@@ -1090,10 +1090,10 @@ daemon still holding its event, is stopped as before.
 
 **After every update the daemon runs, or the record says why not (FR-150 P1b).** The
 post-install watcher has always settled a per-Machine service after every verdict
-(`settle_service`, `agents/roomlerd/src/post_install.rs:1261`). Its per-user arm started the
+(`settle_service`, `agents/roomlerd/src/post_install.rs:1616`). Its per-user arm started the
 task only after a failed install, because an exit 0 means the new task's one-shots do it, and
 #3507 was an exit 0 that had registered nothing. So the per-user arm is now a ladder
-(`relaunch_user_daemon`, `post_install.rs:852`, run by `settle_user_daemon`, `:1005`). "Up"
+(`relaunch_user_daemon`, `post_install.rs:1207`, run by `settle_user_daemon`, `:1360`). "Up"
 is the daemon's stop event held for this config (`user_stop_event_held`,
 `agents/roomlerd/src/win_service/stop_event.rs:514`), in the person's session, where the
 watcher runs too:
@@ -1135,12 +1135,12 @@ flowchart TD
 - **The record says it in three places.** The field sits in `last-install.json`, in
   `NodeStatus.last_install` (`InstallDaemon`, `crates/localapi/src/lib.rs:620`, additive both
   ways), and in the next daemon's `last install:` line, a WARN when the watcher left no daemon
-  running (`post_install.rs:1888`).
+  running (`post_install.rs:2267`).
 - **The first update onto P1b runs the old release's watcher**, so P1b protects the hops after
   it. P1a's `Roomler start-<SID>` protects that one.
 - `ROOMLERD_WATCHER_RELAUNCH=0` in the daemon's environment, which the watcher inherits, keeps
   the old arm: a start only after a failure (`start_user_daemon_after_a_failure`,
-  `post_install.rs:726`; the switch, `:773`).
+  `post_install.rs:1081`; the switch, `:1128`).
 
 **The first update onto the launcher looks a little different.** It runs the old
 product's table and the old daemon's own console: one terminal can flash when the old
@@ -1162,11 +1162,13 @@ that is online. Any other answer keeps the launcher, so a person who is not sign
 that moment gets the launcher, and the block, until the next registration. Once the policy
 allows the launcher, the next update takes the window away.
 
-**`last-install.json` can stay at `InProgress` on a self-update.** The staged watcher
-holds the install folder's VC runtime through `PATH`, and Restart Manager can shut it down
-(event 10002) before it writes a verdict: read on both jumps, while another
-launcher-to-launcher update read `SucceededVerified`. Nothing reads the file, and the
-device comes back either way.
+**`last-install.json` can stay at `InProgress` on a self-update.** Restart Manager can shut
+the staged watcher down (event 10002) before it writes a verdict: read on both jumps, while
+another launcher-to-launcher update read `SucceededVerified`. The device comes back either
+way, and the next daemon settles the record at its clean-run threshold (#3302). A watcher
+from a release with #4302 adds to the record that a console control event stopped it, and
+which files of the install folder it held when it began
+([update-outcome.md](update-outcome.md) §3).
 
 **A resume from sleep needs no start.** The processes sleep with the machine and carry
 on, with the same process ids: after a hibernate the row was back online 13 s after the
@@ -2032,7 +2034,7 @@ profile, or the machine's data folder) or is reached through a link below it (`k
   wins because the tree a copy sits in does not say which one is live: a device whose config
   stayed in the OLD tree writes its state there (#3747). The update marker's age is what it says
   (`recent_update_attempt_at`, `agents/roomlerd/src/updater.rs:268`), the newest install record
-  is the one its reader takes (`newest_record_path`, `agents/roomlerd/src/post_install.rs:227`),
+  is the one its reader takes (`newest_record_path`, `agents/roomlerd/src/post_install.rs:333`),
   and the host-mute, privacy-curtain and keep-busy files hold the latest state. A move keeps a
   file's modification time. Of two fragments of one day's log both are kept: a kept-beside log
   ages out with the logs (`prune_old_logs_at`, `crates/agent-core/src/logging.rs:1083`), and the
@@ -3837,7 +3839,7 @@ flowchart TD
 
 | What is live | What the periodic check does | Where |
 |---|---|---|
-| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3684` |
+| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3770` |
 | a remote-control session, an SSH connection, a Fleet RPC run, a transfer or a recording | defers, and checks again in 1 h | `TRANSFER_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:77` |
 | only a network transition in the last 10 min | defers, and checks again in 2 min (R5b) | `NET_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:98` |
 | either, after 7 defers in a row | installs anyway, and warns what it cuts: a device that is never idle still takes a release about 7 h after it was due | `MAX_CONSECUTIVE_DEFERS`, `agents/roomlerd/src/updater.rs:84` |
@@ -3864,9 +3866,9 @@ flowchart TD
   outlives an hour without its socket (FR-138 keeps one for 120 s at most), but
   an SSH session on the mesh does, and so does a session another enrollment of
   the daemon serves; and a long outage often ends on a network that just moved.
-  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3158`),
+  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3244`),
   and one function picks the cycle's way (`cycle_arm`,
-  `agents/roomlerd/src/updater.rs:3753`).
+  `agents/roomlerd/src/updater.rs:3839`).
 - **Only the process that installs is asked**, and it counts only what it
   serves itself:
 
@@ -3984,7 +3986,7 @@ session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
 daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
-agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3806`,
+agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3892`,
 `WatchPaths` in `com.roomler.update.plist:61`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way.

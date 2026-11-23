@@ -48,6 +48,18 @@
 //! misclassify as PerUser — same trap as the install wizard,
 //! see `spawn_installer_inner`'s doc).
 //!
+//! #4302 — the copy alone was not enough. Read on a per-Machine
+//! hop, the staged copy still held files that the update replaces,
+//! and the installer's Restart Manager session ended it with a
+//! console control event 1.9 s after it started, before its
+//! verdict. So the updater stages the copy so that everything it
+//! loads sits beside it, and gives it a console of its own
+//! (`updater::stage_watcher_exe`, `updater::watcher_creation_flags`).
+//! The record names any file of the install folder the watcher
+//! holds when it begins ([`InstallWatcher`]), and a console control
+//! event that stops the watcher is noted in the record before the
+//! stop goes on (`console_event_answer`).
+//!
 //! ## Lifecycle
 //!
 //! 1. Updater downloads installer.
@@ -99,9 +111,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-#[cfg(all(unix, not(target_os = "windows")))]
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tunnel_core::localapi::{InstallDaemon, LastInstallStatus};
 
 /// Wall-clock budget for waiting on the installer to finish.
@@ -139,6 +151,22 @@ pub struct InstallOutcome {
     /// record of an older watcher, which still parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon: Option<InstallDaemon>,
+    /// #4302 — the watcher that wrote this record, as it found itself when it
+    /// began. Absent from a record of an older watcher, which still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watcher: Option<InstallWatcher>,
+}
+
+/// #4302 — the watcher process behind a record. Written with the `InProgress`
+/// state, before the wait, so a record whose watcher never came back still says
+/// which process it was and what it held.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub struct InstallWatcher {
+    pub pid: u32,
+    /// The files in the install folder that the watcher held open when it began,
+    /// read from its own module list: file names, lower case, sorted, each once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -179,25 +207,103 @@ pub fn outcome_path() -> Option<PathBuf> {
     crate::logging::log_dir().map(|d| d.join("last-install.json"))
 }
 
-/// Persist the outcome to `<log_dir>/last-install.json`. Atomic
-/// rename via tempfile-then-replace would be nicer; for now a
-/// straight write is fine — the file is small and corruption
-/// downside is just "operator sees a partial JSON" which is
-/// recoverable.
+/// Persist the outcome to `<log_dir>/last-install.json`, whole: see
+/// [`write_outcome_at`].
 pub fn write_outcome(outcome: &InstallOutcome) -> Result<PathBuf> {
     let path = outcome_path().context("no log dir resolvable")?;
     write_outcome_at(&path, outcome)?;
     Ok(path)
 }
 
+/// #4302 — one lock over every write of the record in this process. The
+/// watcher's console control handler ([`note_console_event_at`]) reads, adds to
+/// and writes the record on a thread of its own, beside the main thread's writes.
+/// A writer that panicked leaves the record as whole as the rename made it, so a
+/// poisoned lock is taken anyway. A daemon's settle runs in another process and
+/// stays outside it: a watcher that comes back after a settle writes over it
+/// with what it knows (#3302).
+static RECORD_LOCK: Mutex<()> = Mutex::new(());
+
+/// #4302 — a count of this process's record writes, which names each one's
+/// fresh file ([`fresh_record_path`]).
+static RECORD_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// [`RECORD_LOCK`], taken whatever a panicked writer left.
+fn record_lock() -> MutexGuard<'static, ()> {
+    RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// #4302 — `lock` within `wait`, or `None`. For a caller that must never be held
+/// up for long, such as the watcher's console control handler.
+#[cfg(any(target_os = "windows", test))]
+fn lock_within<T>(lock: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
+    use std::sync::TryLockError;
+    let deadline = Instant::now() + wait;
+    loop {
+        match lock.try_lock() {
+            Ok(held) => return Some(held),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => return None,
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
 /// [`write_outcome`] into a given file: the settle writes a record back where it
 /// found it.
 fn write_outcome_at(path: &Path, outcome: &InstallOutcome) -> Result<()> {
+    let _held = record_lock();
+    write_record_file(path, outcome)
+}
+
+/// #4302 — the pauses before each try of a record's rename. A file just written
+/// can be held for a moment by a scanner, which refuses the rename.
+const RECORD_RENAME_PAUSES: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_millis(10),
+    Duration::from_millis(40),
+];
+
+/// #4302 — the write itself, under [`RECORD_LOCK`]: the record goes into a fresh
+/// file in the same folder, which is then renamed over the record. A reader
+/// finds the last record or the new one, never part of one. If every rename is
+/// refused (another process holds the record open without sharing its
+/// deletion), the record is written in place, as before.
+fn write_record_file(path: &Path, outcome: &InstallOutcome) -> Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let json = serde_json::to_string_pretty(outcome).context("serialising install outcome")?;
+    let fresh = fresh_record_path(path);
+    if let Err(e) = std::fs::write(&fresh, &json) {
+        let _ = std::fs::remove_file(&fresh);
+        return Err(e).with_context(|| format!("writing {}", fresh.display()));
+    }
+    let mut refused = None;
+    for pause in RECORD_RENAME_PAUSES {
+        std::thread::sleep(pause);
+        match std::fs::rename(&fresh, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => refused = Some(e),
+        }
+    }
+    let _ = std::fs::remove_file(&fresh);
+    tracing::debug!(
+        error = ?refused,
+        path = %path.display(),
+        "the record's rename was refused; writing it in place"
+    );
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+/// #4302 — the fresh file of one write: beside the record, named for this process
+/// and this write, so no two writers ever share one.
+fn fresh_record_path(path: &Path) -> PathBuf {
+    let write = RECORD_WRITES.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map_or_else(|| "last-install.json".into(), |n| n.to_string_lossy());
+    path.with_file_name(format!("{name}.{}-{write}.tmp", std::process::id()))
 }
 
 /// #3302 — every file a record may be in, this process's own log dir first.
@@ -319,10 +425,39 @@ pub fn watch(
         status: InstallStatus::InProgress,
         note: String::new(),
         daemon: None,
+        watcher: None,
     };
+    // #4302 — which process this is, and which files of the install folder it
+    // holds: an update that replaces one of them may end the watcher before its
+    // verdict, and then this record is what is left to say so.
+    #[cfg(target_os = "windows")]
+    {
+        let me = watcher_self(origin_exe.as_deref());
+        if me.held.is_empty() {
+            tracing::info!(
+                pid = me.pid,
+                "the post-install watcher holds no file in the install folder"
+            );
+        } else {
+            tracing::warn!(
+                pid = me.pid,
+                held = %me.held.join(", "),
+                "the post-install watcher holds files in the install folder; an update that \
+                 replaces them may end it before its verdict"
+            );
+        }
+        outcome.watcher = Some(me);
+    }
     // Persist the InProgress state immediately so a watcher that
     // crashes mid-wait still leaves a forensic trail.
-    let _ = write_outcome(&outcome);
+    let first = write_outcome(&outcome);
+    // #4302 — and a watcher that a console control event stops says so in it.
+    #[cfg(target_os = "windows")]
+    if let Ok(path) = first {
+        note_console_stops_in(path);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = first;
 
     let exit = if should_wait_for_installer(installer_pid, already_exited) {
         wait_for_pid(installer_pid, INSTALLER_BUDGET)
@@ -411,6 +546,120 @@ pub fn watch(
     Ok(outcome)
 }
 
+/// #4302 — the console control events Windows hands a handler (`wincon.h`).
+#[cfg(any(target_os = "windows", test))]
+const CTRL_C_EVENT: u32 = 0;
+#[cfg(any(target_os = "windows", test))]
+const CTRL_BREAK_EVENT: u32 = 1;
+#[cfg(any(target_os = "windows", test))]
+const CTRL_CLOSE_EVENT: u32 = 2;
+#[cfg(test)]
+const CTRL_LOGOFF_EVENT: u32 = 5;
+#[cfg(test)]
+const CTRL_SHUTDOWN_EVENT: u32 = 6;
+
+/// #4302 — what a watcher stopped by a console control event leaves in its
+/// record, before its verdict and after it.
+#[cfg(any(target_os = "windows", test))]
+const STOPPED_BEFORE_VERDICT: &str =
+    "the watcher was stopped by a console control event before its verdict";
+#[cfg(any(target_os = "windows", test))]
+const STOPPED_AFTER_VERDICT: &str =
+    "the watcher was stopped by a console control event after its verdict";
+
+/// #4302 — how long the console control handler waits for the record's lock
+/// before it lets the stop go on without its note.
+#[cfg(any(target_os = "windows", test))]
+const CONSOLE_NOTE_WAIT: Duration = Duration::from_millis(200);
+
+/// #4302 — what the watcher's console control handler does with one event: the
+/// note it adds to the record, if any, and whether it handled the event. It
+/// never handles one, so the next handler, Windows' own, ends the watcher as it
+/// did before the handler existed, and Restart Manager can still stop it. Ctrl+C,
+/// Ctrl+Break and a closed console are noted. A log-off or a shut-down is the
+/// system's own business, and the record says nothing of it.
+#[cfg(any(target_os = "windows", test))]
+fn console_event_answer(event: u32, has_verdict: bool) -> (Option<&'static str>, bool) {
+    let note = match event {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT if has_verdict => {
+            Some(STOPPED_AFTER_VERDICT)
+        }
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => Some(STOPPED_BEFORE_VERDICT),
+        _ => None,
+    };
+    (note, false)
+}
+
+/// #4302 — the console control handler's work on the record at `path`: add the
+/// note [`console_event_answer`] gives for `event`. Waits at most `wait` for the
+/// record's lock, then gives up, because a stop must never wait on the record.
+/// Whether the note was written.
+#[cfg(any(target_os = "windows", test))]
+fn note_console_event_at(path: &Path, event: u32, wait: Duration) -> bool {
+    let Some(_held) = lock_within(&RECORD_LOCK, wait) else {
+        return false;
+    };
+    let Ok(mut outcome) = read_outcome_at(path) else {
+        return false;
+    };
+    let has_verdict = outcome.status != InstallStatus::InProgress;
+    let (Some(note), _) = console_event_answer(event, has_verdict) else {
+        return false;
+    };
+    outcome.note = with_note(&outcome.note, note);
+    write_record_file(path, &outcome).is_ok()
+}
+
+/// #4302 — the record the watcher's console control handler adds to.
+#[cfg(target_os = "windows")]
+static CONSOLE_NOTE_RECORD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// #4302 — from here on, a console control event that reaches the watcher is
+/// noted in the record at `path` before the watcher stops. Restart Manager stops
+/// a console program that holds a file an install replaces with such an event.
+#[cfg(target_os = "windows")]
+fn note_console_stops_in(path: PathBuf) {
+    if CONSOLE_NOTE_RECORD.set(path).is_err() {
+        return;
+    }
+    // SAFETY: `on_console_event` has the signature Windows calls a handler with,
+    // and as a plain function it lives as long as the process.
+    let set = unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console_event), 1)
+    };
+    if set == 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "could not set the post-install watcher's console control handler"
+        );
+    }
+}
+
+/// #4302 — Windows runs this on a thread of its own for each console control
+/// event that reaches the watcher: [`note_console_event_at`], then FALSE.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn on_console_event(event: u32) -> windows_sys::Win32::Foundation::BOOL {
+    if let Some(path) = CONSOLE_NOTE_RECORD.get()
+        && note_console_event_at(path, event, CONSOLE_NOTE_WAIT)
+    {
+        tracing::warn!(
+            event,
+            "a console control event is stopping the post-install watcher; its record says so"
+        );
+    }
+    let (_, handled) = console_event_answer(event, false);
+    i32::from(handled)
+}
+
+/// `note` with `more` after it, or `more` alone when there is no note yet.
+fn with_note(note: &str, more: &str) -> String {
+    if note.is_empty() {
+        more.to_owned()
+    } else {
+        format!("{note}; {more}")
+    }
+}
+
 /// The flavour of the install this watcher is watching. Prefers the
 /// `--origin-exe` path (the real install dir) over the watcher's own
 /// location — a staged-copy watcher runs from %TEMP%, which the path
@@ -423,6 +672,96 @@ fn install_flavour(origin: Option<&std::path::Path>) -> crate::updater::WindowsI
         Some(p) => crate::updater::classify_install_flavour_from_path(p),
         None => crate::updater::current_install_flavour(),
     }
+}
+
+/// #4302 — this watcher as its record names it: its pid, and the files of the
+/// install folder it holds. The install folder is `--origin-exe`'s, or, for a
+/// watcher started from the install folder itself, its own.
+#[cfg(target_os = "windows")]
+fn watcher_self(origin: Option<&Path>) -> InstallWatcher {
+    let exe = origin
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_exe().ok());
+    let held = match exe.as_deref().and_then(Path::parent) {
+        Some(dir) => held_in(&own_modules(), dir),
+        None => Vec::new(),
+    };
+    InstallWatcher {
+        pid: std::process::id(),
+        held,
+    }
+}
+
+/// #4302 — the files this process has open as modules, as its module list
+/// names them, the executable first. Empty when the list cannot be read.
+#[cfg(target_os = "windows")]
+fn own_modules() -> Vec<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::HMODULE;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32EnumProcessModules, K32GetModuleFileNameExW,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: the pseudo-handle of this process; it needs no closing.
+    let me = unsafe { GetCurrentProcess() };
+    let size_of = std::mem::size_of::<HMODULE>();
+    let mut mods: Vec<HMODULE> = vec![std::ptr::null_mut(); 256];
+    loop {
+        let mut needed = 0u32;
+        // SAFETY: `mods` holds the byte count passed; `needed` is a valid
+        // out-pointer.
+        let ok = unsafe {
+            K32EnumProcessModules(
+                me,
+                mods.as_mut_ptr(),
+                (mods.len() * size_of) as u32,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return Vec::new();
+        }
+        let count = needed as usize / size_of;
+        if count <= mods.len() {
+            mods.truncate(count);
+            break;
+        }
+        // A module was loaded between the two calls: read the list again.
+        mods.resize(count, std::ptr::null_mut());
+    }
+    let mut buf = vec![0u16; 32_768];
+    mods.iter()
+        .filter_map(|&module| {
+            // SAFETY: `module` is a module of this process; `buf` is sized as
+            // passed.
+            let n =
+                unsafe { K32GetModuleFileNameExW(me, module, buf.as_mut_ptr(), buf.len() as u32) };
+            (n > 0).then(|| PathBuf::from(OsString::from_wide(&buf[..n as usize])))
+        })
+        .collect()
+}
+
+/// #4302 — the file names among `modules` that sit directly in `dir`, compared
+/// the way Windows compares paths: lower case, sorted, each once.
+#[cfg(target_os = "windows")]
+fn held_in(modules: &[PathBuf], dir: &Path) -> Vec<String> {
+    use crate::win_service::companion_procs::normalize;
+    let dir = normalize(dir);
+    let dir = dir.trim_end_matches('\\');
+    let mut held: Vec<String> = modules
+        .iter()
+        .filter(|m| {
+            m.parent()
+                .is_some_and(|p| normalize(p).trim_end_matches('\\') == dir)
+        })
+        .filter_map(|m| m.file_name())
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .collect();
+    held.sort();
+    held.dedup();
+    held
 }
 
 // RETIRED-NAME-ANCHOR(4): names the folder hosts installed BEFORE P4b; the
@@ -551,9 +890,12 @@ fn recover_wedged_install(
     );
     let _ = write_outcome(outcome);
 
-    run_recovery_cmd("taskkill", &["/F", "/T", "/PID", &wedged_pid.to_string()]);
+    run_recovery_cmd(
+        "taskkill.exe",
+        &["/F", "/T", "/PID", &wedged_pid.to_string()],
+    );
     std::thread::sleep(Duration::from_secs(5));
-    run_recovery_cmd("taskkill", &["/F", "/IM", "msiexec.exe"]);
+    run_recovery_cmd("taskkill.exe", &["/F", "/IM", "msiexec.exe"]);
     std::thread::sleep(Duration::from_secs(5));
 
     // #2107 — the one log that names the action this attempt stopped in.
@@ -615,7 +957,10 @@ fn recover_wedged_install(
             tracing::warn!(status = ?outcome.status, "retry was gone before its exit could be read");
         }
         WaitOutcome::Timeout => {
-            run_recovery_cmd("taskkill", &["/F", "/T", "/PID", &retry_pid.to_string()]);
+            run_recovery_cmd(
+                "taskkill.exe",
+                &["/F", "/T", "/PID", &retry_pid.to_string()],
+            );
             outcome.status = InstallStatus::Timeout;
             outcome.note = format!(
                 "retry also wedged (no exit in {}s); killed — see the msiexec /l*v log next to the MSI",
@@ -646,12 +991,22 @@ fn keep_wedged_log(log: &std::path::Path, dir: &std::path::Path) -> Option<PathB
     Some(kept)
 }
 
+/// The program a recovery step runs: the tool's full path in the system folder,
+/// like the daemon's other system tools (FR-129, `appdirs::system32_tool`).
+#[cfg(target_os = "windows")]
+fn recovery_program(tool: &str) -> PathBuf {
+    crate::appdirs::system32_tool(tool)
+}
+
 /// Spawn a recovery shell-out, log its exit code, never fail the
 /// watcher on it. taskkill exit codes are informational here (128 =
 /// no such process — already gone, which is fine).
 #[cfg(target_os = "windows")]
 fn run_recovery_cmd(cmd: &str, args: &[&str]) {
-    match std::process::Command::new(cmd).args(args).output() {
+    match std::process::Command::new(recovery_program(cmd))
+        .args(args)
+        .output()
+    {
         Ok(out) => {
             tracing::info!(cmd, ?args, code = out.status.code(), "recovery command ran");
         }
@@ -1524,6 +1879,9 @@ pub(crate) enum Settle {
 ///
 /// The daemon being the expected version settles it at any age. Anything else waits
 /// out [`WATCHER_LIFETIME`], and then says plainly that nobody will ever say more.
+///
+/// #4302 — a note the watcher wrote stays first, and the settle's words follow it:
+/// a wedge it was recovering from, or a console control event that stopped it.
 pub(crate) fn settle_unreported(
     outcome: &mut InstallOutcome,
     running_version: &str,
@@ -1532,12 +1890,12 @@ pub(crate) fn settle_unreported(
     if outcome.status != InstallStatus::InProgress {
         return Settle::HasVerdict;
     }
-    if version_matches(running_version, &outcome.expected_version) {
+    let settled = if version_matches(running_version, &outcome.expected_version) {
         outcome.status = InstallStatus::SucceededVerified;
         outcome.new_binary_version = Some(format!("roomlerd {running_version}"));
-        outcome.note = format!(
+        format!(
             "the watcher left no verdict; this daemon is {running_version}, and has stayed up on it"
-        );
+        )
     } else {
         let age = now_unix.saturating_sub(outcome.started_unix);
         let life = WATCHER_LIFETIME.as_secs();
@@ -1545,15 +1903,36 @@ pub(crate) fn settle_unreported(
             return Settle::TooSoon(Duration::from_secs(life - age));
         }
         outcome.status = InstallStatus::WatcherStopped;
-        outcome.note = format!(
+        format!(
             "no verdict after {} min: the watcher was stopped first. This daemon is \
              {running_version}, and the install was for {}",
             age / 60,
             outcome.expected_version
-        );
+        )
+    };
+    outcome.note = with_note(&outcome.note, &settled);
+    if let Some(watcher) = &outcome.watcher {
+        outcome.note = with_note(&outcome.note, &watcher_words(watcher));
     }
     outcome.finished_unix = Some(now_unix);
     Settle::Settled
+}
+
+/// #4302 — what a settled record says of the watcher that left it: the files of
+/// the install folder it held when it began.
+fn watcher_words(watcher: &InstallWatcher) -> String {
+    if watcher.held.is_empty() {
+        format!(
+            "the watcher (pid {}) held no file in the install folder when it began",
+            watcher.pid
+        )
+    } else {
+        format!(
+            "the watcher (pid {}) held these files in the install folder when it began: {}",
+            watcher.pid,
+            watcher.held.join(", ")
+        )
+    }
 }
 
 /// #3302 — [`settle_unreported`] on the record on disk. Returns how long to wait
@@ -1895,6 +2274,17 @@ pub fn log_at_startup() {
 mod tests {
     use super::*;
 
+    /// #4302 — the wedge recovery runs `taskkill` by its full path from the
+    /// system folder, like the daemon's other system tools (FR-129).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn recovery_runs_taskkill_from_the_system_folder() {
+        let program = recovery_program("taskkill.exe");
+        assert!(program.is_absolute(), "{}", program.display());
+        assert_eq!(program, crate::appdirs::system32_tool("taskkill.exe"));
+        assert!(program.is_file(), "no taskkill at {}", program.display());
+    }
+
     /// #3302 — a process gone before the wait began has no exit code anyone read.
     /// A 0 here made a refused MSI read as a success: the record said exit 0 and the
     /// MSI's own log said 1603.
@@ -1936,6 +2326,7 @@ mod tests {
             status: InstallStatus::InProgress,
             note: String::new(),
             daemon: None,
+            watcher: None,
         }
     }
 
@@ -2319,6 +2710,7 @@ mod tests {
                 status: InstallStatus::InProgress,
                 note: String::new(),
                 daemon: None,
+                watcher: None,
             })),
             Some(path),
         );
@@ -2350,6 +2742,7 @@ mod tests {
                 status: InstallStatus::SucceededVerified,
                 note: "new binary at /usr/bin/roomlerd reports roomlerd 0.4.172".into(),
                 daemon: None,
+                watcher: None,
             })),
             Some(path),
         );
@@ -2561,6 +2954,7 @@ mod tests {
             status: InstallStatus::SucceededVerified,
             note: "ok".into(),
             daemon: None,
+            watcher: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(json.contains("\"installer_pid\":1234"));
@@ -2583,6 +2977,7 @@ mod tests {
             status: InstallStatus::InProgress,
             note: "".into(),
             daemon: None,
+            watcher: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(json.contains("\"finished_unix\":null"));
@@ -3240,5 +3635,413 @@ mod tests {
         assert_eq!(summary.daemon, None);
         let summary = summarize(Ok(Some(outcome)), Some(path.as_path()));
         assert_eq!(summary.daemon.map(|d| d.running), Some(false));
+    }
+
+    /// #4302 — the record's `watcher` field round-trips through the file, an empty
+    /// `held` is left out of it, and a record an older watcher wrote still parses.
+    #[test]
+    fn the_records_watcher_field_round_trips_and_an_old_record_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-install.json");
+        let mut outcome = unreported("agent-v0.4.234", 1000);
+        outcome.watcher = Some(InstallWatcher {
+            pid: 4242,
+            held: vec!["one.dll".into(), "two.dll".into()],
+        });
+        write_outcome_at(&path, &outcome).unwrap();
+        assert_eq!(read_outcome_at(&path).unwrap(), outcome);
+
+        outcome.watcher = Some(InstallWatcher {
+            pid: 4242,
+            held: Vec::new(),
+        });
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"watcher\":{\"pid\":4242}"), "{json}");
+        let back: InstallOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, outcome);
+
+        let old = serde_json::json!({
+            "installer_pid": 2876,
+            "installer_path": "C:\\T\\roomlerd-0.4.233-perMachine-x86_64-pc-windows-msvc.msi",
+            "expected_version": "agent-v0.4.233",
+            "started_unix": 1_795_185_131u64,
+            "finished_unix": null,
+            "installer_exit_code": null,
+            "new_binary_path": null,
+            "new_binary_version": null,
+            "status": "InProgress",
+            "note": ""
+        });
+        std::fs::write(&path, old.to_string()).unwrap();
+        let back = read_outcome_at(&path).unwrap();
+        assert_eq!(back.watcher, None);
+        assert_eq!(back.status, InstallStatus::InProgress);
+        let json = serde_json::to_string(&back).unwrap();
+        assert!(!json.contains("watcher"), "{json}");
+    }
+
+    /// #4302 — a record settled for a watcher that never came back says what that
+    /// watcher held in the install folder, on both settle branches; a record of an
+    /// older watcher, which names no watcher, keeps today's note.
+    #[test]
+    fn a_settled_note_says_what_the_watcher_held() {
+        let held = InstallWatcher {
+            pid: 4242,
+            held: vec!["one.dll".into(), "two.dll".into()],
+        };
+        let mut o = unreported("agent-v0.4.234", 1000);
+        o.watcher = Some(held.clone());
+        assert_eq!(settle_unreported(&mut o, "0.4.234", 1010), Settle::Settled);
+        assert_eq!(o.status, InstallStatus::SucceededVerified);
+        assert!(o.note.contains("no verdict"), "{}", o.note);
+        assert!(
+            o.note.ends_with(
+                "; the watcher (pid 4242) held these files in the install folder when it \
+                 began: one.dll, two.dll"
+            ),
+            "{}",
+            o.note
+        );
+
+        let life = WATCHER_LIFETIME.as_secs();
+        let mut o = unreported("agent-v0.4.234", 1000);
+        o.watcher = Some(InstallWatcher {
+            pid: 77,
+            held: Vec::new(),
+        });
+        assert_eq!(
+            settle_unreported(&mut o, "0.4.233", 1000 + life),
+            Settle::Settled
+        );
+        assert_eq!(o.status, InstallStatus::WatcherStopped);
+        assert!(o.note.contains("agent-v0.4.234"), "{}", o.note);
+        assert!(
+            o.note.ends_with(
+                "; the watcher (pid 77) held no file in the install folder when it began"
+            ),
+            "{}",
+            o.note
+        );
+
+        // Too soon: the note is not touched, the watcher's facts included.
+        let mut o = unreported("agent-v0.4.234", 1000);
+        o.watcher = Some(held);
+        assert!(matches!(
+            settle_unreported(&mut o, "0.4.233", 1010),
+            Settle::TooSoon(_)
+        ));
+        assert_eq!(o.note, "");
+
+        let mut o = unreported("agent-v0.4.234", 1000);
+        assert_eq!(settle_unreported(&mut o, "0.4.234", 1010), Settle::Settled);
+        assert_eq!(
+            o.note,
+            "the watcher left no verdict; this daemon is 0.4.234, and has stayed up on it"
+        );
+        assert!(!o.note.contains("pid"), "{}", o.note);
+    }
+
+    /// #4302 — the install folder's files among a module list, compared the way
+    /// Windows compares paths: case, the `\\?\` prefix, a trailing separator and
+    /// `/` do not matter; another folder and a subfolder are not the folder.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn held_in_compares_folders_the_way_windows_does() {
+        let modules: Vec<PathBuf> = [
+            r"C:\Program Files\Roomler\roomlerd.exe",
+            r"C:\Windows\SYSTEM32\ntdll.dll",
+            r"\\?\C:\PROGRAM FILES\roomler\TWO.dll",
+            r"C:/Program Files/Roomler/one.dll",
+            r"C:\Program Files\Roomler\sub\other.dll",
+            r"C:\Program Files\Roomler2\roomlerd.exe",
+            r"C:\Program Files\Roomler\two.dll",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let want = vec![
+            "one.dll".to_string(),
+            "roomlerd.exe".to_string(),
+            "two.dll".to_string(),
+        ];
+        for dir in [
+            r"C:\Program Files\Roomler",
+            r"c:\program files\roomler\",
+            r"\\?\C:\Program Files\Roomler",
+        ] {
+            assert_eq!(held_in(&modules, Path::new(dir)), want, "{dir}");
+        }
+        assert!(held_in(&modules, Path::new(r"C:\Windows\Temp")).is_empty());
+    }
+
+    /// #4302 — the module list this process reads of itself: the executable
+    /// first, `ntdll.dll` in it, and the watcher's own entry from it.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_watcher_reads_its_own_modules() {
+        let modules = own_modules();
+        let exe = std::env::current_exe().unwrap();
+        let first = modules.first().expect("a module list");
+        assert_eq!(
+            crate::win_service::companion_procs::normalize(first),
+            crate::win_service::companion_procs::normalize(&exe),
+            "{modules:?}"
+        );
+        assert!(
+            modules.iter().any(|m| m
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("ntdll.dll"))),
+            "{modules:?}"
+        );
+
+        // Started from the install folder itself: it holds its own executable.
+        let me = watcher_self(Some(&exe));
+        assert_eq!(me.pid, std::process::id());
+        let own = exe.file_name().unwrap().to_string_lossy().to_lowercase();
+        assert!(me.held.contains(&own), "{:?}", me.held);
+        assert_eq!(watcher_self(None).held, me.held);
+
+        // A staged copy whose install folder it holds nothing of.
+        let elsewhere = std::env::temp_dir()
+            .join("w4302-no-such-folder")
+            .join("roomlerd.exe");
+        assert!(watcher_self(Some(&elsewhere)).held.is_empty());
+    }
+
+    /// The files in `dir`, by name, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// #4302 — a record is written to a fresh file and renamed over the old one,
+    /// never rewritten in place: a second name of the old file still reads the old
+    /// record whole, and no fresh file is left behind.
+    #[test]
+    fn a_record_write_replaces_the_file_and_never_rewrites_it_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-install.json");
+        write_outcome_at(&path, &unreported("agent-v0.4.300", 1000)).unwrap();
+        let old = dir.path().join("old-name.json");
+        std::fs::hard_link(&path, &old).unwrap();
+
+        let mut verdict = unreported("agent-v0.4.300", 1000);
+        verdict.status = InstallStatus::SucceededVerified;
+        verdict.note = "the watcher's verdict".into();
+        write_outcome_at(&path, &verdict).unwrap();
+
+        assert_eq!(read_outcome_at(&path).unwrap(), verdict);
+        assert_eq!(
+            read_outcome_at(&old).unwrap(),
+            unreported("agent-v0.4.300", 1000),
+            "the old file was rewritten in place"
+        );
+        assert_eq!(names_in(dir.path()), ["last-install.json", "old-name.json"]);
+    }
+
+    /// #4302 — each write has a fresh file of its own, named for this process.
+    #[test]
+    fn each_record_write_has_a_fresh_file_of_its_own() {
+        let path = Path::new("logs").join("last-install.json");
+        let (a, b) = (fresh_record_path(&path), fresh_record_path(&path));
+        assert_ne!(a, b);
+        for fresh in [&a, &b] {
+            assert_eq!(fresh.parent(), path.parent());
+            let name = fresh.file_name().unwrap().to_string_lossy().into_owned();
+            let pid = format!("last-install.json.{}-", std::process::id());
+            assert!(name.starts_with(&pid) && name.ends_with(".tmp"), "{name}");
+        }
+    }
+
+    /// #4302 — writers on several threads leave one whole record, and no fresh
+    /// file.
+    #[test]
+    fn writers_on_several_threads_leave_one_whole_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-install.json");
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let path = &path;
+                s.spawn(move || {
+                    for n in 0..25u64 {
+                        let mut o = unreported("agent-v0.4.300", t * 100 + n);
+                        o.note = "x".repeat(usize::try_from(n * 40).unwrap());
+                        write_outcome_at(path, &o).unwrap();
+                    }
+                });
+            }
+        });
+        read_outcome_at(&path).unwrap();
+        assert_eq!(names_in(dir.path()), ["last-install.json"]);
+    }
+
+    /// #4302 — the console control handler's lock: taken when free or poisoned,
+    /// given up once its wait is over.
+    #[test]
+    fn a_lock_within_its_wait_or_none() {
+        let lock = Mutex::new(());
+        assert!(lock_within(&lock, Duration::ZERO).is_some());
+
+        let held = lock.lock().unwrap();
+        let start = Instant::now();
+        assert!(lock_within(&lock, Duration::from_millis(60)).is_none());
+        assert!(start.elapsed() >= Duration::from_millis(60));
+        drop(held);
+
+        let poisoned = Mutex::new(());
+        let _ = std::panic::catch_unwind(|| {
+            let _g = poisoned.lock().unwrap();
+            panic!("a writer panicked");
+        });
+        assert!(poisoned.is_poisoned());
+        assert!(lock_within(&poisoned, Duration::ZERO).is_some());
+    }
+
+    /// #4302 — every console control event: Ctrl+C, Ctrl+Break and a closed
+    /// console are noted, before or after the verdict as the record stands; a
+    /// log-off, a shut-down or anything else is not. None is ever handled, so
+    /// Windows' own handler still ends the watcher.
+    #[test]
+    fn a_console_event_is_noted_and_never_handled() {
+        let (before, after) = (Some(STOPPED_BEFORE_VERDICT), Some(STOPPED_AFTER_VERDICT));
+        for (event, want_before, want_after) in [
+            (CTRL_C_EVENT, before, after),
+            (CTRL_BREAK_EVENT, before, after),
+            (CTRL_CLOSE_EVENT, before, after),
+            (CTRL_LOGOFF_EVENT, None, None),
+            (CTRL_SHUTDOWN_EVENT, None, None),
+            (3, None, None),
+            (4, None, None),
+            (7, None, None),
+            (u32::MAX, None, None),
+        ] {
+            assert_eq!(
+                console_event_answer(event, false),
+                (want_before, false),
+                "{event}"
+            );
+            assert_eq!(
+                console_event_answer(event, true),
+                (want_after, false),
+                "{event}"
+            );
+        }
+    }
+
+    /// #4302 — the events are the ones `wincon.h` names.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_console_events_are_windows_own() {
+        use windows_sys::Win32::System::Console as c;
+        assert_eq!(
+            [
+                CTRL_C_EVENT,
+                CTRL_BREAK_EVENT,
+                CTRL_CLOSE_EVENT,
+                CTRL_LOGOFF_EVENT,
+                CTRL_SHUTDOWN_EVENT
+            ],
+            [
+                c::CTRL_C_EVENT,
+                c::CTRL_BREAK_EVENT,
+                c::CTRL_CLOSE_EVENT,
+                c::CTRL_LOGOFF_EVENT,
+                c::CTRL_SHUTDOWN_EVENT
+            ]
+        );
+    }
+
+    /// #4302 — the handler's note lands in the record on disk: after a note the
+    /// watcher already wrote, before or after the verdict as the record stands.
+    /// A log-off leaves the record as it was, and with no record nothing is
+    /// written.
+    #[test]
+    fn a_console_stop_is_noted_in_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-install.json");
+
+        let mut waiting = unreported("agent-v0.4.300", 1000);
+        waiting.note =
+            "installer wedged (no exit in 600s); killing msiexec and retrying once".into();
+        write_outcome_at(&path, &waiting).unwrap();
+        assert!(!note_console_event_at(
+            &path,
+            CTRL_LOGOFF_EVENT,
+            CONSOLE_NOTE_WAIT
+        ));
+        assert_eq!(read_outcome_at(&path).unwrap(), waiting);
+
+        assert!(note_console_event_at(
+            &path,
+            CTRL_C_EVENT,
+            CONSOLE_NOTE_WAIT
+        ));
+        let o = read_outcome_at(&path).unwrap();
+        assert_eq!(o.status, InstallStatus::InProgress);
+        assert_eq!(
+            o.note,
+            format!("{}; {STOPPED_BEFORE_VERDICT}", waiting.note)
+        );
+
+        let mut verdict = unreported("agent-v0.4.300", 1000);
+        verdict.status = InstallStatus::SucceededVerified;
+        write_outcome_at(&path, &verdict).unwrap();
+        assert!(note_console_event_at(
+            &path,
+            CTRL_CLOSE_EVENT,
+            CONSOLE_NOTE_WAIT
+        ));
+        let o = read_outcome_at(&path).unwrap();
+        assert_eq!(o.status, InstallStatus::SucceededVerified);
+        assert_eq!(o.note, STOPPED_AFTER_VERDICT);
+        assert_eq!(names_in(dir.path()), ["last-install.json"]);
+
+        let none = dir.path().join("absent").join("last-install.json");
+        assert!(!note_console_event_at(
+            &none,
+            CTRL_C_EVENT,
+            CONSOLE_NOTE_WAIT
+        ));
+        assert!(!none.exists());
+    }
+
+    /// #4302 — a settled record keeps the note its watcher wrote, first, on both
+    /// of the settle's branches.
+    #[test]
+    fn a_settle_keeps_the_watchers_note() {
+        let mut o = unreported("agent-v0.4.300", 1000);
+        o.note = STOPPED_BEFORE_VERDICT.into();
+        assert_eq!(settle_unreported(&mut o, "0.4.300", 1300), Settle::Settled);
+        assert_eq!(o.status, InstallStatus::SucceededVerified);
+        assert_eq!(
+            o.note,
+            format!(
+                "{STOPPED_BEFORE_VERDICT}; the watcher left no verdict; this daemon is 0.4.300, \
+                 and has stayed up on it"
+            )
+        );
+
+        let mut o = unreported("agent-v0.4.300", 1000);
+        o.note = STOPPED_BEFORE_VERDICT.into();
+        o.watcher = Some(InstallWatcher {
+            pid: 7,
+            held: vec![],
+        });
+        let late = 1000 + WATCHER_LIFETIME.as_secs();
+        assert_eq!(settle_unreported(&mut o, "0.4.299", late), Settle::Settled);
+        assert_eq!(o.status, InstallStatus::WatcherStopped);
+        let first = format!("{STOPPED_BEFORE_VERDICT}; no verdict after 25 min");
+        assert!(o.note.starts_with(&first), "{}", o.note);
+        assert!(
+            o.note.ends_with(
+                "; the watcher (pid 7) held no file in the install folder when it began"
+            ),
+            "{}",
+            o.note
+        );
     }
 }

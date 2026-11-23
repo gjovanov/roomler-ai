@@ -3045,6 +3045,12 @@ fn spawn_watcher(
     // ...and it keeps nothing else of ours either.
     #[cfg(unix)]
     tunnel_core::child::inherit_only_stdio(&mut cmd);
+    // #4302 — nor our console: it gets one of its own ([`watcher_creation_flags`]).
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(watcher_creation_flags());
+    }
     let _child = cmd
         .spawn()
         .context("spawning post-install-watch subprocess")?;
@@ -3060,6 +3066,62 @@ fn spawn_watcher(
     Ok(())
 }
 
+/// #4302 — the watcher's creation flags on Windows: a console of its own, with
+/// no window. With no flag a console program shares the console of the process
+/// that started it, so the watcher was in the old worker's console, and a
+/// control event sent to that console reaches every process in it. Not
+/// `DETACHED_PROCESS`: with no console at all, a console tool the watcher runs
+/// (`taskkill` on a wedge) would open a window of its own on the signed-in
+/// desktop. Not a new process group either: that turns Ctrl+C off for the
+/// watcher, and Restart Manager must still be able to stop it.
+#[cfg(target_os = "windows")]
+fn watcher_creation_flags() -> u32 {
+    windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+}
+
+/// #4302 — the runtime libraries both MSIs place beside `roomlerd.exe`
+/// (`VcRedistCrt`), which are what its import table names besides Windows'
+/// own. A staged copy of the EXE gets them beside it too
+/// ([`stage_runtime_libs`]), so everything the copy loads sits beside it.
+#[cfg(target_os = "windows")]
+const WATCHER_RUNTIME_LIBS: [&str; 3] = ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"];
+
+/// Whether [`stage_watcher_exe`] places the runtime libraries beside the copy:
+/// only in a staging dir of ours ([`is_staging_dir`]), made by this process
+/// holding the SYSTEM token ([`create_fresh_protected_dir`]). Anywhere else
+/// the copy is staged exactly as before.
+#[cfg(target_os = "windows")]
+fn may_stage_runtime_libs(staging: &std::path::Path, as_system: bool) -> bool {
+    as_system && is_staging_dir(staging)
+}
+
+/// Copy each of [`WATCHER_RUNTIME_LIBS`] found beside `exe` into `staging`.
+/// A library that is not beside `exe` (a build that does not ship it) is
+/// skipped. Returns how many were placed. Best effort: a failed copy is
+/// logged, and the watcher still runs.
+#[cfg(target_os = "windows")]
+fn stage_runtime_libs(exe: &std::path::Path, staging: &std::path::Path) -> usize {
+    let Some(exe_dir) = exe.parent() else {
+        return 0;
+    };
+    let mut placed = 0;
+    for lib in WATCHER_RUNTIME_LIBS {
+        let from = exe_dir.join(lib);
+        if !from.is_file() {
+            continue;
+        }
+        match std::fs::copy(&from, staging.join(lib)) {
+            Ok(_) => placed += 1,
+            Err(e) => tracing::warn!(
+                error = %e,
+                lib,
+                "could not place a runtime library beside the staged watcher"
+            ),
+        }
+    }
+    placed
+}
+
 /// Copy the running daemon EXE into the update staging directory
 /// (the installer's own directory) and return the path to launch the
 /// watcher from, plus whether it IS a staged copy. Fallback chain:
@@ -3069,6 +3131,9 @@ fn spawn_watcher(
 /// (pre-fix behaviour — a watcher RestartManager may kill beats no
 /// watcher at all).
 ///
+/// #4302 — in a staging dir of ours ([`may_stage_runtime_libs`]) the copy
+/// gets its runtime libraries beside it ([`stage_runtime_libs`]).
+///
 /// The name deliberately avoids the "install"/"setup"/"update"/
 /// "patch" substrings (Windows UAC's installer-detection heuristic
 /// auto-elevates EXEs matching them — the P4 lib-naming rule).
@@ -3077,6 +3142,19 @@ fn stage_watcher_exe(
     exe: &std::path::Path,
     installer_path: &std::path::Path,
 ) -> (std::path::PathBuf, bool) {
+    let with_libs = installer_path
+        .parent()
+        .is_some_and(|dir| may_stage_runtime_libs(dir, running_as_system()));
+    stage_watcher_exe_with(exe, installer_path, with_libs)
+}
+
+/// [`stage_watcher_exe`] with the runtime-library decision made by the caller.
+#[cfg(target_os = "windows")]
+fn stage_watcher_exe_with(
+    exe: &std::path::Path,
+    installer_path: &std::path::Path,
+    with_libs: bool,
+) -> (std::path::PathBuf, bool) {
     let Some(staging) = installer_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -3084,24 +3162,32 @@ fn stage_watcher_exe(
         return (exe.to_path_buf(), false);
     };
     let fixed = staging.join("roomlerd-watch.exe");
-    match std::fs::copy(exe, &fixed) {
-        Ok(_) => return (fixed, true),
+    let staged = match std::fs::copy(exe, &fixed) {
+        Ok(_) => Some(fixed),
         Err(e) => {
-            tracing::debug!(error = %e, dest = %fixed.display(), "watcher stage copy (fixed name) failed; trying pid-suffixed name")
+            tracing::debug!(error = %e, dest = %fixed.display(), "watcher stage copy (fixed name) failed; trying pid-suffixed name");
+            let suffixed = staging.join(format!("roomlerd-watch-{}.exe", std::process::id()));
+            match std::fs::copy(exe, &suffixed) {
+                Ok(_) => Some(suffixed),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "staging watcher copy failed; spawning watcher from the install-dir EXE \
+                         (RestartManager may shut it down mid-install)"
+                    );
+                    None
+                }
+            }
         }
+    };
+    let Some(copy) = staged else {
+        return (exe.to_path_buf(), false);
+    };
+    if with_libs {
+        let placed = stage_runtime_libs(exe, staging);
+        tracing::info!(placed, "runtime libraries placed beside the staged watcher");
     }
-    let suffixed = staging.join(format!("roomlerd-watch-{}.exe", std::process::id()));
-    match std::fs::copy(exe, &suffixed) {
-        Ok(_) => (suffixed, true),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "staging watcher copy failed; spawning watcher from the install-dir EXE \
-                 (RestartManager may shut it down mid-install)"
-            );
-            (exe.to_path_buf(), false)
-        }
-    }
+    (copy, true)
 }
 
 /// Resolve the effective update-check cadence for this run. Order:
@@ -7256,6 +7342,97 @@ mod tests {
         assert_eq!(fallback, fake_exe);
 
         let _ = std::fs::remove_dir_all(&staging);
+    }
+
+    /// #4302 — asked, the copy gets the runtime libraries that sit beside the
+    /// EXE; not asked, it is staged alone, as before.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn staged_watcher_gets_its_runtime_libraries_beside_it() {
+        let root = tempfile::tempdir().unwrap();
+        let install = root.path().join("install");
+        let staging = root.path().join("staging");
+        let bare = root.path().join("bare");
+        for dir in [&install, &staging, &bare] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let exe = install.join("roomlerd.exe");
+        std::fs::write(&exe, b"MZ-fake").unwrap();
+        for lib in WATCHER_RUNTIME_LIBS {
+            std::fs::write(install.join(lib), lib.as_bytes()).unwrap();
+        }
+
+        let (launch, staged) = stage_watcher_exe_with(&exe, &staging.join("pkg.msi"), true);
+        assert!(staged);
+        assert_eq!(launch, staging.join("roomlerd-watch.exe"));
+        for lib in WATCHER_RUNTIME_LIBS {
+            assert_eq!(
+                std::fs::read(staging.join(lib)).unwrap(),
+                lib.as_bytes(),
+                "{lib} is not beside the copy"
+            );
+        }
+
+        let (launch, staged) = stage_watcher_exe_with(&exe, &bare.join("pkg.msi"), false);
+        assert!(staged);
+        assert_eq!(launch, bare.join("roomlerd-watch.exe"));
+        for lib in WATCHER_RUNTIME_LIBS {
+            assert!(!bare.join(lib).exists(), "{lib} placed without being asked");
+        }
+    }
+
+    /// #4302 — the libraries go beside the copy only in a staging dir of ours,
+    /// made holding the SYSTEM token.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn runtime_libraries_only_in_a_staging_dir_of_ours() {
+        let ours = stage_dir().expect("stage_dir");
+        assert!(may_stage_runtime_libs(&ours, true));
+        assert!(!may_stage_runtime_libs(&ours, false), "not holding SYSTEM");
+        let other = std::env::temp_dir().join("rw-libs-not-ours");
+        assert!(!may_stage_runtime_libs(&other, true), "not a staging dir");
+        let _ = std::fs::remove_dir_all(&ours);
+    }
+
+    /// #4302 — the list is what both MSIs place beside the EXE. `wintun.dll` is
+    /// the one library left out: the overlay opens it when it starts, and the
+    /// watcher never starts the overlay. A library added to either MSI fails
+    /// here until it is placed on this list or left out by name.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn watcher_runtime_libraries_are_what_the_msis_ship() {
+        let mut ours = WATCHER_RUNTIME_LIBS.to_vec();
+        ours.sort_unstable();
+        for table in [
+            include_str!("../wix/main.wxs"),
+            include_str!("../wix-perMachine/main.wxs"),
+        ] {
+            let mut shipped: Vec<&str> = table
+                .split("Name='")
+                .skip(1)
+                .filter_map(|rest| rest.split('\'').next())
+                .filter(|name| name.ends_with(".dll") && *name != "wintun.dll")
+                .collect();
+            shipped.sort_unstable();
+            shipped.dedup();
+            assert_eq!(shipped, ours);
+        }
+    }
+
+    /// #4302 — the watcher gets a console of its own, with no window, and is no
+    /// process without a console.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn watcher_gets_a_console_of_its_own() {
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        };
+        let flags = watcher_creation_flags();
+        assert_eq!(flags & CREATE_NO_WINDOW, CREATE_NO_WINDOW);
+        assert_eq!(
+            flags & (DETACHED_PROCESS | CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP),
+            0
+        );
     }
 
     // ----- msiexec_argv (Plan rc.18 P1) -------------------------------

@@ -155,7 +155,7 @@ sequenceDiagram
 
 - **Only onto a proven binary.** The file the command was started as, read before
   the install replaces it, must answer `--version` as the release just installed
-  (`beside_daemon_after_install`, `agents/roomlerd/src/post_install.rs:1461`).
+  (`beside_daemon_after_install`, `agents/roomlerd/src/post_install.rs:1816`).
   Otherwise the service keeps its image: P2b's rule for the same question.
 - **The daemon's refusals stand** (FR-84 D3, `roomler restart`'s client,
   `agents/roomler-cli/src/localclient.rs:1651`): `local_restart_enabled = false`,
@@ -557,9 +557,9 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 
 | Host | Who moves the companion | When |
 |---|---|---|
-| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3650`) | after every check that installs nothing; at the start after an update (`:3524`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3592`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4344`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3453`, `package_needs_sync`) |
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3736`) | after every check that installs nothing; at the start after an update (`:3610`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3678`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4430`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3539`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in

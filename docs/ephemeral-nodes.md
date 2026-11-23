@@ -225,7 +225,7 @@ flowchart LR
   row ([above](#the-ci--container-recipe),
   [#4322](https://github.com/gjovanov/roomler-ai/issues/4322)). The
   auto-updater's own exit is the internal arm, which never unenrolls
-  ([`updater.rs:3385`](../agents/roomlerd/src/updater.rs#L3385)). A stop its
+  ([`updater.rs:3471`](../agents/roomlerd/src/updater.rs#L3471)). A stop its
   installer issues after that takes the OS-initiated arm, and the
   `update-attempt` marker written before the spawn is what keeps the row
   ([`updater.rs:2000`](../agents/roomlerd/src/updater.rs#L2000)).
