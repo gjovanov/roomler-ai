@@ -2582,6 +2582,23 @@ mod tests {
         assert_eq!(counters.take(None).unwrap().asks, KeyframeSplit::default());
     }
 
+    /// FR-148 P4b-4 (D59) — both pumps hand their encoder to the budget's
+    /// step, which reads the rule's rate from it at every frame past the
+    /// gate: the one call each pump had, edited in place.
+    #[test]
+    fn both_pumps_feed_the_rule_s_rate_at_each_frame() {
+        let src = peer_rs();
+        let call = "delivery.on_frame(&pc, &mut governor, encoder.as_ref()); // FR-148 D46, P4b-4";
+        for name in [
+            "async fn media_pump_vp9_444_dc(",
+            "async fn media_pump_ffmpeg_dc(",
+        ] {
+            let body = body_of(&src, name);
+            assert_eq!(body.matches(call).count(), 1, "{name}");
+            assert_eq!(body.matches("delivery.on_frame(").count(), 1, "{name}");
+        }
+    }
+
     /// FR-148 P4b-3 — in a live session the lane holds `video-bytes`' stash
     /// through the frame's send, as the send task's `if let` did (FR-65's
     /// `dc_lock`: the pump's own take of the stash waits out a frame's send),

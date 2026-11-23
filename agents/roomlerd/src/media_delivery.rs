@@ -1035,8 +1035,18 @@ impl DeliverySampler {
     /// `on`, on a constrained session, the step ran at [`Self::gate`], before
     /// the gate, and this reads nothing. FR-148 D48: beside the mark, the
     /// step's rate and SCTP's loss count go to the shadow model's window
-    /// rules ([`RateGovernor::note_path_rate`]).
-    pub fn on_frame(&mut self, pc: &RTCPeerConnection, governor: &mut RateGovernor) {
+    /// rules ([`RateGovernor::note_path_rate`]). FR-148 P4b-4 (D59): first,
+    /// whatever the pass, the session's key frame rule reads its rate, the
+    /// budget's last measured one or else `encoder`'s current target
+    /// (`media_deadline::Counters::note_rate`).
+    pub fn on_frame<E: crate::encode::thread::EncoderOps>(
+        &mut self,
+        pc: &RTCPeerConnection,
+        governor: &mut RateGovernor,
+        encoder: Option<&crate::encode::thread::EncoderHandle<E>>,
+    ) {
+        let target = encoder.map(|e| e.current_maxrate_bps());
+        self.deadline.note_rate(self.measured_rate_bps(), target);
         if self.pass.acts() {
             return;
         }
@@ -1298,6 +1308,14 @@ impl DeliverySampler {
     /// `shadow` and `on` (`media_deadline::Pump::start`).
     pub fn deadline(&self) -> &std::sync::Arc<crate::media_deadline::Counters> {
         &self.deadline
+    }
+
+    /// FR-148 P4b-4 (D59) — the in-flight budget's rate at its last step,
+    /// bit/s, when this association's own figures gave it; `None` while the
+    /// opening rate stands in, and with no budget.
+    pub fn measured_rate_bps(&self) -> Option<u64> {
+        let b = self.budget.as_deref()?.budget();
+        b.rate_bps().filter(|_| b.rate_measured())
     }
 
     /// FR-148 D46 B3 — [`Self::gate`] on one frame's reading, as
@@ -2334,6 +2352,60 @@ mod tests {
         );
     }
 
+    /// FR-148 P4b-4 (D59) — the rate the key frame rule reads at the pump's
+    /// step: the in-flight budget's, once this association's own figures gave
+    /// it; none while the opening rate stands in, and none with no budget, so
+    /// the encoder's target stands in (`media_deadline::kf_rate`). The step
+    /// reads it first, whatever the budget's pass.
+    #[test]
+    fn the_key_frame_rule_reads_the_budget_s_rate_once_measured() {
+        assert_eq!(
+            DeliverySampler::new(true).measured_rate_bps(),
+            None,
+            "no budget"
+        );
+        let mut s = DeliverySampler::new(true).with_budget();
+        assert_eq!(s.measured_rate_bps(), None, "before its first step");
+        let t0 = Instant::now();
+        let g = Gauges {
+            max_payload: 1_200,
+            cwnd: 1_048_576,
+            ssthresh: 1_048_576,
+            rwnd: 131_072,
+            inflight_bytes: 200_000,
+            pending_bytes: 16_384,
+            ack_delay: Some(Duration::from_millis(40)),
+            ack_delay_min: Some(Duration::from_millis(30)),
+            ..Gauges::default()
+        };
+        // 3 Mbit/s acknowledged, against a 2 Mbit/s opening.
+        let mut opening = 0;
+        for frame in 0..90_u64 {
+            let now = at(t0, frame * 1_000 / 30);
+            s.on_frame_reading(now, frame * 375_000 / 30, g, 2_000_000);
+            let b = s.budget.as_deref().expect("a budget").budget();
+            match b.rate_measured() {
+                true => assert_eq!(s.measured_rate_bps(), b.rate_bps(), "frame {frame}"),
+                false => {
+                    assert_eq!(s.measured_rate_bps(), None, "frame {frame}");
+                    opening += u32::from(b.rate_bps().is_some());
+                }
+            }
+        }
+        assert!(opening > 0, "the opening rate stood in first");
+        let rate = s.measured_rate_bps().expect("measured by 3 s");
+        assert!((2_800_000..=3_200_000).contains(&rate), "{rate}");
+        let src = include_str!("media_delivery.rs").replace("\r\n", "\n");
+        let head = "    pub fn on_frame<E: crate::encode::thread::EncoderOps>(";
+        let body = &src[src.find(head).expect("the step")..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let read = "let target = encoder.map(|e| e.current_maxrate_bps());";
+        let feed = "self.deadline.note_rate(self.measured_rate_bps(), target);";
+        let pass = body.find("if self.pass.acts() {").expect("the pass");
+        assert!(body.find(read).expect(read) < pass);
+        assert!(body.find(feed).expect(feed) < pass);
+    }
+
     /// FR-148 D46 B3 — `on` no longer runs as `shadow`: no warning where a
     /// pump reads the switch; the pump says once which mode acted on its
     /// session, and again when a change of transport changes it; `shadow`
@@ -3070,7 +3142,7 @@ mod tests {
         const PEER_RS: &str = include_str!("peer.rs");
         const GATE: &str =
             "if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {";
-        const STEP: &str = "delivery.on_frame(&pc, &mut governor);";
+        const STEP: &str = "delivery.on_frame(&pc, &mut governor, encoder.as_ref());";
         let src = PEER_RS.replace("\r\n", "\n");
         let pump = |head: &str| {
             assert_eq!(src.matches(head).count(), 1, "one {head:?} in peer.rs");
@@ -3185,7 +3257,7 @@ mod tests {
         );
         let passed = vp9.find("gate_clock.passed(").unwrap();
         let step = vp9
-            .find("delivery.on_frame(&pc, &mut governor);")
+            .find("delivery.on_frame(&pc, &mut governor, encoder.as_ref());")
             .expect("the step");
         assert!(
             at < passed && passed < step,
