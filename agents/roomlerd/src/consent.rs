@@ -72,17 +72,6 @@ pub const DEFAULT_PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// (sub-second) without burning CPU on a permanent poll loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// #3559 — ON PURPOSE, for one test run, and reverted by the next commit: the
-/// rule `CONSENT_BREAK` names is broken, to show the test that guards it fail.
-#[cfg(test)]
-fn broken(rule: &str) -> bool {
-    std::env::var("CONSENT_BREAK").is_ok_and(|v| v == rule)
-}
-#[cfg(not(test))]
-fn broken(_rule: &str) -> bool {
-    false
-}
-
 /// Outcome of a consent prompt. The agent sends `rc:consent
 /// { granted }` based on this; if Timeout fires, the agent sends
 /// `granted: false` (the safe-default closes the Hub's wait).
@@ -459,7 +448,7 @@ impl PendingGuard {
             Decision::Granted
         } else if answered(SentinelKind::Deny) {
             Decision::Denied
-        } else if !broken("ignore-timeout") && tokio::time::Instant::now() >= deadline {
+        } else if tokio::time::Instant::now() >= deadline {
             Decision::Timeout
         } else {
             return None;
@@ -554,12 +543,7 @@ impl ArmedPrompt {
         // was registered — a sentinel that exists now is an answer to this
         // prompt. Purging here again would eat one recorded between arming
         // and this first poll.
-        let window = if broken("early-timeout") {
-            timeout.saturating_sub(POLL_INTERVAL)
-        } else {
-            timeout
-        };
-        let deadline = tokio::time::Instant::now() + window; // the poll's clock (#3559)
+        let deadline = tokio::time::Instant::now() + timeout; // the poll's clock (#3559)
         let outcome = loop {
             if let Some(decided) = guard.look(deadline) {
                 break decided;
@@ -761,25 +745,19 @@ impl ConsentBroker {
         // Reject anything that doesn't look like a hex session id.
         // Stops a stray empty-string request from scanning the
         // entire sentinel dir.
-        let armed =
-            if (session_hex.is_empty() && !broken("empty-id-waits")) || session_hex.len() > 64 {
-                tracing::warn!(session = session_hex, "consent request with implausible id");
-                Err(Decision::Denied)
-            } else {
-                match mode {
-                    Mode::AutoGrant => Err(Decision::Granted),
-                    Mode::Prompt { timeout } => Ok(self.arm(session_hex, timeout)),
-                }
-            };
+        let armed = if session_hex.is_empty() || session_hex.len() > 64 {
+            tracing::warn!(session = session_hex, "consent request with implausible id");
+            Err(Decision::Denied)
+        } else {
+            match mode {
+                Mode::AutoGrant => Err(Decision::Granted),
+                Mode::Prompt { timeout } => Ok(self.arm(session_hex, timeout)),
+            }
+        };
         async move {
             match armed {
                 Ok(prompt) => prompt.run().await,
-                Err(immediate) => {
-                    if immediate == Decision::Granted && broken("slow-auto-grant") {
-                        tokio::time::sleep(POLL_INTERVAL).await;
-                    }
-                    immediate
-                }
+                Err(immediate) => immediate,
             }
         }
     }
