@@ -4331,6 +4331,10 @@ mod tests {
         /// call of that effect, and launchd loads their LaunchAgent from the
         /// plist in their home, where one is there.
         login_at: Option<(&'static str, usize, u32)>,
+        /// #4184 — the people whose `convert` and `put-back` are done as
+        /// `one_row_home` does them, on a home that also holds what this fake
+        /// does not: the config's `.prev`.
+        real: BTreeMap<u32, crate::one_row_home::ChildHome>,
     }
 
     fn one_row_daemon(kicks: u32) -> NodeStatus {
@@ -4391,7 +4395,17 @@ mod tests {
                 ps_fails: false,
                 stop_saves: HashMap::new(),
                 login_at: None,
+                real: BTreeMap::new(),
             }
+        }
+
+        /// #4184 — `uid`'s `convert` and `put-back` done by `one_row_home`
+        /// itself, each on their files as they are then.
+        fn with_real_child(mut self, uid: u32) -> Self {
+            let h = &self.homes[&uid];
+            let home = crate::one_row_home::ChildHome::with(h.config.as_ref(), h.plist.as_ref());
+            self.real.insert(uid, home);
+            self
         }
 
         /// A second person, ana (uid 502), whose enrollment the root holds.
@@ -4719,6 +4733,27 @@ mod tests {
                 Some(Script::Garbage) => return Ok(out(Some(0), b"not json".to_vec())),
                 Some(Script::NotRun) => bail!("spawning it failed (the test said so)"),
                 _ => {}
+            }
+            // #4184 — the verb as `one_row_home` does it, on the files as they
+            // are now; what it leaves is the person's files from then on.
+            if matches!(verb, Verb::Convert { .. } | Verb::PutBack)
+                && let Some(home) = self.real.get_mut(&account.uid)
+            {
+                let h = self.homes.get_mut(&account.uid).unwrap();
+                home.hold(h.config.as_ref(), h.plist.as_ref());
+                let done = home.answer(verb, account.uid, account.gid, stdin);
+                h.config = home.config();
+                h.plist = home.plist();
+                return Ok(match script {
+                    Some(Script::StoppedAfterActing) => out(None, Vec::new()),
+                    Some(Script::FailedAfterActing) => out(Some(1), Vec::new()),
+                    _ => ChildOutput {
+                        code: Some(done.exit.code()),
+                        stdout: done.stdout,
+                        stderr: done.stderr.into_bytes(),
+                        ..out(None, Vec::new())
+                    },
+                });
             }
             let mut reply = Reply {
                 v: crate::one_row_home::FORMAT,
@@ -7446,5 +7481,224 @@ mod tests {
             let why = program_refusal(stat);
             assert!(why.is_some(), "{case} is refused");
         }
+    }
+
+    /// #4184 — a conversion as the command drives it, casey's own process
+    /// doing `convert` and `put-back` as `one_row_home` does them: root's
+    /// records hold the outgoing config, and nothing in casey's folder does.
+    /// The new config is kept as its `.prev` too, so no load of casey's
+    /// config, with the file as it is, removed or unreadable, makes an
+    /// enrollment live again, and root's records stay as the conversion left
+    /// them. `--revert` gives the outgoing bytes back from those records.
+    #[tokio::test]
+    async fn after_a_conversion_roots_records_are_the_only_copy_of_the_enrollment() {
+        let mut mac = Fake::new(one_row_daemon).with_real_child(501);
+        let (_, homes_before) = mac.files();
+        let outgoing = homes_before[&501].config.clone().unwrap();
+        convert_now(&mut mac).await.unwrap();
+        let records = mac.root.clone();
+        let person_file = |part| records[&RootFile::Person { uid: 501, part }].clone();
+        assert_eq!(person_file(Part::Config), outgoing.0);
+        let record: PersonRecord = serde_json::from_slice(&person_file(Part::Record)).unwrap();
+        assert_eq!(record.config.sha256, Some(sha256_hex(&outgoing.0)));
+        let home = &mac.real[&501];
+        let now = home.config().expect("casey's new config");
+        assert_eq!(mac.homes[&501].config, Some(now.clone()));
+        assert_eq!(
+            home.prev(),
+            Some(now),
+            "the new config is kept as its `.prev` too"
+        );
+        assert_eq!(home.plist(), None);
+        let dir = tempfile::tempdir().unwrap();
+        crate::one_row_home::assert_no_load_brings_an_enrollment_back(&home.on_disk(dir.path()));
+        assert_eq!(mac.root, records, "root's records are unchanged");
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(mac.real[&501].config(), Some(outgoing));
+        assert_eq!(mac.homes[&501], homes_before[&501]);
+    }
+
+    /// #4184 — a conversion stopped at each of its steps, and at each step of
+    /// its undo that can fail, casey's own process doing `convert` and
+    /// `put-back` as `one_row_home` does them: casey is left a config that
+    /// loads. Where the undo puts their files back, the config and the plist
+    /// are as they were; where it leaves them converted, no load of the
+    /// config brings an enrollment back. A `.prev` their process cannot
+    /// replace stops their `convert` (exit 1) with the plist already gone,
+    /// and the undo puts both back.
+    #[tokio::test]
+    async fn a_conversion_stopped_at_any_step_leaves_the_person_a_config_that_loads() {
+        // The step, the daemon's answers, how the step fails, and whether
+        // casey stays converted after the undo.
+        type Case = (&'static str, fn(u32) -> NodeStatus, fn(&mut Fake), bool);
+        let cases: [Case; 17] = [
+            (
+                "root's kept copy",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 1)),
+                false,
+            ),
+            (
+                "root.json",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 2)),
+                false,
+            ),
+            (
+                "casey's kept config",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 3)),
+                false,
+            ),
+            (
+                "casey's kept plist",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 4)),
+                false,
+            ),
+            (
+                "casey's record.json",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 5)),
+                false,
+            ),
+            (
+                "the bootout",
+                one_row_daemon,
+                |m| m.fail = Some(("bootout", 1)),
+                false,
+            ),
+            (
+                "root's file",
+                one_row_daemon,
+                |m| m.fail = Some(("save_root", 1)),
+                false,
+            ),
+            (
+                "a convert that exits 1 before it acts",
+                one_row_daemon,
+                |m| {
+                    m.scripts.insert((501, "convert"), Script::Exit(1));
+                },
+                false,
+            ),
+            (
+                "a convert stopped after it acted",
+                one_row_daemon,
+                |m| {
+                    m.scripts
+                        .insert((501, "convert"), Script::StoppedAfterActing);
+                },
+                false,
+            ),
+            (
+                "a convert that exits 1 after it acted",
+                one_row_daemon,
+                |m| {
+                    m.scripts
+                        .insert((501, "convert"), Script::FailedAfterActing);
+                },
+                false,
+            ),
+            (
+                "a `.prev` casey's process cannot replace",
+                one_row_daemon,
+                |m| m.real.get_mut(&501).unwrap().prev_cannot_be_replaced(),
+                false,
+            ),
+            (
+                "casey's after.json",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 6)),
+                false,
+            ),
+            (
+                "the restart",
+                one_row_daemon,
+                |m| m.fail = Some(("kickstart", 1)),
+                false,
+            ),
+            ("the verify", no_grant_daemon, |_| {}, false),
+            // The undo's own steps.
+            (
+                "the undo's root file, before the restart",
+                one_row_daemon,
+                |m| {
+                    m.scripts
+                        .insert((501, "convert"), Script::FailedAfterActing);
+                    m.fail = Some(("write_root", 6));
+                },
+                false,
+            ),
+            (
+                "the undo's root file, after the restart",
+                no_grant_daemon,
+                |m| m.fail = Some(("write_root", 7)),
+                true,
+            ),
+            (
+                // Casey's agent is not loaded, so the undo starts none.
+                "the undo's put-back",
+                no_grant_daemon,
+                |m| {
+                    m.loaded.clear();
+                    m.scripts.insert((501, "put-back"), Script::Exit(1));
+                },
+                true,
+            ),
+        ];
+        for (step, daemon, stop, stays_converted) in cases {
+            let mut mac = Fake::new(daemon).with_real_child(501);
+            let before = mac.homes[&501].clone();
+            stop(&mut mac);
+            assert!(
+                convert_now(&mut mac).await.is_err(),
+                "{step}: {}",
+                mac.said()
+            );
+            let home = &mac.real[&501];
+            assert_eq!(home.config(), mac.homes[&501].config, "{step}");
+            let dir = tempfile::tempdir().unwrap();
+            let path = home.on_disk(dir.path());
+            let cfg = crate::config::load(&path).unwrap_or_else(|e| panic!("{step}: {e:#}"));
+            if stays_converted {
+                assert!(mac.homes[&501].plist.is_none(), "{step}");
+                assert!(
+                    !cfg.has_primary_enrollment() && cfg.orgs.is_empty(),
+                    "{step}"
+                );
+                crate::one_row_home::assert_no_load_brings_an_enrollment_back(&path);
+            } else {
+                assert_eq!(
+                    mac.homes[&501], before,
+                    "{step}: casey's files are as they were"
+                );
+                assert!(cfg.has_primary_enrollment(), "{step}");
+            }
+        }
+    }
+
+    /// #4184 — a `.prev` casey's process cannot replace: their `convert`
+    /// stops before the config (exit 1), its line in the output says what to
+    /// do, and the undo puts the config and the plist back and starts their
+    /// agent again.
+    #[tokio::test]
+    async fn a_prev_the_person_cannot_replace_stops_the_conversion_and_says_what_to_do() {
+        let mut mac = Fake::new(one_row_daemon).with_real_child(501);
+        let before = mac.files();
+        mac.real.get_mut(&501).unwrap().prev_cannot_be_replaced();
+        let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+        assert!(e.contains("the Mac is as it was"), "{e}");
+        let said = mac.said();
+        for want in [
+            "casey's one-row-home convert: pid 4242, uid 501, exit 1",
+            "config.toml.prev could not be replaced",
+            "then run `sudo roomlerd one-row` again",
+        ] {
+            assert!(said.contains(want), "{want:?} in {said}");
+        }
+        assert_eq!(calls_of(&mac, &["put-back"]), ["put-back 501"]);
+        assert_eq!(mac.files(), before);
+        assert!(mac.loaded.contains(&501));
     }
 }
