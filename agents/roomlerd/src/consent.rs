@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 /// Default operator-decision timeout when an operator-consent prompt
@@ -439,7 +439,7 @@ impl PendingGuard {
     /// so an Allow that passed `record_decision`'s check just before a cancel,
     /// or one the CLI's fallback wrote with no check at all, landed after it
     /// and was taken.
-    fn look(&self, deadline: Instant) -> Option<Decision> {
+    fn look(&self, deadline: tokio::time::Instant) -> Option<Decision> {
         let mut books = self.inner.pending.lock().unwrap();
         let answered = |kind| self.inner.answered(&books, &self.session_hex, kind);
         let decided = if !self.holds(&books) {
@@ -448,7 +448,7 @@ impl PendingGuard {
             Decision::Granted
         } else if answered(SentinelKind::Deny) {
             Decision::Denied
-        } else if Instant::now() >= deadline {
+        } else if tokio::time::Instant::now() >= deadline {
             Decision::Timeout
         } else {
             return None;
@@ -543,7 +543,7 @@ impl ArmedPrompt {
         // was registered — a sentinel that exists now is an answer to this
         // prompt. Purging here again would eat one recorded between arming
         // and this first poll.
-        let deadline = Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now() + timeout; // the poll's clock (#3559)
         let outcome = loop {
             if let Some(decided) = guard.look(deadline) {
                 break decided;
@@ -2096,7 +2096,7 @@ mod tests {
                 let broker = broker.clone();
                 std::thread::spawn(move || broker.arm(session, Duration::from_millis(300)))
             };
-            let waited = Instant::now();
+            let waited = std::time::Instant::now();
             while leftover.exists() && waited.elapsed() < Duration::from_secs(1) {
                 std::thread::sleep(Duration::from_millis(5));
             }
