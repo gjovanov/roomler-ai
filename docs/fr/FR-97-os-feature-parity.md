@@ -729,7 +729,7 @@ test of the SIGKILL property itself.
   answer with the window, as Linux's title convention does.
 - **P2d, the small ones.** *P2d-1, the lock hint (built):* the session dictionary's lock flag
   (`CGSessionCopyCurrentDictionary`), read as keep busy reads it (`keep_busy/host_mac.rs:187`), reaches the viewer at
-  two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1453-1519`): whether
+  two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1479-1545`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
   `signaling.rs:4515`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
@@ -1032,7 +1032,7 @@ test of the SIGKILL property itself.
   off master: its P2 (#3475, merged as `9da76c4e6`) shipped in agent 0.4.201, and 0.4.200 is the last release that
   carries P4c. The code is kept whole on `park/hive-fr90` at `7106d588d`; every anchor below is read there (at master
   `7106d588d`), and none of the files it names is on master. Master keeps two traces of P4c: `hive_adopt`, one of 23
-  retired config keys (`crates/agent-core/src/config.rs:4418`), and the hidden `roomler hive hook`
+  retired config keys (`crates/agent-core/src/config.rs:4431`), and the hidden `roomler hive hook`
   (`agents/roomler-cli/src/cli.rs:1063`; `docs/retired-names.md`, *Reserved after FR-90 was parked*), which exits 0.
   It answers the hook entries already written into Claude Code's settings, such as the bare `roomler.exe hive hook`
   that P4c wrote on Windows. As the parked head has it, the adopt socket is a named pipe,
