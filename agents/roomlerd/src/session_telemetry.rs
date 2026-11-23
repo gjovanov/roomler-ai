@@ -108,6 +108,14 @@ pub struct SessionCounters {
     /// no counter confirmed it).
     kf_asks: AtomicU32,
     kf_asks_gapped: AtomicU32,
+    /// FR-148 P4b-4 (D59) — N12's split of the same asks ([`KeyframeSplit`]):
+    /// by who asked, the refused ones by what refused them, and the owed asks
+    /// granted.
+    kf_asks_viewer: AtomicU32,
+    kf_asks_lane: AtomicU32,
+    kf_refused_gap: AtomicU32,
+    kf_refused_rule: AtomicU32,
+    kf_owed_granted: AtomicU32,
     /// When the last ask the gap let through arrived, as `kf_ask_epoch`
     /// micros plus one; 0 = none waiting. The pump takes it when the key frame
     /// that answers it is queued ([`Self::take_keyframe_ask`]).
@@ -158,6 +166,52 @@ pub struct MediaTally {
     /// Windows folded so far. The fold's fields are absent until one has, so a
     /// first frame noted before the first fold adds no zeros.
     pub folds: u32,
+}
+
+/// FR-148 P4b-4 (D59) — who asked a session's key frame gate
+/// (`media_deadline::KeyframeGate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyframeAsker {
+    /// The viewer's `rc:keyframe`.
+    Viewer,
+    /// The agent's lane (`media_deadline::Lane`): a frame D dropped, or a
+    /// switch waiting for its key frame.
+    Lane,
+}
+
+/// FR-148 P4b-4 (D59) — what refused a key frame ask: rc.130's 500 ms gap, or
+/// past it D55's cost rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyframeRefusal {
+    Gap,
+    Rule,
+}
+
+/// FR-148 P4b-4 (D59) — N12's split of a session's key frame asks: how many
+/// the viewer asked and how many the lane did, how many were refused by the
+/// 500 ms gap and how many by the rule, and how many owed asks were granted,
+/// at a frame once the gap opened or by a later ask that passed. The refusals
+/// and the owed grants are the rule's world: under `shadow`, `on`'s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyframeSplit {
+    pub viewer: u32,
+    pub lane: u32,
+    pub refused_gap: u32,
+    pub refused_rule: u32,
+    pub owed_granted: u32,
+}
+
+impl KeyframeSplit {
+    /// The counts since `base`, an earlier reading of the same session's.
+    pub fn since(self, base: Self) -> Self {
+        Self {
+            viewer: self.viewer.wrapping_sub(base.viewer),
+            lane: self.lane.wrapping_sub(base.lane),
+            refused_gap: self.refused_gap.wrapping_sub(base.refused_gap),
+            refused_rule: self.refused_rule.wrapping_sub(base.refused_rule),
+            owed_granted: self.owed_granted.wrapping_sub(base.owed_granted),
+        }
+    }
 }
 
 /// The clock the keyframe ask's arrival is kept in: microseconds since the
@@ -308,16 +362,60 @@ impl SessionCounters {
     pub fn note_keyframe_ask(&self, allowed: bool) {
         self.kf_asks.fetch_add(1, Ordering::Relaxed);
         if allowed {
-            let at = kf_ask_epoch()
-                .elapsed()
-                .as_micros()
-                .min(u64::MAX as u128 - 1) as u64;
-            // Keep the OLDEST unanswered ask: the wait is the viewer's.
-            let _ =
-                self.kf_ask_at
-                    .compare_exchange(0, at + 1, Ordering::Relaxed, Ordering::Relaxed);
+            self.start_keyframe_wait();
         } else {
             self.kf_asks_gapped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// FR-148 P4b-4 — an ask the key frame rule refused and owes, already
+    /// counted by [`Self::note_keyframe_ask`] as one not let through: its wait
+    /// starts, since a key frame answers it.
+    pub fn note_keyframe_owed(&self) {
+        self.start_keyframe_wait();
+    }
+
+    fn start_keyframe_wait(&self) {
+        let at = kf_ask_epoch()
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128 - 1) as u64;
+        // Keep the OLDEST unanswered ask: the wait is the viewer's.
+        let _ = self
+            .kf_ask_at
+            .compare_exchange(0, at + 1, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// FR-148 P4b-4 (D59) — one ask's split: who asked, and what refused it in
+    /// the rule's world (`None`: it passed there).
+    pub fn note_keyframe_split(&self, asker: KeyframeAsker, refused: Option<KeyframeRefusal>) {
+        let by = match asker {
+            KeyframeAsker::Viewer => &self.kf_asks_viewer,
+            KeyframeAsker::Lane => &self.kf_asks_lane,
+        };
+        by.fetch_add(1, Ordering::Relaxed);
+        let cause = match refused {
+            Some(KeyframeRefusal::Gap) => &self.kf_refused_gap,
+            Some(KeyframeRefusal::Rule) => &self.kf_refused_rule,
+            None => return,
+        };
+        cause.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// FR-148 P4b-4 (D59) — an owed ask granted, at a frame once the gap
+    /// opened or by a later ask that passed (under `shadow`, `on`'s).
+    pub fn note_keyframe_owed_grant(&self) {
+        self.kf_owed_granted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// FR-148 P4b-4 (D59) — N12's split so far.
+    pub fn keyframe_split(&self) -> KeyframeSplit {
+        KeyframeSplit {
+            viewer: self.kf_asks_viewer.load(Ordering::Relaxed),
+            lane: self.kf_asks_lane.load(Ordering::Relaxed),
+            refused_gap: self.kf_refused_gap.load(Ordering::Relaxed),
+            refused_rule: self.kf_refused_rule.load(Ordering::Relaxed),
+            owed_granted: self.kf_owed_granted.load(Ordering::Relaxed),
         }
     }
 
@@ -827,6 +925,63 @@ mod tests {
             counters(s).keyframe_asks(),
             (3, 1),
             "taking leaves the counts"
+        );
+        forget(s);
+    }
+
+    /// FR-148 P4b-4 (D59) — N12's split: the viewer's asks and the lane's
+    /// apart, the refusals by the gap and by the rule apart, the owed asks
+    /// granted; an owed ask's wait starts when it is refused, and today's two
+    /// counts are not touched by the split. A reading less an earlier one is
+    /// the counts between them.
+    #[test]
+    fn n12_splits_its_asks_by_asker_and_by_refusal() {
+        use KeyframeAsker::{Lane, Viewer};
+        use KeyframeRefusal::{Gap, Rule};
+        let s = ObjectId::new();
+        let c = counters(s);
+        for (asker, refused) in [
+            (Viewer, None),
+            (Lane, Some(Gap)),
+            (Lane, Some(Rule)),
+            (Lane, Some(Rule)),
+            (Viewer, Some(Gap)),
+        ] {
+            c.note_keyframe_split(asker, refused);
+        }
+        let base = c.keyframe_split();
+        assert_eq!(
+            base,
+            KeyframeSplit {
+                viewer: 2,
+                lane: 3,
+                refused_gap: 2,
+                refused_rule: 2,
+                owed_granted: 0,
+            }
+        );
+        assert_eq!(c.keyframe_asks(), (0, 0), "the split counts apart");
+        c.note_keyframe_owed_grant();
+        c.note_keyframe_split(Viewer, None);
+        assert_eq!(
+            c.keyframe_split().since(base),
+            KeyframeSplit {
+                viewer: 1,
+                owed_granted: 1,
+                ..KeyframeSplit::default()
+            }
+        );
+        assert_eq!(c.take_keyframe_ask(), None);
+        c.note_keyframe_ask(false);
+        c.note_keyframe_owed();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        c.note_keyframe_ask(true);
+        let waited = c.take_keyframe_ask().expect("the owed ask waits");
+        assert!(waited >= std::time::Duration::from_millis(5), "{waited:?}");
+        assert_eq!(
+            c.keyframe_asks(),
+            (2, 1),
+            "an owed ask is one not let through"
         );
         forget(s);
     }
