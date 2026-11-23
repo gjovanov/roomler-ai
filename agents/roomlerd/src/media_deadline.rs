@@ -2197,12 +2197,12 @@ mod tests {
         assert!(Session::of(id).is_none(), "found while its peer holds it");
     }
 
-    /// FR-148 P4b-4 (D55) — the rule's gap is `max(MIN_KF_GAP, kf_bytes /
-    /// (KF_SHARE × rate))`: 80 KB at 2 Mbit/s, 1.28 s; 20 KB at 16 Mbit/s,
-    /// 80 ms, so the 500 ms floor; no rate, or no key frame yet, 500 ms. At
-    /// the gate, under `on` on `video-deadline`, it runs from the last key
-    /// frame written: an ask a millisecond before it opens is refused, one
-    /// as it opens passes.
+    /// FR-148 P4b-4 (D55) — the rule's gap is `max(MIN_KF_GAP, 8 × kf_bytes /
+    /// (KF_SHARE × rate))`, bytes and bit/s: 80 KB at 2 Mbit/s, 1.28 s; 20 KB
+    /// at 16 Mbit/s, 40 ms, so the 500 ms floor; no rate, or no key frame yet,
+    /// 500 ms. At the gate, under `on` on `video-deadline`, it runs from the
+    /// last key frame written: an ask a millisecond before it opens is
+    /// refused, one as it opens passes.
     #[test]
     fn the_rule_s_gap_is_the_last_key_frame_at_a_quarter_of_the_rate() {
         assert_eq!(KF_SHARE, 0.25);
