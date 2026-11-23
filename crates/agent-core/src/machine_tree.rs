@@ -34,14 +34,14 @@
 //!   account other than an administrator a right to replace the machine
 //!   folder ([`REPLACE`]), and the folder and the config gave none a right to
 //!   add to or change them ([`PLANT`]), owners included ([`closed_as_found`]).
-//!   Outside a save R takes the folder only then; it seals a `.prev`, and
-//!   outside a save the keys, only when that entry was closed as found; and
-//!   while the folder holds a config it keeps such a replace right on the
-//!   parent, for the check to refuse. An elevated writer folds only into a
-//!   config that was the machine's as found ([`may_fold`]), and `roomlerd
-//!   re-enroll` and `roomlerd org` load only such a one. A device whose
-//!   config was not stays without SYSTEM mode until an elevated Setup or
-//!   `roomlerd enroll --machine-global` writes a fresh one.
+//!   Outside a save, while the folder holds a config or only its copy (#4176), R leaves
+//!   the tree as it found it unless that file, the folder and the keys were the
+//!   machine's as found, inherited entries counted, and a copy beside a config
+//!   inherited no right for another account to change it ([`holds_the_machines`]).
+//!   An elevated writer folds only into a config that was the machine's as found
+//!   ([`may_fold`]); `roomlerd re-enroll` and `roomlerd org` load only such a one.
+//!   A device whose config was not stays without SYSTEM mode until an elevated
+//!   Setup or `roomlerd enroll --machine-global` writes a fresh one.
 //! - **[`check`]** then judges the same chain: plain folders and files only,
 //!   each owned by SYSTEM or Administrators, none that another account may
 //!   change ([`verdict`]); `.prev` where it is loaded. The service host and
@@ -608,24 +608,24 @@ fn is_exactly(sd: &Sd, want: &[Ace]) -> bool {
 ///
 /// #3666 — what R seals, it reads as found first, because a seal makes the
 /// check pass on whatever the entry holds:
-/// - outside a save it takes the machine folder only when the config in it
-///   was the machine's as found ([`as_found`]);
+/// - outside a save, while the folder holds a config, or with none the copy
+///   a start restores it from (#4176), R leaves the tree as it found it
+///   unless that file, the folder and the keys were the machine's as found,
+///   inherited entries counted, and a copy beside a config inherited no right
+///   for another account to change it ([`holds_the_machines`]); when they
+///   were, R takes the folder for that file;
 /// - a `.prev`, and outside a save the keys folder and each key file, only
 ///   when that entry itself was closed as found;
-/// - while the folder holds a config and no save is writing, the parent's cut
-///   spares a right to replace the folder that an account other than an
-///   administrator holds (`Role::Parent`).
+/// - while the folder holds a config or a copy and no save is writing, the
+///   parent's cut spares a right to replace the folder that an account other
+///   than an administrator holds (`Role::Parent`).
 ///
-/// #4176 — while only a copy is there (the `.prev` a start restores a missing
-/// config from), R leaves the tree as it found it unless the copy, the folder
-/// and the keys were the machine's as found, inherited entries counted
-/// ([`holds_the_machines_copy`]), and the check that follows
-/// ([`read_machine_copy`]) then refuses the copy, at this tick and at every
-/// one after, until the tree is closed. When they were the machine's as
-/// found, R takes the folder for the copy, and the parent's cut spares a
-/// replace right as above.
-///
-/// What it leaves, it says once in `left`, and the check refuses.
+/// R repairs the attempt record whatever it leaves, and says once in `left`
+/// what it leaves and why (one line for a tree it leaves as found). What was
+/// not closed stays refused, at this tick and every one after, until an
+/// elevated save writes a closed tree: the config by the check, the copy of a
+/// missing config by [`read_machine_copy`], and a copy beside a config where
+/// it is read ([`read_checked`]).
 #[cfg(windows)]
 pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
     let mut out = Repairs::default();
@@ -640,14 +640,14 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
     // Read before anything changes. Any answer but "not there" counts as a
     // config: a wrong answer may only keep a right the check then refuses.
     let holds_a_config = there(&tree.config());
-    let holds_a_copy = !holds_a_config && there(&tree.prev());
-    if !writing && holds_a_copy && !holds_the_machines_copy(tree, &mut out) {
+    let holds_a_file = holds_a_config || there(&tree.prev());
+    if !writing && holds_a_file && !holds_the_machines(tree, holds_a_config, &mut out) {
         repair_path(&tree.record(), win::Kind::File, Role::Record, &mut out);
         return out;
     }
     match win::open(tree.folder(), win::Kind::Dir, false, true) {
         Ok(Some(folder)) => {
-            if writing || holds_a_copy || holds_the_machines_config(tree, &mut out) {
+            if writing || holds_a_file {
                 repair_path(&tree.config(), win::Kind::File, Role::Private, &mut out);
                 repair_path_if_closed(&tree.prev(), win::Kind::File, Role::Private, &mut out);
                 match win::open(&tree.keys(), win::Kind::Dir, false, true) {
@@ -678,55 +678,55 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
         Err(why) => out.left.push(why),
     }
     repair_path(&tree.record(), win::Kind::File, Role::Record, &mut out);
-    let spare = !writing && (holds_a_config || holds_a_copy);
+    let spare = !writing && holds_a_file;
     repair_entry(tree.parent(), &parent, Role::Parent { spare }, &mut out);
     out
 }
 
-/// #3666 — does the machine folder hold a config that was the machine's as
-/// found ([`as_found`]): the only folder R takes outside a save. Until it
-/// does, the folder is a waiting or attended host's, where the person's own
-/// daemon stages files, and R leaves it as `%ProgramData%` hands it down. A
-/// config another account could have put there, or chosen what it holds, does
-/// not make it the machine's: taken, the check would pass it.
+/// #3666, #4176 — outside a save, with a config (`config`) or only its copy in
+/// the machine folder: were that file, the folder, the keys and, beside a config,
+/// what its copy inherits the machine's AS FOUND ([`found_as_the_machines`],
+/// [`keys_as_found`], [`copy_inherits_as_found`])? Only then does R change the tree.
 #[cfg(windows)]
-fn holds_the_machines_config(tree: &MachineTree, out: &mut Repairs) -> bool {
-    match as_found(tree) {
-        Ok(()) => true,
-        Err(Refusal::Absent) => false,
-        Err(Refusal::NotPrivate(why)) => {
-            out.left.push(format!(
-                "{} is left as it is: the config it holds was not the machine's as found ({why})",
-                tree.folder().display()
-            ));
-            false
-        }
+fn holds_the_machines(tree: &MachineTree, config: bool, out: &mut Repairs) -> bool {
+    let file = if config { tree.config() } else { tree.prev() };
+    let what = if config {
+        "the config the folder holds, with the folder, its keys and any copy beside it"
+    } else {
+        "the copy of a missing config the folder holds, with the folder and its keys"
+    };
+    let mut found = found_as_the_machines(tree, &file).and_then(|()| keys_as_found(tree));
+    if config {
+        found = found.and_then(|()| copy_inherits_as_found(tree));
     }
-}
-
-/// #4176 — while the machine folder holds no config and holds a copy: were
-/// the copy, the folder and the keys the machine's AS FOUND, before anything
-/// in this tick changed them? The parent, the folder and the copy as
-/// [`found_as_the_machines`] reads them, and the keys folder and each key file
-/// the daemon loads closed to [`PLANT`] ([`keys_as_found`]), inherited entries
-/// counted in each. Only then does R change anything above or below the copy;
-/// otherwise it leaves the tree as it found it, says why once in `left`, and
-/// the check refuses the copy.
-#[cfg(windows)]
-fn holds_the_machines_copy(tree: &MachineTree, out: &mut Repairs) -> bool {
-    match found_as_the_machines(tree, &tree.prev()).and_then(|()| keys_as_found(tree)) {
+    match found {
         Ok(()) => true,
         Err(Refusal::Absent) => false,
         Err(Refusal::NotPrivate(why)) => {
             out.left.push(format!(
-                "{} and {} are left as they are: the copy of a missing config the folder holds, \
-                 with the folder and its keys, was not the machine's as found ({why})",
+                "{} and {} are left as they are: {what}, was not the machine's as found ({why})",
                 tree.parent().display(),
                 tree.folder().display()
             ));
             false
         }
     }
+}
+
+/// What a copy beside the config inherits, as found ([`closed_as_found`] over those entries;
+/// no DACL fails it); its owner and own entries are judged where it is read.
+#[cfg(windows)]
+fn copy_inherits_as_found(tree: &MachineTree) -> Result<(), Refusal> {
+    let (copy, what) = (tree.prev(), tree.prev().display().to_string());
+    let Some(entry) = open_entry(&copy, win::Kind::File, false)? else {
+        return Ok(());
+    };
+    let mut sd = security(&copy, &entry)?;
+    sd.owner = SYSTEM.to_string(); // its readers judge the owner
+    if let Some(aces) = &mut sd.dacl {
+        aces.retain(|a| a.flags & INHERITED != 0);
+    }
+    closed_as_found(&sd, PLANT, &what, win::is_administrator).map_err(Refusal::NotPrivate)
 }
 
 /// #4176 — the keys folder and each key file the daemon loads, as
@@ -1065,8 +1065,8 @@ fn check_config(tree: &MachineTree) -> Result<(), Refusal> {
 }
 
 /// #3666 — is the machine config under `tree` the machine's AS FOUND, before
-/// any repair ([`the_machines`]): what R asks before it takes the machine
-/// folder, what an elevated writer asks before it folds into the config
+/// any repair ([`the_machines`]): what R asks first, before it changes the tree
+/// ([`holds_the_machines`]), what an elevated writer asks before it folds into the config
 /// ([`may_fold`]), and what `roomlerd re-enroll` and `roomlerd org` ask before
 /// they load it. [`Refusal::Absent`] with no config; an entry that is a link,
 /// or one this process may not open or read, is [`Refusal::NotPrivate`].
