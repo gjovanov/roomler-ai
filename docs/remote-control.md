@@ -1121,7 +1121,7 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:14391`](../agents/roomlerd/src/peer.rs#L14391)) sends it
+The pump ([`peer.rs:14400`](../agents/roomlerd/src/peer.rs#L14400)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5768`](../agents/roomlerd/src/peer.rs#L5768); the viewer parses it
@@ -3872,8 +3872,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14646`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14624`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4688`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14655`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14655`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14633`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4688`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14664`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:110`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:691`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:351`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:942`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:481`, #2326) |
@@ -3994,7 +3994,7 @@ sequenceDiagram
 |---|---|---|
 | the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2634`; sent by `reportDecodeError` (`:7860`) from all three worker handlers |
 | the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2608`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10823` |
-| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11368`; `viewer_decode_error`, `peer.rs:10798` |
+| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11377`; `viewer_decode_error`, `peer.rs:10798` |
 | the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:505` |
 | the early samples | the first `de` and each of the first eight errors send one `rc:session.stats` at once, by the carrier's road (§11.9): a session someone leaves right after a black screen still records its count, and a short clean one its zero | the FR-102 P9d channel, `peer.rs` `attach_control_handler` |
 | the wire | `decode_errors: Option<u32>` on `rc:session.stats`, absent unless counted; an older server ignores it | `crates/remote_control/src/signaling.rs:764` |
@@ -4634,7 +4634,7 @@ and the worker keeps the peer (§11.16.1).
 | ⚠️ The consent prompt keeps the connection's own sender: `await_prompt_or_socket_end` reads its close to withdraw a prompt (#2416) | `agents/roomlerd/src/signaling.rs:413` |
 | The person at the device ends a kept session at once: it stops serving, says `rc:ended {reason}` on its control channel, closes after the grace, and its `rc:terminate` goes out on the current connection, or on the next one, after its hello. A pump with no encoder asks through the same channel, and a kept one's end is `no_video` too, never the person's `host_disconnect` (P2a-2, L10). The end is logged once, before it, as on every road (#4010) | `end_kept_by_device`, `agents/roomlerd/src/session_table.rs:1794`; `end_in_gap`, `agents/roomlerd/src/signaling.rs:7650`; `log_device_end`, `:7600`; `no_video`, `agents/roomlerd/src/session_table.rs:1443` |
 | The server's end of a session the table holds, attached or kept (a kick, the maximum length, a refused claim): control stops at once, `rc:ended {reason, limit}` goes on its control channel, and the peer closes after the grace, on a task of its own. Its viewer may not have rejoined since a resume, and to a viewer a bare close reads as a drop, which it redials: on an owner's or an auto-consent device that undid the kick. The viewer reads `rc:ended` as it reads `rc:terminate`, and the first of the two wins (§11.17). Off, or with no window open on this connection, the switch on included, the end closes the peer at once and says nothing, as before (P2a-2, C1; P4-0). A session kept under an earlier connection's window is no exception: with no window its claim is refused `agent_disconnect` at the hello, which its viewer redials after anyway. A GUI worker's delegated table always says it, since it holds only what the daemon offered `keepable` under its window | `close_terminated`, `agents/roomlerd/src/session_table.rs:1469`; its call in the `Terminate` arm, `agents/roomlerd/src/signaling.rs:5049`; `p4_0_a_kept_sessions_end_on_a_connection_with_no_window_closes_at_once`, `agents/roomlerd/src/session_table.rs:4673` |
-| A dead peer, `Failed` or `Closed`, is never kept and never resumed. Its state handler says `Terminate` once, on `Failed`, and the watchdog stops watching there, so one that died while its socket was dying told only that socket. A transient exit closes it and says its end, `error`, on the next connection; a claim answered after it died is refused the same way (P2a-2, M1) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622`; `resume`, `:1566`; `AgentPeer::is_dead`, `agents/roomlerd/src/peer.rs:14184` |
+| A dead peer, `Failed` or `Closed`, is never kept and never resumed. Its state handler says `Terminate` once, on `Failed`, and the watchdog stops watching there, so one that died while its socket was dying told only that socket. A transient exit closes it and says its end, `error`, on the next connection; a claim answered after it died is refused the same way (P2a-2, M1) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622`; `resume`, `:1566`; `AgentPeer::is_dead`, `agents/roomlerd/src/peer.rs:14193` |
 | A connection that ends before its server announced a window (the window comes after the hello) closes what it built, as before. What the last connection kept keeps its own deadline, and the next hello claims it (P2a-2, M3) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622` |
 | What the server must hear is never lost to a full queue: an end at the device, a kept session's own end and reports, the answer to a claim the device can no longer honour, a request refused as busy. It waits, in order, for room on this connection's queue, and the loop's table arm sends it the moment there is room; with no connection, the next one's hello is followed by it. Nothing waits on it (P2a-2, L7) | `queue_end`, `agents/roomlerd/src/session_table.rs:1832`; `next_event`, `:1876` |
 | Kept sessions count against `rc_max_sessions`: a request that would put one beside a kept peer past it is refused as busy (`rc:terminate agent_hangup`), and the table never keeps more than the capacity | `full_beside_kept`, `agents/roomlerd/src/session_table.rs:1539` |
@@ -5378,11 +5378,11 @@ features, `agents/roomlerd/src/media_deadline.rs`, which the two send tasks only
 
 | Piece | Rule | Where |
 |---|---|---|
-| the arm | `video-deadline` has an arm of its own in the data-channel match, by equality like every arm there (`video-bytes`' is `:1368`). It stashes the channel in the session's `media_deadline::Session`, which `AgentPeer::new` registers (`:1195`) and both pumps find by session, and logs `video-deadline DC stashed (FR-148 P4b-3)` with the channel's `ordered`, `max_retransmits` and `stream_id` | `agents/roomlerd/src/peer.rs:1411`; `Session`, `agents/roomlerd/src/media_deadline.rs:580` |
+| the arm | `video-deadline` has an arm of its own in the data-channel match, by equality like every arm there (`video-bytes`' is `:1368`). It stashes the channel in the session's `media_deadline::Session`, which `AgentPeer::new` registers (`:1195`) and both pumps find by session, and logs `video-deadline DC stashed (FR-148 P4b-3)` with the channel's `ordered`, `max_retransmits` and `stream_id` | `agents/roomlerd/src/peer.rs:1411`; `Session`, `agents/roomlerd/src/media_deadline.rs:611` |
 | the class | the carrier of the selected pair, one of seven (below) | `class_of`, `media_deadline.rs:192`; `class_now`, `:232` |
 | the pick | `video-deadline` when the class is TCP somewhere (`turn_tcp`, `turn_tls`, `mesh_relay`) and the session has one open; `video-bytes` otherwise, and whenever the class is `unknown` | `pick`, `media_deadline.rs:223`; `CarrierClass::is_tcp`, `:169` |
-| when the class is read | at the pump's start, once `detect_constrained_transport` returned, and again at each 5 s transport re-check (`TRANSPORT_RECHECK_INTERVAL`, `peer.rs:2120`), under every override. Never from `detect_constrained_transport`'s 3 s default: with no pair selected the class is `unknown`, so the session starts on `video-bytes` and the next re-check picks again. A change writes `video channel: carrier class (FR-148 P4b-3)` with `from` and `to` | `Pump::start`, `media_deadline.rs:769`; `Pump::read`, `:794`; the VP9-444 pump, `peer.rs:4090` and `:4421`; the FFmpeg pump, `:6660` and `:7755` |
-| the lane | each send task routes every frame through its lane once, before the frame's first write: the channel and the `frame_seq`, or nothing. The lane holds `video-bytes`' stash through the frame's chunked send, as the send task's `if let` did, so the FFmpeg pump's `dc_lock` (FR-65) still waits out a frame's send | `Lane::route`, `media_deadline.rs:1002`; the VP9-444 send task, `peer.rs:4338`; the FFmpeg one, `:7373` |
+| when the class is read | at the pump's start, once `detect_constrained_transport` returned, and again at each 5 s transport re-check (`TRANSPORT_RECHECK_INTERVAL`, `peer.rs:2120`), under every override. Never from `detect_constrained_transport`'s 3 s default: with no pair selected the class is `unknown`, so the session starts on `video-bytes` and the next re-check picks again. A change writes `video channel: carrier class (FR-148 P4b-3)` with `from` and `to` | `Pump::start`, `media_deadline.rs:800`; `Pump::read`, `:825`; the VP9-444 pump, `peer.rs:4090` and `:4421`; the FFmpeg pump, `:6660` and `:7755` |
+| the lane | each send task routes every frame through its lane once, before the frame's first write: the channel and the `frame_seq`, or nothing. The lane holds `video-bytes`' stash through the frame's chunked send, as the send task's `if let` did, so the FFmpeg pump's `dc_lock` (FR-65) still waits out a frame's send | `Lane::route`, `media_deadline.rs:1034`; the VP9-444 send task, `peer.rs:4338`; the FFmpeg one, `:7373` |
 
 **The classes.** The pair, what carries the agent's own relay and whether the pair rides the mesh are
 the carrier line's own reads (§11.9): `session_carrier::nominated_pair`
@@ -5417,8 +5417,8 @@ stateDiagram-v2
 
 | Rule | What the lane does |
 |---|---|
-| the drain rule | once the pick says switch, nothing more is written on the old channel. Every frame that arrives, a key frame too, is dropped whole while the old channel's buffered amount is above 0, that is until each of its chunks was acknowledged, or abandoned and forwarded (P4b-1). Then a key frame is asked through the session's gate, asked again at each frame until an ask passes (or, toward `video-deadline`, until the key frame rule owes it: P4b-4), and the frames before the key frame are dropped. The wait has no time bound: the switch line says how long it held the video |
-| one `frame_seq` space | a frame written, a frame a switch dropped and a frame D dropped each take the next number, so the viewer reads every drop as a gap and the numbers it receives never repeat (`Lane::write`, `media_deadline.rs:1047`; `drop_switching`, `:1286`; `drop_late`, `:1296`) |
+| the drain rule | once the pick says switch, nothing more is written on the old channel. Every frame that arrives, a key frame too, is dropped whole while the old channel's buffered amount is above 0, that is until each of its chunks was acknowledged, or abandoned and forwarded (P4b-1). Then a key frame is asked through the session's gate, asked again at each frame until an ask passes the gate's 500 ms gap, toward either channel (a switch's own key frame is not recovery, so the key frame rule never spaces it: P4b-4b), and the frames before the key frame are dropped. The wait has no time bound: the switch line says how long it held the video |
+| one `frame_seq` space | a frame written, a frame a switch dropped and a frame D dropped each take the next number, so the viewer reads every drop as a gap and the numbers it receives never repeat (`Lane::write`, `media_deadline.rs:1079`; `drop_switching`, `:1322`; `drop_late`, `:1332`) |
 | the first pick | at the pump's first frame: no old channel, so no drain and no wait |
 | a channel that closes | the drain of a closed channel is over at once. A switch whose `video-deadline` closed while it waited ends on `video-bytes` at the key frame, and a session on `video-deadline` whose channel closed is picked back onto `video-bytes` |
 | an unframed session | never leaves `video-bytes`: an unframed stream on an unordered channel cannot be put back together |
@@ -5428,33 +5428,36 @@ deadline-limited (`RTCSctpTransport::mark_deadline_stream`,
 `crates/vendored/webrtc/src/sctp_transport/mod.rs:493`, FR-148 P4b-1): once per stream, when the pick
 says switch, before the drain. A refused mark (no association, its slot held, no such stream) switches
 nothing: the session stays on `video-bytes`, one WARN line says so, and the mark is tried again at the
-next key frame (`Lane::mark`, `media_deadline.rs:1260`). `off` and `shadow` never mark.
+next key frame (`Lane::mark`, `media_deadline.rs:1296`). `off` and `shadow` never mark.
 
 **D.** Under `on`, on `video-deadline` only, a frame older than 300 ms at its first write, counted
 from its hand-off to the send task, is dropped whole, and a key frame is asked through the session's
 gate ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)).
 
-**The key frame gate is the session's** (`KeyframeGate`, `media_deadline.rs:425`). The viewer's
+**The key frame gate is the session's** (`KeyframeGate`, `media_deadline.rs:449`). The viewer's
 `rc:keyframe` used to keep its 500 ms gap in the control channel's handler. The gap moved into the gate
 (`MIN_KF_GAP`, `:249`), which `AgentPeer::new` hands that handler, whose `rc:keyframe` arm asks
-through it (`peer.rs:11364`), as the send tasks do. So at most one forced key frame passes per 500 ms,
+through it (`peer.rs:11373`), as the send tasks do. So at most one forced key frame passes per 500 ms,
 whoever asks. The gate counts every ask in the session's telemetry, the viewer's and the send tasks'
 alike (`kf_asks`, `kf_asks_gapped` and `kf_ask_to_queued_ms`, FR-135 R0's N12, §11.13), so under `on`
 those fields also count the asks of a switch and of D.
 
-**From P4b-4 the gate spaces forced key frames by their cost** under `on`, while the lane is on
-`video-deadline` or switching to it: an ask passes once `max(500 ms, kf_bytes / (0.25 × rate))` has
-passed since the later of the last key frame written and the gate's last grant, with `kf_bytes` the size
-of the last key frame the send task wrote and `rate` the in-flight budget's measured rate, or else the
-encoder's target. A refused ask is owed, never forgotten: the first frame the lane is handed after the
-gap opens grants it, and a key frame written first answers it
+**From P4b-4 the gate spaces recovery key frames by their cost** under `on`, while the lane is on
+`video-deadline` or switching to it: D's ask or the viewer's passes once
+`max(500 ms, 8 × kf_bytes / (0.25 × rate))` has passed since the later of the last key frame written and
+the gate's last grant, with `kf_bytes` the size in bytes of the last key frame the send task wrote and
+`rate`, in bit/s, the in-flight budget's measured rate, or else the encoder's target. A refused recovery
+ask is owed, never forgotten: the first frame the lane is handed after the gap opens grants it, and a key
+frame written first answers it
 ([rate-control.md](rate-control.md#the-key-frame-rule-fr-148-p4b-4--recovery-costs-at-most-a-quarter-of-the-path)).
-So a switch waiting for its key frame asks once and waits for the grant, and a run of D's drops forces
-one key frame per gap. Everywhere else the 500 ms gap holds, grant for grant. N12 also tells the asker
-apart: the viewer's asks and the lane's, and refusals by the 500 ms gap and by the rule, on the
-`path delivery` line under `shadow` and `on` (`kf_asks_viewer` … `kf_owed_granted`), with the rule's
-gap at the line (`kf_gap_ms`). Under `shadow` they count the viewer's asks alone, since the shadow lane
-asks nothing.
+So a run of D's drops forces one key frame per gap. A switch's own asks are not recovery (P4b-4b): they
+get the 500 ms gap toward either channel, and a refused one is forgotten, so a switch waiting for its key
+frame asks at each frame until an ask passes; the key frame it writes restarts the rule's clock and
+answers an owed ask like any other. Everywhere else the 500 ms gap holds, grant for grant. N12 also
+tells the asker apart: the viewer's asks and the lane's, and refusals by the 500 ms gap and by the rule,
+on the `path delivery` line under `shadow` and `on` (`kf_asks_viewer` … `kf_owed_granted`), with the
+rule's gap at the line (`kf_gap_ms`). Under `shadow` they count the viewer's asks alone, since the
+shadow lane asks nothing.
 
 **The switch's values.** `ROOMLERD_VIDEO_DEADLINE`, or the local config key `video_deadline`, read once
 per pump ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)):
@@ -6538,12 +6541,12 @@ to-activate, so the browser never sees a bait-and-switch.
   A folder whose path alone leaves a page no room is refused, named by its
   last part, shortened to fit if need be (`refusal`, `dir_pages.rs:148`).
   The listing's task sends the frames in order (`send_listing_frames`,
-  [`peer.rs:13554`](../agents/roomlerd/src/peer.rs#L13554)), each waiting
+  [`peer.rs:13563`](../agents/roomlerd/src/peer.rs#L13563)), each waiting
   while the channel holds more than the download pumps' 4 MiB high-water
   mark, and stops at the channel's end, the session's, or the first send
   that fails. A send that fails is a WARN, `files: answer not sent`, with
   the frame's kind, size, id and error, never an entry's name
-  (`send_files_frame`, `peer.rs:14007`); `files: dir listed` gains
+  (`send_files_frame`, `peer.rs:14016`); `files: dir listed` gains
   `capped`, `bytes` and `pages`. The viewer
   ([`remoteDirListing.ts`](../ui/src/composables/remoteDirListing.ts),
   moved out of `useRemoteControl.ts` by #4121) asks with `paged: true`,
@@ -6594,14 +6597,14 @@ to-activate, so the browser never sees a bait-and-switch.
   upload left open before the refused one, which a viewer's Cancel leaves
   open on the device. The end of an upload whose begin the channel refused
   gets no answer either (`refused_at_begin`, `files.rs:3264`, asked in the
-  End arm at `agents/roomlerd/src/peer.rs:13312`). The channel remembers its
+  End arm at `agents/roomlerd/src/peer.rs:13321`). The channel remembers its
   last 64 refused ids, the oldest forgotten first, and only ids that are one
   plain name. A begin with a refused id is a retry and runs as a fresh
   begin, and once accepted its id is off the list. A resume, whatever its
   answer, ends the dropping, and an accepted one takes its id off the list. A
   chunk or an end for an upload never begun is answered as before, and so is
   everything on the declined (#3757) and FILES-denied channels. Tests:
-  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17669`), over
+  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17678`), over
   a real channel through the production router, and
   `files::refused_begin_tests` (`files.rs:14080`).
   **A refused folder is said, not hidden** (#2930). The agent falls back to
@@ -6772,7 +6775,7 @@ The same chip and picker on an X11 desktop, through the same two messages. On
 Linux `input::layout` *is* `input::layout_x11`
 (`agents/roomlerd/src/input/mod.rs:158`), so the peer's emitter
 (`agents/roomlerd/src/peer.rs:1598`) and its `rc:layout.set` arm
-(`agents/roomlerd/src/peer.rs:11432`) serve both platforms.
+(`agents/roomlerd/src/peer.rs:11441`) serve both platforms.
 
 ```mermaid
 sequenceDiagram
