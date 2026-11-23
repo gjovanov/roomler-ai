@@ -2639,14 +2639,14 @@ async fn post_install_watch_cmd(
 /// `ROOMLERD_ENCODER` → config file field → default (Auto).
 /// Invalid values fall through to Auto with a warning, so a typo can't
 /// prevent the agent from starting.
-fn rollback_attention_msg(
+pub(crate) fn rollback_attention_msg(
     current: &str,
     target: &str,
     crash_count: u32,
     failure_reason: Option<&str>,
 ) -> String {
     let mut msg = format!(
-        "Roomler agent: crash loop detected (auto-rollback failed).\n\n\
+        "roomlerd: crash loop detected (auto-rollback failed).\n\n\
          Version {current} has crashed {crash_count} times within \
          {win_min} min. Last known good version: {target}.\n",
         win_min = config::CRASH_WINDOW_SECS / 60,
@@ -2667,9 +2667,9 @@ fn rollback_attention_msg(
 /// and running the older installer over this version is the one thing it refuses.
 /// The way back it gives is measured: an uninstall keeps the config and the
 /// enrollment, and with updates left on the older version took this one back in 25 s.
-fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
+pub(crate) fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
     format!(
-        "Roomler agent: crash loop detected.\n\n\
+        "roomlerd: crash loop detected.\n\n\
          Version {current} has crashed {crash_count} times within {win_min} min. \
          Last known good version: {target}.\n\n\
          This device did not roll back: the Windows installer refuses to install an \

@@ -406,7 +406,7 @@
     }
     const custom = document.createElement('option');
     custom.value = CUSTOM;
-    custom.textContent = 'Other device (enter agent id)…';
+    custom.textContent = 'Other device (enter device id)…';
     opts.push(custom);
     sel.replaceChildren(...opts);
     // Keep the operator's selection stable across the 2 s repaint.
@@ -497,7 +497,7 @@
 
       const node = selectedNode();
       if (!node) {
-        errSlot.textContent = 'Pick a target device (or enter its agent id).';
+        errSlot.textContent = 'Pick a target device (or enter its device id).';
         show(errSlot);
         return;
       }
