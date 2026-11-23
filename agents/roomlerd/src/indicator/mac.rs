@@ -552,12 +552,12 @@ fn should_terminate() -> NSApplicationTerminateReply {
                 sender = %sender_text,
                 "terminating the way AppKit does: exit 0, which launchd does not relaunch (#3164)"
             );
-            // #4119 — this exit 0 is ours (a log-out's quit from loginwindow,
-            // a quit under no supervisor): the exit net leaves it alone.
+            // #4119, #4292 — this exit 0 is ours (a log-out's quit from loginwindow,
+            // a quit under no supervisor): left to AppKit, and its run marked clean.
             exit_net::exit_chosen();
-            // AppKit exits as soon as this returns; the log's file layer
-            // writes from its own thread, so give it a moment to keep this
-            // line (a log-out's quit is diagnosed from it).
+            crate::run_end::mark_quit_by_macos();
+            // AppKit exits as soon as this returns; the file log writes from its
+            // own thread, so a moment keeps these lines (a log-out is read from them).
             std::thread::sleep(std::time::Duration::from_millis(150));
             NSApplicationTerminateReply::TerminateNow
         }

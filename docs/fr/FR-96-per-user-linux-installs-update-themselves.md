@@ -77,9 +77,9 @@ sequenceDiagram
 | piece | reused or new | where |
 |---|---|---|
 | the release check, with no config (the feed is `ROOMLERD_UPDATE_URL`, else the proxy) | reused | `check_once`, `updater.rs:1861-1945`; `DEFAULT_PROXY_URL` `:37` |
-| download and verify: size floor, digest, the pinned release key | reused | `download_asset` `:1408-1572`, PGP `:1498-1533` |
+| download and verify: size floor, digest, the pinned release key | reused | `download_asset` `:1410-1574`, PGP `:1500-1535` |
 | the install-storm cooldown (root's own marker) | reused | `recent_update_attempt` / `record_update_attempt` `:242-279`, `STARTUP_UPDATE_COOLDOWN` `:71` |
-| the install, as root | reused | `linux_install_candidates(0, …)` `:2367-2382`; `install_tarball_linux(0, …)` `:2419-2542` |
+| the install, as root | reused | `linux_install_candidates(0, …)` `:2412-2427`; `install_tarball_linux(0, …)` `:2464-2587` |
 | the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT_MARKERS` `:3884-3887` (shared by macOS and Linux) |
 | the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3540`, `LINUX_UPDATE_TRIGGER` `:3545`, `queue_update_check` / `queue_update_check_at` `:3760-3779` (was `macos_queue_update_check`) |
 | `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`app.rs:2034-2051`) |

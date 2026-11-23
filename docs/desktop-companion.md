@@ -3422,9 +3422,9 @@ flowchart TD
 | Piece | Where | What |
 |---|---|---|
 | the decision | `peer_may_decide_for_the_screen`, `crates/localapi/src/lib.rs:2766` | pure: the peer, the console session, the daemon's own session and uid. SYSTEM is named by its SID, because `ClientPeer::is_root` reads a uid, which a pipe client never has |
-| the daemon's own session | `own_session_id`, `:2735` | `ProcessIdToSessionId` of this process; `None` off Windows |
-| the dispatch | `:4251` (consent), `:4260` (Disconnect) | after the person socket's seat check (`:4234`), on every scope but the person socket's, so a new scope starts refused |
-| the refusals | `not_the_screens_person`, `:3964` | "The answer was not taken: …" and "The session was not ended: …", which the tray and the CLI show as they arrive |
+| the daemon's own session | `own_session_id`, `:2783` | `ProcessIdToSessionId` of this process; `None` off Windows |
+| the dispatch | `:4330` (consent), `:4339` (Disconnect) | after the person socket's seat check (`:4313`), on every scope but the person socket's, so a new scope starts refused |
+| the refusals | `not_the_screens_person`, `:4032` | "The answer was not taken: …" and "The session was not ended: …", which the tray and the CLI show as they arrive |
 
 Who calls them, and how each is read:
 
@@ -3454,9 +3454,9 @@ is. Each gate's other conditions are as they were:
 | Gate | Where | Taken on Windows | Also, as before |
 |---|---|---|---|
 | the external-access password's set and clear (`is_console_user`) | `peer_is_console_user`, `crates/localapi/src/lib.rs:2664`; the dispatch `:4344` | a peer in the screen's session | Unix: the daemon's own uid, or root |
-| a console person's key | `peer_may_set_console_key`, `:2659`; the dispatch `:4206` | the same | the person socket: its person, and the seat asked again (§12.3) |
-| the recording verbs: start, stop, delete | `peer_may_record`, `:2593`; the dispatch `:4308` | the same | the person socket: its person |
-| keep busy on | `peer_may_start_keep_busy`, `:2560`; the dispatch `:4304` | a peer in the screen's session whose token reads as a person's account | never root, SYSTEM, LocalService, NetworkService or an account that could not be read; stopping is open to every peer |
+| a console person's key | `peer_may_set_console_key`, `:2707`; the dispatch `:4285` | the same | the person socket: its person, and the seat asked again (§12.3) |
+| the recording verbs: start, stop, delete | `peer_may_record`, `:2641`; the dispatch `:4387` | the same | the person socket: its person |
+| keep busy on | `peer_may_start_keep_busy`, `:2608`; the dispatch `:4383` | a peer in the screen's session whose token reads as a person's account | never root, SYSTEM, LocalService, NetworkService or an account that could not be read; stopping is open to every peer |
 
 | The daemon serving the pipe | Who passes these gates on Windows |
 |---|---|

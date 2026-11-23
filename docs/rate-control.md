@@ -1765,12 +1765,76 @@ hold that case.
 | `shaped_link::tcp_shape::a_still_screen_on_the_{deep,shallow}_queue_reads_no_queue` | the still screens above: at least two samples in their 10 s, none that counts, a delay from some SACK, and no sample queued. The precondition was four samples, and the first runs took five. Under D44 it moved to two: a still screen's 200 bytes a second never pass `counts`' byte bound, so two samples show the guard holds. Three runs of each, alone on a Windows box, after the change: five samples in every run, 200 to 600 bytes each |
 | `shaped_link::tcp_shape::stalls_2_mbps_path_i_lift_the_floor_over_the_link`, `stalls_under_the_pump_skip_2_mbps_path_i_lift_the_floor_over_the_link` | ignored, a measurement (D44): head-of-line stalls of 0.8 s every 3.3 s on the deep lossless link at 2 Mbit/s, path I. The viewer window after a stall carries the stall's bytes too, and `Pipe`'s floor takes every window, so the floor ends over 1.3 times the link's 1,954 kbit/s of payload. The cells pin that defect, so as gates they would protect nothing in the product. Three runs of each with `--ignored`, alone on a Windows box: 1.50 to 1.55 times the link under a writer that offers 80 % of it, and 1.77 to 1.78 times under the pump's skip at 150 %, which is 1.15 to 1.20 and 1.36 to 1.37 times the 1.3 they assert |
 | `shaped_link::tcp_shape::stalls_2_mbps_path_c_lift_the_floor_over_the_link` | ignored, red: path C's window caps what the link carries in a stall, at 1.27 to 1.28 times the link in 20 s |
+| `shaped_link::tcp_shape::relay_writer::the_relay_writer_with_every_packet_in_one_frame`, `the_relay_writer_with_a_full_packet_in_two_frames` | FR-148 P4b-3 (D55): AC23's fast motion behind the mesh relay's writer (below), with every packet in one frame, or with a full packet in two as the mesh relay sends it (D20). Four arms run one after another on the same path. **r**, the reliable channel at the 100 ms age bound: frames dropped for their age; each chunk they lost sent again, fast retransmits among them and no more of those than chunks lost; every message read; ssthresh cut; writes blocked. **r0**, the bound off: no drop, no fast retransmit and no T3. **d**, the deadline stream, marked before its first write: no fast retransmit and no chunk sent again; the messages the viewer misses are exactly those with a dropped frame; FORWARD TSNs; and without a T3, no cut and no write longer than r's median blocked write. **u**, unmarked `maxRetransmits: 0`: d sends fewer FORWARD TSNs per SACK. Ten runs in a row on a Windows box, the host loaded as it was: 10 of 10 each, with the numbers in the table below |
+| `shaped_link::tcp_shape::relay_writer::the_reliable_channel_with_every_packet_in_one_frame_takes_no_t3`, `the_reliable_channel_with_a_full_packet_in_two_frames_takes_no_t3` | ignored: r alone, with AC23's first read (D54) on top: no T3, and every chunk sent again a fast retransmit of one the writer dropped. Flaky with one frame and red with two, for the reason below. Ten runs by name: 10 of 10 with one frame, 0 of 10 with two. Over every r arm run on this writer and load, in the cells above and by name: a T3 in 2 of 46 with one frame and in all 47 with two |
+| `shaped_link::tcp_shape::relay_writer::the_deadline_stream_with_every_packet_in_one_frame_takes_no_t3`, `the_deadline_stream_with_a_full_packet_in_two_frames_takes_no_t3` | ignored: r for its median blocked write, then d with no T3 on top, and so no cut and no write longer than that median. Flaky, for the reason below. Ten runs by name: 10 of 10 with one frame, 8 of 10 with two. Over every d arm run on this writer and load, in the cells above and by name: a T3 in 1 of 36 with one frame and in 8 of 36 with two |
 
 They add about 23 s of test time, each cell timed alone: 10.1 s for each still-screen
 cell, 2.2 s for the relay pair below, 0.3 s for the peek, and the unit cells nothing that
 shows. The two still-screen cells wait their turn with the TCP cells, which run one at a
 time, so that line of cells grows by about 20 s. Since D44 the line runs eight cells, in
-141 s on a Windows box: the two stall cells and their 20 s each left it.
+141 s on a Windows box: the two stall cells and their 20 s each left it. The relay
+writer's two cells join that line and add about 100 s to it: four arms a cell, each a 10 s
+load, a 2 s still screen and the drain.
+
+**The mesh relay's writer** (FR-148 P4b-3, D55). The relay writer's cells put a model of
+the agent's /derp writer between SCTP and the shaped link (`RelayWriter`,
+`agents/roomlerd/src/media_delivery.rs:11721`). Its mux queues each frame without waiting,
+in a channel of 512 frames that drops a frame when full
+(`crates/tunnel-core/src/transport/derp.rs:55`, `:290-318`). Its owner task drops a frame
+that waited longer than the age bound and otherwise waits for the write
+(`agents/roomlerd/src/derp.rs:550-558`): 100 ms, and 0 for off
+(`crates/tunnel-core/src/transport/derp.rs:72-77`). Behind it the /derp socket holds
+212,992 bytes, the 256 KiB the agent asks for as Linux clamps it
+(`agents/roomlerd/src/derp.rs:40`, `:73-76`). The carrier is TCP and loses nothing it was
+handed, so the socket and the 200 ms queue are one first hop of 262,992 bytes
+(`Shaper::hop`) in front of a queue that drops nothing: the writer is the path's only
+loss. A packet over the mesh's MTU of 1,280 bytes, as a full one's 1,293 are, leaves as two
+IPv4 fragments, and so as two frames (D20). The age check is per frame, and the viewer's
+end passes a pair on only whole (`RelayReader`, `:11963`). The load is the deep 2 Mbit/s
+cell's, frames at 1.5 times the link under the pump's skip over 256 KiB, for 10 s. Then
+the screen goes still, one 200-byte message a second for 2 s, so that a later SACK
+reports a loss among the load's last packets. Without it only a T3 found one: in one of
+three runs, before the still screen was added, d lost its last chunk so, and the T3 cut
+its window to one MTU.
+
+| Ten runs of the cells above | Every packet in one frame | A full packet in two frames |
+|---|---|---|
+| r: frames dropped for their age; the packets they cost | 6 to 9; 6 to 9 | 41 to 46; 26 to 32, 8 to 13 of them by one frame of two |
+| r: fast retransmits; T3s | 6 to 9, one for each chunk lost; none | 5 to 8; one in every run, and 27 to 108 chunks sent again in all, the 26 to 32 lost among them |
+| r: ssthresh's least, from the peer's 1 MiB | 68,820 to 70,870 | 69,245 to 70,195 |
+| r: writes blocked after the opening; their median; the longest | 100 to 109 of 120; 54 to 56 ms; 278 to 338 ms | 50 to 67 of 85 to 105; 22 to 30 ms; 590 to 1,833 ms |
+| r0: frames dropped; fast retransmits and T3s; writes blocked | none; none; none | none; none; none |
+| d: frames dropped; the packets they cost, whose chunks were abandoned | 18 to 23; 18 to 23 | 76 to 143; 48 to 92 |
+| d: messages missed, each with a dropped frame, of those written | 13 to 20 of 196 | 9 to 20 of 173 to 190 |
+| d: FORWARD TSN packets; T3s | 13 to 20; none | 8 to 17; two in each of 2 runs, which cut ssthresh to 4,912 and blocked 57 writes, the longest 758 and 760 ms |
+| d: the longest write without a T3 | under 1 ms | under 1 ms |
+| u: messages missed | 47 to 50 | 53 to 60 |
+| FORWARD TSNs per SACK, d against u | 0.007 to 0.011 against 0.873 to 0.892 | 0.006 to 0.010 against 0.884 to 0.899 |
+
+No cut means no relief either. d keeps the first hop full, as r0 and u do: their frames
+wait 1,031 to 1,051 ms in the socket and the queue all through the load, and d's age drops
+go on to its end. With every packet in one frame, r's cut leaves 242 to 320 ms there once
+its burst is repaired.
+
+**Why the no-T3 cells are ignored.** AC23's first read took no T3 on the reliable
+channel, and the deadline stream is built to need none. Both take one here. On r, the
+slow start's first overflow drops a burst of packets within a few hundred ms, and fast
+recovery repairs it one packet a round trip: the vendored SCTP sends one packet of chunks
+each time it is asked
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:486-549`), and in
+recovery it is asked only when the cumulative point advances (`:1550-1552`). A T3 ends the
+repair when the episode reaches its exit point (`:1527`, `:1305-1307`) while holes remain
+past it whose miss indications already stopped at 3 (`:1520`), so that none starts another
+episode, or when the viewer's window has filled behind the first hole of the ordered
+stream. It sends again every chunk not yet acknowledged, those still on their way among
+them. On d, a hole holds the cumulative point until its FORWARD TSN lands
+(`forward_tsn_due`, `:1174`), a loaded round trip behind the full first hop, or longer when
+the writer drops the FORWARD TSN too. The T3-rtx timer runs from the point's last advance,
+with an RTO of srtt + 4 rttvar (`crates/vendored/webrtc-sctp/src/timer/rtx_timer.rs:56`),
+barely longer while the queue stands still. On d the T3 abandons what is out
+(`association_internal.rs:2594-2600`), and on either it cuts the window to one MTU
+(`:2578-2579`).
 
 **The carrier's relay transport.** The carrier line (`session carrier recorded (FR-102
 P9c)`, [remote-control.md §11.9](remote-control.md#119-the-carrier-a-session-rides-fr-102-p9c))
