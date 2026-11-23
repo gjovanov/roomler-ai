@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-148 P4b-3 (D55) — the agent's half of the deadline-limited video
 //! channel: which of a session's two video channels a frame goes on, and
 //! whether it goes at all.

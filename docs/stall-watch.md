@@ -263,7 +263,7 @@ a body `try_lock` fails; after a plain `let` statement it succeeds. FR-148
 P4b-3 keeps the hold on purpose: the scrutinee is now the send task's lane
 (`lane.route`), which takes the mutex as an owned guard, and the frame it lets
 through holds that guard until its last chunk is written (`Routed`,
-`agents/roomlerd/src/media_deadline.rs:557`).
+`agents/roomlerd/src/media_deadline.rs:559`).
 
 That would re-couple the pump to the link that rc.106 moved the send off. It is
 **named, not fixed**: `dc_lock` (and `heartbeat`, which takes the same mutex)

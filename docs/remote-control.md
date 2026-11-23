@@ -5365,11 +5365,11 @@ features, `agents/roomlerd/src/media_deadline.rs`, which the two send tasks only
 
 | Piece | Rule | Where |
 |---|---|---|
-| the arm | `video-deadline` has an arm of its own in the data-channel match, by equality like every arm there (`video-bytes`' is `:1368`). It stashes the channel in the session's `media_deadline::Session`, which `AgentPeer::new` registers (`:1195`) and both pumps find by session, and logs `video-deadline DC stashed (FR-148 P4b-3)` with the channel's `ordered`, `max_retransmits` and `stream_id` | `agents/roomlerd/src/peer.rs:1411`; `Session`, `agents/roomlerd/src/media_deadline.rs:291` |
-| the class | the carrier of the selected pair, one of seven (below) | `class_of`, `media_deadline.rs:185`; `class_now`, `:225` |
-| the pick | `video-deadline` when the class is TCP somewhere (`turn_tcp`, `turn_tls`, `mesh_relay`) and the session has one open; `video-bytes` otherwise, and whenever the class is `unknown` | `pick`, `media_deadline.rs:216`; `CarrierClass::is_tcp`, `:162` |
-| when the class is read | at the pump's start, once `detect_constrained_transport` returned, and again at each 5 s transport re-check (`TRANSPORT_RECHECK_INTERVAL`, `peer.rs:2120`), under every override. Never from `detect_constrained_transport`'s 3 s default: with no pair selected the class is `unknown`, so the session starts on `video-bytes` and the next re-check picks again. A change writes `video channel: carrier class (FR-148 P4b-3)` with `from` and `to` | `Pump::start`, `media_deadline.rs:422`; `Pump::read`, `:444`; the VP9-444 pump, `peer.rs:4090` and `:4421`; the FFmpeg pump, `:6660` and `:7755` |
-| the lane | each send task routes every frame through its lane once, before the frame's first write: the channel and the `frame_seq`, or nothing. The lane holds `video-bytes`' stash through the frame's chunked send, as the send task's `if let` did, so the FFmpeg pump's `dc_lock` (FR-65) still waits out a frame's send | `Lane::route`, `media_deadline.rs:640`; the VP9-444 send task, `peer.rs:4338`; the FFmpeg one, `:7373` |
+| the arm | `video-deadline` has an arm of its own in the data-channel match, by equality like every arm there (`video-bytes`' is `:1368`). It stashes the channel in the session's `media_deadline::Session`, which `AgentPeer::new` registers (`:1195`) and both pumps find by session, and logs `video-deadline DC stashed (FR-148 P4b-3)` with the channel's `ordered`, `max_retransmits` and `stream_id` | `agents/roomlerd/src/peer.rs:1411`; `Session`, `agents/roomlerd/src/media_deadline.rs:293` |
+| the class | the carrier of the selected pair, one of seven (below) | `class_of`, `media_deadline.rs:187`; `class_now`, `:227` |
+| the pick | `video-deadline` when the class is TCP somewhere (`turn_tcp`, `turn_tls`, `mesh_relay`) and the session has one open; `video-bytes` otherwise, and whenever the class is `unknown` | `pick`, `media_deadline.rs:218`; `CarrierClass::is_tcp`, `:164` |
+| when the class is read | at the pump's start, once `detect_constrained_transport` returned, and again at each 5 s transport re-check (`TRANSPORT_RECHECK_INTERVAL`, `peer.rs:2120`), under every override. Never from `detect_constrained_transport`'s 3 s default: with no pair selected the class is `unknown`, so the session starts on `video-bytes` and the next re-check picks again. A change writes `video channel: carrier class (FR-148 P4b-3)` with `from` and `to` | `Pump::start`, `media_deadline.rs:424`; `Pump::read`, `:446`; the VP9-444 pump, `peer.rs:4090` and `:4421`; the FFmpeg pump, `:6660` and `:7755` |
+| the lane | each send task routes every frame through its lane once, before the frame's first write: the channel and the `frame_seq`, or nothing. The lane holds `video-bytes`' stash through the frame's chunked send, as the send task's `if let` did, so the FFmpeg pump's `dc_lock` (FR-65) still waits out a frame's send | `Lane::route`, `media_deadline.rs:642`; the VP9-444 send task, `peer.rs:4338`; the FFmpeg one, `:7373` |
 
 **The classes.** The pair, what carries the agent's own relay and whether the pair rides the mesh are
 the carrier line's own reads (§11.9): `session_carrier::nominated_pair`
@@ -5405,7 +5405,7 @@ stateDiagram-v2
 | Rule | What the lane does |
 |---|---|
 | the drain rule | once the pick says switch, nothing more is written on the old channel. Every frame that arrives, a key frame too, is dropped whole while the old channel's buffered amount is above 0, that is until each of its chunks was acknowledged, or abandoned and forwarded (P4b-1). Then a key frame is asked through the session's gate, asked again at each frame until an ask passes, and the frames before the key frame are dropped. The wait has no time bound: the switch line says how long it held the video |
-| one `frame_seq` space | a frame written, a frame a switch dropped and a frame D dropped each take the next number, so the viewer reads every drop as a gap and the numbers it receives never repeat (`Lane::write`, `media_deadline.rs:665`; `drop_switching`, `:886`; `drop_late`, `:896`) |
+| one `frame_seq` space | a frame written, a frame a switch dropped and a frame D dropped each take the next number, so the viewer reads every drop as a gap and the numbers it receives never repeat (`Lane::write`, `media_deadline.rs:667`; `drop_switching`, `:888`; `drop_late`, `:898`) |
 | the first pick | at the pump's first frame: no old channel, so no drain and no wait |
 | a channel that closes | the drain of a closed channel is over at once. A switch whose `video-deadline` closed while it waited ends on `video-bytes` at the key frame, and a session on `video-deadline` whose channel closed is picked back onto `video-bytes` |
 | an unframed session | never leaves `video-bytes`: an unframed stream on an unordered channel cannot be put back together |
@@ -5415,13 +5415,13 @@ deadline-limited (`RTCSctpTransport::mark_deadline_stream`,
 `crates/vendored/webrtc/src/sctp_transport/mod.rs:493`, FR-148 P4b-1): once per stream, when the pick
 says switch, before the drain. A refused mark (no association, its slot held, no such stream) switches
 nothing: the session stays on `video-bytes`, one WARN line says so, and the mark is tried again at the
-next key frame (`Lane::mark`, `media_deadline.rs:860`). `off` and `shadow` never mark.
+next key frame (`Lane::mark`, `media_deadline.rs:862`). `off` and `shadow` never mark.
 
 **D.** Under `on`, on `video-deadline` only, a frame older than 300 ms at its first write, counted
 from its hand-off to the send task, is dropped whole, and a key frame is asked through the session's
 gate ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)).
 
-**The key frame gate is the session's** (`KeyframeGate`, `media_deadline.rs:253`). The viewer's
+**The key frame gate is the session's** (`KeyframeGate`, `media_deadline.rs:255`). The viewer's
 `rc:keyframe` used to keep its 500 ms gap in the control channel's handler. The gap moved into the gate
 (`MIN_KF_GAP`, `:244`), which `AgentPeer::new` hands that handler, whose `rc:keyframe` arm asks
 through it (`peer.rs:11364`), as the send tasks do. So at most one forced key frame passes per 500 ms,

@@ -843,7 +843,7 @@ flowchart TB
         E --> S["÷ followers (shared split)"]
         S --> CEIL["ceiling_bps<br/>= the AIMD's ceiling = the gate's reference"]
     end
-    subgraph gate["the direct gate — one pass, before capture (peer.rs:6565–6686)"]
+    subgraph gate["the direct gate — one pass, before capture (peer.rs:6565–6714)"]
         CEIL --> SOFT["soft = 150 ms × ceiling"]
         CEIL --> HARD["hard = max(soft, HRD reservoir)"]
         W["wait = max(EMA of completed waits,<br/>age of the head-of-queue frame)"]
@@ -5296,12 +5296,12 @@ under on, on video-deadline, once, before the frame's first chunk is written:
 
 | Rule | Why |
 |---|---|
-| D is 300 ms, a constant (`DEADLINE`, `agents/roomlerd/src/media_deadline.rs:114`) | FR-148's O-b starts it there, counted under `shadow` first |
+| D is 300 ms, a constant (`DEADLINE`, `agents/roomlerd/src/media_deadline.rs:116`) | FR-148's O-b starts it there, counted under `shadow` first |
 | it is read once, at the frame's turn | the road is decided before the first write, so a frame begun is finished: cutting one after its first chunk would cost the viewer the whole frame and the link the chunks already sent |
 | from the hand-off | the instant each frame already carries through the send channel for the send wait ([§ Where it runs](#where-it-runs)): the VP9-444 send task's (`agents/roomlerd/src/peer.rs:4336`) and the FFmpeg one's (`:7362`) |
 | on `video-deadline` only | `video-bytes` stays reliable and ordered: D drops nothing there, under any value of the switch |
 | a drop consumes its `frame_seq` | the viewer reads it as a gap, as it reads a loss on that channel (P4b-2): on `video-deadline` a gap does not re-arm its decode gate |
-| the recovery key frame | asked through the session's gate, the one the viewer's `rc:keyframe` passes through (`KeyframeGate`, `media_deadline.rs:253`): one forced key frame per 500 ms at most, whoever asks (`MIN_KF_GAP`, `:244`). P4b-4's cost rule replaces it |
+| the recovery key frame | asked through the session's gate, the one the viewer's `rc:keyframe` passes through (`KeyframeGate`, `media_deadline.rs:255`): one forced key frame per 500 ms at most, whoever asks (`MIN_KF_GAP`, `:246`). P4b-4's cost rule replaces it |
 
 The frames that follow a dropped one are written while they are young enough, and the viewer decodes
 them as it decodes the frames after a loss on that channel, until the key frame lands. Under `shadow`
@@ -5311,7 +5311,7 @@ drops none.
 ### The deadline channel's switch
 
 `ROOMLERD_VIDEO_DEADLINE`, or the config key `video_deadline`, read once per pump beside
-`ROOMLERD_PATH_MODEL` (`media_deadline::mode`, `agents/roomlerd/src/media_deadline.rs:75`, from
+`ROOMLERD_PATH_MODEL` (`media_deadline::mode`, `agents/roomlerd/src/media_deadline.rs:77`, from
 `DeliverySampler::from_env`, `agents/roomlerd/src/media_delivery.rs:687`):
 
 | Value | The send tasks |
@@ -5334,7 +5334,7 @@ retires with FR-148 P5).
 Its counts close `path delivery (FR-148 P0, shadow, ≈10s)`, after the budget's fields, or after `loss`,
 or after `acked_bytes`, whichever ends the line without them, and only with the switch not `off`. They
 are a pump's: each data-channel pump's line carries its own send task's (`Counters`,
-`agents/roomlerd/src/media_deadline.rs:334`; the sampler's handle, `DeliverySampler::deadline`,
+`agents/roomlerd/src/media_deadline.rs:336`; the sampler's handle, `DeliverySampler::deadline`,
 `agents/roomlerd/src/media_delivery.rs:1299`).
 
 | Field | Meaning |
@@ -5451,7 +5451,7 @@ still waiting for its evidence.
 | `PATH_MODEL` | `agents/roomlerd/src/media_delivery.rs:157`, not `encode/mod.rs` | FR-148 P0 | shadow | the delivery samples and their line ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)), the path numbers' tags and their line ([§ Path numbers](#path-numbers-and-their-provenance-fr-148-p0--how-each-was-obtained-and-how-old-it-is)), and since P1 the path memory and its two lines ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)). Three values since P1 (D28): `off`, `shadow` (the default) and `on`, under which the path memory opens a constrained session of the FFmpeg data-channel pump ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)); ⚠️ `on` is set on no device until FR-148's O7 is ruled | P5 deletes it with the composition it measures | FR-148 P5 | — |
 | `QSV_RATE_MODE` | `agents/roomlerd/src/encode/ffmpeg/encoder.rs:3471`, not `encode/mod.rs` | FR-148 P2 (FR-62 A5) | `cbr` | constant bitrate on QSV: `qvbr` opens HEVC and H.264 QSV at QVBR, the target at 0.9 × the cap, and falls back to `cbr` on a refusal (`QsvRateOpen`, [`encoders.md`](encoders.md#qsv-off-constant-bitrate-fr-148-p2)) | FR-148 AC13 read with it on: a QSV keepalive no longer `maxrate ÷ fps ÷ 8` bytes, a still screen under 0.3 Mbit/s. FR-148 P5 then deletes the constant-bitrate path, and the switch with it | FR-148 P5 | — |
 | `INFLIGHT_BUDGET` | `agents/roomlerd/src/media_inflight.rs:160`, not `encode/mod.rs` | FR-148 D46 B1 | off | the in-flight budget, computed in shadow on both data-channel pumps, and its fields at the end of the `path delivery` line ([§ The in-flight budget](#the-in-flight-budget-fr-148-d46--what-may-be-out-in-time)). Since D46's step B3 `on` acts on relay sessions, in place of the relay byte gate and the VP9-444 watermark arm ([§ The budget acts under `on`](#the-budget-acts-under-on-d46-b3)). Since D48 the same computing reads a path that drops for the shadow model and the pair memory ([§ A path that drops](#a-path-that-drops-who-bound-the-sample-d48)) | B3's gates: D46's fresh-delivery bar on the stall shapes, O11's field read of the sessions that ride a TCP leg, and AC32 in the lab; B3 then holds on it on relay sessions. FR-148 P5 deletes the switch, kept or not | FR-148 P5 | — |
-| `VIDEO_DEADLINE` | `agents/roomlerd/src/media_deadline.rs:75`, not `encode/mod.rs` | FR-148 P4b-3 (D55) | off | the video channel's pick per carrier class, the switch at a key frame with its drain, the stream's mark and the deadline D on both data-channel send tasks ([§ The deadline channel](#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)) | FR-148 P5: one controller picks the channel and owns D, or the field read rejects the deadline channel. P5 deletes the switch either way | FR-148 P5 | — |
+| `VIDEO_DEADLINE` | `agents/roomlerd/src/media_deadline.rs:77`, not `encode/mod.rs` | FR-148 P4b-3 (D55) | off | the video channel's pick per carrier class, the switch at a key frame with its drain, the stream's mark and the deadline D on both data-channel send tasks ([§ The deadline channel](#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)) | FR-148 P5: one controller picks the channel and owns D, or the field read rejects the deadline channel. P5 deletes the switch either way | FR-148 P5 | — |
 
 **Heuristics with no switch of their own.** FR-62's A4 deletions, FR-63's B4 since 2026-11-05.
 Each one retires through this table too, and its deletion PR cites the precondition below.
