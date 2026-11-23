@@ -154,10 +154,20 @@ struct Shared {
     dirty: bool,
 }
 
+impl super::Slot for Shared {
+    fn holds(&self) -> bool {
+        self.prompt.is_some()
+    }
+    fn fill(&mut self, view: PromptView) {
+        self.prompt = Some(view);
+        self.dirty = true;
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Inner {
     shared: Arc<Mutex<Shared>>,
-    /// Whether the X thread is up. A dead thread must report `false` from
+    /// Whether the X thread is up. A dead thread must report no panel from
     /// `prompt` so the caller falls through to the companion rather than
     /// waiting on a panel nobody will draw.
     alive: Arc<AtomicBool>,
@@ -236,19 +246,10 @@ impl Inner {
         Ok(Self { shared, alive })
     }
 
-    pub(super) fn prompt(&self, view: PromptView) -> bool {
-        if !self.alive.load(Ordering::SeqCst) {
-            return false;
-        }
-        let mut s = self.shared.lock().unwrap();
-        // At most one on screen: two overlapping Approve/Deny panels is how
-        // someone approves the wrong thing.
-        if s.prompt.is_some() {
-            return false;
-        }
-        s.prompt = Some(view);
-        s.dirty = true;
-        true
+    /// #4164 — busy while another question is up, no panel once the X thread
+    /// has ended, whatever it held ([`super::panel_takes`]).
+    pub(super) fn prompt(&self, view: PromptView) -> Result<(), super::NotShown> {
+        super::panel_takes(|| self.alive.load(Ordering::SeqCst), &self.shared, view)
     }
 
     pub(super) fn dismiss(&self, session_hex: &str) {
@@ -690,16 +691,22 @@ mod tests {
             }
             false
         };
-        assert!(panel.prompt(crate::indicator::PromptView {
-            session_hex: "6acf953f1b6883945abe0e3e".into(),
+        let question = |id: &str| crate::indicator::PromptView {
+            session_hex: id.into(),
             title: "Remote control request".into(),
             lead: "the lane is requesting to control this device.".into(),
             detail: String::new(),
             permissions: "VIEW".into(),
             org: String::new(),
             expires_at: Instant::now() + Duration::from_secs(300),
-        }));
+        };
+        assert_eq!(panel.prompt(question("6acf953f1b6883945abe0e3e")), Ok(()));
         assert!(settle(MapState::VIEWABLE), "the prompt never appeared");
+        // #4164 — a second question while it is up: busy, never no panel.
+        assert_eq!(
+            panel.prompt(question("6acf953f1b6883945abe0e3f")),
+            Err(crate::indicator::NotShown::Busy)
+        );
         panel.dismiss("6acf953f1b6883945abe0e3e");
         assert!(
             settle(MapState::UNMAPPED),
@@ -707,6 +714,61 @@ mod tests {
             panel_state()
         );
         println!("x11-real: a dismissed prompt left the screen");
+    }
+
+    /// #4164 — the X11 panel's refusal says why, read with its X thread stood
+    /// in by its flag: a second question while one is up is busy, and the
+    /// first stays; once the thread has ended it is no panel, even holding
+    /// a question; a dismissed question frees it.
+    ///
+    /// Red before #4164: both refusals were `false`, and the caller read a
+    /// busy panel as no panel at all.
+    #[test]
+    fn the_x11_panel_says_busy_for_a_second_question_and_no_panel_once_gone() {
+        use super::Inner;
+        use crate::indicator::NotShown;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let question = |id: &str| crate::indicator::PromptView {
+            session_hex: id.into(),
+            title: "Command execution request".into(),
+            lead: "Alice wants to run a command on this device.".into(),
+            detail: "uptime".into(),
+            permissions: String::new(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        };
+        let panel = Inner {
+            shared: Default::default(),
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(panel.prompt(question("a")), Ok(()));
+        assert_eq!(
+            panel.prompt(question("b")),
+            Err(NotShown::Busy),
+            "a second question while one is up"
+        );
+        assert_eq!(
+            panel
+                .shared
+                .lock()
+                .unwrap()
+                .prompt
+                .as_ref()
+                .map(|p| p.session_hex.as_str()),
+            Some("a"),
+            "the first question stays"
+        );
+        panel.alive.store(false, Ordering::SeqCst);
+        assert_eq!(
+            panel.prompt(question("c")),
+            Err(NotShown::NoPanel),
+            "the X thread has ended, holding a question"
+        );
+        panel.alive.store(true, Ordering::SeqCst);
+        panel.dismiss("a");
+        assert_eq!(panel.prompt(question("d")), Ok(()), "free again");
     }
 
     // RETIRED-NAME-ANCHOR(16): the legacy env spelling under test, on purpose

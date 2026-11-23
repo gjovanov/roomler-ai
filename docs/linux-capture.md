@@ -618,7 +618,7 @@ what they leave behind and collects whatever exits.
 
 ⚠️ **A virtual-desktop host is not a consent surface**, even though its X
 display connects: the only viewer of that Xvfb is a remote controller, so the
-native consent panel would be drawn where nobody can see it (`indicator/x11.rs:193`
+native consent panel would be drawn where nobody can see it (`indicator/x11.rs:203`
 reads the daemon's own `ROOMLERD_VIRTUAL_DESKTOP` and declines). Detail in
 [`remote-control.md` §11.2](remote-control.md#112-consent).
 
@@ -2439,10 +2439,10 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:4920`) — the same `loginctl` walk the FR-27
+(`agents/roomlerd/src/companion.rs:5079`) — the same `loginctl` walk the FR-27
 consent companion uses, asked since #3857 through one walk in flight, 1.5 s at
-most (`graphical_session_within`, `companion.rs:9065`). It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:4973-4976`),
+most (`graphical_session_within`, `companion.rs:9224`). It accepts a session only when
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:5132-5135`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers
