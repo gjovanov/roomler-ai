@@ -826,6 +826,50 @@ fn an_optional_json_body_is_read_before_the_handler_too() {
     assert!(found[0].1.contains("platform_admins.contains"), "{found:?}");
 }
 
+/// A body that may be absent, `Result<Option<Json<T>>, _>`, is checked for
+/// order like `Result<Json<T>, _>`: unwrapped after its gate, it passes.
+#[test]
+fn an_optional_body_unwrapped_after_its_gate_passes() {
+    let found = flagged(&[
+        CORE,
+        (
+            "h.rs",
+            r#"
+            pub async fn send(State(state): State<Core>, auth: AuthUser, body: Result<Option<Json<Req>>, JsonRejection>) -> Result<(), ApiError> {
+                require_platform_admin(&state, &auth)?;
+                let req = body?.map(|Json(b)| b).unwrap_or_default();
+                Ok(())
+            }
+            "#,
+        ),
+    ]);
+    assert!(found.is_empty(), "{found:?}");
+}
+
+/// A body that may be absent, `Result<Option<Json<T>>, _>`, used before its
+/// gate is flagged.
+#[test]
+fn an_optional_body_unwrapped_before_its_gate_is_flagged() {
+    let found = flagged(&[
+        CORE,
+        (
+            "h.rs",
+            r#"
+            pub async fn send(State(state): State<Core>, auth: AuthUser, body: Result<Option<Json<Req>>, JsonRejection>) -> Result<(), ApiError> {
+                let req = body?.map(|Json(b)| b).unwrap_or_default();
+                require_platform_admin(&state, &auth)?;
+                Ok(())
+            }
+            "#,
+        ),
+    ]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].1.contains("uses `body` in statement 1"),
+        "{found:?}"
+    );
+}
+
 #[test]
 fn a_body_unwrapped_after_its_gate_passes() {
     let found = flagged(&[

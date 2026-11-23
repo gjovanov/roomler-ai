@@ -298,6 +298,62 @@ async fn checkout_rejects_non_owner() {
     assert_eq!(resp.status().as_u16(), 403);
 }
 
+/// #4254, ruling R1: a pin, green before #4254's change and after it. The
+/// billing writes are on the gate guard's by-design list: their gate asks
+/// about the org their body names, and their routes carry no org in their
+/// path. What this pins is the rest of the order: a member of the org
+/// without MANAGE_TENANT, sending a body that parses and names their own
+/// org, is answered the gate's 403 before a field the handler judges itself,
+/// a bad `interval`, is judged.
+#[tokio::test]
+async fn the_checkout_gate_is_decided_before_a_bad_interval() {
+    use crate::tunnel_policy_permission_tests::{Gate, call};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("checkout-gate-first").await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/stripe/checkout",
+        &seeded.member.access_token,
+        Some(serde_json::json!({
+            "tenant_id": seeded.tenant_id,
+            "plan": "pro",
+            "interval": "fortnight",
+            "success_url": "http://localhost/success",
+            "cancel_url": "http://localhost/cancel",
+        })),
+    )
+    .await;
+    let problem = Gate::Bit("MANAGE_TENANT").problem(status, &body.to_string());
+    assert!(problem.is_none(), "{problem:?}");
+}
+
+/// #4254, ruling R1: the same pin for the plan change. A member of the org
+/// without MANAGE_TENANT, sending a body that parses and names their own
+/// org, is answered the gate's 403 before a bad `interval` is judged.
+#[tokio::test]
+async fn the_change_plan_gate_is_decided_before_a_bad_interval() {
+    use crate::tunnel_policy_permission_tests::{Gate, call};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("change-plan-gate-first").await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/stripe/change-plan",
+        &seeded.member.access_token,
+        Some(serde_json::json!({
+            "tenant_id": seeded.tenant_id,
+            "plan": "pro",
+            "interval": "fortnight",
+        })),
+    )
+    .await;
+    let problem = Gate::Bit("MANAGE_TENANT").problem(status, &body.to_string());
+    assert!(problem.is_none(), "{problem:?}");
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/stripe/portal — authentication & authorization
 // ---------------------------------------------------------------------------
@@ -342,6 +398,31 @@ async fn portal_fails_without_billing_account() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 400);
+}
+
+/// #4254, ruling R1: the portal's pin. Its gate asks about the org the body
+/// names, and the route carries no org in its path. A member of the org
+/// without MANAGE_TENANT, sending a body that parses and names their own
+/// org, is answered the gate's 403.
+#[tokio::test]
+async fn the_portal_gate_refuses_a_member_without_manage_tenant() {
+    use crate::tunnel_policy_permission_tests::{Gate, call};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("portal-gate-first").await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/stripe/portal",
+        &seeded.member.access_token,
+        Some(serde_json::json!({
+            "tenant_id": seeded.tenant_id,
+            "return_url": "http://localhost/billing",
+        })),
+    )
+    .await;
+    let problem = Gate::Bit("MANAGE_TENANT").problem(status, &body.to_string());
+    assert!(problem.is_none(), "{problem:?}");
 }
 
 // ---------------------------------------------------------------------------
