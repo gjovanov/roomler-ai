@@ -106,25 +106,39 @@ pub trait TunIo: Send + Sync {
 
     /// #4279 — the route guard's re-assert of a router peer's subnet route,
     /// one that [`add_cidr_route`](Self::add_cidr_route) installed: put ours
-    /// back via this device if it is missing, and write nothing if it is
-    /// there. Never evicts: another interface may route the same range on
-    /// purpose (the host's own LAN, a corp VPN's split include).
+    /// back via this device when it is MISSING, and never displace a route
+    /// that holds the prefix. Another interface may route the same range on
+    /// purpose: a sibling org's adapter (multi-org gives each org its own),
+    /// the host's own LAN, a corp VPN's split include. Two guards that each
+    /// took the prefix back would flip it on every wave.
     ///
-    /// The default is `add_cidr_route` itself, whose Linux and macOS forms
-    /// already write only a missing route (`ip route replace` is a no-op for
-    /// an identical route, and macOS reads `route -n get` first). Windows
-    /// overrides it with the peer `/32`'s primitive, `winroute::ensure`: the
-    /// same in-place check, plus the #1328 stand-down. A VPN whose route
-    /// monitor keeps deleting a prefix gets it back for 4 waves, then not
-    /// for a backoff of 1 to 15 min, then one probe: reachability through the
-    /// overlay was lost either way, and the fight is what ran the guard at
-    /// ~20 waves/min (#1282). `add_cidr_route` deliberately never stands down,
-    /// because an exit client's `/1`s must not leave a hole that egress
-    /// leaks through; a subnet route has no such duty. A wrapper device must
-    /// forward this, or it falls back to the default and loses the
-    /// stand-down.
-    async fn defend_subnet_route(&self, cidr: &str) -> std::io::Result<()> {
-        self.add_cidr_route(cidr).await
+    /// Install still takes the prefix (`replace` on Linux, delete-then-add on
+    /// macOS), so the last carrier install wins, as before. The guard only
+    /// fills a hole, on every OS:
+    ///
+    /// - Linux reads `ip route show exact <cidr> dev <if>`, and only when ours
+    ///   is not listed runs install's argv with `replace` → `add`, which a
+    ///   held key refuses.
+    /// - macOS reads install's `route -n get` three ways, as #4117 reads a
+    ///   utun's block (ours, held on another interface, absent), and only when
+    ///   nothing holds the prefix runs install's `add` alone, never its
+    ///   delete. Never an add over a holder: `route` exits 0 on a refused
+    ///   write, and the refusal still reaches the route monitor as an
+    ///   `RTM_ADD` with errno 17, which would arm the next wave.
+    /// - Windows `winroute::ensure` writes only this adapter's row, with the
+    ///   #1328 stand-down: a VPN whose route monitor keeps deleting the
+    ///   prefix gets it back for 4 waves, then not for a backoff of 1 to 15
+    ///   min, then one probe. Reachability through the overlay was lost
+    ///   either way, and the fight is what ran the guard at ~20 waves/min
+    ///   (#1282). `add_cidr_route` deliberately never stands down, because an
+    ///   exit client's `/1`s must not leave a hole that egress leaks through;
+    ///   a subnet route has no such duty.
+    ///
+    /// The default does nothing: only a device with OS routes has one to put
+    /// back. A wrapper device must forward this, or its OS device's subnet
+    /// routes go undefended.
+    async fn defend_subnet_route(&self, _cidr: &str) -> std::io::Result<()> {
+        Ok(())
     }
 
     /// Change B (corp-gateway leak) — maintain the BLOCK-FLOOR routes: the
@@ -575,6 +589,271 @@ fn mask_plen(mask: std::net::IpAddr) -> Option<u8> {
     (ones == total).then_some(ones as u8)
 }
 
+/// Phase 1 — install's Linux write of a CIDR route on the overlay device,
+/// `ip [-6] route replace <cidr> dev <if>` (no metric, the main table). It
+/// takes the exact key (prefix, metric 0, main table) from whatever held it,
+/// so the last carrier install wins. The exit `/1`s are written this way too.
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+pub(crate) fn linux_cidr_install_args(cidr: &str, v6: bool, if_name: &str) -> Vec<String> {
+    linux_cidr_route_args("replace", cidr, v6, if_name)
+}
+
+/// #4279 — the route guard's Linux writes for a subnet route, given what
+/// [`linux_subnet_show_args`] read: `Some(true)` when our device holds the
+/// prefix, `None` when the read did not answer. Nothing when the route is
+/// ours, else install's argv with `replace` → `add`. `add` refuses (EEXIST,
+/// "File exists") whenever a route already holds the exact key, so the guard
+/// fills a hole and never displaces: a sibling org's adapter (multi-org gives
+/// each org its own) or another product keeps the prefix, where `replace`
+/// would take it back on every wave and two guards would flip it forever.
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+pub(crate) fn linux_subnet_restore_writes(
+    cidr: &str,
+    v6: bool,
+    if_name: &str,
+    ours_listed: Option<bool>,
+) -> Vec<Vec<String>> {
+    if ours_listed == Some(true) {
+        return Vec::new();
+    }
+    vec![linux_cidr_route_args("add", cidr, v6, if_name)]
+}
+
+/// #4279 — `ip [-6] route show exact <cidr> dev <if>`: the routes for exactly
+/// this prefix on OUR device. A read, so the guard's steady state (the route
+/// is ours) changes no table and arms no wave.
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+pub(crate) fn linux_subnet_show_args(cidr: &str, v6: bool, if_name: &str) -> Vec<String> {
+    let mut args = linux_family(v6);
+    args.extend([
+        "route".into(),
+        "show".into(),
+        "exact".into(),
+        cidr.into(),
+        "dev".into(),
+        if_name.into(),
+    ]);
+    args
+}
+
+/// #4279 — did [`linux_subnet_show_args`] list a route? Any non-blank line.
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+pub(crate) fn linux_route_listed(stdout: &str) -> bool {
+    stdout.lines().any(|l| !l.trim().is_empty())
+}
+
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+fn linux_cidr_route_args(verb: &str, cidr: &str, v6: bool, if_name: &str) -> Vec<String> {
+    let mut args = linux_family(v6);
+    args.extend([
+        "route".into(),
+        verb.into(),
+        cidr.into(),
+        "dev".into(),
+        if_name.into(),
+    ]);
+    args
+}
+
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+fn linux_family(v6: bool) -> Vec<String> {
+    if v6 { vec!["-6".into()] } else { Vec::new() }
+}
+
+/// Phase 1 — a CIDR as BSD `route` takes it: the network and the length, the
+/// length empty when the string carries none.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_cidr_parts(cidr: &str) -> (&str, &str) {
+    cidr.split_once('/').unwrap_or((cidr, ""))
+}
+
+/// Phase 1 — install's macOS lookup of a CIDR route, `route -n get <family>
+/// -net <net> -prefixlen <plen>`: an exact (destination, mask) lookup, read
+/// with [`bsd_route_is_ours`]. `None` when the CIDR does not parse, and then
+/// install writes without looking, as it always did.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_cidr_get_args(cidr: &str, v6: bool) -> Option<Vec<String>> {
+    let (net, plen) = bsd_cidr_parts(cidr);
+    net.parse::<std::net::IpAddr>().ok()?;
+    plen.parse::<u8>().ok()?;
+    Some(vec![
+        "-n".into(),
+        "get".into(),
+        bsd_cidr_family(v6).into(),
+        "-net".into(),
+        net.into(),
+        "-prefixlen".into(),
+        plen.into(),
+    ])
+}
+
+/// Phase 1 — install's macOS writes for a CIDR route, given what its lookup
+/// answered: nothing when the route is ours (#1856), else delete-then-add,
+/// because BSD `route` has no replace and `add` fails once the entry exists.
+/// The delete may find nothing, so only the add's answer counts. The last
+/// carrier install wins, as on Linux.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_cidr_install_writes(
+    cidr: &str,
+    v6: bool,
+    if_name: &str,
+    ours: bool,
+) -> Vec<Vec<String>> {
+    if ours {
+        return Vec::new();
+    }
+    vec![
+        bsd_cidr_route_args("delete", cidr, v6, None),
+        bsd_cidr_route_args("add", cidr, v6, Some(if_name)),
+    ]
+}
+
+/// #4279 — the route guard's macOS write for a subnet route, given install's
+/// exact lookup read three ways by #4117's [`utun_block_held`]: install's
+/// `add` ALONE, never its delete, and only when nothing holds the prefix
+/// ([`UtunBlockHeld::Absent`]). Nothing when the route is ours, when the
+/// lookup could not run, and when another interface holds the prefix (a
+/// sibling org's utun, the host's own LAN), which keeps it.
+///
+/// Never an add over a holder, as #4117 never adds a utun's block over one:
+/// macOS `route` exits 0 when the kernel refuses a write, and the refused add
+/// still reaches every routing-socket listener as an `RTM_ADD` carrying
+/// errno 17. The route monitor counts it as a table change, so an add over a
+/// holder would arm the next wave, be refused again, and arm the one after.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_subnet_restore_writes(
+    cidr: &str,
+    v6: bool,
+    if_name: &str,
+    held: &UtunBlockHeld,
+) -> Vec<Vec<String>> {
+    match held {
+        UtunBlockHeld::Absent => vec![bsd_cidr_route_args("add", cidr, v6, Some(if_name))],
+        UtunBlockHeld::Ours | UtunBlockHeld::Elsewhere(_) | UtunBlockHeld::Unread => Vec::new(),
+    }
+}
+
+/// #4279 — a subnet route's prefix as [`utun_block_held`] reads it. A router
+/// peer's approved subnets are IPv4 (`router::Cidr`), so anything else is
+/// `None`.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_subnet_prefix(cidr: &str) -> Option<(std::net::Ipv4Addr, u8)> {
+    let (net, plen) = bsd_cidr_parts(cidr);
+    let plen = plen.parse::<u8>().ok().filter(|p| *p <= 32)?;
+    Some((net.parse().ok()?, plen))
+}
+
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+fn bsd_cidr_route_args(verb: &str, cidr: &str, v6: bool, if_name: Option<&str>) -> Vec<String> {
+    let (net, plen) = bsd_cidr_parts(cidr);
+    let mut args: Vec<String> = vec![
+        "-n".into(),
+        verb.into(),
+        bsd_cidr_family(v6).into(),
+        "-net".into(),
+        net.into(),
+    ];
+    if !plen.is_empty() {
+        args.extend(["-prefixlen".into(), plen.into()]);
+    }
+    if let Some(if_name) = if_name {
+        args.extend(["-interface".into(), if_name.into()]);
+    }
+    args
+}
+
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+fn bsd_cidr_family(v6: bool) -> &'static str {
+    if v6 { "-inet6" } else { "-inet" }
+}
+
+/// #4279 — what one route-guard restore of a subnet route came to on Linux or
+/// macOS, where the guard reads before it writes.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "overlay-l3"),
+    test
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubnetRestore {
+    /// The read found ours in place, and nothing was written: the steady
+    /// state.
+    Ours,
+    /// Ours was missing and is back.
+    Restored,
+    /// Another route holds the exact key, on the interface named (empty when
+    /// the OS did not say which): a sibling org's adapter, another product,
+    /// the host's own LAN. It keeps it. Quiet: not an error, never a WARN per
+    /// wave, and nothing that arms another wave.
+    Held(String),
+}
+
+/// #4279 — read the guard's `add`: iproute2 says `RTNETLINK answers: File
+/// exists` and route(8) `…: File exists` (EEXIST) when the key is held, and
+/// anything else is a real failure.
+///
+/// On Linux a refused add is the held answer: the read looks at our device
+/// only, and the kernel tells whether anything else holds the key. A refused
+/// netlink write is answered to the writer alone, so no route monitor sees
+/// it. On macOS the add runs only on [`UtunBlockHeld::Absent`], so a refusal
+/// there is a holder that came between the read and the add.
+///
+/// iproute2 prints the C library's `strerror`, which a host with a localized
+/// libc translates. There a held key reads as a failure, which costs a debug
+/// line per wave and changes nothing.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "overlay-l3"),
+    test
+))]
+pub(crate) fn subnet_restore_outcome(res: std::io::Result<()>) -> std::io::Result<SubnetRestore> {
+    match res {
+        Ok(()) => Ok(SubnetRestore::Restored),
+        Err(e) if e.to_string().contains("File exists") => Ok(SubnetRestore::Held(String::new())),
+        Err(e) => Err(e),
+    }
+}
+
+/// #4279 — what one macOS restore came to: the three-way read, then what
+/// `route` complained about when it made the add, if it made one ([`None`]
+/// for no complaint; `route` exits 0 on a refused write, so the complaint is
+/// the answer). A lookup that could not run is a failure.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_subnet_outcome(
+    held: &UtunBlockHeld,
+    complaint: Option<&str>,
+) -> std::io::Result<SubnetRestore> {
+    match held {
+        UtunBlockHeld::Ours => Ok(SubnetRestore::Ours),
+        UtunBlockHeld::Elsewhere(on) => Ok(SubnetRestore::Held(on.clone())),
+        UtunBlockHeld::Unread => Err(std::io::Error::other("the subnet's lookup could not run")),
+        UtunBlockHeld::Absent => match complaint {
+            None => Ok(SubnetRestore::Restored),
+            Some(c) => subnet_restore_outcome(Err(std::io::Error::other(c.to_string()))),
+        },
+    }
+}
+
+/// #4279 — the subnet prefixes another route holds right now, so the guard
+/// names a holder once, when that starts, never on every wave. `true` when
+/// `cidr` has just become held by another route; ours again forgets it.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "overlay-l3"),
+    test
+))]
+pub(crate) fn note_subnet_holder(held: &mut Vec<String>, cidr: &str, by_another: bool) -> bool {
+    let at = held.iter().position(|c| c == cidr);
+    match (by_another, at) {
+        (true, None) => {
+            held.push(cidr.to_string());
+            true
+        }
+        (false, Some(i)) => {
+            held.remove(i);
+            false
+        }
+        _ => false,
+    }
+}
+
 /// #4117 — what an `inet` line of `ifconfig <utun>` says about one address:
 /// its peer (the `-->` address a point-to-point interface prints) and its
 /// netmask (printed in hex, `netmask 0xffc00000`).
@@ -902,6 +1181,9 @@ impl std::fmt::Display for UtunBlockHeld {
 /// measured on macOS 26 CI runners: `not in table` before the block had been
 /// routed, the default route right after the block's own route was deleted.
 /// So an answer that is not exactly the block is [`UtunBlockHeld::Absent`].
+///
+/// #4279 — the route guard reads a router peer's subnet route the same way,
+/// with install's lookup for exactly that prefix ([`bsd_subnet_restore_writes`]).
 #[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
 pub(crate) fn utun_block_held(
     got: Option<&BsdRouteGet>,
@@ -2018,6 +2300,398 @@ default                                 fe80::1%en0                             
             !bsd_pin_holds(iface, &up),
             "with no gateway flag it is no pin"
         );
+    }
+}
+
+/// #4279 — the route guard's subnet write on Linux and macOS puts back a
+/// route that is MISSING and never displaces one. Install keeps its write
+/// (`replace`, delete-then-add), so the last carrier install wins as before.
+/// Pure: the argv, the plan and the outcome are decided here, on every
+/// platform.
+#[cfg(test)]
+mod subnet_restore_tests {
+    use super::{
+        SubnetRestore, UtunBlockHeld, bsd_cidr_get_args, bsd_cidr_install_writes,
+        bsd_subnet_outcome, bsd_subnet_prefix, bsd_subnet_restore_writes, linux_cidr_install_args,
+        linux_route_listed, linux_subnet_restore_writes, linux_subnet_show_args,
+        note_subnet_holder, parse_bsd_route_get, subnet_restore_outcome, utun_block_held,
+    };
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Install's Linux write is unchanged: `replace` takes the exact key from
+    /// whatever held it. v6 too, because the exit `/1` halves ride this path.
+    #[test]
+    fn linux_install_still_replaces() {
+        assert_eq!(
+            linux_cidr_install_args("10.1.0.0/16", false, "roomler0"),
+            argv(&["route", "replace", "10.1.0.0/16", "dev", "roomler0"])
+        );
+        assert_eq!(
+            linux_cidr_install_args("::/1", true, "roomler0"),
+            argv(&["-6", "route", "replace", "::/1", "dev", "roomler0"])
+        );
+    }
+
+    /// The guard's Linux write is install's argv with `replace` → `add`, and
+    /// nothing else. `add` refuses when any route already holds the exact key
+    /// (prefix, metric 0, main table), so it only fills a hole: a sibling
+    /// org's adapter keeps what it holds, where `replace` would take it back
+    /// on every wave and the two guards would flip it forever.
+    #[test]
+    fn linux_guard_adds_where_install_replaces() {
+        for (cidr, v6) in [
+            ("10.1.0.0/16", false),
+            ("192.168.50.0/24", false),
+            ("fd00:1::/64", true),
+        ] {
+            let install = linux_cidr_install_args(cidr, v6, "roomler0-ab12cd");
+            let swapped: Vec<String> = install
+                .iter()
+                .map(|t| {
+                    if t == "replace" {
+                        "add".to_string()
+                    } else {
+                        t.clone()
+                    }
+                })
+                .collect();
+            let writes = linux_subnet_restore_writes(cidr, v6, "roomler0-ab12cd", Some(false));
+            assert_eq!(writes, [swapped], "{cidr}");
+            for verb in ["replace", "del", "delete", "change", "flush"] {
+                assert!(!writes[0].iter().any(|t| t == verb), "{cidr}: {writes:?}");
+            }
+        }
+    }
+
+    /// The guard reads first: does OUR device already hold exactly this
+    /// prefix? A read is never a table change, so the steady state (ours is
+    /// there) writes nothing and arms no wave. An unanswered read still
+    /// tries the add, which cannot displace anything.
+    #[test]
+    fn linux_guard_writes_only_when_ours_is_missing() {
+        assert_eq!(
+            linux_subnet_show_args("10.1.0.0/16", false, "roomler0"),
+            argv(&["route", "show", "exact", "10.1.0.0/16", "dev", "roomler0"])
+        );
+        assert_eq!(
+            linux_subnet_show_args("fd00:1::/64", true, "roomler0"),
+            argv(&[
+                "-6",
+                "route",
+                "show",
+                "exact",
+                "fd00:1::/64",
+                "dev",
+                "roomler0"
+            ])
+        );
+        assert!(
+            linux_subnet_restore_writes("10.1.0.0/16", false, "roomler0", Some(true)).is_empty()
+        );
+        let add = vec![argv(&["route", "add", "10.1.0.0/16", "dev", "roomler0"])];
+        assert_eq!(
+            linux_subnet_restore_writes("10.1.0.0/16", false, "roomler0", Some(false)),
+            add
+        );
+        assert_eq!(
+            linux_subnet_restore_writes("10.1.0.0/16", false, "roomler0", None),
+            add
+        );
+        assert!(linux_route_listed("10.1.0.0/16 scope link \n"));
+        assert!(!linux_route_listed(""));
+        assert!(!linux_route_listed("\n  \n"));
+    }
+
+    /// Install's macOS writes are unchanged: the exact lookup, then nothing
+    /// when the route is ours, else delete-then-add (BSD `route` has no
+    /// replace). v6 too, for the exit `/1` halves.
+    #[test]
+    fn bsd_install_still_deletes_then_adds() {
+        assert_eq!(
+            bsd_cidr_get_args("10.1.0.0/16", false),
+            Some(argv(&[
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                "10.1.0.0",
+                "-prefixlen",
+                "16"
+            ]))
+        );
+        assert_eq!(
+            bsd_cidr_install_writes("10.1.0.0/16", false, "utun4", false),
+            [
+                argv(&[
+                    "-n",
+                    "delete",
+                    "-inet",
+                    "-net",
+                    "10.1.0.0",
+                    "-prefixlen",
+                    "16"
+                ]),
+                argv(&[
+                    "-n",
+                    "add",
+                    "-inet",
+                    "-net",
+                    "10.1.0.0",
+                    "-prefixlen",
+                    "16",
+                    "-interface",
+                    "utun4",
+                ]),
+            ]
+        );
+        assert!(bsd_cidr_install_writes("10.1.0.0/16", false, "utun4", true).is_empty());
+        assert_eq!(
+            bsd_cidr_get_args("8000::/1", true),
+            Some(argv(&[
+                "-n",
+                "get",
+                "-inet6",
+                "-net",
+                "8000::",
+                "-prefixlen",
+                "1"
+            ]))
+        );
+        assert_eq!(
+            bsd_cidr_install_writes("8000::/1", true, "utun4", false),
+            [
+                argv(&[
+                    "-n",
+                    "delete",
+                    "-inet6",
+                    "-net",
+                    "8000::",
+                    "-prefixlen",
+                    "1"
+                ]),
+                argv(&[
+                    "-n",
+                    "add",
+                    "-inet6",
+                    "-net",
+                    "8000::",
+                    "-prefixlen",
+                    "1",
+                    "-interface",
+                    "utun4",
+                ]),
+            ]
+        );
+        // No length: no lookup, and the writes carry none either (as before).
+        assert_eq!(bsd_cidr_get_args("10.1.0.0", false), None);
+        assert_eq!(
+            bsd_cidr_install_writes("10.1.0.0", false, "utun4", false),
+            [
+                argv(&["-n", "delete", "-inet", "-net", "10.1.0.0"]),
+                argv(&[
+                    "-n",
+                    "add",
+                    "-inet",
+                    "-net",
+                    "10.1.0.0",
+                    "-interface",
+                    "utun4"
+                ]),
+            ]
+        );
+    }
+
+    /// The macOS guard's write is install's `add` ALONE, never the delete,
+    /// and only when the three-way read found nothing holding the prefix.
+    /// Ours, a holder on another interface (a sibling org's utun, the host's
+    /// own LAN) and a lookup that could not run all write nothing: macOS
+    /// `route` exits 0 on a refused add, and the refused add still reaches the
+    /// route monitor as an `RTM_ADD` with errno 17, which would arm the next
+    /// wave, so an add over a holder would be retried on every wave.
+    #[test]
+    fn bsd_guard_adds_without_a_delete() {
+        for (cidr, v6) in [("10.1.0.0/16", false), ("fd00:1::/64", true)] {
+            let install = bsd_cidr_install_writes(cidr, v6, "utun7", false);
+            let guard = bsd_subnet_restore_writes(cidr, v6, "utun7", &UtunBlockHeld::Absent);
+            assert_eq!(guard, [install[1].clone()], "{cidr}");
+            for step in &guard {
+                for verb in ["delete", "change", "flush"] {
+                    assert!(!step.iter().any(|t| t == verb), "{cidr}: {step:?}");
+                }
+            }
+            for held in [
+                UtunBlockHeld::Ours,
+                UtunBlockHeld::Elsewhere("utun9".into()),
+                UtunBlockHeld::Elsewhere(String::new()),
+                UtunBlockHeld::Unread,
+            ] {
+                assert!(
+                    bsd_subnet_restore_writes(cidr, v6, "utun7", &held).is_empty(),
+                    "{cidr}: {held:?}"
+                );
+            }
+        }
+    }
+
+    /// The macOS guard reads a subnet as #4117 reads a utun's block: install's
+    /// exact lookup, its answer parsed and read three ways, then the write.
+    /// Answers as `route -n get` prints them for a `/24` subnet.
+    #[test]
+    fn bsd_guard_reads_the_subnet_three_ways() {
+        let prefix = bsd_subnet_prefix("10.249.49.0/24").unwrap();
+        let answer = |destination: &str, mask: &str, interface: &str| {
+            [
+                format!("   route to: {destination}"),
+                format!("destination: {destination}"),
+                format!("       mask: {mask}"),
+                format!("  interface: {interface}"),
+                "      flags: <UP,DONE,STATIC>".to_string(),
+            ]
+            .join("\n")
+        };
+        let read = |out: &str| utun_block_held(parse_bsd_route_get(out).as_ref(), prefix, "utun7");
+        // Ours: nothing to write.
+        let ours = read(&answer("10.249.49.0", "255.255.255.0", "utun7"));
+        assert_eq!(ours, UtunBlockHeld::Ours);
+        // A sibling org's utun holds exactly the prefix: it keeps it.
+        let sibling = read(&answer("10.249.49.0", "255.255.255.0", "utun9"));
+        assert_eq!(sibling, UtunBlockHeld::Elsewhere("utun9".into()));
+        // Deleted: `not in table`, or the default route that covers it.
+        let gone = read("route: writing to routing socket: not in table\n");
+        let covered = read(&answer("default", "default", "en0"));
+        assert_eq!(gone, UtunBlockHeld::Absent);
+        assert_eq!(covered, UtunBlockHeld::Absent);
+        let add = bsd_subnet_restore_writes("10.249.49.0/24", false, "utun7", &gone);
+        assert_eq!(
+            add,
+            [vec![
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                "10.249.49.0",
+                "-prefixlen",
+                "24",
+                "-interface",
+                "utun7",
+            ]]
+        );
+        for held in [&ours, &sibling] {
+            assert!(bsd_subnet_restore_writes("10.249.49.0/24", false, "utun7", held).is_empty());
+        }
+        // The lookup is install's own.
+        assert_eq!(
+            bsd_cidr_get_args("10.249.49.0/24", false).unwrap(),
+            [
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                "10.249.49.0",
+                "-prefixlen",
+                "24"
+            ]
+        );
+    }
+
+    /// A router peer's subnets are IPv4 (`router::Cidr`); the macOS read takes
+    /// nothing else.
+    #[test]
+    fn bsd_subnet_prefix_is_an_ipv4_prefix() {
+        let v4 = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
+        assert_eq!(
+            bsd_subnet_prefix("10.249.49.0/24"),
+            Some((v4("10.249.49.0"), 24))
+        );
+        assert_eq!(bsd_subnet_prefix("10.0.0.0/32"), Some((v4("10.0.0.0"), 32)));
+        for bad in ["fd00:1::/64", "10.0.0.0/33", "10.0.0.0", "10.0.0.0/", "x/8"] {
+            assert_eq!(bsd_subnet_prefix(bad), None, "{bad}");
+        }
+    }
+
+    /// What a macOS restore came to. Ours and a holder elsewhere are quiet
+    /// `Ok`s that wrote nothing; the holder's interface is named. An add with
+    /// no complaint restored the route. A refused add ("File exists": a holder
+    /// came between the read and the add) is held, not an error. A lookup
+    /// that could not run, and any other complaint, are failures.
+    #[test]
+    fn bsd_outcome_reads_the_lookup_and_the_complaint() {
+        use UtunBlockHeld::{Absent, Elsewhere, Ours, Unread};
+        assert_eq!(
+            bsd_subnet_outcome(&Ours, None).unwrap(),
+            SubnetRestore::Ours
+        );
+        assert_eq!(
+            bsd_subnet_outcome(&Elsewhere("utun9".into()), None).unwrap(),
+            SubnetRestore::Held("utun9".into())
+        );
+        assert_eq!(
+            bsd_subnet_outcome(&Absent, None).unwrap(),
+            SubnetRestore::Restored
+        );
+        assert_eq!(
+            bsd_subnet_outcome(
+                &Absent,
+                Some("route: writing to routing socket: File exists")
+            )
+            .unwrap(),
+            SubnetRestore::Held(String::new())
+        );
+        assert!(bsd_subnet_outcome(&Unread, None).is_err());
+        assert!(
+            bsd_subnet_outcome(
+                &Absent,
+                Some("route: writing to routing socket: Network is unreachable")
+            )
+            .is_err()
+        );
+    }
+
+    /// "File exists" (EEXIST) is the quiet HELD outcome: another route holds
+    /// the key. Not an error, never a WARN, and no table change, so nothing
+    /// that arms another wave. Anything else is a real failure.
+    #[test]
+    fn file_exists_is_held_not_an_error() {
+        let err = |s: &str| -> std::io::Result<()> { Err(std::io::Error::other(s.to_string())) };
+        assert_eq!(
+            subnet_restore_outcome(Ok(())).unwrap(),
+            SubnetRestore::Restored
+        );
+        assert_eq!(
+            subnet_restore_outcome(err(
+                "ip [\"route\", \"add\", \"10.1.0.0/16\", \"dev\", \"roomler0\"] exited exit \
+                 status: 2: RTNETLINK answers: File exists"
+            ))
+            .unwrap(),
+            SubnetRestore::Held(String::new())
+        );
+        assert_eq!(
+            subnet_restore_outcome(err(
+                "route [\"-n\", \"add\"] exited exit status: 1: route: writing to routing \
+                 socket: File exists\nadd net 10.1.0.0: gateway utun4: File exists"
+            ))
+            .unwrap(),
+            SubnetRestore::Held(String::new())
+        );
+        assert!(subnet_restore_outcome(err("Cannot find device \"roomler0\"")).is_err());
+        assert!(subnet_restore_outcome(err("RTNETLINK answers: Network is unreachable")).is_err());
+    }
+
+    /// A key another route holds is named ONCE, when that starts, never per
+    /// wave; each prefix on its own; ours again re-arms it.
+    #[test]
+    fn a_foreign_holder_is_named_once_per_change() {
+        let mut held = Vec::new();
+        assert!(note_subnet_holder(&mut held, "10.1.0.0/16", true));
+        assert!(!note_subnet_holder(&mut held, "10.1.0.0/16", true));
+        assert!(note_subnet_holder(&mut held, "10.2.0.0/16", true));
+        assert!(!note_subnet_holder(&mut held, "10.1.0.0/16", false));
+        assert!(!note_subnet_holder(&mut held, "10.1.0.0/16", false));
+        assert!(note_subnet_holder(&mut held, "10.1.0.0/16", true));
+        assert_eq!(held, ["10.2.0.0/16", "10.1.0.0/16"]);
     }
 }
 
@@ -3595,6 +4269,11 @@ mod system {
         /// Windows. Seeded with the bring-up's decision, which logged its own.
         #[cfg(target_os = "macos")]
         utun_block_state: std::sync::Mutex<Vec<((Ipv4Addr, u8), bool)>>,
+        /// #4279 — the subnet prefixes another route holds on this host right
+        /// now ([`super::note_subnet_holder`]), so the route guard names a
+        /// holder once instead of on every wave.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        subnet_held: std::sync::Mutex<Vec<String>>,
         /// #4125 — the read path's hand-back of a packet for this utun's own
         /// address, and its count ([`Self::self_delivered`]).
         #[cfg(target_os = "macos")]
@@ -5512,6 +6191,8 @@ mod system {
                 utun_block: utun_block.map(|(block, _)| block),
                 #[cfg(target_os = "macos")]
                 utun_block_state: std::sync::Mutex::new(utun_block.into_iter().collect()),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                subnet_held: std::sync::Mutex::new(Vec::new()),
                 #[cfg(target_os = "macos")]
                 self_delivery,
                 #[cfg(windows)]
@@ -5565,6 +6246,69 @@ mod system {
     impl Drop for SystemTun {
         fn drop(&mut self) {
             own_adapters::deregister(&self.if_name);
+        }
+    }
+
+    /// #4279 — what the route guard's subnet restore came to, on the two OSes
+    /// where it reads before it writes. Windows has `winroute`'s strikes.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl SystemTun {
+        /// Our route for `cidr` is in place: a holder named earlier is gone.
+        fn subnet_is_ours(&self, cidr: &str) {
+            let mut held = self.subnet_held.lock().unwrap_or_else(|e| e.into_inner());
+            super::note_subnet_holder(&mut held, cidr, false);
+        }
+
+        /// Ours, restored and held are all `Ok`, and quiet: a restore is a
+        /// debug line (a VPN that deletes the route on every wave would make
+        /// an INFO one a flood), and a holder is named once, when it starts.
+        fn subnet_restored(
+            &self,
+            cidr: &str,
+            outcome: std::io::Result<super::SubnetRestore>,
+        ) -> std::io::Result<()> {
+            match outcome {
+                Ok(super::SubnetRestore::Ours) => {
+                    self.subnet_is_ours(cidr);
+                    Ok(())
+                }
+                Ok(super::SubnetRestore::Restored) => {
+                    self.subnet_is_ours(cidr);
+                    tracing::debug!(
+                        %cidr, dev = %self.if_name,
+                        "overlay: route guard restored a missing subnet route"
+                    );
+                    Ok(())
+                }
+                Ok(super::SubnetRestore::Held(on)) => {
+                    let named = {
+                        let mut held = self.subnet_held.lock().unwrap_or_else(|e| e.into_inner());
+                        super::note_subnet_holder(&mut held, cidr, true)
+                    };
+                    if named {
+                        let holder = if on.is_empty() {
+                            "unnamed"
+                        } else {
+                            on.as_str()
+                        };
+                        tracing::info!(
+                            %cidr, dev = %self.if_name, %holder,
+                            "overlay: another route holds this subnet's prefix (a sibling \
+                             org's adapter, another product or the host's own LAN). The \
+                             route guard leaves it, and puts ours back only once the prefix \
+                             is free; the router peer's next carrier install takes it back."
+                        );
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        %cidr, dev = %self.if_name, %e,
+                        "overlay: route guard could not restore a subnet route"
+                    );
+                    Err(e)
+                }
+            }
         }
     }
 
@@ -5848,68 +6592,28 @@ mod system {
             }
             #[cfg(target_os = "linux")]
             {
-                let mut args: Vec<String> = Vec::new();
-                if v6 {
-                    args.push("-6".into());
-                }
-                args.extend([
-                    "route".into(),
-                    "replace".into(),
-                    cidr.to_string(),
-                    "dev".into(),
-                    self.if_name.clone(),
-                ]);
-                run_cmd("ip", args).await
+                run_cmd(
+                    "ip",
+                    super::linux_cidr_install_args(cidr, v6, &self.if_name),
+                )
+                .await
             }
             #[cfg(target_os = "macos")]
             {
                 // BSD `route` wants `-net <prefix> -prefixlen <n>`; the
                 // family flag picks v4 vs v6. Delete-then-add for the same
                 // reason as the peer `/32`s: `add` is not idempotent.
-                let (net, plen) = cidr.split_once('/').unwrap_or((cidr, ""));
-                let family = if v6 { "-inet6" } else { "-inet" };
                 // #1856 — and skipped for the same reason as the peer `/32`s:
                 // the exit `/1`s are re-asserted on every wave, and a hole in
                 // them sends that instant's egress out the physical uplink.
-                if let (Ok(dest), Ok(len)) = (net.parse::<std::net::IpAddr>(), plen.parse::<u8>()) {
-                    let got = bsd_route_get(vec![
-                        "-n".into(),
-                        "get".into(),
-                        family.into(),
-                        "-net".into(),
-                        net.into(),
-                        "-prefixlen".into(),
-                        plen.into(),
-                    ])
-                    .await;
-                    if super::bsd_route_is_ours(got.as_ref(), dest, len, &self.if_name) {
-                        return Ok(());
-                    }
+                let ours = bsd_cidr_is_ours(cidr, v6, &self.if_name).await;
+                // Only the add's answer counts: the delete finds nothing on
+                // the first install.
+                let mut answer = Ok(());
+                for step in super::bsd_cidr_install_writes(cidr, v6, &self.if_name, ours) {
+                    answer = run_cmd("route", step).await;
                 }
-                let mut del: Vec<String> = vec![
-                    "-n".into(),
-                    "delete".into(),
-                    family.into(),
-                    "-net".into(),
-                    net.into(),
-                ];
-                let mut add: Vec<String> = vec![
-                    "-n".into(),
-                    "add".into(),
-                    family.into(),
-                    "-net".into(),
-                    net.into(),
-                ];
-                if !plen.is_empty() {
-                    for v in [&mut del, &mut add] {
-                        v.push("-prefixlen".into());
-                        v.push(plen.into());
-                    }
-                }
-                add.push("-interface".into());
-                add.push(self.if_name.clone());
-                let _ = run_cmd("route", del).await;
-                run_cmd("route", add).await
+                answer
             }
             #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
             {
@@ -5918,17 +6622,54 @@ mod system {
             }
         }
 
-        /// #4279 — see [`TunIo::defend_subnet_route`]. Windows only: Linux
-        /// and macOS take the trait default, their `add_cidr_route`.
-        /// `ensure` reads and writes exactly the row `add_cidr_route` makes
-        /// (this LUID, on-link, metric 1), so a route that is ours costs one
-        /// in-memory `Get` and no write, and nothing else on the interface
-        /// is touched.
-        #[cfg(target_os = "windows")]
+        /// #4279 — see [`TunIo::defend_subnet_route`]: ours back when it is
+        /// missing, and never a route that holds the prefix displaced.
         async fn defend_subnet_route(&self, cidr: &str) -> std::io::Result<()> {
-            let (addr, plen) = parse_cidr(cidr)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad cidr"))?;
-            winroute::ensure(self.dev.tun_luid(), addr, plen, 1)
+            #[cfg(target_os = "windows")]
+            {
+                // `ensure` reads and writes exactly the row `add_cidr_route`
+                // makes (this LUID, on-link, metric 1) and never another
+                // interface's, so a route that is ours costs one in-memory
+                // `Get` and no write, and the #1328 stand-down bounds a VPN
+                // that keeps deleting it.
+                let (addr, plen) = parse_cidr(cidr).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad cidr")
+                })?;
+                winroute::ensure(self.dev.tun_luid(), addr, plen, 1)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let v6 = is_v6_cidr(cidr);
+                let listed =
+                    linux_route_shown(super::linux_subnet_show_args(cidr, v6, &self.if_name)).await;
+                let writes = super::linux_subnet_restore_writes(cidr, v6, &self.if_name, listed);
+                if writes.is_empty() {
+                    return self.subnet_restored(cidr, Ok(super::SubnetRestore::Ours));
+                }
+                let mut answer = Ok(());
+                for step in writes {
+                    answer = run_cmd("ip", step).await;
+                }
+                self.subnet_restored(cidr, super::subnet_restore_outcome(answer))
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let (subnet, if_name) = (cidr.to_string(), self.if_name.clone());
+                let outcome =
+                    tokio::task::spawn_blocking(move || bsd_subnet_restore(&subnet, &if_name))
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                        .and_then(|read| read)
+                        .and_then(|(held, complaint)| {
+                            super::bsd_subnet_outcome(&held, complaint.as_deref())
+                        });
+                self.subnet_restored(cidr, outcome)
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+            {
+                let _ = cidr;
+                Ok(())
+            }
         }
 
         async fn defend_block_floor(&self) {
@@ -7324,6 +8065,41 @@ mod system {
         super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout))
     }
 
+    /// macOS — is the route for `cidr` ours? Install's exact lookup
+    /// ([`super::bsd_cidr_get_args`]) read with [`super::bsd_route_is_ours`].
+    /// `false` when it cannot tell, which install reads as "write", as it
+    /// always did. The route guard reads three ways instead
+    /// ([`bsd_subnet_restore`]).
+    #[cfg(target_os = "macos")]
+    async fn bsd_cidr_is_ours(cidr: &str, v6: bool, if_name: &str) -> bool {
+        let (net, plen) = super::bsd_cidr_parts(cidr);
+        let (Ok(dest), Ok(len), Some(get)) = (
+            net.parse::<std::net::IpAddr>(),
+            plen.parse::<u8>(),
+            super::bsd_cidr_get_args(cidr, v6),
+        ) else {
+            return false;
+        };
+        super::bsd_route_is_ours(bsd_route_get(get).await.as_ref(), dest, len, if_name)
+    }
+
+    /// #4279 — run the route guard's `ip … route show exact <cidr> dev <if>`
+    /// and say whether it listed a route ([`super::linux_route_listed`]).
+    /// `None` when `ip` did not answer, which the guard reads as "try the
+    /// add": the add cannot displace anything.
+    #[cfg(target_os = "linux")]
+    async fn linux_route_shown(args: Vec<String>) -> Option<bool> {
+        tokio::task::spawn_blocking(move || {
+            let out = std::process::Command::new("ip").args(&args).output().ok()?;
+            out.status
+                .success()
+                .then(|| super::linux_route_listed(&String::from_utf8_lossy(&out.stdout)))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// FR-97 P1a — the routing table of one family, from `netstat -rnW`: where
     /// a pin is read (see [`super::BsdTableRow`]). Empty on any failure, which
     /// reads as "no pin" and so fails toward withhold.
@@ -7678,6 +8454,44 @@ mod system {
             step,
             complaint,
         }
+    }
+
+    /// #4279 — the route guard's restore of one subnet route on a Mac:
+    /// install's exact lookup ([`super::bsd_cidr_get_args`]) read three ways,
+    /// as #4117 reads a utun's block ([`super::utun_block_held`]), then at
+    /// most install's `add`, and only when nothing holds the prefix
+    /// ([`super::bsd_subnet_restore_writes`]). Returns the read and what
+    /// `route` complained about when it made the add, if anything: `route`
+    /// exits 0 when the kernel refuses a write, so a complaint is read from
+    /// stderr ([`run_bringup`]). The lookup and the add are separate `route`
+    /// runs, so it blocks: the wave runs it on the blocking pool.
+    #[cfg(target_os = "macos")]
+    fn bsd_subnet_restore(
+        cidr: &str,
+        if_name: &str,
+    ) -> std::io::Result<(super::UtunBlockHeld, Option<String>)> {
+        let (Some(prefix), Some(get)) = (
+            super::bsd_subnet_prefix(cidr),
+            super::bsd_cidr_get_args(cidr, false),
+        ) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("not an IPv4 subnet: {cidr}"),
+            ));
+        };
+        let held = match std::process::Command::new("route").args(&get).output() {
+            Ok(out) => super::utun_block_held(
+                super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout)).as_ref(),
+                prefix,
+                if_name,
+            ),
+            Err(_) => super::UtunBlockHeld::Unread,
+        };
+        let mut complaint = None;
+        for step in super::bsd_subnet_restore_writes(cidr, false, if_name, &held) {
+            complaint = run_bringup("route", &step).1;
+        }
+        Ok((held, complaint))
     }
 
     /// One command of the macOS bring-up or of a block decision: what it
@@ -10195,6 +11009,189 @@ mod macos_kernel_tests {
 
         tun.del_cidr_route("10.66.0.0/16").await;
         tun.del_peer_route(peer).await;
+    }
+
+    /// #4279 — the words of the INFO that names a subnet's other holder.
+    const SUBNET_HELD: &str = "another route holds this subnet's prefix";
+
+    /// #4279 — three route-guard restores of `cidr` (`net`/24) under `route -n
+    /// monitor`, then a control write on `lo0` for `control` that the monitor
+    /// must see. Returns every write that names the subnet, as `net` or as
+    /// route(8) may shorten it (`short`): a refused add included, because the
+    /// kernel still reports it to every routing socket (`RTM_ADD` with errno
+    /// 17), and the daemon's route monitor would count it.
+    async fn subnet_writes_during_three_restores(
+        tun: &SystemTun,
+        cidr: &str,
+        (net, short): (&str, &str),
+        control: &str,
+    ) -> Vec<String> {
+        let mut mon = std::process::Command::new("route")
+            .args(["-n", "monitor"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("route monitor");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for _ in 0..3 {
+            tun.defend_subnet_route(cidr)
+                .await
+                .expect("a restore that finds ours or a holder is not an error");
+        }
+        sh(
+            "route",
+            &["-n", "add", "-inet", control, "-interface", "lo0"],
+        );
+        sh("route", &["-n", "delete", "-inet", control]);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = mon.kill();
+        let out = mon.wait_with_output().expect("route monitor output");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let blocks: Vec<&str> = text.split("got message of size").collect();
+        assert!(
+            blocks.iter().any(|b| is_write(b) && mentions(b, control)),
+            "the monitor did not even see the control write — this run proves nothing:\n{text}"
+        );
+        blocks
+            .iter()
+            .filter(|b| is_write(b) && (mentions(b, net) || mentions(b, short)))
+            .map(|b| b.to_string())
+            .collect()
+    }
+
+    /// #4279 — the route guard's restore of a router peer's subnet route, on
+    /// a real utun. Ours in place: no write. Deleted with nothing in its place
+    /// (what a route-reaping VPN does): back after one restore. Held exactly
+    /// by another interface (`lo0` stands in for a sibling org's utun): left
+    /// where it is with no write at all, not even an add the kernel refuses,
+    /// and the holder named once. The holder gone: ours back.
+    #[tokio::test]
+    async fn a_subnet_route_is_restored_when_missing_and_never_added_over_a_holder() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        const CIDR: &str = "10.249.49.0/24";
+        const NET: (&str, &str) = ("10.249.49.0", "10.249.49");
+        let delete = ["-n", "delete", "-inet", "-net", NET.0, "-prefixlen", "24"];
+        /// Whatever happens, no route for the subnet is left behind: the
+        /// stand-in's, ours, or one of each.
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for _ in 0..2 {
+                    let _ = std::process::Command::new("route")
+                        .args([
+                            "-n",
+                            "delete",
+                            "-inet",
+                            "-net",
+                            "10.249.49.0",
+                            "-prefixlen",
+                            "24",
+                        ])
+                        .output();
+                }
+            }
+        }
+        let _cleanup = Cleanup;
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        tun.add_cidr_route(CIDR).await.expect("install");
+        assert!(
+            block_is_ours(NET.0, 24, &iface),
+            "install routes the subnet on {iface}: {:?}",
+            block_route(NET.0, 24)
+        );
+
+        // The steady state: ours is in place, and a restore writes nothing.
+        let writes = subnet_writes_during_three_restores(&tun, CIDR, NET, "100.65.0.248").await;
+        assert!(
+            writes.is_empty(),
+            "restores that find ours must not write the table:\n{}",
+            writes.join("\n---\n")
+        );
+
+        // The incident: deleted, with nothing in its place.
+        sh("route", &delete);
+        assert_eq!(
+            held_exactly(NET.0, 24),
+            None,
+            "staging the delete failed: {:?}",
+            block_route(NET.0, 24)
+        );
+        tun.defend_subnet_route(CIDR).await.expect("restore");
+        assert!(
+            block_is_ours(NET.0, 24, &iface),
+            "one restore puts the subnet back on {iface}: {:?}\n{}",
+            block_route(NET.0, 24),
+            sh("netstat", &["-rn", "-f", "inet"])
+        );
+
+        // A holder: ours deleted, and exactly the prefix routed on lo0.
+        sh("route", &delete);
+        sh(
+            "route",
+            &[
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                NET.0,
+                "-prefixlen",
+                "24",
+                "-interface",
+                "lo0",
+            ],
+        );
+        assert_eq!(
+            held_exactly(NET.0, 24).as_deref(),
+            Some("lo0"),
+            "staging the holder failed: {:?}",
+            block_route(NET.0, 24)
+        );
+        let (logs, _logging) = Logs::start();
+        let writes = subnet_writes_during_three_restores(&tun, CIDR, NET, "100.65.0.249").await;
+        assert!(
+            writes.is_empty(),
+            "a restore beside a holder must write nothing, not even an add the kernel refuses:\n{}",
+            writes.join("\n---\n")
+        );
+        assert_eq!(
+            held_exactly(NET.0, 24).as_deref(),
+            Some("lo0"),
+            "the holder keeps the prefix: {:?}",
+            block_route(NET.0, 24)
+        );
+        let named = logs.lines_with(SUBNET_HELD);
+        assert_eq!(
+            named.len(),
+            1,
+            "the holder is named once, not per restore:\n{}",
+            logs.text()
+        );
+        assert!(
+            names(&named[0], "lo0"),
+            "the INFO names the holder: {}",
+            named[0]
+        );
+
+        // The holder goes: ours is back.
+        sh("route", &delete);
+        tun.defend_subnet_route(CIDR)
+            .await
+            .expect("restore after the holder");
+        assert!(
+            block_is_ours(NET.0, 24, &iface),
+            "with the holder gone the subnet is back on {iface}: {:?}",
+            block_route(NET.0, 24)
+        );
+        tun.del_cidr_route(CIDR).await;
     }
 
     /// #1856 follow-up — route(8) prints ANY all-zeros destination as

@@ -493,7 +493,7 @@ mod tests {
             pinned.to_vec()
         }
         /// An answer only this device gives. A shim that kept the trait's
-        /// default would reach `add_cidr_route` instead, which answers `Ok`.
+        /// default would answer `Ok` without writing anything.
         async fn defend_subnet_route(&self, cidr: &str) -> std::io::Result<()> {
             Err(std::io::Error::other(format!("os device defended {cidr}")))
         }
@@ -511,12 +511,10 @@ mod tests {
         assert_eq!(split.stale_host_exemptions(&pinned).await, pinned.to_vec());
     }
 
-    /// #4279 — the route guard's subnet re-assert reaches the real device.
-    /// The trait's default would still write the route, through
-    /// `add_cidr_route`, but on Windows that path never stands down, so a
-    /// shim that dropped the forward would bring back the unbounded fight
-    /// with a VPN that keeps deleting the route, on every host that serves
-    /// SSH.
+    /// #4279 — the route guard's subnet restore reaches the real device. The
+    /// trait's default does nothing, so a shim that dropped the forward would
+    /// leave every subnet route undefended on every host that serves SSH,
+    /// which is when the OS device sits under this shim.
     #[tokio::test]
     async fn the_subnet_reassert_reaches_the_os_device() {
         let (mock, _seen) = mock_os_tun();

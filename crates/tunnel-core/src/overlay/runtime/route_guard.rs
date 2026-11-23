@@ -69,15 +69,15 @@ pub(super) enum Defend {
     AssertPeer(Ipv4Addr),
     /// #4279 — an installed router peer's approved subnet, as
     /// [`OverlayRuntime::install_subnets`] routed it and the netmap still
-    /// approves it ([`defended_subnets_of`]): (re-)add our route via the
-    /// overlay NIC if it is missing
-    /// ([`TunIo::defend_subnet_route`]). NO eviction: another interface may
-    /// route the same range legitimately (the host's own LAN, a corp VPN's
-    /// split include), so only our own row is written. Before this arm a
-    /// subnet route that anything deleted stayed missing until the next
-    /// carrier install for that peer ran `install_subnets` again — 35 minutes
-    /// on a Windows host on 2026-11-21, with the router peer reading online
-    /// throughout.
+    /// approves it ([`defended_subnets_of`]): put our route back via the
+    /// overlay NIC when it is MISSING ([`TunIo::defend_subnet_route`]).
+    /// NEVER displaces: another interface may hold the same prefix on purpose
+    /// (a sibling org's adapter, the host's own LAN, a corp VPN's split
+    /// include), and a guard that took it back would flip it with a sibling
+    /// org's guard on every wave. Before this arm a subnet route that anything
+    /// deleted stayed missing until the next carrier install for that peer ran
+    /// `install_subnets` again — 35 minutes on a Windows host on 2026-11-21,
+    /// with the router peer reading online throughout.
     AssertSubnet(crate::overlay::router::Cidr),
     /// Our OWN addresses — the self `/32` plus (on Windows) the derived v6
     /// `/128` and the connected ULA `/96`: EVICTION-ONLY
