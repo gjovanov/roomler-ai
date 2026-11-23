@@ -39,17 +39,17 @@ describe('FR-135 R1 — the recovery decision', () => {
     expect(r.onFailure(10, 1_500)).toBe(false)
   })
 
-  it('lets a chunk gap close the gate only on an ordered channel with the switch on', () => {
+  it('lets a chunk gap close the gate only on the ordered channel with the switch on', () => {
+    // FR-148 P4b-2 — the channel is the message's: `video-bytes` is ordered,
+    // `video-deadline` is not.
     const r = createDecodeRecovery()
-    expect(r.gapClosesGate()).toBe(false)
+    expect(r.gapClosesGate(false)).toBe(false)
+    expect(r.gapClosesGate(true)).toBe(false)
     r.setEnabled(true)
-    expect(r.gapClosesGate()).toBe(true)
-    r.setUnorderedChannel(true)
-    expect(r.gapClosesGate()).toBe(false)
-    r.setUnorderedChannel(false)
-    expect(r.gapClosesGate()).toBe(true)
+    expect(r.gapClosesGate(false)).toBe(true)
+    expect(r.gapClosesGate(true)).toBe(false)
     r.setEnabled(false)
-    expect(r.gapClosesGate()).toBe(false)
+    expect(r.gapClosesGate(false)).toBe(false)
   })
 
   it('times an outage from the failure to the first frame, once', () => {
@@ -362,21 +362,24 @@ describe.each(DC_CODECS)('FR-135 R1 — the data-channel worker on $name', ({ co
   })
 
   it.each([
-    ['with the switch off', { decodeRecover: false, chunkFraming: true }],
-    ['on an unordered channel, where a gap is routine', { decodeRecover: true, chunkFraming: true, unorderedVideo: true }],
-  ])('keeps decoding the deltas behind a chunk gap %s', async (_name, init) => {
+    ['with the switch off', { decodeRecover: false, chunkFraming: true }, false],
+    // FR-148 P4b-2 — the unordered channel is `video-deadline` now, and the
+    // page marks each message it relays off it.
+    ['on video-deadline, where a gap is routine', { decodeRecover: true, chunkFraming: true }, true],
+  ])('keeps decoding the deltas behind a chunk gap %s', async (_name, init, deadline) => {
     const send = await start(init)
+    const chunk = (bytes: ArrayBuffer) => send(deadline ? { type: 'chunk', bytes, deadline: true } : { type: 'chunk', bytes })
     const decoder = FakeDecoder.instances[0]!
-    send({ type: 'chunk', bytes: framedChunk(1, 0, 1, frameBytes(true, 1)) })
-    send({ type: 'chunk', bytes: framedChunk(2, 0, 1, frameBytes(false, 2)) })
+    chunk(framedChunk(1, 0, 1, frameBytes(true, 1)))
+    chunk(framedChunk(2, 0, 1, frameBytes(false, 2)))
     decoder.init.output(fakeFrame(1))
     decoder.init.output(fakeFrame(2))
     clock += 1_000 // past the resync debounce
     posted = []
 
-    send({ type: 'chunk', bytes: framedChunk(3, 0, 2, frameBytes(false, 3)) })
-    send({ type: 'chunk', bytes: framedChunk(4, 0, 1, frameBytes(false, 4)) })
-    send({ type: 'chunk', bytes: framedChunk(5, 0, 1, frameBytes(false, 5)) })
+    chunk(framedChunk(3, 0, 2, frameBytes(false, 3)))
+    chunk(framedChunk(4, 0, 1, frameBytes(false, 4)))
+    chunk(framedChunk(5, 0, 1, frameBytes(false, 5)))
     // The gap is still counted and still asks for a key frame, as it always has.
     expect(ofType('frame-rejected')).toHaveLength(1)
     expect(ofType('request-keyframe')).toHaveLength(1)
@@ -384,15 +387,18 @@ describe.each(DC_CODECS)('FR-135 R1 — the data-channel worker on $name', ({ co
     expect(decoder.chunks.map((c) => c.type)).toEqual(['key', 'delta', 'delta', 'delta'])
   })
 
-  it('keeps the channel flag across the idempotent visible-canvas re-init', async () => {
+  it('closes the gate behind a gap on video-bytes whatever an init-canvas says of the retired opt-in', async () => {
+    // FR-148 P4b-2 — `unorderedVideo` is read no more: `video-bytes` is always
+    // ordered, so a gap on it re-arms the gate.
     const send = await start({ decodeRecover: true, chunkFraming: true, unorderedVideo: true })
-    send({ type: 'init-canvas', canvas: fakeCanvas() })
+    send({ type: 'init-canvas', canvas: fakeCanvas(), unorderedVideo: true })
     const decoder = FakeDecoder.instances[0]!
     send({ type: 'chunk', bytes: framedChunk(1, 0, 1, frameBytes(true, 1)) })
     decoder.init.output(fakeFrame(1))
     clock += 1_000
     send({ type: 'chunk', bytes: framedChunk(2, 0, 2, frameBytes(false, 2)) })
     send({ type: 'chunk', bytes: framedChunk(3, 0, 1, frameBytes(false, 3)) })
-    expect(decoder.chunks.map((c) => c.type)).toEqual(['key', 'delta'])
+    expect(ofType('frame-rejected')).toHaveLength(1)
+    expect(decoder.chunks.map((c) => c.type)).toEqual(['key'])
   })
 })
