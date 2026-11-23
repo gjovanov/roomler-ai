@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2156`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:3352`).
+(`agents/roomlerd/src/signaling.rs:3383`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -358,7 +358,7 @@ decide."*
 1. A node opts in locally (`relay_server_enabled`, `relay_server_port`) and advertises the
    capability verb `relay-server` through `models::RpcCap` — variant → `wire()` arm → `ALL`
    entry. ⚠️ Equality matching only: `relay` is a prefix of `relay-server`, the
-   `ssh`/`ssh-consent` trap. (`RpcCap::ALL` is `[RpcCap; 6]` at `models.rs:333`, a
+   `ssh`/`ssh-consent` trap. (`RpcCap::ALL` is `[RpcCap; 6]` at `models.rs:338`, a
    fixed-size array — the **compiler** forces the entry, not a test.)
 2. An admin approves the device — the offer is not the grant (§2, gate 3).
 3. The **server** mints the session and pushes it to both nodes plus the relay.
@@ -409,7 +409,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
 claimed four default-deny gates; there are three. `OverlayAclMode` derives `#[default] Off`
-(`crates/remote_control/src/models.rs:1799`), documented as *"every node sees every peer…
+(`crates/remote_control/src/models.rs:1804`), documented as *"every node sees every peer…
 The default, so enabling the feature never breaks a live mesh"*; `Warn` *"ship[s] the
 permissive netmap"*; and `CLAUDE.md`'s own open-issues list records that **nothing has ever
 run under `enforce` in the field**. Tailscale's `cap/relay` is an *affirmative grant*; a
@@ -615,7 +615,7 @@ So the design is:
 - **The transport is a fourth `RelayConn` impl.** `Carrier::Relay { conn: Arc<dyn RelayConn>, dst, dead }`
   (`wg.rs:159`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:416`)
   just calls `conn.send_to(buf, dst)`. DERP plugs in exactly this way — `impl RelayConn for
-  DerpConn` (`transport/derp.rs:276`), `DerpMux::conn_for` (`derp.rs:439`) vending one per
+  DerpConn` (`transport/derp.rs:281`), `DerpMux::conn_for` (`derp.rs:486`) vending one per
   peer off a shared connection — and there are already **three** production impls
   (`DerpConn`, `TurnRelayConn` `transport/relay.rs:415`, `UdpRelayConn` `:564`). An org relay
   is a fourth, plus an `OrgRelayMux` shaped like `DerpMux`.
@@ -688,8 +688,8 @@ evidence that justifies it.
 
 ⚠️ **The precedent:** FR-18's field log records `dropped_stale` *"could NOT be evaluated —
 the counter was added without a reader"*. It has one now: the agent's `/derp` loop logs
-`stale_drops()` (`transport/derp.rs:426`) as `dropped_stale` whenever it moves
-(`agents/roomlerd/src/derp.rs:477`).
+the count `stale_drops()` reads (`transport/derp.rs:461`) as `dropped_stale` whenever it moves
+(`agents/roomlerd/src/derp.rs:521`, through `drops()` since FR-148 D52, on the drop line).
 
 | surface | addition |
 |---|---|
@@ -719,7 +719,7 @@ Verified against `origin/master`, 2026-08-28.
 | change | file:line |
 |---|---|
 | Relay sub-kind gains `Org` | `crates/tunnel-core/src/overlay/relay_link.rs:158` `RelayKind` |
-| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:276` (`impl RelayConn for DerpConn`) and `derp.rs:439` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
+| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:281` (`impl RelayConn for DerpConn`) and `derp.rs:486` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
 | Client cascade branch | `relay_link.rs:1289` `relay_strategy` |
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |

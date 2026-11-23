@@ -74,6 +74,11 @@ pub mod ffmpeg;
 pub mod aimd;
 /// FR-35 — the constrained ceiling learns the pair (pure controller).
 pub mod ceiling_learn;
+/// FR-148 D51 B4f, B4g — the time an encode is charged (pure): the pts libvpx is
+/// handed, today's or, where the in-flight budget acts, its gap less the time the
+/// pump's gate held frames back, down to the interval. The VP9-444 path's alone.
+#[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
+pub mod charge;
 /// FR-112 P1 — an encoding thread asks the scheduler for its clock (a Linux
 /// utilisation clamp): a periodic encoder is otherwise parked on a slow core.
 pub mod clock;

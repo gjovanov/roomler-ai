@@ -58,7 +58,7 @@ The shared rules live in `crates/remote_control/src/upgrade_auth.rs`.
 From 0.4.210 every native dial puts its credential in an `Authorization: Bearer`
 header whose value is marked sensitive: the daemon's control socket
 (`agents/roomlerd/src/signaling.rs:1842`), its central and regional DERP sockets
-(`agents/roomlerd/src/derp.rs:381`) and the CLI's tunnel-client socket. The URL
+(`agents/roomlerd/src/derp.rs:424`) and the CLI's tunnel-client socket. The URL
 names the role and the tenant only. The rule is one function in each client
 (`agents/roomlerd/src/ws_connect.rs:224`, `agents/roomler-cli/src/forward.rs:442`):
 
@@ -842,9 +842,9 @@ reaches every viewer whatever their view says. Locked against a real worker by
 `crates/tests/src/conference_view_tests.rs:439`.
 
 **What "visible" is.** Each remote `VideoTile` runs an `IntersectionObserver` on its root
-(`ui/src/components/conference/VideoTile.vue:507`), which applies the clip of every
+(`ui/src/components/conference/VideoTile.vue:481`), which applies the clip of every
 scrolling ancestor, and emits `visible: { visible, w, h }` once per change and `false` on
-unmount (`:553`), while its parent still listens. Every layout forwards it with the stream
+unmount (`:527`), while its parent still listens. Every layout forwards it with the stream
 key (`layouts/TiledLayout.vue:23`, `SpotlightLayout.vue:25`, `SidebarLayout.vue:25`), the
 call page hands it to the store (`ConferenceView.vue:435`), and the store keeps the tiles on
 screen, maps stream keys to the video producers it consumes
@@ -861,7 +861,7 @@ declared viewer that never reported would have every camera paused.
 | tiled | `primary`, at most `tiledMaxTiles` (`useConferenceLayout.ts:306`), no scrolling | exactly the rendered remote tiles |
 | spotlight | the big tile, a 120 px filmstrip that scrolls sideways | the big tile plus the strip tiles inside the strip's viewport |
 | sidebar | the big tile, a 280 px column that scrolls | the same rule |
-| the mini view (another page of the app, `MiniConference.vue`) | up to three remote cameras in the app bar's widget, no `VideoTile` | exactly those three (the widget reports them itself; the per-key count tolerates its report overlapping a tile's during the page switch); the rest paused until the call page is back; audio flows |
+| the mini view (another page of the app, `MiniConference.vue`) | up to three remote cameras in the app bar's widget, no `VideoTile` | exactly those three (the widget reports them itself; the per-key count tolerates its report overlapping a tile's during the page switch); the rest paused until the call page is back; audio flows, and the app shell's `CallAudio` plays every participant's, these three included (#3563) |
 
 A tile scrolled into view plays within a second: one debounce, one round trip, and the
 worker requests a key frame the moment a consumer resumes (`SimpleConsumer::UserOnResumed`
@@ -918,7 +918,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
-| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1186`), `RETIRED_RC_TAG_FAMILIES` (`:1215`), `RETIRED_USER_WS_NAMESPACES` (`:1220`) and `RETIRED_MODULE_IDS` (`:1224`), locked by `retired_rpc_verbs_are_never_reused` (`:8324`), `retired_wire_families_and_module_ids_are_never_reused` (`:8393`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5308`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1191`), `RETIRED_RC_TAG_FAMILIES` (`:1220`), `RETIRED_USER_WS_NAMESPACES` (`:1225`) and `RETIRED_MODULE_IDS` (`:1229`), locked by `retired_rpc_verbs_are_never_reused` (`:8329`), `retired_wire_families_and_module_ids_are_never_reused` (`:8398`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5308`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 
@@ -1029,7 +1029,7 @@ UDP-blocked:
   FR-103 looks for a newer token in the config file, else renews this one, and
   retries once (`agents/roomlerd/src/signaling.rs:1311`). Otherwise the agent
   waits 30 s, 60 s, 5 min, then an hour between tries
-  (`agents/roomlerd/src/signaling.rs:1639`), and the third refusal in a row raises
+  (`agents/roomlerd/src/signaling.rs:1625`), and the third refusal in a row raises
   the re-enrollment prompt on the primary org.
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially

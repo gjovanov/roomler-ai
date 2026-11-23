@@ -1,6 +1,6 @@
 # FR-133: Nothing a person reads calls the daemon an "agent" — it is `roomlerd`
 
-**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 shipped in 0.4.192 (#3209); AC1 to AC4 and AC7 met 2026-11-03; P2, P3 and P4 proposed (D1–D3 decided 2026-10-30); spec and claim 2026-10-30 ·
+**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 shipped in 0.4.192 (#3209); AC1 to AC4 and AC7 met 2026-11-03; P2a built (#4307), for the next agent release; P2b built (#4314), rides a promote; P2c, P3 and P4 proposed (D1–D3 decided 2026-10-30); spec and claim 2026-10-30 ·
 **Related:** FR-46 ([#1051](https://github.com/gjovanov/roomler-ai/issues/1051), the retired `roomler-agent` names; its "MSI installer identity — its own program" row is this FR's P1) ·
 FR-21 (the retired-name guard, `scripts/name-audit.sh`) · FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), the wizard; its phase C renames the wizard's own words)
 
@@ -34,7 +34,7 @@ approximate, wire/identity names excluded):
 | the docs site | `ui/docs/content` | ~237 lines |
 
 FR-46 already classified the MSI's display identity as "renaming breaks upgrade detection — its
-own program" (`docs/fr/FR-46-eradicate-the-retired-agent-name.md:276`). Measured on master:
+own program" (`docs/fr/FR-46-eradicate-the-retired-agent-name.md:383`). Measured on master:
 Windows Installer matches an upgrade by its UpgradeCode, and `install_detect` keys on the
 UpgradeCode's registry presence, so neither reads the ProductName. What does read it is
 `scripts/install.ps1`: the post-install check (`:279`) and `-Uninstall` (`:453`) find the product by
@@ -58,7 +58,9 @@ and needs those lookups to accept both names.
 |---|---|---|---|
 | P0 | spec + ledger row + issue | — | this commit |
 | P1 | the install surfaces: the MSI ProductName, shortcut and title (both flavours), the Authenticode description, the `.deb`/`.rpm` summary; `install.ps1`'s two lookups and the verify script accept both names; `install.sh`/`install.ps1` output. The wizard's own words ride FR-129 phase C, and the macOS grant notices ride #3164. **Where it landed:** `agents/roomlerd/wix/main.wxs:73` (Name), `:339` (shortcut), `:359` (title); `agents/roomlerd/wix-perMachine/main.wxs:71`, `:308`; `.github/workflows/release-agent.yml:2026`; `agents/roomlerd/Cargo.toml:7` (roomlerd ships no `.rpm`: only the companion does, and its summary never said "agent"); `scripts/install.ps1:109` (the exact names, old and new, per flavour), `:294`, `:476`; `agents/roomlerd/scripts/m3-a1-verify-win11.ps1:387`. Proved by `.github/workflows/installer-smoke.yml:1699` | copy: a revert. The lookups match both names, so an older or a newer MSI is always found | shipped: [#3209](https://github.com/gjovanov/roomler-ai/pull/3209) merged 2026-10-31, first released in 0.4.192. Field-verified on the CI MSI on 2026-10-31 and on the released 0.4.197 packages (the log below) |
-| P2 | the companion and the web app, the viewer's banners included, and the daemon's own notifications that still open "Roomler agent:" (`agents/roomlerd/src/signaling.rs:1352`, `:1410`, `:1671`, `agents/roomlerd/src/app.rs:2645`) | a revert | proposed |
+| P2a | the daemon's own notifications (the needs-attention notice: a crash loop, a re-enrollment, a server-side close, a duplicate-instance duel) and the updater reasons they carry, which now open `roomlerd:`, say the server's close reason in words and show a release as its version (`notify::versions_not_tags` in `crates/agent-core/src/notify.rs`, at the one writer); the companion's pages, the errors it hands them, and the key descriptions on its Settings page (`crates/agent-core/src/config_surface.rs`). Held by `agents/roomlerd/src/notice_text_tests.rs`, the `says_roomlerd` tests in `agents/roomler-desktop/src/commands.rs`, and four node-core tests (three in `notify.rs`, one in `config_surface.rs`) | a revert | built: [#4307](https://github.com/gjovanov/roomler-ai/pull/4307), rides an agent release |
+| P2b | the web app (`ui/src`) and the server's own words: the server-written half of the viewer's banners (the page's text and the refusal reasons the server sends), and the server text a notice quotes (`crates/modules/fleet/src/hub.rs`, `socket.rs`, `auth_agent.rs`) | a revert | built (#4314), rides a promote |
+| P2c | the daemon-written half of the viewer's banners: about 36 lines in 13 files of `agents/roomlerd/src` (`capture/mod.rs`, `audio_source.rs`, `encode/caps.rs`, `apps/{linux,macos,mod}.rs`, `input/reach.rs`, `keep_busy/engine.rs`, `files.rs`, `files/drawer_edges.rs`, `virtual_desktop.rs`, `peer.rs`, `display_match.rs`); and the CLI and LocalAPI output: about 30 lines of `roomlerd` (`service.rs`'s enroll output, `app.rs`, `tunnel/client_mgr.rs`, `tunnel/acceptor.rs`, `probe_target.rs`, `one_row.rs`) and about 25 of `agents/roomler-cli/src` | a revert | proposed, rides an agent release |
 | P3 | the docs site (`ui/docs/content`) | a revert | proposed |
 | P4 | a guard in CI: person-facing strings may not say "agent" except the listed identities (an allowlist, in the shape of `name-audit.sh`) | the guard's own baseline | proposed |
 | D | docs: `docs/installation.md` (what Windows lists), the `ship-it` skill (the signing description), this spec's log | — | `docs/installation.md` § Windows rides P1's PR, and so does `ship-it` § 2: the MSI's name is display only, and a change to it ships in one order, because `install.ps1` matches exact names and is served by the server image. Neither `ship-it` nor `docs/code-signing.md` ever named the signing description (checked 2026-10-31), so there was nothing to rename. This log, as phases land |
@@ -84,6 +86,9 @@ and needs those lookups to accept both names.
 - [ ] **AC5** — Every page, progress line and Done text of the released wizard, every companion
       page and the web app's person-facing strings contain no "agent" outside the allowlist
       (asserted by tests, then by P4's guard).
+- [ ] **AC5b** — The daemon's notifications, the text the daemon writes for the web viewer, and
+      the CLI and LocalAPI output contain no "agent" outside the allowlist (asserted by tests,
+      then by P4's guard).
 - [ ] **AC6** — The docs site's pages say `roomlerd`.
 - [x] **AC7** — Docs: `docs/installation.md` and the `ship-it` skill updated, with a
       `docs/README.md` row if a doc is added. **Met:** `docs/installation.md:550` and

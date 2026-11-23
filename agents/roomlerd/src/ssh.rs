@@ -2650,7 +2650,11 @@ mod sshd {
             org: String::new(),
             expires_at: std::time::Instant::now() + timeout,
         };
-        let native = indicator.show_prompt(view.clone());
+        // FR-149 P1 — on a one-row Mac's root daemon the screen worker's
+        // panel first, `PANEL_WITHIN` at most (`companion::COMPANION_START_BUDGET`'s
+        // assertion counts it).
+        let on_screen = indicator.show_prompt(view.clone()).await;
+        let native = on_screen.native;
         let mut prompt = crate::consent::PendingPrompt {
             kind: crate::consent::PromptKind::Ssh,
             asked_by: caller,
@@ -2667,7 +2671,10 @@ mod sshd {
                 crate::consent::PromptSurface::Companion
             },
         };
-        let marker = match broker.write_prompt(sentinel, &prompt) {
+        // FR-149 P1 — and read on the session panel's books after it.
+        let marker = match crate::indicator::session_panel::write_marker(
+            broker, sentinel, &prompt, &on_screen,
+        ) {
             Ok(_) => true,
             Err(e) => {
                 warn!(?caller, %sentinel, %e, native, "ssh: could not write the .pending consent marker");
@@ -2702,9 +2709,16 @@ mod sshd {
             // this read `native` alone, so a question the companion showed
             // and nobody answered was reported as one nobody could be asked.
             have_surface = (companion_up && marker) || notified;
-            why_not = tray.why_not_shown(marker);
+            // #4164 — a panel busy with another question wins over the app's
+            // cause (`session_panel::Prompted::why_not_shown`).
+            why_not = on_screen.why_not_shown(tray.why_not_shown(marker));
         }
-        info!(?caller, %sentinel, native, notified, have_surface, "consent prompt surface (ssh)");
+        info!(
+            ?caller, %sentinel, native, panel = on_screen.panel(),
+            session_panel = on_screen.session_panel(), why = on_screen.why(),
+            panel_busy = on_screen.panel_busy(), notified, have_surface,
+            "consent prompt surface (ssh)"
+        );
 
         let decision = asking.await;
         // The single convergence point: answered, timed out, or resolved from
@@ -3227,6 +3241,10 @@ const MAX_PENDING_GRANTS: usize = 16;
 pub enum GrantRejected {
     /// The key the server validated does not parse here.
     UnparseableKey(String),
+    /// #3558 — a copy of a grant id this process still holds, or let go of
+    /// inside [`GRANT_ID_HORIZON`]. It is not recorded, so the first copy's
+    /// entry, window and acknowledgement stay exactly as they were.
+    Duplicate(GrantSeen),
 }
 
 #[cfg(feature = "ssh-server")]
@@ -3235,7 +3253,13 @@ impl GrantRejected {
     pub fn refusal(&self) -> roomler_ai_remote_control::models::SshGrantRefusal {
         use roomler_ai_remote_control::models::SshGrantRefusal;
         match self {
-            Self::UnparseableKey(_) => SshGrantRefusal::Invalid,
+            // `Invalid` is "the device could not use what the server
+            // validated", which the caller hears as `grant_refused`. A copy
+            // is not `Other`, a reason this build would not know, and not
+            // `Expired`, which #3511 retired. On the worker's own path the
+            // copy's refusal reaches no waiter anyway: the first copy's
+            // acknowledgement already removed it (`SshGrantAcks::deliver`).
+            Self::UnparseableKey(_) | Self::Duplicate(_) => SshGrantRefusal::Invalid,
         }
     }
 }
@@ -3245,6 +3269,9 @@ impl std::fmt::Display for GrantRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnparseableKey(e) => write!(f, "grant carries an unparseable public key: {e}"),
+            Self::Duplicate(seen) => {
+                write!(f, "a grant id is honoured at most once, and {seen}")
+            }
         }
     }
 }
@@ -3317,13 +3344,31 @@ pub fn record_grant(
     };
 
     let mut grants = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
-    prune(&mut grants);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    prune(&mut grants, &mut spent, now);
+    // #3558 — a grant id is honoured at most once. Checked before the drop
+    // below, so a copy never evicts a live grant, and before the push, so it
+    // never becomes a second redeemable entry with a window of its own.
+    let seen = if grants.iter().any(|g| g.grant_id == grant.grant_id) {
+        Some(GrantSeen::Pending)
+    } else {
+        spent.recall(&grant.grant_id, now)
+    };
+    if let Some(seen) = seen {
+        return Err(GrantRejected::Duplicate(seen));
+    }
     if grants.len() >= MAX_PENDING_GRANTS {
         // Drop the OLDEST rather than refusing the newest: the newest is the
         // one a caller is actively waiting on, and the oldest is within
         // seconds of expiring anyway.
-        grants.remove(0);
-        tracing::warn!("ssh: pending-grant table full — dropped the oldest");
+        let dropped = grants.remove(0);
+        tracing::warn!(
+            grant_id = %dropped.grant_id,
+            "ssh: pending-grant table full — dropped the oldest"
+        );
+        // Burned, as an expired one is: a late copy gets no window of its own.
+        spent.remember(dropped.grant_id, GrantSeen::Dropped, now);
     }
     tracing::info!(
         grant_id = %grant.grant_id, caller = ?grant.caller,
@@ -3335,14 +3380,15 @@ pub fn record_grant(
     Ok(())
 }
 
-/// Drop everything past its deadline.
+/// Drop everything past its deadline, and remember each dropped id (#3558):
+/// a grant that timed out unredeemed is burned, as a redeemed one is.
 #[cfg(feature = "ssh-server")]
-fn prune(grants: &mut Vec<Grant>) {
-    let now = std::time::Instant::now();
+fn prune(grants: &mut Vec<Grant>, spent: &mut RememberedIds<GrantSeen>, now: std::time::Instant) {
     grants.retain(|g| {
         let live = g.deadline > now;
         if !live {
             tracing::debug!(grant_id = %g.grant_id, "ssh: grant expired unredeemed");
+            spent.remember(g.grant_id.clone(), GrantSeen::Expired, now);
         }
         live
     });
@@ -3350,31 +3396,188 @@ fn prune(grants: &mut Vec<Grant>) {
 
 /// Consume the live grant admitting `key`, if any. Single use: a redeemed
 /// grant is gone, so a captured public key cannot be replayed into a second
-/// session.
+/// session — and its id is remembered (#3558), so a copy of the grant that
+/// arrives later is not recorded as new.
 #[cfg(feature = "ssh-server")]
 fn take_grant_for(key: &russh::keys::ssh_key::PublicKey) -> Option<Grant> {
     let mut grants = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
-    prune(&mut grants);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    prune(&mut grants, &mut spent, now);
     let idx = grants.iter().position(|g| {
         russh::keys::ssh_key::PublicKey::from_openssh(&g.public_key)
             .is_ok_and(|k| k.key_data() == key.key_data())
     })?;
-    Some(grants.remove(idx))
+    let grant = grants.remove(idx);
+    spent.remember(grant.grant_id.clone(), GrantSeen::Redeemed, now);
+    Some(grant)
 }
 
 /// How many grants are pending — surfaced in diagnostics.
 #[cfg(feature = "ssh-server")]
 pub fn pending_grants() -> usize {
     let mut grants = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
-    prune(&mut grants);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    prune(&mut grants, &mut spent, std::time::Instant::now());
     grants.len()
 }
 
-/// Test-only: empty the table so cases cannot leak into each other through
-/// process-global state.
+// ── #3558: a grant id is honoured at most once ──────────────────────────────
+//
+// A grant delivered twice used to become two redeemable entries, and a copy
+// that arrived after its grant was redeemed was recorded as new, with a fresh
+// window of its own (#3511): a captured key could open a second session. Now
+// a process refuses a copy whose id it still holds, or let go of within
+// `GRANT_ID_HORIZON`, whichever way the first copy left: redeemed, expired
+// unredeemed, or dropped from a full table.
+
+/// How long a grant id is remembered after it left the table, so that a copy
+/// of it is refused. While the grant is pending the table itself refuses a
+/// copy, so an id is refused for its whole window and this long after: ten
+/// windows (`ssh_limits::GRANT_TTL_SECS`, 60 s), at least one by construction.
+#[cfg(feature = "ssh-server")]
+const GRANT_ID_HORIZON: std::time::Duration = std::time::Duration::from_secs(
+    10 * roomler_ai_remote_control::models::ssh_limits::GRANT_TTL_SECS,
+);
+
+/// Most grant ids one memory holds; when it is full the oldest is forgotten
+/// first. An id is a few dozen bytes, so this is a few KiB, and the server
+/// mints one grant per session asked for: 256 inside the horizon is a scripted
+/// loop, not a person.
+#[cfg(feature = "ssh-server")]
+const MAX_REMEMBERED_GRANTS: usize = 256;
+
+/// What became of the first copy of a grant id, when a second one arrives.
+#[cfg(feature = "ssh-server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantSeen {
+    /// It is in the table, waiting for its connection.
+    Pending,
+    /// A connection redeemed it.
+    Redeemed,
+    /// Its window ended with nobody redeeming it.
+    Expired,
+    /// A full table dropped it to make room for a newer grant.
+    Dropped,
+}
+
+#[cfg(feature = "ssh-server")]
+impl std::fmt::Display for GrantSeen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "its first copy is still pending",
+            Self::Redeemed => "its first copy was redeemed",
+            Self::Expired => "its first copy expired unredeemed",
+            Self::Dropped => "its first copy was dropped from a full table",
+        })
+    }
+}
+
+/// Grant ids a process is done with, each until its time to be forgotten,
+/// oldest first. Every entry is kept for the same horizon, so the order of
+/// arrival is the order of forgetting, by age or by the bound alike.
+#[cfg(feature = "ssh-server")]
+#[derive(Debug)]
+struct RememberedIds<T> {
+    entries: std::collections::VecDeque<(String, T, std::time::Instant)>,
+}
+
+#[cfg(feature = "ssh-server")]
+impl<T> RememberedIds<T> {
+    const fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+#[cfg(feature = "ssh-server")]
+impl<T: Copy> RememberedIds<T> {
+    /// What is remembered about `grant_id`, if it is still remembered.
+    fn recall(&mut self, grant_id: &str, now: std::time::Instant) -> Option<T> {
+        self.forget_past(now);
+        self.entries
+            .iter()
+            .find(|(id, _, _)| id == grant_id)
+            .map(|(_, what, _)| *what)
+    }
+
+    /// Remember `grant_id` for [`GRANT_ID_HORIZON`] from `now`. A full
+    /// memory forgets its oldest id first.
+    fn remember(&mut self, grant_id: String, what: T, now: std::time::Instant) {
+        self.forget_past(now);
+        if self.entries.len() >= MAX_REMEMBERED_GRANTS
+            && let Some((oldest, _, _)) = self.entries.pop_front()
+        {
+            tracing::debug!(grant_id = %oldest, "ssh: grant-id memory full — forgot the oldest");
+        }
+        self.entries
+            .push_back((grant_id, what, now + GRANT_ID_HORIZON));
+    }
+
+    fn forget_past(&mut self, now: std::time::Instant) {
+        self.entries.retain(|(_, _, forget_at)| *forget_at > now);
+    }
+}
+
+/// The ids that left [`GRANTS`]: redeemed, expired unredeemed, or dropped.
+///
+/// Locked only while `GRANTS` is held, and always after it: one lock order,
+/// and no moment at which a grant has left the table and its id is not yet
+/// remembered.
+#[cfg(feature = "ssh-server")]
+static SPENT: std::sync::Mutex<RememberedIds<GrantSeen>> =
+    std::sync::Mutex::new(RememberedIds::new());
+
+/// The worker's memory of the grants it was asked to hand to this device's
+/// SYSTEM service (FR-105). Never [`GRANTS`] or [`SPENT`]: those back the
+/// table this process's own server reads, and a via-service grant is never
+/// redeemable here.
+#[cfg(feature = "ssh-server")]
+static SEEN_VIA_SERVICE: std::sync::Mutex<RememberedIds<()>> =
+    std::sync::Mutex::new(RememberedIds::new());
+
+/// #3558 — whether this is the first copy of a via-service grant this worker
+/// has seen. On `false` the caller logs the copy and drops it: no second ring,
+/// no acknowledgement.
+///
+/// A copy answers nothing on this path, where the worker's own path refuses
+/// one ([`GrantRejected::Duplicate`]), because here a refusal could undo the
+/// first copy's outcome. The service's claim is single use on the server, so
+/// a copy's ring ends in a refused claim, and the worker would acknowledge
+/// that as a refusal. With two server instances, the first copy's claim can
+/// land on the one that does not hold the caller's wait: that wait then stays
+/// open and still takes a worker's refusal, and the caller is denied while
+/// the service holds the grant.
+///
+/// Remembered at first sight, before any outcome: a grant the worker refused
+/// is as dead as one the service took, and the first refusal already
+/// answered.
+#[cfg(feature = "ssh-server")]
+pub(crate) fn first_sight_via_service(grant_id: &str) -> bool {
+    let mut seen = SEEN_VIA_SERVICE.lock().unwrap_or_else(|e| e.into_inner());
+    first_sight(&mut seen, grant_id, std::time::Instant::now())
+}
+
+#[cfg(feature = "ssh-server")]
+fn first_sight(seen: &mut RememberedIds<()>, grant_id: &str, now: std::time::Instant) -> bool {
+    if seen.recall(grant_id, now).is_some() {
+        return false;
+    }
+    seen.remember(grant_id.to_owned(), (), now);
+    true
+}
+
+/// Test-only: empty the table, and the ids it let go of, so cases cannot
+/// leak into each other through process-global state.
 #[cfg(all(test, feature = "ssh-server"))]
 fn clear_grants() {
     GRANTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SPENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .clear();
 }
 
 #[cfg(all(test, feature = "ssh-server"))]
@@ -4592,6 +4795,257 @@ mod tests {
             super::pending_grants() <= super::MAX_PENDING_GRANTS,
             "pending grants must stay capped, got {}",
             super::pending_grants()
+        );
+    }
+
+    // ── #3558: a grant id is honoured at most once ───────────────────────
+
+    /// Record a grant under a FIXED id, as a duplicated or replayed
+    /// `rc:ssh.grant` carries it. [`grant_for`] draws a fresh id on every
+    /// call, which is exactly what these cases must not do.
+    fn record_copy(grant_id: &str, line: &str) -> Result<(), super::GrantRejected> {
+        super::record_grant(
+            grant_id.to_string(),
+            line.to_string(),
+            "alice@example.com".into(),
+            "daemon".into(),
+            None,
+            Some(roomler_ai_remote_control::models::ConsentMode::Auto),
+            now_ms() + 30_000,
+            0,
+        )
+    }
+
+    /// Whether a connection authenticating with `key` gets in. Unlike
+    /// [`connect`], a refusal is an answer here, not a failed test.
+    async fn admits(addr: std::net::SocketAddr, key: PrivateKey) -> bool {
+        let config = Arc::new(russh::client::Config::default());
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut session = russh::client::connect_stream(config, stream, TestClient)
+            .await
+            .expect("ssh handshake");
+        let hash = session.best_supported_rsa_hash().await.unwrap().flatten();
+        session
+            .authenticate_publickey(
+                "roomler",
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+            .expect("auth exchange")
+            .success()
+    }
+
+    /// #3558 — a grant delivered twice is held once. The copy is refused
+    /// while its id is pending, so the table holds one entry and the key opens
+    /// one session. Before the fix the copy was a second redeemable entry, and
+    /// a second connection with the same key got in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_same_grant_twice_is_held_once_and_admits_one_session() {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(13);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        let addr2 = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-twice", &line).expect("the first copy is held");
+        let copy = record_copy("g-3558-twice", &line);
+        let held = super::pending_grants();
+
+        let _first = connect(addr, key.clone()).await;
+        assert!(
+            !admits(addr2, key).await,
+            "a second connection with the same key is refused after the first redeems"
+        );
+        assert_eq!(held, 1, "the table holds one entry for the two copies");
+        let refused = copy.expect_err("a copy whose id is pending is refused");
+        assert_eq!(refused.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — a copy that arrives after its grant was redeemed is refused,
+    /// and the key opens nothing more. Before the fix redemption removed the
+    /// entry, so the copy was recorded as new, with a fresh window of its own
+    /// (#3511).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copy_of_a_redeemed_grant_is_refused() {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(14);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        let addr2 = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-redeemed", &line).expect("the grant is held");
+        let _first = connect(addr, key.clone()).await;
+        assert_eq!(
+            super::pending_grants(),
+            0,
+            "redeeming the grant consumed it"
+        );
+
+        let copy = record_copy("g-3558-redeemed", &line);
+        assert!(
+            !admits(addr2, key).await,
+            "a connection with the key is refused after its grant was redeemed"
+        );
+        let refused = copy.expect_err("a copy of a redeemed grant is refused");
+        assert_eq!(refused.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — a second copy does not extend the first one's window. The copy
+    /// arrives while the first is pending and is refused, and it leaves the
+    /// first copy's deadline as it was. Once that deadline passes, nothing
+    /// admits the key. The deadline is driven as in
+    /// [`an_expired_grant_admits_nobody`]. Before the fix the copy was held
+    /// with a window from its OWN arrival, so the key outlived the first one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_copy_does_not_extend_the_first_ones_window() {
+        let _lock = grant_test().await;
+        let (key, line) = client_key(15);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-window", &line).expect("the first copy is held");
+        let deadline = super::GRANTS.lock().unwrap()[0].deadline;
+        let copy = record_copy("g-3558-window", &line);
+        assert_eq!(
+            super::GRANTS.lock().unwrap()[0].deadline,
+            deadline,
+            "the copy leaves the first copy's window as it was"
+        );
+
+        // The first copy's window ends. Entry 0 is the oldest: the first copy.
+        super::GRANTS.lock().unwrap()[0].deadline = std::time::Instant::now();
+        assert!(
+            !admits(addr, key).await,
+            "once the first copy's window ends, the key opens nothing"
+        );
+        assert!(copy.is_err(), "the copy was refused on arrival");
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — a grant that timed out unredeemed is burned as well: a late
+    /// copy of it is refused, not given a fresh window from its own arrival.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copy_of_a_grant_that_expired_unredeemed_is_refused() {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(16);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-expired", &line).expect("the grant is held");
+        super::GRANTS.lock().unwrap()[0].deadline = std::time::Instant::now();
+        assert_eq!(super::pending_grants(), 0, "its window ended unredeemed");
+
+        let copy = record_copy("g-3558-expired", &line);
+        assert!(
+            !admits(addr, key).await,
+            "a late copy of an expired grant opens nothing"
+        );
+        let refused = copy.expect_err("a late copy of an expired grant is refused");
+        assert_eq!(refused.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — recording many distinct ids, each followed by a copy, keeps
+    /// both tables within their bounds: the pending grants and the ids that
+    /// left them, some redeemed and the rest pushed out of the full table.
+    #[tokio::test]
+    async fn both_tables_stay_within_their_bounds() {
+        use super::{MAX_PENDING_GRANTS, MAX_REMEMBERED_GRANTS};
+
+        let _lock = grant_test().await;
+        let (_key, line) = client_key(17);
+        let parsed = russh::keys::ssh_key::PublicKey::from_openssh(&line).unwrap();
+        let remembered = || super::SPENT.lock().unwrap().entries.len();
+
+        let ids = MAX_REMEMBERED_GRANTS + 4 * MAX_PENDING_GRANTS;
+        for i in 0..ids {
+            let id = format!("g-3558-bound-{i}");
+            record_copy(&id, &line).expect("a new id is held");
+            assert!(
+                record_copy(&id, &line).is_err(),
+                "{id}: its copy is refused"
+            );
+            if i % 3 == 0 {
+                assert!(
+                    super::take_grant_for(&parsed).is_some(),
+                    "{id}: one redeems"
+                );
+            }
+            assert!(
+                super::pending_grants() <= MAX_PENDING_GRANTS,
+                "{id}: pending"
+            );
+            assert!(remembered() <= MAX_REMEMBERED_GRANTS, "{id}: remembered");
+        }
+        // 320 ids, 16 of them still pending: 304 left the table, more than
+        // the memory holds.
+        assert_eq!(super::pending_grants(), MAX_PENDING_GRANTS);
+        assert_eq!(remembered(), MAX_REMEMBERED_GRANTS);
+    }
+
+    /// #3558 — the worker hands a grant for the SYSTEM service on at first
+    /// sight only (FR-105): a copy of an id it has seen is dropped, whether
+    /// the first copy rang the service or was refused here.
+    #[test]
+    fn a_via_service_grant_is_handed_on_at_first_sight_only() {
+        let now = std::time::Instant::now();
+        let mut seen = super::RememberedIds::new();
+        assert!(super::first_sight(&mut seen, "g-a", now), "the first copy");
+        assert!(!super::first_sight(&mut seen, "g-a", now), "a copy of it");
+        assert!(super::first_sight(&mut seen, "g-b", now), "another grant");
+
+        // The worker's own memory, under an id no other case uses.
+        let id = format!("g-3558-service-{}", rand::random::<u64>());
+        assert!(super::first_sight_via_service(&id), "the first copy");
+        assert!(!super::first_sight_via_service(&id), "a copy of it");
+    }
+
+    /// #3558 — the via-service memory holds at most `MAX_REMEMBERED_GRANTS`
+    /// ids, and forgets the oldest first.
+    #[test]
+    fn the_via_service_memory_stays_within_its_bound() {
+        use super::MAX_REMEMBERED_GRANTS;
+
+        let now = std::time::Instant::now();
+        let mut seen = super::RememberedIds::new();
+        let ids = MAX_REMEMBERED_GRANTS + 50;
+        for i in 0..ids {
+            assert!(super::first_sight(&mut seen, &format!("g-{i}"), now));
+            assert!(seen.entries.len() <= MAX_REMEMBERED_GRANTS);
+        }
+        assert_eq!(seen.entries.len(), MAX_REMEMBERED_GRANTS);
+        assert!(
+            !super::first_sight(&mut seen, &format!("g-{}", ids - 1), now),
+            "the newest id is still remembered"
+        );
+        assert!(
+            super::first_sight(&mut seen, "g-0", now),
+            "the oldest was forgotten first"
+        );
+    }
+
+    /// #3558 — an id is remembered for the whole horizon, and forgotten once
+    /// it has passed.
+    #[test]
+    fn a_via_service_id_is_forgotten_after_the_horizon() {
+        use super::GRANT_ID_HORIZON;
+        use std::time::Duration;
+
+        let now = std::time::Instant::now();
+        let mut seen = super::RememberedIds::new();
+        assert!(super::first_sight(&mut seen, "g-h", now));
+        let inside = now + GRANT_ID_HORIZON - Duration::from_millis(1);
+        assert!(
+            !super::first_sight(&mut seen, "g-h", inside),
+            "still remembered just inside the horizon"
+        );
+        assert!(
+            super::first_sight(&mut seen, "g-h", now + GRANT_ID_HORIZON),
+            "forgotten once the horizon has passed"
         );
     }
 

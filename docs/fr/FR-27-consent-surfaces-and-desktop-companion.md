@@ -76,7 +76,7 @@ was rewritten on 2026-11-07 (#3531), and its anchors follow the code.
    agent uses that as its modal timeout. The doc-comment on
    `ConsentMode::PromptThenEmail` still describes a fallback that was never
    built (rewritten in P1–2, `e1501c9a4`). — `hub.rs:2050` (the per-mode window),
-   `models.rs:1336` (the doc-comment on the `PromptThenEmail` variant at `:1346`),
+   `models.rs:1341` (the doc-comment on the `PromptThenEmail` variant at `:1351`),
    `consent_consumer.rs:207` (the email leg; it was `state.rs:1199`)
 
 ### Desktop companion
@@ -99,7 +99,7 @@ was rewritten on 2026-11-07 (#3531), and its anchors follow the code.
    `Spawning self-update: No such file or directory (os error 2)` made this
    look like a second, independent macOS defect. It is not: `self_update_cmd`
    has queued the root `com.roomler.update` helper for a non-root macOS caller
-   since FR-5 (`app.rs:6368`), so the mechanism was already correct and
+   since FR-5 (`app.rs:6410`), so the mechanism was already correct and
    finding 7 alone accounts for the error. What WAS wrong is that
    `cmd_apply_update` spawned detached and discarded stdout, so the daemon's
    <!-- RETIRED-NAME-ANCHOR: quoting the daemon's OWN output; that log path is

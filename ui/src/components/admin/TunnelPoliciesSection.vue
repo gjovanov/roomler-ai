@@ -272,7 +272,7 @@
           <div class="d-flex align-center flex-wrap ga-1 mb-2">
             <strong>Targets</strong>
             <span class="text-medium-emphasis text-caption ml-2">
-              Which agents this policy lets the subjects reach.
+              Which devices this policy lets the subjects reach.
             </span>
             <v-spacer />
             <v-btn
@@ -302,14 +302,14 @@
               v-if="t.kind === 'agent_id'"
               v-model="t.id"
               :items="withCurrent(agentItems, t.id)"
-              label="Agent"
+              label="Device"
               variant="outlined"
               density="compact"
               hide-details
               style="flex: 1 1 200px"
             />
             <span v-else class="text-medium-emphasis text-caption">
-              (catch-all — matches every agent in the tenant)
+              (catch-all — matches every device in the tenant)
             </span>
             <v-btn
               icon="mdi-close"
@@ -463,7 +463,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import {
   type DestinationRule,
   type HostPattern,
@@ -527,11 +527,11 @@ const subjectKinds = [
   // 2026-08-04 — the wire supported AgentId subjects (node-stack
   // unification P3b-2: an agent acting as a tunnel ORIGIN) but the picker
   // never offered it.
-  { title: 'Agent', value: 'agent_id' },
+  { title: 'Device', value: 'agent_id' },
 ]
 const targetKinds = [
-  { title: 'All agents', value: 'all_agents' },
-  { title: 'Agent', value: 'agent_id' },
+  { title: 'All devices', value: 'all_agents' },
+  { title: 'Device', value: 'agent_id' },
 ]
 const hostKinds = [
   { title: 'Exact', value: 'exact' },
@@ -635,7 +635,7 @@ function subjectIdLabel(kind: string) {
     case 'user_id': return 'User'
     case 'role_id': return 'Role'
     case 'tunnel_client_id': return 'Tunnel client'
-    case 'agent_id': return 'Agent'
+    case 'agent_id': return 'Device'
     default: return 'ID'
   }
 }
@@ -703,7 +703,7 @@ function validateForm(): string | null {
   }
   for (const t of form.targets) {
     if (t.kind === 'agent_id' && !t.id.trim()) {
-      return 'Agent-ID targets need an Agent ID.'
+      return 'Device targets need a device ID.'
     }
   }
   for (const r of form.allowlist) {
@@ -774,14 +774,14 @@ function subjectLabel(s: PolicySubject): string {
     case 'user_id': return `User ${memberItems.value.find((m) => m.value === s.id)?.title ?? id}`
     case 'role_id': return `Role ${roleItems.value.find((r) => r.value === s.id)?.title ?? id}`
     case 'tunnel_client_id': return `Client ${clientLabel(s.id, id)}`
-    case 'agent_id': return `Agent ${agentLabel(s.id, id)}`
+    case 'agent_id': return `Device ${agentLabel(s.id, id)}`
   }
 }
 
 function targetLabel(t: PolicyTarget): string {
-  if (t.kind === 'all_agents') return 'All agents'
+  if (t.kind === 'all_agents') return 'All devices'
   const id = t.id.length > 8 ? `${t.id.slice(0, 6)}…` : t.id
-  return `Agent ${agentLabel(t.id, id)}`
+  return `Device ${agentLabel(t.id, id)}`
 }
 
 function hostLabel(h: HostPattern): string {
@@ -807,16 +807,38 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`
 }
 
-onMounted(async () => {
-  await store.fetchPolicies(props.tenantId)
+async function load(tenantId: string) {
+  await store.fetchPolicies(tenantId)
+  // The org changed while the list was loading: the load for the new org
+  // owns the tab, and this one must not go on to fill the pickers with the
+  // previous org's rows (#4248).
+  if (tenantId !== props.tenantId) return
   // The pickers' data serves the editor only: a caller who may not manage
   // the policies gets no editor, so nothing is fetched for it.
   if (store.refused) return
-  roleStore.fetchRoles(props.tenantId)
-  membersStore.fetchMembers(props.tenantId)
-  if (agentStore.agents.length === 0) agentStore.fetchAgents(props.tenantId)
-  if (tunnelClientStore.clients.length === 0) {
-    tunnelClientStore.fetchTunnelClients(props.tenantId)
-  }
-})
+  roleStore.fetchRoles(tenantId)
+  membersStore.fetchMembers(tenantId)
+  // The shell loads the devices for its nav and the Devices page the tunnel
+  // clients: each is fetched only when its store does not hold this org's.
+  void agentStore.ensureAgents(tenantId)
+  void tunnelClientStore.ensureTunnelClients(tenantId)
+}
+
+// #4248 — the tab follows its org. The route reuses this section when only
+// the tenant id in the URL changes, so a load in onMounted alone kept the
+// previous org's policies and pickers under the new org's URL. An editor or a
+// delete prompt open on the previous org's policy is closed: its save would go
+// to the new org.
+watch(
+  () => props.tenantId,
+  (tenantId, previous) => {
+    if (previous !== undefined) {
+      editDialog.value = false
+      deleteDialog.value = false
+      deleteTarget.value = null
+    }
+    void load(tenantId)
+  },
+  { immediate: true },
+)
 </script>

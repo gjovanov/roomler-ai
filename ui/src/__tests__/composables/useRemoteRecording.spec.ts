@@ -155,7 +155,7 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
     ch.deliver({ t: 'rc:record.state', id: '', state: 'idle', audio_unavailable: 'audio_unsupported' })
     expect(r.audioUnavailable.value).toBe('audio_unsupported')
     expect(describeRecordReason(r.audioUnavailable.value)).toBe(
-      "this device can't record what the computer plays (a Mac can, from agent 0.4.161)",
+      "this device can't record what the computer plays (a Mac can, from roomlerd 0.4.161)",
     )
     // A box that cannot be ticked never asks: even a stale tick sends no audio.
     r.start(true)

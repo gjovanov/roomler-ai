@@ -65,12 +65,12 @@ flowchart TD
 - **Linux: the companion tracks the daemon**, the invariant Windows has had since S1a (`companion.rs:3-34`). The one
   process that installs updates as root on the host also moves an installed `roomler-desktop` package to its **own**
   version (`CARGO_PKG_VERSION`), never "latest": the companion follows the daemon, not the feed.
-  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3721`, FR-96). That is a system install's root
-    daemon, or `roomlerd update-helper` (`updater.rs:3943`) for a per-user install. A per-user daemon that sees the
+  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3883`, FR-96). That is a system install's root
+    daemon, or `roomlerd update-helper` (`updater.rs:4107`) for a per-user install. A per-user daemon that sees the
     skew touches the helper's wake file (`/var/tmp/roomler-update-check`): a wake, never an instruction. A non-root
     daemon with no helper skips, with one log line, never a password prompt (D3).
   - **What:** the package database that owns the companion picks the format (`installed_package`,
-    `companion.rs:1600`, reads dpkg then rpm). The asset is `roomler-desktop-<own>-<arch>-unknown-linux-gnu.<deb|rpm>`
+    `companion.rs:1604`, reads dpkg then rpm). The asset is `roomler-desktop-<own>-<arch>-unknown-linux-gnu.<deb|rpm>`
     from release `agent-v<own>` (`fetch_release_by_tag`, `updater.rs:1695`). The 0.4.147 release carries all four, each
     with `.asc` and `.sha256`.
   - **Trust:** the same `download_asset` (`updater.rs:1408`) as the daemon's own update: the digest, the `.asc` against
@@ -79,17 +79,17 @@ flowchart TD
     the daemon (#2055).
   - **Install:** the host's own package manager, so it stays the source of truth. `apt-get install -y` (then
     `dpkg --install`) for a `.deb`; `dnf`, `zypper` or `yum` for an `.rpm`, in `install.sh`'s order
-    (`desktop_rpm_tool`, `scripts/install.sh:1390`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
+    (`desktop_rpm_tool`, `scripts/install.sh:1403`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
     restarts services, roomlerd among them, after an apt run (a vmtest trap, seen 2026-10-19). Then `DEBIAN_FRONTEND=noninteractive`
     and a dpkg lock timeout, so unattended-upgrades holding the lock costs one tick, not a hang.
   - **Restart:** a companion that was running is stopped and started again in its person's graphical session, through
-    the path FR-27 already uses (`systemd_run_command`, `companion.rs:4592`). One that was not running stays stopped.
+    the path FR-27 already uses (`systemd_run_command`, `companion.rs:4797`). One that was not running stays stopped.
   - **Never** installs a companion where none is installed, and **never** downgrades one (D1).
-  - **The heartbeat:** `installed_version`'s 10-minute cache (`companion.rs:1491`, `VERSION_TTL` `:1527`) is dropped
+  - **The heartbeat:** `installed_version`'s 10-minute cache (`companion.rs:1495`, `VERSION_TTL` `:1531`) is dropped
     after a sync, so the dashboard's skew clears at the next heartbeat.
 - **When:** at the owner's start, and again on a 4 h tick, so a failed sync no longer waits for the next restart.
 - **Windows: the same retry.** `refresh_if_stale` runs once, at the start of whichever process owns the refresh (#1686:
-  the SCM host, `win_service/mod.rs:511`, or the worker, `app.rs:4545`). It now runs on the same 4 h tick in that
+  the SCM host, `win_service/mod.rs:511`, or the worker, `app.rs:4549`). It now runs on the same 4 h tick in that
   process. It costs one file read when the version marker matches.
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` on both platforms gives back today's behaviour.
 

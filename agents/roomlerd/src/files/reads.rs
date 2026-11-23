@@ -71,9 +71,10 @@ pub(super) const LISTING_BOUND: Duration = Duration::from_secs(super::DIR_LIST_T
 /// How long a listing has from reaching its task to its answer, all in: the
 /// person lookup (1.5 s at most: [`PERSON_LOOKUP_WAIT`] on Windows, the seat0
 /// lookup's on Linux), its wait for the channel's lane, and its step. The
-/// viewer waits 5 s from its send (`listDir`,
-/// `ui/src/composables/useRemoteControl.ts`): 0.5 s for the way there and back
-/// if the read loop hands it on at once; an upload's end, run inline, can delay it.
+/// viewer waits 5 s from its send, and 5 s after each page of a listing in
+/// pages (`ui/src/composables/remoteDirListing.ts`): 0.5 s for the way there
+/// and back, since the read loop hands it on at once, during an upload's end
+/// too: that end's placement runs in the channel's placement lane (#4082).
 pub(super) const LISTING_ANSWERED_WITHIN: Duration = Duration::from_millis(4500);
 
 /// How many listings may wait on a channel's lane behind the step it runs.
@@ -284,18 +285,20 @@ pub(super) async fn roots(lane: &Lane, who: &FsAs, by: Instant) -> Result<DirLis
         path: super::roots_label(),
         parent: None,
         entries,
+        capped: false,
     })
 }
 
 /// The entries of the folder `read` lists, `at` being its resolved path:
 /// where a test stands in a share whose entries do not come
-/// (`drawer_edges::seams::hold_entries`).
-pub(super) fn read_entries(at: &Path, read: std::fs::ReadDir) -> Vec<super::DirEntryView> {
+/// (`drawer_edges::seams::hold_entries`). With them, whether the folder held
+/// more than a listing takes (#4121).
+pub(super) fn read_entries(at: &Path, read: std::fs::ReadDir) -> (Vec<super::DirEntryView>, bool) {
     #[cfg(test)]
     super::drawer_edges::seams::entries_wait(at);
     #[cfg(not(test))]
     let _ = at;
-    super::collect_dir_entries(read)
+    super::collect_dir_entries(read, super::DIR_ENTRIES_MAX)
 }
 
 impl super::FilesHandler {

@@ -42,7 +42,7 @@
 
       <p class="text-medium-emphasis mb-4">
         A node advertises subnet CIDRs it can route (set
-        <code>overlay_advertised_routes</code> in its agent config). Approve a
+        <code>overlay_advertised_routes</code> in its daemon config). Approve a
         route to distribute it to every other node in the mesh — they'll route
         that LAN through this node. Nothing is routed until you approve it.
       </p>
@@ -96,7 +96,7 @@
                   {{ osLabel(n.os) }}
                 </v-chip>
               </div>
-              <div class="text-caption text-medium-emphasis">{{ n.kind }}</div>
+              <div class="text-caption text-medium-emphasis">{{ n.kind === 'agent' ? 'daemon' : 'tunnel client' }}</div>
             </td>
             <td data-label="Overlay IP">
               <div>{{ n.overlay_ip }}</div>

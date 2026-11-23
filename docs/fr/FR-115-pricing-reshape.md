@@ -201,7 +201,7 @@ must count against the controller's org. That is **P3b** (#2637), live since 202
 outsider's session (FR-52's extauth path) opens
 uncapped. A refusal is `org_session_limit`
 (`crates/remote_control/src/error.rs:41`), which the viewer does not retry
-(`ui/src/composables/useRemoteControl.ts:830`). It names the person and the device holding
+(`ui/src/composables/useRemoteControl.ts:831`). It names the person and the device holding
 the slot, and a Pro org at its cap (one per billed seat) is told the way past it is a
 session ending or Business. Kill switch `rc.org_session_cap = false`.
 
@@ -522,7 +522,7 @@ sequenceDiagram
 |---|---|
 | The parser, one for both readers | `crates/remote_control/src/turn_stats.rs:42` (`parse`), moved from the cluster's collector |
 | The PoP's store and its collector | `crates/derp-relay/src/main.rs:262` (`TurnUsage`), `:388` (the subscription to `TURN_STATS_REDIS`) |
-| The PoP's endpoint | `crates/derp-relay/src/main.rs:646` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
+| The PoP's endpoint | `crates/derp-relay/src/main.rs:649` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
 | The signed request | `crates/remote_control/src/derp_ticket.rs:220` (sign), `:239` (verify): audience `derp-turn-usage`, a `region` claim, 60 s |
 | The pull | `crates/core/src/relay_load.rs:314` (`TurnUsagePull`), from endpoints whose `/stats` reports `turn_usage` (`:186`) |
 | The booking, one for both readers | `crates/core/src/turn_bytes.rs:86` (`record`). The cluster's claim key is P4b-1's, unchanged (`:71`) |

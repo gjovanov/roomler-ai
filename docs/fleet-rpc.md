@@ -104,7 +104,12 @@ Where the desktop app was up and a Mac's road from the question to it was
 closed (#4140), the sentence names that cause instead: "nobody could be asked
 at this device — the question could not reach the Roomler desktop app there
 (…); answer with `roomlerd consent` there, or set this device's execution
-policy to auto". One a surface showed, which nobody answered, ends "the
+policy to auto". Where the device's consent panel was showing another question
+and nothing else showed this one (#4164), it says so, whatever the app's side
+found: "nobody could be asked at this device — its consent panel was showing
+another question, and nothing else there could show this one; answer with
+`roomlerd consent` there, ask again once the panel is free, or set this
+device's execution policy to auto". One a surface showed, which nobody answered, ends "the
 operator at this device did not approve the command (Timeout)", as before. The
 chain and its log line are in [remote-control.md §11.2](remote-control.md#112-consent),
 its "Prompt surfaces" paragraph.
@@ -529,7 +534,7 @@ run the command as root:
 | The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:975`](../crates/modules/fleet/src/agent_exec.rs#L975) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:371`](../crates/modules/fleet/src/agent_exec.rs#L371) |
 | The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3206`](../crates/modules/fleet/src/hub.rs#L3206) |
-| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5773`](../agents/roomlerd/src/signaling.rs#L5773) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5815`](../agents/roomlerd/src/signaling.rs#L5815) |
 
 The word is kept per connection, never read from the stored row, for the reason
 `ssh-grant-ack` is: after a rollback the row still promises what the running

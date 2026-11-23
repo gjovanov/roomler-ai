@@ -221,7 +221,7 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 | P1b | publish daemon assets as `roomlerd-*`; guard rewritten as a companion denylist | revert the workflow; published assets are immutable and additive | **✅ FIELD-PROVEN on 0.4.40** |
 | P2a | env prefix: rewrite every host that sets the retired spelling (make-before-break) | both spellings kept; `.bak` / additive reg key | **swept with the P2b instrument** — 11 of 17 online peers measurable, 2 hits, both resolved; 6 unmeasurable (exec off / no CLI / other org) |
 | P2b | env prefix: retire the read arm; a retired variable is now IGNORED **and reported**, never silently dropped | restore the arm | **shipped** |
-| P1c | tunnel assets: publish as `roomler-<v>-<triple>` and name the tarball's inner dir the same — **proposed 2026-10-26**, not started | the tunnel lane keeps the retired spelling; nothing else moves | ⛔ gated like P1b was, but the CLI's updater is stricter than the daemon's pickers: `agents/roomler-cli/src/update.rs:391` REFUSES a tarball whose inner dir is not the retired spelling (it is how the artifact names its own version), so step 1 = a CLI that accepts both spellings, step 2 = the rename once no tunnel-only host runs an older CLI — measured on `tunnel_clients.client_version` by `last_seen_at`, the standalone population `agents` cannot see |
+| P1c | tunnel assets: publish as `roomler-<v>-<triple>` and name the tarball's inner dir the same — **proposed 2026-10-26**; step 1 built 2026-11-21, step 2 not started | step 1: revert it, while no release is published under the new spelling; step 2: the tunnel lane keeps the retired spelling, nothing else moves | **step 1 built, in no release yet.** The CLI's updater was stricter than the daemon's pickers: it REFUSED a tarball whose inner dir was not the retired spelling (the dir is how the artifact names its own version). It now takes `<dir>/roomler` under either spelling, the current one first, and still only under the offered version and this host's triple (`agents/roomler-cli/src/update.rs:395`, `:411`); no other reader needed a change (§P1c step 1). Step 1's floor, the first `tunnel-v*` that carries it, is **not cut yet**. ⛔ step 2 = the rename, once no tunnel-only host runs a CLI older than that floor — measured on `tunnel_clients.client_version` by `last_seen_at`, the standalone population `agents` cannot see |
 | P2c | remaining cheap classes | per-item revert | `TermsView` ✅, logs ✅, **e2e image ✅**, **wizard PATH (Linux) ✅**, **macOS install-script notice ✅ (2026-10-26)** — `scripts/install.sh` told every script-installed Mac since 0.4.41 to enable a Privacy-pane entry P5b had replaced; its anchor's reason ("the bundle is frozen") was the SIXTH found false — Windows install dir **investigated, not shipped**: its anchor's stated reason (frozen with the enrolled-config segment) is FALSE, the real blockers are a stale HKCU PATH entry + a layout decision, and there is no wizard host to field-prove it on |
 | P3 | appdirs read-fallback | staged rollout + rollback build | **KEEP** — the migration it backstops is skipped whenever the desktop companion is up, so on a GUI host the fallback is the PRIMARY path, not a net |
 | P4 | wire values — **step 2 of 3 shipped**: server accepts both ALPNs (step 1, agent-v0.4.45), the client now offers only `roomlerd-quic-v1` (step 2, 2026-10-26); SNI renamed outright (provably unread) | revert `build_client_config` to the legacy offer — one constant | **step 1 done** (agent-v0.4.45). **Step 2 shipped 2026-10-26**, unblocked by a re-read of the server's rows bucketed by `last_seen_at`: every row seen in the last 7 days is ≥0.4.45 and the four below it are offline and in the class decision 1 ruled losable (log below). Field read owed on the release that carries it. Step 3 = drop the legacy arm; its gate is **every tunnel CLIENT** at the step-2 build or later — the daemon-hosted ones via `agents.agent_version` AND the standalone CLI via `tunnel_clients.client_version`, which the agents histogram does not see. The 2026-09-01 blocker (two online rows on 0.4.43; three Windows rc.* rows that cannot self-update) has resolved as the spec predicted: the 0.4.43 rows updated, the rc.* rows went dormant |
@@ -235,6 +235,113 @@ found false on inspection: `artifact_version.rs` calls its fixtures "PUBLISHED r
 names that no release ever carried, and `TermsView` called a section heading a "defined term in
 the Terms" when the Terms define the word in the body and reference the heading nowhere. Both
 were free. An anchor is a *claim*, and FR-21 wrote them under time pressure across ~1 849 sites.
+
+### P1c — who reads the tunnel lane's names (inventory 2026-11-21, master `368f39902`)
+
+The rename has two halves, and the readers treat them differently:
+
+- the **asset name**, `roomler-tunnel-<v>-<triple>.<ext>` → `roomler-<v>-<triple>.<ext>`
+  (`release-tunnel.yml:178,205,260,278,400,483`);
+- the **one dir inside each tarball**, `roomler-tunnel-<v>-<triple>/` → `roomler-<v>-<triple>/`.
+  The Windows zip has no dir: `release-tunnel.yml:494` zips `$name\*`, so its entries sit at the
+  root, and they have since the lane's first commit (`35a0786bf`).
+
+| # | reader | where | what it reads | how it matches | both spellings on master? |
+|---|---|---|---|---|---|
+| 1 | CLI `artifact_for` | `agents/roomler-cli/src/update.rs:101` | platform + kind → proxy token, triple, ext | reads no name | n/a |
+| 2 | CLI `manifest_asset` | `update.rs:118` | the asset whose digest and `.asc` URL it uses | `contains(triple) && ends_with(ext)`, the first listed | **yes** |
+| 3 | CLI `tarball_dir` + `extract_tarball_binary` | `update.rs:391`, `:402`, called at `:242` | the tarball's dir, entry `<dir>/roomler` | **exact** `roomler-tunnel-<v>-<triple>/roomler` | **no: the one strict reader** |
+| 4 | CLI `extract_windows_exe` | `update.rs:440` | zip entry names | suffix `roomler.exe` or `roomler-tunnel.exe` | yes (the zip has no dir) |
+| 5 | CLI `.deb` route | `install_deb` `:531`, `deb_version_is` `:587`, `dpkg_owner` `:316` | the control `Version`, the owning package | the package, never the asset name | yes |
+| 6 | CLIs older than tunnel-v0.4.149, in the field | `c02ca67a3^:agents/roomler-cli/src/update.rs:96-101,119-123,209` | Windows only: the first `.zip` asset, then `roomler.exe` by suffix | `ends_with(".zip")` | yes; Linux and macOS had no self-update |
+| 7 | server `pick_installer_asset`, behind `installer_health` and `installer_proxy` | `crates/modules/fleet/src/tunnel_release.rs:234`, `:78`, `:109` | the asset name | `contains(triple) && ends_with(ext)`, `.sha256` skipped, the first listed; the same rule since `35a0786bf` | **yes** |
+| 8 | server `latest_release`, `pick_release` | `tunnel_release.rs:66`, `:204` | the tag | `tunnel-v` prefix | P1c keeps the tag |
+| 9 | server `installer_proxy` header | `tunnel_release.rs:148-155` | — | passes the asset name on as `Content-Disposition` | passes either through |
+| 10 | setup wizard, tunnel card | `agents/roomler-setup/src/orchestrator_tunnel.rs:149-188`; `asset_resolver::plain_name` `crates/roomler-setup-core/src/asset_resolver.rs:343`; `extract_archive` `extract.rs:43`; `find_tunnel_binary` `extract.rs:260` | the health `filename` as the staged name, the archive layout | any plain name, by extension; the binary flat or in any one subdir | yes |
+| 11 | wizard publisher check (Windows) | `agents/roomler-setup/src/package_step.rs:741-757` | the extracted files | `find_tunnel_binary` | yes |
+| 12 | `scripts/install.sh` | `install_tunnel_linux` `:1274`, `install_tunnel_macos` `:1324`, `install_tunnel_tarball` `:1353` | proxy tokens; saves `roomler-cli.deb` / `.tar.gz`; `find -maxdepth 2 -name roomler` | reads no name | yes |
+| 13 | `scripts/install.ps1` | `Install-TunnelClient` `:414-440` | the health `filename` as the local name; `Get-ChildItem -Recurse -Filter roomler.exe` | any name | yes |
+| 14 | UI | `ui/src` | — | no tunnel download names a file | n/a |
+| 15 | GitHub release page | `release-tunnel.yml:561-576` | — | names no file | n/a |
+| 16 | a person following the docs | `docs/tunnel-install.md:148`, `:191`, `:201` | the dir after `Expand-Archive` / `tar -x` | `roomler-tunnel-*-<triple>/roomler` | **no: step 2 rewrites them** |
+
+What the inventory shows:
+
+1. **One reader is strict, and it reads the dir, not the asset name.** Every asset-name reader
+   (#2, #6, #7, #10, #12, #13) matches by triple and extension or by token, in this tree, on
+   every server version since the lane began, and in every CLI in the field. Renaming the asset
+   alone strands nobody. The dir (#3) is the half step 2 has to wait for.
+2. **The population step 2 can strand is narrower than "every tunnel-only host":** a CLI from
+   tunnel-v0.4.149 up to step 1's floor that installs the TARBALL, which is macOS, and Linux
+   where no package owns the binary. Windows (the zip, #4), Linux on dpkg (the `.deb`, #5) and
+   CLIs older than 0.4.149 (#6) never read the dir. The gate as written, every tunnel-only host
+   on `tunnel_clients.client_version` by `last_seen_at`, is a superset of that population, so it
+   is safe; narrowing it is the operator's call.
+3. **The asset-name pick is not a security boundary, and it must stay one rule on both ends.**
+   The CLI takes the digest and the `.asc` URL from its own pick (#2) while the bytes come from
+   the proxy's (#7), so a spelling preference on one side only would split them on a manifest that
+   carried both spellings. A server can stream any bytes it likes; the pinned key and the dir
+   inside the signed bytes decide what installs.
+4. **`docs/tunnel-install.md:148` names a dir that never existed.** It tells a Windows person to
+   put `…\roomler-cli\roomler-tunnel-0.3.0-rc.46-x86_64-pc-windows-msvc` on PATH, but the zip has
+   been flat since `35a0786bf`, so `Expand-Archive` puts `roomler.exe` straight into `…\roomler-cli`.
+   Its `RETIRED-NAME-ANCHOR(4)` reason ("the ARCHIVE directory keeps the roomler-tunnel prefix by
+   contract") is the seventh anchor reason found false. It is wrong today, whatever step 2 does.
+
+Step 1 is built: what it changed, and what it left alone, is the next section.
+
+### P1c step 1 — what was built
+
+The CLI reads the tarball's dir under either spelling. Nothing else changed, because nothing else
+needed to: every other reader in the table above already takes both spellings or reads no name.
+
+| reader (# above) | step 1 | where |
+|---|---|---|
+| CLI tarball dir (#3) | `tarball_dirs` gives two exact dirs, `roomler-<v>-<triple>` first; `extract_tarball_binary` takes `<dir>/roomler` from the first that holds it, a regular file at exactly that path (a leading `./` aside) | `agents/roomler-cli/src/update.rs:395`, `:411`, `:427`, called at `:242` |
+| CLI manifest pick (#2) | unchanged: it took both already; tests now pin it under both | `update.rs:118` |
+| server picker (#7) | unchanged: it took both already; a test now pins it, mirroring the CLI's | `crates/modules/fleet/src/tunnel_release.rs:234`, its test `:403` |
+| every other reader (#1, #4-#6, #8-#15) | unchanged | the table above |
+| the docs a person follows (#16) | the Linux and macOS tarball commands unchanged until step 2 publishes the new dir; the Windows PATH line fixed (point 4): it names `…\roomler-cli` itself, and the false anchor over it is gone | `docs/tunnel-install.md` §3 |
+
+| invariant | the test that pins it (`update.rs` unless named) |
+|---|---|
+| Under either spelling the dir names exactly the offered version and the host's triple: another version, a longer version and another triple are refused under both | `the_tarball_gives_up_its_binary_only_under_the_offered_version` `:986` |
+| A tarball under the current spelling gives up its binary | `the_tarball_gives_up_its_binary_under_the_current_spelling` `:1036`, RED on `368f39902` |
+| A tarball holding both spellings gives the current one, whatever the order of its entries | `with_both_spellings_the_current_one_wins_whatever_the_order` `:1052`, RED on `368f39902` |
+| Dir and entry match whole, never by prefix: the daemon's tarball (its `usr/bin/roomler` is the shim), `roomlerd-`, `roomler-setup-` and `roomler-desktop-` dirs, a longer dir, a deeper or longer entry, no dir, and a symlink are all refused | `the_tarball_dir_and_entry_are_matched_whole_never_by_a_prefix` `:1077`, which fails if the match becomes a prefix match |
+| Each host takes its own artifact, never a sidecar or the release key, under both spellings | `each_host_takes_its_own_artifact_and_never_a_sidecar` `:785` |
+| A manifest listing both spellings gives the first listed, on both ends | `with_both_spellings_the_manifest_gives_the_first_listed_as_the_server_does` `:857`; `tunnel_release.rs:403` |
+| The digest, then the `.asc`, then the install; `is_newer`, asked before any download, so an older release is never installed | the code is unchanged: `update.rs:202`, `:206-233`, `:236`; `:339`, asked at `:157` |
+
+**Why the current spelling wins.** The retired arm is the one that goes after step 2 has shipped,
+so the spelling that decides must already be the one that stays, and a pick by entry order would
+let two archives with the same entries install different bytes. The manifest pick stays
+first-listed instead, which is the server's own rule: the CLI takes the digest and the `.asc` URL
+from its pick while the proxy streams the bytes of its own, and a spelling preference on one side
+only would split the two on a release that listed both. No release lists both; the tests keep the
+two rules one.
+
+**Expected RED, found green.** The plan expected master to refuse a manifest asset named
+`roomler-<v>-<triple>.<ext>`. It does not: the CLI's `manifest_asset` and the server's
+`pick_installer_asset` match by triple and extension, so both manifest tests passed on `368f39902`
+before any code changed. The two tarball tests were the only RED.
+
+**Read against real archives** (a local check, 2026-11-21). When the current spelling is absent,
+the new reader reads every entry of the archive, where the old one stopped at its match, so an
+entry it could not parse would turn a working update into a refusal. Every tarball of the newest
+release, tunnel-v0.4.215, parses in full: four entries each (the dir, `roomler`, `LICENSE`,
+`README.md`), the current spelling absent, the retired one giving the binary the old reader gave.
+
+| tarball | entries | current spelling | retired spelling: `roomler`, bytes |
+|---|---|---|---|
+| `x86_64-unknown-linux-gnu` | 4 | absent | 17 290 168 (ELF) |
+| `aarch64-unknown-linux-gnu` | 4 | absent | 15 383 376 (ELF) |
+| `universal-apple-darwin` | 4 | absent | 30 813 584 (Mach-O universal) |
+
+**Step 1's floor** is the first `tunnel-v*` that carries it, not cut yet. **Step 2's gate** is
+unchanged: the rename waits until no tunnel-only host runs a CLI older than that floor, measured on
+`tunnel_clients.client_version` by `last_seen_at`. **Owed:** step 1's field read, a tunnel-only host
+that updates across the first tunnel release carrying it, on today's spelling.
 
 ## Acceptance criteria
 
@@ -308,6 +415,7 @@ Every class above has a named condition, so "how would we know?" has an answer f
 
 | date | build | what was proven |
 |---|---|---|
+| 2026-11-21 | 🧪 P1c step 1 | **Built, RED before GREEN, read against real archives and mutation-checked; the field read is owed.** On `368f39902`, with the new tests and no code change, the CLI refused a tarball under the current spelling (*"the tarball has no `roomler-tunnel-0.4.149-x86_64-unknown-linux-gnu/roomler`: it is not the release it was offered as, or not a tunnel CLI archive; refusing it"*) and, handed both spellings, installed the retired entry. With the change both pass, with every other `update::` test (15 of 15 on Linux, the 9 that build on Windows) and the server's mirror test. ⚠️ The manifest cases the plan expected RED were green on master already: both pickers match by triple and extension (§P1c step 1). Turning the exact match into a prefix match fails the exactness test on `roomler-0.4.149-x86_64-unknown-linux-gnu/roomlerd`; restored. Every tarball of tunnel-v0.4.215 parses in full under the new reader, which reads the whole archive when the current spelling is absent: four entries each, the retired spelling giving the binary the old reader gave. Owed: a tunnel-only host updating across the first tunnel release that carries step 1, on today's spelling |
 | 2026-10-26 | 🧪 P4 step 2 | **Proven in loopback, both directions, and mutation-checked; the field read is owed.** `the_default_client_settles_on_the_current_alpn` runs the DEFAULT client config — the one every tunnel dial goes through — against the dual server and reads the negotiated ALPN on BOTH ends through the new `negotiated_alpn` (quinn's `HandshakeData.protocol`): `roomlerd-quic-v1` on each. Flipping the client back to the legacy offer fails it by name (`left: "roomler-tunnel-quic-v1"`); restored. `the_server_answers_both_the_new_and_the_legacy_alpn` is kept as the only place a pre-step-2 client is exercised until step 3 removes the arm. The instrument for the field read is new too: the client's `connect` now logs `quic: handshake complete alpn=…`, which nothing on either end logged before. ⚠️ **This session could not take the field read**: it needs a tunnel client on the step-2 build dialling a live exit, i.e. a tunnel-client enrollment minted from a signed-in admin session — the browser extension was disconnected, and a password login is not a worker's to perform. Two routes remain, either is enough: (a) the operator mints a tunnel-client token, enrolls a branch-built `roomler.exe` into a scratch `--config`, runs `socks5 --agent <an exit>` and reads the line; a legacy-offer build of the same tree sits beside it so the before/after is one command apart; (b) the first release carrying this change — any tunnel client's log then carries the line, and the exits it dials are the deployed fleet |
 | 2026-10-26 | ✅ P4 gate | **Step 2 is safe now, measured where the 09-01 row said to measure.** The server's `agents` rows (86 live), bucketed by `last_seen_at` with counts only: every row seen ≤1 d (30) and ≤7 d (1) is ≥0.4.45; of the 50 seen ≤30 d all are ≥0.4.45 bar one; **four rows sit below the gate and all are offline** — `rc.99` and `rc.458` (Windows, the pair the 09-01 row said could never self-update) and `rc.434` (Linux) unseen for >30 d, and `rc.286` (Linux, pre-0.4.16) seen within 30 d but offline. All four are the class decision 1 ruled losable. The two online 0.4.43 rows that blocked step 2 on 09-01 are gone — they updated, as the spec predicted they would. ⚠️ This histogram covers the daemon-hosted client only; step 3's gate must ALSO read `tunnel_clients.client_version`, the standalone CLI population, which `agents` cannot see |
 | 2026-10-26 | 🚨 method | **The read itself caused an 80-second prod outage, and the fault was mine.** The histogram script generalised over "every tunnel collection with a `client_version` field" and ran `find().toArray()` on each — which included `tunnel_audit`, the per-flow audit log — **inside the mongodb container via `kubectl exec`**, where mongosh's memory counts against the database's own 2 GiB limit. The container was OOM-killed at 12:40:50Z (exit 137), restarted, and was READY again at 12:42:09Z; both app pods logged a fresh `Connected to MongoDB` at 12:42:23Z / 12:42:39Z, so DB-backed requests in that window failed, and a DB-backed probe (`POST /api/auth/login` with a bogus account → 401) confirmed reads were back. ⚠️ Rule: a prod read is a **bounded, server-side aggregation** (`$group`, a capped cursor), never an unbounded fetch — and never from inside the database's own container. The histogram above was taken from the half of the script that completed before the kill |

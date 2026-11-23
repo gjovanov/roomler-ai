@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::relay_probe::DerpTicketSlot;
 use crate::ws_connect::{Credential, Dial};
-use tunnel_core::transport::derp::DerpMux;
+use tunnel_core::transport::derp::{DerpDrops, DerpMux};
 
 /// Hard upper bound on a single `/derp` connect attempt (mirrors the control
 /// WS's `WS_CONNECT_TIMEOUT`): a hung TLS handshake must not stall the backoff.
@@ -215,6 +215,48 @@ impl SndbufCap {
     }
 }
 
+/// FR-148 D52 — the keepalive tick's drop line for one `/derp` socket: every
+/// drop its mux counts ([`DerpDrops`]), as lifetime counts and as the moves
+/// since the line before. [`DropLine::due`] is the change gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DropLine {
+    now: DerpDrops,
+    last: DerpDrops,
+}
+
+impl DropLine {
+    /// The line to write when ANY of the four counts moved since the `last`
+    /// one reported, and `None` while none did: a carrier that drops nothing
+    /// stays silent. The counts only rise (the mux's, for its life), so a
+    /// difference is a move.
+    fn due(now: DerpDrops, last: DerpDrops) -> Option<Self> {
+        (now != last).then_some(Self { now, last })
+    }
+
+    /// The line, at INFO, at most once a tick. It replaces FR-18's shed line
+    /// (`shed stale carrier frames`) and keeps that line's two fields with
+    /// their meaning: `dropped_stale` is the stale count, and `since_last`
+    /// is its move. Each other cause writes its count and its move as
+    /// `dropped_<cause>` and `<cause>_since_last`, so one line tells which
+    /// drop moved: the writer's stale shed or the full queue on the way out,
+    /// a full consumer or a missing route on the way in.
+    fn log(&self, relay: &str) {
+        let (now, last) = (self.now, self.last);
+        info!(
+            %relay,
+            dropped_stale = now.stale,
+            since_last = now.stale.saturating_sub(last.stale),
+            dropped_full = now.full,
+            full_since_last = now.full.saturating_sub(last.full),
+            dropped_backpressure = now.backpressure,
+            backpressure_since_last = now.backpressure.saturating_sub(last.backpressure),
+            dropped_unrouted = now.unrouted,
+            unrouted_since_last = now.unrouted.saturating_sub(last.unrouted),
+            "overlay derp: carrier frames dropped (stale, full, backpressure, unrouted)"
+        );
+    }
+}
+
 /// Derive the `/derp` WSS URL from the control `ws_url` (`wss://host/ws`).
 fn derp_url_from_ws(ws_url: &str) -> String {
     match ws_url.strip_suffix("/ws") {
@@ -352,9 +394,10 @@ async fn run(
     // per-frame decision, and re-reading the env per frame would be the hot
     // path of the whole carrier.
     let max_queue_age = tunnel_core::transport::derp::queue_max_age();
-    // FR-18 — last value reported, so the keepalive log is change-gated
-    // rather than a line every 25 s on a carrier that shed nothing.
-    let mut last_reported_stale: u64 = 0;
+    // FR-18, FR-148 D52 — the counts last reported, so the keepalive line is
+    // change-gated rather than a line every 25 s on a carrier that dropped
+    // nothing. Held across reconnects, as the mux's counts are.
+    let mut last_reported = DerpDrops::default();
     let mut backoff = Duration::from_secs(1);
     loop {
         // The mux is gone (runtime torn down) ⇒ stop reconnecting.
@@ -466,23 +509,19 @@ async fn run(
                                 }
                                 break;
                             }
-                            // FR-18 — report the shed count on the keepalive
-                            // tick, change-gated so a healthy carrier stays
-                            // silent. Without a reader the counter proves
-                            // nothing in the field, and "the carrier shed
-                            // stale load" has to be distinguishable from "the
-                            // carrier stalled" — they look identical from the
-                            // pump's side and want opposite responses.
+                            // FR-18, FR-148 D52 — report the mux's drops on
+                            // the keepalive tick, change-gated so a healthy
+                            // carrier stays silent. Without a reader a counter
+                            // proves nothing in the field: "the carrier shed
+                            // stale load" has to be told from "the carrier
+                            // stalled" (they look identical from the pump's
+                            // side and want opposite responses), and a T3 on
+                            // the mesh relay from a drop here, or from none.
                             if let Some(m) = mux.upgrade() {
-                                let shed = m.stale_drops();
-                                if shed != last_reported_stale {
-                                    info!(
-                                        %relay,
-                                        dropped_stale = shed,
-                                        since_last = shed - last_reported_stale,
-                                        "overlay derp: shed stale carrier frames (queue age bound)"
-                                    );
-                                    last_reported_stale = shed;
+                                let now = m.drops();
+                                if let Some(line) = DropLine::due(now, last_reported) {
+                                    line.log(&relay);
+                                    last_reported = now;
                                 }
                             }
                             if tx.send(Message::Ping(Vec::new().into())).await.is_err() {
@@ -1221,5 +1260,95 @@ mod tests {
         ] {
             assert!(line.contains(want), "{want:?} is not in {line:?}");
         }
+    }
+
+    /// The `k=v` fields of a logged line, in the order it wrote them.
+    fn fields_of(line: &str) -> Vec<&str> {
+        line.split_whitespace()
+            .filter(|t| t.contains('='))
+            .collect()
+    }
+
+    /// Counts a socket's mux held when its line before was written.
+    const HELD: DerpDrops = DerpDrops {
+        stale: 40,
+        full: 7,
+        backpressure: 3,
+        unrouted: 2,
+    };
+
+    /// FR-148 D52 — no line while no count moved: a carrier that drops
+    /// nothing stays silent, tick after tick, at zero or at any count.
+    #[test]
+    fn no_drop_line_while_no_count_moved() {
+        assert_eq!(
+            DropLine::due(DerpDrops::default(), DerpDrops::default()),
+            None
+        );
+        assert_eq!(DropLine::due(HELD, HELD), None);
+    }
+
+    /// FR-148 D52 — one line when ANY of the four counts moved, carrying all
+    /// four lifetime counts and each one's move since the line before.
+    #[test]
+    fn a_drop_line_when_any_count_moved_carries_all_four() {
+        let moved = [
+            DerpDrops { stale: 41, ..HELD },
+            DerpDrops { full: 9, ..HELD },
+            DerpDrops {
+                backpressure: 4,
+                ..HELD
+            },
+            DerpDrops {
+                unrouted: 5,
+                ..HELD
+            },
+        ];
+        for now in moved {
+            let line = DropLine::due(now, HELD)
+                .unwrap_or_else(|| panic!("{now:?} moved from {HELD:?}, and no line is due"));
+            let text = logged(|| line.log("central"));
+            assert!(
+                text.contains("INFO")
+                    && text.contains(
+                        "overlay derp: carrier frames dropped (stale, full, backpressure, unrouted)"
+                    ),
+                "{text:?}"
+            );
+            let want = [
+                "relay=central".to_string(),
+                format!("dropped_stale={}", now.stale),
+                format!("since_last={}", now.stale - HELD.stale),
+                format!("dropped_full={}", now.full),
+                format!("full_since_last={}", now.full - HELD.full),
+                format!("dropped_backpressure={}", now.backpressure),
+                format!(
+                    "backpressure_since_last={}",
+                    now.backpressure - HELD.backpressure
+                ),
+                format!("dropped_unrouted={}", now.unrouted),
+                format!("unrouted_since_last={}", now.unrouted - HELD.unrouted),
+            ];
+            assert_eq!(fields_of(&text), want, "{text:?}");
+        }
+    }
+
+    /// FR-148 D52 — the line replaces FR-18's shed line and keeps its two
+    /// fields: `dropped_stale` is the stale count and `since_last` that
+    /// count's move, whatever else moved with it.
+    #[test]
+    fn the_drop_line_keeps_the_shed_lines_dropped_stale_and_since_last() {
+        let now = DerpDrops {
+            stale: 41,
+            full: 19,
+            ..HELD
+        };
+        let line = DropLine::due(now, HELD).expect("the stale count moved");
+        let text = logged(|| line.log("central"));
+        let fields = fields_of(&text);
+        assert!(
+            fields.contains(&"dropped_stale=41") && fields.contains(&"since_last=1"),
+            "{fields:?}"
+        );
     }
 }

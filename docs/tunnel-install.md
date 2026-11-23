@@ -139,13 +139,11 @@ Invoke-WebRequest `
   -OutFile "$env:USERPROFILE\Downloads\roomler-cli.zip"
 Expand-Archive "$env:USERPROFILE\Downloads\roomler-cli.zip" `
   -DestinationPath "$env:LOCALAPPDATA\roomler-cli"
-# RETIRED-NAME-ANCHOR(4): the ARCHIVE directory keeps the roomler-tunnel
-# prefix by contract (release-tunnel.yml). Only the binary inside it was
-# renamed to `roomler`.
+# The zip has no directory inside: roomler.exe lands in roomler-cli itself.
 # Optional — add to PATH:
 [Environment]::SetEnvironmentVariable(
   "Path",
-  "$env:Path;$env:LOCALAPPDATA\roomler-cli\roomler-tunnel-0.3.0-rc.46-x86_64-pc-windows-msvc",
+  "$env:Path;$env:LOCALAPPDATA\roomler-cli",
   "User"
 )
 ```
@@ -163,7 +161,7 @@ sudo dpkg -i /tmp/roomler-cli.deb
 > `linux-deb-aarch64` and `linux-aarch64`. A release built before P7b has no
 > aarch64 CLI, and the proxy answers 404 for it rather than hand over the
 > x86_64 one. `install.sh --role tunnel` picks the arch by itself
-> (`scripts/install.sh:1279-1283`), and the aarch64 wizard asks for
+> (`scripts/install.sh:1292-1296`), and the aarch64 wizard asks for
 > `linux-aarch64`. The arm64 build is made on Ubuntu 22.04, so it needs glibc
 > 2.35 or later, as the x86_64 agent does.
 
@@ -186,7 +184,8 @@ sudo dpkg -i /tmp/roomler-cli.deb
 ```bash
 curl -fsSL -o /tmp/roomler-cli.tar.gz \
   "https://roomler.ai/api/tunnel/installer/linux-x86_64?version=latest"
-# RETIRED-NAME-ANCHOR(2): archive directory name, frozen (see above).
+# RETIRED-NAME-ANCHOR(2): the tarball's directory, as release-tunnel.yml
+# names it until FR-46 P1c step 2.
 mkdir -p ~/.local/opt && tar -C ~/.local/opt -xzf /tmp/roomler-cli.tar.gz
 ln -sf ~/.local/opt/roomler-tunnel-*-x86_64-unknown-linux-gnu/roomler ~/.local/bin/
 ```
@@ -196,7 +195,8 @@ ln -sf ~/.local/opt/roomler-tunnel-*-x86_64-unknown-linux-gnu/roomler ~/.local/b
 ```bash
 curl -fsSL -o /tmp/roomler-cli.tar.gz \
   "https://roomler.ai/api/tunnel/installer/macos?version=latest"
-# RETIRED-NAME-ANCHOR(2): archive directory name, frozen (see above).
+# RETIRED-NAME-ANCHOR(2): the tarball's directory, as release-tunnel.yml
+# names it until FR-46 P1c step 2.
 mkdir -p ~/.local/opt && tar -C ~/.local/opt -xzf /tmp/roomler-cli.tar.gz
 ln -sf ~/.local/opt/roomler-tunnel-*-universal-apple-darwin/roomler ~/.local/bin/
 ```
@@ -266,7 +266,7 @@ For a tenant-wide catch-all (everyone → every agent → anywhere) **for testin
 | Field | Value |
 |---|---|
 | Subjects | `All users` |
-| Targets | `All agents` |
+| Targets | `All devices` |
 | Allowlist | `Wildcard` `*` ports `1–65535` |
 
 Do not ship that to production — it disables the policy gate.
@@ -483,7 +483,7 @@ Then it installs by host:
 
 dpkg asks nothing during that install, not even in your terminal: a configuration file you
 edited stays as it is, with the package's version beside it as `<file>.dpkg-dist`
-(`dpkg_install_args`, `agents/roomler-cli/src/update.rs:570`, #3932). The CLI's package ships
+(`dpkg_install_args`, `agents/roomler-cli/src/update.rs:592`, #3932). The CLI's package ships
 no such file today. The option is there because every package install of ours takes it
 ([linux-self-update.md](linux-self-update.md#every-package-install-keeps-an-edited-configuration-file-and-asks-nothing-3932)).
 

@@ -239,8 +239,8 @@ pub async fn self_update(cfg: &TunnelConfig, check_only: bool) -> Result<()> {
             replace_self(&exe, &new_exe)?;
         }
         Kind::Tarball => {
-            let dir = tarball_dir(latest_ver, triple);
-            let new_exe = extract_tarball_binary(&bytes, &dir)?;
+            let dirs = tarball_dirs(latest_ver, triple);
+            let new_exe = extract_tarball_binary(&bytes, &dirs)?;
             replace_self(&exe, &new_exe)?;
         }
         Kind::Deb => install_deb(&bytes, latest_ver)?,
@@ -382,26 +382,50 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
 }
 
 // RETIRED-NAME-ANCHOR-BEGIN
-// Reads a PUBLISHED artifact's layout: `release-tunnel.yml` names every tunnel
-// asset, and the dir inside its tarball, `roomler-tunnel-<version>-<triple>`.
-// Release asset names are frozen by FR-21 D6.
-/// The one top-level dir of a release tarball (`release-tunnel.yml` tars
-/// `roomler-tunnel-<version>-<triple>/`). It is inside the signed bytes, so
-/// it names the version from the artifact itself.
-fn tarball_dir(version: &str, triple: &str) -> String {
-    format!("roomler-tunnel-{version}-{triple}")
+// Reads a PUBLISHED artifact's layout. Every tunnel release so far tars its CLI
+// under `roomler-tunnel-<version>-<triple>/` (`release-tunnel.yml`), and FR-46
+// P1c step 2 renames that dir to `roomler-<version>-<triple>/`. This reader
+// takes both, because a host on it is offered releases under either spelling,
+// and step 2 waits until no tunnel-only host runs a CLI older than it
+// (docs/fr/FR-46 §P1c). The retired arm can go only after step 2 has shipped.
+/// The top-level dirs a release tarball may hold the binary under, the current
+/// spelling first: [`extract_tarball_binary`] takes the first that holds it.
+/// Each names the offered version and this host's triple, and the dir is
+/// inside the signed bytes, so the artifact names its own version.
+fn tarball_dirs(version: &str, triple: &str) -> [String; 2] {
+    [
+        format!("roomler-{version}-{triple}"),
+        format!("roomler-tunnel-{version}-{triple}"),
+    ]
 }
 // RETIRED-NAME-ANCHOR-END
 
 /// The `roomler` binary from a release tarball, read in memory: nothing is
 /// extracted to disk, so no directory is ever created or chowned, as root or
-/// otherwise. The binary must sit at `<dir>/roomler`, where `dir` names the
-/// version the artifact was offered as; an archive of another version, or one
-/// with no such entry, is refused.
+/// otherwise. The binary must be a regular file at exactly `<dir>/roomler`
+/// for one of `dirs`, which name the version the artifact was offered as; an
+/// archive of another version, or one with no such entry, is refused. An
+/// archive that holds it under more than one of `dirs` gives the first of
+/// them, whatever the order of its entries.
 #[cfg(unix)]
-fn extract_tarball_binary(tgz: &[u8], dir: &str) -> Result<Vec<u8>> {
+fn extract_tarball_binary(tgz: &[u8], dirs: &[String]) -> Result<Vec<u8>> {
+    for dir in dirs {
+        if let Some(binary) = tarball_file(tgz, &format!("{dir}/roomler"))? {
+            return Ok(binary);
+        }
+    }
+    let wanted: Vec<String> = dirs.iter().map(|d| format!("`{d}/roomler`")).collect();
+    bail!(
+        "the tarball has no {}: it is not the release it was offered as, or not a tunnel CLI archive; refusing it",
+        wanted.join(" or ")
+    )
+}
+
+/// The bytes of the regular file at exactly `want` in a gzipped tar, where a
+/// leading `./` is not part of a name, or `None` when the archive has none.
+#[cfg(unix)]
+fn tarball_file(tgz: &[u8], want: &str) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
-    let want = format!("{dir}/roomler");
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tgz));
     for entry in archive.entries().context("read the release tarball")? {
         let mut entry = entry.context("read a tarball entry")?;
@@ -413,16 +437,14 @@ fn extract_tarball_binary(tgz: &[u8], dir: &str) -> Result<Vec<u8>> {
             entry
                 .read_to_end(&mut buf)
                 .context("read roomler from the tarball")?;
-            return Ok(buf);
+            return Ok(Some(buf));
         }
     }
-    bail!(
-        "the tarball has no `{want}`: it is not the release it was offered as, or not a tunnel CLI archive; refusing it"
-    )
+    Ok(None)
 }
 
 #[cfg(not(unix))]
-fn extract_tarball_binary(_tgz: &[u8], _dir: &str) -> Result<Vec<u8>> {
+fn extract_tarball_binary(_tgz: &[u8], _dirs: &[String]) -> Result<Vec<u8>> {
     bail!("a tarball installs only on Linux and macOS")
 }
 
@@ -746,8 +768,8 @@ mod tests {
     }
 
     // RETIRED-NAME-ANCHOR-BEGIN
-    // Fixtures of PUBLISHED tunnel artifacts: their names, and the dir inside a
-    // tarball, are `roomler-tunnel-<version>-<triple>`, frozen by FR-21 D6.
+    // Fixtures of PUBLISHED tunnel artifacts, `roomler-tunnel-<version>-<triple>`: every
+    // release before FR-46 P1c step 2 carries it, so the reader's retired arm stays till then.
     fn asset(name: &str) -> ReleaseAsset {
         ReleaseAsset {
             name: name.into(),
@@ -757,65 +779,92 @@ mod tests {
     }
 
     // FR-97 P6b — every host's artifact, by the server picker's own rule.
+    // FR-46 P1c: under the published spelling and under the current one,
+    // `roomler-<version>-<triple>`, which step 2 publishes.
     #[test]
     fn each_host_takes_its_own_artifact_and_never_a_sidecar() {
         let v = "0.4.149";
-        // Each sidecar is listed BEFORE its artifact, so a match on "contains
-        // the extension" would take the sidecar and fail this test.
-        let assets: Vec<ReleaseAsset> = [
-            "x86_64-unknown-linux-gnu.tar.gz.asc",
-            "x86_64-unknown-linux-gnu.tar.gz.sha256",
-            "x86_64-unknown-linux-gnu.tar.gz",
-            "x86_64-unknown-linux-gnu.deb.asc",
-            "x86_64-unknown-linux-gnu.deb",
-            "aarch64-unknown-linux-gnu.tar.gz.asc",
-            "aarch64-unknown-linux-gnu.tar.gz",
-            "aarch64-unknown-linux-gnu.deb.sha256",
-            "aarch64-unknown-linux-gnu.deb",
-            "universal-apple-darwin.tar.gz.asc",
-            "universal-apple-darwin.tar.gz",
-            "x86_64-pc-windows-msvc.zip.asc",
-            "x86_64-pc-windows-msvc.zip",
-        ]
-        .iter()
-        .map(|t| asset(&format!("roomler-tunnel-{v}-{t}")))
-        .collect();
-        let pick = |platform, kind| {
-            let (token, triple, ext) = artifact_for(platform, kind).expect("an artifact");
-            (
-                token,
-                manifest_asset(&assets, triple, ext).map(|a| a.name.clone()),
-            )
-        };
-        let named = |t: &str| Some(format!("roomler-tunnel-{v}-{t}"));
-        assert_eq!(
-            pick("linux-x86_64", Kind::Tarball),
-            ("linux-x86_64", named("x86_64-unknown-linux-gnu.tar.gz"))
-        );
-        assert_eq!(
-            pick("linux-x86_64", Kind::Deb),
-            ("linux-deb", named("x86_64-unknown-linux-gnu.deb"))
-        );
-        assert_eq!(
-            pick("linux-aarch64", Kind::Tarball),
-            ("linux-aarch64", named("aarch64-unknown-linux-gnu.tar.gz"))
-        );
-        assert_eq!(
-            pick("linux-aarch64", Kind::Deb),
-            ("linux-deb-aarch64", named("aarch64-unknown-linux-gnu.deb"))
-        );
-        assert_eq!(
-            pick("macos", Kind::Tarball),
-            ("macos", named("universal-apple-darwin.tar.gz"))
-        );
-        assert_eq!(
-            pick("windows-x86_64", Kind::Zip),
-            ("windows-x86_64", named("x86_64-pc-windows-msvc.zip"))
-        );
+        for spelling in ["roomler-tunnel", "roomler"] {
+            // Each sidecar is listed BEFORE its artifact, so a match on "contains
+            // the extension" would take the sidecar and fail this test. The
+            // release key comes first: every signed release carries it.
+            let assets: Vec<ReleaseAsset> = std::iter::once(asset("roomler-release-pubkey.asc"))
+                .chain(
+                    [
+                        "x86_64-unknown-linux-gnu.tar.gz.asc",
+                        "x86_64-unknown-linux-gnu.tar.gz.sha256",
+                        "x86_64-unknown-linux-gnu.tar.gz",
+                        "x86_64-unknown-linux-gnu.deb.asc",
+                        "x86_64-unknown-linux-gnu.deb",
+                        "aarch64-unknown-linux-gnu.tar.gz.asc",
+                        "aarch64-unknown-linux-gnu.tar.gz",
+                        "aarch64-unknown-linux-gnu.deb.sha256",
+                        "aarch64-unknown-linux-gnu.deb",
+                        "universal-apple-darwin.tar.gz.asc",
+                        "universal-apple-darwin.tar.gz",
+                        "x86_64-pc-windows-msvc.zip.asc",
+                        "x86_64-pc-windows-msvc.zip",
+                    ]
+                    .iter()
+                    .map(|t| asset(&format!("{spelling}-{v}-{t}"))),
+                )
+                .collect();
+            let pick = |platform, kind| {
+                let (token, triple, ext) = artifact_for(platform, kind).expect("an artifact");
+                (
+                    token,
+                    manifest_asset(&assets, triple, ext).map(|a| a.name.clone()),
+                )
+            };
+            let named = |t: &str| Some(format!("{spelling}-{v}-{t}"));
+            assert_eq!(
+                pick("linux-x86_64", Kind::Tarball),
+                ("linux-x86_64", named("x86_64-unknown-linux-gnu.tar.gz"))
+            );
+            assert_eq!(
+                pick("linux-x86_64", Kind::Deb),
+                ("linux-deb", named("x86_64-unknown-linux-gnu.deb"))
+            );
+            assert_eq!(
+                pick("linux-aarch64", Kind::Tarball),
+                ("linux-aarch64", named("aarch64-unknown-linux-gnu.tar.gz"))
+            );
+            assert_eq!(
+                pick("linux-aarch64", Kind::Deb),
+                ("linux-deb-aarch64", named("aarch64-unknown-linux-gnu.deb"))
+            );
+            assert_eq!(
+                pick("macos", Kind::Tarball),
+                ("macos", named("universal-apple-darwin.tar.gz"))
+            );
+            assert_eq!(
+                pick("windows-x86_64", Kind::Zip),
+                ("windows-x86_64", named("x86_64-pc-windows-msvc.zip"))
+            );
+        }
         // No artifact is built for these, so no download is attempted.
         assert_eq!(artifact_for("macos", Kind::Deb), None);
         assert_eq!(artifact_for("unknown", Kind::Tarball), None);
         assert_eq!(artifact_for("windows-x86_64", Kind::Tarball), None);
+    }
+
+    /// FR-46 P1c: a manifest that lists a host's artifact under both spellings
+    /// gives the first listed, in either order. That is the server's rule
+    /// (`pick_installer_asset`, pinned by its mirror of this test): the CLI
+    /// reads the digest and the `.asc` URL from this pick while the proxy
+    /// streams the bytes of its own, so the two picks must never differ.
+    #[test]
+    fn with_both_spellings_the_manifest_gives_the_first_listed_as_the_server_does() {
+        let retired = "roomler-tunnel-0.4.149-x86_64-unknown-linux-gnu.tar.gz";
+        let current = "roomler-0.4.149-x86_64-unknown-linux-gnu.tar.gz";
+        for (first, second) in [(retired, current), (current, retired)] {
+            let assets = [asset(first), asset(second)];
+            assert_eq!(
+                manifest_asset(&assets, "x86_64-unknown-linux-gnu", ".tar.gz")
+                    .map(|a| a.name.as_str()),
+                Some(first)
+            );
+        }
     }
 
     #[test]
@@ -911,34 +960,152 @@ mod tests {
             .expect("finish gzip")
     }
 
+    /// A gzipped tar holding one symlink, `path` -> `target`.
+    #[cfg(unix)]
+    fn tgz_link(path: &str, target: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, path, target)
+            .expect("append link");
+        builder
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip")
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_tarball_gives_up_its_binary_only_under_the_offered_version() {
-        let dir = tarball_dir("0.4.149", "x86_64-unknown-linux-gnu");
-        assert_eq!(dir, "roomler-tunnel-0.4.149-x86_64-unknown-linux-gnu");
-        let good = tgz(&[
-            (&format!("{dir}/README"), b"readme"),
-            (&format!("{dir}/roomler"), b"the new binary"),
-        ]);
+        let dirs = tarball_dirs("0.4.149", "x86_64-unknown-linux-gnu");
+        // The current spelling first: it is the one taken when both are there.
         assert_eq!(
-            extract_tarball_binary(&good, &dir).expect("found"),
-            b"the new binary"
+            dirs,
+            [
+                "roomler-0.4.149-x86_64-unknown-linux-gnu",
+                "roomler-tunnel-0.4.149-x86_64-unknown-linux-gnu",
+            ]
         );
-        // Tarred as `./<dir>`.
-        let dotted = tgz(&[(&format!("./{dir}/roomler"), b"dotted")]);
-        assert_eq!(
-            extract_tarball_binary(&dotted, &dir).expect("found"),
-            b"dotted"
-        );
-        // An older release offered as this one: its dir names its own version.
-        let old = tgz(&[(
+        for dir in &dirs {
+            let good = tgz(&[
+                (&format!("{dir}/README"), b"readme"),
+                (&format!("{dir}/roomler"), b"the new binary"),
+            ]);
+            assert_eq!(
+                extract_tarball_binary(&good, &dirs).expect("found"),
+                b"the new binary"
+            );
+            // Tarred as `./<dir>`.
+            let dotted = tgz(&[(&format!("./{dir}/roomler"), b"dotted")]);
+            assert_eq!(
+                extract_tarball_binary(&dotted, &dirs).expect("found"),
+                b"dotted"
+            );
+            // An archive without the binary.
+            let empty = tgz(&[(&format!("{dir}/README"), b"readme")]);
+            assert!(extract_tarball_binary(&empty, &dirs).is_err());
+        }
+        // An older release offered as this one, under either spelling: its dir
+        // names its own version. A build for another triple names its own too.
+        for refused in [
             "roomler-tunnel-0.4.148-x86_64-unknown-linux-gnu/roomler",
-            b"old binary",
+            "roomler-0.4.148-x86_64-unknown-linux-gnu/roomler",
+            "roomler-0.4.1490-x86_64-unknown-linux-gnu/roomler",
+            "roomler-tunnel-0.4.149-aarch64-unknown-linux-gnu/roomler",
+            "roomler-0.4.149-aarch64-unknown-linux-gnu/roomler",
+        ] {
+            let tarball = tgz(&[(refused, b"another build")]);
+            assert!(
+                extract_tarball_binary(&tarball, &dirs).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    /// FR-46 P1c step 1: a tarball under the current spelling,
+    /// `roomler-<version>-<triple>/roomler`, installs.
+    #[cfg(unix)]
+    #[test]
+    fn the_tarball_gives_up_its_binary_under_the_current_spelling() {
+        let dirs = tarball_dirs("0.4.149", "x86_64-unknown-linux-gnu");
+        let current = tgz(&[(
+            "roomler-0.4.149-x86_64-unknown-linux-gnu/roomler",
+            b"the current spelling",
         )]);
-        assert!(extract_tarball_binary(&old, &dir).is_err());
-        // An archive without the binary.
-        let empty = tgz(&[(&format!("{dir}/README"), b"readme")]);
-        assert!(extract_tarball_binary(&empty, &dir).is_err());
+        assert_eq!(
+            extract_tarball_binary(&current, &dirs).expect("the current spelling installs"),
+            b"the current spelling"
+        );
+    }
+
+    /// FR-46 P1c step 1: a tarball that holds the binary under both spellings
+    /// gives the current one, whatever the order of its entries.
+    #[cfg(unix)]
+    #[test]
+    fn with_both_spellings_the_current_one_wins_whatever_the_order() {
+        let dirs = tarball_dirs("0.4.149", "x86_64-unknown-linux-gnu");
+        let retired: (&str, &[u8]) = (
+            "roomler-tunnel-0.4.149-x86_64-unknown-linux-gnu/roomler",
+            b"retired",
+        );
+        let current: (&str, &[u8]) = (
+            "roomler-0.4.149-x86_64-unknown-linux-gnu/roomler",
+            b"current",
+        );
+        for files in [[retired, current], [current, retired]] {
+            assert_eq!(
+                extract_tarball_binary(&tgz(&files), &dirs).expect("found"),
+                b"current"
+            );
+        }
+    }
+
+    /// FR-46 P1c: the dir and the entry are compared whole, never by a prefix.
+    /// `roomler` begins other lanes' names, and every lane signs with the one
+    /// release key, so the `.asc` check cannot tell them apart. The daemon's
+    /// own tarball (`scripts/stage-linux-tarball.sh`) even holds a `roomler`:
+    /// the shim that re-execs `roomlerd cli`.
+    #[cfg(unix)]
+    #[test]
+    fn the_tarball_dir_and_entry_are_matched_whole_never_by_a_prefix() {
+        let dirs = tarball_dirs("0.4.149", "x86_64-unknown-linux-gnu");
+        for refused in [
+            // The daemon's tarball, as it is published.
+            "roomlerd-0.4.149-x86_64-unknown-linux-gnu/usr/bin/roomler",
+            // Other lanes' names, holding the entry this reader wants.
+            "roomlerd-0.4.149-x86_64-unknown-linux-gnu/roomler",
+            "roomler-setup-0.4.149-x86_64-unknown-linux-gnu/roomler",
+            "roomler-desktop-0.4.149-x86_64-unknown-linux-gnu/roomler",
+            // A longer dir, a deeper entry, a longer entry, no dir at all.
+            "roomler-0.4.149-x86_64-unknown-linux-gnu-x/roomler",
+            "roomler-0.4.149-x86_64-unknown-linux-gnu/sub/roomler",
+            "roomler-tunnel-0.4.149-x86_64-unknown-linux-gnu/sub/roomler",
+            "roomler-0.4.149-x86_64-unknown-linux-gnu/roomlerd",
+            "roomler",
+        ] {
+            let tarball = tgz(&[(refused, b"not the tunnel CLI")]);
+            let refusal = extract_tarball_binary(&tarball, &dirs).expect_err(refused);
+            // The refusal names both of the names it looked for.
+            assert!(
+                refusal.to_string().contains(
+                    "`roomler-0.4.149-x86_64-unknown-linux-gnu/roomler` or `roomler-tunnel-0.4.149-x86_64-unknown-linux-gnu/roomler`"
+                ),
+                "{refusal}"
+            );
+        }
+        // The right name, as a link rather than a regular file.
+        let link = tgz_link(
+            "roomler-0.4.149-x86_64-unknown-linux-gnu/roomler",
+            "/usr/bin/roomlerd",
+        );
+        assert!(extract_tarball_binary(&link, &dirs).is_err());
     }
     // RETIRED-NAME-ANCHOR-END
 

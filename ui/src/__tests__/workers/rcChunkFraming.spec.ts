@@ -354,3 +354,105 @@ describe('rc-chunk-framing — the flag is the counter, made visible', () => {
     expect(st.partials.size).toBe(0)
   })
 })
+
+describe('rc-chunk-framing across two channels — a key frame supersedes (FR-148 P4b-2, D55)', () => {
+  // The viewer opens `video-bytes` and `video-deadline`, and the agent switches
+  // between them only at a key frame, with one frame_seq space across both.
+  // So when the switch's key frame completes, the old channel may still hold a
+  // partial frame from before it. A frame older than the newest key frame is a
+  // straggler: the key frame does not need it, and a gap there would spend a
+  // key-frame ask, the largest frame there is, on nothing.
+
+  /** The first bytes of a record as `frame_video_bytes` writes it: u32 size,
+   *  then the flags byte, whose bit 0 is the key frame. */
+  const header = (key: boolean) => [0, 0, 0, 0, key ? 1 : 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+  it('drops a partial frame as a straggler when a KEY frame completes over it, with no gap', () => {
+    const st = createChunkFraming()
+    // Frame 1, one of its two chunks in, on the old channel.
+    expect(stripChunkPrefix(st, framed(1, 0, 2, [...header(false), 1])).payload).toBeNull()
+    // The switch's key frame, whole, on the new one.
+    const key = stripChunkPrefix(st, framed(2, 0, 1, [...header(true), 2]))
+    expect(bytes(key)).toEqual([...header(true), 2])
+    expect(key.gap).toBe(false)
+    expect(st.gaps).toBe(0)
+    // The chunk frame 1 held is counted where late chunks are.
+    expect(st.stragglers).toBe(1)
+    expect(st.partials.size).toBe(0)
+    // Its last chunk, late on the old channel, is a straggler too.
+    expect(stripChunkPrefix(st, framed(1, 1, 2, [3]))).toEqual({ payload: null, gap: false })
+    expect(st.stragglers).toBe(2)
+    expect(st.gaps).toBe(0)
+  })
+
+  it('drops every older partial a key frame completes over', () => {
+    const st = createChunkFraming()
+    stripChunkPrefix(st, framed(1, 0, 2, [...header(false), 1])) // 1 of 2 chunks held
+    stripChunkPrefix(st, framed(2, 0, 3, [...header(false), 2])) // 2 of 3 held
+    stripChunkPrefix(st, framed(2, 2, 3, [2]))
+    const key = stripChunkPrefix(st, framed(3, 0, 1, [...header(true), 3]))
+    expect(bytes(key)).toEqual([...header(true), 3])
+    expect(key.gap).toBe(false)
+    expect(st.gaps).toBe(0)
+    expect(st.stragglers).toBe(3)
+    expect(st.partials.size).toBe(0)
+  })
+
+  it('keeps a newer partial, started before the key frame completed, and completes it', () => {
+    // Unordered, frame 4's first chunk can overtake the key frame's last one,
+    // and the header's chunk need not come first.
+    const st = createChunkFraming()
+    stripChunkPrefix(st, framed(1, 0, 2, [...header(false), 1]))
+    stripChunkPrefix(st, framed(3, 1, 2, [3]))
+    stripChunkPrefix(st, framed(4, 0, 2, [...header(false), 4]))
+    const key = stripChunkPrefix(st, framed(3, 0, 2, [...header(true), 3]))
+    expect(bytes(key)).toEqual([...header(true), 3, 3])
+    expect(key.gap).toBe(false)
+    expect(st.stragglers).toBe(1)
+    expect([...st.partials.keys()]).toEqual([4])
+    const four = stripChunkPrefix(st, framed(4, 1, 2, [5]))
+    expect(bytes(four)).toEqual([...header(false), 4, 5])
+    expect(four.gap).toBe(false)
+    expect(st.gaps).toBe(0)
+  })
+
+  it('reads the key flag from the record header, which chunk 0 carries, whichever chunk completes it', () => {
+    const st = createChunkFraming()
+    stripChunkPrefix(st, framed(1, 0, 2, [...header(false), 1]))
+    stripChunkPrefix(st, framed(2, 0, 2, [...header(true), 2]))
+    const key = stripChunkPrefix(st, framed(2, 1, 2, [9]))
+    expect(bytes(key)).toEqual([...header(true), 2, 9])
+    expect(key.gap).toBe(false)
+    expect(st.gaps).toBe(0)
+    expect(st.stragglers).toBe(1)
+  })
+
+  it('still reports a gap when a DELTA completes over an older partial: the delta needs it', () => {
+    // Today's rule, unchanged: a delta is decoded against the frame before it.
+    const st = createChunkFraming()
+    stripChunkPrefix(st, framed(1, 0, 2, [...header(false), 1]))
+    const delta = stripChunkPrefix(st, framed(2, 0, 1, [...header(false), 2]))
+    expect(delta.payload).not.toBeNull()
+    expect(delta.gap).toBe(true)
+    expect(st.gaps).toBe(1)
+    expect(st.stragglers).toBe(0)
+  })
+
+  it('keeps the eviction rule: a fourth frame evicts the oldest partial as a gap, key frame or not', () => {
+    // The key frame's flag is not known until it completes, and the evicted
+    // frame might be the one the next delta needs: an eviction stays a loss.
+    const st = createChunkFraming()
+    for (let seq = 1; seq <= MAX_PARTIAL_FRAMES; seq++) {
+      stripChunkPrefix(st, framed(seq, 0, 2, [...header(false), seq]))
+    }
+    const r = stripChunkPrefix(st, framed(MAX_PARTIAL_FRAMES + 1, 0, 2, [...header(true), 9]))
+    expect(r.gap).toBe(true)
+    expect(st.gaps).toBe(1)
+    // When that key frame completes, the partials older than it go as stragglers.
+    const done = stripChunkPrefix(st, framed(MAX_PARTIAL_FRAMES + 1, 1, 2, [10]))
+    expect(done.gap).toBe(false)
+    expect(st.gaps).toBe(1)
+    expect(st.stragglers).toBe(MAX_PARTIAL_FRAMES - 1)
+    expect(st.partials.size).toBe(0)
+  })
+})

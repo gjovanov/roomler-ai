@@ -119,6 +119,11 @@ pub struct DerpConn {
     peer_pubkey: DerpPubKey,
     /// The node's shared WS write queue (cloned from the [`DerpMux`]).
     ws_out: mpsc::Sender<OutboundFrame>,
+    /// FR-148 D52 — the mux's count of frames `send_to` dropped on a full
+    /// shared queue. Every conn of the mux adds to the ONE counter (cloned
+    /// from the [`DerpMux`], as `ws_out` is): the queue is the WS's, so the
+    /// count is too, whichever peer's frame it refused.
+    dropped_full: Arc<std::sync::atomic::AtomicU64>,
     /// This peer's demuxed inbound payloads (the mux routes frames whose
     /// `src_pubkey == peer_pubkey` here).
     inbound: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
@@ -296,7 +301,13 @@ impl RelayConn for DerpConn {
             Ok(()) => Ok(buf.len()),
             // Backpressure: drop this datagram (loss-tolerant carrier). NOT an
             // error — a full transient queue must not latch the carrier dead.
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(buf.len()),
+            // FR-148 D52 — but counted: answering `Ok` kept this drop out of
+            // every count and line, so a read could not tell it from a loss
+            // below the overlay. The keepalive tick's drop line reports it.
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped_full.fetch_add(1, Ordering::Relaxed);
+                Ok(buf.len())
+            }
             // The WS write task is gone → the carrier IS dead. Return `Err` so
             // the `dead` latch fires and the sweep rebuilds.
             Err(mpsc::error::TrySendError::Closed(_)) => Err(io::Error::new(
@@ -324,6 +335,23 @@ impl RelayConn for DerpConn {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.synth_local)
     }
+}
+
+/// FR-148 D52 — the carrier frames a [`DerpMux`] dropped, by where it dropped
+/// them, each a lifetime count that is never reset ([`DerpMux::drops`]). The
+/// `/derp` WS owner reports them on its keepalive tick, one line per socket
+/// when any moved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DerpDrops {
+    /// FR-18 — outbound, shed by the WS writer for waiting past
+    /// [`queue_max_age`].
+    pub stale: u64,
+    /// Outbound, refused at enqueue: the shared queue was full.
+    pub full: u64,
+    /// Inbound, for a routed peer whose consumer's queue was full or closed.
+    pub backpressure: u64,
+    /// Inbound, for a peer this mux holds no route for.
+    pub unrouted: u64,
 }
 
 /// The per-node DERP demux + fan-out. Owns the shared outbound queue and the
@@ -363,6 +391,12 @@ pub struct DerpMux {
     /// the carrier shedding load correctly, which reads nothing like a drop
     /// caused by a full queue or a missing route.
     dropped_stale: Arc<std::sync::atomic::AtomicU64>,
+    /// FR-148 D52 — OUTBOUND frames refused at enqueue because the shared
+    /// queue already held [`OUTBOUND_QUEUE`] frames. `send_to` answers `Ok`
+    /// for them (a full queue is backpressure and must not latch the carrier
+    /// dead), so before this count the drop left no trace. Handed to every
+    /// [`DerpConn`], which is where it is counted.
+    dropped_full: Arc<std::sync::atomic::AtomicU64>,
     /// FR-137 S-B1 — frames that opened on [`HIVE_MAGIC`] (a 0.4.199 peer's
     /// Hive replica stream), dropped before anything else read them. A
     /// counter of its own, since none says anything about the carrier the
@@ -388,6 +422,7 @@ impl DerpMux {
             dropped_unrouted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dropped_backpressure: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dropped_stale: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped_full: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dropped_hive: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
         (mux, ws_out_rx)
@@ -425,6 +460,18 @@ impl DerpMux {
     /// FR-18 — lifetime count of outbound frames shed for staleness.
     pub fn stale_drops(&self) -> u64 {
         self.dropped_stale.load(Ordering::Relaxed)
+    }
+
+    /// FR-148 D52 — every carrier frame this mux dropped, by cause, each
+    /// cumulative for its lifetime: what the `/derp` WS owner's keepalive
+    /// tick reports.
+    pub fn drops(&self) -> DerpDrops {
+        DerpDrops {
+            stale: self.dropped_stale.load(Ordering::Relaxed),
+            full: self.dropped_full.load(Ordering::Relaxed),
+            backpressure: self.dropped_backpressure.load(Ordering::Relaxed),
+            unrouted: self.dropped_unrouted.load(Ordering::Relaxed),
+        }
     }
 
     /// The first frame to send on a fresh `/derp` WS: this node's own pubkey
@@ -480,6 +527,7 @@ impl DerpMux {
         DerpConn {
             peer_pubkey,
             ws_out: self.ws_out.clone(),
+            dropped_full: Arc::clone(&self.dropped_full),
             inbound: AsyncMutex::new(in_rx),
             alive: Arc::clone(&self.alive),
             synth_local: synth_addr(&self.self_pubkey),
@@ -1151,6 +1199,94 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    /// FR-148 D52 — a full outbound queue drops the frame and still answers
+    /// `Ok` (backpressure must not latch the carrier dead), and the drop is
+    /// COUNTED: `full` moves by exactly the frames refused, whichever conn of
+    /// the mux sent them, and no other count moves.
+    #[tokio::test]
+    async fn a_full_outbound_queue_counts_each_refused_frame_and_still_answers_ok() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let a = mux.conn_for(pk(0x02));
+        let b = mux.conn_for(pk(0x03));
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        for _ in 0..OUTBOUND_QUEUE {
+            a.send_to(&[1, 2, 3], dst).await.unwrap();
+        }
+        assert_eq!(
+            mux.drops(),
+            DerpDrops::default(),
+            "a queue filled to its bound has refused nothing"
+        );
+        for k in 0..5 {
+            let conn = if k % 2 == 0 { &a } else { &b };
+            let sent = conn.send_to(&[1, 2, 3], dst).await;
+            assert_eq!(
+                sent.ok(),
+                Some(3),
+                "a full queue is backpressure, not a dead carrier"
+            );
+        }
+        assert_eq!(
+            mux.drops(),
+            DerpDrops {
+                full: 5,
+                ..DerpDrops::default()
+            },
+            "dropped_full moves by exactly the frames refused, from every conn of the mux"
+        );
+    }
+
+    /// FR-148 D52 — a CLOSED outbound queue (the WS writer is gone) is a dead
+    /// carrier: `send_to` answers `Err` so the `dead` latch fires, and the
+    /// frame is not counted as a full-queue drop, even though the queue was
+    /// full when it closed.
+    #[tokio::test]
+    async fn a_closed_outbound_queue_is_an_error_and_not_counted_as_full() {
+        let (mux, out_rx) = DerpMux::new(pk(0x01));
+        let conn = mux.conn_for(pk(0x02));
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        for _ in 0..OUTBOUND_QUEUE {
+            conn.send_to(&[1], dst).await.unwrap();
+        }
+        drop(out_rx);
+        let err = conn.send_to(&[1], dst).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(mux.drops().full, 0, "a closed queue is not a full one");
+    }
+
+    /// FR-148 D52 — `drops` reads each cause from its own counter: the
+    /// writer's stale shed, and `deliver`'s unrouted and backpressure drops.
+    /// The #27 and FR-18 accessors still read what they did.
+    #[tokio::test]
+    async fn drops_reads_each_cause_from_its_own_counter() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        mux.note_stale_drop();
+        let wg = |src: u8| {
+            let mut frame = pk(src).to_vec();
+            frame.extend_from_slice(&[1, 0, 0, 0]);
+            frame
+        };
+        // Two WG frames from a peer this mux holds no route for.
+        mux.deliver(&wg(0x03));
+        mux.deliver(&wg(0x03));
+        // A routed peer whose consumer never drains: three past its bound.
+        let _conn = mux.conn_for(pk(0x02));
+        for _ in 0..INBOUND_QUEUE + 3 {
+            mux.deliver(&wg(0x02));
+        }
+        assert_eq!(
+            mux.drops(),
+            DerpDrops {
+                stale: 1,
+                full: 0,
+                backpressure: 3,
+                unrouted: 2,
+            }
+        );
+        assert_eq!(mux.drop_counts(), (2, 3), "#27's (unrouted, backpressure)");
+        assert_eq!(mux.stale_drops(), 1, "FR-18's shed count");
     }
 
     #[tokio::test]

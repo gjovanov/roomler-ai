@@ -1,8 +1,8 @@
 # FR-91: Scheduled blog publishing — a post goes live without rolling `roomler2`
 
 **Issue:** [#1880](https://github.com/gjovanov/roomler-ai/issues/1880) · **Status:** P0–P2 live since
-2026-10-09; P2b, P3 + P4 merged 2026-11-02 and on production, the blog's copy of the carry at the
-publisher's next release · **Owner:** web / public site + deploy · **Anchors:** master `507f1398e` ·
+2026-10-09; P2b, P3 + P4 merged 2026-11-02 and on production, the lane's copy of the carry read GREEN on 2026-11-22
+(AC8, §8) · **Owner:** web / public site + deploy · **Anchors:** master `507f1398e` ·
 **Builds on:** [FR-87](FR-87-blog-and-google-indexing.md) (the blog, its gates, IndexNow),
 [FR-60](FR-60-public-docs-site.md) (the generator), [FR-88](FR-88-promotion-attribution-and-site-video.md)
 (attribution, `INSTALL_PAGES`), [FR-73](FR-73-image-build-on-github.md) (the image pipeline)
@@ -178,7 +178,7 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
 | P1 | `--blog-only` + the second `AssetEmitter`, `installCopy`, the sitemap-index change behind `BLOG_LANE` in `site.ts`, `files/security-headers.conf`, `public-site-smoke.sh --blog` (compares `/blog/` headers with `/docs/`), tests | `--blog-only` not passed ⇒ output identical to today; `BLOG_LANE = false` | **merged** #1883 `19a8d11c4`, verified before merge |
 | P2 | The deploy repo: `roomler-blog` Deployment + Service, bucket + scoped users, the edge vhost committed and then routed; one promote for P1 | Remove the three edge locations | **live** roomler-ai-deploy#19 `5b4e5d7`, field-verified 2026-10-09 |
 | P2b | `BLOG_LANE = true`, which P1 held back until the edge was routed and P2 did not flip | `BLOG_LANE = false` | **live** #3205 `be06c7070`, `hosted-20261102-be06c70`, GREEN 2026-11-02 (§8) |
-| P3 | §3e: the organic carry and the admin breakdown | `ATTRIBUTION_ENABLED` (existing) | **merged** #3205 `be06c7070`; the image is live, the blog's copy follows at the publisher's next release (§8) |
+| P3 | §3e: the organic carry and the admin breakdown | `ATTRIBUTION_ENABLED` (existing) | **merged** #3205 `be06c7070`; the image is live, and the lane's copy carries the rule since its release of 2026-11-11, read 2026-11-22 (§8) |
 | P4 | Docs: `docs/public-site.md` gains "Publishing without a roll" (the sequence above, the edge flowchart, the kill switch); `docs/README.md` row; the field log | — | **merged** #3205 `be06c7070` |
 
 ## 5. Acceptance criteria
@@ -230,9 +230,17 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
   The RED is in §8: the served script changed 0 of 63 links on such a visit.
   **Read 2026-11-02 on production (§8):** the image's served script is GREEN on that harness, 9 of 63 links
   with `/register` among them, and the SPA's served chunk holds the same rule. A post loads the lane's copy,
-  which is still the old script: 0 of 63.
-  **Missing:** the same read on the lane's script, at the first release built after the merge, then a real
-  organic sign-up in `by_landing_path`.
+  which then was still the old script: 0 of 63.
+  **Read 2026-11-22 on the lane's script (§8):** the lane's release `20261111T060009Z` serves
+  `attribution.55ada1bcea.js`, and on a post from Google with no campaign it changes 12 of 74 links, with
+  `/register` 2 of 2, both carrying `referrer_host` and `landing_path`. The controls change 0 of 74: no
+  referrer, a same-site referrer, and the 10-30 script on the same visit. Two more posts read the same, 9 of 67
+  and 10 of 64, `/register` 2 of 2 on each. The read is of the lane's CURRENT release (11-11), because the lane
+  serves only that one: the first release after the merge (11-05) answers 404 now and cannot be read. Apart
+  from its baked `INSTALL_PAGES` list, the served script equals master's `ui/docs/theme/attribution.js` (its
+  last commit is `be06c7070`). No script line touches cookies or storage, and after the carry
+  `document.cookie` was empty and both storages held 0 entries.
+  **Missing:** a real organic sign-up, stored and counted in `by_landing_path` (the operator's read).
 - [~] **AC9:** right after each edge reload, `/ws`, `/derp`, `/health` and a remote-desktop connect all
   work.
   **Partly met 2026-10-09:** after each of P2's two reloads, `/ws` and `/derp` answered 401 from `roomler2` as
@@ -295,6 +303,11 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
 | 2026-11-02 22:26Z | **Still RED, AC8, the lane's script:** the served `attribution.bd6ed8e979.js` on that post, the same visit. Control: the same run with `?utm_source=fr91-harness` | 0 of 63 links, because a post loads the lane's copy. The control changes 10 |
 | 2026-11-02 22:26Z | The feed: the newest `published` is `2026-11-01T06:00:04Z`, after a post every day from 10-21, and `_release.txt` still names that post | no post yet on 11-02, so nothing built after the merge has reached the lane. The lane's read waits for it |
 | 2026-11-02 22:27Z | The SPA's half: the served `attribution-ChSnkNfg.js` | holds the rule, `"/blog/"` and `startsWith` on the landing path. Code read only: nothing was submitted |
+| 2026-11-22 11:02Z | **GREEN, AC8's carry half, the lane's script** ([the read](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-7078363752)): the lane's release `20261111T060009Z-connect-to-raspberry-pi-remotely` (`/blog/_release.txt`), the served `/blog/connect-to-raspberry-pi-remotely/` loading `attribution.55ada1bcea.js` (6621 bytes), the 10-30 harness, referrer `https://www.google.com/`, no campaign | 12 of 74 links change, `/register` 2 of 2, both to `/register?referrer_host=www.google.com&landing_path=%2Fblog%2Fconnect-to-raspberry-pi-remotely%2F`. Plain GETs of public pages: nothing submitted |
+| 2026-11-22 11:02Z | Controls for that read: no referrer; a same-site referrer; the 10-30 script `f2ef772513` on the same visit; and `?utm_source=fr91-harness` with Google | 0 of 74, 0 of 74, 0 of 74 (so the script changed, not the page); the campaign tag changes 12 of 74, `/register` 2 of 2 |
+| 2026-11-22 11:05Z | The same script and visit on two more posts: `/blog/zerotier-alternative/` (the first published after the merge, 11-05) and `/blog/subnet-router/` (the post of the 10-30 RED) | 9 of 67 and 10 of 64, `/register` 2 of 2 on each; no referrer 0 of 67 and 0 of 64 |
+| 2026-11-22 11:05Z | The served bytes against master's `ui/docs/theme/attribution.js` (last commit `be06c7070`), and against the 10-30 copy | equal to master line for line, apart from the baked `INSTALL_PAGES` line (17 entries on 10-30, 24 now). Against the 10-30 copy the diff is that list and the organic rule: `ORGANIC_PREFIX = '/blog/'` and an early return. No script line touches cookies, storage, `fetch`, XHR or `sendBeacon`; after the carry `document.cookie` is empty and both storages hold 0 entries |
+| 2026-11-22 11:05Z | What the read cannot show: the first release built after the merge; a real browser; a real organic sign-up | the lane serves only its current release, so the 11-05 release cannot be read and the 11-02 and 10-30 scripts answer 404; the harness sets `document.referrer` by hand, as the RED did; the sign-up in `by_landing_path` is still owed (AC8 stays `[~]`) |
 
 Negative controls for P3, each run and restored (hashes compared):
 

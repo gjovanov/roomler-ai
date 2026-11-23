@@ -1225,6 +1225,11 @@ mod keeper_tests {
     const LATE: Duration = Duration::from_millis(200);
     /// How long a request is left hanging while the keeper is watched.
     const HUNG_FOR: Duration = Duration::from_millis(1500);
+    /// How long a test waits for the requests it expects to begin (#4274):
+    /// far longer than a busy runner takes to schedule a thread. A count
+    /// already there returns at once, so only a request that never begins
+    /// waits this out.
+    const BEGINS: Duration = Duration::from_secs(10);
 
     /// What the stood-in OS does with a request.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1296,6 +1301,29 @@ mod keeper_tests {
 
         fn began(&self) -> usize {
             self.0.began.load(SeqCst)
+        }
+
+        /// The requests begun, once `want` of them have, waited for `within`
+        /// at most. A request counts when the `power-inhibit` thread the
+        /// keeper started for it runs it (`PowerKeeper::start_taking`), and
+        /// the keeper goes on at once, so a count read straight after the
+        /// passes that wanted it can miss a request they started (#4274). The
+        /// caller asserts the exact count, so one request more than `want`
+        /// still fails. Async: the wait holds no worker of the runtime the
+        /// keeper runs on.
+        async fn began_within(&self, want: usize, within: Duration) -> usize {
+            let deadline = Instant::now() + within;
+            loop {
+                let began = self.began();
+                if began >= want {
+                    return began;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{began} of {want} requests began within {within:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
 
         fn released(&self) -> usize {
@@ -1618,7 +1646,11 @@ mod keeper_tests {
             passes.iter().all(|(_, p)| !p.held),
             "{kind:?}: nothing is published as held while the request hangs"
         );
-        assert_eq!(os.began(), 1, "{kind:?}: one request in flight");
+        assert_eq!(
+            os.began_within(1, BEGINS).await,
+            1,
+            "{kind:?}: one request in flight"
+        );
 
         // The OS answers: held at once, not a pass later.
         let answered = Instant::now();
@@ -1775,7 +1807,12 @@ mod keeper_tests {
         let _session = device.start(Kind::Ssh);
         let started = Instant::now();
         tokio::time::sleep(EVERY * 10).await;
-        let (began, watched) = (os.began(), started.elapsed());
+        // #4274 — the range's floor is two requests begun, each on a
+        // `power-inhibit` thread of its own, which a busy runner may not have
+        // run yet: wait for them, then read the time watched. A keeper that
+        // spins still fails the ceiling.
+        let began = os.began_within(2, BEGINS).await;
+        let watched = started.elapsed();
         let _ = stop.send(true);
         keeper.await.expect("the keeper ends");
         let most = (watched.as_millis() / EVERY.as_millis()) as usize + 2;

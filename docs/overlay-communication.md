@@ -665,8 +665,8 @@ graph TB
     end
     IN["inbound frame<br/>dst ‖ payload"] --> LOOK{"look up<br/>sender network_id + dst"}
     LOOK -->|"hit"| OUT["deliver src ‖ payload"]
-    LOOK -->|"miss — peer offline<br/>or other network"| DROP["drop silently"]
-    LOOK -->|"queue full"| DROP2["drop — loss-tolerant"]
+    LOOK -->|"miss — peer offline<br/>or other network"| DROP["drop, counted<br/>one line per pair per 30 s"]
+    LOOK -->|"queue full"| DROP2["drop, counted — loss-tolerant<br/>one line per pair per 30 s"]
     REG -.-> LOOK
 ```
 
@@ -682,7 +682,9 @@ Three guarantees fall out of the key shape:
 
 Backpressure is a bounded per-connection queue with drop-on-overflow; WireGuard
 retransmits, so a dropped carrier datagram is harmless. Re-registration is
-last-writer-wins, because corp middleboxes routinely leave half-open TCP.
+last-writer-wins, because corp middleboxes routinely leave half-open TCP. Both
+drops are counted and logged on the central relay and on a regional one
+([every drop on the relay path](#every-drop-on-the-relay-path-and-where-it-reports-fr-148-d52)).
 
 ### Client side
 
@@ -721,7 +723,7 @@ The second is the kernel's TCP send buffer under the `/derp` WebSocket.
 ```mermaid
 flowchart LR
     WG["WireGuard datagram"] --> SEND["DerpConn::send_to<br/>stamps the frame"]
-    SEND -->|"queue full"| FULL["dropped, uncounted"]
+    SEND -->|"queue full"| FULL["dropped_full + 1"]
     SEND --> Q["outbound queue<br/>512 frames, a memory bound"]
     Q --> AGE{"waited longer than<br/>the age bound?"}
     AGE -->|"yes"| STALE["dropped_stale + 1"]
@@ -732,9 +734,9 @@ flowchart LR
 
 | Lever | Where | What it does |
 |---|---|---|
-| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:511` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
-| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:77`), called once per connect (`:392`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:40`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
-| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:421`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:479`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
+| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:550` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
+| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:77`), called once per connect (`:435`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:40`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
+| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:456`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it, with the mux's three other drop counts, when any of them changed (`agents/roomlerd/src/derp.rs:522`): *"overlay derp: carrier frames dropped (stale, full, backpressure, unrouted)"*, which keeps the `dropped_stale` and `since_last` of FR-18's shed line, *"overlay derp: shed stale carrier frames (queue age bound)"* ([every drop on the relay path](#every-drop-on-the-relay-path-and-where-it-reports-fr-148-d52)) |
 
 ⚠️ **A successful set is not a cap.** The OS may apply less than was asked and
 still return success, so the daemon reads the size back with
@@ -790,6 +792,115 @@ answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:2
 so that a transient overflow never latches the carrier dead. FR-18's design
 also named a `dropped_full` counter, and it was never built.
 
+### Every drop on the relay path, and where it reports (FR-148 D52)
+
+A frame on the DERP path leaves one node's mux, crosses a relay (the central
+`/derp` on the API pods, or a regional `derp-relay`) and enters the other
+node's mux. Each place that drops it counts the drop where it happens, and the
+host that dropped it reports the count on a line. On the mesh relay a lost
+carrier frame is what fires an SCTP T3-rtx expiry in a remote-control session
+(FR-148 AC4), so a read has to tell which drop moved, on which node, or that
+none did. The drop on a full outbound queue, which the warning just above
+calls uncounted, is counted since FR-148 D52, in `dropped_full`, and `send_to`
+still answers `Ok` (the table's first row).
+
+```mermaid
+flowchart LR
+    subgraph SND["sending node: the DerpMux of one /derp socket"]
+        WG1["WireGuard datagram"] --> SEND["DerpConn::send_to"]
+        SEND -->|"queue full"| D1["dropped_full + 1"]
+        SEND --> Q["outbound queue"]
+        Q -->|"older than the age bound"| D2["dropped_stale + 1"]
+        Q --> WS1["its /derp WebSocket"]
+    end
+    subgraph RLY["relay: central /derp or a regional derp-relay"]
+        FWD["forward_frame"]
+        FWD -->|"org past its allowance"| D3["allowance shaped total + 1"]
+        FWD -->|"no registration for dst"| D4["derp_miss_total + 1"]
+        FWD -->|"dst queue full or closed"| D5["derp_full_total + 1"]
+        FWD --> WS2["the dst's /derp WebSocket"]
+    end
+    subgraph RCV["receiving node: the DerpMux of one /derp socket"]
+        DEL["DerpMux::deliver"]
+        DEL -->|"no route for src"| D6["dropped_unrouted + 1"]
+        DEL -->|"route's queue full or closed"| D7["dropped_backpressure + 1"]
+        DEL --> WG2["WireGuard, or a tunnel's QUIC"]
+    end
+    WS1 --> FWD
+    WS2 --> DEL
+    D1 -.-> NL["the node's drop line<br/>keepalive tick, when a count moved"]
+    D2 -.-> NL
+    D6 -.-> NL
+    D7 -.-> NL
+    D6 -.-> LA["LocalAPI derp_inbound_drops<br/>roomler status"]
+    D7 -.-> LA
+    D3 -.-> RL["the relay's own lines<br/>paced, per network or pair"]
+    D4 -.-> RL
+    D5 -.-> RL
+```
+
+Every node is both ends: its drop line carries its two outbound counts and its
+two inbound ones, so the sending node's line tells `stale` and `full`, and the
+receiving node's line tells `backpressure` and `unrouted`.
+
+| Where | It drops a frame when | Counted in | Reported on |
+|---|---|---|---|
+| sending node, `DerpConn::send_to` (`crates/tunnel-core/src/transport/derp.rs:307`) | the shared outbound queue already holds 512 frames (`OUTBOUND_QUEUE`, `:55`) | `dropped_full` (`:308`), one count for every conn of the mux | the drop line |
+| sending node, the WS writer (`agents/roomlerd/src/derp.rs:550`) | the frame waited past the age bound (above) | `dropped_stale` (`DerpMux::note_stale_drop`, `crates/tunnel-core/src/transport/derp.rs:456`) | the drop line |
+| relay, both: central `forward_frame` (`crates/modules/network/src/derp.rs:691`), regional (`crates/derp-relay/src/main.rs:1091`) | a bulk frame of an org past its plan's monthly relay (FR-115) | `derp_allowance_shaped_total` | INFO, at most one per network and source per 30 s (central) or per network per 10 s (regional) |
+| central relay only (`crates/modules/network/src/derp.rs:674`, `:709`) | the overlay ACL denies the pair; a tunnel-leg frame over its rate | the ACL drop is not counted; `derp_tunnel_shaped_total` | INFO `derp: dropped a frame the overlay ACL denies`; the shaper's INFO at most one per network and source per 30 s |
+| relay, both: central (`crates/modules/network/src/derp.rs:725`), regional (`crates/derp-relay/src/main.rs:1102`) | no registration for (network, dst) here: the peer is offline, or registered on another pod or relay | `derp_miss_total` | INFO, at most one per network and destination per 30 s; on the central relay also its census line each minute (`crates/modules/network/src/derp.rs:286`) |
+| relay, both: central (`crates/modules/network/src/derp.rs:749`), regional (`crates/derp-relay/src/main.rs:1125`) | the destination's send queue refused it: full (a slow or half-open consumer), or closed by a socket on its way out | `derp_full_total` | WARN, at most one per network and destination per 30 s; the central relay's census line |
+| receiving node, `DerpMux::deliver` (`crates/tunnel-core/src/transport/derp.rs:622`) | the mux holds no route for the frame's source | `dropped_unrouted` (`:623`), and `DERP_INBOUND_UNROUTED`; the runtime is told to follow that peer onto DERP | the drop line; `NodeStatus.derp_inbound_drops`, which `roomler status` prints |
+| receiving node, `DerpMux::deliver` (`crates/tunnel-core/src/transport/derp.rs:603`, `:611`) | a routed consumer's queue (256 frames, `INBOUND_QUEUE`, `:80`) is full, or closed since a better tier replaced the carrier | `dropped_backpressure` (`:604`, `:617`), and `DERP_INBOUND_BACKPRESSURE` | the drop line; `NodeStatus.derp_inbound_drops` |
+
+In no count, so in no line: a frame shorter than 32 bytes, at either relay or
+at the receiving node, and one longer than 2,048 bytes at either relay. A
+0.4.199 peer's Hive frame is counted apart (`dropped_hive`, FR-137) and read by
+nothing outside `derp.rs`, so it is not on the drop line either.
+
+**The node's drop line.** The `/derp` WS owner reads its mux's four counts
+(`DerpMux::drops`, `crates/tunnel-core/src/transport/derp.rs:468`) on every
+keepalive tick, every 25 s from the connect (`DERP_KEEPALIVE`,
+`agents/roomlerd/src/derp.rs:56`), and writes one INFO line when any of them
+moved since the line before (`DropLine::due`, `:232`, called at `:522`). A
+carrier that drops nothing stays silent. A node with a regional relay writes
+one line per socket, each under its own `relay`. The counts are the mux's for
+its life, so a reconnect keeps them, and a line's moves read across it.
+
+*"overlay derp: carrier frames dropped (stale, full, backpressure, unrouted)"*
+(`DropLine::log`, `agents/roomlerd/src/derp.rs:243`):
+
+| Field | Meaning |
+|---|---|
+| `relay` | which `/derp` socket: `central`, or a regional relay's host. The path reader keeps it in the database |
+| `dropped_stale`, `since_last` | the stale count and its move since the line before: FR-18's shed line's two fields, with their names and meaning |
+| `dropped_full`, `full_since_last` | outbound frames the full queue refused |
+| `dropped_backpressure`, `backpressure_since_last` | inbound frames a full or closed consumer queue refused |
+| `dropped_unrouted`, `unrouted_since_last` | inbound frames from a peer the mux holds no route for |
+
+It replaced FR-18's shed line, *"overlay derp: shed stale carrier frames (queue
+age bound)"*, which an older agent still writes when its stale count moved, so
+read both. `roomler status` prints the inbound pair only (its `derp drops`
+line, from `NodeStatus.derp_inbound_drops`): the outbound counts are on the
+drop line alone. To read a host, grep its log for
+`overlay derp: carrier frames dropped`. To pair the lines with a
+remote-control session's T3 expiries, on both ends of the mesh relay pair, use
+the path reader's `--timeline` with `--viewer-agent`
+([production-mongo-reads.md §8a](production-mongo-reads.md#8a-one-devices-window-line-by-line---timeline)).
+
+**The relays' lines.** The central relay writes
+*"derp: dropped a frame for an unregistered dst (peer offline, or registered on
+another pod/relay)"* and *"derp: dropped a frame on a full destination queue
+(slow or half-open consumer)"*, each with `network_id`, `src` and `dst` (each
+key as its first 8 hex characters) and the running total. A regional relay writes
+the same two as *"derp-relay: dropped a frame …"*, with `network`, `src`, `dst`
+and its own totals (`ForwardDrops`, `crates/derp-relay/src/main.rs:995`). It has
+no periodic census line, so its totals are on these lines alone
+([the regional relay's doc](../scripts/relay-pop/README.md#the-drop-lines-fr-148-d52)).
+A drop on a relay is in no node's line: a T3 that no node's count explains
+needs the relay's log of the same minutes.
+
 ### Lazy connection
 
 ⚠️ **Since rc.400 the always-on floor opens `/derp` on every node at startup**
@@ -841,7 +952,7 @@ flowchart TD
 ```
 
 - **The mux starts connecting, not alive** (`DerpMux::begin_connecting`,
-  `crates/tunnel-core/src/transport/derp.rs:640`). No carrier is built on it until its
+  `crates/tunnel-core/src/transport/derp.rs:688`). No carrier is built on it until its
   WS registers, and the registration wakes the walk (`MuxEvent::Recovered`), so a
   stamped pair moves within a tick of `/derp` coming up. The startup mux is unchanged:
   it is born alive, and floors are built at birth.
@@ -909,25 +1020,38 @@ why per-roll medians land on 7.5, 15 and 25 s.
 **Since the pre-pull** (2026-11-07, the second lever below), the image is on both nodes before the roll
 begins ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#ac4-the-rolls-since-the-pre-pull)):
 
-| Measure | Before the pre-pull | Since the pre-pull |
-|---|---|---|
-| A replacement starts | 5.1–5.9 s after its SIGTERM, 3–4 s of it the pull | 2 s after its SIGTERM, `Container image … already present on machine` |
-| A whole roll, first SIGTERM to second Ready | 33.9 s | 25 s on 2026-11-07; 24–28 s on five promotes to 2026-11-16 |
-| Each wave, SIGTERM to Ready | 16.9 s and 17.1 s | 12 s and 13 s |
-| `/derp` down, per socket | p50 7.6 s, p90 15.9 s (310 sockets, October) | p50 3.4 s, p90 3.7 s (156 sockets on eight promotes to 2026-11-16) |
-| Control socket close to `control-WS reattached` | p50 7.8 s, p90 8.8 s (2026-11-02) | p50 3.5 s, p90 4.0 s (84 sockets, the same eight) |
+| Measure | Before the pre-pull | Since the pre-pull | Since, with `ws_flat_redial` on |
+|---|---|---|---|
+| A replacement starts | 5.1–5.9 s after its SIGTERM, 3–4 s of it the pull | 2 s after its SIGTERM, `Container image … already present on machine` | Unchanged: the switch acts on the device |
+| A whole roll, first SIGTERM to second Ready | 33.9 s | 25 s on 2026-11-07; 24–28 s on five promotes to 2026-11-16 | Unchanged |
+| Each wave, SIGTERM to Ready | 16.9 s and 17.1 s | 12 s and 13 s | Unchanged |
+| `/derp` down, per socket | p50 7.6 s, p90 15.9 s (310 sockets, October) | p50 3.4 s, p90 3.7 s (156 sockets on eight promotes to 2026-11-16) | p50 2.1 s, max 2.7 s (8 sockets on two hosts, two promotes of 2026-11-21) |
+| Control socket close to `control-WS reattached` | p50 7.8 s, p90 8.8 s (2026-11-02) | p50 3.5 s, p90 4.0 s (84 sockets, the same eight) | 1.9–2.9 s to the hello (8 sockets, the same two promotes). These hosts cannot log the reattach line, which follows the hello by 47 ms at most where it is logged |
 
 What is left of a wave is the old pod's exit, the scheduling and the start (about 2 s), then 10–12 s until
 Kubernetes marks the replacement Ready, which releases the second wave. That paces the roll, not the reattach:
 the front nginx sends to the node's address and never sees readiness, so a socket can land as soon as the
 binary listens. On the ladder it lands at the +3 s dial, as 80 of the 84 reattaches did, where it used to wait
-for +7 s.
+for +7 s. With the flat redial on, it lands within a second of the replacement listening
+([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#the-switch-on-half-2026-11-22)):
+
+```mermaid
+flowchart LR
+    C["socket cut"] --> D["first dial, about +1 s<br/>502: no process behind the pin"]
+    D --> Q{"ws_flat_redial on?"}
+    Q -- no --> L["the ladder's +3 s dial<br/>back at 3.1 s"]
+    Q -- yes --> F["a flat redial every 0.5 to 1 s<br/>while the answer is 502"]
+    F --> B["back at 1.9 to 2.9 s"]
+```
+
+The two hosts that ran it were back 1.9–2.9 s after their cut on two promotes, after one or two flat redials,
+where the same hosts took 3.1 s on the ladder and the same promotes' other hosts p50 3.4 s.
 
 **Two levers go at that wait** ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#p2-the-flat-redial)):
 
 | Lever | What it changes | Switch |
 |---|---|---|
-| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:75`), up to 30 times an outage. Every other failure keeps the ladder. In every agent since 0.4.200. With the pre-pull it has about 1 s a wave left to buy, and its field read (FR-28's AC3) is owed | `ws_flat_redial`, default OFF |
+| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:75`), up to 30 times an outage. Every other failure keeps the ladder. In every agent since 0.4.200. With the pre-pull it had about 1 s a wave left to buy, and it bought most of it: 1.9–2.9 s with it on, against 3.1 s for the same hosts on the ladder (FR-28's AC3, read 2026-11-22) | `ws_flat_redial`, default OFF |
 | Pre-pull | With #3320, a promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)). In force since 2026-11-07: a roll takes 25 s instead of 33.9 s (the table above) | The deploy repo's DaemonSet file |
 
 ⚠️ **A server that accepts and drops must still climb** (#2221), or a fleet reconnects to it every second. So only a

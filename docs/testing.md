@@ -119,8 +119,8 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:15317`,
-  `:15377`), both recording what the host would get and WHO sent it.
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:15241`,
+  `:15331`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
   through the IME (CDP `Input.imeSetComposition`), pastes, and asserts one
@@ -263,7 +263,7 @@ Fixed since:
 > whenever it landed inside them. The probe's state is now one value, `ProbeState`, and a test
 > that asks whether there is an answer holds an instance of its own. A loop test is a plain
 > `#[test]` that takes `caps::loop_fixture()`
-> ([`caps.rs:2574`](../agents/roomlerd/src/encode/caps.rs#L2574)) and runs its body with the
+> ([`caps.rs:2571`](../agents/roomlerd/src/encode/caps.rs#L2571)) and runs its body with the
 > fixture's `block_on`. The first answer is in, the probe counts as started (no thread, no
 > child), and `DENY_ENV_LOCK` is held, so no probe test runs beside the loop: unlocked, a loop's
 > session ask landed in a retry test's quiet wait and held that test, and the lock, for 60 s.
@@ -795,7 +795,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8082`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8096`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -818,7 +818,7 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
 | `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
 | `rtp:av1` | MF's AV1 | MF |
-| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5447`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5463`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
 | `named` | `encode::open_named`: an FFmpeg name past every cascade and the denylist; an MF cell's name, that MF cascade alone (MF still refuses a denied MF cell) | FFmpeg; an MF name asks for MF, not hardware |
 
@@ -874,7 +874,7 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
   to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
   beside `hw_encoders` for that join: the legacy label is enumeration-only
-  (`agents/roomlerd/src/encode/caps.rs:4579`), so on Windows it says `mf-h264-hw` even where the
+  (`agents/roomlerd/src/encode/caps.rs:4578`), so on Windows it says `mf-h264-hw` even where the
   cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.

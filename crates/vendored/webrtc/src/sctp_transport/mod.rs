@@ -484,6 +484,25 @@ impl RTCSctpTransport {
         sctp_association.as_ref().map(|a| a.gauges())
     }
 
+    /// roomler patch (FR-148 P4b-1, D55): marks the association's stream
+    /// `stream_identifier` (a data channel's id) deadline-limited
+    /// (`sctp::association::Association::mark_deadline_stream`). Reaches the
+    /// association as `gauges` does: a slot held by `stop()` is not waited
+    /// for. False when there is no association, its slot is held, or it has
+    /// no such stream: nothing is marked, and the caller may ask again.
+    pub async fn mark_deadline_stream(&self, stream_identifier: u16) -> bool {
+        let association = {
+            let Ok(sctp_association) = self.sctp_association.try_lock() else {
+                return false;
+            };
+            let Some(association) = sctp_association.as_ref() else {
+                return false;
+            };
+            Arc::clone(association)
+        };
+        association.mark_deadline_stream(stream_identifier).await
+    }
+
     pub(crate) fn data_channels_accepted(&self) -> u32 {
         self.data_channels_accepted.load(Ordering::SeqCst)
     }

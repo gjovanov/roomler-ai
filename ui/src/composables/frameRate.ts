@@ -56,7 +56,7 @@ export function frameRateOptions(
   const high = agentOffersHighRefresh(video)
   return FRAME_RATES.map((fps) => {
     if (fps === 60) return { fps, enabled: true, why: null }
-    if (!high) return { fps, enabled: false, why: "this device's agent streams at most 60 fps" }
+    if (!high) return { fps, enabled: false, why: "this device's daemon streams at most 60 fps" }
     if (hostRefreshHz !== null && hostRefreshHz > 0 && hostRefreshHz < fps) {
       return { fps, enabled: false, why: `the host's screen refreshes at ${hostRefreshHz} Hz` }
     }

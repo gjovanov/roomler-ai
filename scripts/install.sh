@@ -895,6 +895,19 @@ install_daemon_macos() {
         return 0
     fi
 
+    # FR-141 P2's follow-up — the wizard's two-row half (FR-129 B2) on a Mac
+    # whose root config is one row already (both switches on): a one-row
+    # attempt left half-placed, a one-row Mac removed with --keep-config, or one
+    # whose daemon did not answer the wizard's guard in time. Its marker and
+    # package run would start root as the Mac's one row and remove the per-user
+    # LaunchAgent the second row needs, and the fold below keeps both switches.
+    # So it stops here, as root and before either, and names the roads.
+    if [ "$PRIV_STEPS" = 1 ] && [ -n "$CONFIG_FROM" ] && as_root test -f "$MACOS_DAEMON_CONFIG" \
+        && root_config_says macos_supervise_gui_worker && root_config_says macos_one_row; then
+        echo "error: this Mac is one row already ($MACOS_DAEMON_CONFIG): its root service holds its one row and starts the screen worker, so it takes no second row. Nothing was changed. To finish it as one row, run: curl -fsSL $SERVER/api/setup/install.sh | sh -s -- --role daemon --one-row (with no token it installs the package only). To remove it instead, run: curl -fsSL $SERVER/api/setup/install.sh | sh -s -- --uninstall" >&2
+        exit 1
+    fi
+
     # The marker has to exist BEFORE the pkg runs: the postinstall reads it to
     # decide whether to install the root LaunchDaemon, and its ABSENCE actively
     # removes a previously-installed one. Nothing in the product ever created
@@ -1981,16 +1994,28 @@ uninstall_linux() {
 
 # ── macOS ──
 
+# Whether com.roomler.update is installing now: the process launchd runs for it
+# has an `installer` child. launchctl's whole answer is read before it is
+# matched, as the .pkg postinstall reads it (#3783).
+update_helper_installs() {
+    out="$(as_root launchctl print system/com.roomler.update 2>/dev/null)" || return 1
+    pid="$(printf '%s\n' "$out" | awk '$1 == "pid" && $2 == "=" { print $3; exit }')"
+    [ -n "$pid" ] && pgrep -P "$pid" -x installer >/dev/null 2>&1
+}
+
 uninstall_stop_macos() {
     # The update helper first, and never in the middle of an install: booting
     # it out kills its whole process group, `installer` included (the .pkg
-    # postinstall's own warning).
+    # postinstall's own warning). Only a helper running `installer` is waited
+    # for. One without it is checking, downloading, or waiting for live work
+    # to end (FR-151), which can take hours: it is stopped at once, and it
+    # exits on that SIGTERM without installing.
     if as_root launchctl print system/com.roomler.update >/dev/null 2>&1; then
         n=0
-        while as_root launchctl print system/com.roomler.update 2>/dev/null | grep -q 'state = running'; do
+        while update_helper_installs; do
             [ "$n" = 0 ] && say "waiting for com.roomler.update to finish: it is installing an update"
             n=$((n + 1))
-            [ "$n" -ge 300 ] && { warn "com.roomler.update still runs after 300 s; stopping it"; break; }
+            [ "$n" -ge 300 ] && { warn "com.roomler.update still installs after 300 s; stopping it"; break; }
             sleep 1
         done
         say "stopping com.roomler.update"

@@ -4028,6 +4028,8 @@ async fn media_pump_vp9_444_dc(
     let media_thread = crate::encode::media_thread_enabled();
     let mut encoder: Option<crate::encode::thread::EncoderHandle<Vp9Encoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
+    // FR-148 D51 B4g — the time the capacity gate held frames back since the last encode.
+    let mut gate_clock = crate::encode::charge::GateClock::default();
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
     // FR-93 P3e — a capture waiting on its host (a display switched off).
@@ -4254,7 +4256,7 @@ async fn media_pump_vp9_444_dc(
     // loop). A SINGLE consumer keeps the 16 KiB chunk order intact (the browser
     // reassembler needs it). Depth is intentionally shallow so we stay
     // low-latency — under sustained congestion the pump sheds load rather than
-    // building a stale backlog.
+    // building a stale backlog. Each frame carries its hand-off instant (FR-148).
     const VP9_SEND_QUEUE_DEPTH: usize = 2; // shallower than FFmpeg's 4 — VP9-444 frames are large; minimise input head-of-line delay
     let send_depth = if constrained_transport {
         VP9_SEND_QUEUE_DEPTH
@@ -4265,7 +4267,7 @@ async fn media_pump_vp9_444_dc(
         // Input rides a SEPARATE DC, so a deeper video queue adds no input lag.
         8
     };
-    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(send_depth);
+    let (send_tx, mut send_rx) = mpsc::channel::<(std::time::Instant, Bytes)>(send_depth);
     // P8c — the rate governor owns this pump's AIMD (rc.171 — driven off
     // SEND-CHANNEL OCCUPANCY at the capacity gate, the real webrtc-rs
     // backpressure signal; `dc.buffered_amount()` stays low under SCTP flow
@@ -4291,6 +4293,7 @@ async fn media_pump_vp9_444_dc(
         let task_session = session_id;
         let goodput_sink = governor.goodput_sink();
         let budget_bytes = delivery.pump_count(); // FR-148 D46
+        let send_wait = Arc::clone(delivery.send_wait()); // FR-148
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
@@ -4303,7 +4306,7 @@ async fn media_pump_vp9_444_dc(
             // (`encode::goodput`).
             while let Some(first) = send_rx.recv().await {
                 let mut next = Some(first);
-                while let Some(wire) = next.take() {
+                while let Some((enqueued_at, wire)) = next.take() {
                     let mut unsent = budget_bytes.unsent(wire.len()); // FR-148 D46
                     if let Some(dc) = video_bytes_dc.lock().await.clone() {
                         let total = wire.len();
@@ -4344,6 +4347,7 @@ async fn media_pump_vp9_444_dc(
                                 ser_start.elapsed(),
                                 video_bytes_is_keyframe(&wire),
                             );
+                            send_wait.sent(enqueued_at, std::time::Instant::now()); // FR-148
                         }
                     }
                     next = send_rx.try_recv().ok();
@@ -4504,6 +4508,7 @@ async fn media_pump_vp9_444_dc(
         delivery.gate(&pc, &mut governor, session_id, constrained_transport, false); // FR-148 D46
         if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {
             frames_skipped_backpressure += 1;
+            gate_clock.skipped(std::time::Instant::now()); // FR-148 D51 B4g
             delivery.note_gate(send_tx.capacity() == 0, false); // FR-148 D46
             // Adaptive bitrate (rc.171) — a FULL send channel is the real DC
             // backpressure signal. Drive the multiplicative decrease HERE,
@@ -4514,7 +4519,7 @@ async fn media_pump_vp9_444_dc(
             // frame that DOES get through is already smaller.
             // P5 — a congested follower gates production identically (the
             // shared stream paces to the slowest link; see media_share).
-            if let Some(applied) = delivery.on_skip(false, |t| governor.on_backpressure_skip(t))
+            if let Some(applied) = delivery.on_skip(false, |s| governor.on_gate_skip(s))
                 && let Some(enc) = encoder.as_mut()
             {
                 enc.set_bitrate(applied.bps).await;
@@ -4522,6 +4527,7 @@ async fn media_pump_vp9_444_dc(
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
+        gate_clock.passed(std::time::Instant::now()); // FR-148 D51 B4g
         delivery.on_frame(&pc, &mut governor); // FR-148 D46
 
         // FR-112 P2 — cadence pacing, as the FFmpeg pump's (FR-1 P5): when the
@@ -4952,6 +4958,7 @@ async fn media_pump_vp9_444_dc(
         // Bounded sub-second, and NO forced keyframe on resume — a pause
         // loses no frames, so the delta chain survives it intact.
         if governor.draining(std::time::Instant::now()) {
+            gate_clock.paused(); // FR-148: under `on`, the pause is gated
             tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         }
@@ -5028,8 +5035,15 @@ async fn media_pump_vp9_444_dc(
             last_applied_quality = q_now;
         }
 
+        // FR-148 D51 B4g — where the budget acts, libvpx is charged this frame's gap
+        // less the time the gate held frames back, never less than the interval
+        // (`RateGovernor::charge_interval`), on the encode's own message. Else today's pts.
+        let gated = gate_clock.take();
+        let gate = governor
+            .charge_interval(target_fps)
+            .map(|interval| crate::encode::charge::Gate { gated, interval });
         let encode_start = std::time::Instant::now();
-        let packets = match enc.encode(&frame).await {
+        let packets = match enc.encode_charged(&frame, gate).await {
             Ok(p) => p,
             Err(e) => {
                 warn!(%session_id, %e, "VP9-444 encode error — pump exits");
@@ -5241,7 +5255,7 @@ async fn media_pump_vp9_444_dc(
             );
             let wire_len = wire.len() as u64;
             delivery.on_media_write(&pc, session_id, crate::media_delivery::Pump::Vp9444Dc); // FR-148 O10
-            match send_tx.try_send(wire) {
+            match send_tx.try_send((std::time::Instant::now(), wire)) {
                 Ok(()) => {
                     handed_bytes += wire_len;
                     delivery.on_handed(wire_len); // FR-148 D46
@@ -5324,6 +5338,7 @@ async fn media_pump_vp9_444_dc(
             // None = no report this window.
             let avg_qp = (qp_n > 0).then(|| (qp_sum / qp_n) as u32);
             let max_qp = (qp_n > 0).then_some(qp_max);
+            let (send_wait_avg_ms, send_wait_max_ms) = delivery.send_wait().take().ms(); // FR-148
             info!(
                 %session_id,
                 target_fps,
@@ -5335,6 +5350,7 @@ async fn media_pump_vp9_444_dc(
                 settle_kf_suppressed,
                 avg_scale_ms,
                 avg_encode_ms,
+                send_wait_avg_ms, send_wait_max_ms,
                 paced_fps = ?governor.paced_software_fps(),
                 target_bps = governor.applied_bps(), target_moves = %governor.take_moves(),
                 avg_qp = ?avg_qp,
@@ -5345,7 +5361,7 @@ async fn media_pump_vp9_444_dc(
                 viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
                 viewer_age_implausible = governor.viewer_age_implausible(),
                 // FR-70 M0 — the fused age split by plane (transit is an
-                // upper bound here: this pump keeps no send-wait figure).
+                // upper bound here: this pump hands it no send wait).
                 age_split = ?governor.viewer_age_split(None),
                 // FR-71 T1a — which plane was the limiter last window (the
                 // verdict FR-79's gate reads; `evidence_rejected` below says
@@ -7087,20 +7103,16 @@ async fn media_pump_ffmpeg_dc(
     // against, resolved once like the line above (env/config are process-stable).
     let direct_lag_bound_ms = crate::encode::rate_profile::direct_queue_ms();
     // 2026-08-26 — queue-wait telemetry (P7 of the drag-latency design):
-    // enqueue→wire-complete per frame, accumulated by the send task and
-    // drained by the heartbeat. Sent frames only — a stale-dropped frame
-    // never rode the wire, and its wait would double-count the rebuild
-    // gap the epoch discard exists to erase.
-    let send_wait_us_sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let send_wait_us_max = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // enqueue→wire-complete per frame of the frames that reached the wire,
+    // recorded by the send task in the delivery sampler's send wait (FR-148,
+    // `media_inflight::SendWait`, which both pumps keep) and drained by the
+    // heartbeat.
     // FR-71 T1a — per-viewer-window deltas of the sender-side counters, so the
     // governor's shadow classifier sees THIS window's sends, skips and waits
     // rather than the heartbeat's or the session's totals.
     let mut win_sent_last: u64 = 0;
     let mut win_skips_last: u64 = 0;
-    let mut win_sw_sum_last: u64 = 0;
-    let mut win_sw_frames_last: u64 = 0;
-    let send_wait_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut win_send_wait = crate::media_inflight::SendWaitSince::default();
     // FR-35 P3 — the opener as a burst probe: bytes sent and the longest
     // queue-wait seen while the opening grace is on. Their ratio is the
     // pipe's burst drain rate — the one number that sizes a crisp opener —
@@ -7116,19 +7128,18 @@ async fn media_pump_ffmpeg_dc(
     let send_stall_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // FR-74 P1b — the enqueue instant (µs since `head_wait_epoch`, +1 so 0
     // means "nothing at the head") of the frame the send task is writing
-    // RIGHT NOW. The completion-based waits above only learn about a frame
+    // RIGHT NOW. The completion-based send waits only learn about a frame
     // once it has left the wire, so on a stalled pipe they read stale-low
     // while the queue grows; this cell lets the gate see the live age of
     // the head frame instead. Cleared by the send task after each write.
     let send_head_enqueued_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let head_wait_epoch = std::time::Instant::now();
     // The gate's own view of the measured send wait: an EMA over the
-    // per-pass average of completed frames' waits (α = 0.3) — separate
-    // "last" cursors from the FR-71 window deltas so the two readers never
-    // race each other for the same counters.
+    // per-pass average of completed frames' waits (α = 0.3) — its own place
+    // in the send wait, apart from the FR-71 window's, so the two readers
+    // never race each other for the same counters.
     let mut direct_wait_ema_ms: f64 = 0.0;
-    let mut gate_sw_sum_last: u64 = 0;
-    let mut gate_sw_frames_last: u64 = 0;
+    let mut gate_send_wait = crate::media_inflight::SendWaitSince::default();
     // The direct byte gate's reference rate: the last policy ceiling (the
     // AIMD's applied target takes over once it exists). One-shot log the
     // first time the direct gate actually sheds, so a field read can tell
@@ -7293,9 +7304,7 @@ async fn media_pump_ffmpeg_dc(
         let send_errors = send_errors.clone();
         let inflight_bytes = inflight_bytes.clone();
         let send_epoch = send_epoch.clone();
-        let send_wait_us_sum = send_wait_us_sum.clone();
-        let send_wait_us_max = send_wait_us_max.clone();
-        let send_wait_frames = send_wait_frames.clone();
+        let send_wait = Arc::clone(delivery.send_wait()); // FR-148
         let send_stall_us = send_stall_us.clone();
         let send_head_enqueued_us = send_head_enqueued_us.clone();
         let opener_wait_us_max = opener_wait_us_max.clone();
@@ -7397,11 +7406,8 @@ async fn media_pump_ffmpeg_dc(
                             );
                             // P7 — queue-wait: enqueue→wire-complete. This is
                             // the transport-added latency the viewer feels;
-                            // the heartbeat drains it per window.
-                            let waited_us = enqueued_at.elapsed().as_micros() as u64;
-                            send_wait_us_sum.fetch_add(waited_us, Relaxed);
-                            send_wait_us_max.fetch_max(waited_us, Relaxed);
-                            send_wait_frames.fetch_add(1, Relaxed);
+                            // the pump's send wait keeps it (FR-148).
+                            let waited_us = send_wait.sent(enqueued_at, std::time::Instant::now());
                             send_stall_us.fetch_max(waited_us, Relaxed);
                             // FR-35 P3 — the opening burst as a probe.
                             if in_opener_grace.load(Relaxed) {
@@ -8032,17 +8038,8 @@ async fn media_pump_ffmpeg_dc(
         let (hard_budget, measured_wait_ms) = if constrained {
             (queue_budget, 0.0)
         } else {
-            {
-                let sum_now = send_wait_us_sum.load(std::sync::atomic::Ordering::Relaxed);
-                let frames_now = send_wait_frames.load(std::sync::atomic::Ordering::Relaxed);
-                let frames = frames_now.saturating_sub(gate_sw_frames_last);
-                if frames > 0 {
-                    let avg_ms =
-                        sum_now.saturating_sub(gate_sw_sum_last) as f64 / frames as f64 / 1000.0;
-                    direct_wait_ema_ms = 0.7 * direct_wait_ema_ms + 0.3 * avg_ms;
-                }
-                gate_sw_sum_last = sum_now;
-                gate_sw_frames_last = frames_now;
+            if let Some(avg_ms) = gate_send_wait.avg_ms(delivery.send_wait()) {
+                direct_wait_ema_ms = 0.7 * direct_wait_ema_ms + 0.3 * avg_ms;
             }
             let head = send_head_enqueued_us.load(std::sync::atomic::Ordering::Relaxed);
             let head_wait_ms = if head == 0 {
@@ -8165,10 +8162,10 @@ async fn media_pump_ffmpeg_dc(
             }
             // FR-35 P3 — inside the opener grace the skips are the opening
             // burst draining, not congestion: skip the frame, keep the AIMD.
-            // FR-148 D46 B3 — so is the budget's hold in a still span, under `on`.
+            // FR-148 D46 B3, D51 B4a-1 — nor, under `on`, is the budget's own hold.
             let in_grace = constrained && !opener_grace_done;
             grace_bp_skips += u32::from(in_grace);
-            let bp_applied = delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t));
+            let bp_applied = delivery.on_skip(in_grace, |s| governor.on_gate_skip(s));
             if let Some(applied) = bp_applied
                 && let Some(enc) = encoder.as_mut()
             {
@@ -9259,23 +9256,18 @@ async fn media_pump_ffmpeg_dc(
         // FR-71 T1a — hand the governor this PASS's sender-side facts, every
         // pass, before it folds the viewer's report; it adds the passes up into
         // the window (FR-119 P2b-8), so the plane verdict reads both sides of
-        // the same window. Deltas against the running counters (the heartbeat
-        // swaps some of them, so it reads the totals, not swaps).
+        // the same window. Deltas against the running counters; the send wait's
+        // average from this reader's own place in it (FR-148). A heartbeat takes
+        // the send wait whole under that place, so the pass across one reads a
+        // saturated delta, as it did before; its longest is the heartbeat's so far.
         {
             let sent_now = frames_sent.load(std::sync::atomic::Ordering::Relaxed);
-            let sw_sum_now = send_wait_us_sum.load(std::sync::atomic::Ordering::Relaxed);
-            let sw_frames_now = send_wait_frames.load(std::sync::atomic::Ordering::Relaxed);
-            let sw_frames = sw_frames_now.saturating_sub(win_sw_frames_last);
-            let sw_avg_ms = (sw_frames > 0).then(|| {
-                sw_sum_now.saturating_sub(win_sw_sum_last) as f64 / sw_frames as f64 / 1000.0
-            });
+            let sw_avg_ms = win_send_wait.avg_ms(delivery.send_wait());
             governor.note_window_sender(crate::encode::governor::WindowSenderStats {
                 inflight_bytes: inflight_bytes.load(std::sync::atomic::Ordering::Relaxed),
                 budget_bytes: queue_budget,
                 gate_skips: frames_skipped_backpressure.saturating_sub(win_skips_last) as u32,
-                send_wait_max_ms: send_wait_us_max.load(std::sync::atomic::Ordering::Relaxed)
-                    as f64
-                    / 1000.0,
+                send_wait_max_ms: delivery.send_wait().max_ms(),
                 send_wait_avg_ms: sw_avg_ms,
                 frames_sent: sent_now.saturating_sub(win_sent_last) as u32,
                 // FR-79 — the gate's first condition: was the agent's own loop
@@ -9294,8 +9286,6 @@ async fn media_pump_ffmpeg_dc(
             win_stalls_last = watch.stalls_total();
             win_sent_last = sent_now;
             win_skips_last = frames_skipped_backpressure;
-            win_sw_sum_last = sw_sum_now;
-            win_sw_frames_last = sw_frames_now;
         }
         let viewer_window = governor.tick_viewer_window(
             std::time::Instant::now(),
@@ -10026,15 +10016,8 @@ async fn media_pump_ffmpeg_dc(
             // for frames that reached the wire. THE drag-latency number the
             // byte gate exists to bound; read avg against max — a fat max
             // with a small avg is one IDR's transit, both fat is a standing
-            // queue.
-            let sw_frames = send_wait_frames.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let send_wait_avg_ms = send_wait_us_sum
-                .swap(0, std::sync::atomic::Ordering::Relaxed)
-                .checked_div(sw_frames)
-                .map(|us| us as f64 / 1000.0)
-                .unwrap_or(0.0);
-            let send_wait_max_ms =
-                send_wait_us_max.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
+            // queue. FR-148: the delivery sampler's send wait, taken whole.
+            let (send_wait_avg_ms, send_wait_max_ms) = delivery.send_wait().take().ms();
             // FR-17 - read the LIVE channel, not a cached flag: the
             // handle can be replaced mid-session, and a stale copy
             // would mislabel exactly the window someone is measuring.
@@ -12969,7 +12952,7 @@ pub(crate) fn attach_files_declined(
                 return; // a chunk for a transfer that was never accepted
             }
             if let Some(reply) = declined_reply(&msg.data, why) {
-                let _ = dc.send_text(reply).await;
+                let _ = send_files_frame(&dc, reply).await;
             }
         })
     }));
@@ -12982,7 +12965,7 @@ pub(crate) fn attach_files_declined(
 /// settles on its `req_id`), `files:error` for anything else (a transfer's
 /// waiter settles on its `id`). A frame that does not parse is answered with
 /// no id, as the FILES-denied channel answers it. Pure.
-fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
+fn declined_reply(frame: &[u8], why: &str) -> Option<crate::files::FilesFrame> {
     let parsed = std::str::from_utf8(frame)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
@@ -13000,15 +12983,17 @@ fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
         .and_then(|t| t.as_str())
         == Some("files:dir");
     let reply = if listing {
-        serde_json::to_string(&crate::files::FilesOutgoing::DirError {
+        crate::files::FilesOutgoing::DirError {
             req_id: &field("req_id"),
             message: why,
-        })
+        }
+        .frame()
     } else {
-        serde_json::to_string(&crate::files::FilesOutgoing::Error {
+        crate::files::FilesOutgoing::Error {
             id: &field("id"),
             message: why,
-        })
+        }
+        .frame()
     };
     reply.ok()
 }
@@ -13083,16 +13068,20 @@ pub fn attach_files_handler(
         })
     }));
     let handler_for_end = handler.clone();
+    // #4082 — where an upload's end places its file, off the read loop. Its
+    // sender lives in the message callback below, and goes with it.
+    let placements = spawn_placement_lane(&dc, handler.listings_closed(), session_id);
     dc.on_message(Box::new(move |msg| {
         let dc = dc_for_handler.clone();
         let handler = handler.clone();
+        let placements = placements.clone();
         Box::pin(async move {
             // FR-101 P4b-2 — every message the controller sends here (an
             // upload's chunks, a request to browse or download) is activity
             // for the session's idle limit.
             crate::session_telemetry::counters(session_id).note_transfer();
             if msg.is_string {
-                handle_files_control(dc, handler, session_id, &msg.data).await;
+                handle_files_control(dc, handler, session_id, &placements, &msg.data).await;
             } else {
                 handle_files_chunk(dc, handler, session_id, &msg.data).await;
             }
@@ -13146,10 +13135,104 @@ fn on_session_end<F, Fut>(
     });
 }
 
+/// #4082 — a files channel's placement lane: the uploads whose end its read
+/// loop took out of the slot ([`crate::files::FilesHandler::begin_end`]),
+/// each placed in a task of its own ([`crate::files::Ending::place`]), one
+/// at a time, in the order their ends arrived. A begin read while an end
+/// places is taken at once, and its own end waits here for the earlier
+/// placement (D2-A), so their answers keep their order. Each is answered by
+/// [`answer_upload_end`].
+///
+/// ⚠️ The lane holds no channel and no handler: the channel only weakly, its
+/// end by `over` (the channel's close or the session's end). Its sender lives
+/// in the channel's message callback, which [`on_session_end`] lets go, and
+/// the lane ends once the placements queued by then are done. A placement is
+/// never stopped part way: its file lands whole, as when the read loop ran
+/// it, and only its answer is dropped.
+fn spawn_placement_lane(
+    dc: &Arc<RTCDataChannel>,
+    over: tokio_util::sync::CancellationToken,
+    session_id: bson::oid::ObjectId,
+) -> mpsc::UnboundedSender<crate::files::Ending> {
+    let (lane, mut endings) = mpsc::unbounded_channel::<crate::files::Ending>();
+    let dc = Arc::downgrade(dc);
+    tokio::spawn(async move {
+        while let Some(ending) = endings.recv().await {
+            let id = ending.id().to_string();
+            // A task of its own: a panic there is this upload's error, and
+            // the lane goes on to the next.
+            let placed = tokio::spawn(ending.place())
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("placing the file stopped: {e}")));
+            answer_upload_end(&dc, &over, session_id, &id, placed).await;
+        }
+    });
+    lane
+}
+
+/// #4082 — an upload's one answer, from its placement lane: `files:complete`,
+/// or the end's `files:error`, in the words the read loop sent them. Logged,
+/// and the file noted for the session's audit while it keeps its counters
+/// (FR-101 P3; none are made for a session that is over). Sent only while the
+/// channel lives, never after its close or its session's end, and the send
+/// races that end ([`or_stopped`]).
+async fn answer_upload_end(
+    dc: &std::sync::Weak<RTCDataChannel>,
+    over: &tokio_util::sync::CancellationToken,
+    session_id: bson::oid::ObjectId,
+    id: &str,
+    placed: anyhow::Result<(std::path::PathBuf, u64)>,
+) {
+    match &placed {
+        Ok((path, bytes)) => {
+            info!(%session_id, %id, bytes, path = ?path, "files: complete");
+            // FR-101 P3 — the audit gets the name's hash, never the name.
+            if let Some(counters) = crate::session_telemetry::peek(session_id) {
+                counters.note_file(
+                    TransferDirection::ToHost,
+                    &path
+                        .file_name()
+                        .map(|n| n.to_string_lossy())
+                        .unwrap_or_default(),
+                    *bytes,
+                );
+            }
+        }
+        Err(e) => warn!(%session_id, ?id, e = ?e.to_string(), "files: end failed"),
+    }
+    let dc = dc
+        .upgrade()
+        .filter(|dc| !over.is_cancelled() && !channel_gone(dc.ready_state()));
+    let Some(dc) = dc else {
+        debug!(%session_id, %id, "files: the end's answer is not sent: its channel closed, or its session ended");
+        return;
+    };
+    match placed {
+        Ok((path, bytes)) => {
+            let path_str = path.to_string_lossy();
+            let complete = crate::files::FilesOutgoing::Complete {
+                id,
+                path: &path_str,
+                bytes,
+            };
+            let _ = or_stopped(over, send_files_json(&dc, &complete)).await;
+        }
+        Err(e) => {
+            let message = format!("{e}");
+            let error = crate::files::FilesOutgoing::Error {
+                id,
+                message: &message,
+            };
+            let _ = or_stopped(over, send_files_json(&dc, &error)).await;
+        }
+    }
+}
+
 async fn handle_files_control(
     dc: Arc<RTCDataChannel>,
     handler: crate::files::FilesHandler,
     session_id: bson::oid::ObjectId,
+    placements: &mpsc::UnboundedSender<crate::files::Ending>,
     data: &[u8],
 ) {
     let Ok(text) = std::str::from_utf8(data) else {
@@ -13215,28 +13298,33 @@ async fn handle_files_control(
         crate::files::FilesIncoming::End { id } if handler.refused_at_begin(&id) => {
             debug!(%session_id, ?id, "files: the end of an upload whose begin was refused is dropped");
         }
-        crate::files::FilesIncoming::End { id } => match handler.end(&id).await {
-            Ok((path, bytes)) => {
-                info!(%session_id, %id, bytes, path = ?path, "files: complete");
-                // FR-101 P3 — the audit gets the name's hash, never the name.
-                crate::session_telemetry::counters(session_id).note_file(
-                    TransferDirection::ToHost,
-                    &path
-                        .file_name()
-                        .map(|n| n.to_string_lossy())
-                        .unwrap_or_default(),
-                    bytes,
-                );
-                let path_str = path.to_string_lossy();
-                send_files_json(
-                    &dc,
-                    &crate::files::FilesOutgoing::Complete {
-                        id: &id,
-                        path: &path_str,
-                        bytes,
-                    },
-                )
-                .await;
+        // #4082 — another end of an upload whose end is placing it now: that
+        // end answers it, once, and its staging is left to it.
+        crate::files::FilesIncoming::End { id } if crate::files::upload_ending(&id) => {
+            debug!(%session_id, ?id, "files: another end of an upload being placed is dropped");
+        }
+        // #4082 — the upload leaves the channel's slot here, at once, and its
+        // file is placed in the channel's placement lane, which answers it
+        // ([`spawn_placement_lane`]). This loop never waits for a placement,
+        // which can copy a large file for minutes, so whatever comes behind
+        // the end is read at once: a listing, a download's cancel, the next
+        // upload's begin.
+        crate::files::FilesIncoming::End { id } => match handler.begin_end(&id).await {
+            Ok(ending) => {
+                if placements.send(ending).is_err() {
+                    // Never while this callback lives, which holds the lane's
+                    // sender. The upload's staging stays for a resume, as an
+                    // abort leaves it.
+                    warn!(%session_id, ?id, "files: end failed — the placement lane is gone");
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &id,
+                            message: "the upload's end could not be placed; resume it",
+                        },
+                    )
+                    .await;
+                }
             }
             Err(e) => {
                 warn!(%session_id, ?id, e = ?e.to_string(), "files: end failed");
@@ -13284,12 +13372,16 @@ async fn handle_files_control(
             // upload only when its resume loop gives up, which since
             // rc.23's endless retry it never does.
             let out_cancelled = handler.cancel_outgoing(&id).await;
+            // #4082 (D1-A) — an upload whose end is placing it is left to
+            // that end: it is not stopped, and its staging is not removed
+            // (`cancel_incoming`). This line says so.
+            let ending = crate::files::upload_ending(&id);
             // #3688 — an upload's id is one plain name
             // (`files::transfer_id`): any other is refused, and the viewer
             // told, as at files:begin and files:resume.
             match handler.cancel_incoming(&id).await {
                 Ok(in_cancelled) => info!(
-                    %session_id, %id, out_cancelled, in_cancelled,
+                    %session_id, %id, out_cancelled, in_cancelled, ending,
                     "files: cancel requested"
                 ),
                 Err(e) => {
@@ -13306,7 +13398,11 @@ async fn handle_files_control(
                 }
             }
         }
-        crate::files::FilesIncoming::Dir { req_id, path } => {
+        crate::files::FilesIncoming::Dir {
+            req_id,
+            path,
+            paged,
+        } => {
             if !crate::files::is_remote_browse_enabled() {
                 info!(%session_id, ?req_id, path = ?path, "files: dir refused — remote browse disabled");
                 send_files_json(
@@ -13321,7 +13417,7 @@ async fn handle_files_control(
             }
             // #3682 (D1-B) — never awaited here: this loop reads the
             // channel's next message only once this one is handled.
-            spawn_dir_listing(dc.clone(), handler, session_id, req_id, path);
+            spawn_dir_listing(dc.clone(), handler, session_id, req_id, path, paged);
         }
         crate::files::FilesIncoming::Resume {
             id,
@@ -13379,8 +13475,11 @@ fn spawn_dir_listing(
     session_id: bson::oid::ObjectId,
     req_id: String,
     path: String,
+    paged: bool,
 ) {
-    tokio::spawn(answer_dir_listing(dc, handler, session_id, req_id, path));
+    tokio::spawn(answer_dir_listing(
+        dc, handler, session_id, req_id, path, paged,
+    ));
 }
 
 /// [`spawn_dir_listing`]'s task, answering on `dc`. Once the channel closes
@@ -13395,6 +13494,7 @@ async fn answer_dir_listing<S: DownloadSink>(
     session_id: bson::oid::ObjectId,
     req_id: String,
     path: String,
+    paged: bool,
 ) {
     let closed = handler.listings_closed();
     let listed = tokio::select! {
@@ -13406,20 +13506,19 @@ async fn answer_dir_listing<S: DownloadSink>(
     }
     match listed {
         Ok(listing) => {
+            let (frames, bytes) =
+                crate::files::dir_pages::answer_measured(&req_id, &listing, paged);
+            let pages = frames.iter().filter(|f| f.kind == "files:dir-list").count();
             info!(
                 %session_id, ?req_id,
                 path = ?listing.path,
                 entries = listing.entries.len(),
+                capped = listing.capped,
+                bytes,
+                pages,
                 "files: dir listed"
             );
-            let parent_owned = listing.parent.clone();
-            let msg = crate::files::FilesOutgoing::DirList {
-                req_id: &req_id,
-                path: &listing.path,
-                parent: parent_owned.as_deref(),
-                entries: &listing.entries,
-            };
-            let _ = or_stopped(&closed, dc.send_json(&msg)).await;
+            send_listing_frames(&dc, &closed, frames).await;
         }
         Err(e) => {
             warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
@@ -13429,6 +13528,40 @@ async fn answer_dir_listing<S: DownloadSink>(
                 message: &message,
             };
             let _ = or_stopped(&closed, dc.send_json(&msg)).await;
+        }
+    }
+}
+
+/// #4121 — a listing's frames ([`crate::files::dir_pages`]), in order. Each
+/// waits while the channel's buffer is over the download pumps' high-water
+/// mark (a listing in pages never fills it alone, but it shares the channel
+/// with them), and the frames stop at the channel's end, the session's, or
+/// the first send that fails, which [`send_files_frame`] logs.
+async fn send_listing_frames<S: DownloadSink>(
+    dc: &S,
+    closed: &tokio_util::sync::CancellationToken,
+    frames: Vec<crate::files::FilesFrame>,
+) {
+    const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
+    for frame in frames {
+        // ⚠️ After a drop the buffer never drains (only a SACK lowers it):
+        // the channel's state ends the wait too.
+        loop {
+            match or_stopped(closed, dc.buffered()).await {
+                Ok(buffered) if buffered > BACKPRESSURE_HIGH => {}
+                Ok(_) => break,
+                Err(_) => return,
+            }
+            if or_stopped(closed, tokio::time::sleep(Duration::from_millis(20)))
+                .await
+                .is_err()
+                || dc.gone()
+            {
+                return;
+            }
+        }
+        if dc.gone() || !matches!(or_stopped(closed, dc.send_frame(frame)).await, Ok(Ok(()))) {
+            return;
         }
     }
 }
@@ -13757,6 +13890,12 @@ async fn pump_outgoing_file<S: DownloadSink>(
     let stop = &offer.cancel;
 
     let mut file = or_stopped(stop, handler.open_outgoing(&offer.id)).await??;
+    #[cfg(test)]
+    or_stopped(
+        stop,
+        crate::files::drawer_edges::seams::sending_waits(&offer.id),
+    )
+    .await?;
     let mut buf = vec![0u8; CHUNK];
     let mut total: u64 = 0;
     let mut last_progress: u64 = 0;
@@ -13840,9 +13979,32 @@ async fn handle_files_chunk(
 }
 
 async fn send_files_json(dc: &Arc<RTCDataChannel>, msg: &crate::files::FilesOutgoing<'_>) {
-    if let Ok(s) = serde_json::to_string(msg) {
-        let _ = dc.send_text(s).await;
+    if let Ok(frame) = msg.frame() {
+        let _ = send_files_frame(dc, frame).await;
     }
+}
+
+/// #4121 — every answer on the files channel goes out here, a listing's
+/// pages among them, and the send's result comes back. A send that fails is
+/// a WARN naming the frame's kind, size, id and the error, never its text:
+/// a listing names a person's files. One line an answer at most: a stop
+/// (`or_stopped`) drops the send rather than failing it, the senders stop at
+/// the channel's end, and no listing frame is over the stack's limit.
+async fn send_files_frame(
+    dc: &RTCDataChannel,
+    frame: crate::files::FilesFrame,
+) -> anyhow::Result<()> {
+    let crate::files::FilesFrame { kind, id, text } = frame;
+    let bytes = text.len();
+    let sent = dc
+        .send_text(text)
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::from);
+    if let Err(e) = &sent {
+        warn!(kind, bytes, id = ?id, e = %e, "files: answer not sent");
+    }
+    sent
 }
 
 /// #1730 — what a download pump needs of its data channel: the channel
@@ -13858,6 +14020,12 @@ trait DownloadSink: Send + Sync {
         &self,
         msg: &crate::files::FilesOutgoing<'_>,
     ) -> impl std::future::Future<Output = ()> + Send;
+    /// #4121 — one frame, as serialized, and whether it went: a listing's
+    /// pages stop at the first that did not.
+    fn send_frame(
+        &self,
+        frame: crate::files::FilesFrame,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
     /// Closed, or begun to ([`channel_gone`]).
     fn gone(&self) -> bool;
 }
@@ -13874,6 +14042,9 @@ impl DownloadSink for Arc<RTCDataChannel> {
     }
     async fn send_json(&self, msg: &crate::files::FilesOutgoing<'_>) {
         send_files_json(self, msg).await
+    }
+    async fn send_frame(&self, frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+        send_files_frame(self, frame).await
     }
     fn gone(&self) -> bool {
         channel_gone(self.ready_state())
@@ -16440,6 +16611,9 @@ mod download_stop_tests {
             std::future::pending().await
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -16459,6 +16633,9 @@ mod download_stop_tests {
             Ok(())
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -16477,6 +16654,9 @@ mod download_stop_tests {
             Ok(())
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -16631,6 +16811,10 @@ pub(crate) mod folder_download_as_the_person_tests {
         async fn send_json(&self, msg: &crate::files::FilesOutgoing<'_>) {
             let json = serde_json::to_string(msg).expect("a message as JSON");
             self.said.lock().unwrap().push(json);
+        }
+        async fn send_frame(&self, frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            self.said.lock().unwrap().push(frame.text);
+            Ok(())
         }
         fn gone(&self) -> bool {
             false
@@ -16977,6 +17161,9 @@ pub(crate) mod files_log_tests {
             Ok(())
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -17097,7 +17284,7 @@ mod files_channel_tests {
     /// The declined channel's answer to one control frame, as JSON.
     fn reply_to(frame: &[u8]) -> Value {
         let reply = declined_reply(frame, WHY).expect("a declined frame is answered");
-        serde_json::from_str(&reply).expect("the answer is JSON")
+        serde_json::from_str(&reply.text).expect("the answer is JSON")
     }
 
     /// A listing's answer is the drawer's: `files:dir-error` on its `req_id`.
@@ -17274,6 +17461,14 @@ mod files_channel_tests {
             got
         }
 
+        /// #4121 — the next frame the viewer hears within `wait`, as sent.
+        pub(super) async fn next_within(&mut self, wait: Duration) -> Option<String> {
+            tokio::time::timeout(wait, self.heard.recv())
+                .await
+                .ok()
+                .flatten()
+        }
+
         /// Anything more the viewer hears within `wait`.
         async fn more_within(&mut self, wait: Duration) -> Vec<String> {
             let mut got = Vec::new();
@@ -17281,6 +17476,12 @@ mod files_channel_tests {
                 got.push(text);
             }
             got
+        }
+
+        /// #4082 — the session ends, and the peers stay up until
+        /// [`Self::close`].
+        pub(super) fn end_session(&self) {
+            self.session_end.cancel();
         }
 
         /// The session ends, and both peers are closed: a peer that is only
@@ -17484,7 +17685,9 @@ mod refused_upload_tests {
     /// The frames the viewer hears before the answer to `probe`: an end for an
     /// upload this channel never began, which is always answered. One channel,
     /// in order, so by then every frame sent before the probe has had its
-    /// answer, if it gets one.
+    /// answer, if it gets one, but an upload's end that was taken: its answer
+    /// comes from the channel's placement lane once the file is placed, and
+    /// can come after the probe's (#4082).
     async fn heard_before(pair: &mut Pair, probe: &str) -> Vec<Value> {
         pair.ask(&json!({"t": "files:end", "id": probe})).await;
         let mut before = Vec::new();
@@ -17585,7 +17788,12 @@ mod refused_upload_tests {
             .await
             .expect("the chunk went out");
         pair.ask(&json!({"t": "files:end", "id": id})).await;
-        let heard = heard_before(&mut pair, "never-begun").await;
+        let mut heard = heard_before(&mut pair, "never-begun").await;
+        // #4082 — the taken end is answered by the placement lane, and may be
+        // heard after the probe's answer.
+        if !heard.iter().any(|f| f["t"] == "files:complete") {
+            heard.extend(pair.heard(1).await);
+        }
         pair.close().await;
 
         let kinds: Vec<&str> = heard.iter().filter_map(|f| f["t"].as_str()).collect();
@@ -17838,9 +18046,12 @@ mod wire_text_log_tests {
 mod dir_listing_tests {
     use super::files_channel_tests::Pair;
     use super::*;
+    use crate::files::dir_pages::{DIR_PAGE_BUDGET, FILES_FRAME_MAX};
     use crate::files::drawer_edges::seams;
     use roomler_ai_remote_control::permissions::Permissions;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+    use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
     /// Messages of other kinds, sent behind a listing whose folder's entries
     /// do not come, are acted on at once: a cancel naming an id that is not
@@ -17918,6 +18129,10 @@ mod dir_listing_tests {
             self.parked.notify_one();
             std::future::pending().await
         }
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            self.parked.notify_one();
+            std::future::pending().await
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -17939,6 +18154,7 @@ mod dir_listing_tests {
             bson::oid::ObjectId::new(),
             "parks".to_string(),
             temp.path().to_string_lossy().into_owned(),
+            false,
         ));
         let sent = tokio::time::timeout(Duration::from_secs(5), parked.notified()).await;
         handler.end_session().await;
@@ -17948,5 +18164,1042 @@ mod dir_listing_tests {
             panic!("the listing outlived its session, parked in its answer's send");
         };
         ended.expect("the listing's task");
+    }
+
+    /// The folder `name` in `temp`, of `n` empty files whose names are `len`
+    /// characters long, and those names in the order a listing gives them.
+    fn folder_of(
+        temp: &std::path::Path,
+        name: &str,
+        n: usize,
+        len: usize,
+    ) -> (std::path::PathBuf, Vec<String>) {
+        let at = temp.join(name);
+        std::fs::create_dir(&at).expect("a folder");
+        let names: Vec<String> = (0..n)
+            .map(|i| {
+                let head = format!("{i:05}-");
+                format!("{head}{}", "x".repeat(len.saturating_sub(head.len())))
+            })
+            .collect();
+        for file in &names {
+            std::fs::write(at.join(file), b"").expect("an empty file");
+        }
+        (at, names)
+    }
+
+    fn json_of(text: &str) -> Value {
+        serde_json::from_str(text).unwrap_or(Value::Null)
+    }
+
+    /// The start of a frame, for a message about it.
+    fn head_of(text: &str) -> &str {
+        let end = text
+            .char_indices()
+            .nth(200)
+            .map_or(text.len(), |(at, _)| at);
+        &text[..end]
+    }
+
+    /// A viewer's `files` channel whose device end nothing serves: the test
+    /// sends on that end itself, once it is open.
+    async fn bare_pair() -> (Pair, Arc<RTCDataChannel>) {
+        let stash = Arc::new(std::sync::Mutex::new(None));
+        let put = stash.clone();
+        let pair = Pair::open_with("files", move |device, _| {
+            *put.lock().unwrap() = Some(device);
+        })
+        .await;
+        let device = stash
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the channel's device end");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while device.ready_state() != RTCDataChannelState::Open
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (pair, device)
+    }
+
+    /// #4121 — a folder whose listing is over 64 KiB of JSON (1 500 names of
+    /// 120 characters, about 270 KB) reaches a viewer that joins pages, over
+    /// a real SCTP association: every entry, in order, each frame within the
+    /// budget and within the viewer's wait of the one before.
+    #[tokio::test]
+    async fn a_listing_over_64_kib_reaches_a_paging_viewer() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, names) = folder_of(temp.path(), "w23-1500", 1_500, 120);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "big", "path": folder, "paged": true}))
+            .await;
+        let mut heard: Vec<String> = Vec::new();
+        let mut wait = Duration::from_secs(8);
+        while let Some(text) = pair.next_within(wait).await {
+            heard.push(text);
+            let pages = json_of(&heard[0])["pages"].as_u64().unwrap_or(1);
+            if heard.len() as u64 >= pages {
+                break;
+            }
+            wait = Duration::from_secs(5);
+        }
+        pair.close().await;
+        assert!(
+            !heard.is_empty(),
+            "no frame within 8 s: a ~270 KB listing never reached the viewer (#4121)"
+        );
+        let pages: Vec<Value> = heard.iter().map(|text| json_of(text)).collect();
+        for (i, (text, page)) in heard.iter().zip(&pages).enumerate() {
+            assert!(
+                text.len() <= DIR_PAGE_BUDGET,
+                "frame {i} is {} bytes: {}",
+                text.len(),
+                head_of(text)
+            );
+            assert_eq!(page["t"], "files:dir-list", "frame {i}: {}", head_of(text));
+            assert_eq!(page["req_id"], "big", "frame {i}");
+            assert_eq!(page["page"], i, "frame {i}");
+            assert_eq!(page["pages"], heard.len(), "frame {i}");
+            assert_eq!(page["total"], names.len(), "frame {i}");
+        }
+        let joined: Vec<&str> = pages
+            .iter()
+            .filter_map(|page| page["entries"].as_array())
+            .flatten()
+            .map(|entry| entry["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(joined, names, "the pages joined in order are the folder");
+    }
+
+    /// #4121 (D1-A) — the same folder, asked by a viewer that does not join
+    /// pages (every viewer before it): within that viewer's 5 s wait, one
+    /// `files:dir-error` naming the folder and its count, and nothing after.
+    #[tokio::test]
+    async fn a_listing_over_64_kib_tells_an_old_viewer_why() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, _) = folder_of(temp.path(), "w23-1500", 1_500, 120);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        let asked = std::time::Instant::now();
+        pair.ask(&json!({"t": "files:dir", "req_id": "old", "path": folder}))
+            .await;
+        let first = pair.next_within(Duration::from_secs(8)).await;
+        let took = asked.elapsed();
+        let more = pair.next_within(Duration::from_secs(1)).await;
+        pair.close().await;
+        let Some(first) = first else {
+            panic!("an old viewer heard nothing in 8 s (#4121)");
+        };
+        let refusal = json_of(&first);
+        assert_eq!(refusal["t"], "files:dir-error", "{}", head_of(&first));
+        assert_eq!(refusal["req_id"], "old");
+        assert!(
+            took <= Duration::from_secs(5),
+            "the refusal came {took:?} after the ask"
+        );
+        let message = refusal["message"].as_str().unwrap_or("");
+        for named in ["w23-1500", "1500"] {
+            assert!(message.contains(named), "{named:?} is not in {message:?}");
+        }
+        assert!(
+            more.is_none(),
+            "something followed the refusal: {}",
+            more.as_deref().map(head_of).unwrap_or("")
+        );
+    }
+
+    /// #4121 — a files answer the channel refuses (a frame over the SCTP
+    /// stack's message limit) is a WARN naming its kind, size, id and the
+    /// error, and never its text: a listing names a person's files.
+    #[tokio::test]
+    async fn a_files_answer_that_cannot_be_sent_is_a_warning() {
+        let (pair, device) = bare_pair().await;
+        let entries: Vec<crate::files::DirEntryView> = (0..400)
+            .map(|i| crate::files::DirEntryView {
+                name: format!("w23-private-name-{i:04}-{}", "y".repeat(100)),
+                is_dir: false,
+                size: Some(0),
+                mtime_unix: None,
+            })
+            .collect();
+        let msg = crate::files::FilesOutgoing::DirList {
+            req_id: "g1",
+            path: "/home/person/w23-g1",
+            parent: None,
+            entries: &entries,
+            page: None,
+            pages: None,
+            total: None,
+            capped: false,
+        };
+        let bytes = serde_json::to_string(&msg)
+            .expect("the answer as JSON")
+            .len();
+        let log = files_log_tests::Logged::start(tracing::Level::WARN);
+        send_files_json(&device, &msg).await;
+        let text = log.text();
+        drop(log);
+        pair.close().await;
+        assert!(
+            bytes > 65_536,
+            "the answer is {bytes} bytes, small enough to go"
+        );
+        let warned: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("files: answer not sent"))
+            .collect();
+        assert!(
+            !warned.is_empty(),
+            "the failed send left no WARN (#4121): {text:?}"
+        );
+        assert_eq!(warned.len(), 1, "{text:?}");
+        for part in [
+            "WARN",
+            "files:dir-list",
+            bytes.to_string().as_str(),
+            "\"g1\"",
+            "outbound packet larger than maximum message size",
+        ] {
+            assert!(
+                warned[0].contains(part),
+                "{part:?} is not in {:?}",
+                warned[0]
+            );
+        }
+        assert!(
+            !text.contains("w23-private-name"),
+            "an entry's name was logged: {text:?}"
+        );
+    }
+
+    /// A small folder is answered in one frame with today's keys, to a viewer
+    /// that joins pages and to one that does not.
+    #[tokio::test]
+    async fn a_small_listing_is_one_frame_as_today() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, names) = folder_of(temp.path(), "w23-4", 4, 12);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        let mut heard = Vec::new();
+        for (req_id, paged) in [("c1-old", None), ("c1-new", Some(true))] {
+            let mut ask = json!({"t": "files:dir", "req_id": req_id, "path": folder});
+            if let Some(paged) = paged {
+                ask["paged"] = json!(paged);
+            }
+            pair.ask(&ask).await;
+            heard.push((req_id, pair.next_within(Duration::from_secs(8)).await));
+        }
+        let more = pair.next_within(Duration::from_millis(500)).await;
+        pair.close().await;
+        let today: BTreeSet<&str> = ["t", "req_id", "path", "parent", "entries"].into();
+        for (req_id, frame) in &heard {
+            let listing = json_of(frame.as_deref().unwrap_or(""));
+            let keys: BTreeSet<&str> = listing
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(keys, today, "{req_id}: {frame:?}");
+            assert_eq!(listing["req_id"], *req_id);
+            let listed: Vec<&str> = listing["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|entry| entry["name"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(listed, names, "{req_id}");
+        }
+        assert!(more.is_none(), "a third frame: {more:?}");
+    }
+
+    /// A listing over the page budget but under the frame limit (about 320
+    /// names of 120 characters, about 57 KB) goes whole, in one frame, to a
+    /// viewer that joins pages.
+    #[tokio::test]
+    async fn a_listing_under_the_limit_is_one_frame() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, names) = folder_of(temp.path(), "w23-320", 320, 120);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "c2", "path": folder, "paged": true}))
+            .await;
+        let first = pair.next_within(Duration::from_secs(8)).await;
+        let more = pair.next_within(Duration::from_secs(1)).await;
+        pair.close().await;
+        let first = first.unwrap_or_default();
+        assert!(
+            (DIR_PAGE_BUDGET + 1..=FILES_FRAME_MAX).contains(&first.len()),
+            "the listing is {} bytes; this test needs one between the budget and the limit",
+            first.len()
+        );
+        let listing = json_of(&first);
+        assert_eq!(listing["t"], "files:dir-list", "{}", head_of(&first));
+        assert!(listing.get("pages").is_none(), "{}", head_of(&first));
+        let listed: Vec<&str> = listing["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| entry["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(listed, names);
+        assert!(
+            more.is_none(),
+            "a second frame: {}",
+            more.as_deref().map(head_of).unwrap_or("")
+        );
+    }
+
+    /// #4121 — what the constants assume of the stack, over a real
+    /// association: a frame of 65 535 bytes arrives whole at a webrtc-rs
+    /// viewer, and one of 65 537 is refused at the send with the error a
+    /// failed answer logs.
+    #[tokio::test]
+    async fn the_stacks_limits_are_what_the_constants_assume() {
+        let (mut pair, device) = bare_pair().await;
+        let fits = device.send_text("x".repeat(FILES_FRAME_MAX)).await;
+        let heard = pair.next_within(Duration::from_secs(8)).await;
+        let over = device.send_text("x".repeat(FILES_FRAME_MAX + 2)).await;
+        pair.close().await;
+        assert!(fits.is_ok(), "65 535 bytes: {fits:?}");
+        assert_eq!(
+            heard.map(|text| text.len()),
+            Some(FILES_FRAME_MAX),
+            "65 535 bytes arrive whole"
+        );
+        let refused = over.expect_err("65 537 bytes are refused at the send");
+        assert!(
+            refused
+                .to_string()
+                .contains("outbound packet larger than maximum message size"),
+            "{refused}"
+        );
+        const { assert!(DIR_PAGE_BUDGET < FILES_FRAME_MAX) };
+    }
+}
+
+/// #4082 — an upload's end never holds the files channel's read loop. Its
+/// placement (a rename; a copy across volumes; on a Windows service install, a
+/// copy into the person's folder, as them) ran in that loop, so while a large
+/// file was copied no later message on the channel was read: not a listing,
+/// not a download's cancel. A test holds the placement where that copy runs
+/// ([`crate::files::drawer_edges::seams::hold_placing`]), over the loopback
+/// channel the listing's tests use ([`files_channel_tests::Pair`]).
+#[cfg(test)]
+mod upload_end_tests {
+    use super::files_channel_tests::Pair;
+    use super::files_log_tests::Logged;
+    use super::*;
+    use crate::files::drawer_edges::seams;
+    use roomler_ai_remote_control::permissions::Permissions;
+    use serde_json::{Value, json};
+
+    /// How long the viewer waits for a listing's answer, from its send
+    /// (`ui/src/composables/remoteDirListing.ts`).
+    const VIEWER_WAITS: Duration = Duration::from_secs(5);
+
+    /// A listing's own bound, from reaching its task to its answer
+    /// (`files::reads::LISTING_ANSWERED_WITHIN`, #3682).
+    const LISTING_BOUND: Duration = Duration::from_millis(4500);
+
+    async fn served() -> Pair {
+        Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await
+    }
+
+    /// An id of this test's own: an accepted begin registers its partial
+    /// process-wide.
+    fn id_of(tag: &str) -> String {
+        format!("w42-{tag}-{}", std::process::id())
+    }
+
+    /// `n` bytes that differ from one offset to the next.
+    fn bytes_of(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Upload `payload` as `id` into `dest`, as the viewer sends one: its
+    /// begin, its chunks and its end, back to back.
+    async fn upload(pair: &Pair, id: &str, dest: &std::path::Path, payload: &[u8]) {
+        pair.ask(&json!({"t": "files:begin", "id": id, "name": "w42.bin", "size": payload.len(), "dest_path": dest}))
+            .await;
+        for chunk in payload.chunks(16 * 1024) {
+            pair.viewer
+                .send(&Bytes::copy_from_slice(chunk))
+                .await
+                .expect("the chunk went out");
+        }
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+    }
+
+    /// The frames the viewer hears within `wait`, up to the first one that
+    /// `matches`: that one, and every frame heard before it.
+    async fn heard_until(
+        pair: &mut Pair,
+        wait: Duration,
+        matches: impl Fn(&Value) -> bool,
+    ) -> (Option<Value>, Vec<Value>) {
+        let until = tokio::time::Instant::now() + wait;
+        let mut before = Vec::new();
+        loop {
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            let Some(text) = pair.next_within(left).await else {
+                return (None, before);
+            };
+            let frame: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            if matches(&frame) {
+                return (Some(frame), before);
+            }
+            before.push(frame);
+        }
+    }
+
+    /// Upload `id`'s answer: its `files:complete`, or its `files:error`.
+    fn answers(id: &str) -> impl Fn(&Value) -> bool + '_ {
+        move |f| f["id"] == id && (f["t"] == "files:complete" || f["t"] == "files:error")
+    }
+
+    /// The answer is upload `id`'s `files:complete`, and the file it names
+    /// holds `payload`, whole.
+    fn assert_whole(answer: Option<&Value>, id: &str, payload: &[u8]) {
+        let Some(answer) = answer else {
+            panic!("upload {id} was never answered");
+        };
+        assert_eq!(answer["t"], "files:complete", "{answer}");
+        assert_eq!(answer["bytes"], payload.len(), "{answer}");
+        let placed = std::path::Path::new(answer["path"].as_str().expect("the file's path"));
+        let landed = std::fs::read(placed).expect("the file landed");
+        assert_eq!(landed.len(), payload.len(), "its size: {answer}");
+        assert!(
+            landed == payload,
+            "its bytes differ from those sent: {answer}"
+        );
+    }
+
+    /// Whether a line logged within `wait` `says` it.
+    async fn logged_within(log: &Logged, wait: Duration, says: impl Fn(&str) -> bool) -> bool {
+        let until = tokio::time::Instant::now() + wait;
+        loop {
+            if log.text().lines().any(&says) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= until {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// AC1 — a listing asked while an upload's end places its file is
+    /// answered within its own bound, while the end still waits; the upload
+    /// then completes, its file whole. Red on master, where the read loop
+    /// read the listing only once the end was done.
+    #[tokio::test]
+    async fn a_listing_asked_during_an_uploads_end_is_answered_within_its_bound() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dest = temp.path().join("dest");
+        let listed = temp.path().join("listed");
+        for folder in [&dest, &listed] {
+            std::fs::create_dir(folder).expect("a folder");
+        }
+        std::fs::write(listed.join("a.txt"), b"a").expect("a file to list");
+        let id = id_of("listing");
+        let payload = bytes_of(300 * 1024);
+        let held = seams::hold_placing(&dest);
+        let mut pair = served().await;
+        upload(&pair, &id, &dest, &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        let asked = std::time::Instant::now();
+        pair.ask(&json!({"t": "files:dir", "req_id": "w42-during", "path": listed}))
+            .await;
+        let (listing, _) =
+            heard_until(&mut pair, VIEWER_WAITS, |f| f["req_id"] == "w42-during").await;
+        let took = asked.elapsed();
+        // The copy is done: the end goes on.
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        pair.close().await;
+        assert!(reached, "the upload's end never reached its placement");
+        let Some(listing) = listing else {
+            panic!(
+                "a listing asked during an upload's end was not answered within the \
+                 viewer's {VIEWER_WAITS:?} (#4082)"
+            );
+        };
+        assert_eq!(listing["t"], "files:dir-list", "{listing}");
+        assert!(
+            took <= LISTING_BOUND,
+            "the listing was answered {took:?} after its ask"
+        );
+        assert_whole(answer.as_ref(), &id, &payload);
+    }
+
+    /// AC1 — a download's `files:cancel` sent while an upload's end places its
+    /// file is acted on at once: the download stops and the cancel is done
+    /// with, while the end still waits. Red on master, where the read loop
+    /// read the cancel only once the end was done.
+    #[tokio::test]
+    async fn a_downloads_cancel_sent_during_an_uploads_end_is_acted_on_at_once() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&dest).expect("a folder");
+        let wanted = temp.path().join("w42-wanted.bin");
+        std::fs::write(&wanted, bytes_of(1000)).expect("a file to download");
+        let (dl, id) = (id_of("download"), id_of("cancel"));
+        let payload = bytes_of(64 * 1024);
+        let log = Logged::start(tracing::Level::INFO);
+        // Still on its way when it is cancelled: its pump has sent the offer
+        // and waits before its first chunk.
+        let sending = seams::hold_sending(&dl);
+        let held = seams::hold_placing(&dest);
+        let mut pair = served().await;
+        pair.ask(&json!({"t": "files:get", "id": dl, "path": wanted}))
+            .await;
+        let (offer, _) = heard_until(&mut pair, Duration::from_secs(10), |f| {
+            f["id"] == dl.as_str()
+        })
+        .await;
+        let on_its_way = sending.reached_within(Duration::from_secs(10)).await;
+        upload(&pair, &id, &dest, &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.ask(&json!({"t": "files:cancel", "id": dl})).await;
+        let quoted = format!("{dl:?}");
+        let stopped = logged_within(&log, Duration::from_secs(2), |line| {
+            line.contains("files: download stopped") && line.contains(&quoted)
+        })
+        .await;
+        let done_with = logged_within(&log, Duration::from_secs(2), |line| {
+            line.contains("files: cancel requested")
+                && line.contains(&dl)
+                && line.contains("out_cancelled=true")
+        })
+        .await;
+        // The copy is done: the end goes on.
+        held.release();
+        let (answer, heard) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        pair.close().await;
+        drop(log);
+        assert!(reached, "the upload's end never reached its placement");
+        assert_eq!(
+            offer.as_ref().map(|f| f["t"].clone()),
+            Some(json!("files:offer")),
+            "the download began"
+        );
+        assert!(on_its_way, "the download was not on its way");
+        assert!(
+            stopped,
+            "the download did not stop within 2 s of its cancel, sent during an upload's end (#4082)"
+        );
+        assert!(
+            done_with,
+            "the download's cancel was not done with within 2 s, during an upload's end (#4082)"
+        );
+        assert!(
+            !heard
+                .iter()
+                .any(|f| f["t"] == "files:eof" && f["id"] == dl.as_str()),
+            "the cancelled download ran to its end"
+        );
+        assert_whole(answer.as_ref(), &id, &payload);
+    }
+
+    /// Every frame for `id` the viewer hears within `wait`.
+    async fn more_for(pair: &mut Pair, id: &str, wait: Duration) -> Vec<Value> {
+        let (_, heard) = heard_until(pair, wait, |_| false).await;
+        heard.into_iter().filter(|f| f["id"] == id).collect()
+    }
+
+    /// Upload `id`'s staged `data` beside `dest`, while its end has not
+    /// placed it: how many bytes it holds.
+    fn staged(dest: &std::path::Path, id: &str) -> Option<u64> {
+        let data = dest.join(".roomler-partial").join(id).join("data");
+        std::fs::metadata(data).ok().map(|m| m.len())
+    }
+
+    /// Invariant 2 — an upload's end is answered once its placement is done,
+    /// never before, and once: `files:complete` with today's fields, and
+    /// nothing more for that upload.
+    #[tokio::test]
+    async fn an_uploads_end_is_answered_once_when_its_placement_is_done() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("once");
+        let payload = bytes_of(200 * 1024 + 11);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        let (early, _) = heard_until(&mut pair, Duration::from_secs(1), answers(&id)).await;
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        let more = more_for(&mut pair, &id, Duration::from_secs(1)).await;
+        pair.close().await;
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(early.is_none(), "answered before its placement: {early:?}");
+        let keys: std::collections::BTreeSet<&str> = answer
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let today: std::collections::BTreeSet<&str> = ["bytes", "id", "path", "t"].into();
+        assert_eq!(keys, today, "{answer:?}");
+        assert_whole(answer.as_ref(), &id, &payload);
+        assert!(more.is_empty(), "more for the upload: {more:?}");
+    }
+
+    /// Invariant 2 — an end that fails in its placement lane (a short upload)
+    /// is answered once, with today's words.
+    #[tokio::test]
+    async fn a_short_upload_is_answered_once_with_todays_words() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("short");
+        let mut pair = served().await;
+        pair.ask(&json!({"t": "files:begin", "id": id, "name": "w42.bin", "size": 102_400, "dest_path": temp.path()}))
+            .await;
+        for chunk in bytes_of(65_536).chunks(16 * 1024) {
+            pair.viewer
+                .send(&Bytes::copy_from_slice(chunk))
+                .await
+                .expect("the chunk went out");
+        }
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        let more = more_for(&mut pair, &id, Duration::from_secs(1)).await;
+        pair.close().await;
+        assert_eq!(
+            answer,
+            Some(json!({
+                "t": "files:error",
+                "id": id,
+                "message": "short transfer: received 65536 of 102400 bytes",
+            }))
+        );
+        assert!(more.is_empty(), "more for the upload: {more:?}");
+    }
+
+    /// Invariant 3 (D2-A) — a begin read while an earlier end places its file
+    /// is taken at once, and its chunks land; its own end waits for the
+    /// earlier placement (into another folder, so only the channel makes it
+    /// wait), and both answers come in order, both files whole.
+    #[tokio::test]
+    async fn a_begin_during_an_end_is_taken_at_once_and_its_end_waits_for_the_earlier() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (into_one, into_two) = (temp.path().join("one"), temp.path().join("two"));
+        for folder in [&into_one, &into_two] {
+            std::fs::create_dir(folder).expect("a folder");
+        }
+        let (first, second) = (id_of("first"), id_of("second"));
+        let (one, two) = (bytes_of(100 * 1024), bytes_of(300 * 1024 + 3));
+        let held = seams::hold_placing(&into_one);
+        let mut pair = served().await;
+        upload(&pair, &first, &into_one, &one).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        upload(&pair, &second, &into_two, &two).await;
+        let (accepted, _) = heard_until(&mut pair, Duration::from_secs(5), |f| {
+            f["id"] == second.as_str() && f["t"] == "files:accepted"
+        })
+        .await;
+        let (progress, _) = heard_until(&mut pair, Duration::from_secs(5), |f| {
+            f["id"] == second.as_str() && f["t"] == "files:progress"
+        })
+        .await;
+        let (early, _) = heard_until(&mut pair, Duration::from_secs(1), answers(&second)).await;
+        held.release();
+        let done = |f: &Value| f["t"] == "files:complete" || f["t"] == "files:error";
+        let (a, _) = heard_until(&mut pair, Duration::from_secs(20), done).await;
+        let (b, _) = heard_until(&mut pair, Duration::from_secs(20), done).await;
+        pair.close().await;
+        assert!(reached, "the first end never reached its placement");
+        assert!(
+            accepted.is_some(),
+            "a begin read during an end was not answered within 5 s"
+        );
+        assert!(
+            progress.is_some(),
+            "its chunks were not received during the earlier end"
+        );
+        assert!(
+            early.is_none(),
+            "its end was answered before the earlier placement was done: {early:?}"
+        );
+        assert_whole(a.as_ref(), &first, &one);
+        assert_whole(b.as_ref(), &second, &two);
+    }
+
+    /// Invariant 3 (D2-A) — the staging folder an end removes once empty,
+    /// racing a begin into the same folder that has made that staging folder
+    /// and not yet its own `<id>` in it: the begin makes it again and
+    /// succeeds, and both files land whole.
+    #[tokio::test]
+    async fn a_begin_into_the_same_folder_survives_the_end_removing_its_staging() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&dest).expect("a folder");
+        let staging = dest.join(".roomler-partial");
+        let (first, second) = (id_of("same-first"), id_of("same-second"));
+        let (one, two) = (bytes_of(90 * 1024), bytes_of(40 * 1024 + 7));
+        let held = Arc::new(seams::hold_placing(&dest));
+        let mut pair = served().await;
+        upload(&pair, &first, &dest, &one).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel();
+        let (release, folder) = (held.clone(), staging.clone());
+        // The second begin, between its two makes: the first end goes on, and
+        // removes the staging folder once its own `<id>` is out of it.
+        seams::before_the_id(&dest, move || {
+            release.release();
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while folder.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = gone_tx.send(!folder.exists());
+        });
+        upload(&pair, &second, &dest, &two).await;
+        let done = |f: &Value| f["t"] == "files:complete" || f["t"] == "files:error";
+        let (a, _) = heard_until(&mut pair, Duration::from_secs(20), done).await;
+        let (b, _) = heard_until(&mut pair, Duration::from_secs(20), done).await;
+        pair.close().await;
+        assert!(reached, "the first end never reached its placement");
+        assert_eq!(
+            gone_rx.try_recv().ok(),
+            Some(true),
+            "the staging folder was not removed between the second begin's two makes"
+        );
+        assert_whole(a.as_ref(), &first, &one);
+        assert_whole(b.as_ref(), &second, &two);
+        assert!(!staging.exists(), "the staging folder is left behind");
+    }
+
+    /// D1-A — a `files:cancel` of the upload whose end is placing it leaves
+    /// it to that end: its staging stays while the placement reads it, the
+    /// file lands whole, and its one answer is the end's.
+    #[tokio::test]
+    async fn a_cancel_of_the_ending_upload_leaves_it_to_its_end() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("cancel-ending");
+        let payload = bytes_of(200 * 1024);
+        let log = Logged::start(tracing::Level::INFO);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.ask(&json!({"t": "files:cancel", "id": id})).await;
+        let left = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: cancel requested")
+                && line.contains(&id)
+                && line.contains("in_cancelled=false")
+                && line.contains("ending=true")
+        })
+        .await;
+        let still_staged = staged(temp.path(), &id);
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        let more = more_for(&mut pair, &id, Duration::from_secs(1)).await;
+        pair.close().await;
+        drop(log);
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(
+            left,
+            "the cancel was not read and left to the end within 5 s"
+        );
+        assert_eq!(
+            still_staged,
+            Some(payload.len() as u64),
+            "the staging the placement reads"
+        );
+        assert_whole(answer.as_ref(), &id, &payload);
+        assert!(more.is_empty(), "more for the upload: {more:?}");
+    }
+
+    /// A `files:resume` of the upload whose end is placing it is refused at
+    /// once, before its staging is touched; the file then lands whole.
+    #[tokio::test]
+    async fn a_resume_of_the_ending_upload_is_refused_at_once() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("resume-ending");
+        let payload = bytes_of(600 * 1024);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.ask(&json!({"t": "files:resume", "id": id, "offset": 0}))
+            .await;
+        let (refused, _) = heard_until(&mut pair, Duration::from_secs(5), |f| {
+            f["id"] == id.as_str() && f["t"] == "files:error"
+        })
+        .await;
+        let still_staged = staged(temp.path(), &id);
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        pair.close().await;
+        assert!(reached, "the upload's end never reached its placement");
+        assert_eq!(
+            refused,
+            Some(json!({
+                "t": "files:error",
+                "id": id,
+                "message": format!("files:resume {id} but its end is placing the file now"),
+            })),
+            "the resume's answer, within 5 s"
+        );
+        assert_eq!(
+            still_staged,
+            Some(payload.len() as u64),
+            "the staging the placement reads"
+        );
+        assert_whole(answer.as_ref(), &id, &payload);
+    }
+
+    /// Another `files:end` of the upload whose end is placing it gets no
+    /// answer of its own: the upload is answered once.
+    #[tokio::test]
+    async fn another_end_of_the_ending_upload_is_not_answered() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("end-twice");
+        let payload = bytes_of(70 * 1024);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        let (early, _) = heard_until(&mut pair, Duration::from_secs(1), answers(&id)).await;
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        let more = more_for(&mut pair, &id, Duration::from_secs(1)).await;
+        pair.close().await;
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(early.is_none(), "the other end was answered: {early:?}");
+        assert_whole(answer.as_ref(), &id, &payload);
+        assert!(more.is_empty(), "more for the upload: {more:?}");
+    }
+
+    /// Invariant 4 — the session ends while an upload's end places its file:
+    /// the placement goes on and the file lands whole, its staging and its
+    /// entry in the registry go as on any end, and its answer is not sent,
+    /// though the channel is still up.
+    #[tokio::test]
+    async fn an_end_placing_when_its_session_ends_lands_whole_and_is_not_answered() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("session-ends");
+        let payload = bytes_of(300 * 1024);
+        let log = Logged::start(tracing::Level::DEBUG);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.end_session();
+        // The session's teardown runs at once (`on_session_end`): by now the
+        // channel's handler has ended its session.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        held.release();
+        let placed = temp.path().join("w42.bin");
+        let until = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !(placed.exists() && staged(temp.path(), &id).is_none())
+            && tokio::time::Instant::now() < until
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let completed = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: complete") && line.contains(&id)
+        })
+        .await;
+        let not_sent = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: the end's answer is not sent") && line.contains(&id)
+        })
+        .await;
+        let (answer, _) = heard_until(&mut pair, Duration::from_millis(500), answers(&id)).await;
+        let up = pair.viewer.ready_state();
+        pair.close().await;
+        let text = log.text();
+        drop(log);
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(completed, "the placement did not finish: {text}");
+        assert!(not_sent, "its answer was not dropped: {text}");
+        assert_eq!(
+            up,
+            webrtc::data_channel::data_channel_state::RTCDataChannelState::Open,
+            "the channel went down before the answer could be sent"
+        );
+        assert!(
+            answer.is_none(),
+            "answered after its session ended: {answer:?}"
+        );
+        assert_eq!(
+            std::fs::read(&placed).expect("the file landed"),
+            payload,
+            "the file, whole"
+        );
+        assert!(
+            !temp.path().join(".roomler-partial").exists(),
+            "its staging is left behind"
+        );
+        let registered = crate::files::PARTIAL_REGISTRY
+            .lock()
+            .map(|r| r.contains_key(&id))
+            .unwrap_or(false);
+        assert!(!registered, "its entry is left in the registry");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.contains("files: answer not sent") && line.contains(&id)),
+            "an answer was sent on the closed channel: {text}"
+        );
+    }
+
+    /// Condition 1 — after a drop the viewer's next channel is another one.
+    /// While an upload's end places its file, a resume of it on another
+    /// channel is refused and a cancel of it there leaves it alone: its
+    /// staging is untouched, and the file lands whole.
+    #[tokio::test]
+    async fn another_channel_leaves_an_ending_upload_to_its_end() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dest = temp.path().to_string_lossy().into_owned();
+        let id = id_of("elsewhere");
+        let payload = bytes_of(600 * 1024);
+        let here = crate::files::FilesHandler::new();
+        let elsewhere = crate::files::FilesHandler::new();
+        here.begin(
+            id.clone(),
+            "w42.bin".into(),
+            payload.len() as u64,
+            None,
+            Some(dest.as_str()),
+        )
+        .await
+        .expect("the upload begun");
+        for chunk in payload.chunks(64 * 1024) {
+            here.chunk(chunk).await.expect("a chunk written");
+        }
+        let ending = here.begin_end(&id).await.expect("its end begun");
+        let resumed = elsewhere.resume_incoming(&id, 0).await;
+        let cancelled = elsewhere.cancel_incoming(&id).await;
+        let still_staged = staged(temp.path(), &id);
+        let placed = ending.place().await;
+        let resumed_after = elsewhere.resume_incoming(&id, 0).await;
+        let refusal = resumed.expect_err("a resume elsewhere is refused");
+        assert_eq!(
+            refusal.to_string(),
+            format!("files:resume {id} but its end is placing the file now")
+        );
+        assert!(
+            matches!(cancelled, Ok(false)),
+            "a cancel elsewhere touched it: {cancelled:?}"
+        );
+        assert_eq!(
+            still_staged,
+            Some(payload.len() as u64),
+            "the staging the placement reads"
+        );
+        let (path, bytes) = placed.expect("the file placed");
+        assert_eq!(bytes, payload.len() as u64);
+        assert_eq!(std::fs::read(path).expect("the file landed"), payload);
+        assert!(
+            !resumed_after
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("is placing the file now")),
+            "still refused as ending once placed: {resumed_after:?}"
+        );
+    }
+
+    /// Invariant 2 — the channel closes while an upload's end places its file
+    /// (the viewer closed it, and the session goes on): the placement runs
+    /// on, the file lands whole and its staging goes, and its answer is
+    /// dropped. No send is tried on the closed channel.
+    #[tokio::test]
+    async fn an_end_placing_when_its_channel_closes_lands_whole_and_is_not_answered() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("channel-closes");
+        let payload = bytes_of(300 * 1024);
+        let log = Logged::start(tracing::Level::DEBUG);
+        let held = seams::hold_placing(temp.path());
+        let stash = Arc::new(std::sync::Mutex::new(None));
+        let put = stash.clone();
+        let pair = Pair::open_with("files", move |device, session_end| {
+            *put.lock().unwrap() = Some(device.clone());
+            attach_files(
+                device,
+                bson::oid::ObjectId::new(),
+                Permissions::default() | Permissions::FILES,
+                FilesChannel::Served,
+                session_end,
+            );
+        })
+        .await;
+        let device = stash
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the channel's device end");
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        // The viewer closes the channel; the session goes on. A close from the
+        // far end always reaches the device's end, once its read loop is free.
+        let _ = pair.viewer.close().await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !channel_gone(device.ready_state()) && tokio::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let gone = channel_gone(device.ready_state());
+        held.release();
+        let placed = temp.path().join("w42.bin");
+        let until = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !(placed.exists() && staged(temp.path(), &id).is_none())
+            && tokio::time::Instant::now() < until
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let completed = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: complete") && line.contains(&id)
+        })
+        .await;
+        let not_sent = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: the end's answer is not sent") && line.contains(&id)
+        })
+        .await;
+        pair.close().await;
+        let text = log.text();
+        drop(log);
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(
+            gone,
+            "the device's end did not hear the viewer's close while the end placed its file"
+        );
+        assert!(completed, "the placement did not finish: {text}");
+        assert!(not_sent, "its answer was not dropped: {text}");
+        assert_eq!(
+            std::fs::read(&placed).expect("the file landed"),
+            payload,
+            "the file, whole"
+        );
+        assert!(
+            !temp.path().join(".roomler-partial").exists(),
+            "its staging is left behind"
+        );
+        let registered = crate::files::PARTIAL_REGISTRY
+            .lock()
+            .map(|r| r.contains_key(&id))
+            .unwrap_or(false);
+        assert!(!registered, "its entry is left in the registry");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.contains("files: answer not sent") && line.contains(&id)),
+            "a send was tried on the closed channel: {text}"
+        );
     }
 }

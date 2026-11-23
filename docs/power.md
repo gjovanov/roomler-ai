@@ -117,9 +117,9 @@ shell, none of 3 runs stalled, against 2 of 3 on 0.4.221.
 **A runtime that stood still, told from a slow runner (#4075).** Whether the
 runtime kept time is read from two 10 ms timers over the same stretch: the canary
 on the runtime, and a control on a thread of its own that no request can hold
-([`power.rs:1501`](../agents/roomlerd/src/power.rs#L1501) `ControlTimer`). The
+([`power.rs:1529`](../agents/roomlerd/src/power.rs#L1529) `ControlTimer`). The
 test fails when the runtime's timer was silent more than 200 ms longer than the
-control's ([`power.rs:1600`](../agents/roomlerd/src/power.rs#L1600)). A slow
+control's ([`power.rs:1628`](../agents/roomlerd/src/power.rs#L1628)). A slow
 runner holds both timers. On the macOS lane, for one, `thread_dump`'s test points
 `/usr/bin/sample` at the test process beside these, and `sample` suspends the
 process at every sample. In the run #4075 records, the runtime's timer woke 265 ms
@@ -133,7 +133,7 @@ the runtime's timer.
 | The same wait while another worker drives the timers | on time | on time | fails: the keeper's passes stop |
 
 The second row runs on Linux, Windows and macOS
-([`power.rs:1678`](../agents/roomlerd/src/power.rs#L1678)
+([`power.rs:1710`](../agents/roomlerd/src/power.rs#L1710)
 `a_pass_that_waits_for_the_request_on_the_runtime_fails_as_a_stall`): the stood-in
 OS puts #3871's wait back inside a pass, on a runtime of one worker, and the test
 must fail saying the runtime stood still. With the two workers of the other tests,
@@ -201,11 +201,11 @@ sequenceDiagram
 ### 3.1 The posture
 
 `PowerBrief { policy, on_ac?, held }`
-([`models.rs:1955`](../crates/remote_control/src/models.rs#L1955)) rides the
+([`models.rs:1960`](../crates/remote_control/src/models.rs#L1960)) rides the
 heartbeat as an optional `power`
 ([`signaling.rs:686`](../crates/remote_control/src/signaling.rs#L686)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:5010`](../agents/roomlerd/src/app.rs#L5010)) and
+anything connects ([`app.rs:5018`](../agents/roomlerd/src/app.rs#L5018)) and
 after every pass, with what it actually holds, not what it wanted
 ([`power.rs:371`](../agents/roomlerd/src/power.rs#L371)). A request the OS has
 not answered yet holds nothing (§1.1).
@@ -216,7 +216,7 @@ not answered yet holds nothing (§1.1).
   stay two answers.
 - `held: false` is what **asleep by policy** means: nothing was holding the
   machine, so the OS slept it as the policy allows
-  ([`models.rs:1976`](../crates/remote_control/src/models.rs#L1976)
+  ([`models.rs:1981`](../crates/remote_control/src/models.rs#L1981)
   `by_policy`). `held: true` means it slept past the hold: a closed lid, a
   person, or the OS overruling it.
 
@@ -263,7 +263,7 @@ sleep would say hello again and erase the reason.
 - The next hello `$unset`s `sleep`
   ([`agent.rs:588`](../crates/services/src/dao/agent.rs#L588)), and every reader
   goes through `SleepView::of`, which shows a notice only on a device that is not
-  online ([`models.rs:2005`](../crates/remote_control/src/models.rs#L2005)). A
+  online ([`models.rs:2010`](../crates/remote_control/src/models.rs#L2010)). A
   read between the reconnect and that write never shows a stale "asleep".
 
 ### 3.4 What each surface shows
@@ -275,7 +275,7 @@ sleep would say hello again and erase the reason.
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
 | the admin agent API | `power`, `sleep` ([`agent.rs:913`](../crates/modules/fleet/src/agent.rs#L913)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
-| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3509`](../crates/remote_control/src/models.rs#L3509)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
+| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3514`](../crates/remote_control/src/models.rs#L3514)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:
 

@@ -1310,6 +1310,10 @@ pub fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // FR-149 P1 (C2) — this thread is handed to AppKit below, after the
+    // daemon's thread starts: a panel the daemon builds before the loop pumps
+    // is built for it, and takes questions from the loop's first pass.
+    roomlerd::indicator::mac::promise_main_loop();
     std::thread::Builder::new()
         .name("roomlerd-main".into())
         .spawn(move || {
@@ -2635,14 +2639,14 @@ async fn post_install_watch_cmd(
 /// `ROOMLERD_ENCODER` → config file field → default (Auto).
 /// Invalid values fall through to Auto with a warning, so a typo can't
 /// prevent the agent from starting.
-fn rollback_attention_msg(
+pub(crate) fn rollback_attention_msg(
     current: &str,
     target: &str,
     crash_count: u32,
     failure_reason: Option<&str>,
 ) -> String {
     let mut msg = format!(
-        "Roomler agent: crash loop detected (auto-rollback failed).\n\n\
+        "roomlerd: crash loop detected (auto-rollback failed).\n\n\
          Version {current} has crashed {crash_count} times within \
          {win_min} min. Last known good version: {target}.\n",
         win_min = config::CRASH_WINDOW_SECS / 60,
@@ -2663,9 +2667,9 @@ fn rollback_attention_msg(
 /// and running the older installer over this version is the one thing it refuses.
 /// The way back it gives is measured: an uninstall keeps the config and the
 /// enrollment, and with updates left on the older version took this one back in 25 s.
-fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
+pub(crate) fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
     format!(
-        "Roomler agent: crash loop detected.\n\n\
+        "roomlerd: crash loop detected.\n\n\
          Version {current} has crashed {crash_count} times within {win_min} min. \
          Last known good version: {target}.\n\n\
          This device did not roll back: the Windows installer refuses to install an \
@@ -3946,10 +3950,11 @@ async fn run_cmd(
 ) -> Result<Option<i32>> {
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
-    if !config_path.exists() && !unenrolled {
-        // #4023 — the device's state, not a fault, told apart by type and never by its words:
-        // no crash is recorded for it, and a supervisor that reads 78 gets 78 (#4028, #4071).
-        let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+    let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+    let at_start = config_at_start::of(config_path, unenrolled, supervision);
+    if at_start == config_at_start::AtStart::NoConfig {
+        // #4023 — a state, not a fault: no crash is recorded, and a supervisor that reads 78 gets
+        // 78 (#4028, #4071). #4157 — an enrolled copy is restored instead, if the run may restore.
         return Err(roomlerd::daemon_error::NoConfig::under(config_path, supervision).into());
     }
     // FR-150 P2 — before the lock: the per-user task's daemon started inside an install leaves.
@@ -4037,12 +4042,11 @@ async fn run_cmd(
         );
     }
 
-    // FR-84 D3 — who will relaunch this process if it exits, decided once,
-    // from evidence the supervisor left (argv, environment, cgroup) — never
-    // from the config file. `none` is the answer for a hand-run `roomlerd
-    // run`, and it is the one that makes "Apply now" refuse instead of
-    // taking the device offline.
-    let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+    // FR-84 D3 — who will relaunch this process if it exits, decided once, at
+    // the top (#4157's check reads it), from evidence the supervisor left
+    // (argv, environment, cgroup) — never from the config file. `none` is the
+    // answer for a hand-run `roomlerd run`, and it is the one that makes
+    // "Apply now" refuse instead of taking the device offline.
     roomlerd::supervision::set_current(supervision);
     tracing::info!(
         supervisor = supervision.wire(),
@@ -4963,6 +4967,10 @@ async fn run_cmd(
         supervised,
     )
     .then(|| {
+        // FR-149 P1 (D4) — a question the screen worker's panel showed, whose
+        // channel then ends, goes to the person's app by this broker's
+        // rewrite of its marker.
+        delegate_host.set_consent_broker(consent_broker.clone());
         delegate_host.set_one_row();
         delegate_host.clone()
     });
@@ -5196,6 +5204,12 @@ async fn run_cmd(
     roomlerd::exec_service::spawn_health_watch();
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(daemon_state);
+    // FR-149 P1 (D3) — a one-row Mac's screen worker shows the root daemon's
+    // questions on its panel, and a click on one takes the road the person's
+    // app's answer takes: this state's `consent_decide_view`, to the root half.
+    if roomlerd::indicator::session_panel::hosts_the_panel(unenrolled) {
+        roomlerd::consent_relay::register_panel_road(localapi_state.clone());
+    }
     // P3b-3: the RTT prober. Pings each carrier-reachable peer every
     // RTT_PROBE_INTERVAL into rtt_cache; exits on shutdown. A fresh
     // `overlay_view_tx.subscribe()` receiver (the original moved into
@@ -9253,3 +9267,6 @@ mod no_enrollment_exit_tests {
 
 /// #3589 — what the last line of `adopt-enrollment` says was at the target.
 mod adopt_line;
+
+/// #4157 — what a `run` does with its config before it takes the lock.
+mod config_at_start;

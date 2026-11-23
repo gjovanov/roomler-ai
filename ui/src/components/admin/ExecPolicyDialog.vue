@@ -121,7 +121,7 @@
             as whoever is signed in at its own screen, and is refused when
             nobody is.
             <template v-if="!agentDropsToPerson">
-              This device's agent cannot do that yet: update it, or choose root.
+              This device's daemon cannot do that yet: update it, or choose root.
             </template>
           </div>
         </template>

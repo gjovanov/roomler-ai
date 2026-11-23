@@ -105,9 +105,6 @@ type InitCanvasMessage = {
    *  Absent/false reports the failure as before, and it sticks across the
    *  idempotent visible-canvas re-init. */
   decodeRecover?: boolean
-  /** FR-135 R1 — this session's video channel is unordered (`videoDcOptions`),
-   *  so a chunk gap is routine and keeps the deltas moving. Sticks the same way. */
-  unorderedVideo?: boolean
   /** FR-17 — true when the controller negotiated per-chunk framing for
    *  this session (the agent advertised `chunk-framing` in
    *  `AgentCaps.video`). Absent/false keeps the pre-FR-17 bare byte
@@ -153,6 +150,9 @@ type ChunkMessage = {
    *  `onmessage` → measures the main→worker forwarding hop. On the page's
    *  clock, so it is read through `pageSkewMs` (#3566). */
   sentAt?: number
+  /** FR-148 P4b-2 — true on a message the page relayed off `video-deadline`,
+   *  the unordered channel; absent off `video-bytes`. */
+  deadline?: boolean
 }
 /** P7 — the canvas element's CSS box + devicePixelRatio (composable
  *  ResizeObserver). Drives the FSR sizing policy; until the first report
@@ -555,7 +555,6 @@ workerScope.onmessage = (e) => {
     if (typeof msg.colorSpace === 'boolean') decoderColorSpace.setWanted(msg.colorSpace)
     // FR-135 R1 — sticky across the visible-canvas re-init, which omits it.
     if (typeof msg.decodeRecover === 'boolean') decodeRecovery.setEnabled(msg.decodeRecover)
-    if (typeof msg.unorderedVideo === 'boolean') decodeRecovery.setUnorderedChannel(msg.unorderedVideo)
     initDecoder()
   } else if (msg.type === 'viewport') {
     // P7 — cache the element box; the sizing policy runs per paint.
@@ -580,11 +579,13 @@ workerScope.onmessage = (e) => {
     if (msg.sharpen !== undefined) sharpenMode = normalizeSharpenMode(msg.sharpen)
     if (msg.sharpness !== undefined) sharpness = normalizeSharpness(msg.sharpness)
   } else if (msg.type === 'chunk') {
-    onChunk(msg.bytes, msg.sentAt)
+    onChunk(msg.bytes, msg.sentAt, msg.deadline === true)
   } else if (msg.type === 'video-channel') {
     // FR-135 R3 — the page moved the channel itself here, and keeps no copy
     // of it, so it waits to hear the channel arrived (`video-channel-attached`).
-    attachVideoChannel(msg.channel)
+    // FR-148 P4b-2 — `video-deadline` comes in the same message when the
+    // session opened one, and the one answer covers both.
+    attachVideoChannel(msg.channel, msg.deadline)
     workerScope.postMessage({ type: 'video-channel-attached' })
   } else if (msg.type === 'close') {
     teardown()
@@ -598,11 +599,18 @@ workerScope.onmessageerror = () => {
   workerScope.postMessage({ type: 'message-error' })
 }
 
-/** One message off the `video-bytes` channel, however it came: relayed by the
- *  page (`chunk`, stamped with the page's `sentAt`, so the hop is timed) or
+/** One message off a video channel, however it came: relayed by the page
+ *  (`chunk`, stamped with the page's `sentAt`, so the hop is timed) or
  *  straight off the channel the page moved here (FR-135 R3), which has no
- *  page hop to time. */
-function onChunk(bytes: ArrayBuffer, sentAt: number | undefined): void {
+ *  page hop to time.
+ *
+ *  FR-148 P4b-2 (D55) — `deadline` is true for a message off `video-deadline`,
+ *  the unordered channel, and false off `video-bytes`. Both feed the one
+ *  assembler, keyed by frame_seq: the agent is to keep one frame_seq space
+ *  across the two and switch between them only at a key frame (P4b-3). The
+ *  channel decides one thing here, what a gap does to the gate
+ *  (`gapClosesGate`). */
+function onChunk(bytes: ArrayBuffer, sentAt: number | undefined, deadline: boolean): void {
   framesReceived++
   if (typeof sentAt === 'number') {
     // #3566 — `sentAt` is on the page's clock: read through the skew. #3596 — a
@@ -630,8 +638,9 @@ function onChunk(bytes: ArrayBuffer, sentAt: number | undefined): void {
       // FR-135 R1 — the deltas behind the gap reference the frame it lost,
       // so they wait at the gate for the IDR asked for below. Decoded, they
       // paint garbage until it lands, or fail the decoder. Not where a gap is
-      // routine, or with the switch off (`gapClosesGate`).
-      if (decodeRecovery.gapClosesGate()) {
+      // routine, `video-deadline`'s (FR-148 P4b-2), or with the switch off
+      // (`gapClosesGate`).
+      if (decodeRecovery.gapClosesGate(deadline)) {
         sawKeyframe = false
         mediaWindow.onGateArmed(performance.now())
       }
@@ -651,26 +660,30 @@ function onChunk(bytes: ArrayBuffer, sentAt: number | undefined): void {
 
 /** FR-135 R3 — the `video-bytes` channel the page moved here
  *  (`moveVideoChannelToWorker`), and the delivery-gap clock the page keeps for
- *  a channel it relays: only the worker sees this one's messages. */
+ *  a channel it relays: only the worker sees this one's messages. FR-148
+ *  P4b-2 — and `video-deadline`, moved beside it. The gap clock is the video
+ *  stream's, over both channels, as the page's is: the agent sends on one at
+ *  a time, so a switch is no silence. */
 let videoChannel: RTCDataChannel | null = null
+let deadlineChannel: RTCDataChannel | null = null
 const videoChannelGap = createDeliveryGapClock()
 let videoChannelOpenSaid = false
 let videoChannelClosedSaid = false
 
-/** Read `channel` here. Its open and close go to the page
- *  (`video-channel-open`, `video-channel-closed`), which logs them and marks
- *  `dc_open` as it does for a channel it relays, and a silence longer than
- *  `VIDEO_DC_GAP_MS` goes as `video-channel-gap`. The binary type does not
- *  travel with a channel, so it is set here. */
-function attachVideoChannel(channel: RTCDataChannel): void {
+/** Read `channel` here, and `deadline` beside it when the page moved one. The
+ *  open and close of `channel` go to the page (`video-channel-open`,
+ *  `video-channel-closed`), which logs them and marks `dc_open` as it does for
+ *  a channel it relays, and a silence on both longer than `VIDEO_DC_GAP_MS`
+ *  goes as `video-channel-gap`. `deadline`'s open and close say nothing: the
+ *  video path's state is `video-bytes`'s, and an agent that never sends on
+ *  `video-deadline` (all of them before P4b-3) leaves it idle. */
+function attachVideoChannel(channel: RTCDataChannel, deadline?: RTCDataChannel): void {
   detachVideoChannel()
   videoChannel = channel
-  channel.binaryType = 'arraybuffer'
-  channel.onmessage = (ev: MessageEvent) => {
-    if (!(ev.data instanceof ArrayBuffer)) return
-    const gapMs = videoChannelGap.note(performance.now())
-    if (gapMs !== null) workerScope.postMessage({ type: 'video-channel-gap', gapMs: Math.round(gapMs) })
-    onChunk(ev.data, undefined)
+  readVideoChannel(channel, false)
+  if (deadline) {
+    deadlineChannel = deadline
+    readVideoChannel(deadline, true)
   }
   channel.onopen = () => sayVideoChannel('open')
   channel.onclose = () => sayVideoChannel('closed')
@@ -678,6 +691,18 @@ function attachVideoChannel(channel: RTCDataChannel): void {
   // past that says so now, because its event will not come again.
   if (channel.readyState === 'open') sayVideoChannel('open')
   else if (channel.readyState === 'closed') sayVideoChannel('closed')
+}
+
+/** Feed a moved channel's messages to `onChunk`. The binary type does not
+ *  travel with a channel, so it is set here. */
+function readVideoChannel(channel: RTCDataChannel, deadline: boolean): void {
+  channel.binaryType = 'arraybuffer'
+  channel.onmessage = (ev: MessageEvent) => {
+    if (!(ev.data instanceof ArrayBuffer)) return
+    const gapMs = videoChannelGap.note(performance.now())
+    if (gapMs !== null) workerScope.postMessage({ type: 'video-channel-gap', gapMs: Math.round(gapMs) })
+    onChunk(ev.data, undefined, deadline)
+  }
 }
 
 /** Tell the page the moved channel opened or closed, once each. */
@@ -693,15 +718,18 @@ function sayVideoChannel(state: 'open' | 'closed'): void {
   }
 }
 
-/** Stop reading the moved channel. It is not closed: a relayed channel stays
- *  open when its path stops too, and the session's `pc.close()` closes either. */
+/** Stop reading the moved channels. They are not closed: a relayed channel
+ *  stays open when its path stops too, and the session's `pc.close()` closes
+ *  either. */
 function detachVideoChannel(): void {
-  if (videoChannel) {
-    videoChannel.onmessage = null
-    videoChannel.onopen = null
-    videoChannel.onclose = null
-    videoChannel = null
+  for (const ch of [videoChannel, deadlineChannel]) {
+    if (!ch) continue
+    ch.onmessage = null
+    ch.onopen = null
+    ch.onclose = null
   }
+  videoChannel = null
+  deadlineChannel = null
   videoChannelGap.reset()
   videoChannelOpenSaid = false
   videoChannelClosedSaid = false

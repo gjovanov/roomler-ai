@@ -1788,6 +1788,9 @@ pub fn revert_digest(r: &Revert) -> u64 {
     (r.supervised, &r.unfinished, &r.strays).hash(&mut h);
     // #4122 — whose LaunchAgent it bootstraps for a keep that never finished.
     r.unfinished_agent.as_ref().map(|a| a.uid).hash(&mut h);
+    // #4227 — whether the job of the person given back is loaded: the plan's
+    // words for them turn on it.
+    r.agent_loaded.hash(&mut h);
     for p in &r.people {
         p.uid.hash(&mut h);
         match &p.back {
@@ -2279,7 +2282,7 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
                      system/com.roomler.daemon` retries it"
                 ));
                 for &index in &done.booted_out {
-                    problems.push(not_bootstrapped(read.people[index].account.uid));
+                    problems.push(not_bootstrapped(host, read.people[index].account.uid));
                 }
                 None
             }
@@ -2400,6 +2403,13 @@ async fn worker_gone<H: Host>(host: &mut H, uid: u32) -> Option<String> {
 /// starts a job that lost the race anyway and does nothing to one that runs:
 /// the supervisor's own hand-back (`kickstart_launch_agent` in
 /// `macos_supervisor.rs`). `Err`: the bootstrap's, which the caller says.
+///
+/// #4227 — the job is read right before the bootstrap, here, for every
+/// caller: one still loaded (a run that stopped after the person's Keep and
+/// before its bootout) or loaded again (a login since) is never bootstrapped a
+/// second time, which launchd refuses, and one line says so. The kickstart
+/// still follows: an agent that started while the one-row daemon's screen
+/// worker held its lock exited 0, so its job is loaded and nothing runs.
 async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) -> Result<()> {
     let job = format!("gui/{uid}/com.roomler.agent");
     if wait && let Some(why) = worker_gone(host, uid).await {
@@ -2408,8 +2418,14 @@ async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) ->
              worker has stopped, `sudo launchctl kickstart {job}` starts it"
         ));
     }
-    host.bootstrap(&bootstrap_argv(uid, home))?;
-    host.say(&format!("bootstrapped: {job}"));
+    if host.agent_loaded(uid) {
+        host.say(&format!(
+            "{job}: already loaded, so it is not bootstrapped again"
+        ));
+    } else {
+        host.bootstrap(&bootstrap_argv(uid, home))?;
+        host.say(&format!("bootstrapped: {job}"));
+    }
     match host.kickstart_agent(uid) {
         Ok(()) => host.say(&format!("kickstarted: {job}")),
         Err(e) => host.say(&format!(
@@ -2421,11 +2437,26 @@ async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) ->
 
 /// #4092 — what `--revert` and the undo say of an agent they load only once
 /// the restart has answered, when it did not.
-fn not_bootstrapped(uid: u32) -> String {
-    format!(
-        "gui/{uid}/com.roomler.agent: not bootstrapped, as the daemon did not restart onto the \
-         files put back; launchd loads it at the next login"
-    )
+///
+/// #4287 — the job is read as the line is made. One still loaded (a run that
+/// stopped after the person's Keep and before its bootout) or loaded again (a
+/// login since) does not load at the next login: its agent may run, or may
+/// have exited 0 while the one-row daemon's screen worker held its lock, and
+/// then only `kickstart` starts it.
+fn not_bootstrapped<H: Host>(host: &mut H, uid: u32) -> String {
+    let job = format!("gui/{uid}/com.roomler.agent");
+    if host.agent_loaded(uid) {
+        format!(
+            "{job}: already loaded, and not started here, as the daemon did not restart onto \
+             the files put back; if the agent is not running, `sudo launchctl kickstart {job}` \
+             starts it"
+        )
+    } else {
+        format!(
+            "{job}: not bootstrapped, as the daemon did not restart onto the files put back; \
+             launchd loads it at the next login"
+        )
+    }
 }
 
 /// The Verify step: the restarted daemon has every part of one row within
@@ -2545,6 +2576,12 @@ pub struct Revert {
     /// in their home as their own process read it, and their job not loaded.
     /// A keep again that stopped after the bootout (#4097) leaves just that.
     pub unfinished_agent: Option<Account>,
+    /// #4227 — the LaunchAgent of the person given back whom
+    /// [`bootstrap_after_revert`] names was loaded as the plan read it, as a
+    /// run that stopped after their Keep and before its bootout leaves it.
+    /// The plan then says it is started, not bootstrapped; [`start_agent`]
+    /// reads it again right before either.
+    pub agent_loaded: bool,
     /// [`Host::record_strays`]: temporary files a power loss left, removed
     /// first.
     pub strays: Vec<String>,
@@ -2687,6 +2724,11 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
     {
         unfinished_agent = Some(p.account.clone());
     }
+    // #4227 — the job of the person given back whom the bootstrap names, read
+    // so that the plan says what the revert does with it.
+    let agent_loaded = bootstrap_after_revert(supervised, console_uid)
+        .filter(|uid| people.iter().any(|p| p.uid == *uid))
+        .is_some_and(|uid| host.agent_loaded(uid));
     Ok(Some(Revert {
         root_kept,
         root_record,
@@ -2695,6 +2737,7 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
         people,
         unfinished,
         unfinished_agent,
+        agent_loaded,
         strays,
         unread,
         console_uid,
@@ -2714,6 +2757,14 @@ pub fn bootstrap_after_revert(supervised: bool, console_uid: Option<u32>) -> Opt
 /// ([`Revert::unfinished_agent`], #4122).
 const AGENT_AFTER_RESTART: &str = ", and their LaunchAgent is bootstrapped after the restart, \
                                    once the one-row screen worker that runs as them has stopped";
+
+/// #4227 — what the plan adds instead for a person given back whose job is
+/// loaded as it reads it ([`Revert::agent_loaded`]): never bootstrapped
+/// again, only kickstarted without `-k`, which starts it if it is not running
+/// ([`start_agent`]).
+const LOADED_AGENT_AFTER_RESTART: &str = ", and their LaunchAgent, already loaded, is started \
+                                          after the restart if it is not running, once the \
+                                          one-row screen worker that runs as them has stopped";
 
 /// The revert's plan, in the words it says before it asks.
 pub fn describe_revert(r: &Revert) -> Vec<String> {
@@ -2749,15 +2800,16 @@ pub fn describe_revert(r: &Revert) -> Vec<String> {
             Back::Record { .. } => format!("from what root keeps in {RECORDS}/{}", p.uid),
             Back::Legacy => "from the copies an earlier release kept in their folder".to_string(),
         };
+        let agent = if bootstrap_for != Some(p.uid) {
+            ""
+        } else if r.agent_loaded {
+            LOADED_AGENT_AFTER_RESTART
+        } else {
+            AGENT_AFTER_RESTART
+        };
         out.push(format!(
-            "{} (uid {}): their files go back {how}, by their own process{}",
-            p.name,
-            p.uid,
-            if bootstrap_for == Some(p.uid) {
-                AGENT_AFTER_RESTART
-            } else {
-                ""
-            }
+            "{} (uid {}): their files go back {how}, by their own process{agent}",
+            p.name, p.uid
         ));
     }
     for (uid, name, why) in &r.unread {
@@ -2965,8 +3017,8 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     let failed: Vec<String> = failed.into_iter().map(|(_, name)| name).collect();
     // #4122 — the person of an unfinished folder the plan named, at the same
     // point and in the same way as one given back, and once, whichever path
-    // names them. Their job is read again first: a login since loads it.
-    let read_again = r.unfinished_agent.as_ref().map(|a| a.uid);
+    // names them. `start_agent` reads their job again first, as it does
+    // anyone's (#4227): a login since loads it.
     let agent = agent.or_else(|| r.unfinished_agent.as_ref().map(|a| (a.uid, a.home.clone())));
     host.say("restarting the daemon onto the files put back: live sessions end now");
     let leaving = host.status().await.ok().map(|s| DaemonInstance::of(&s));
@@ -2978,7 +3030,8 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
         Ok(status) => status,
         Err(e) => {
             if let Some((uid, _)) = &agent {
-                host.say(&not_bootstrapped(*uid));
+                let line = not_bootstrapped(host, *uid);
+                host.say(&line);
             }
             host.say(&format!(
                 "root's records stay in {RECORDS}: `sudo roomlerd one-row --revert` finishes the \
@@ -2991,17 +3044,13 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     // the one-row file, whose moved enrollments the person's file holds again:
     // two processes on one enrollment, which root's file going first prevents.
     // Now it runs root's file put back, which leaves this person to launchd.
-    if let Some((uid, home)) = &agent {
-        if read_again == Some(*uid) && host.agent_loaded(*uid) {
-            host.say(&format!(
-                "gui/{uid}/com.roomler.agent: loaded since the plan was said, so it is left alone"
-            ));
-        } else if let Err(e) = start_agent(host, *uid, home, true).await {
-            host.say(&format!(
-                "gui/{uid}/com.roomler.agent did not start ({e:#}); launchd loads it at the next \
-                 login"
-            ));
-        }
+    if let Some((uid, home)) = &agent
+        && let Err(e) = start_agent(host, *uid, home, true).await
+    {
+        host.say(&format!(
+            "gui/{uid}/com.roomler.agent did not start ({e:#}); launchd loads it at the next \
+             login"
+        ));
     }
     for uid in given_back {
         host.remove_records_of(uid)
@@ -4131,6 +4180,10 @@ mod tests {
         /// #4097 — what each person's agent saves as a bootout stops it: the
         /// config's bytes and mode, written over their config then.
         stop_saves: HashMap<u32, (Vec<u8>, u32)>,
+        /// #4227 — `(effect, n, uid)`: `uid` logs in just before the n-th
+        /// call of that effect, and launchd loads their LaunchAgent from the
+        /// plist in their home, where one is there.
+        login_at: Option<(&'static str, usize, u32)>,
     }
 
     fn one_row_daemon(kicks: u32) -> NodeStatus {
@@ -4190,6 +4243,7 @@ mod tests {
                 workers: HashMap::new(),
                 ps_fails: false,
                 stop_saves: HashMap::new(),
+                login_at: None,
             }
         }
 
@@ -4210,7 +4264,14 @@ mod tests {
         fn hit(&mut self, effect: &'static str) -> Result<()> {
             let n = self.counts.entry(effect).or_default();
             *n += 1;
-            if self.fail == Some((effect, *n)) {
+            let n = *n;
+            if let Some((at, call, uid)) = self.login_at
+                && (at, call) == (effect, n)
+                && self.homes.get(&uid).is_some_and(|h| h.plist.is_some())
+            {
+                self.loaded.insert(uid);
+            }
+            if self.fail == Some((effect, n)) {
                 bail!("{effect} #{n} failed (the test said so)");
             }
             Ok(())
@@ -4455,6 +4516,12 @@ mod tests {
                 self.homes[&uid].plist.is_some(),
                 "a LaunchAgent is bootstrapped from its plist"
             );
+            // #4227 — launchd refuses a job it has loaded already.
+            if self.loaded.contains(&uid) {
+                self.calls
+                    .push(format!("bootstrap {uid}: refused, already loaded"));
+                bail!("Bootstrap failed: 37: Operation already in progress");
+            }
             self.loaded.insert(uid);
             self.calls.push(format!("bootstrap {uid}"));
             Ok(())
@@ -6010,24 +6077,332 @@ mod tests {
         assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
     }
 
-    /// #4122 — the job is loaded between the plan and the bootstrap (casey
-    /// logged in again meanwhile): read again right before, it is left alone,
-    /// and the revert says so in one line.
+    /// #4227 — the line `start_agent` says of casey's job when it finds it
+    /// loaded.
+    const ALREADY_LOADED_501: &str =
+        "gui/501/com.roomler.agent: already loaded, so it is not bootstrapped again";
+
+    /// #4122, #4227 R4 — the job is loaded between the plan and the bootstrap
+    /// (casey logged in again meanwhile): read again right before, it is not
+    /// bootstrapped again, one line says so, and it is kickstarted without
+    /// `-k` once the worker is gone.
     #[tokio::test]
-    async fn an_agent_loaded_after_the_revert_plan_is_left_alone() {
+    async fn an_agent_loaded_after_the_revert_plan_is_kickstarted_not_bootstrapped() {
         let mut mac = Fake::new(one_row_daemon);
         stopped_inside_the_keep_again(&mut mac).await;
         let r = revert_plan(&mut mac).await.unwrap().unwrap();
         mac.loaded.insert(501);
         revert(&mut mac, &r).await.unwrap();
-        assert!(
-            calls_of(&mac, &["worker", "bootstrap", "agent"]).is_empty(),
-            "{:?}",
-            mac.calls
+        assert_eq!(
+            calls_of(&mac, &["worker", "bootstrap", "agent"]),
+            ["worker 501: gone", "agent kickstart 501"]
         );
-        let line = "gui/501/com.roomler.agent: loaded since the plan was said, so it is left alone";
-        assert!(mac.said().contains(line), "{}", mac.said());
+        let said = mac.said();
+        assert!(said.contains(ALREADY_LOADED_501), "{said}");
+        assert!(
+            said.contains("kickstarted: gui/501/com.roomler.agent"),
+            "{said}"
+        );
+        assert!(!said.contains("did not start"), "{said}");
         assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4227 — a stop after casey's Keep has finished (their `record.json`
+    /// written) and before the bootout: their record whole, their job still
+    /// loaded. The bootout's first call fails before it changes anything,
+    /// which leaves the Mac as a stop there does (`steps` alone, no undo).
+    async fn stopped_after_the_keep(mac: &mut Fake) {
+        mac.fail = Some(("bootout", 1));
+        let read = read_now(mac).await;
+        let plan = plan(&read.root, &read.people).unwrap();
+        let mut done = Done::default();
+        let e = format!(
+            "{:#}",
+            steps(mac, &read, &plan, &mut done).await.unwrap_err()
+        );
+        assert!(e.contains("booting out casey's LaunchAgent"), "{e}");
+        let record = RootFile::Person {
+            uid: 501,
+            part: Part::Record,
+        };
+        assert!(mac.root.contains_key(&record), "their Keep finished");
+        assert!(mac.loaded.contains(&501), "never booted out");
+        mac.fail = None;
+        mac.calls.clear();
+        mac.said.clear();
+    }
+
+    /// #4227 R1 — after that stop, `--revert` gives casey back and does not
+    /// bootstrap their job again, which launchd refuses: one line says so,
+    /// and the kickstart without `-k` follows once the restart has answered
+    /// and the worker is gone. Before, the bootstrap failed and the revert's
+    /// last word was that the agent did not start, while it ran.
+    #[tokio::test]
+    async fn a_person_given_back_whose_agent_is_still_loaded_is_not_bootstrapped_again() {
+        let mut mac = Fake::new(one_row_daemon);
+        let before = mac.files();
+        stopped_after_the_keep(&mut mac).await;
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(
+            mac.files(),
+            before,
+            "the files as they were, root's records gone"
+        );
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "write Config",
+                    "put-back",
+                    "kickstart",
+                    "status: daemon 1",
+                    "worker",
+                    "bootstrap",
+                    "agent"
+                ]
+            ),
+            [
+                "write Config",
+                "put-back 501",
+                "kickstart",
+                "status: daemon 1",
+                "worker 501: gone",
+                "agent kickstart 501"
+            ]
+        );
+        let said = mac.said();
+        assert!(said.contains(ALREADY_LOADED_501), "{said}");
+        assert!(
+            said.contains("kickstarted: gui/501/com.roomler.agent"),
+            "{said}"
+        );
+        assert!(!said.contains("did not start"), "{said}");
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4227 R2 — the plan says it: R1's plan does not say "bootstrapped"
+    /// for casey, but that their LaunchAgent, already loaded, is started if
+    /// it is not running. The same Mac with the job not loaded is another
+    /// plan, with another digest.
+    #[tokio::test]
+    async fn the_revert_plan_says_a_loaded_agent_is_started_not_bootstrapped() {
+        let mut mac = Fake::new(one_row_daemon);
+        stopped_after_the_keep(&mut mac).await;
+        let loaded = revert_plan(&mut mac).await.unwrap().unwrap();
+        let words = describe_revert(&loaded).join("\n");
+        let line = "casey (uid 501): their files go back from what root keeps in \
+                    /etc/roomler/one-row/501, by their own process, and their LaunchAgent, \
+                    already loaded, is started after the restart if it is not running, once \
+                    the one-row screen worker that runs as them has stopped";
+        assert!(words.lines().any(|l| l == line), "{words}");
+        assert!(!words.contains("bootstrapped"), "{words}");
+        mac.loaded.remove(&501);
+        let not_loaded = revert_plan(&mut mac).await.unwrap().unwrap();
+        let words = describe_revert(&not_loaded).join("\n");
+        assert!(
+            words.contains("and their LaunchAgent is bootstrapped after the restart"),
+            "{words}"
+        );
+        assert_ne!(revert_digest(&loaded), revert_digest(&not_loaded));
+    }
+
+    /// #4227 R3 — the undo: casey logs in again after the run booted their
+    /// agent out, and launchd loads it from the plist in their home before
+    /// the undo starts it. It is not bootstrapped again: the line, then the
+    /// kickstart without `-k`. Before the conversion's restart (root's file
+    /// fails, and the login comes as the undo writes root's file back) at
+    /// once; after it (the verify fails, and the login comes with the undo's
+    /// restart, once casey's plist is back) once the worker is gone.
+    #[tokio::test]
+    async fn an_undo_never_bootstraps_an_agent_loaded_again() {
+        type Cell = (
+            &'static str,
+            fn(u32) -> NodeStatus,
+            Option<(&'static str, usize)>,
+            (&'static str, usize, u32),
+            &'static [&'static str],
+        );
+        let cells: [Cell; 2] = [
+            (
+                "before the restart",
+                one_row_daemon,
+                Some(("save_root", 1)),
+                ("write_root", 6, 501),
+                &["bootout 501", "agent kickstart 501"],
+            ),
+            (
+                "after the restart",
+                no_grant_daemon,
+                None,
+                ("kickstart", 2, 501),
+                &[
+                    "bootout 501",
+                    "kickstart",
+                    "put-back 501",
+                    "kickstart",
+                    "status: daemon 2",
+                    "worker 501: gone",
+                    "agent kickstart 501",
+                ],
+            ),
+        ];
+        for (cell, daemon, fail, login, want) in cells {
+            let mut mac = Fake::new(daemon);
+            let before = mac.files();
+            mac.fail = fail;
+            mac.login_at = Some(login);
+            let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+            assert!(e.contains("the Mac is as it was"), "{cell}: {e}");
+            assert_eq!(mac.files(), before, "{cell}");
+            assert_eq!(
+                calls_of(
+                    &mac,
+                    &[
+                        "bootout",
+                        "put-back",
+                        "kickstart",
+                        "status: daemon 2",
+                        "worker",
+                        "bootstrap",
+                        "agent"
+                    ]
+                ),
+                want,
+                "{cell}"
+            );
+            let said = mac.said();
+            assert!(said.contains(ALREADY_LOADED_501), "{cell}: {said}");
+            assert!(
+                said.contains("kickstarted: gui/501/com.roomler.agent"),
+                "{cell}: {said}"
+            );
+            assert!(mac.loaded.contains(&501), "{cell}");
+        }
+    }
+
+    /// #4287 — the two lines `--revert` and the undo say of casey's job when
+    /// the restart onto the files put back does not answer: not loaded, it
+    /// loads at the next login, as before; loaded, it was not started here,
+    /// and `kickstart` starts it if its agent is not running.
+    const NOT_BOOTSTRAPPED_501: &str = "gui/501/com.roomler.agent: not bootstrapped, as the \
+                                        daemon did not restart onto the files put back; launchd \
+                                        loads it at the next login";
+    const LOADED_NOT_STARTED_501: &str = "gui/501/com.roomler.agent: already loaded, and not \
+                                          started here, as the daemon did not restart onto the \
+                                          files put back; if the agent is not running, `sudo \
+                                          launchctl kickstart gui/501/com.roomler.agent` starts it";
+
+    /// #4287 — a `--revert` whose restart does not answer starts no agent, and
+    /// reads casey's job as it says the line. Not loaded (a conversion, then
+    /// the revert): the line as before. Loaded again by a login as the revert
+    /// restarts, after its plan read it not loaded, or still loaded after a
+    /// stop after the Keep: no "next login", but that it is loaded and how it
+    /// starts.
+    #[tokio::test]
+    async fn a_revert_whose_restart_does_not_answer_says_whether_the_agent_is_loaded() {
+        type Cell = (
+            &'static str,
+            bool,
+            Option<(&'static str, usize, u32)>,
+            &'static str,
+            &'static str,
+        );
+        let cells: [Cell; 3] = [
+            (
+                "not loaded",
+                false,
+                None,
+                "their LaunchAgent is bootstrapped after the restart",
+                NOT_BOOTSTRAPPED_501,
+            ),
+            (
+                "loaded again by a login as the revert restarts",
+                false,
+                Some(("kickstart", 2, 501)),
+                "their LaunchAgent is bootstrapped after the restart",
+                LOADED_NOT_STARTED_501,
+            ),
+            (
+                "still loaded after a stop after the Keep",
+                true,
+                None,
+                "their LaunchAgent, already loaded, is started after the restart",
+                LOADED_NOT_STARTED_501,
+            ),
+        ];
+        for (cell, stopped, login, plan, line) in cells {
+            let mut mac = Fake::new(one_row_daemon);
+            if stopped {
+                stopped_after_the_keep(&mut mac).await;
+            } else {
+                convert_now(&mut mac).await.unwrap();
+                mac.calls.clear();
+                mac.said.clear();
+            }
+            mac.stuck = true;
+            mac.login_at = login;
+            let e = format!("{:#}", revert_now(&mut mac).await.unwrap_err());
+            assert!(
+                e.contains("the restart onto the files put back"),
+                "{cell}: {e}"
+            );
+            assert!(
+                calls_of(&mac, &["bootstrap", "agent"]).is_empty(),
+                "{cell}: {:?}",
+                mac.calls
+            );
+            let said = mac.said();
+            assert!(said.contains(plan), "{cell}: {said}");
+            assert!(said.lines().any(|l| l == line), "{cell}: {said}");
+            let loaded = line == LOADED_NOT_STARTED_501;
+            assert_eq!(mac.loaded.contains(&501), loaded, "{cell}");
+            assert_eq!(said.contains("next login"), !loaded, "{cell}: {said}");
+        }
+    }
+
+    /// #4287 — the undo whose restart does not answer starts no agent, and
+    /// reads each job it booted out as it says the line. casey's job not
+    /// loaded: the line as before. Loaded again by a login as the undo
+    /// restarts, their plist back: that it is loaded and how it starts.
+    #[tokio::test]
+    async fn an_undo_whose_restart_does_not_answer_says_whether_the_agent_is_loaded() {
+        type Cell = (
+            &'static str,
+            Option<(&'static str, usize, u32)>,
+            &'static str,
+        );
+        let cells: [Cell; 2] = [
+            ("not loaded", None, NOT_BOOTSTRAPPED_501),
+            (
+                "loaded again by a login as the undo restarts",
+                Some(("kickstart", 2, 501)),
+                LOADED_NOT_STARTED_501,
+            ),
+        ];
+        for (cell, login, line) in cells {
+            let mut mac = Fake::new(one_row_daemon);
+            mac.stuck = true;
+            mac.login_at = login;
+            let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+            assert!(
+                e.contains("2 thing(s) could not be put back"),
+                "{cell}: {e}"
+            );
+            assert_eq!(
+                calls_of(
+                    &mac,
+                    &["bootout", "put-back", "kickstart", "bootstrap", "agent"]
+                ),
+                ["bootout 501", "kickstart", "put-back 501", "kickstart"],
+                "{cell}"
+            );
+            let said = mac.said();
+            let want = format!("could not put back: {line}");
+            assert!(said.lines().any(|l| l == want), "{cell}: {said}");
+            let loaded = line == LOADED_NOT_STARTED_501;
+            assert_eq!(mac.loaded.contains(&501), loaded, "{cell}");
+            assert_eq!(said.contains("next login"), !loaded, "{cell}: {said}");
+        }
     }
 
     /// #4097 — the second `read` lets through only a save of the agent's own
@@ -6237,6 +6612,7 @@ mod tests {
             people: Vec::new(),
             unfinished: Vec::new(),
             unfinished_agent: None,
+            agent_loaded: false,
             strays: Vec::new(),
             unread: Vec::new(),
             console_uid: Some(501),

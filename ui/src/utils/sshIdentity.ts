@@ -26,7 +26,7 @@ export interface SshAsChip {
 
 /** What `daemon` means when the agent's own process serves the session. */
 export const AGENT_ACCOUNT_TITLE =
-  'The account the agent runs as: root on Linux and macOS, SYSTEM on a Windows ' +
+  'The account roomlerd runs as: root on Linux and macOS, SYSTEM on a Windows ' +
   'service install, and the signed-in user on an attended Windows install.'
 
 /** The chip for one audit row. `null` for a refusal, which names no account. */
@@ -55,7 +55,7 @@ export function sshAsChip(
     case '':
       return null
     case 'daemon':
-      return { label: "agent's account", color: 'warning', title: AGENT_ACCOUNT_TITLE }
+      return { label: 'daemon account', color: 'warning', title: AGENT_ACCOUNT_TITLE }
     case 'console_user':
       return { label: 'signed-in user', title: "The user signed in at the device's console" }
     case 'named':

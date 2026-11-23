@@ -69,8 +69,8 @@ only when a local branch matches `^fr-?<N>`.
 | **Build slots** `cargo-slot.sh` | same | One host-wide FIFO pool of build slots that every hub shares (§12.2). |
 | **Navigator** `hubs.mjs` | same, run as `hubs` | A terminal program with no dependencies: every hub, then one hub's workers grouped by what they need, then one worker, in one window, with a filter across every hub. It answers, cleans up, opens and attaches in the same window (§8.1). |
 | **Hub view** `hub-view` | `~/.claude/skills/hub-view/` | A function-hooks plugin. `/hub` with no arguments opens a pane with the host strip and one question list across hubs. A question enters its worker, which the operator can answer through its mailbox, activate, deactivate, attach to, or clean up after (§8.2). |
-| **Guard** `hub-guard` | `~/.claude/skills/hub-guard/` | A function-hooks plugin in every session. It ends what a stopped, interrupted or timed-out call started, refuses a bare build in a worker, delivers a worker's mail, and gates the idle handoff (§12). |
-| **Idle handoff** `hub-handoff` | `~/.claude/skills/hub-handoff/` | The skill the auto-handoff plugin runs in a session that sat idle; what it writes depends on whether the session is a worker, a hub or neither (§12.4). |
+| **Guard** `hub-guard` | `~/.claude/skills/hub-guard/` | A function-hooks plugin in every session. It ends what a stopped, interrupted or timed-out call started, refuses a bare build in a worker, delivers a worker's mail, and runs and gates the idle handoff (§12.4). |
+| **Idle handoff** `hub-handoff` | `~/.claude/skills/hub-handoff/` | The skill hub-guard runs 45 minutes after a session's last model request, while its prompt cache is still warm; what it writes depends on whether the session is a worker, a hub or neither (§12.4). |
 
 Each tool folder is a git work tree whose repository sits outside it, so git's own writes never
 land in a folder Claude Code watches.
@@ -785,15 +785,15 @@ every backtick and `$(…)` inside it, the failure that started FR-136.
 
 ### 12.4 The idle handoff
 
-The third-party auto-handoff plugin runs a command once a session has sat idle for its configured
-minutes. It is set to run the `hub-handoff` skill with `idle-triggered` after 45 minutes, while the
-prompt cache, which lives an hour, is still warm. The skill asks `hub.mjs role` what the session is:
+hub-guard runs the `hub-handoff` skill with `idle-triggered` 45 minutes after the session's last
+**model request**, while the prompt cache, which lives an hour, still has 15 minutes left. The skill
+asks `hub.mjs role` what the session is:
 
 | Role | It writes |
 |---|---|
 | hub worker | `handoff-g<N>.md` by `worker.md §Handoff`, `state: handing_off`, then `HANDOFF READY` |
 | hub | `hub-handoff.md`, with no `/clear` |
-| any other session | the plugin's own sections, under `~/.claude/handoffs/<project>/`, never inside a repository |
+| any other session | a handoff under the skill's eight headings (Goal, Status, Decisions, Dead ends, Files, Verification, Next steps, Open questions), in `~/.claude/handoffs/<project>/`, never inside a repository |
 
 hub-guard's gate on `command.run` answers in the skill's place, with no model turn, when the
 handoff would be wasted:
@@ -804,8 +804,33 @@ handoff would be wasted:
 4. the worker has a next step with nothing blocking it, a context under 150k tokens, or a wait shorter
    than the cache's life: the cases where `CACHE_HANDOFF` would not hand off either.
 
-The plugin marks its idle period done before its command runs, so a skipped run spends that
-period's one try until a person types again. That is why the gate skips instead of waiting.
+**The timer (hub-guard 0.5.0, 2026-11-22).** Every 30 seconds hub-guard reads the last request's
+time from Cache Keeper's live snapshot (`cache.lastAt`), the same file the gate reads:
+
+| It runs | It does not run |
+|---|---|
+| 45 minutes after the last request, with more than 5 minutes of the 1h cache left | during a turn · on the 5m tier · on a cold cache or within 5 minutes of it · when no request has been seen · when the snapshot was not rewritten after the last turn's end (nothing is keeping it) |
+
+```mermaid
+flowchart LR
+  R["last model request<br/>(cache.lastAt)"] -->|45 min| D{"more than 5 min<br/>of cache left?"}
+  D -->|yes| C["runs hub-handoff<br/>idle-triggered"]
+  D -->|no| N["nothing: a handoff now<br/>pays the full re-read"]
+  C --> G{"gate (above)"}
+  G -->|passes| H["handoff written<br/>on a warm cache"]
+  G -->|skips| S["answered in place,<br/>no model turn"]
+```
+
+It runs once per idle period. The handoff's own turn keeps the period quiet. Any other turn starts a
+new one: a prompt, a cron tick, mail or a background task. A skipped run spends that period's one
+try, which is why the gate skips instead of waiting. The settings are `HUB_GUARD_IDLE_MIN` (`0` turns
+it off), `HUB_GUARD_IDLE_CMD` and `HUB_GUARD_CACHE_LIVE`; the kill-switch part is `idle`.
+
+Until 0.5.0 the third-party auto-handoff plugin ran it, and timed the 45 minutes from a turn's
+**end**. A turn that made no request restarted that clock while the cache kept ageing. In hub `bl1`
+on 2026-11-22 the last request was at 09:11:59Z, a turn at 09:31:43Z made none, and the plugin came
+due at 10:16:43Z, five minutes after the cache had gone cold. The gate skipped it with no model turn,
+as designed, but no handoff was written while it was still cheap. The plugin is now disabled.
 
 ## 13. Field log
 

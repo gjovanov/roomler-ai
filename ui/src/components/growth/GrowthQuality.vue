@@ -95,12 +95,12 @@
         </v-card>
 
         <v-card class="mb-3">
-          <v-card-title class="text-subtitle-1">By agent version</v-card-title>
+          <v-card-title class="text-subtitle-1">By daemon version</v-card-title>
           <v-card-text>
             <v-table density="compact" class="growth-wide">
               <thead>
                 <tr>
-                  <th class="text-left">Agent version</th>
+                  <th class="text-left">Daemon version</th>
                   <th class="text-right">Requested</th>
                   <th class="text-right">Reached Active</th>
                   <th class="text-right">Never Active</th>
@@ -378,7 +378,7 @@ const cards = computed(() => {
       value: t.ttff && t.ttff.n > 0 ? `${t.ttff.exact ? '' : '≈ '}${msLabel(t.ttff.p50_ms)}` : '—',
       note: t.ttff ? `p90 ${msLabel(t.ttff.p90_ms)} · n ${t.ttff.n}` : 'not measured',
     },
-    { label: 'Agent crashes', value: t.crashes != null ? String(t.crashes) : '—', note: t.device_days != null ? `${t.device_days} device-days` : undefined },
+    { label: 'Daemon crashes', value: t.crashes != null ? String(t.crashes) : '—', note: t.device_days != null ? `${t.device_days} device-days` : undefined },
     {
       label: 'Per 100 device-days',
       value: t.crashes_per_100_device_days != null ? t.crashes_per_100_device_days.toFixed(2) : '—',

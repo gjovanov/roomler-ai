@@ -85,7 +85,7 @@ session's `session_requested` audit row (`privacy_stripped`):
 > password and a name the stranger chose, and is the only one placed to see what that stranger
 > then does. A curtain would hide it from them, the same reason break-glass is refused. The
 > device strips `PRIVACY` again when it admits an outsider's session
-> ([`admit_session`, `extauth.rs:463`](../agents/roomlerd/src/extauth.rs#L463)), together with
+> ([`admit_session`, `extauth.rs:475`](../agents/roomlerd/src/extauth.rs#L475)), together with
 > `RECORD`, so the server's strip is not the only one. No `external_max_permissions` an owner sets
 > lets either back in.
 
@@ -107,7 +107,7 @@ Every reason is said in words ([`describePrivacyReason`, `usePrivacyMode.ts:47`]
 ## How the curtain works
 
 One window over the whole virtual desktop, drawn by the overlay that already paints the "being
-viewed" border and badge ([`set_privacy`, `indicator/win.rs:344`](../agents/roomlerd/src/indicator/win.rs#L344)):
+viewed" border and badge ([`set_privacy`, `indicator/win.rs:353`](../agents/roomlerd/src/indicator/win.rs#L353)):
 
 - topmost, click-through and never activated, so the controller's injected clicks reach the
   applications underneath;
