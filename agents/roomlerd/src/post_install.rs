@@ -551,9 +551,12 @@ fn recover_wedged_install(
     );
     let _ = write_outcome(outcome);
 
-    run_recovery_cmd("taskkill", &["/F", "/T", "/PID", &wedged_pid.to_string()]);
+    run_recovery_cmd(
+        "taskkill.exe",
+        &["/F", "/T", "/PID", &wedged_pid.to_string()],
+    );
     std::thread::sleep(Duration::from_secs(5));
-    run_recovery_cmd("taskkill", &["/F", "/IM", "msiexec.exe"]);
+    run_recovery_cmd("taskkill.exe", &["/F", "/IM", "msiexec.exe"]);
     std::thread::sleep(Duration::from_secs(5));
 
     // #2107 — the one log that names the action this attempt stopped in.
@@ -615,7 +618,10 @@ fn recover_wedged_install(
             tracing::warn!(status = ?outcome.status, "retry was gone before its exit could be read");
         }
         WaitOutcome::Timeout => {
-            run_recovery_cmd("taskkill", &["/F", "/T", "/PID", &retry_pid.to_string()]);
+            run_recovery_cmd(
+                "taskkill.exe",
+                &["/F", "/T", "/PID", &retry_pid.to_string()],
+            );
             outcome.status = InstallStatus::Timeout;
             outcome.note = format!(
                 "retry also wedged (no exit in {}s); killed — see the msiexec /l*v log next to the MSI",
@@ -646,12 +652,22 @@ fn keep_wedged_log(log: &std::path::Path, dir: &std::path::Path) -> Option<PathB
     Some(kept)
 }
 
+/// The program a recovery step runs: the tool's full path in the system folder,
+/// like the daemon's other system tools (FR-129, `appdirs::system32_tool`).
+#[cfg(target_os = "windows")]
+fn recovery_program(tool: &str) -> PathBuf {
+    crate::appdirs::system32_tool(tool)
+}
+
 /// Spawn a recovery shell-out, log its exit code, never fail the
 /// watcher on it. taskkill exit codes are informational here (128 =
 /// no such process — already gone, which is fine).
 #[cfg(target_os = "windows")]
 fn run_recovery_cmd(cmd: &str, args: &[&str]) {
-    match std::process::Command::new(cmd).args(args).output() {
+    match std::process::Command::new(recovery_program(cmd))
+        .args(args)
+        .output()
+    {
         Ok(out) => {
             tracing::info!(cmd, ?args, code = out.status.code(), "recovery command ran");
         }
@@ -1894,6 +1910,17 @@ pub fn log_at_startup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4302 — the wedge recovery runs `taskkill` by its full path from the
+    /// system folder, like the daemon's other system tools (FR-129).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn recovery_runs_taskkill_from_the_system_folder() {
+        let program = recovery_program("taskkill.exe");
+        assert!(program.is_absolute(), "{}", program.display());
+        assert_eq!(program, crate::appdirs::system32_tool("taskkill.exe"));
+        assert!(program.is_file(), "no taskkill at {}", program.display());
+    }
 
     /// #3302 — a process gone before the wait began has no exit code anyone read.
     /// A 0 here made a refused MSI read as a success: the record said exit 0 and the
