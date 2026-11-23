@@ -1086,7 +1086,9 @@ async function maybeAutoOpenTour() {
   try {
     await Promise.all([
       agentStore.fetchAgents(tid),
-      roomStore.rooms.length || !caps.has('chat') ? Promise.resolve() : roomStore.fetchRooms(tid),
+      // #4257 — this org's rooms, once they have landed: a list that holds
+      // another org's rooms is not empty, and a fetch in flight is waited for.
+      !caps.has('chat') ? Promise.resolve() : roomStore.ensureRooms(tid),
     ])
   } catch {
     return

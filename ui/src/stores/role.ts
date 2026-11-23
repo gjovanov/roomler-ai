@@ -30,11 +30,14 @@ export const useRoleStore = defineStore('roles', () => {
   // Only the latest fetch writes: the answer for an org asked before it (the
   // page moved on to another org) is dropped.
   let seq = 0
+  // The latest fetch failed: `ensureRoles` asks again.
+  let failed = false
 
   async function fetchRoles(tenantId: string) {
     const mySeq = ++seq
     if (rolesTenantId.value !== null && rolesTenantId.value !== tenantId) roles.value = []
     rolesTenantId.value = tenantId
+    failed = false
     loading.value = true
     error.value = null
     try {
@@ -43,11 +46,22 @@ export const useRoleStore = defineStore('roles', () => {
       roles.value = list
     } catch (e) {
       if (mySeq !== seq) return
+      failed = true
       error.value = (e as Error).message
       roles.value = []
     } finally {
       if (mySeq === seq) loading.value = false
     }
+  }
+
+  /** #4257 — the org's roles for a dialog or a list that only names or picks
+   *  them, fetched only when the store does not hold them already. A store
+   *  that holds another org's roles, or whose last fetch failed, fetches; one
+   *  that holds this org's (or is loading them) does not. It replaces a check
+   *  of an empty list, which never reloaded a list holding another org's. */
+  function ensureRoles(tenantId: string): Promise<void> {
+    if (rolesTenantId.value === tenantId && !failed) return Promise.resolve()
+    return fetchRoles(tenantId)
   }
 
   async function createRole(tenantId: string, payload: Partial<Role>) {
@@ -94,6 +108,7 @@ export const useRoleStore = defineStore('roles', () => {
     error,
     rolesTenantId,
     fetchRoles,
+    ensureRoles,
     createRole,
     updateRole,
     deleteRole,

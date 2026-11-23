@@ -1187,13 +1187,42 @@ export const useAgentStore = defineStore('agents', () => {
   /** Tenant members — for the owner-reassign picker + resolving an agent's
    *  `owner_user_id` to a display name. Fetched on demand by AgentsSection. */
   const tenantMembers = ref<TenantMember[]>([])
+  /** #4257 — which org `tenantMembers` describes: the org of the latest
+   *  fetch, answered or not. A fetch for another org drops the rows first, so
+   *  one org's people never fill a picker (or name a row) under another org. */
+  const tenantMembersTenantId = ref<string | null>(null)
+  // Only the latest fetch writes: the answer for an org asked before it is
+  // dropped, a failure too.
+  let membersSeq = 0
+  // The latest fetch failed: `ensureTenantMembers` asks again.
+  let membersFailed = false
   async function fetchTenantMembers(tenantId: string) {
-    try {
-      const resp = await api.get<{ items: TenantMember[] }>(`/tenant/${tenantId}/member`)
-      tenantMembers.value = resp.items
-    } catch {
+    const mySeq = ++membersSeq
+    if (tenantMembersTenantId.value !== null && tenantMembersTenantId.value !== tenantId) {
       tenantMembers.value = []
     }
+    tenantMembersTenantId.value = tenantId
+    membersFailed = false
+    try {
+      const resp = await api.get<{ items: TenantMember[] }>(`/tenant/${tenantId}/member`)
+      if (mySeq !== membersSeq) return
+      tenantMembers.value = resp.items
+    } catch {
+      if (mySeq !== membersSeq) return
+      membersFailed = true
+      tenantMembers.value = []
+    }
+  }
+
+  /** #4257 — the org's members for a dialog or a log that only names or picks
+   *  them, fetched only when the store does not hold them: AgentsSection loads
+   *  them with the Devices page. A store that holds another org's members, or
+   *  whose last fetch failed, fetches; one that holds this org's (or is
+   *  loading them) does not. It replaces a check of an empty list, which
+   *  never reloaded a list holding another org's people. */
+  function ensureTenantMembers(tenantId: string): Promise<void> {
+    if (tenantMembersTenantId.value === tenantId && !membersFailed) return Promise.resolve()
+    return fetchTenantMembers(tenantId)
   }
 
   /** S1a — push an immediate self-update to one agent (`rc:agent.update`).
@@ -2027,7 +2056,9 @@ export const useAgentStore = defineStore('agents', () => {
     updateRoutes,
     updateOwner,
     tenantMembers,
+    tenantMembersTenantId,
     fetchTenantMembers,
+    ensureTenantMembers,
     triggerUpdate,
     triggerUpdateAll,
     rotateOverlayKey,

@@ -280,6 +280,10 @@ describe("RoomMemberList and RoleAssignDialog: the org's roles (#4257)", () => {
     display_name: o.lead,
     role_ids: [o.role],
   })
+  // Under bun's runtime a `.vue` component's props are not typed (vue-tsc in
+  // "Frontend checks"), so the dialog's state is read through a cast.
+  const dialogOpen = (w: VueWrapper) =>
+    (w.findComponent(RoleAssignDialog).props() as unknown as { modelValue: boolean }).modelValue
 
   it("RoomMemberList mounted for org B while the role store holds org A's roles: asks for org B's, and names them", async () => {
     await useRoleStore().fetchRoles(ORG_A)
@@ -307,7 +311,7 @@ describe("RoomMemberList and RoleAssignDialog: the org's roles (#4257)", () => {
     const assign = w.findAll('button').find((b) => b.find('.mdi-shield-plus').exists())
     await assign!.trigger('click')
     await settle()
-    expect(w.findComponent(RoleAssignDialog).props('modelValue')).toBe(true)
+    expect(dialogOpen(w)).toBe(true)
 
     const since = asked().length
     await w.setProps({ tenantId: ORG_B, members: [memberOf(B)] } as unknown as Parameters<
@@ -316,7 +320,7 @@ describe("RoomMemberList and RoleAssignDialog: the org's roles (#4257)", () => {
     await settle()
     expect(asked().slice(since)).toEqual([`/tenant/${ORG_B}/role`])
     expect(w.text()).toContain(B.roleName)
-    expect(w.findComponent(RoleAssignDialog).props('modelValue')).toBe(false)
+    expect(dialogOpen(w)).toBe(false)
     expectNothingRaised()
     w.unmount()
   })

@@ -5359,9 +5359,9 @@ function saysNoSuchDevice(e: unknown): boolean {
 async function loadAgent() {
   // FR-52 P4e — an outsider has no tenant to list devices from.
   if (isExternal) return
-  if (!agentStore.agents.length) {
-    await agentStore.fetchAgents(tenantId.value)
-  }
+  // #4257 — this org's devices, not any: a list that holds another org's is
+  // not empty (a miss here costs one single-device GET, never a wrong device).
+  await agentStore.ensureAgents(tenantId.value)
   try {
     agent.value = await resolveAgent()
   } catch (e) {

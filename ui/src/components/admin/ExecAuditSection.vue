@@ -239,9 +239,9 @@ async function load() {
 
 onMounted(() => {
   void load()
-  if (!agentStore.tenantMembers.length) {
-    void agentStore.fetchTenantMembers(props.tenantId)
-  }
+  // #4257 — this org's people, not any: a list that holds another org's
+  // members is not empty.
+  void agentStore.ensureTenantMembers(props.tenantId)
 })
 
 defineExpose({ load })
