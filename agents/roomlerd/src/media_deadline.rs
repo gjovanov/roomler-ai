@@ -2657,6 +2657,282 @@ mod tests {
         }
     }
 
+    /// FR-148 P4b-3b on P4b-4b (R1, C1) — `ends` under `mode`, wired as a live
+    /// session is: the lane's asks and frames reach the session's gate, as
+    /// `SessionWire` takes them there, and the rule's rate is 2 Mbit/s, handed
+    /// over through the pump's counters as each frame's budget step hands it.
+    /// The pump's first read is made: a pair off the mesh whose agent-side
+    /// class is `turn_udp`, before any report. Under `off`, `Pump::read` reads
+    /// nothing.
+    fn ends_on_turn_udp(mode: Mode) -> (Arc<Session>, Pump, Rig) {
+        let (session, pump, rig) = ends(mode);
+        rig.fake.st().gate = Some((session.gate(), pump.session_id));
+        rig.counters.note_rate(Some(2_000_000), None);
+        if mode != Mode::Off {
+            pump.note(C::TurnUdp, true);
+        }
+        (session, pump, rig)
+    }
+
+    /// FR-148 P4b-3b with P4b-4 and P4b-4b (R1) — where the steps meet: the
+    /// viewer's report puts the session in the key frame rule's scope. The
+    /// pump forces a key frame, 80 KB, at the frame after each grant. The gate
+    /// grants the viewer's `rc:keyframe`, and the session's first key frame
+    /// goes on `video-bytes`: the pump read `turn_udp` off the mesh, and no
+    /// report. 100 ms on, the viewer reports `tls` and the pump reads it.
+    /// Under `on` that is TCP somewhere, at the viewer's end (D58), so the
+    /// lane switches to `video-deadline`, drained at once. The key frame it
+    /// switches at is not recovery (P4b-4b): its asks are refused until
+    /// rc.130's 500 ms gap from the viewer's grant has passed, and that key
+    /// frame goes whole on `video-deadline` 500 ms after the first. Written,
+    /// it restarts the rule's clock, and the lane hands the gate the rule's
+    /// scope with each frame. The viewer's ask 590 ms after it, past the
+    /// 500 ms gap and inside the rule's 1.28 s at 2 Mbit/s, is the rule's
+    /// (D55's Recovery): owed and not granted, counted `refused_rule`, and
+    /// granted at the first frame once the rule's gap has opened. Under `off`
+    /// the report is never kept, and the ask passes rc.130's gap. Under
+    /// `shadow` the same traffic grants what `off` grants, the shadow lane
+    /// says the switch `on` would make, and the world `on` would have had
+    /// owes the ask.
+    #[test]
+    fn the_viewer_s_report_puts_the_session_in_the_key_frame_rule_s_scope() {
+        /// One run of the traffic under a value of the switch.
+        struct Run {
+            /// Each key frame the pump forced: when, from the session's first,
+            /// and its channel and number.
+            keys: Vec<(Duration, Option<(u16, u32)>)>,
+            /// The viewer's ask 1.09 s after the first key frame: whether it
+            /// passed.
+            granted: bool,
+            /// Who owes it then: the session's world, and the shadow world.
+            owed: (bool, bool),
+            /// N12's split of the session's asks.
+            split: KeyframeSplit,
+            /// Why the lane asked, ask by ask.
+            whys: Vec<LaneAsk>,
+            /// The pump's counts on the `path delivery` line, at the end.
+            line: Option<DeadlineLine>,
+            /// What the run logged.
+            said: String,
+        }
+        let ms = Duration::from_millis;
+        let run = |mode: Mode| {
+            let (session, pump, mut rig) = ends_on_turn_udp(mode);
+            let (id, gate) = (pump.session_id, session.gate());
+            let flag = Arc::clone(&gate.requested);
+            let ((keys, granted, owed), said) = logged(|| {
+                assert!(gate.ask_at(id, rig.t), "the viewer's first ask");
+                let t0 = rig.t + ms(10);
+                let mut keys = Vec::new();
+                // The pump's frames until the next is due at `at`: a key
+                // frame, 80 KB, at the frame after each grant.
+                let mut frames_until = |rig: &mut Rig, at: Instant| {
+                    while rig.t + ms(10) < at {
+                        let key = flag.swap(false, Relaxed);
+                        let wrote = rig.sized(key, 0, if key { 80_000 } else { 1_000 });
+                        if key {
+                            keys.push((rig.t - t0, wrote));
+                        }
+                    }
+                };
+                frames_until(&mut rig, t0 + ms(100));
+                // The viewer's report, and the pump's read of it with the
+                // class.
+                session
+                    .viewer_relay()
+                    .note(&decodestat(Some(serde_json::json!("tls"))));
+                if mode != Mode::Off {
+                    pump.note(C::TurnUdp, true);
+                }
+                frames_until(&mut rig, t0 + ms(1_100));
+                // The viewer's `rc:keyframe`: under `on`, 590 ms after the
+                // switch's key frame.
+                let granted = gate.ask_at(id, rig.t);
+                let owed = {
+                    let st = gate.state.lock().unwrap();
+                    (st.real.owed.is_some(), st.shadow.owed.is_some())
+                };
+                frames_until(&mut rig, t0 + ms(2_000));
+                (keys, granted, owed)
+            });
+            Run {
+                keys,
+                granted,
+                owed,
+                split: split(id),
+                whys: rig.fake.st().whys.clone(),
+                line: rig.counters.take(None),
+                said,
+            }
+        };
+
+        let on = run(Mode::On);
+        assert!(
+            !on.granted,
+            "on: the report's switch puts the gate in the rule's scope, and after the \
+             switch's key frame the rule owes the viewer's ask; key frames {:?}\n{}",
+            on.keys, on.said
+        );
+        assert_eq!(on.owed, (true, false), "on: the session's world owes it");
+        let read = "from=\"turn_udp\" to=\"turn_udp\" viewer_relay=\"tls\" tcp_end=\"viewer\"";
+        assert_eq!(on.said.matches(read).count(), 1, "{}", on.said);
+        let first = "video channel: none -> video-bytes (carrier=turn_udp, frame_seq=1, \
+                     held_ms=0, dropped=0, tcp_end=none)";
+        assert_eq!(on.said.matches(first).count(), 1, "{}", on.said);
+        let switch = "video channel: video-bytes -> video-deadline (carrier=turn_udp, \
+                      frame_seq=51, held_ms=400, dropped=40, tcp_end=viewer)";
+        assert_eq!(on.said.matches(switch).count(), 1, "{}", on.said);
+        // The switch's key frame at rc.130's gap from the viewer's grant; the
+        // owed ask's at the frame after the rule's gap from it opened, 1.28 s
+        // on.
+        assert_eq!(
+            on.keys,
+            [
+                (ms(0), Some((BYTES, 1))),
+                (ms(500), Some((DL, 51))),
+                (ms(500 + 1_290), Some((DL, 180))),
+            ]
+        );
+        assert_eq!(on.whys, [LaneAsk::Switch; 40], "the switch's own asks");
+        // The viewer's two asks; the switch's 40, 39 refused by the gap; the
+        // viewer's second refused by the rule, owed, and granted.
+        let on_asks = KeyframeSplit {
+            viewer: 2,
+            lane: 40,
+            refused_gap: 39,
+            refused_rule: 1,
+            owed_granted: 1,
+        };
+        assert_eq!(on.split, on_asks);
+        let line = on.line.expect("a line under on");
+        assert_eq!((line.asks, line.kf_gap_ms), (on_asks, Some(1_280)));
+        assert_eq!((line.switches, line.drained, line.late), (1, 40, 0));
+        assert_eq!(line.channel, Some(Channel::Deadline));
+
+        let off = run(Mode::Off);
+        assert!(off.granted, "off: rc.130's 500 ms gap alone");
+        assert_eq!(off.owed, (false, false));
+        assert_eq!(
+            off.keys,
+            [(ms(0), Some((BYTES, 1))), (ms(1_100), Some((BYTES, 111)))]
+        );
+        let asked = KeyframeSplit {
+            viewer: 2,
+            ..KeyframeSplit::default()
+        };
+        assert_eq!(off.split, asked);
+        assert!(off.whys.is_empty());
+        assert!(off.line.is_none(), "no line under off");
+        assert!(!off.said.contains("video channel"), "{}", off.said);
+
+        let shadow = run(Mode::Shadow);
+        assert_eq!(
+            (shadow.granted, &shadow.keys),
+            (off.granted, &off.keys),
+            "shadow grants what off grants"
+        );
+        assert_eq!(
+            shadow.owed,
+            (false, true),
+            "and the shadow world owes the ask"
+        );
+        let switch = "video channel (shadow): video-bytes -> video-deadline \
+                      (carrier=turn_udp, frame_seq=111, held_ms=1000, dropped=0, tcp_end=viewer)";
+        assert_eq!(shadow.said.matches(switch).count(), 1, "{}", shadow.said);
+        assert!(shadow.whys.is_empty(), "the shadow lane asks nothing");
+        let counted = KeyframeSplit {
+            viewer: 2,
+            refused_rule: 1,
+            ..KeyframeSplit::default()
+        };
+        assert_eq!(shadow.split, counted, "N12 counts the rule's refusal");
+        let line = shadow.line.expect("a line under shadow");
+        assert_eq!((line.asks, line.kf_gap_ms), (counted, Some(1_280)));
+    }
+
+    /// FR-148 P4b-3b with P4b-4b (C1) — P4b-4b inside the switch P4b-3b's
+    /// report causes: the switch's own asks are never the key frame rule's,
+    /// and D's late-frame ask in `Steady` on `video-deadline` after it is.
+    /// R1's set-up under `on`: the gate grants the viewer's `rc:keyframe`
+    /// 10 ms before the session's first key frame, 80 KB on `video-bytes`,
+    /// whose rule's gap is 1.28 s at 2 Mbit/s, and 100 ms on the viewer
+    /// reports `tls`, which the pump reads. The switch to `video-deadline`
+    /// drains at once, then asks at each frame and drops it. rc.130's gap
+    /// refuses each ask until 500 ms after the viewer's grant, and each
+    /// refusal is forgotten, never owed; then an ask passes, and the key frame
+    /// it brings goes whole on `video-deadline`, its line naming the viewer's
+    /// end. D then drops a frame 590 ms after that key frame and asks: past
+    /// the 500 ms gap and inside the rule's, the ask is owed, counted
+    /// `refused_rule`, and granted at the first frame once the rule's gap
+    /// from the switch's key frame has opened. Were the switch's asks
+    /// recovery, as on P4b-4, its first would be owed, and the switch would
+    /// drop every frame until the rule's gap from the first key frame opened,
+    /// 1.28 s on.
+    #[test]
+    fn the_report_s_switch_keys_at_the_500_ms_gap_and_d_s_ask_after_it_is_the_rule_s() {
+        let ms = Duration::from_millis;
+        let (session, pump, mut rig) = ends_on_turn_udp(Mode::On);
+        let (id, gate) = (pump.session_id, session.gate());
+        let flag = Arc::clone(&gate.requested);
+        assert!(gate.ask_at(id, rig.t), "the viewer's first ask");
+        assert!(flag.swap(false, Relaxed));
+        assert_eq!(rig.sized(true, 0, 80_000), Some((BYTES, 1)));
+        let t0 = rig.t;
+        assert_eq!(gate.gap(), ms(1_280), "80 KB at 2 Mbit/s");
+        rig.deltas_until(t0 + ms(100));
+        report_and_read(&session, &pump, Some("tls"), C::TurnUdp, true);
+        // The switch: drained at once, it asks at each frame until an ask
+        // passes, and drops every frame meanwhile.
+        let mut owed = Vec::new();
+        while !flag.load(Relaxed) && rig.t < t0 + ms(3_000) {
+            assert_eq!(rig.delta(), None, "dropped while the switch waits");
+            owed.push(gate.state.lock().unwrap().real.owed.is_some());
+        }
+        assert_eq!(
+            rig.t - t0,
+            ms(490),
+            "the switch's own asks pass rc.130's gap from the viewer's grant, not the \
+             rule's from the key frame; owed after each frame: {owed:?}"
+        );
+        assert_eq!(owed, [false; 40], "each refusal forgotten, never owed");
+        assert_eq!(rig.fake.st().asks, 40, "asked again at each frame");
+        assert!(flag.swap(false, Relaxed));
+        let (wrote, out) = logged(|| rig.sized(true, 0, 80_000));
+        assert_eq!(wrote, Some((DL, 51)), "{out}");
+        let switch = "video channel: video-bytes -> video-deadline (carrier=turn_udp, \
+                      frame_seq=51, held_ms=400, dropped=40, tcp_end=viewer)";
+        assert_eq!(out.matches(switch).count(), 1, "{out}");
+        // In `Steady` on `video-deadline`: D drops a frame 590 ms after the
+        // switch's key frame, and asks.
+        let t1 = rig.t;
+        rig.deltas_until(t1 + ms(590));
+        assert_eq!(rig.frame(false, 301), None, "D drops it, and asks");
+        assert!(!flag.load(Relaxed), "D's ask is the rule's: not granted");
+        assert!(gate.state.lock().unwrap().real.owed.is_some(), "owed");
+        assert_eq!(split(id).refused_rule, 1, "refused by the rule");
+        while !flag.load(Relaxed) {
+            assert!(rig.delta().is_some());
+            assert!(rig.t < t1 + ms(3_000), "never granted");
+        }
+        assert_eq!(rig.t - t1, ms(1_280), "granted once the rule's gap opens");
+        let mut whys = vec![LaneAsk::Switch; 40];
+        whys.push(LaneAsk::Late);
+        assert_eq!(rig.fake.st().whys, whys);
+        let asks = KeyframeSplit {
+            viewer: 1,
+            lane: 41,
+            refused_gap: 39,
+            refused_rule: 1,
+            owed_granted: 1,
+        };
+        assert_eq!(split(id), asks);
+        flag.store(false, Relaxed);
+        assert_eq!(rig.sized(true, 0, 80_000), Some((DL, 180)));
+        let line = rig.counters.take(None).unwrap();
+        assert_eq!((line.late, line.drained, line.switches), (1, 40, 1));
+        assert_eq!((line.asks, line.kf_gap_ms), (asks, Some(1_280)));
+    }
+
     /// FR-148 P4b-3 — the default fired: the session starts on `video-bytes`
     /// with the class unknown, a `video-deadline` open or not, and the pick
     /// runs again once a re-check reads the selected pair: at the next frame
