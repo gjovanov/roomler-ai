@@ -1029,7 +1029,7 @@ UDP-blocked:
   FR-103 looks for a newer token in the config file, else renews this one, and
   retries once (`agents/roomlerd/src/signaling.rs:1311`). Otherwise the agent
   waits 30 s, 60 s, 5 min, then an hour between tries
-  (`agents/roomlerd/src/signaling.rs:1639`), and the third refusal in a row raises
+  (`agents/roomlerd/src/signaling.rs:1625`), and the third refusal in a row raises
   the re-enrollment prompt on the primary org.
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially
