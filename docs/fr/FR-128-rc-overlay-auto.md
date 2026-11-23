@@ -57,7 +57,7 @@ So §2.2 still holds for **Chrome** and no longer for **Safari**. The cause for 
 
 - **#1856:** a 3 ms route hole on a Mac killed sessions.
 - **Hidden carrier:** a pair the mesh carries over DERP/TCP reads as `Host` ↔ `Host`. The data-channel video then crosses a TCP relay: two retransmission layers and head-of-line blocking.
-- The guard `overlay_remote_is_relay_tier` (`agents/roomlerd/src/peer.rs:2318`) asks the daemon which carrier holds the session's overlay peer, and clamps the session as constrained unless it is a live direct one. That ended the 2026-07-27 collapse (821 kbps, 17 fps, 1.5–7.5 s stalls). It **cannot** remove the TCP latency. And ICE still ranks the mesh host pair above a far TURN pair over UDP, so on a relayed mesh `on` picks the TCP path even when the UDP relay would be better.
+- The guard `overlay_remote_is_relay_tier` (`agents/roomlerd/src/peer.rs:2235`) asks the daemon which carrier holds the session's overlay peer, and clamps the session as constrained unless it is a live direct one. That ended the 2026-07-27 collapse (821 kbps, 17 fps, 1.5–7.5 s stalls). It **cannot** remove the TCP latency. And ICE still ranks the mesh host pair above a far TURN pair over UDP, so on a relayed mesh `on` picks the TCP path even when the UDP relay would be better.
 
 ### 2.4 Where the overlay is the only path (#2781)
 

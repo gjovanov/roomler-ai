@@ -6,6 +6,7 @@ closes the issue, under the operator's rule of 2026-10-30 19:50Z.**
 P1 is the skill, the worker protocol and the helper, with the mechanics measured live. P2 is the hub view mod,
 `hub-view` 0.2.0. P3 is the first real backlog run, hub `bl1`. P4 is the engineering doc,
 [`docs/agent-hub.md`](../agent-hub.md), which also holds the operating lessons from P3.
+[FR-152](FR-152-cold-hub-continues-from-handoff.md) builds on the hub: a coordinator whose prompt cache went cold continues from its handoff in a fresh context instead of re-reading its whole context ([`agent-hub.md` §12.5](../agent-hub.md#125-the-cold-rotation)).
 
 ## Problem / Goal
 

@@ -9,7 +9,9 @@ one Windows perMachine host (attended), read on 0.4.172 and again on 0.4.174
 and 0.4.177, §7.
 
 Claims about behaviour were checked against the code at `5f126955b` plus
-#2924; anchors say where a check would need repeating.
+#2924; anchors say where a check would need repeating. The #4302 parts (§2's
+`watcher` row and the record written whole, §3's per-Machine hop) were checked
+against the code of #4330.
 
 ## 1. The problem
 
@@ -18,9 +20,9 @@ watcher** beside the installer (`updater::spawn_installer_with_watch`,
 `agents/roomlerd/src/updater.rs:1933` → `spawn_watcher`, `:2916`), the watcher
 waits the installer out where there is anything to wait for, runs the new
 binary's `--version`, and writes a typed record to `<log_dir>/last-install.json`
-(`post_install::watch`, `agents/roomlerd/src/post_install.rs:302`).
+(`post_install::watch`, `agents/roomlerd/src/post_install.rs:408`).
 
-Then nothing read it. `post_install::read_outcome` (`post_install.rs:263`) had
+Then nothing read it. `post_install::read_outcome` (`post_install.rs:369`) had
 no caller on any platform; the module doc's "the new binary reads
 `last-install.json` at startup" described a wire that was never run. The only
 hosts anyone ever looked at were the ones somebody SSHed into — which is how a
@@ -32,23 +34,34 @@ reading was wrong about which mattered:
 
 | | What | Fixed |
 |---|---|---|
-| 1 | Both Linux install paths complete **inside the daemon** (the tarball path inline, the `.deb` path `wait()`ing on `apt-get`), so the pid handed to the watcher was the daemon's own or a corpse. Polling it made the watcher's only exit condition **its parent's death**, which is also what tears down the unit's cgroup (`KillMode=control-group`) and kills it | P1, #1400: `should_wait_for_installer` skips the wait for an install that already finished (`post_install.rs:293`); #1457 dropped the 2 s settle for the same case, the whole remaining window |
+| 1 | Both Linux install paths complete **inside the daemon** (the tarball path inline, the `.deb` path `wait()`ing on `apt-get`), so the pid handed to the watcher was the daemon's own or a corpse. Polling it made the watcher's only exit condition **its parent's death**, which is also what tears down the unit's cgroup (`KillMode=control-group`) and kills it | P1, #1400: `should_wait_for_installer` skips the wait for an install that already finished (`post_install.rs:399`); #1457 dropped the 2 s settle for the same case, the whole remaining window |
 | 2 | On the `.deb` path there was **no watcher to kill**: `apt` replaces `/usr/bin/roomlerd`, the running image is unlinked, `current_exe()` reads `/usr/bin/roomlerd (deleted)`, and `Command::spawn` on that path fails ENOENT. 21 `post-install watcher spawn failed` in seven days against zero `post-install watcher started` | P2, #1427: `strip_deleted_suffix` recovers the path and the spawn refuses a path that is not there (`updater.rs:2870`) |
 
 ## 2. The record
 
 `<log_dir>/last-install.json`, one file, rewritten at every attempt
-(`post_install::write_outcome`, `post_install.rs:187`; `InstallOutcome`,
-`:118`):
+(`post_install::write_outcome`, `post_install.rs:212`; `InstallOutcome`,
+`:130`):
 
 | Field | What |
 |---|---|
-| `status` | `InProgress` · `SucceededVerified` · `SucceededUnverified` · `InstallerFailed` · `Timeout` · `WatcherStopped` (`InstallStatus`, `post_install.rs:145`) |
+| `status` | `InProgress` · `SucceededVerified` · `SucceededUnverified` · `InstallerFailed` · `Timeout` · `WatcherStopped` (`InstallStatus`, `post_install.rs:173`) |
 | `expected_version` | the release tag the install was for, `agent-v0.4.172` |
 | `started_unix` / `finished_unix` | when the watcher started and when it wrote its verdict; `finished_unix` is null while `InProgress` |
 | `installer_pid`, `installer_path`, `installer_exit_code` | the installer as the watcher saw it. ⚠️ On Linux the pid is the daemon's own or already reaped — forensic, never waited on (§1) |
 | `new_binary_path`, `new_binary_version` | the binary the version probe ran, and what it printed |
 | `note` | the watcher's own sentence: the probe's answer, the exit code, on Windows the service settle's verdict (`service Roomler: running (0 starts; seen Running)`) |
+| `watcher` | Windows, since #4302: which process the watcher is (`pid`) and which files of the install folder it held when it began (`held`, left out when empty), written with the first `InProgress` (`InstallWatcher`, `post_install.rs:164`; filled in `watch`, `:430-450`). A record an older watcher wrote has no such field and still parses |
+
+**The record is written whole** (#4302). Each write goes into a fresh file beside the record,
+named for the process and the write (`fresh_record_path`, `post_install.rs:301`), which is
+then renamed over it, so a reader finds the last record or the new one and never part of one
+(`write_record_file`, `:272`). A refused rename is tried again after 10 and 40 ms, for a
+scanner holding a file it has just seen (`RECORD_RENAME_PAUSES`, `:261`). After the third
+refusal the fresh file is removed and the record is written in place, as before. One lock
+covers every write in the process (`RECORD_LOCK`, `:225`), because the watcher's console
+control handler writes from a thread of its own (§3). A daemon's settle runs in another
+process and stays outside that lock, as before.
 
 `<log_dir>` is `logging::resolve_log_dir`'s
 (`crates/agent-core/src/logging.rs:1028`): the process's per-user data dir plus
@@ -98,12 +111,58 @@ sequenceDiagram
 > startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:1063`),
 > and why a fresh `InProgress` is "still at work", not a failure (§4).
 
+### On a per-Machine hop: what ended the watcher, and what #4302 changes
+
+Read on a Windows 11 guest, the released per-Machine 0.4.232 updating itself to 0.4.233
+(§7): when the upgrade removes the old version, the installer opens a second Restart Manager
+session. The staged watcher still held files that the update replaces, so that session ended
+it with a console control event (`0xC000013A`) 1.88 s after it started, before its verdict and
+its service check (#2711). The record stayed `InProgress` until the next daemon settled it at
+its clean-run threshold (§4, #3302). The service came back by itself on every hop read; the
+watcher's service check is the net for the hop where it does not.
+
+| | What changed | Where |
+|---|---|---|
+| 1 | The staged copy has the runtime libraries the MSIs place beside `roomlerd.exe` beside it, so everything it loads sits beside it. They go only into the updater's own staging folder; anywhere else the copy is staged as before | `stage_watcher_exe`, `agents/roomlerd/src/updater.rs:3096`; the list, `WATCHER_RUNTIME_LIBS`, `:3042`, which a test ties to what both MSIs ship |
+| 2 | A console of its own, with no window: `CREATE_NO_WINDOW` alone. Before, the watcher shared the old worker's console, and a control event sent to a console reaches every process in it. Not `DETACHED_PROCESS`: a console tool the watcher runs (`taskkill` on a wedge) would open a window on the signed-in desktop. Not a new process group: that turns Ctrl+C off for the watcher | `watcher_creation_flags`, `updater.rs:3033`, at the spawn `:3007` |
+| 3 | The record names the watcher and any file of the install folder it holds when it begins (`watcher`, §2), and a console control event that stops it is noted in the record before the stop goes on | `watch`, `post_install.rs:430-458` |
+
+The console control handler (`on_console_event`, `post_install.rs:641`) never handles an
+event. It answers FALSE, so Windows' own handler ends the watcher as it did before, and the
+installer can still stop it. For Ctrl+C, Ctrl+Break and a closed console it adds "the watcher
+was stopped by a console control event before its verdict" to the record's note, or "after its
+verdict" when the record already holds one, a stop during the service check. A log-off or a
+shut-down adds nothing (`console_event_answer`, `:582`). It waits at most 200 ms for the
+record's lock (`CONSOLE_NOTE_WAIT`, `:573`; `note_console_event_at`, `:598`) and then lets the
+stop go on without its note.
+
+A note the watcher wrote stays first when the next daemon settles the record, the wedge's or
+a console stop's, and the settle's words follow it (`settle_unreported`, `:1885`):
+
+```text
+the watcher was stopped by a console control event before its verdict; the watcher left no
+verdict; this daemon is <version>, and has stayed up on it; the watcher (pid <pid>) held no
+file in the install folder when it began
+```
+
+Read on candidates of this change, three hops on one guest (§7,
+[the cells](https://github.com/gjovanov/roomler-ai/issues/4302#issuecomment-7099732479)). From the
+released 0.4.233 the watcher shared its parent's console host, the removal's Restart Manager
+session named it (event 10002, application type console), and it exited `0xC000013A` 2.16 s
+after it started; the record stayed `InProgress` until the next daemon settled it. From a
+candidate the watcher had a console host of its own, started 7 ms after it, the removal's
+session shut nothing down, and the watcher itself wrote `SucceededVerified` with its service
+check's note. On the third hop a task stopped the service when the installer logged its
+success (MsiInstaller 1033): the watcher saw the service Running, StopPending and Stopped,
+started it 2.5 s into its check and saw it Running (`verdict=running starts=1`). The next daemon
+read the watcher's verdict at its start and settled nothing at its clean-run mark.
+
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
 (`crates/localapi/src/lib.rs:484`), a `LastInstallStatus` (`:581`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
-as the file and the watcher's `post-install verdict:` log line spell them so
+as the file and the watcher's `post-install verdict:` stdout line spell them so
 one grep finds all three surfaces (locked by
 `install_status_words_match_the_file_spelling`), plus two only the reader can
 say:
@@ -141,7 +200,7 @@ a record older than that (`never_reported`, `:669`).
 
 The reader has to look where the watcher wrote. On every platform's plain
 daemon that is the reader's own `<log_dir>`. It reads two places
-(`post_install::last_install_status`, `post_install.rs:1751`, through
+(`post_install::last_install_status`, `post_install.rs:2130`, through
 `outcome_paths`, #3302): its own `<log_dir>` first, then its account's
 profile data dir. It reports the record written last, and `path` names that
 record's file. Two topologies split roles:
@@ -203,11 +262,11 @@ $ roomler status
   the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2556`;
   the sentence per word, `last_install_line`, `:2966`).
 - **The startup log**: one line, always prefixed `last install:`, right after
-  `agent starting` (`post_install::log_at_startup`, `post_install.rs:1829`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4313`). `journalctl -u
+  `agent starting` (`post_install::log_at_startup`, `post_install.rs:2208`,
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4341`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
-  level is `startup_level`'s (`:1265`): the two quiet states and a watcher
+  level is `startup_level`'s (`post_install.rs:2192`): the two quiet states and a watcher
   still at work are INFO; everything else is WARN.
 - **The watcher's own line — a surface that ends at 0.4.176.** Written as
   the verdict lands: `post-install verdict: SucceededVerified (new binary at
@@ -228,10 +287,12 @@ $ roomler status
   altogether** — the same inherited pipe kept the exec's reader from EOF and
   made the outgoing worker overrun its stop budget — so `spawn_watcher` gives
   it `/dev/null` for all three on every platform (`without_caller_stdio`,
-  `agents/roomlerd/src/updater.rs:2898`, called at `:2998`). From the first
+  `agents/roomlerd/src/updater.rs:2898`, called at `:2999`). From the first
   update a 0.4.176+ daemon spawns, the journal shows the daemon's own
   `post-install watcher spawned` line and nothing from the watcher; the
   verdict reaches the record file and P3's two readers, and nothing else.
+  On Windows the watcher's own log also carries its `post-install service
+  check` line (§3).
   As of 2026-10-26 17:32Z every watcher on the three fleet hosts was still a
   ≤0.4.175 daemon's (mars went 0.4.175 → 0.4.177 directly), so that end is
   read off the code, not yet observed.
@@ -251,6 +312,10 @@ $ roomler status
 | 2026-11-03 | a Win11 guest, per-user, a standard user at the console; candidate 0.4.223 (#2924 with #3345 and the `WatcherStopped` word), after a self-update from 0.4.221 | `roomler status`, `--json`, the startup line | the watcher's own verdict: `ok — agent-v0.4.223 installed 6m ago, verified: roomlerd 0.4.223`, INFO. An hour-old `InProgress` for the running version, written by hand: `NEVER REPORTED`, WARN, and after the clean-run threshold the daemon settled it to `ok`. A two-hour-old `InProgress` for another release: `WATCHER STOPPED`, WARN. The record deleted: `none recorded`, INFO. `--json` carried `last_install` with `path` in every state |
 | 2026-11-03 | a Win11 guest, per-machine SystemContext; released 0.4.197 updated itself to candidate 0.4.223 | the startup line; `roomler status`, elevated | 0.4.197's watcher was stopped before its verdict. The new daemon logged `last install: in progress` at its start and settled the record at its threshold, and `roomler status` read `ok — agent-v0.4.223 installed 6m ago, verified: roomlerd 0.4.223` with `path` in SYSTEM's profile (§5) |
 | 2026-11-03 | an Ubuntu guest, a root `.deb` daemon under systemd, candidate 0.4.223 installed by hand | `roomler status`, `journalctl -u roomlerd` | `none recorded` with no record, INFO; `NEVER REPORTED` for an hour-old `InProgress`, WARN. A crash loop rolled the device back to 0.4.197 on a real `dpkg` downgrade, and the candidate went in again by hand: `ok — agent-v0.4.197 installed 4m ago, verified: roomlerd 0.4.197 — but this daemon runs 0.4.223`, from the record the rollback's own watcher wrote. `none recorded` after the delete |
+| 2026-11-23 | a Win11 guest, the per-Machine service install; released 0.4.232 updating itself to 0.4.233 from a local feed (#4302) | a process sampler at 250 ms (start, parent, console host, exit code) and the installer's verbose log | the upgrade's second Restart Manager session logged "Successfully shut down all applications that held files in use" at 03:21:09.782Z, and the staged watcher exited 8 ms later with `0xC000013A`, 1.88 s after it started, with no verdict: the record stayed `InProgress`. The old daemon processes had exited `0x0` 0.8 s before, no `taskkill`, `sc` or `net` ran in the window, and the console host stayed up until the installer finished. Restart Manager's own event naming the process was not captured ([the read](https://github.com/gjovanov/roomler-ai/issues/4302#issuecomment-7091434679)) |
+| 2026-11-23 | a Win11 guest, the per-Machine service install; released 0.4.233 updating itself to candidate 0.4.305 from a local feed (#4302, RED) | the same sampler, Restart Manager's events and the installer's verbose log, then the record past the new daemon's clean-run mark | 0.4.233's watcher shared its parent's console host. The removal's Restart Manager session named it in event 10002 (application type console), the installer logged "Successfully shut down all applications that held files in use" at 09:44:04.129Z, and the watcher exited `0xC000013A` 8 ms later, 2.16 s after it started, with no verdict. The record stayed `InProgress` until the 0.4.305 daemon settled it at its clean-run mark: "the watcher left no verdict" ([the cells](https://github.com/gjovanov/roomler-ai/issues/4302#issuecomment-7099732479)) |
+| 2026-11-23 | the same guest; candidate 0.4.305 updating itself to candidate 0.4.306 (#4302, GREEN) | the same reads | the watcher had a console host of its own, started 7 ms after it; the removal's Restart Manager session shut nothing down, and no event named it. It outlived the old worker and the installer, wrote `SucceededVerified` (exit code 0, `roomlerd 0.4.306`) with its `watcher` field, ran its service check (`verdict=running starts=0`) and exited 0 after 21.3 s. The 0.4.306 daemon settled nothing at its clean-run mark |
+| 2026-11-23 | the same guest; candidate 0.4.306 updating itself to candidate 0.4.307, the service stopped by a task on the installer's success event, MsiInstaller 1033 (#4302, GREEN) | the same reads, the service's states and process creation | the watcher saw the service Running, StopPending and Stopped, logged "the service is STOPPED after the install - starting it" 2.5 s into its check, and the service's new process was created 1 ms later. It saw it Running (`verdict=running starts=1`), wrote the start into the record's note and exited 0 after 24.3 s. The stop task ran one stop, the service manager logged no failure or recovery event, and the 0.4.307 daemon the watcher started read its verdict 1.3 s later |
 | — | the release that carries P3 — none yet: 0.4.198, the newest at this writing, predates #2924, and the three rows above are candidates | `roomler exec <host> -- roomler status`, `journalctl -g "last install"` | **owed**: the `last update` line and the startup line on a fleet host; then a synthetic stale `InProgress` and a deleted record on one host, to read `NEVER REPORTED` and `none recorded` apart in the field |
 
 ## 8. Not built

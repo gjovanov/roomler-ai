@@ -591,7 +591,7 @@ restores its missing machine config the same way (#4176), with one rule more: on
 would. That is the machine tree's check, and the rule that `%PROGRAMDATA%\roomler`, the machine folder and the copy were the machine's
 as found (#3609, #3666, [below](#windows)), read through one function
 (`crates/agent-core/src/machine_tree.rs:1135`). While only the copy is there, the repair leaves the tree as it found it unless the
-copy, the machine folder and its keys were the machine's as found, inherited entries counted (`machine_tree.rs:716`). The service host
+copy, the machine folder and its keys were the machine's as found, inherited entries counted (`machine_tree.rs:691`). The service host
 asks that function after the machine config and the SYSTEM profile's own config, the order of the worker's ladder
 (`agents/roomlerd/src/win_service/supervisor.rs:990`), so a SYSTEM-profile config that opens runs, and nothing is restored. For a copy
 that passes, it starts the SYSTEM worker, whose start restores the file as above: written from the bytes the check judged, and put in
@@ -850,9 +850,9 @@ Details worth knowing:
   and `keep-system-context`) the daemon repairs what drifted, in-process:
   - an entry of `%PROGRAMDATA%\roomler`'s own that lets another account change
     anything is cut to read and execute (Explorer adds one, full control, for
-    the account that confirms its folder-access prompt). What it inherits from
-    `%PROGRAMDATA%` stays, so an attended host's daemon still stages received
-    files below it;
+    the account that confirms its folder-access prompt), except in a tree the
+    as-found rule leaves as found (below). What it inherits from `%PROGRAMDATA%`
+    stays, so an attended host's daemon still stages received files below it;
   - the machine folder, once it holds a machine config that was the
     machine's as found (below), becomes Administrators', with SYSTEM and
     Administrators alone; the config gets the same, `.prev` and the keys only
@@ -878,14 +878,14 @@ Details worth knowing:
   to, a deny never offsets an allow, and an entry kind the check does not read
   counts against it. An administrator here is SYSTEM, the Administrators
   group, TrustedInstaller, or an account the computer's own account database
-  names, as above. Outside a save the repair takes the machine folder only
-  when its config was the machine's as found, and while the folder holds a
-  config it keeps such a replace right on `%PROGRAMDATA%\roomler` as it is,
-  for the check to refuse at every start and tick. With no config, the copy a
-  start would restore it from is read the same way (#4176): while only the
-  copy is there, the repair leaves the tree as it found it, a replace right
-  included, unless the copy, the folder and its keys were the machine's as
-  found, inherited entries counted. A config that was not the
+  names, as above. Outside a save, while the machine folder holds a config, or
+  with none the copy a start would restore it from (#4176), the repair leaves
+  the tree as it found it, a replace right on `%PROGRAMDATA%\roomler` included,
+  unless that file, the folder and its keys were the machine's as found,
+  inherited entries counted, and a `.prev` beside a config inherited no right for
+  another account to change it (`machine_tree.rs:691`). It repairs the attempt
+  record either way, and what was not closed stays refused at every start and
+  tick, until an elevated save writes a closed tree. A config that was not the
   machine's is never run, never folded into (below), and `roomlerd re-enroll`
   and `roomlerd org` refuse it with nothing sent. Such a device stays without
   SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd
@@ -1090,10 +1090,10 @@ daemon still holding its event, is stopped as before.
 
 **After every update the daemon runs, or the record says why not (FR-150 P1b).** The
 post-install watcher has always settled a per-Machine service after every verdict
-(`settle_service`, `agents/roomlerd/src/post_install.rs:1261`). Its per-user arm started the
+(`settle_service`, `agents/roomlerd/src/post_install.rs:1616`). Its per-user arm started the
 task only after a failed install, because an exit 0 means the new task's one-shots do it, and
 #3507 was an exit 0 that had registered nothing. So the per-user arm is now a ladder
-(`relaunch_user_daemon`, `post_install.rs:852`, run by `settle_user_daemon`, `:1005`). "Up"
+(`relaunch_user_daemon`, `post_install.rs:1207`, run by `settle_user_daemon`, `:1360`). "Up"
 is the daemon's stop event held for this config (`user_stop_event_held`,
 `agents/roomlerd/src/win_service/stop_event.rs:514`), in the person's session, where the
 watcher runs too:
@@ -1135,12 +1135,12 @@ flowchart TD
 - **The record says it in three places.** The field sits in `last-install.json`, in
   `NodeStatus.last_install` (`InstallDaemon`, `crates/localapi/src/lib.rs:620`, additive both
   ways), and in the next daemon's `last install:` line, a WARN when the watcher left no daemon
-  running (`post_install.rs:1888`).
+  running (`post_install.rs:2267`).
 - **The first update onto P1b runs the old release's watcher**, so P1b protects the hops after
   it. P1a's `Roomler start-<SID>` protects that one.
 - `ROOMLERD_WATCHER_RELAUNCH=0` in the daemon's environment, which the watcher inherits, keeps
   the old arm: a start only after a failure (`start_user_daemon_after_a_failure`,
-  `post_install.rs:726`; the switch, `:773`).
+  `post_install.rs:1081`; the switch, `:1128`).
 
 **The first update onto the launcher looks a little different.** It runs the old
 product's table and the old daemon's own console: one terminal can flash when the old
@@ -1162,11 +1162,13 @@ that is online. Any other answer keeps the launcher, so a person who is not sign
 that moment gets the launcher, and the block, until the next registration. Once the policy
 allows the launcher, the next update takes the window away.
 
-**`last-install.json` can stay at `InProgress` on a self-update.** The staged watcher
-holds the install folder's VC runtime through `PATH`, and Restart Manager can shut it down
-(event 10002) before it writes a verdict: read on both jumps, while another
-launcher-to-launcher update read `SucceededVerified`. Nothing reads the file, and the
-device comes back either way.
+**`last-install.json` can stay at `InProgress` on a self-update.** Restart Manager can shut
+the staged watcher down (event 10002) before it writes a verdict: read on both jumps, while
+another launcher-to-launcher update read `SucceededVerified`. The device comes back either
+way, and the next daemon settles the record at its clean-run threshold (#3302). A watcher
+from a release with #4302 adds to the record that a console control event stopped it, and
+which files of the install folder it held when it began
+([update-outcome.md](update-outcome.md) §3).
 
 **A resume from sleep needs no start.** The processes sleep with the machine and carry
 on, with the same process ids: after a hibernate the row was back online 13 s after the
@@ -2032,7 +2034,7 @@ profile, or the machine's data folder) or is reached through a link below it (`k
   wins because the tree a copy sits in does not say which one is live: a device whose config
   stayed in the OLD tree writes its state there (#3747). The update marker's age is what it says
   (`recent_update_attempt_at`, `agents/roomlerd/src/updater.rs:268`), the newest install record
-  is the one its reader takes (`newest_record_path`, `agents/roomlerd/src/post_install.rs:227`),
+  is the one its reader takes (`newest_record_path`, `agents/roomlerd/src/post_install.rs:333`),
   and the host-mute, privacy-curtain and keep-busy files hold the latest state. A move keeps a
   file's modification time. Of two fragments of one day's log both are kept: a kept-beside log
   ages out with the logs (`prune_old_logs_at`, `crates/agent-core/src/logging.rs:1083`), and the
@@ -3837,7 +3839,7 @@ flowchart TD
 
 | What is live | What the periodic check does | Where |
 |---|---|---|
-| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3580` |
+| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3666` |
 | a remote-control session, an SSH connection, a Fleet RPC run, a transfer or a recording | defers, and checks again in 1 h | `TRANSFER_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:77` |
 | only a network transition in the last 10 min | defers, and checks again in 2 min (R5b) | `NET_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:98` |
 | either, after 7 defers in a row | installs anyway, and warns what it cuts: a device that is never idle still takes a release about 7 h after it was due | `MAX_CONSECUTIVE_DEFERS`, `agents/roomlerd/src/updater.rs:84` |
@@ -3864,9 +3866,9 @@ flowchart TD
   outlives an hour without its socket (FR-138 keeps one for 120 s at most), but
   an SSH session on the mesh does, and so does a session another enrollment of
   the daemon serves; and a long outage often ends on a network that just moved.
-  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3113`),
+  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3199`),
   and one function picks the cycle's way (`cycle_arm`,
-  `agents/roomlerd/src/updater.rs:3649`).
+  `agents/roomlerd/src/updater.rs:3735`).
 - **Only the process that installs is asked**, and it counts only what it
   serves itself:
 
@@ -3963,7 +3965,7 @@ session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
 daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
-agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3702`,
+agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3788`,
 `WatchPaths` in `com.roomler.update.plist:61`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way.
