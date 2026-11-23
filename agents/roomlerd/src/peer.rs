@@ -12860,7 +12860,7 @@ async fn send_clipboard_image(
 /// transfer, or in the drawer.
 pub(crate) const FILES_IN_THE_PERSONS_SESSION: &str = "File transfer on this Mac needs someone \
      signed in at its screen and runs in their session, not in this one. Reconnect once someone \
-     is signed in, or connect to the Mac's user-session agent.";
+     is signed in, or connect to the Mac's user-session roomlerd.";
 
 /// #3757 — whether the process that holds a session's peer serves the
 /// session's `files` channel ([`files_channel`]).
@@ -17264,7 +17264,7 @@ mod files_channel_tests {
         for words in [
             "needs someone signed in at its screen",
             "Reconnect once someone is signed in",
-            "user-session agent",
+            "user-session roomlerd",
         ] {
             assert!(WHY.contains(words), "{words:?} is not in {WHY:?}");
         }

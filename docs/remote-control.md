@@ -818,7 +818,7 @@ evicts it and opens a capture of its own
 and every session registered at that moment gets, one stop grace (1 s) after
 the exit, the reason a session opened while the desktop is down gets:
 `backend_error`, with *this device's virtual desktop is down: its X server
-(Xvfb) exited: … The agent starts it again by itself; reconnect in a moment.*
+(Xvfb) exited: … The daemon starts it again by itself; reconnect in a moment.*
 (`down_detail_of`, `agents/roomlerd/src/virtual_desktop.rs:438`). The
 supervisor reads who to tell on its own thread and sends one
 `spawn_capture_unavailable_notice` per session on the daemon's runtime

@@ -149,7 +149,7 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
             } else {
                 verdict(
                     Reach::None,
-                    "this agent was built without an input backend".into(),
+                    "this roomlerd was built without an input backend".into(),
                 )
             };
         }
@@ -157,7 +157,7 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
             return if !f.enigo_built {
                 verdict(
                     Reach::None,
-                    "this agent was built without an input backend".into(),
+                    "this roomlerd was built without an input backend".into(),
                 )
             } else if accessibility {
                 verdict(Reach::Full, "CGEvent, with Accessibility granted".into())
@@ -200,7 +200,7 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
     if !f.enigo_built {
         return verdict(
             Reach::None,
-            format!("this agent was built without an X11 input backend{uinput_note}"),
+            format!("this roomlerd was built without an X11 input backend{uinput_note}"),
         );
     }
     match f.x {
@@ -214,7 +214,7 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
         ),
         XServer::XwaylandEi(EiRoute::Compositor { granted: true }) => verdict(
             Reach::Full,
-            "XTest through KWin's input-emulation gate, which lets this agent \
+            "XTest through KWin's input-emulation gate, which lets roomlerd \
              through without asking (Legacy X11 App Support)"
                 .into(),
         ),

@@ -1016,7 +1016,7 @@ sequenceDiagram
   outgoing path`, `validating folder path`, `canonicalising <path>`). Every reader other than the
   person is this agent's own account (a per-user install on any OS, a Mac, an attended install,
   `ROOMLERD_FILES_AS_SEAT_USER=0`), and its access refusal says so: "`<path>`: `<OS>` refused to open
-  it for the account this agent runs as" (`explain_refusal`, `agents/roomlerd/src/files.rs:590`).
+  it for the account roomlerd runs as" (`explain_refusal`, `agents/roomlerd/src/files.rs:590`).
   That account need not be the person at the screen. This and the listing's bound are shared code,
   so every install changed with them.
 - **Still unbounded, and holding no channel**: a download's open (`begin_outgoing_as`) and each
@@ -1471,7 +1471,7 @@ flowchart TD
 | The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12893`), asked as the channel opens (`files_channel_here`, `:12902`, from the `"files"` arm, `:1337`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3845`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1175`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4734`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
 | The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12928`), `attach_files_declined` (`:12951`), `declined_reply` (`:12982`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
-| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12861`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
+| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12861`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session roomlerd." |
 | What stays | the device's caps (`agents/roomlerd/src/encode/caps.rs:4481`) | the row still offers file transfer: on a one-row Mac it is the row the worker serves whenever someone is signed in, and the hub puts FILES in a grant, which consent names, from these words when a session is asked. Consent, the session request and every other channel are unchanged |
 
 What a viewer notices:

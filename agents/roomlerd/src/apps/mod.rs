@@ -262,7 +262,7 @@ impl Unavailable {
                  ({detail}). They are never run as root on a user's session instead."
             ),
             Self::ToolMissing { tool, install } => format!(
-                "`{tool}` is not installed on the agent host ({install}); this backend \
+                "`{tool}` is not installed on this device ({install}); this backend \
                  needs it to find and manage the desktop."
             ),
             Self::Platform => "Remote apps have no backend on this platform — they exist for \
@@ -270,7 +270,7 @@ impl Unavailable {
                                macOS."
                 .to_string(),
             Self::SwitchedOff => format!(
-                "Remote apps are switched off on this device by `{APPS_ENV}=0` in the agent's \
+                "Remote apps are switched off on this device by `{APPS_ENV}=0` in the daemon's \
                  environment — on a Mac, the form in which the root half's \
                  `[virtual_desktop_apps] enabled = false` reaches the GUI worker that serves \
                  the session. Remove the variable, or enable them in that config, and restart \

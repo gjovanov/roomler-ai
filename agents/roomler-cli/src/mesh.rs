@@ -315,7 +315,7 @@ async fn open_udp_chain(
     );
     sock.connect(proxy_relay)
         .await
-        .context("connect to agent proxy relay")?;
+        .context("connect to the device's proxy relay")?;
     debug!(%agent_id, %proxy_relay, "mesh: udp chain to agent proxy open");
 
     let sock_rx = Arc::clone(&sock);
@@ -406,7 +406,7 @@ async fn connect_tcp(proxy_port: u16) -> Result<TcpStream> {
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(e) => return Err(e).context("connect to agent proxy"),
+            Err(e) => return Err(e).context("connect to the device's proxy"),
         }
     }
 }

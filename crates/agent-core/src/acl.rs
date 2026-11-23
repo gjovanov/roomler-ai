@@ -81,7 +81,7 @@ impl AgentForwardAcl {
     pub fn check(&self, dst_host: &str, dst_port: u16, proto: ProtocolKind) -> AclDecision {
         if !self.enabled {
             return AclDecision::Reject {
-                reason: "agent has tunnel forwards disabled".into(),
+                reason: "tunnel forwards are disabled on this device".into(),
             };
         }
         if self.allowlist.is_empty() {
@@ -94,7 +94,7 @@ impl AgentForwardAcl {
             }
         }
         AclDecision::Reject {
-            reason: format!("{dst_host}:{dst_port} ({proto:?}) not in agent allowlist"),
+            reason: format!("{dst_host}:{dst_port} ({proto:?}) not in this device's allowlist"),
         }
     }
 }

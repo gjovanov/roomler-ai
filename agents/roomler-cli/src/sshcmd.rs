@@ -69,7 +69,7 @@ pub async fn run(device: &str, session_secs: u64, args: &[String]) -> Result<i32
         bail!(
             "{device} has not published an SSH host key, so this connection cannot be \
              verified.\nRefusing rather than trusting it on first use. The device needs \
-             an agent that has had SSH enabled at least once (rc.444+)."
+             a roomlerd that has had SSH enabled at least once (rc.444+)."
         );
     };
 
