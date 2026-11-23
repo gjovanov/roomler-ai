@@ -63,8 +63,6 @@ use syn::visit::Visit;
 /// as `Json<T>`: `(file, function, issue)`. Fix one the #4218 way and remove
 /// its entry; the test fails while a fixed one is still listed.
 const DEFERRED: &[(&str, &str, &str)] = &[
-    ("crates/modules/chat/src/membership.rs", "prune", "#4254"),
-    ("crates/modules/chat/src/room.rs", "update", "#4254"),
     (
         "crates/modules/fleet/src/agent.rs",
         "trigger_agent_update",
