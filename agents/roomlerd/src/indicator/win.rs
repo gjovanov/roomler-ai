@@ -186,6 +186,15 @@ struct State {
     curtain: Option<bool>,
 }
 
+impl super::Slot for State {
+    fn holds(&self) -> bool {
+        self.prompt.is_some()
+    }
+    fn fill(&mut self, view: super::PromptView) {
+        self.prompt = Some(view);
+    }
+}
+
 // ── FR-99: the privacy curtain ─────────────────────────────────────────────
 //
 // One window over the whole virtual desktop, so every monitor is covered,
@@ -405,25 +414,15 @@ impl Inner {
         shown && self.hwnd.lock().unwrap().is_some()
     }
 
-    /// FR-27 — raise the native consent panel. `false` when one is already up
-    /// (see [`State::prompt`]) or the pump never came up.
-    pub(super) fn prompt(&self, view: super::PromptView) -> bool {
-        {
-            let mut s = self.state.lock().unwrap();
-            if s.prompt.is_some() {
-                return false;
-            }
-            s.prompt = Some(view);
-        }
-        if self.hwnd.lock().unwrap().is_none() {
-            // No pump → nothing will ever draw it. Undo, and let the caller
-            // fall through to the companion instead of waiting on a panel
-            // that does not exist.
-            self.state.lock().unwrap().prompt = None;
-            return false;
-        }
+    /// FR-27 — raise the native consent panel. #4164 — busy when one is
+    /// already up (see [`State::prompt`]), no panel when the pump never came
+    /// up or has ended ([`super::panel_takes`]).
+    pub(super) fn prompt(&self, view: super::PromptView) -> Result<(), super::NotShown> {
+        // No pump → nothing will ever draw it: the caller falls through to
+        // the companion instead of waiting on a panel that does not exist.
+        super::panel_takes(|| self.hwnd.lock().unwrap().is_some(), &self.state, view)?;
         self.post_redraw();
-        true
+        Ok(())
     }
 
     pub(super) fn dismiss(&self, session_hex: &str) {
@@ -1775,5 +1774,58 @@ mod tests {
     #[test]
     fn no_session_and_no_prompt_stops_the_timer() {
         assert!(!pump_timer_wanted(false, false));
+    }
+
+    /// #4164 — the Windows panel's refusal says why, on its own state: a
+    /// second question while one is up is busy, and the first stays; a pump
+    /// that has ended is no panel, even holding a question; and a panel
+    /// whose pump never came up is no panel and takes nothing. The pump's
+    /// window is stood in by its flag: nothing is posted to a window here.
+    ///
+    /// Red before #4164: both refusals were `false`, and the caller read a
+    /// busy panel as no panel at all.
+    #[test]
+    fn the_windows_panel_says_busy_for_a_second_question_and_no_panel_with_no_pump() {
+        use super::{Inner, State};
+        use crate::indicator::{NotShown, PromptView, panel_takes};
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        let question = |id: &str| PromptView {
+            session_hex: id.into(),
+            title: "Command execution request".into(),
+            lead: "Alice wants to run a command on this device.".into(),
+            detail: "uptime".into(),
+            permissions: String::new(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        };
+        let state = Mutex::new(State::default());
+        assert_eq!(panel_takes(|| true, &state, question("a")), Ok(()));
+        assert_eq!(
+            panel_takes(|| true, &state, question("b")),
+            Err(NotShown::Busy),
+            "a second question while one is up"
+        );
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .prompt
+                .as_ref()
+                .map(|p| p.session_hex.as_str()),
+            Some("a"),
+            "the first question stays"
+        );
+        assert_eq!(
+            panel_takes(|| false, &state, question("c")),
+            Err(NotShown::NoPanel),
+            "a pump that has ended, holding a question"
+        );
+        let never = Inner::disabled();
+        assert_eq!(never.prompt(question("d")), Err(NotShown::NoPanel));
+        assert!(
+            never.state.lock().unwrap().prompt.is_none(),
+            "a panel with no pump took the question"
+        );
     }
 }

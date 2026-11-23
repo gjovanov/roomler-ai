@@ -138,7 +138,7 @@ export function createDirListing(deps: DirListingDeps) {
     if (folder === null) return 'No answer from the host within 5 s.'
     const words = `No answer from the host for ${folder} within 5 s.`
     // An agent that does not page cannot send a listing over 64 KiB at all.
-    return hasDirPages() ? words : `${words} To list a large folder, the host's agent needs an update.`
+    return hasDirPages() ? words : `${words} To list a large folder, roomlerd on the host needs an update.`
   }
 
   /** List a directory on the host. `path` is the absolute host path;
@@ -234,7 +234,7 @@ export function createDirListing(deps: DirListingDeps) {
       const reqId = typeof msg.req_id === 'string' ? msg.req_id : ''
       const pending = settleDirRequest(reqId)
       if (pending) {
-        pending.reject(new Error(String(msg.message ?? 'agent dir error')))
+        pending.reject(new Error(String(msg.message ?? 'roomlerd dir error')))
       }
       return true
     }

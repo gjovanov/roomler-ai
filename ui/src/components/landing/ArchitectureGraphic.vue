@@ -193,7 +193,7 @@ const layers = [
     label: 'Machines',
     color: '#455a64',
     caption:
-      'A GPU workstation, a k8s cluster, a home server, the laptop in your bag — if it runs the agent, it is on your network.',
+      'A GPU workstation, a k8s cluster, a home server, the laptop in your bag — if it runs roomlerd, it is on your network.',
   },
   {
     id: 'mesh',

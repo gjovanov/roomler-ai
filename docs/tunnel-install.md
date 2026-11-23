@@ -266,7 +266,7 @@ For a tenant-wide catch-all (everyone → every agent → anywhere) **for testin
 | Field | Value |
 |---|---|
 | Subjects | `All users` |
-| Targets | `All agents` |
+| Targets | `All devices` |
 | Allowlist | `Wildcard` `*` ports `1–65535` |
 
 Do not ship that to production — it disables the policy gate.

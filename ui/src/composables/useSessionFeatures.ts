@@ -60,7 +60,7 @@ export function describeFeatureReason(feature: SessionFeature, code: string): st
     case 'needs_consent':
       return `${w.start} needs the approval of the person at the device, and this session does not ask them.`
     case 'device_cannot_ask':
-      return `${w.start} needs the person at the device to approve it, and this device's agent is too old to ask. Updating the device fixes it.`
+      return `${w.start} needs the person at the device to approve it, and this device's daemon is too old to ask. Updating the device fixes it.`
     case 'policy_unavailable':
       return `Your organization's session policy could not be read, so ${w.inline} is off for this session. Reconnect to try again.`
     default:

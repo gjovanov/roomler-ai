@@ -978,10 +978,10 @@ been lost.
 - `Shadow::swap_spawn` (`plan.rs:552`) captures the plan's rate and dims when a
   replacement spawns, and the pump carries it beside the handle: `pending_swap`
   is now `(handle, spawn)` (`peer.rs:7698`), and `PendingDimsOpen` gains a fifth
-  field (`peer.rs:6824`).
+  field (`peer.rs:6852`).
 - At adoption, `judge_swap` (`plan.rs:601`, through `note_rate_swap_adopted`
-  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7660` and
-  `:7564`) asks one question: **did the plan move while it opened?**
+  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7686` and
+  `:7590`) asks one question: **did the plan move while it opened?**
   - **It held** — the common case; opens are milliseconds on most backends: the
     replacement is judged exactly as an inline open is, against the
     controller's first target after adoption (`after_tick`, `plan.rs:527`).

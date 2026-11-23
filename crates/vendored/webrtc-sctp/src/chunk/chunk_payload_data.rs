@@ -122,6 +122,11 @@ pub struct ChunkPayloadData {
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
     pub(crate) retransmit: bool,
+
+    /// roomler (FR-148 P4b-1, D55): the order the pending queue took it in,
+    /// across its ordered and unordered queues; read only by the queue's
+    /// arrival order. Never on the wire.
+    pub(crate) pending_order: u64,
 }
 
 impl Default for ChunkPayloadData {
@@ -143,6 +148,7 @@ impl Default for ChunkPayloadData {
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,
+            pending_order: 0, // roomler (FR-148 P4b-1)
         }
     }
 }
@@ -222,6 +228,7 @@ impl Chunk for ChunkPayloadData {
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
             retransmit: false,
+            pending_order: 0, // roomler (FR-148 P4b-1)
         })
     }
 

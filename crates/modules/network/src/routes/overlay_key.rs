@@ -18,7 +18,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -376,12 +376,15 @@ pub async fn get_retired_key_mode(
 /// org's switch. It disturbs no live session: the mode is read at each join
 /// and DERP registration, so it applies from the next one. `MANAGE_AGENTS`:
 /// whoever may order a device's rotation may have the server order it when
-/// the device presents a retired key.
+/// the device presents a retired key. The bit is decided before the body is
+/// read (#4218): a caller without it gets the gate's answer whatever the body
+/// is, and a holder is answered one that does not parse as the `Json`
+/// extractor answered it (`ApiError::JsonBody`).
 pub async fn set_retired_key_mode(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<SetRetiredKeyModeBody>,
+    body: Result<Json<SetRetiredKeyModeBody>, JsonRejection>,
 ) -> Result<Json<RetiredKeyModeView>, ApiError> {
     let tid = tenant_of(&tenant_id)?;
     require_permission(
@@ -392,6 +395,7 @@ pub async fn set_retired_key_mode(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
     let mode = RetiredKeyMode::from_wire(&body.mode).ok_or_else(|| {
         ApiError::BadRequest("mode must be one of: off, warn, enforce".to_string())
     })?;

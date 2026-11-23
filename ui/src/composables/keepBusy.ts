@@ -198,7 +198,7 @@ export function keepBusyRefusalText(code: string): string {
     case 'unsupported':
       return 'Keep busy is not available on this computer.'
     case 'bad_request':
-      return 'The device did not understand the request. Its agent may need an update.'
+      return 'The device did not understand the request. Its daemon may need an update.'
     default:
       return 'The device did not apply the change.'
   }

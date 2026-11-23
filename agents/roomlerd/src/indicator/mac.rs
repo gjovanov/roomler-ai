@@ -161,6 +161,17 @@ impl Shared {
     }
 }
 
+/// #4164 — this daemon's own question in the slot ([`Inner::prompt`]).
+impl super::Slot for Shared {
+    fn holds(&self) -> bool {
+        self.prompt.is_some()
+    }
+    fn fill(&mut self, view: PromptView) {
+        self.prompt = Some(view);
+        self.dirty = true;
+    }
+}
+
 fn shared() -> &'static Mutex<Shared> {
     static SHARED: OnceLock<Mutex<Shared>> = OnceLock::new();
     SHARED.get_or_init(|| Mutex::new(Shared::default()))
@@ -245,30 +256,26 @@ impl Inner {
         Ok(Self)
     }
 
-    pub(super) fn prompt(&self, view: PromptView) -> bool {
-        if !MAIN_LOOP.takes_a_question() {
-            return false;
-        }
-        // #4053 — not where this process cannot reach the screen now: the
-        // window server refused it at the start, its connection is gone (a
-        // log-out), another console session has started since, or (#4119)
-        // the seat has emptied or changed hands since. Asked
-        // before the shared lock is taken, never under it: the connection's
-        // read waits for the main thread, `PROBE_WAIT` at most, and the pump
-        // and `dismiss` take that lock. This `false` is a taken panel's: the
-        // caller sends the question to the person's app.
-        if !PANEL_SCREEN.get().is_some_and(PanelScreen::shows_now) {
-            return false;
-        }
-        let mut s = shared().lock().unwrap();
-        // At most one on screen — two overlapping Approve/Deny panels is how
-        // someone approves the wrong thing.
-        if s.prompt.is_some() {
-            return false;
-        }
-        s.prompt = Some(view);
-        s.dirty = true;
-        true
+    pub(super) fn prompt(&self, view: PromptView) -> Result<(), super::NotShown> {
+        // #4053 — not where this process cannot reach the screen now: no
+        // loop pumps to draw it, the window server refused it at the start,
+        // its connection is gone (a log-out), another console session has
+        // started since, or (#4119) the seat has emptied or changed hands
+        // since. Asked before the shared lock is taken, never under it: the
+        // connection's read waits for the main thread, `PROBE_WAIT` at most,
+        // and the pump and `dismiss` take that lock. The caller sends the
+        // question to the person's app, as for a panel showing another one;
+        // #4164 — only its words, if nothing else shows it, tell the two
+        // apart: this is no panel here, that one is busy.
+        super::panel_takes(
+            || {
+                super::panel_gate::reaches_the_screen(&MAIN_LOOP, || {
+                    PANEL_SCREEN.get().is_some_and(PanelScreen::shows_now)
+                })
+            },
+            shared(),
+            view,
+        )
     }
 
     pub(super) fn dismiss(&self, session_hex: &str) {
@@ -545,12 +552,12 @@ fn should_terminate() -> NSApplicationTerminateReply {
                 sender = %sender_text,
                 "terminating the way AppKit does: exit 0, which launchd does not relaunch (#3164)"
             );
-            // #4119 — this exit 0 is ours (a log-out's quit from loginwindow,
-            // a quit under no supervisor): the exit net leaves it alone.
+            // #4119, #4292 — this exit 0 is ours (a log-out's quit from loginwindow,
+            // a quit under no supervisor): left to AppKit, and its run marked clean.
             exit_net::exit_chosen();
-            // AppKit exits as soon as this returns; the log's file layer
-            // writes from its own thread, so give it a moment to keep this
-            // line (a log-out's quit is diagnosed from it).
+            crate::run_end::mark_quit_by_macos();
+            // AppKit exits as soon as this returns; the file log writes from its
+            // own thread, so a moment keeps these lines (a log-out is read from them).
             std::thread::sleep(std::time::Duration::from_millis(150));
             NSApplicationTerminateReply::TerminateNow
         }

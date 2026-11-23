@@ -511,6 +511,9 @@ pub struct LineReport {
     /// FR-148 D46 B1 — the in-flight budget's window, computed in shadow;
     /// `None` when its switch is off.
     pub budget: Option<WindowReport>,
+    /// FR-148 P4b-3 — the video channel's counts over the line; `None` when
+    /// its switch is off.
+    pub deadline: Option<crate::media_deadline::DeadlineLine>,
 }
 
 /// The standing queue over one line's samples.
@@ -672,16 +675,23 @@ pub struct DeliverySampler {
     largest: Largest,
     /// FR-148 — the pump's send wait, kept under every mode ([`Self::send_wait`]).
     send_wait: std::sync::Arc<SendWait>,
+    /// FR-148 P4b-3 — the deadline channel's switch as this pump read it, and
+    /// its counts ([`Self::deadline`]).
+    deadline: std::sync::Arc<crate::media_deadline::Counters>,
 }
 
 impl DeliverySampler {
     /// On unless `ROOMLERD_PATH_MODEL=off`: the pump's one read of the switch,
-    /// and of FR-148 D46's, `ROOMLERD_INFLIGHT_BUDGET`, beside it.
+    /// and of FR-148 D46's, `ROOMLERD_INFLIGHT_BUDGET`, and FR-148 P4b-3's,
+    /// `ROOMLERD_VIDEO_DEADLINE`, beside it.
     pub fn from_env() -> Self {
         let mode = mode();
         let mut sampler = Self::new(mode.samples());
         sampler.mode = mode;
         sampler.budget = Shadow::for_pump(crate::media_inflight::mode(), sampler.on).map(Box::new);
+        sampler.deadline = std::sync::Arc::new(crate::media_deadline::Counters::new(
+            crate::media_deadline::mode(),
+        ));
         sampler
     }
 
@@ -710,6 +720,9 @@ impl DeliverySampler {
             said: None,
             largest: Largest::default(),
             send_wait: std::sync::Arc::default(),
+            deadline: std::sync::Arc::new(crate::media_deadline::Counters::new(
+                crate::media_deadline::Mode::Off,
+            )),
         }
     }
 
@@ -946,10 +959,14 @@ impl DeliverySampler {
         (!self.fold.is_empty()).then(|| self.report())
     }
 
-    /// The fold's report, and FR-148 D46's budget window beside it.
+    /// The fold's report, and FR-148 D46's budget window and FR-148 P4b-3's
+    /// video channel beside it. The FORWARD TSN count is a look at the gauges
+    /// (`GaugeReader::peek`), which takes nothing.
     fn report(&mut self) -> LineReport {
+        let forward_tsns = self.gauges.as_ref().map(|g| g.peek().forward_tsns);
         LineReport {
             budget: self.budget.as_deref_mut().map(Shadow::take_window),
+            deadline: self.deadline.take(forward_tsns),
             ..std::mem::take(&mut self.fold).report
         }
     }
@@ -1276,6 +1293,13 @@ impl DeliverySampler {
         &self.send_wait
     }
 
+    /// FR-148 P4b-3 — the deadline channel's switch, as the pump read it, and
+    /// the counts its lane keeps, which this pump's line carries under
+    /// `shadow` and `on` (`media_deadline::Pump::start`).
+    pub fn deadline(&self) -> &std::sync::Arc<crate::media_deadline::Counters> {
+        &self.deadline
+    }
+
     /// FR-148 D46 B3 — [`Self::gate`] on one frame's reading, as
     /// [`Self::on_frame_reading`] reads one; returns whether the acting budget
     /// marked a stall, which the pump hands the governor.
@@ -1358,98 +1382,77 @@ fn say_budget_mode(session_id: ObjectId, acts: bool) {
 /// The line. Its field names and their order are pinned by a test, since a
 /// field read greps for them. The standing queue's fields follow when a
 /// sample of the line was read with SCTP's gauges, and are left out when none
-/// was. FR-148 D46's in-flight budget closes the line when its switch is not
-/// `off`; with it off the line is as before, to the byte.
+/// was. FR-148 D46's in-flight budget follows when its switch is not `off`,
+/// and FR-148 P4b-3's video channel closes the line when its switch is not
+/// `off`; with both off the line is as before, to the byte.
 pub fn emit(session_id: ObjectId, line: &LineReport) {
-    match (&line.queue, &line.budget) {
-        (Some(q), None) => tracing::info!(
-            %session_id,
-            span_ms = line.span_ms,
-            delivery_samples = ?line.samples,
-            backlogged_bps = ?line.backlogged_bps,
-            app_limited_bps = ?line.app_limited_bps,
-            stalled_ms = line.stalled_ms,
-            acked_bytes = line.acked_bytes,
-            ack_ms = ?q.ack_ms,
-            standing_ms = ?q.standing_ms,
-            queued = q.queued,
-            inflight = ?q.inflight,
-            cwnd = ?q.cwnd,
-            ssthresh = q.ssthresh,
-            rwnd_low = q.rwnd_low,
-            pending_high = q.pending_high,
-            loss = ?q.loss,
-            "{LINE}"
-        ),
-        (None, None) => tracing::info!(
-            %session_id,
-            span_ms = line.span_ms,
-            delivery_samples = ?line.samples,
-            backlogged_bps = ?line.backlogged_bps,
-            app_limited_bps = ?line.app_limited_bps,
-            stalled_ms = line.stalled_ms,
-            acked_bytes = line.acked_bytes,
-            "{LINE}"
-        ),
-        (Some(q), Some(b)) => tracing::info!(
-            %session_id,
-            span_ms = line.span_ms,
-            delivery_samples = ?line.samples,
-            backlogged_bps = ?line.backlogged_bps,
-            app_limited_bps = ?line.app_limited_bps,
-            stalled_ms = line.stalled_ms,
-            acked_bytes = line.acked_bytes,
-            ack_ms = ?q.ack_ms,
-            standing_ms = ?q.standing_ms,
-            queued = q.queued,
-            inflight = ?q.inflight,
-            cwnd = ?q.cwnd,
-            ssthresh = q.ssthresh,
-            rwnd_low = q.rwnd_low,
-            pending_high = q.pending_high,
-            loss = ?q.loss,
-            budget_held = ?b.held,
-            budget_max = b.budget_max,
-            budget_out_max = b.out_max,
-            budget_rate_bps = b.rate_bps,
-            budget_least_ms = ?b.least_ms,
-            budget_slack_ms = b.slack_ms,
-            budget_ack_over_ms = ?b.ack_over_ms,
-            budget_still = ?b.still,
-            bound_watermark = b.bounds.0,
-            bound_ledger = b.bounds.1,
-            bound_full = b.bounds.2,
-            budget_released = ?b.released,
-            budget_still_admitted = b.still_admitted,
-            budget_acted = ?b.acted,
-            budget_acted_stalled = b.acted_stalled,
-            "{LINE}"
-        ),
-        (None, Some(b)) => tracing::info!(
-            %session_id,
-            span_ms = line.span_ms,
-            delivery_samples = ?line.samples,
-            backlogged_bps = ?line.backlogged_bps,
-            app_limited_bps = ?line.app_limited_bps,
-            stalled_ms = line.stalled_ms,
-            acked_bytes = line.acked_bytes,
-            budget_held = ?b.held,
-            budget_max = b.budget_max,
-            budget_out_max = b.out_max,
-            budget_rate_bps = b.rate_bps,
-            budget_least_ms = ?b.least_ms,
-            budget_slack_ms = b.slack_ms,
-            budget_ack_over_ms = ?b.ack_over_ms,
-            budget_still = ?b.still,
-            bound_watermark = b.bounds.0,
-            bound_ledger = b.bounds.1,
-            bound_full = b.bounds.2,
-            budget_released = ?b.released,
-            budget_still_admitted = b.still_admitted,
-            budget_acted = ?b.acted,
-            budget_acted_stalled = b.acted_stalled,
-            "{LINE}"
-        ),
+    // The line's fields, each group after the first in its order:
+    // `path_line!([] queue(q) budget(b) deadline(d))`.
+    macro_rules! path_line {
+        ([$($fields:tt)*]) => {
+            tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                $($fields)*
+                "{LINE}"
+            )
+        };
+        ([$($fields:tt)*] queue($q:ident) $($rest:tt)*) => {
+            path_line!([$($fields)*
+                ack_ms = ?$q.ack_ms,
+                standing_ms = ?$q.standing_ms,
+                queued = $q.queued,
+                inflight = ?$q.inflight,
+                cwnd = ?$q.cwnd,
+                ssthresh = $q.ssthresh,
+                rwnd_low = $q.rwnd_low,
+                pending_high = $q.pending_high,
+                loss = ?$q.loss,
+            ] $($rest)*)
+        };
+        ([$($fields:tt)*] budget($b:ident) $($rest:tt)*) => {
+            path_line!([$($fields)*
+                budget_held = ?$b.held,
+                budget_max = $b.budget_max,
+                budget_out_max = $b.out_max,
+                budget_rate_bps = $b.rate_bps,
+                budget_least_ms = ?$b.least_ms,
+                budget_slack_ms = $b.slack_ms,
+                budget_ack_over_ms = ?$b.ack_over_ms,
+                budget_still = ?$b.still,
+                bound_watermark = $b.bounds.0,
+                bound_ledger = $b.bounds.1,
+                bound_full = $b.bounds.2,
+                budget_released = ?$b.released,
+                budget_still_admitted = $b.still_admitted,
+                budget_acted = ?$b.acted,
+                budget_acted_stalled = $b.acted_stalled,
+            ] $($rest)*)
+        };
+        ([$($fields:tt)*] deadline($d:ident) $($rest:tt)*) => {
+            path_line!([$($fields)*
+                forward_tsns = ?$d.forward_tsns,
+                late_dropped = $d.late,
+                drain_dropped = $d.drained,
+                channel_switches = $d.switches,
+                video_channel = %$d.channel_label(),
+            ] $($rest)*)
+        };
+    }
+    match (&line.queue, &line.budget, &line.deadline) {
+        (None, None, None) => path_line!([]),
+        (Some(q), None, None) => path_line!([] queue(q)),
+        (None, Some(b), None) => path_line!([] budget(b)),
+        (Some(q), Some(b), None) => path_line!([] queue(q) budget(b)),
+        (None, None, Some(d)) => path_line!([] deadline(d)),
+        (Some(q), None, Some(d)) => path_line!([] queue(q) deadline(d)),
+        (None, Some(b), Some(d)) => path_line!([] budget(b) deadline(d)),
+        (Some(q), Some(b), Some(d)) => path_line!([] queue(q) budget(b) deadline(d)),
     }
 }
 
@@ -1779,6 +1782,7 @@ mod tests {
                 acked_bytes: 850_000,
                 queue: None,
                 budget: None,
+                deadline: None,
             }
         );
         // The next line starts empty and comes ten seconds after this one.
@@ -1909,6 +1913,7 @@ mod tests {
                 loss: (0, 1),
             }),
             budget: None,
+            deadline: None,
         }
     }
 
@@ -1961,6 +1966,7 @@ mod tests {
                 ..QueueLine::default()
             }),
             budget: None,
+            deadline: None,
         };
         let idle = logged(|| emit(sid(), &idle));
         for want in [
@@ -2088,6 +2094,212 @@ mod tests {
         );
         println!("delivery line with the budget: {} bytes", out.len());
         assert!(out.len() < 1_024, "{} bytes: {out:?}", out.len());
+    }
+
+    /// FR-148 P4b-3 — `emit` as master had it before the video channel's
+    /// counts joined the line, kept here to hold the line with the switch off
+    /// to today's, byte for byte.
+    fn emit_today(session_id: ObjectId, line: &LineReport) {
+        match (&line.queue, &line.budget) {
+            (Some(q), None) => tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                ack_ms = ?q.ack_ms,
+                standing_ms = ?q.standing_ms,
+                queued = q.queued,
+                inflight = ?q.inflight,
+                cwnd = ?q.cwnd,
+                ssthresh = q.ssthresh,
+                rwnd_low = q.rwnd_low,
+                pending_high = q.pending_high,
+                loss = ?q.loss,
+                "{LINE}"
+            ),
+            (None, None) => tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                "{LINE}"
+            ),
+            (Some(q), Some(b)) => tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                ack_ms = ?q.ack_ms,
+                standing_ms = ?q.standing_ms,
+                queued = q.queued,
+                inflight = ?q.inflight,
+                cwnd = ?q.cwnd,
+                ssthresh = q.ssthresh,
+                rwnd_low = q.rwnd_low,
+                pending_high = q.pending_high,
+                loss = ?q.loss,
+                budget_held = ?b.held,
+                budget_max = b.budget_max,
+                budget_out_max = b.out_max,
+                budget_rate_bps = b.rate_bps,
+                budget_least_ms = ?b.least_ms,
+                budget_slack_ms = b.slack_ms,
+                budget_ack_over_ms = ?b.ack_over_ms,
+                budget_still = ?b.still,
+                bound_watermark = b.bounds.0,
+                bound_ledger = b.bounds.1,
+                bound_full = b.bounds.2,
+                budget_released = ?b.released,
+                budget_still_admitted = b.still_admitted,
+                budget_acted = ?b.acted,
+                budget_acted_stalled = b.acted_stalled,
+                "{LINE}"
+            ),
+            (None, Some(b)) => tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                budget_held = ?b.held,
+                budget_max = b.budget_max,
+                budget_out_max = b.out_max,
+                budget_rate_bps = b.rate_bps,
+                budget_least_ms = ?b.least_ms,
+                budget_slack_ms = b.slack_ms,
+                budget_ack_over_ms = ?b.ack_over_ms,
+                budget_still = ?b.still,
+                bound_watermark = b.bounds.0,
+                bound_ledger = b.bounds.1,
+                bound_full = b.bounds.2,
+                budget_released = ?b.released,
+                budget_still_admitted = b.still_admitted,
+                budget_acted = ?b.acted,
+                budget_acted_stalled = b.acted_stalled,
+                "{LINE}"
+            ),
+        }
+    }
+
+    /// FR-148 P4b-3 — the video channel's counts close the line, after every
+    /// field before them (the budget's too), in their order; with its switch
+    /// off the line has none of them, to the byte. A sampler's switch is the
+    /// pump's one read: `new` is `off`, and its line carries nothing of it.
+    #[test]
+    fn the_video_channel_s_counts_close_the_line() {
+        use crate::media_deadline::{Channel, Counters, DeadlineLine, Mode};
+        let deadline = DeadlineLine {
+            forward_tsns: Some(17),
+            late: 3,
+            drained: 5,
+            switches: 1,
+            channel: Some(Channel::Deadline),
+        };
+        let fields = [
+            "forward_tsns=Some(17)",
+            "late_dropped=3",
+            "drain_dropped=5",
+            "channel_switches=1",
+            "video_channel=video-deadline",
+        ];
+        let off = logged(|| emit(sid(), &busy_line()));
+        for (before, line) in [
+            ("loss=(0, 1)", busy_line()),
+            (
+                "budget_acted_stalled=12",
+                LineReport {
+                    budget: Some(budget_window()),
+                    ..busy_line()
+                },
+            ),
+            (
+                "acked_bytes=3012345",
+                LineReport {
+                    queue: None,
+                    ..busy_line()
+                },
+            ),
+        ] {
+            let with = LineReport {
+                deadline: Some(deadline),
+                ..line.clone()
+            };
+            let out = logged(|| emit(sid(), &with));
+            let mut rest = &out[out.find(before).expect(before)..];
+            for want in fields {
+                let at = rest
+                    .find(want)
+                    .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+                rest = &rest[at + want.len()..];
+            }
+            assert_eq!(rest.trim(), "", "the counts close the line: {out:?}");
+            let without = logged(|| emit(sid(), &line));
+            assert!(
+                !without.contains("video_channel") && !without.contains("forward_tsns"),
+                "{without:?}"
+            );
+        }
+        // Off, the line is today's to the byte, past its timestamp: with and
+        // without the gauges' fields and the budget's.
+        let body = |out: String| out.split_once(" INFO ").map(|(_, b)| b.to_owned());
+        for line in [
+            busy_line(),
+            LineReport {
+                queue: None,
+                ..busy_line()
+            },
+            LineReport {
+                budget: Some(budget_window()),
+                ..busy_line()
+            },
+            LineReport {
+                queue: None,
+                budget: Some(budget_window()),
+                ..busy_line()
+            },
+        ] {
+            let today = body(logged(|| emit_today(sid(), &line)));
+            assert!(today.is_some());
+            assert_eq!(body(logged(|| emit(sid(), &line))), today, "off");
+        }
+        assert!(!off.contains("video_channel"), "{off:?}");
+        let none = DeadlineLine {
+            channel: None,
+            forward_tsns: None,
+            ..deadline
+        };
+        let out = logged(|| {
+            emit(
+                sid(),
+                &LineReport {
+                    deadline: Some(none),
+                    ..busy_line()
+                },
+            )
+        });
+        assert!(out.contains("forward_tsns=None"), "{out:?}");
+        assert!(out.contains("video_channel=none"), "{out:?}");
+        // The pump's read: `new` carries the switch off, and so no counts.
+        let sampler = DeliverySampler::new(true);
+        assert_eq!(sampler.deadline().mode(), Mode::Off);
+        assert_eq!(sampler.deadline().take(Some(1)), None);
+        let on = Counters::new(Mode::On);
+        assert_eq!(
+            on.take(None),
+            Some(DeadlineLine::default()),
+            "on, before the first frame"
+        );
     }
 
     /// FR-148 D46 B3 — `on` no longer runs as `shadow`: no warning where a
@@ -10751,6 +10963,1077 @@ pub(crate) mod shaped_link {
                     "no windows: {x:?} {y:?}"
                 );
             }
+        }
+
+        /// FR-148 P4b-3 (D55) — the mesh relay's writer ([`RelayWriter`]) on the
+        /// agent's end, under AC23's fast motion: P4b-3's transport evidence.
+        /// AC23's first read (D54) found that on the reliable channel the
+        /// writer's age drops were repaired by fast retransmits and never by a
+        /// T3, while writes blocked. P4b's answer is the deadline-limited stream
+        /// (P4b-1), on which an age drop costs the frame and nothing more. Each
+        /// cell runs four arms on the same path, one after another:
+        ///
+        /// | arm | channel | age bound | asserts |
+        /// |---|---|---|---|
+        /// | r | ordered and reliable, today's | 100 ms | age drops; each chunk they lost sent again, fast retransmits among them; the viewer reads every message; ssthresh falls; writes block |
+        /// | r0 | the same | 0, off | no drop and no fast retransmit: the bound causes them |
+        /// | d | unordered, `maxRetransmits: 0`, marked deadline-limited before its first write | 100 ms | no retransmission; the messages the viewer misses are those with a dropped frame; FORWARD TSNs; without a T3, no cut and no write longer than r's median blocked write |
+        /// | u | unordered, `maxRetransmits: 0`, unmarked: FR-17's retired opt-in | 100 ms | d sends fewer FORWARD TSNs per SACK |
+        ///
+        /// r takes no T3 only some of the time, so its no-T3 cells are ignored
+        /// (`the_reliable_channel_*_takes_no_t3`). The slow start's first
+        /// overflow drops a burst of packets in a few hundred ms: 6 to 9 with
+        /// every packet in one frame, some 27 with a full packet in two. Fast
+        /// recovery sends one packet of chunks each time the cumulative point
+        /// advances (`association_internal.rs:486-549`, `:1550-1552`), so the
+        /// burst is repaired one packet a round trip. A T3 ends the repair when
+        /// the episode passes its exit point (`:1527`) first, because the holes
+        /// after it, whose miss indications stop at 3 (`:1520`), start no other,
+        /// or when the viewer's window has filled behind the first hole of the
+        /// ordered stream.
+        ///
+        /// d's window can be cut too, by a T3 alone, so its no-T3 cells are
+        /// ignored as well (`the_deadline_stream_*_takes_no_t3`). A hole holds
+        /// the cumulative point until its FORWARD TSN lands, a loaded round
+        /// trip behind the full first hop, or longer when the writer drops the
+        /// FORWARD TSN too. The T3-rtx timer runs from the point's last advance
+        /// with an RTO of srtt + 4 rttvar (`rtx_timer.rs:56`), barely longer
+        /// while the queue stands still, and it expired first in some arms of
+        /// either setting.
+        ///
+        /// The path is 2 Mbit/s each way at the lab slice's round trip
+        /// ([`RTT`]). Behind the writer the agent's frames wait in its /derp
+        /// socket, which holds 212,992 bytes (the 256 KiB the agent asks for,
+        /// `agents/roomlerd/src/derp.rs:40`, as Linux clamps it, `:73-76`), and
+        /// then in the bottleneck's 200 ms queue ([`QUEUE`]). The carrier is
+        /// TCP, which loses nothing it was handed, so the two are one first hop
+        /// of 262,992 bytes in front of a queue that drops nothing: the writer
+        /// is the path's only loss. The load is the lab's shape on TCP: frames
+        /// of [`Shape::frame_len`] at [`FPS`], 1.5 times the link, each skipped
+        /// while the stream's buffered amount is over the VP9-444 pump's
+        /// watermark ([`OVERFLOW`]), for [`LOAD`]. Then the screen goes still,
+        /// as FR-148 P0's still screen does, one [`SPARSE_LEN`]-byte message a
+        /// second for [`STILL`] seconds, and the arm drains. A loss among the
+        /// load's last packets, which no later packet reports missing, is
+        /// otherwise found only by a T3: one of three runs without the still
+        /// tail lost d's last chunk so, and its T3 cut the window to one MTU.
+        ///
+        /// `cargo test -p roomlerd --lib media_delivery::shaped_link::tcp_shape::relay_writer --
+        /// --skip clipboard:: --nocapture --test-threads=1`
+        mod relay_writer {
+            use std::collections::{BTreeSet, HashMap};
+
+            use super::*;
+
+            const BPS: u64 = 2_000_000;
+            /// The /derp socket, as Linux holds it.
+            const SOCKET: u64 = 212_992;
+            /// The age bound as shipped: `queue_max_age`'s default.
+            const BOUND: Duration = Duration::from_millis(100);
+            /// The load; the still screen's seconds after it; and the most the
+            /// drain may take. Over loads of 20 s, r's drops, repairs and T3s
+            /// all fell in the first 10 s; d and u drop throughout.
+            const LOAD: Duration = Duration::from_secs(10);
+            const STILL: u32 = 2;
+            const DRAIN: Duration = Duration::from_secs(15);
+            /// Slow start's opening, which the write figures leave out.
+            const OPENING: Duration = Duration::from_secs(3);
+            /// The stream every arm writes on.
+            const STREAM: u16 = 1;
+
+            /// The channel an arm writes on.
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            enum Channel {
+                /// Today's `video-bytes`: ordered and reliable.
+                Reliable,
+                /// P4b's deadline-limited stream: unordered, `maxRetransmits:
+                /// 0`, marked (`Association::mark_deadline_stream`).
+                Deadline,
+                /// FR-17's retired opt-in: unordered, `maxRetransmits: 0`,
+                /// unmarked.
+                Unmarked,
+            }
+
+            /// One arm: its name, its channel, the age bound (`None`: off) and
+            /// whether a full packet leaves as two frames.
+            #[derive(Debug, Clone, Copy)]
+            struct Arm {
+                name: &'static str,
+                channel: Channel,
+                bound: Option<Duration>,
+                fragments: bool,
+            }
+
+            /// The load: [`shape`]'s offer, 1.5 times the link, in frames at
+            /// [`FPS`], under the pump's skip.
+            fn load() -> Shape {
+                Shape {
+                    skip_over: true,
+                    ..shape(BPS, DEEP, OpenPath::InitAck)
+                }
+            }
+
+            /// One second of an arm, read at its end.
+            #[derive(Debug, Clone, Copy)]
+            struct Row {
+                s: usize,
+                g: Gauges,
+                buffered: u64,
+                stale: u64,
+                /// Frames in the mux, and the wait in the socket and the queue.
+                mux: usize,
+                socket_ms: u64,
+            }
+
+            /// One arm's run.
+            struct ArmRun {
+                arm: Arm,
+                /// The writer's counts, and the agent's packets as it read them.
+                frames: u64,
+                stale: u64,
+                full: u64,
+                sacks: u64,
+                packets: Vec<RelayPacket>,
+                /// The gauges when the stream opened and at the run's end, and
+                /// ssthresh's least, read every [`POLL`].
+                start: Gauges,
+                end: Gauges,
+                ssthresh_least: u32,
+                /// Each write's send wait after the opening, µs (`SendWait`:
+                /// from the hand-off to SCTP's taking the frame).
+                waits: Vec<u64>,
+                skipped: u64,
+                /// The messages written and those the viewer read, by tag.
+                written: Vec<u64>,
+                read: Vec<u64>,
+                rows: Vec<Row>,
+                /// Whether nothing was outstanding by the drain's end.
+                drained: bool,
+            }
+
+            /// One arm on the path: the load for [`LOAD`], the still screen for
+            /// [`STILL`] seconds, then the drain until nothing is outstanding,
+            /// for [`DRAIN`] at most.
+            async fn run(arm: Arm) -> ArmRun {
+                let _turn = TURN.lock().await;
+                #[cfg(target_os = "windows")]
+                let _timer = crate::win_timer::TimerResolutionGuard::request_1ms();
+                let t0 = Instant::now();
+                let (a, b) = shaped(BPS, RTT / 2, DEEP);
+                let hop = SOCKET + BPS / 8 * QUEUE_MS / 1000;
+                let writer = Arc::new(RelayWriter::new(a.with_hop(hop), arm.bound, arm.fragments));
+                let arrivals: Arc<StdMutex<Vec<Arrival>>> = Arc::default();
+                let (agent, viewer) = pair_timed(
+                    writer.clone(),
+                    Arc::new(RelayReader::new(b)),
+                    OpenPath::InitAck,
+                    t0,
+                    Arc::clone(&arrivals),
+                    None,
+                )
+                .await;
+                let stream = agent
+                    .open_stream(STREAM, PayloadProtocolIdentifier::Binary)
+                    .await
+                    .unwrap();
+                if arm.channel != Channel::Reliable {
+                    stream.set_reliability_params(true, ReliabilityType::Rexmit, 0);
+                }
+                if arm.channel == Channel::Deadline {
+                    // Before the stream's first write, as P4b-3's pick marks it.
+                    assert!(
+                        agent.mark_deadline_stream(STREAM).await,
+                        "{}: no stream to mark",
+                        arm.name
+                    );
+                }
+                let gauges = agent.gauges();
+                let start = gauges.peek();
+                let began = Instant::now();
+                let stop = began + LOAD;
+                let writing = {
+                    let stream = Arc::clone(&stream);
+                    let len = load().frame_len();
+                    tokio::spawn(async move {
+                        let send_wait = SendWait::default();
+                        let mut tick = tokio::time::interval(SAMPLE / FPS);
+                        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                        let mut frame = vec![0x6b_u8; len];
+                        let (mut waits, mut written, mut skipped) = (Vec::new(), Vec::new(), 0);
+                        loop {
+                            tick.tick().await;
+                            let now = Instant::now();
+                            if now >= stop {
+                                break;
+                            }
+                            if stream.buffered_amount() as u64 > OVERFLOW {
+                                skipped += 1;
+                                continue;
+                            }
+                            let stamp = us(now.saturating_duration_since(t0));
+                            frame[..8].copy_from_slice(&stamp.to_le_bytes());
+                            if stream.write(&Bytes::copy_from_slice(&frame)).await.is_err() {
+                                break;
+                            }
+                            let wait = send_wait.sent(now, Instant::now());
+                            if now >= began + OPENING {
+                                waits.push(wait);
+                            }
+                            written.push(stamp);
+                        }
+                        // The screen goes still: a small message a second, so a
+                        // loss among the load's last packets is reported missing.
+                        let mut still = vec![0x6b_u8; SPARSE_LEN];
+                        for _ in 0..STILL {
+                            tokio::time::sleep(SAMPLE).await;
+                            let stamp = us(Instant::now().saturating_duration_since(t0));
+                            still[..8].copy_from_slice(&stamp.to_le_bytes());
+                            if stream.write(&Bytes::copy_from_slice(&still)).await.is_err() {
+                                break;
+                            }
+                            written.push(stamp);
+                        }
+                        (waits, written, skipped)
+                    })
+                };
+                let counts = writer.counts();
+                let row = |s: usize, g: Gauges| Row {
+                    s,
+                    g,
+                    buffered: stream.buffered_amount() as u64,
+                    stale: counts.dropped_stale.load(Ordering::Relaxed),
+                    mux: writer.queued(),
+                    socket_ms: ms(queue_now(writer.socket())),
+                };
+                let mut rows = Vec::new();
+                let mut ssthresh_least = start.ssthresh;
+                let mut next = began + SAMPLE;
+                while !writing.is_finished() {
+                    let g = gauges.peek();
+                    ssthresh_least = ssthresh_least.min(g.ssthresh);
+                    if Instant::now() >= next {
+                        rows.push(row(rows.len() + 1, g));
+                        next += SAMPLE;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+                let (waits, written, skipped) = writing.await.unwrap();
+                let mut drained = false;
+                let drain_end = Instant::now() + DRAIN;
+                while Instant::now() < drain_end {
+                    let g = gauges.peek();
+                    ssthresh_least = ssthresh_least.min(g.ssthresh);
+                    if stream.buffered_amount() == 0
+                        && g.inflight_bytes == 0
+                        && g.pending_bytes == 0
+                    {
+                        drained = true;
+                        break;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+                // The viewer's reader takes the last messages.
+                tokio::time::sleep(RTT).await;
+                let end = gauges.peek();
+                rows.push(row(rows.len() + 1, end));
+                let read = arrivals.lock().unwrap().iter().map(|x| x.sent_us).collect();
+                let packets = std::mem::take(&mut *counts.packets.lock().unwrap());
+                let count = |n: &AtomicU64| n.load(Ordering::Relaxed);
+                let out = ArmRun {
+                    arm,
+                    frames: count(&counts.frames),
+                    stale: count(&counts.dropped_stale),
+                    full: count(&counts.dropped_full),
+                    sacks: count(&counts.sacks),
+                    packets,
+                    start,
+                    end,
+                    ssthresh_least,
+                    waits,
+                    skipped,
+                    written,
+                    read,
+                    rows,
+                    drained,
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(5), agent.close()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), viewer.close()).await;
+                out
+            }
+
+            /// What the writer's packets show: the frames it dropped, the chunks
+            /// they carried and the messages those were part of.
+            #[derive(Debug, Default)]
+            struct Fates {
+                /// Packets, and those that lost a frame; of those, the pairs
+                /// that lost one frame of two (split).
+                packets: u64,
+                lost: u64,
+                split: u64,
+                /// DATA chunks sent (by TSN), those whose first send lost a
+                /// frame, those sent again, and those sent again after a first
+                /// send that lost a frame.
+                chunks: u64,
+                first_lost: u64,
+                again: u64,
+                again_after_a_drop: u64,
+                /// Packets carrying a FORWARD TSN, and those that lost a frame.
+                forward_tsns: u64,
+                forward_tsns_lost: u64,
+                /// The messages (by tag) a first send of whose chunks lost a
+                /// frame, and the chunks those messages had.
+                hit: BTreeSet<u64>,
+                hit_chunks: u64,
+                /// Each chunk whose first send lost a frame, and each chunk
+                /// sent again: its TSN and when it went, ms.
+                lost_at: Vec<(u32, u64)>,
+                again_at: Vec<(u32, u64)>,
+            }
+
+            fn fates(packets: &[RelayPacket]) -> Fates {
+                let mut f = Fates::default();
+                // Each TSN's message, and whether its first send lost a frame.
+                let mut first: HashMap<u32, bool> = HashMap::new();
+                let mut chunks_of: HashMap<u64, u64> = HashMap::new();
+                let mut message = None;
+                for p in packets {
+                    f.packets += 1;
+                    if p.lost() {
+                        f.lost += 1;
+                        f.split += u64::from(p.dropped < p.frames);
+                    }
+                    if p.forward_tsns > 0 {
+                        f.forward_tsns += 1;
+                        f.forward_tsns_lost += u64::from(p.lost());
+                    }
+                    for &(tsn, tag) in &p.data {
+                        if let Some(&lost) = first.get(&tsn) {
+                            f.again += 1;
+                            f.again_after_a_drop += u64::from(lost);
+                            f.again_at.push((tsn, p.at_ms));
+                            continue;
+                        }
+                        message = tag.or(message);
+                        let m = message.expect("a message's first fragment comes first");
+                        f.chunks += 1;
+                        *chunks_of.entry(m).or_default() += 1;
+                        first.insert(tsn, p.lost());
+                        if p.lost() {
+                            f.first_lost += 1;
+                            f.hit.insert(m);
+                            f.lost_at.push((tsn, p.at_ms));
+                        }
+                    }
+                }
+                f.hit_chunks = f.hit.iter().map(|m| chunks_of[m]).sum();
+                f
+            }
+
+            /// The writes that blocked (`goodput::MIN_BLOCKED_SEND` or more):
+            /// their send waits, µs, least first.
+            fn blocked(r: &ArmRun) -> Vec<u64> {
+                let least = us(crate::encode::goodput::MIN_BLOCKED_SEND);
+                let mut v: Vec<u64> = r.waits.iter().copied().filter(|&w| w >= least).collect();
+                v.sort_unstable();
+                v
+            }
+
+            /// The `q`-th percentile of `sorted`; 0 for none.
+            fn pct(sorted: &[u64], q: usize) -> u64 {
+                sorted
+                    .get(sorted.len().saturating_sub(1) * q / 100)
+                    .copied()
+                    .unwrap_or(0)
+            }
+
+            /// The messages written that the viewer never read.
+            fn missed(r: &ArmRun) -> BTreeSet<u64> {
+                let read: BTreeSet<u64> = r.read.iter().copied().collect();
+                r.written
+                    .iter()
+                    .copied()
+                    .filter(|m| !read.contains(m))
+                    .collect()
+            }
+
+            /// FORWARD TSN packets per SACK that reached the agent.
+            fn per_sack(r: &ArmRun) -> f64 {
+                r.end.forward_tsns as f64 / r.sacks.max(1) as f64
+            }
+
+            fn print_arm(r: &ArmRun, f: &Fates) {
+                let a = r.arm;
+                println!(
+                    "== FR-148 P4b-3 {}: {:?}, bound {}, {} a full packet",
+                    a.name,
+                    a.channel,
+                    a.bound
+                        .map_or_else(|| "off".to_owned(), |b| format!("{b:?}")),
+                    if a.fragments {
+                        "two frames"
+                    } else {
+                        "one frame"
+                    }
+                );
+                println!(
+                    "  s    cwnd ssthresh    rwnd  inflight  pending  buffered fr t3 fwd stale mux socket_ms ack_ms"
+                );
+                for x in &r.rows {
+                    println!(
+                        " {:>2} {:>7} {:>8} {:>7} {:>9} {:>8} {:>9} {:>2} {:>2} {:>3} {:>5} {:>3} {:>9} {:>6}",
+                        x.s,
+                        x.g.cwnd,
+                        x.g.ssthresh,
+                        x.g.rwnd,
+                        x.g.inflight_bytes,
+                        x.g.pending_bytes,
+                        x.buffered,
+                        x.g.fast_retransmits,
+                        x.g.t3_expiries,
+                        x.g.forward_tsns,
+                        x.stale,
+                        x.mux,
+                        x.socket_ms,
+                        opt(x.g.ack_delay.map(ms)),
+                    );
+                }
+                let b = blocked(r);
+                let mut waits = r.waits.clone();
+                waits.sort_unstable();
+                println!(
+                    "P4b-3 | {} | frames {} stale {} full {} | packets {} lost {} split {} | chunks {} \
+                     first-lost {} again {} (after a drop {}) | fast_rtx {} t3 {} | ssthresh {} -> {} | \
+                     writes {} max {} ms, blocked {} p50 {} ms p99 {} ms | fwd {} (seen {} lost {}) sacks {} \
+                     per SACK {:.3} | messages written {} read {} missed {} with a drop {} ({} chunks) | \
+                     skipped {} | drained {}",
+                    a.name,
+                    r.frames,
+                    r.stale,
+                    r.full,
+                    f.packets,
+                    f.lost,
+                    f.split,
+                    f.chunks,
+                    f.first_lost,
+                    f.again,
+                    f.again_after_a_drop,
+                    r.end.fast_retransmits,
+                    r.end.t3_expiries,
+                    r.start.ssthresh,
+                    r.ssthresh_least,
+                    r.waits.len(),
+                    waits.last().copied().unwrap_or(0) / 1000,
+                    b.len(),
+                    pct(&b, 50) / 1000,
+                    pct(&b, 99) / 1000,
+                    r.end.forward_tsns,
+                    f.forward_tsns,
+                    f.forward_tsns_lost,
+                    r.sacks,
+                    per_sack(r),
+                    r.written.len(),
+                    r.read.len(),
+                    missed(r).len(),
+                    f.hit.len(),
+                    f.hit_chunks,
+                    r.skipped,
+                    r.drained,
+                );
+                // The repair's timeline, where there was one: each chunk
+                // lost at its first send and each chunk sent again, TSN@ms.
+                if f.again > 0 || r.end.t3_expiries > 0 {
+                    let at = |v: &[(u32, u64)]| {
+                        v.iter()
+                            .map(|(tsn, ms)| format!("{tsn}@{ms}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    println!("  lost: {}", at(&f.lost_at));
+                    println!("  sent again: {}", at(&f.again_at));
+                }
+            }
+
+            /// (r): the age bound's drops on the reliable channel are each sent
+            /// again, fast retransmits among them, and the viewer reads every
+            /// message; the window is cut, and writes block. `fast_rtx` counts
+            /// chunks and `dropped_stale` frames, so the two are related, not
+            /// paired (§1.2 of P4b's design).
+            fn assert_reliable(r: &ArmRun, f: &Fates) {
+                let n = r.arm.name;
+                assert!(r.drained, "{n}: still outstanding after the drain");
+                assert_eq!(r.full, 0, "{n}: the mux overflowed");
+                assert!(r.stale > 0, "{n}: no age drop");
+                assert!(
+                    f.lost <= r.stale && r.stale <= 2 * f.lost,
+                    "{n}: {} frames dropped from {} packets",
+                    r.stale,
+                    f.lost
+                );
+                let g = r.end;
+                assert!(g.fast_retransmits > 0, "{n}: no fast retransmit");
+                assert!(
+                    g.fast_retransmits <= f.first_lost,
+                    "{n}: more fast retransmits than chunks lost"
+                );
+                assert!(
+                    f.again_after_a_drop >= f.first_lost,
+                    "{n}: a chunk the writer dropped was never sent again"
+                );
+                assert!(missed(r).is_empty(), "{n}: the viewer missed a message");
+                assert!(
+                    r.ssthresh_least < r.start.ssthresh,
+                    "{n}: ssthresh never fell from {}",
+                    r.start.ssthresh
+                );
+                assert!(!blocked(r).is_empty(), "{n}: no write blocked");
+            }
+
+            /// (r), as AC23's first read found it: no T3, so every chunk sent
+            /// again is one fast retransmit of a chunk the writer dropped.
+            fn assert_no_t3(r: &ArmRun, f: &Fates) {
+                let n = r.arm.name;
+                assert_eq!(r.end.t3_expiries, 0, "{n}: a T3-rtx expired");
+                assert_eq!(
+                    f.again, r.end.fast_retransmits,
+                    "{n}: every chunk sent again is a fast retransmit"
+                );
+                assert_eq!(
+                    f.again_after_a_drop, f.again,
+                    "{n}: a chunk was sent again whose first send the writer had not dropped"
+                );
+            }
+
+            /// (r0): with the bound off the writer drops nothing, and nothing is
+            /// retransmitted.
+            fn assert_control(r0: &ArmRun) {
+                let n = r0.arm.name;
+                assert!(r0.drained, "{n}: still outstanding after the drain");
+                assert_eq!((r0.stale, r0.full), (0, 0), "{n}: the writer dropped");
+                let g = r0.end;
+                assert_eq!(
+                    (g.fast_retransmits, g.t3_expiries),
+                    (0, 0),
+                    "{n}: a retransmit with nothing dropped"
+                );
+            }
+
+            /// (d): on the deadline stream an age drop costs its message and
+            /// nothing more. No chunk is sent again, the messages the viewer
+            /// misses are those with a dropped frame, and FORWARD TSNs skip
+            /// them. Only a T3-rtx cuts the window or blocks a write (see the
+            /// module's note), so without one there is no cut and no write
+            /// longer than r's median blocked write.
+            fn assert_deadline(d: &ArmRun, f: &Fates, r: &ArmRun) {
+                let n = d.arm.name;
+                assert!(d.drained, "{n}: still outstanding after the drain");
+                assert_eq!(d.full, 0, "{n}: the mux overflowed");
+                assert!(d.stale > 0, "{n}: no age drop");
+                let g = d.end;
+                assert_eq!(g.fast_retransmits, 0, "{n}: a fast retransmit");
+                assert_eq!(f.again, 0, "{n}: a chunk was sent again");
+                let missed = missed(d);
+                assert!(!missed.is_empty(), "{n}: nothing lost");
+                assert_eq!(
+                    missed, f.hit,
+                    "{n}: the messages missed are not the messages with a dropped frame"
+                );
+                assert!(g.forward_tsns > 0, "{n}: no FORWARD TSN");
+                if g.t3_expiries == 0 {
+                    assert_eq!(
+                        d.ssthresh_least, d.start.ssthresh,
+                        "{n}: the window was cut without a T3-rtx"
+                    );
+                    let longest = d.waits.iter().copied().max().unwrap_or(0);
+                    let median = pct(&blocked(r), 50);
+                    assert!(
+                        longest <= median,
+                        "{n}: a write waited {longest} µs without a T3-rtx, over {}'s median \
+                         blocked write, {median} µs",
+                        r.arm.name
+                    );
+                }
+            }
+
+            /// (d), as P4b's design reads it: no T3-rtx, so with
+            /// [`assert_deadline`] no cut and no blocked write either.
+            fn assert_deadline_no_t3(d: &ArmRun) {
+                assert_eq!(d.end.t3_expiries, 0, "{}: a T3-rtx expired", d.arm.name);
+            }
+
+            /// (u) against (d): the mark's FORWARD TSNs per SACK are fewer.
+            fn assert_fewer_forward_tsns(d: &ArmRun, u: &ArmRun) {
+                println!(
+                    "P4b-3 | FORWARD TSNs per SACK: {} {:.3} ({}/{}), {} {:.3} ({}/{})",
+                    d.arm.name,
+                    per_sack(d),
+                    d.end.forward_tsns,
+                    d.sacks,
+                    u.arm.name,
+                    per_sack(u),
+                    u.end.forward_tsns,
+                    u.sacks
+                );
+                assert!(
+                    d.end.forward_tsns * u.sacks < u.end.forward_tsns * d.sacks,
+                    "{} sends no fewer FORWARD TSNs per SACK than {}",
+                    d.arm.name,
+                    u.arm.name
+                );
+            }
+
+            /// One arm of `channel` behind the writer at the bound, or with it
+            /// off.
+            fn arm(name: &'static str, channel: Channel, bound: bool, fragments: bool) -> Arm {
+                Arm {
+                    name,
+                    channel,
+                    bound: bound.then_some(BOUND),
+                    fragments,
+                }
+            }
+
+            /// The four arms on one path; every arm prints before any asserts.
+            async fn cells(fragments: bool) {
+                let r = run(arm("r", Channel::Reliable, true, fragments)).await;
+                let r0 = run(arm("r0", Channel::Reliable, false, fragments)).await;
+                let d = run(arm("d", Channel::Deadline, true, fragments)).await;
+                let u = run(arm("u", Channel::Unmarked, true, fragments)).await;
+                let f: Vec<Fates> = [&r, &r0, &d, &u].map(|x| fates(&x.packets)).into();
+                for (x, f) in [&r, &r0, &d, &u].into_iter().zip(&f) {
+                    print_arm(x, f);
+                }
+                assert_reliable(&r, &f[0]);
+                assert_control(&r0);
+                assert_deadline(&d, &f[2], &r);
+                assert_fewer_forward_tsns(&d, &u);
+            }
+
+            /// r's no-T3 cell: r alone, with every assert of AC23's read.
+            async fn no_t3(fragments: bool) {
+                let r = run(arm("r", Channel::Reliable, true, fragments)).await;
+                let f = fates(&r.packets);
+                print_arm(&r, &f);
+                assert_reliable(&r, &f);
+                assert_no_t3(&r, &f);
+            }
+
+            /// d's no-T3 cell: r for its median blocked write, then d, with
+            /// every assert of P4b's reading.
+            async fn deadline_no_t3(fragments: bool) {
+                let r = run(arm("r", Channel::Reliable, true, fragments)).await;
+                let d = run(arm("d", Channel::Deadline, true, fragments)).await;
+                let (fr, fd) = (fates(&r.packets), fates(&d.packets));
+                print_arm(&r, &fr);
+                print_arm(&d, &fd);
+                assert_deadline(&d, &fd, &r);
+                assert_deadline_no_t3(&d);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_relay_writer_with_every_packet_in_one_frame() {
+                cells(false).await;
+            }
+
+            /// As the mesh relay sends a full packet (D20).
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_relay_writer_with_a_full_packet_in_two_frames() {
+                cells(true).await;
+            }
+
+            /// d's no-T3 cells, see the module's note. Run them by name with
+            /// `--ignored`.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[ignore = "flaky: a hole holds the cumulative point until its FORWARD TSN lands, a loaded round trip, and a T3-rtx may expire first (FR-148 P4b-3)"]
+            async fn the_deadline_stream_with_every_packet_in_one_frame_takes_no_t3() {
+                deadline_no_t3(false).await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[ignore = "flaky: a hole holds the cumulative point until its FORWARD TSN lands, a loaded round trip, and a T3-rtx may expire first (FR-148 P4b-3)"]
+            async fn the_deadline_stream_with_a_full_packet_in_two_frames_takes_no_t3() {
+                deadline_no_t3(true).await;
+            }
+
+            /// r's no-T3 cells, see the module's note. Run them by name with
+            /// `--ignored`.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[ignore = "flaky: the slow start's burst of age drops is repaired one packet a round trip, and a T3-rtx may end the repair (FR-148 P4b-3)"]
+            async fn the_reliable_channel_with_every_packet_in_one_frame_takes_no_t3() {
+                no_t3(false).await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[ignore = "red: the slow start's burst of age drops is repaired one packet a round trip, and a T3-rtx ends the repair (FR-148 P4b-3)"]
+            async fn the_reliable_channel_with_a_full_packet_in_two_frames_takes_no_t3() {
+                no_t3(true).await;
+            }
+        }
+    }
+
+    /// FR-148 P4b-3 — the mux's depth, in frames (`OUTBOUND_QUEUE`,
+    /// `crates/tunnel-core/src/transport/derp.rs:55`).
+    const MUX_FRAMES: usize = 512;
+    /// FR-148 P4b-3 — what a packet gains on its way to the mesh's IPv4 (D20):
+    /// DTLS 37, UDP 8 and IPv4 20, so a full packet's 1,228 bytes are 1,293.
+    const TO_MESH: usize = 65;
+    /// The mesh's MTU, and the first of two IPv4 fragments: its 20-byte header
+    /// and the most whole 8-byte units that fit after it, 1,276 bytes. The
+    /// second carries a header of its own and the rest.
+    const MESH_MTU: usize = 1_280;
+    const FIRST_FRAGMENT: usize = 20 + (MESH_MTU - 20) / 8 * 8;
+    /// What each frame adds on the /derp socket: WireGuard's 16-byte header
+    /// and 16-byte tag, and the 32-byte key the mux writes in front of the
+    /// datagram (`crates/tunnel-core/src/transport/derp.rs:297-299`). The
+    /// cells' own header ([`FRAME_HEADER`]) rides inside it.
+    const PER_FRAME: usize = 64;
+    /// The cells' header in a frame: its part (0 alone, 1 and 2 of a pair), the
+    /// packet's number, and how many bytes of the packet it carries.
+    const FRAME_HEADER: usize = 11;
+
+    /// FR-148 P4b-3 (D55) — the mesh relay's writer on the agent's end: the
+    /// /derp mux and its owner task, ahead of the first hop ([`Shaper::hop`],
+    /// here the /derp socket) and of the bottleneck. On the mesh relay each of
+    /// the agent's WireGuard datagrams is one carrier frame.
+    ///
+    /// - **The mux.** `DerpConn::send_to` stamps each frame when it queues it
+    ///   and `try_send`s it into one bounded channel of [`MUX_FRAMES`] per
+    ///   /derp socket (`crates/tunnel-core/src/transport/derp.rs:290-318`). A
+    ///   full channel drops the frame: `dropped_full`.
+    /// - **The owner task** takes one frame at a time. A frame that waited
+    ///   longer than the bound is dropped, `dropped_stale`; any other is
+    ///   written, and the task waits for the write
+    ///   (`agents/roomlerd/src/derp.rs:550-558`). The bound defaults to 100 ms
+    ///   and 0 turns the check off (`crates/tunnel-core/src/transport/derp.rs:72-77`),
+    ///   which is `None` here.
+    /// - **The socket** is the first hop of the [`ShapedConn`] behind the
+    ///   writer: it takes a write while it holds less than its size, and
+    ///   otherwise the write waits. Nothing past the writer is dropped.
+    /// - **Fragments** (D20). A packet of `n` bytes is `n` + [`TO_MESH`] on the
+    ///   mesh's IPv4. Over the mesh's MTU of 1,280 (a full packet is 1,293) it
+    ///   leaves as two IPv4 fragments, so as two frames. The age check is per
+    ///   frame, so a packet is lost when either of its frames is dropped, and
+    ///   [`RelayReader`] passes a pair on only whole. With `fragments` off,
+    ///   every packet is one frame.
+    ///
+    /// As in the product, the writer is blind to flows: it drops DATA, SACKs
+    /// and FORWARD TSNs alike. It reads each packet only to count, for the
+    /// cells, what the frames it dropped carried ([`RelayPacket`]).
+    pub(crate) struct RelayWriter {
+        socket: Arc<ShapedConn>,
+        mux: mpsc::Sender<RelayFrame>,
+        fragments: bool,
+        counts: Arc<RelayCounts>,
+        /// When the writer was made: its packets' times count from here.
+        start: Instant,
+    }
+
+    /// FR-148 P4b-3 — one carrier frame in the mux: when it was queued, the
+    /// packet it is part of, and its bytes on the socket.
+    struct RelayFrame {
+        queued_at: Instant,
+        packet: usize,
+        bytes: Vec<u8>,
+    }
+
+    /// FR-148 P4b-3 — what a [`RelayWriter`] counted.
+    #[derive(Debug, Default)]
+    pub(crate) struct RelayCounts {
+        /// The frames the agent's packets made.
+        pub(crate) frames: AtomicU64,
+        /// Frames dropped by the owner task for their age, and at a full mux.
+        pub(crate) dropped_stale: AtomicU64,
+        pub(crate) dropped_full: AtomicU64,
+        /// SACK chunks that reached the agent.
+        pub(crate) sacks: AtomicU64,
+        /// The agent's packets, in the order it sent them.
+        pub(crate) packets: StdMutex<Vec<RelayPacket>>,
+    }
+
+    impl RelayCounts {
+        /// A frame of packet `packet` was dropped.
+        fn dropped(&self, packet: usize) {
+            if let Some(p) = self.packets.lock().unwrap().get_mut(packet) {
+                p.dropped += 1;
+            }
+        }
+    }
+
+    /// FR-148 P4b-3 — one packet the agent sent, as the writer read it.
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct RelayPacket {
+        /// Its frames, and how many of them the writer dropped.
+        pub(crate) frames: u8,
+        pub(crate) dropped: u8,
+        /// Its DATA chunks: the TSN and, on a message's first fragment, the
+        /// message's first 8 bytes read little-endian (the cells' tag).
+        pub(crate) data: Vec<(u32, Option<u64>)>,
+        /// Its FORWARD TSN chunks.
+        pub(crate) forward_tsns: u8,
+        /// When the agent sent it, ms from the writer's start.
+        pub(crate) at_ms: u64,
+    }
+
+    impl RelayPacket {
+        /// Whether the writer dropped any of its frames: the packet is lost.
+        pub(crate) fn lost(&self) -> bool {
+            self.dropped > 0
+        }
+    }
+
+    /// The chunks of SCTP packet `p` (RFC 4960 §3): each one's type, flags and
+    /// value. A chunk that claims more than the packet holds ends the walk.
+    fn sctp_chunks(p: &[u8]) -> impl Iterator<Item = (u8, u8, &[u8])> + '_ {
+        let mut at = 12;
+        std::iter::from_fn(move || {
+            let head = p.get(at..at + 4)?;
+            let len = usize::from(u16::from_be_bytes([head[2], head[3]])).max(4);
+            let value = p.get(at + 4..at + len)?;
+            at += len.div_ceil(4) * 4;
+            Some((head[0], head[1], value))
+        })
+    }
+
+    /// What the cells read of packet `p`: its DATA chunks and FORWARD TSNs.
+    fn read_packet(p: &[u8]) -> RelayPacket {
+        let mut read = RelayPacket::default();
+        for (kind, flags, value) in sctp_chunks(p) {
+            match kind {
+                // DATA: the TSN, then the stream, its sequence and the PPI;
+                // the B bit marks a message's first fragment.
+                0 if value.len() >= 12 => {
+                    let tsn = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+                    let tag = value
+                        .get(12..20)
+                        .filter(|_| flags & 0x02 != 0)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+                    read.data.push((tsn, tag));
+                }
+                192 => read.forward_tsns += 1,
+                _ => {}
+            }
+        }
+        read
+    }
+
+    /// The SACK chunks in packet `p`.
+    fn sacks_in(p: &[u8]) -> u64 {
+        sctp_chunks(p).filter(|c| c.0 == 3).count() as u64
+    }
+
+    /// The frames packet `p`, number `packet`, leaves as: one, or a pair when
+    /// `fragments` is on and the packet is over the mesh's MTU. Each is
+    /// [`FRAME_HEADER`] and its share of the packet, padded to its bytes on the
+    /// socket; the first of a pair carries the whole packet for the cells.
+    fn frames_of(p: &[u8], packet: usize, fragments: bool) -> Vec<Vec<u8>> {
+        let on_mesh = p.len() + TO_MESH;
+        let frame = |part: u8, carried: &[u8], len: usize| {
+            let mut f = Vec::with_capacity(len.max(FRAME_HEADER + carried.len()));
+            f.push(part);
+            f.extend_from_slice(&(packet as u64).to_le_bytes());
+            f.extend_from_slice(&u16::try_from(carried.len()).unwrap().to_le_bytes());
+            f.extend_from_slice(carried);
+            f.resize(len.max(f.len()), 0);
+            f
+        };
+        if !fragments || on_mesh <= MESH_MTU {
+            return vec![frame(0, p, on_mesh + PER_FRAME)];
+        }
+        vec![
+            frame(1, p, FIRST_FRAGMENT + PER_FRAME),
+            frame(2, &[], on_mesh + 20 - FIRST_FRAGMENT + PER_FRAME),
+        ]
+    }
+
+    impl RelayWriter {
+        /// The writer in front of `socket`, whose first hop is the /derp
+        /// socket. `bound` is the age bound, `None` for off (the kill value 0).
+        pub(crate) fn new(socket: ShapedConn, bound: Option<Duration>, fragments: bool) -> Self {
+            let socket = Arc::new(socket);
+            let counts: Arc<RelayCounts> = Arc::default();
+            let (mux, mut queued) = mpsc::channel::<RelayFrame>(MUX_FRAMES);
+            let owner = {
+                let socket = Arc::clone(&socket);
+                let counts = Arc::clone(&counts);
+                async move {
+                    while let Some(f) = queued.recv().await {
+                        if bound.is_some_and(|bound| f.queued_at.elapsed() > bound) {
+                            counts.dropped_stale.fetch_add(1, Ordering::Relaxed);
+                            counts.dropped(f.packet);
+                            continue;
+                        }
+                        if socket.send(&f.bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            };
+            tokio::spawn(owner);
+            Self {
+                socket,
+                mux,
+                fragments,
+                counts,
+                start: Instant::now(),
+            }
+        }
+
+        pub(crate) fn counts(&self) -> &RelayCounts {
+            &self.counts
+        }
+
+        /// The link behind the writer, whose first hop is the /derp socket.
+        pub(crate) fn socket(&self) -> &ShapedConn {
+            &self.socket
+        }
+
+        /// The frames waiting in the mux.
+        pub(crate) fn queued(&self) -> usize {
+            self.mux.max_capacity() - self.mux.capacity()
+        }
+    }
+
+    #[async_trait]
+    impl Conn for RelayWriter {
+        async fn connect(&self, _: SocketAddr) -> UResult<()> {
+            Ok(())
+        }
+        async fn recv(&self, buf: &mut [u8]) -> UResult<usize> {
+            let n = self.socket.recv(buf).await?;
+            let sacks = sacks_in(&buf[..n]);
+            self.counts.sacks.fetch_add(sacks, Ordering::Relaxed);
+            Ok(n)
+        }
+        async fn recv_from(&self, buf: &mut [u8]) -> UResult<(usize, SocketAddr)> {
+            Ok((self.recv(buf).await?, self.socket.remote))
+        }
+        async fn send(&self, b: &[u8]) -> UResult<usize> {
+            // As `send_to` does: stamp, queue and never wait.
+            let (packet, frames) = {
+                let mut packets = self.counts.packets.lock().unwrap();
+                let packet = packets.len();
+                let frames = frames_of(b, packet, self.fragments);
+                packets.push(RelayPacket {
+                    frames: u8::try_from(frames.len()).unwrap(),
+                    at_ms: u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ..read_packet(b)
+                });
+                (packet, frames)
+            };
+            let queued_at = Instant::now();
+            for bytes in frames {
+                self.counts.frames.fetch_add(1, Ordering::Relaxed);
+                let frame = RelayFrame {
+                    queued_at,
+                    packet,
+                    bytes,
+                };
+                match self.mux.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.counts.dropped_full.fetch_add(1, Ordering::Relaxed);
+                        self.counts.dropped(packet);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Err(io::Error::from(io::ErrorKind::ConnectionReset).into());
+                    }
+                }
+            }
+            Ok(b.len())
+        }
+        async fn send_to(&self, b: &[u8], _: SocketAddr) -> UResult<usize> {
+            self.send(b).await
+        }
+        fn local_addr(&self) -> UResult<SocketAddr> {
+            Ok(self.socket.local)
+        }
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            Some(self.socket.remote)
+        }
+        async fn close(&self) -> UResult<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &(dyn Any + Send + Sync) {
+            self
+        }
+    }
+
+    /// FR-148 P4b-3 — the viewer's end behind a [`RelayWriter`]: it rejoins a
+    /// packet the writer sent as two frames and passes it on only whole, as
+    /// IPv4 reassembly does, so a pair missing either frame is lost.
+    pub(crate) struct RelayReader {
+        inner: ShapedConn,
+        /// The first frame of a pair, waiting for its second: the packet's
+        /// number and its bytes.
+        held: StdMutex<Option<(u64, Vec<u8>)>>,
+    }
+
+    impl RelayReader {
+        pub(crate) fn new(inner: ShapedConn) -> Self {
+            Self {
+                inner,
+                held: StdMutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Conn for RelayReader {
+        async fn connect(&self, _: SocketAddr) -> UResult<()> {
+            Ok(())
+        }
+        async fn recv(&self, buf: &mut [u8]) -> UResult<usize> {
+            let mut frame = vec![0u8; 65_536];
+            loop {
+                let n = self.inner.recv(&mut frame).await?;
+                let Some(head) = frame[..n].get(..FRAME_HEADER) else {
+                    continue;
+                };
+                let part = head[0];
+                let packet = u64::from_le_bytes(head[1..9].try_into().unwrap());
+                let len = usize::from(u16::from_le_bytes([head[9], head[10]]));
+                let carried = &frame[FRAME_HEADER..FRAME_HEADER + len];
+                let whole = {
+                    let mut held = self.held.lock().unwrap();
+                    match part {
+                        1 => {
+                            *held = Some((packet, carried.to_vec()));
+                            None
+                        }
+                        2 => held.take().filter(|h| h.0 == packet).map(|h| h.1),
+                        // A packet alone: a pair still held lost its second.
+                        _ => {
+                            *held = None;
+                            Some(carried.to_vec())
+                        }
+                    }
+                };
+                if let Some(p) = whole {
+                    let n = p.len().min(buf.len());
+                    buf[..n].copy_from_slice(&p[..n]);
+                    return Ok(n);
+                }
+            }
+        }
+        async fn recv_from(&self, buf: &mut [u8]) -> UResult<(usize, SocketAddr)> {
+            Ok((self.recv(buf).await?, self.inner.remote))
+        }
+        async fn send(&self, b: &[u8]) -> UResult<usize> {
+            self.inner.send(b).await
+        }
+        async fn send_to(&self, b: &[u8], _: SocketAddr) -> UResult<usize> {
+            self.inner.send(b).await
+        }
+        fn local_addr(&self) -> UResult<SocketAddr> {
+            Ok(self.inner.local)
+        }
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            Some(self.inner.remote)
+        }
+        async fn close(&self) -> UResult<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &(dyn Any + Send + Sync) {
+            self
         }
     }
 }

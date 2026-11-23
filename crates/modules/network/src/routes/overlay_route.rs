@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
 };
 use bson::{doc, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -249,16 +249,19 @@ pub async fn list_overlay_nodes(
 /// PUT /api/tenant/{tenant_id}/overlay-node/{node_id}/approved-routes — set the
 /// admin-approved subset of a node's advertised routes. Only routes the node
 /// actually advertised may be approved; the change is re-fanned to peers.
+///
+/// The gate is decided FIRST, before the node id is parsed or the body read
+/// (#4218): a caller without `MANAGE_AGENTS` gets one 403 whatever the id and
+/// the body are. A holder is answered a body that does not parse as the
+/// `Json` extractor answered it (`ApiError::JsonBody`), whatever the id.
 pub async fn set_approved_routes(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, node_id)): Path<(String, String)>,
-    Json(body): Json<SetApprovedRoutesRequest>,
+    body: Result<Json<SetApprovedRoutesRequest>, JsonRejection>,
 ) -> Result<Json<OverlayNodeResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let nid = ObjectId::parse_str(&node_id)
-        .map_err(|_| ApiError::BadRequest("Invalid node_id".to_string()))?;
     // Distributing a subnet route (or an exit node's /0) exposes a whole
     // network to the mesh, and overlay traffic bypasses the tunnel ACL — so
     // this is an agent-management action, not something bare tenant
@@ -271,6 +274,9 @@ pub async fn set_approved_routes(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
+    let nid = ObjectId::parse_str(&node_id)
+        .map_err(|_| ApiError::BadRequest("Invalid node_id".to_string()))?;
     let network = state.overlay_networks.get_or_create(tid).await?;
     let network_id = network
         .id
@@ -360,16 +366,17 @@ pub struct SetExitNodeRequest {
 /// un-designate) a node as an exit node (P5). Enabling requires the node to have
 /// advertised `0.0.0.0/0`; it sets `is_exit_node` and adds `/0` to the node's
 /// `approved_routes` (the data-plane signal). Re-fanned to peers immediately.
+///
+/// Gate first, then the body, then the node id, as on `set_approved_routes`
+/// (#4218).
 pub async fn set_exit_node(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, node_id)): Path<(String, String)>,
-    Json(body): Json<SetExitNodeRequest>,
+    body: Result<Json<SetExitNodeRequest>, JsonRejection>,
 ) -> Result<Json<OverlayNodeResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let nid = ObjectId::parse_str(&node_id)
-        .map_err(|_| ApiError::BadRequest("Invalid node_id".to_string()))?;
     // Distributing a subnet route (or an exit node's /0) exposes a whole
     // network to the mesh, and overlay traffic bypasses the tunnel ACL — so
     // this is an agent-management action, not something bare tenant
@@ -382,6 +389,9 @@ pub async fn set_exit_node(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
+    let nid = ObjectId::parse_str(&node_id)
+        .map_err(|_| ApiError::BadRequest("Invalid node_id".to_string()))?;
 
     // FR-32 P1a — `exit_nodes` is advertised per plan and was enforced nowhere.
     // ⚠ Only ENABLING is gated. Turning an exit node OFF must always be
@@ -540,20 +550,22 @@ pub async fn get_magic_dns(
 /// PUT /api/tenant/{tenant_id}/magic-dns — set the MagicDNS domain + upstreams.
 /// An empty domain disables MagicDNS.
 ///
-/// `MANAGE_AGENTS`, decided FIRST: before the body is normalized, the plan
-/// gate or the domain checks. Every overlay node of the org applies these
+/// `MANAGE_AGENTS`, decided FIRST: before the body is read or normalized, the
+/// plan gate or the domain checks. Every overlay node of the org applies these
 /// settings: its resolver answers for the domain and forwards every other name
 /// to the upstreams, and under an exit node the host's whole DNS goes there.
 /// Changing them is a device-management action, like the overlay ACL's mode and
 /// the retired-key switch. A member without the bit gets one 403 `forbidden`
-/// whatever the body says (switching MagicDNS off included), never
-/// `not_a_member`; someone outside the org still gets `not_a_member`, from the
-/// membership read inside `require_permission`.
+/// whatever the body says (switching MagicDNS off included, and a body that
+/// does not parse: #4218), never `not_a_member`; someone outside the org still
+/// gets `not_a_member`, from the membership read inside `require_permission`.
+/// A holder is answered a body that does not parse as the `Json` extractor
+/// answered it (`ApiError::JsonBody`).
 pub async fn set_magic_dns(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<SetMagicDnsRequest>,
+    body: Result<Json<SetMagicDnsRequest>, JsonRejection>,
 ) -> Result<Json<MagicDnsResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -565,6 +577,7 @@ pub async fn set_magic_dns(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
     // Normalize: blank domain → None (off); lowercase, strip surrounding dots.
     let domain = body
         .magic_dns_domain

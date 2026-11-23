@@ -132,10 +132,17 @@ Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr
   ⚠️ A **Mac's** native panel is a surface only while the window server serves its
   process (#4053): a root daemon that launchd started before login is refused, and a
   log-out detaches one that was served, each for the rest of its life. Then
-  `indicator::panel_gate` answers `false`, a taken panel's answer, and the question
-  goes to the app. Never turn that `false` into a deny or an accept, and never
+  `indicator::panel_gate` answers `false`, and the question goes to the app as a
+  taken panel's does. Never turn that `false` into a deny or an accept, and never
   restart the daemon to bring the panel back: a restart ends every live session on
   the Mac. Drawing from the person's own session is FR-149 (#4054).
+  ⚠️ A native panel's refusal says **why** (#4164, `indicator::NotShown`): `Busy`
+  while it shows another question, `NoPanel` where it cannot reach the screen,
+  whatever it holds (`panel_takes`: no panel first, read with no lock held, then
+  busy). The road is the same, and the caller's words are not: a question nothing
+  else showed reads the busy panel's sentence, which never says that nobody is at
+  the screen, and busy wins over a closed road (`Prompted::why_not_shown`). Never
+  fold the two back into one `false`.
   ⚠️ On a **one-row Mac** the screen worker draws the root daemon's questions on its
   own panel (FR-149 P1, `indicator::session_panel`). **A session process's word routes
   a question and never decides one:** its `PanelTold` only marks the question

@@ -545,6 +545,11 @@ mod tests {
     const LONG: Duration = Duration::from_secs(10);
     /// Short enough that a test waiting it out several times stays quick.
     const SHORT: Duration = Duration::from_millis(100);
+    /// How long a test waits for the lookups it started to begin (#4138):
+    /// far longer than a busy runner takes to schedule a thread. A count
+    /// already there returns at once, so only a lookup that never begins
+    /// waits this out.
+    const BEGINS: Duration = Duration::from_secs(10);
 
     /// Lookups held until the gate opens, counted as they begin.
     #[derive(Clone, Default)]
@@ -576,6 +581,28 @@ mod tests {
 
         fn began(&self) -> usize {
             self.0.began.load(SeqCst)
+        }
+
+        /// The lookups begun, once `want` of them have, waited for `within`
+        /// at most. A lookup counts when its own thread runs it, and an ask
+        /// can answer before that thread has run: `now` at once, and an ask
+        /// that waits once its wait is out. So a count read straight after
+        /// the asks can miss a lookup they started (#4134, #4138). The
+        /// caller asserts the exact count, so one lookup more than `want`
+        /// still fails.
+        fn began_within(&self, want: usize, within: Duration) -> usize {
+            let deadline = Instant::now() + within;
+            loop {
+                let began = self.began();
+                if began >= want {
+                    return began;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{began} of {want} lookups began within {within:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -613,7 +640,11 @@ mod tests {
             lookups.ask_blocking(SHORT, gate.lookup(5)),
             Asked::OutOfTime
         );
-        assert_eq!(gate.began(), 1, "one lookup, however many asked");
+        assert_eq!(
+            gate.began_within(1, BEGINS),
+            1,
+            "one lookup, however many asked"
+        );
         gate.open();
         assert_eq!(lookups.ask(LONG, gate.lookup(6)).await, Asked::Answer(6));
         assert_eq!(gate.began(), 2, "the next caller's own lookup");
@@ -914,7 +945,11 @@ mod tests {
         });
         let worst = rx.recv_timeout(LONG).expect("the timer kept waking");
         assert!(worst < Duration::from_millis(500), "it woke {worst:?} late");
-        assert_eq!(held.began(), 1, "one lookup in flight, however many asked");
+        assert_eq!(
+            held.began_within(1, BEGINS),
+            1,
+            "one lookup in flight, however many asked"
+        );
     }
 
     /// #3853 — a [`OneInFlightPerKey`] for a test: `'static`, as the
@@ -948,7 +983,7 @@ mod tests {
             [Asked::OutOfTime, Asked::OutOfTime, Asked::OutOfTime]
         );
         assert_eq!(
-            (ana.began(), bob.began()),
+            (ana.began_within(1, BEGINS), bob.began_within(1, BEGINS)),
             (1, 1),
             "one lookup a key, however many asked"
         );
@@ -988,8 +1023,9 @@ mod tests {
         let hung_other = tokio::spawn(lookups.ask("bob", LONG, other.lookup(9)));
         let later = tokio::spawn(lookups.ask("ana", LONG, fresh.lookup(2)));
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let other_began = other.began_within(1, BEGINS);
         assert_eq!(
-            (earlier.began(), fresh.began(), other.began()),
+            (earlier.began(), fresh.began(), other_began),
             (1, 0, 1),
             "the later ask waits, starting nothing"
         );
@@ -1046,7 +1082,7 @@ mod tests {
         }
         assert_eq!(other.join().expect("an ask's thread"), Asked::OutOfTime);
         assert_eq!(
-            (ana.began(), bob.began()),
+            (ana.began_within(1, BEGINS), bob.began_within(1, BEGINS)),
             (1, 1),
             "one lookup a key, from threads and a task alike"
         );

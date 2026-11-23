@@ -4,7 +4,8 @@
  * FR-135 R3 — the `video-bytes` channel, wherever it is read: on the page,
  * which relays each message to the data-channel decode worker (the old path,
  * and the fallback), or in the worker itself, which the page moved it into
- * (`roomler-rc-dc-worker`, `docs/remote-control.md` §11.14.1).
+ * (`roomler-rc-dc-worker`, `docs/remote-control.md` §11.14.1). FR-148 P4b-2 —
+ * and `video-deadline` beside it, which goes wherever `video-bytes` goes.
  *
  * Pure, and imported by both sides, so the rule is one rule: the page cannot
  * import the worker module (it would run the worker's code on the page), and
@@ -35,8 +36,13 @@ export function createDeliveryGapClock(): { note(nowMs: number): number | null; 
   }
 }
 
-/** The page hands a channel to the worker in this message. */
-export type VideoChannelMessage = { type: 'video-channel'; channel: RTCDataChannel }
+/** The page hands a channel to the worker in this message: `video-bytes`, and
+ *  `video-deadline` beside it when the session opened one (FR-148 P4b-2). */
+export type VideoChannelMessage = {
+  type: 'video-channel'
+  channel: RTCDataChannel
+  deadline?: RTCDataChannel
+}
 
 /** FR-135 R3 — the page's wait for a channel it moved to arrive. The page keeps
  *  no copy of a moved channel, so until the worker says `video-channel-attached`
@@ -111,15 +117,25 @@ export function createChannelMoveWatch(opts: {
  *  before anything is detached, so the channel is still the page's, open and
  *  whole, and the page relays it as before.
  *
+ *  FR-148 P4b-2 — `deadline`, the session's `video-deadline` channel, made in
+ *  the same task, moves in the same message, so one `video-channel-attached`
+ *  answers for both and a refusal leaves both on the page.
+ *
  *  Returns null when the worker has the channel, or why it stayed on the page.
  *  Pure for the tests: `worker` is anything with `postMessage`. */
 export function moveVideoChannelToWorker(
   worker: { postMessage(message: unknown, transfer: Transferable[]): void },
   channel: RTCDataChannel,
+  deadline?: RTCDataChannel,
 ): string | null {
   const message: VideoChannelMessage = { type: 'video-channel', channel }
+  const transfer = [channel as unknown as Transferable]
+  if (deadline) {
+    message.deadline = deadline
+    transfer.push(deadline as unknown as Transferable)
+  }
   try {
-    worker.postMessage(message, [channel as unknown as Transferable])
+    worker.postMessage(message, transfer)
     return null
   } catch (err) {
     if (err instanceof Error) return `${err.name}: ${err.message}`

@@ -380,7 +380,7 @@
       />
       <div class="text-caption text-medium-emphasis mt-1">
         No input from the person controlling it and no change on the screen for this long. They
-        are warned shortly before the end. The device keeps this limit, so a device whose agent
+        are warned shortly before the end. The device keeps this limit, so a device whose daemon
         predates it does not. No limit by default.
       </div>
       <v-alert v-if="idleError" type="error" variant="tonal" density="compact" class="mt-3">

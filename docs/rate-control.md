@@ -110,7 +110,7 @@ flowchart TB
 
 The heartbeat carries the tally as `evidence_rejected=[agent-stalled,
 transit-stalled, stall-shadow, carrier-changed, opening, keyframe-burst]` (`Rejections`,
-`evidence.rs:219`; printed at `peer.rs:10190` for the FFmpeg pump and `:5373` for
+`evidence.rs:219`; printed at `peer.rs:10217` for the FFmpeg pump and `:5400` for
 VP9's) — one field where T1b, T2 and
 T2b each had their own counter. `opening` was appended (P2b-8) and then
 `keyframe-burst` (P2b-13), so the earlier positions keep their meaning for a
@@ -177,8 +177,8 @@ a permanent stall, and a stall never lowers the floor it is measured against.
 **The heartbeat.** `pipe_state` is the last window's verdict, `pipe_states` the
 session's windows per verdict as `[unknown, clear, overproduced,
 transit-stalled, viewer-late]`, and `pipe_gap_stalls` the subset of the
-transit-stalled count that came from the gap rule (`peer.rs:10204`–`:10214` for
-the FFmpeg pump; `:5371`–`:5381` for VP9's, whose transit share is an upper
+transit-stalled count that came from the gap rule (`peer.rs:10231`–`:10241` for
+the FFmpeg pump; `:5398`–`:5408` for VP9's, whose transit share is an upper
 bound because that pump hands its split no send wait: it prints one since FR-148,
 and its split still takes none). Three rules for reading them:
 
@@ -371,8 +371,8 @@ were followed within 2 s by a delivery at least 2× above them, and the floor ne
 moved in the true one's 60 s.
 
 ⚠️ **(b) reads two sources because `bytes_written` is not the whole offer.** It counts
-what left the pump's own channel, and both pumps stamp a frame before it (`peer.rs:5247`,
-`:9893`), so a queue growing INSIDE that channel reads sent ≈ rx. `Overproduced` is
+what left the pump's own channel, and both pumps stamp a frame before it (`peer.rs:5274`,
+`:9920`), so a queue growing INSIDE that channel reads sent ≈ rx. `Overproduced` is
 that case. A window with no link report keeps the streak, and an unoffered congested
 window neither arms nor releases, because the queue did grow.
 
@@ -388,7 +388,7 @@ entry at all, so the entry stands until a session measures or carries a hold, or
 
 The heartbeat carries `pipe_measured` (what a stall is judged against),
 `readings_refuted`, and `link_unoffered`, a subset of `link_stats`' congested count: a
-link loop gone quiet with this climbing is rule (b) (`peer.rs:5386`, `:10223`).
+link loop gone quiet with this climbing is rule (b) (`peer.rs:5413`, `:10250`).
 
 ### The ceiling learner (FR-35 P1) — growth above the nominal
 
@@ -475,8 +475,8 @@ plan ceiling verbatim and no memory) and `relay_max_hi_kbps`
 sessions never touch the learner (`governor.rs:786` gates on `constrained`).
 
 ⚠️ **Only the FFmpeg DC pump runs the learner.** `relay_max_hi_bps()` has one
-caller (`peer.rs:6637`, `media_pump_ffmpeg_dc`), the VP9-444 pump builds its
-governor with `hi = 0` (`peer.rs:4278`), and the RTP pump has no governor. There
+caller (`peer.rs:6665`, `media_pump_ffmpeg_dc`), the VP9-444 pump builds its
+governor with `hi = 0` (`peer.rs:4306`), and the RTP pump has no governor. There
 is no software FFmpeg encoder, so a host with no hardware encoder never reaches
 the learner, and `relay_ceiling_learn` reads the same on and off there. A VM
 cannot prove that switch (FR-35 AC6). ⚠️ **On `h264_vaapi` the ceiling does not show in the bytes:** on jupiter (0.4.197, Raphael iGPU) one scroll delivered 10.7 Mbps under `maxrate` 2.55, 3.0 and 5.84 M alike, so on that cell read the target, `learned_ceiling_bps` and the memory ([FR-35's kill-switch A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-kill-switch-ab-2026-11-02)).
@@ -515,7 +515,7 @@ cannot prove that switch (FR-35 AC6). ⚠️ **On `h264_vaapi` the ceiling does 
 >   measured a sustainable limit; the memory's level is the write-back's
 >   dynamics, not the pipe's. (FR-35 AC1's numbers passed on 2026-10-31 without
 >   moving this, and a cold opener passes them too:
->   [the opener A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31).) ⚠️ **Compare opening keyframes only at equal `dc_unopen_drops`.** Every frame the pump encodes before the video channel opens is dropped and forces another keyframe (`peer.rs:9850`, `:9856`), and the one delivered shrinks as the count rises: 63,284 B at 2 drops and 23,435 B at 4 on one `maxrate`. At equal drops it follows `maxrate` ([what moved it](fr/FR-35-relay-ceiling-learns-the-pair.md#what-moved-the-openers-keyframe-2026-11-02), [#3334](https://github.com/gjovanov/roomler-ai/issues/3334)).
+>   [the opener A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31).) ⚠️ **Compare opening keyframes only at equal `dc_unopen_drops`.** Every frame the pump encodes before the video channel opens is dropped and forces another keyframe (`peer.rs:9877`, `:9883`), and the one delivered shrinks as the count rises: 63,284 B at 2 drops and 23,435 B at 4 on one `maxrate`. At equal drops it follows `maxrate` ([what moved it](fr/FR-35-relay-ceiling-learns-the-pair.md#what-moved-the-openers-keyframe-2026-11-02), [#3334](https://github.com/gjovanov/roomler-ai/issues/3334)).
 
 ### The write-back and the seed (V2 + V4) — the pair memory
 
@@ -551,7 +551,7 @@ flowchart LR
 |---|---|---|
 | the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `media_pair_memory.rs:163`, `:140` |
 | the provenance | FR-148 P1. Every entry written carries `"provenance": "measured"`. An entry with no provenance, which is every entry written before this release, or with a value this agent does not know, is **assumed**. An assumed entry seeds nothing, so the pair opens as one never seen: no slow-link profile and no opening below the floor. It is no base for `damp`, so the first measurement replaces it outright. The next write for any pair drops it, because the file is written whole and an assumed value is never stored (FR-148 §4.1). A session that measured nothing leaves it as it is, unread, until it ages out. At the open, a fresh assumed entry logs `FR-148 P1 rate memory: … read as assumed …` with `assumed_bps` and `age_s`. **Rollback:** an older agent ignores the field and reads every entry again. Its whole-file write drops the field, so after a re-upgrade those entries are assumed: one session of learning per pair and carrier | `rate_memory.rs:107`, `:164`, `:173`, `:192`; `media_pair_memory.rs:571` |
-| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9406` (`opener_measured_bps`) |
+| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9433` (`opener_measured_bps`) |
 | the evidence | `RateGovernor::session_evidence_bps`: first `stable_bps()`, the highest AIMD target that held 10 s with no decrease, when above the nominal and, since V5b, carried by a valid window; then a live reading; then the last reading the session took; else 0 = nothing. ⚠️ Before V5b the first was a hold of the *target*, not a measurement: an idle session held the opener's seed for its whole length and wrote 0.85 × the memory back as evidence, and the second was `pipe_bps`, whose last source is the prior's stand-in, so a prior that stood low was written back too (field rows below) | `media_pair_memory.rs:708`; `governor.rs:926` |
 | the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence, or the first after an assumed entry ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:230`, `:79`; `media_pair_memory.rs:238` |
 | the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days, or an assumed one, never seeds and is pruned on the next write | `rate_memory.rs:269`, `:22` |
@@ -671,7 +671,7 @@ evidence the old `min(goodput, link_rx)` averaged together:
 | the anchor a ceiling may be built on | `max(capacity, floor)` — never `min` | — | `ceiling_anchor_bps` (`pipe.rs:683`) |
 
 ⚠️ **It is a shadow, with one exception.** The heartbeat prints `pipe_belief=(anchor,
-floor, capacity)` and `pipe_belief_n=(deliveries, capacities)` (`peer.rs:8517`), and
+floor, capacity)` and `pipe_belief_n=(deliveries, capacities)` (`peer.rs:8544`), and
 none of the three values has a consumer: not V5, not the ceiling, not the memory.
 V5b reads one fact and nothing else, whether a delivery RAISED the floor
 (`Pipe::observe_delivered`, q2). The shadow corrected its own design three times in
@@ -804,7 +804,7 @@ floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:277`). On a direct
 transport `effective_ceiling` is the plan's value unchanged (`governor.rs:683`
 — the learner lifts it on constrained sessions only); the shared-pipeline split
 divides it by the follower count; and the result is both the AIMD's ceiling
-and the gate's reference rate (`last_ceiling_bps`, `peer.rs:7346`).
+and the gate's reference rate (`last_ceiling_bps`, `peer.rs:7175`).
 
 ⚠️ The encode-pressure factor multiplies the bound, so a host whose encoder is
 struggling lowers its own ceiling with no path evidence in it. On 2026-09-25
@@ -829,10 +829,10 @@ meant to bound.
 |---|---|---|
 | soft budget | `direct_queue_ms` (150) × ceiling ÷ 8, floored at 48 KiB; `0` disables the gate | `rate_profile.rs:559` (`direct_queue_budget_bytes`) |
 | hard budget | `max(soft, HRD reservoir)`, the reservoir being `maxrate × open_hrd_pct ÷ 8` — 100 % on direct (`direct_hrd_pct`, `:590`; config `direct_hrd_pct`, [25, 200]), 200 % for every `av1_*` encoder regardless | `rate_profile.rs:578` (`direct_queue_hard_budget_bytes`); `ffmpeg/encoder.rs` `open_hrd_pct` |
-| measured wait | the larger of an EMA (α 0.3 per pass) of completed frames' enqueue→wire-complete waits and the **live age of the frame the send task is writing** (`send_head_enqueued_us`) — a stalled pipe completes nothing, so the EMA alone reads stale-low exactly when the queue grows | `peer.rs:6655`–`6266`; set and cleared by the send task at `:5919`, `:5987` |
-| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:597` (`direct_gate_trips`), called at `peer.rs:6699` |
-| on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6778`, `:6653` |
-| relay paths | unchanged: bytes vs `constrained_queue_ms` (450) of the relay ceiling, no wait term | `peer.rs:8003-8020` |
+| measured wait | the larger of an EMA (α 0.3 per pass) of completed frames' enqueue→wire-complete waits and the **live age of the frame the send task is writing** (`send_head_enqueued_us`) — a stalled pipe completes nothing, so the EMA alone reads stale-low exactly when the queue grows | `peer.rs:6683`–`6266`; set and cleared by the send task at `:5946`, `:6014` |
+| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:597` (`direct_gate_trips`), called at `peer.rs:6727` |
+| on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6806`, `:6681` |
+| relay paths | unchanged: bytes vs `constrained_queue_ms` (450) of the relay ceiling, no wait term | `peer.rs:8030-8047` |
 
 ```mermaid
 flowchart TB
@@ -843,7 +843,7 @@ flowchart TB
         E --> S["÷ followers (shared split)"]
         S --> CEIL["ceiling_bps<br/>= the AIMD's ceiling = the gate's reference"]
     end
-    subgraph gate["the direct gate — one pass, before capture (peer.rs:6538–6686)"]
+    subgraph gate["the direct gate — one pass, before capture (peer.rs:6565–6714)"]
         CEIL --> SOFT["soft = 150 ms × ceiling"]
         CEIL --> HARD["hard = max(soft, HRD reservoir)"]
         W["wait = max(EMA of completed waits,<br/>age of the head-of-queue frame)"]
@@ -1266,8 +1266,8 @@ past 200 Mbps on a desktop sending 5 kbps. So −96 % reads the same on a restin
 that lost nothing and on a scroll spending 14 times the shadow's target.
 
 So the report also compares the shadow with what was actually sent. `bytes_written` is
-the send task's running total of whole frames the transport took (`peer.rs:7398`,
-`:4341`), on both heartbeats (`peer.rs:10156`, `:5346`):
+the send task's running total of whole frames the transport took (`peer.rs:7424`,
+`:4367`), on both heartbeats (`peer.rs:10183`, `:5373`):
 
 ```mermaid
 flowchart LR
@@ -1285,7 +1285,7 @@ flowchart LR
 |---|---|---|
 | `spent > shadow`, clean window | the shadow would have capped spending the path was carrying | that the picture needed those bits. Every FFmpeg backend but NVENC anchors `bit_rate = maxrate` (`ffmpeg/encoder.rs:1887-1896`), so a high target can also draw spend, which is why the report splits by encoder. A small excess can be overshoot, hence the "by > 25 %" column |
 | `spent ≤ shadow` | the window's average fit | that no burst inside the window was capped |
-| the encoder's demand | `spent` bounds it from below | nothing bounds it from above: the heartbeat has no maxrate field (`peer.rs:10042-10057`), and a new field cannot help a read of logs already written |
+| the encoder's demand | `spent` bounds it from below | nothing bounds it from above: the heartbeat has no maxrate field (`peer.rs:10069-10084`), and a new field cannot help a read of logs already written |
 
 The live cap cannot hide a bite: while `shadow < live`, a window capped by live spends
 about live, which is over the shadow. Elevated windows are kept out of the table, since
@@ -1449,8 +1449,8 @@ of the vendored webrtc-sctp keeps where the events happen:
 
 | Counter | Counted in | Means |
 |---|---|---|
-| acknowledged bytes | the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1518`) | user data the peer acknowledged it received, each chunk once, over every stream of the association: by a gap block, or by the cumulative point. A partially reliable chunk is left out when a SACK reported it missing, or when it was outstanding as the retransmission timer expired, and the cumulative point then passed it: a FORWARD TSN skipped it (`DeliveryCounters::loss_mark`, `crates/vendored/webrtc-sctp/src/association/delivery.rs:41`) |
-| fills and empties | the pending queue (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:135`, `:530`) | how many times the queue of written, not yet sent chunks went from empty to holding bytes, and back |
+| acknowledged bytes | the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1604`) | user data the peer acknowledged it received, each chunk once, over every stream of the association: by a gap block, or by the cumulative point. A partially reliable chunk is left out when a SACK reported it missing, or when it was outstanding as the retransmission timer expired, and the cumulative point then passed it: a FORWARD TSN skipped it (`DeliveryCounters::loss_mark`, `crates/vendored/webrtc-sctp/src/association/delivery.rs:41`) |
+| fills and empties | the pending queue (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:159`, `:583`) | how many times the queue of written, not yet sent chunks went from empty to holding bytes, and back |
 
 The agent reads both without the association's lock (`Association::delivery_clock`,
 `crates/vendored/webrtc-sctp/src/association/mod.rs:638`), through the peer
@@ -1491,7 +1491,7 @@ Calling a sample application-limited when in doubt is the safe direction: such a
 sample can only raise a floor.
 
 **The line** is `path delivery (FR-148 P0, shadow, ≈10s)`, at INFO, written by
-`media_delivery::emit` (`agents/roomlerd/src/media_delivery.rs:1363`) at the first
+`media_delivery::emit` (`agents/roomlerd/src/media_delivery.rs:1388`) at the first
 heartbeat 10 s after the last line (`LINE_EVERY`), and once more when the pump ends with
 samples not yet written. A test pins its field names (`the_line_names_its_fields`):
 
@@ -1555,8 +1555,10 @@ application-limited.
   the queue fills.
 - The acknowledged bytes are the association's: video, and the control, input and file
   channels beside it.
-- On a partially reliable channel the count is close, not exact. The viewer's unordered
-  opt-in opens video with `maxRetransmits: 0`; the vendored SCTP marks each such chunk
+- On a partially reliable channel the count is close, not exact. The viewer's
+  `video-deadline` channel (FR-148 P4b-2) is unordered with `maxRetransmits: 0`. Unless
+  the agent marks it deadline-limited (P4b-1; P4b-3 marks it under `on` only, before
+  its first write there), the vendored SCTP marks each such chunk
   abandoned at its first send and sends a FORWARD TSN after nearly every SACK, over
   everything then in flight. A lost chunk that a later one follows is reported missing
   and left out. A lost chunk that nothing follows before such a FORWARD TSN reaches the
@@ -1581,11 +1583,11 @@ FR-148 P1 it reads three values, `off`, `shadow` (the default) and `on`
 
 | Where | Anchor |
 |---|---|
-| the sampler: readings, samples, the line | `agents/roomlerd/src/media_delivery.rs:631` (`DeliverySampler`), `:742` (`heartbeat`), `:864` (`on_reading_with`), `:934` (`take_line`) |
-| the standing queue: the rule, the one take, the reading, the fold | `agents/roomlerd/src/media_delivery.rs:95` (`QUEUED_OVER_MS`), `:117` (`counts`), `:837-846` (`DeliverySampler::observe`, the one take), `:905` (`judge`), `:556` (`Fold::add_queue`) |
-| the gauges | `crates/vendored/webrtc-sctp/src/association/gauges.rs:134` (`Gauges`), `:179` (`take`), `:187` (`peek`); through the transport, `crates/vendored/webrtc/src/sctp_transport/mod.rs:482` (`RTCSctpTransport::gauges`) |
-| the VP9-444 pump | `agents/roomlerd/src/peer.rs:3978` (made), `:5412` (drained, after the heartbeat line) |
-| the FFmpeg pump | `agents/roomlerd/src/peer.rs:6562` (made), `:10344` (drained, after the heartbeat line) |
+| the sampler: readings, samples, the line | `agents/roomlerd/src/media_delivery.rs:634` (`DeliverySampler`), `:755` (`heartbeat`), `:877` (`on_reading_with`), `:947` (`take_line`) |
+| the standing queue: the rule, the one take, the reading, the fold | `agents/roomlerd/src/media_delivery.rs:95` (`QUEUED_OVER_MS`), `:117` (`counts`), `:850-859` (`DeliverySampler::observe`, the one take), `:918` (`judge`), `:559` (`Fold::add_queue`) |
+| the gauges | `crates/vendored/webrtc-sctp/src/association/gauges.rs:146` (`Gauges`), `:194` (`take`), `:202` (`peek`); through the transport, `crates/vendored/webrtc/src/sctp_transport/mod.rs:482` (`RTCSctpTransport::gauges`) |
+| the VP9-444 pump | `agents/roomlerd/src/peer.rs:4005` (made), `:5439` (drained, after the heartbeat line) |
+| the FFmpeg pump | `agents/roomlerd/src/peer.rs:6589` (made), `:10371` (drained, after the heartbeat line) |
 | the clock | `crates/vendored/webrtc-sctp/src/association/delivery.rs:93` (`DeliveryClock`), `:101` (`read`) |
 
 **The tests** (`cargo test -p roomlerd --lib -- media_delivery`):
@@ -1597,7 +1599,7 @@ FR-148 P1 it reads three values, `off`, `shadow` (the default) and `on`
 | `an_idle_trickle_yields_only_application_limited_samples` | the jupiter chain of 2026-11-02 as a cell: a still screen's keepalives give only application-limited samples, so none of them can stand for the path |
 | `shaped_link::backlogged_at_{0_4,2,8}_mbps_reads_the_link`, `shaped_link::a_trickle_at_{0_4,2,8}_mbps_is_application_limited` | two in-process SCTP associations over a link the test shapes (serialised at its rate, 10 ms each way, a drop-tail queue of 200 ms, a viewer window of 7/8 of that queue, and messages that fit it): a writer that always has more reads backlogged at the link's rate within 20 %; a 164 kbit/s trickle reads application-limited at every rate |
 | `shaped_link::a_new_association_starts_a_new_sample` | a new clock starts over, and a held slot keeps the clock the sampler has; the new association's gauges come with it, and the session's least starts over |
-| `shaped_link::a_lossy_unordered_channel_counts_what_the_viewer_took` | an unordered `maxRetransmits: 0` channel, as the viewer's opt-in opens it, writing 1,000-byte messages over the 2 Mbit/s link while one full DATA packet in ten is lost: at each sample's end the clock has counted at least nine tenths of what the viewer took and less than that plus two thirds of what was lost. Of about 215,000 bytes lost by the third sample's end, four runs on a Windows box counted 11,000 to 21,000 more than the viewer took, and two on CI's Linux runners, under the whole suite, 75,000 and 70,000. Before the clock left lost chunks out it counted 2,128,000 against 1,920,000 taken, with 216,000 lost |
+| `shaped_link::a_lossy_unordered_channel_counts_what_the_viewer_took` | an unordered `maxRetransmits: 0` channel, the shape of the viewer's `video-deadline` channel, unmarked, writing 1,000-byte messages over the 2 Mbit/s link while one full DATA packet in ten is lost: at each sample's end the clock has counted at least nine tenths of what the viewer took and less than that plus two thirds of what was lost. Of about 215,000 bytes lost by the third sample's end, four runs on a Windows box counted 11,000 to 21,000 more than the viewer took, and two on CI's Linux runners, under the whole suite, 75,000 and 70,000. Before the clock left lost chunks out it counted 2,128,000 against 1,920,000 taken, with 216,000 lost |
 
 The fork's own tests (`src/association/association_internal/association_internal_test.rs`,
 `test_delivery_clock_*`) pin the rule chunk by chunk: a chunk reported missing that a
@@ -1630,15 +1632,15 @@ carry yet and loses nothing. So SCTP's congestion window grows past what the lin
 carries, the bytes wait in the carrier, and the queue of unsent chunks keeps running
 empty: every sample reads application-limited while seconds of bytes stand on the link.
 The shaped link's TCP cells showed it (`shaped_link::tcp_shape`,
-`agents/roomlerd/src/media_delivery.rs:5466`), and so did the lab: on TURN over TCP 443
+`agents/roomlerd/src/media_delivery.rs:5678`), and so did the lab: on TURN over TCP 443
 at 2 Mbit/s the viewer's round trip ended at 1,262 ms, against 154 ms on TURN over UDP at
 the same rate.
 
 SCTP's acknowledgement delay holds that wait. The vendored webrtc-sctp stamps a chunk
 when it leaves SCTP's queue for the wire
-(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1975`), and the
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2070`), and the
 SACK handler stores the delay of the newest chunk sent once that a SACK acknowledges
-(`:1316-1318`). The carrier's queue is in that delay; SCTP's own queue is not. The
+(`:1397-1399`). The carrier's queue is in that delay; SCTP's own queue is not. The
 association's gauges keep the least of those delays since the last take, beside the
 congestion window, the slow start threshold, the peer's window, the bytes in flight and
 pending, and the counts of fast retransmissions and T3-rtx expiries. The agent reads
@@ -1674,7 +1676,7 @@ backlog too.
 reads covers the SACKs since the take before it. The delivery sampler is the one reader
 that takes. It fetches the gauges with the clock, from the same slot, and takes them
 only where a sample starts and where it closes, beside the clock's reading
-(`DeliverySampler::observe`, `agents/roomlerd/src/media_delivery.rs:837-846`). So a
+(`DeliverySampler::observe`, `agents/roomlerd/src/media_delivery.rs:850-859`). So a
 sample's least is the least of its own SACKs. A second reader that took would split a
 sample's SACKs with the sampler, and each would read a least too high. A reader that
 only looks peeks (`GaugeReader::peek`), which resets nothing, as FR-148 O10's open line
@@ -1763,12 +1765,76 @@ hold that case.
 | `shaped_link::tcp_shape::a_still_screen_on_the_{deep,shallow}_queue_reads_no_queue` | the still screens above: at least two samples in their 10 s, none that counts, a delay from some SACK, and no sample queued. The precondition was four samples, and the first runs took five. Under D44 it moved to two: a still screen's 200 bytes a second never pass `counts`' byte bound, so two samples show the guard holds. Three runs of each, alone on a Windows box, after the change: five samples in every run, 200 to 600 bytes each |
 | `shaped_link::tcp_shape::stalls_2_mbps_path_i_lift_the_floor_over_the_link`, `stalls_under_the_pump_skip_2_mbps_path_i_lift_the_floor_over_the_link` | ignored, a measurement (D44): head-of-line stalls of 0.8 s every 3.3 s on the deep lossless link at 2 Mbit/s, path I. The viewer window after a stall carries the stall's bytes too, and `Pipe`'s floor takes every window, so the floor ends over 1.3 times the link's 1,954 kbit/s of payload. The cells pin that defect, so as gates they would protect nothing in the product. Three runs of each with `--ignored`, alone on a Windows box: 1.50 to 1.55 times the link under a writer that offers 80 % of it, and 1.77 to 1.78 times under the pump's skip at 150 %, which is 1.15 to 1.20 and 1.36 to 1.37 times the 1.3 they assert |
 | `shaped_link::tcp_shape::stalls_2_mbps_path_c_lift_the_floor_over_the_link` | ignored, red: path C's window caps what the link carries in a stall, at 1.27 to 1.28 times the link in 20 s |
+| `shaped_link::tcp_shape::relay_writer::the_relay_writer_with_every_packet_in_one_frame`, `the_relay_writer_with_a_full_packet_in_two_frames` | FR-148 P4b-3 (D55): AC23's fast motion behind the mesh relay's writer (below), with every packet in one frame, or with a full packet in two as the mesh relay sends it (D20). Four arms run one after another on the same path. **r**, the reliable channel at the 100 ms age bound: frames dropped for their age; each chunk they lost sent again, fast retransmits among them and no more of those than chunks lost; every message read; ssthresh cut; writes blocked. **r0**, the bound off: no drop, no fast retransmit and no T3. **d**, the deadline stream, marked before its first write: no fast retransmit and no chunk sent again; the messages the viewer misses are exactly those with a dropped frame; FORWARD TSNs; and without a T3, no cut and no write longer than r's median blocked write. **u**, unmarked `maxRetransmits: 0`: d sends fewer FORWARD TSNs per SACK. Ten runs in a row on a Windows box, the host loaded as it was: 10 of 10 each, with the numbers in the table below |
+| `shaped_link::tcp_shape::relay_writer::the_reliable_channel_with_every_packet_in_one_frame_takes_no_t3`, `the_reliable_channel_with_a_full_packet_in_two_frames_takes_no_t3` | ignored: r alone, with AC23's first read (D54) on top: no T3, and every chunk sent again a fast retransmit of one the writer dropped. Flaky with one frame and red with two, for the reason below. Ten runs by name: 10 of 10 with one frame, 0 of 10 with two. Over every r arm run on this writer and load, in the cells above and by name: a T3 in 2 of 46 with one frame and in all 47 with two |
+| `shaped_link::tcp_shape::relay_writer::the_deadline_stream_with_every_packet_in_one_frame_takes_no_t3`, `the_deadline_stream_with_a_full_packet_in_two_frames_takes_no_t3` | ignored: r for its median blocked write, then d with no T3 on top, and so no cut and no write longer than that median. Flaky, for the reason below. Ten runs by name: 10 of 10 with one frame, 8 of 10 with two. Over every d arm run on this writer and load, in the cells above and by name: a T3 in 1 of 36 with one frame and in 8 of 36 with two |
 
 They add about 23 s of test time, each cell timed alone: 10.1 s for each still-screen
 cell, 2.2 s for the relay pair below, 0.3 s for the peek, and the unit cells nothing that
 shows. The two still-screen cells wait their turn with the TCP cells, which run one at a
 time, so that line of cells grows by about 20 s. Since D44 the line runs eight cells, in
-141 s on a Windows box: the two stall cells and their 20 s each left it.
+141 s on a Windows box: the two stall cells and their 20 s each left it. The relay
+writer's two cells join that line and add about 100 s to it: four arms a cell, each a 10 s
+load, a 2 s still screen and the drain.
+
+**The mesh relay's writer** (FR-148 P4b-3, D55). The relay writer's cells put a model of
+the agent's /derp writer between SCTP and the shaped link (`RelayWriter`,
+`agents/roomlerd/src/media_delivery.rs:11721`). Its mux queues each frame without waiting,
+in a channel of 512 frames that drops a frame when full
+(`crates/tunnel-core/src/transport/derp.rs:55`, `:290-318`). Its owner task drops a frame
+that waited longer than the age bound and otherwise waits for the write
+(`agents/roomlerd/src/derp.rs:550-558`): 100 ms, and 0 for off
+(`crates/tunnel-core/src/transport/derp.rs:72-77`). Behind it the /derp socket holds
+212,992 bytes, the 256 KiB the agent asks for as Linux clamps it
+(`agents/roomlerd/src/derp.rs:40`, `:73-76`). The carrier is TCP and loses nothing it was
+handed, so the socket and the 200 ms queue are one first hop of 262,992 bytes
+(`Shaper::hop`) in front of a queue that drops nothing: the writer is the path's only
+loss. A packet over the mesh's MTU of 1,280 bytes, as a full one's 1,293 are, leaves as two
+IPv4 fragments, and so as two frames (D20). The age check is per frame, and the viewer's
+end passes a pair on only whole (`RelayReader`, `:11963`). The load is the deep 2 Mbit/s
+cell's, frames at 1.5 times the link under the pump's skip over 256 KiB, for 10 s. Then
+the screen goes still, one 200-byte message a second for 2 s, so that a later SACK
+reports a loss among the load's last packets. Without it only a T3 found one: in one of
+three runs, before the still screen was added, d lost its last chunk so, and the T3 cut
+its window to one MTU.
+
+| Ten runs of the cells above | Every packet in one frame | A full packet in two frames |
+|---|---|---|
+| r: frames dropped for their age; the packets they cost | 6 to 9; 6 to 9 | 41 to 46; 26 to 32, 8 to 13 of them by one frame of two |
+| r: fast retransmits; T3s | 6 to 9, one for each chunk lost; none | 5 to 8; one in every run, and 27 to 108 chunks sent again in all, the 26 to 32 lost among them |
+| r: ssthresh's least, from the peer's 1 MiB | 68,820 to 70,870 | 69,245 to 70,195 |
+| r: writes blocked after the opening; their median; the longest | 100 to 109 of 120; 54 to 56 ms; 278 to 338 ms | 50 to 67 of 85 to 105; 22 to 30 ms; 590 to 1,833 ms |
+| r0: frames dropped; fast retransmits and T3s; writes blocked | none; none; none | none; none; none |
+| d: frames dropped; the packets they cost, whose chunks were abandoned | 18 to 23; 18 to 23 | 76 to 143; 48 to 92 |
+| d: messages missed, each with a dropped frame, of those written | 13 to 20 of 196 | 9 to 20 of 173 to 190 |
+| d: FORWARD TSN packets; T3s | 13 to 20; none | 8 to 17; two in each of 2 runs, which cut ssthresh to 4,912 and blocked 57 writes, the longest 758 and 760 ms |
+| d: the longest write without a T3 | under 1 ms | under 1 ms |
+| u: messages missed | 47 to 50 | 53 to 60 |
+| FORWARD TSNs per SACK, d against u | 0.007 to 0.011 against 0.873 to 0.892 | 0.006 to 0.010 against 0.884 to 0.899 |
+
+No cut means no relief either. d keeps the first hop full, as r0 and u do: their frames
+wait 1,031 to 1,051 ms in the socket and the queue all through the load, and d's age drops
+go on to its end. With every packet in one frame, r's cut leaves 242 to 320 ms there once
+its burst is repaired.
+
+**Why the no-T3 cells are ignored.** AC23's first read took no T3 on the reliable
+channel, and the deadline stream is built to need none. Both take one here. On r, the
+slow start's first overflow drops a burst of packets within a few hundred ms, and fast
+recovery repairs it one packet a round trip: the vendored SCTP sends one packet of chunks
+each time it is asked
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:486-549`), and in
+recovery it is asked only when the cumulative point advances (`:1550-1552`). A T3 ends the
+repair when the episode reaches its exit point (`:1527`, `:1305-1307`) while holes remain
+past it whose miss indications already stopped at 3 (`:1520`), so that none starts another
+episode, or when the viewer's window has filled behind the first hole of the ordered
+stream. It sends again every chunk not yet acknowledged, those still on their way among
+them. On d, a hole holds the cumulative point until its FORWARD TSN lands
+(`forward_tsn_due`, `:1174`), a loaded round trip behind the full first hop, or longer when
+the writer drops the FORWARD TSN too. The T3-rtx timer runs from the point's last advance,
+with an RTO of srtt + 4 rttvar (`crates/vendored/webrtc-sctp/src/timer/rtx_timer.rs:56`),
+barely longer while the queue stands still. On d the T3 abandons what is out
+(`association_internal.rs:2594-2600`), and on either it cuts the window to one MTU
+(`:2578-2579`).
 
 **The carrier's relay transport.** The carrier line (`session carrier recorded (FR-102
 P9c)`, [remote-control.md §11.9](remote-control.md#119-the-carrier-a-session-rides-fr-102-p9c))
@@ -1836,16 +1902,16 @@ association's congestion state as gauges: one relaxed store, add or min each, wh
 association already holds its lock or where the pending queue counts its own bytes. A
 reader takes them without the lock (`Association::gauges`,
 `crates/vendored/webrtc-sctp/src/association/mod.rs:647`; the reading is `Gauges`,
-`crates/vendored/webrtc-sctp/src/association/gauges.rs:134`), and nothing in the
+`crates/vendored/webrtc-sctp/src/association/gauges.rs:146`), and nothing in the
 association reads them back.
 
 | Gauge | Stored | Means |
 |---|---|---|
-| `max_payload` | once, when the association is made (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:199`) | the user data one DATA chunk carries, 1,200 bytes at SCTP's MTU of 1,228: the train's message length |
-| `cwnd`, `ssthresh`, `rwnd`, `inflight_bytes` | by `store_gauges` (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:353`) when the association is made (`:200`), at the INIT ACK (`:815`), after every SACK (`:1596`) and every send (`:2073`), and at a T3-rtx expiry (`:2469`) | the windows and the bytes in flight |
-| `pending_bytes` | where the pending queue adds and pops bytes (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:139`, `:532`) | bytes written and not yet sent, over every stream |
-| `fast_retransmits`, `t3_expiries` | where the association's stats count them (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:512`, `:2468`) | loss events since the association began; the train counts only those after its first step |
-| `ack_delay`, `ack_delay_min` | in the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1318`) | how long the newest chunk a SACK newly acknowledged took from its send to that SACK, among the chunks sent once (Karn), and the least of those since the reader's last take |
+| `max_payload` | once, when the association is made (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:209`) | the user data one DATA chunk carries, 1,200 bytes at SCTP's MTU of 1,228: the train's message length |
+| `cwnd`, `ssthresh`, `rwnd`, `inflight_bytes` | by `store_gauges` (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:363`) when the association is made (`:210`), at the INIT ACK (`:829`), after every SACK (`:1691`) and every send (`:2168`), and at a T3-rtx expiry (`:2582`) | the windows and the bytes in flight |
+| `pending_bytes` | where the pending queue adds and pops bytes (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:163`, `:585`) | bytes written and not yet sent, over every stream |
+| `fast_retransmits`, `t3_expiries` | where the association's stats count them (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:522`, `:2581`) | loss events since the association began; the train counts only those after its first step |
+| `ack_delay`, `ack_delay_min` | in the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1399`) | how long the newest chunk a SACK newly acknowledged took from its send to that SACK, among the chunks sent once (Karn), and the least of those since the reader's last take |
 
 **The twin test** shows that a reader changes nothing the association sends.
 `test_gauges_a_reader_changes_nothing_the_association_sends`
@@ -1900,7 +1966,7 @@ flowchart TD
 within the budget (`:368`). SCTP sends the window at once, and the extra message is
 waiting when the first SACK comes, because the vendored SCTP grows its window only
 while bytes wait
-(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1358`). Every
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1439`). Every
 later step writes enough that bytes keep waiting until the next step: twice the most one
 step saw acknowledged, and a message (`agents/roomlerd/src/media_train.rs:459`). Three
 limits hold it back. Until the first round ends, what is in flight and waiting stays
@@ -1971,7 +2037,7 @@ leave SCTP in different states:
 
 | Path | The agent's end is established by | Its slow start threshold at the first write | So the train climbs by |
 |---|---|---|---|
-| **I** | the peer's INIT ACK, which sets the threshold to the peer's window (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:814`) | the peer's window: 1 MiB by default, 64 KiB in the window cell | slow start: each SACK adds what it acknowledged to the window while bytes wait (`:1359`), so a SACK of two packets releases four |
+| **I** | the peer's INIT ACK, which sets the threshold to the peer's window (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:828`) | the peer's window: 1 MiB by default, 64 KiB in the window cell | slow start: each SACK adds what it acknowledged to the window while bytes wait (`:1440`), so a SACK of two packets releases four |
 | **C** | the peer's COOKIE ECHO (`handle_cookie_echo`, `:896`), which sets neither | 0, the constructor's (`:169`); the peer's window is 0 until the first SACK | congestion avoidance from the first byte: one MTU more a round trip (`:1393`) |
 
 On path C the train comes within 20 % of the link only where congestion avoidance
@@ -1997,24 +2063,24 @@ of 1 MiB holds either path under 34 Mbit/s.
 
 **Which path a session took (O10).** How often each path wins on the fleet is not known,
 so each data-channel pump writes one line at its first media write:
-`path open (FR-148 P0, O10)` (`OPEN_LINE`, `agents/roomlerd/src/media_delivery.rs:1552`).
+`path open (FR-148 P0, O10)` (`OPEN_LINE`, `agents/roomlerd/src/media_delivery.rs:1555`).
 The call sits where the pump hands each media message to its send task
-(`agents/roomlerd/src/peer.rs:5257` in the VP9 4:4:4 pump, `:9905` in the FFmpeg one),
+(`agents/roomlerd/src/peer.rs:5284` in the VP9 4:4:4 pump, `:9932` in the FFmpeg one),
 and only its first call reads anything (`DeliverySampler::on_first_write`,
-`agents/roomlerd/src/media_delivery.rs:994`). It reads the gauges through
+`agents/roomlerd/src/media_delivery.rs:1011`). It reads the gauges through
 `RTCSctpTransport::gauges` (`crates/vendored/webrtc/src/sctp_transport/mod.rs:482`),
 which never waits for the transport's slot, with `GaugeReader::peek`
-(`crates/vendored/webrtc-sctp/src/association/gauges.rs:187`), which resets nothing, so
+(`crates/vendored/webrtc-sctp/src/association/gauges.rs:202`), which resets nothing, so
 the least acknowledgement delay stays for the reader that takes it (the fork's test,
 `crates/vendored/webrtc-sctp/src/association/association_internal/association_internal_test.rs:1167`).
 The answer is a pure function of the gauges (`OpenedBy::of`,
-`agents/roomlerd/src/media_delivery.rs:1594`):
+`agents/roomlerd/src/media_delivery.rs:1597`):
 
 | `open_path` | When |
 |---|---|
 | `init_ack` | the slow start threshold is above 0, and no loss came first |
-| `cookie_echo` | the threshold is 0, and no loss came first. An INIT ACK that arrives after the COOKIE ECHO is discarded (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:782`), so it cannot set the threshold later |
-| `unknown` | a fast retransmission or a T3-rtx expiry came first: either sets the threshold, on both paths (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1442`, `:2465`) |
+| `cookie_echo` | the threshold is 0, and no loss came first. An INIT ACK that arrives after the COOKIE ECHO is discarded (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:796`), so it cannot set the threshold later |
+| `unknown` | a fast retransmission or a T3-rtx expiry came first: either sets the threshold, on both paths (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1528`, `:2578`) |
 | `unread` | no gauges: no association, or the transport's slot was held at that moment |
 
 The threshold tells the paths apart and the peer's window does not, since any SACK sets
@@ -2026,19 +2092,19 @@ written at INFO, like the other P0 lines, so the default filter ships it
 follower of a shared pipeline runs no pump and writes no line, and a pump that starts
 again for the same session writes its own. The cells open a pair by each path over the
 shaped link and read `init_ack` and `cookie_echo` at the first write
-(`agents/roomlerd/src/media_delivery.rs:4437`, `:4456`). The path report counts one
+(`agents/roomlerd/src/media_delivery.rs:4649`, `:4668`). The path report counts one
 device's sessions by answer (`docs/production-mongo-reads.md` §8a).
 
 **The properties and their cells.** Each cell opens two in-process associations of the
 vendored SCTP over `media_delivery`'s shaped link (`shaped`,
-`agents/roomlerd/src/media_delivery.rs:4844`; `pair_opened`, `:4983`, by either path,
-`OpenPath`, `:4968`), steps the machine every millisecond, writes what it asks, and
+`agents/roomlerd/src/media_delivery.rs:5056`; `pair_opened`, `:5195`, by either path,
+`OpenPath`, `:5180`), steps the machine every millisecond, writes what it asks, and
 after the stop waits for every byte written to be acknowledged. A grid cell's link
 serialises each direction at its rate, adds half the round trip to every packet, and
 queues up to a second, deeper than anything the train can fill (`Cell::grid`,
 `agents/roomlerd/src/media_train.rs:800`). The shaper records the longest any packet of
-the agent's waited for the wire (`peak_wait`, `agents/roomlerd/src/media_delivery.rs:4649`)
-and its tail drops (`:4100`). `broken` (`agents/roomlerd/src/media_train.rs:1084`) checks
+the agent's waited for the wire (`peak_wait`, `agents/roomlerd/src/media_delivery.rs:4861`)
+and its tail drops (`:4866`). `broken` (`agents/roomlerd/src/media_train.rs:1084`) checks
 every cell; it also checks that `floor_only` matches the stop, and that the slow start
 threshold at the first write is 0 on path C and not 0 on path I.
 
@@ -2118,8 +2184,8 @@ held it:
 
 The shaped link now adds a busy runner's scheduling noise on request, seeded so that a
 cell meets the same draws on every run (`Noise`,
-`agents/roomlerd/src/media_delivery.rs:4674`; `Draws`, `:4694`; `shaped_noisy`,
-`:4849`). Every wake-up of a task comes up to the jitter late, and about once a period
+`agents/roomlerd/src/media_delivery.rs:4886`; `Draws`, `:4906`; `shaped_noisy`,
+`:5061`). Every wake-up of a task comes up to the jitter late, and about once a period
 the scheduler takes the task's core away for up to the stall, so that a wake-up due then
 comes when it returns. On the link a wake-up is a packet's delivery, and the packets
 behind a late one wait for it, in order. Under the rule before this one, 2 ms of jitter
@@ -2170,12 +2236,12 @@ and they stand as found.
 be armed only while its `close_tx` is empty (`AckTimer::start`,
 `crates/vendored/webrtc-sctp/src/timer/ack_timer.rs:36`), and only `stop` empties it
 (`:65`). A timer that fires calls `on_ack_timeout`
-(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2380`), which
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2493`), which
 sends the SACK. Upstream it left `close_tx` set, so after one delayed acknowledgement
 timed out, the next lone packet was acknowledged only when another packet arrived and
-the immediate acknowledgement called `stop` (`:2247`), or when the sender's T3-rtx sent
+the immediate acknowledgement called `stop` (`:2344`), or when the sender's T3-rtx sent
 it again. With one message in flight the train stalled. `on_ack_timeout` now calls
-`stop` itself (`:2393`), so every lone packet arms a timer of its own. A receiver still
+`stop` itself (`:2506`), so every lone packet arms a timer of its own. A receiver still
 holds a lone packet's SACK up to 200 ms, so the cap keeps its floor of three messages,
 with which the train never waits for the timer. The fix reaches the agent's own
 receiver, for what a browser sends it, and both ends of a tunnel on `webrtc-dc-v1`. In a
@@ -2313,8 +2379,8 @@ rate noted the two part at a fall ([D50](#the-pace-of-a-real-fall-d50)), where `
 keeps damping.
 
 **The line** is `path model (FR-148 P0, shadow, ≈10s)`, at INFO, written by
-`media_delivery::emit_model` (`agents/roomlerd/src/media_delivery.rs:1501`). The delivery
-sampler takes the numbers at every pump heartbeat (`on_view`, `:962`) and writes them
+`media_delivery::emit_model` (`agents/roomlerd/src/media_delivery.rs:1504`). The delivery
+sampler takes the numbers at every pump heartbeat (`on_view`, `:979`) and writes them
 at the first heartbeat 10 s after the last line; the first heartbeat starts the count,
 and a pump that ends between two lines writes its last numbers as it drops. Each value
 is `<bps>/<provenance>/<age>ms`, or `None`. A test pins the names and their order
@@ -2390,19 +2456,19 @@ the model reading every push-back as backlogged, both fail.
 
 **The RTP pump writes no `path model` line.** It has no governor, no `Pipe` and no
 delivery sampler. Its heartbeat (`media pump heartbeat (≈1s window)`,
-`agents/roomlerd/src/peer.rs:3572`) carries no path number: `bytes_written` and
+`agents/roomlerd/src/peer.rs:3599`) carries no path number: `bytes_written` and
 `write_errors` are its only transport fields. Its one path number is REMB, the browser's
-estimate (`remb_bps` on the `applying adaptive bitrate` line, `peer.rs:3436`, written
+estimate (`remb_bps` on the `applying adaptive bitrate` line, `peer.rs:3463`, written
 when the target moves past its 15 % hysteresis): the target is the quality target,
 capped at REMB × 85 % but never below the larger of `MIN_BITRATE_BPS` and a quarter of
-the base (`peer.rs:3405`).
+the base (`peer.rs:3432`).
 
 | Where | Anchor |
 |---|---|
 | the tags and the model | `agents/roomlerd/src/encode/pipe.rs:772` (`Basis`), `:807` (`PathNumber`), `:890` (`PathModel`), `:1222` (`PathView`); `Pipe` takes the class at `:314` (`observe_delivered`) and `:400` (`observe_capacity`) |
 | the governor's tags and the view | `agents/roomlerd/src/encode/governor.rs:1648` (a delivery, classed), `:1855` (an arrival-rate push-back, classed), `:2313` (`path_view`), `:2586` (`PathTags`) |
-| the line and the seed's age | `agents/roomlerd/src/media_delivery.rs:962` (`on_view`), `:1501` (`emit_model`), `:1539` (`seed_at_open`) |
-| the pumps | `agents/roomlerd/src/peer.rs:5412` (VP9-444), `:10344` (FFmpeg), `:6648` (the FFmpeg pump's seed and its age) |
+| the line and the seed's age | `agents/roomlerd/src/media_delivery.rs:979` (`on_view`), `:1504` (`emit_model`), `:1542` (`seed_at_open`) |
+| the pumps | `agents/roomlerd/src/peer.rs:5439` (VP9-444), `:10371` (FFmpeg), `:6676` (the FFmpeg pump's seed and its age) |
 
 **The tests** (`cargo test -p roomlerd --lib -- pipe:: governor:: media_delivery`):
 
@@ -2456,7 +2522,7 @@ number is in force: each stage that changes the bound becomes its source (`retag
 
 | Bound | Source | The number in force | Anchor |
 |---|---|---|---|
-| ceiling | `plan` | the pump's own: the quality preference × the relay clamp, ÷ viewers when shared (VP9-444, `peer.rs:5002-5015`); the rate plan's maxrate ceiling, FR-35-lifted, ÷ viewers (FFmpeg, `peer.rs:8905-8940`) | `encode/governor.rs:1118` |
+| ceiling | `plan` | the pump's own: the quality preference × the relay clamp, ÷ viewers when shared (VP9-444, `peer.rs:5029-5042`); the rate plan's maxrate ceiling, FR-35-lifted, ÷ viewers (FFmpeg, `peer.rs:8932-8967`) | `encode/governor.rs:1118` |
 | ceiling | `pipe` | stage 1, the measured clamp from the blocked-send goodput, direct only | `encode/governor.rs:1127` |
 | ceiling | `learned` | FR-35's learned ceiling, constrained only. It is `learned` whenever the ceiling equals the learner's lift, so the FFmpeg pump's own lift of its plan reads `learned` too | `encode/governor.rs:1182` |
 | ceiling | `arrival` | FR-59 P3, 90 % of the viewer's arrival rate while its queue grows | `encode/governor.rs:1197` |
@@ -2521,20 +2587,20 @@ the constrained replay's still span, 0.48 Mbit/s under a 0.33 to 0.52 Mbit/s tar
 
 | Line | Field | Written |
 |---|---|---|
-| `VP9-444 set_bitrate (AIMD)` (`peer.rs:5030`) | `why` | when the target or the quality changed |
-| `VP9-444 AIMD decrease (DC buffer over high watermark)` (`peer.rs:5219`) | `why` | at each move the watermark makes |
-| `VP9-444 DC pump heartbeat (≈1s window)` (`peer.rs:5355`) | `target_moves` | every heartbeat |
-| `FFmpeg DC pump set_bitrate (AIMD)` (`peer.rs:9566`) | `why` | when the number changed, held or not (`deferred`) |
-| `FFmpeg DC pump: deferred bitrate scheduled (background rebuild)` (`peer.rs:9607`) | `why`, the held target's | when a held target starts its rebuild |
-| `FFmpeg DC pump: deferred bitrate applied at quiet` (`peer.rs:9620`) | `why`, the held target's | when a held target is applied in place |
-| `FFmpeg DC pump heartbeat (≈2s window)` (`peer.rs:10152`) | `target_moves` | every heartbeat |
+| `VP9-444 set_bitrate (AIMD)` (`peer.rs:5057`) | `why` | when the target or the quality changed |
+| `VP9-444 AIMD decrease (DC buffer over high watermark)` (`peer.rs:5246`) | `why` | at each move the watermark makes |
+| `VP9-444 DC pump heartbeat (≈1s window)` (`peer.rs:5382`) | `target_moves` | every heartbeat |
+| `FFmpeg DC pump set_bitrate (AIMD)` (`peer.rs:9593`) | `why` | when the number changed, held or not (`deferred`) |
+| `FFmpeg DC pump: deferred bitrate scheduled (background rebuild)` (`peer.rs:9634`) | `why`, the held target's | when a held target starts its rebuild |
+| `FFmpeg DC pump: deferred bitrate applied at quiet` (`peer.rs:9647`) | `why`, the held target's | when a held target is applied in place |
+| `FFmpeg DC pump heartbeat (≈2s window)` (`peer.rs:10179`) | `target_moves` | every heartbeat |
 
 `why` is the causes joined by `+`, or `none`. `target_moves` is the moves handed out since
 the last heartbeat line, as `why:count` joined by `,` in the order each first happened, or
 `none`; past 16 distinct `why`s the rest count as `more:n`. Tracing evaluates a field only
 when its line is written, so with the heartbeat filtered out nothing drains the count, and
 the bound keeps it small. The FFmpeg pump's held target is the `AppliedBitrate` itself
-(`deferred_bps`, `peer.rs:7262`), so it keeps its `why` until it lands. Made-up values:
+(`deferred_bps`, `peer.rs:7290`), so it keeps its `why` until it lands. Made-up values:
 
 ```text
 FFmpeg DC pump set_bitrate (AIMD) session_id=… codec_label="AV1" ceiling_bps=43200000 target_bps=36550000 why=increase(app-limited) deferred=false
@@ -2575,7 +2641,7 @@ target lines beside the heartbeats' `target_moves` ([production-mongo-reads.md](
 |---|---|
 | the causes | `agents/roomlerd/src/encode/aimd.rs:108` (`Congestion`), `:140` (`CeilingSource`), `:172` (`FloorSource`), `:193` (`Cause`), `:234` (`Causes`), `:419` (`take_move`) |
 | the `why` and the count | `agents/roomlerd/src/encode/governor.rs:84` (`Why`), `:124` (`Moves`), `:572` (`retag`), `:1640` (the window's R3 verdict), `:2227` (`take_moves`), `:2290` (`record_applied`) |
-| the pumps | `agents/roomlerd/src/peer.rs:5030`, `:5219`, `:5355` (VP9-444); `:9566`, `:9607`, `:9620`, `:10152` (FFmpeg); `:7262` (the held target) |
+| the pumps | `agents/roomlerd/src/peer.rs:5057`, `:5246`, `:5382` (VP9-444); `:9593`, `:9634`, `:9647`, `:10179` (FFmpeg); `:7290` (the held target) |
 
 **The tests** (`cargo test -p roomlerd --lib encode:: -- --skip clipboard::`):
 
@@ -2926,7 +2992,7 @@ of the opening takes it (`OpenPlan`, `pair_memory.rs:600`; `RateGovernor::new_wi
 
 Two lines say "remembered" when the model opened the session (ledger `p1:OPENER-3`): the
 cap detail above, and FR-59 P8's open line, "the pair is remembered slower than the
-nominal floor: opening at the remembered rate" (`agents/roomlerd/src/peer.rs:7221`), which
+nominal floor: opening at the remembered rate" (`agents/roomlerd/src/peer.rs:7249`), which
 under the model fires when its trusted opening is under 1.5 Mbit/s. Its `seed_bps` is then
 `O`, not a remembered rate; the open line's `taken=model` tells them apart. Its words stay
 until P5, since `scripts/rc-path-report.cjs` matches them.
@@ -2937,7 +3003,7 @@ ceiling at the plan's own N. **The opener's grace stays** (D27): 2 s on a constr
 session, 3 s at most, ended at 1.2 s when nothing drains. **Nothing changes for a direct
 path or the VP9 4:4:4 pump**: neither reads either memory. In the pump the change is in
 place: `new_with` with `pair_memory.plan()`, and the two encoder opens read
-`open_at_bps` (`agents/roomlerd/src/peer.rs:7212`, `:8757`, `:8959`).
+`open_at_bps` (`agents/roomlerd/src/peer.rs:7240`, `:8784`, `:8986`).
 
 | Test | Shows |
 |---|---|
@@ -3043,7 +3109,7 @@ in `media_delivery`, so the env-read count of the FR-135 ratchet does not move.
 | the governor's opening | `agents/roomlerd/src/encode/governor.rs:597` (`new_with`), `:709` (`open_at_bps`), `:718` (`opening_of`) |
 | the gate's verdict before the fold | `agents/roomlerd/src/encode/governor.rs:1648`; `Pipe` at `agents/roomlerd/src/encode/pipe.rs:332` (`observe_delivered_in`), `:1213` (`PathModel::offer`) |
 | the samples' push-backs (D46 B2) | `agents/roomlerd/src/encode/governor.rs:1636` (the take they are filed under), `:2359` (`on_sample_push_back`), `:2370` (`note_path_stall`); `agents/roomlerd/src/encode/pipe.rs:518` (`observe_sample_capacity`), `:537` (`note_stall`), `:1016` (`PathModel::sample_pushed_back`); `agents/roomlerd/src/encode/pair_memory.rs:1071` (`sample_pushed_back_in`) |
-| the FFmpeg pump | `agents/roomlerd/src/peer.rs:6638` (open), `:7212` (`new_with`), `:7232` (`at_open`), `:9331` (`window`), `:9422` (`opener_measured`) |
+| the FFmpeg pump | `agents/roomlerd/src/peer.rs:6666` (open), `:7240` (`new_with`), `:7260` (`at_open`), `:9358` (`window`), `:9449` (`opener_measured`) |
 
 **The tests** (`cargo test -p roomlerd --lib -- pair_memory governor:: media_delivery`):
 
@@ -3286,17 +3352,17 @@ The RTP pump has no SCTP association and no budget.
 instant through the send channel, and the send task records the frame's wait, from that
 hand-off to the moment SCTP took its last chunk, in the delivery sampler's `SendWait`
 (`agents/roomlerd/src/media_inflight.rs:1392`; the sampler's handle,
-`agents/roomlerd/src/media_delivery.rs:1275`), whatever the budget's mode. A frame records
+`agents/roomlerd/src/media_delivery.rs:1292`), whatever the budget's mode. A frame records
 only once it reached the wire, after its last chunk (the VP9-444 send task,
-`agents/roomlerd/src/peer.rs:4350`; the FFmpeg one, `:7410`): a failed send, a stale frame
+`agents/roomlerd/src/peer.rs:4376`; the FFmpeg one, `:7436`): a failed send, a stale frame
 or one dropped on a closed channel records nothing. Each reader drains its own window. A
 heartbeat takes it whole, and the FFmpeg pump's two readers between heartbeats, FR-74 P1b's
-direct gate (`:8041`) and FR-71 T1a's sender window (`:9265`), each read from where it last
+direct gate (`:8068`) and FR-71 T1a's sender window (`:9292`), each read from where it last
 read (`SendWaitSince`, `agents/roomlerd/src/media_inflight.rs:1456`), as their own cursors
 did. Both heartbeats print `send_wait_avg_ms`, the window's average in whole µs, as ms (0
 with no frame), and `send_wait_max_ms`, its longest: the FFmpeg heartbeat over its 2 s
-(`agents/roomlerd/src/peer.rs:10020`), the VP9-444 heartbeat over its 30 encoded frames
-(`:5341`). Only the FFmpeg pump hands the figure to its governor; the VP9-444 governor gets
+(`agents/roomlerd/src/peer.rs:10047`), the VP9-444 heartbeat over its 30 encoded frames
+(`:5368`). Only the FFmpeg pump hands the figure to its governor; the VP9-444 governor gets
 nothing new.
 
 **Shadow acts on nothing.** Every call into the budget returns nothing to the pump; the
@@ -3313,7 +3379,7 @@ verdict reaches the line's counters and nothing else.
 `ROOMLERD_INFLIGHT_BUDGET`, or the config key `inflight_budget`, read once per pump
 beside `ROOMLERD_PATH_MODEL` (`media_inflight::mode`,
 `agents/roomlerd/src/media_inflight.rs:160`, from `DeliverySampler::from_env`,
-`agents/roomlerd/src/media_delivery.rs:680`):
+`agents/roomlerd/src/media_delivery.rs:687`):
 
 | Value | The pumps |
 |---|---|
@@ -4227,11 +4293,11 @@ the larger of its own rate and the budget's rate at its close (`Over::rate`;
 `media_delivery::sample_read_of`,
 `agents/roomlerd/src/media_delivery.rs:442`). With a loss in it the
 sample's two-second mean reads SCTP's recovery as well as the path: a T3 cuts the window to
-one packet (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2465-2466`),
-which then regrows in slow start, and a fast retransmit halves it (`:1442-1443`), each lost
+one packet (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2578-2579`),
+which then regrows in slow start, and a fast retransmit halves it (`:1528-1529`), each lost
 chunk crossing the link twice and counted once. The budget's rate is the most of the same
 clock's one-second figures, and the clock counts what a gap block says the peer holds
-(`:1261-1262`), what reached the peer in any order. So the rate reads the second the
+(`:1342-1343`), what reached the peer in any order. So the rate reads the second the
 recovery cost least, and it follows the path down: every second holds once the path carries
 less than the budget lets out. Keeping such samples out never followed a real fall (0 of 6
 on the halving cell), and a discount has nothing to measure it by. A P3 with no loss in it,
@@ -4277,7 +4343,7 @@ windows back: over the window, or over the window's length before it, since a ho
 reaches the viewer a round trip or so after the retransmission the count counts (39 of 43
 over-link windows had it in their own span; the look-back caught the rest). The governor
 hears the budget's last step beside its stall mark (`DeliverySampler::note_path_rate`,
-`agents/roomlerd/src/media_delivery.rs:1073`, after each
+`agents/roomlerd/src/media_delivery.rs:1090`, after each
 step in shadow and after the gate's under `on`; `RateGovernor::note_path_rate`,
 `agents/roomlerd/src/encode/governor.rs:2393`): the rate, whether this
 association's figures gave it, and SCTP's fast retransmits and T3 expiries, summed over the
@@ -4317,7 +4383,7 @@ reading out of the shadow model, re-read it or bounded it, and how long ago: `st
 stall gate, which had no field of its own), `reread` (rule 1), `ramp` (rule 4), `bound` (rule
 2) or `hole` (rule 3), as `<word>/<age>ms`, or `-` while none has (`Pipe::note_ruled`,
 `agents/roomlerd/src/encode/pipe.rs:601`; the line's field,
-`agents/roomlerd/src/media_delivery.rs:1528`). A sample's rule is
+`agents/roomlerd/src/media_delivery.rs:1531`). A sample's rule is
 named at the heartbeat that hands it, and only where the push-back would have reached the
 model: after a window the gate rejected B2 files none, so no rule acted on one
 (`RateGovernor::on_sample_ruled`). A rule 4 sample still takes the sampler's slot as B2's P3
@@ -4351,7 +4417,7 @@ application-limited sample on the 80 % cells was a P3 (a backlogged writer's lea
 held 0.40 of its whole grains or more), and the loaded cells ended 0 of 56 off.
 `Over::held` has one reader, `sample_read_of`
 (`agents/roomlerd/src/media_delivery.rs:442`), which `push_back_of` wraps and the sampler
-calls at a sample's close (`DeliverySampler::on_reading_with`, `:864`): no admission
+calls at a sample's close (`DeliverySampler::on_reading_with`, `:877`): no admission
 decision reads it.
 
 **The bar.** The `tcp_shape` harness folds every run through the product's rules
@@ -4562,7 +4628,7 @@ grammar: `<from_bps>-><to_bps>/<age>ms`, the floor before and after the last fal
 long ago, or `-` while there has been none (`PathModel::fell`,
 `agents/roomlerd/src/encode/pipe.rs:1082`; `PathView::model_fell`, `:1257`; `path_view`,
 `agents/roomlerd/src/encode/governor.rs:2349`; the field,
-`agents/roomlerd/src/media_delivery.rs:1531`). A busy line now ends
+`agents/roomlerd/src/media_delivery.rs:1534`). A busy line now ends
 `model_rule=hole/3400ms model_fell=2131000->1162000/61300ms` and an idle one
 `model_rule=- model_fell=-`, 36 and 13 bytes more
 ([§ Path numbers and their provenance](#path-numbers-and-their-provenance-fr-148-p0--how-each-was-obtained-and-how-old-it-is)).
@@ -4583,7 +4649,7 @@ word (`d50`), beside the law before D50 (`d48`: the same `Pipe` passed no clock,
 `Pipe::set_unclocked`, `agents/roomlerd/src/encode/pipe.rs:595`), B2 as built (`c`) and rules
 1 to 3 alone (`rr+bm0+u90+l`), and prints each fall of the product's fold: its time, the
 push-back, and the floor before and after (`print_drop`,
-`agents/roomlerd/src/media_delivery.rs:6925`). Every fold reads the same run, so each
+`agents/roomlerd/src/media_delivery.rs:7137`). Every fold reads the same run, so each
 comparison with `d48` is paired: "fixed" is a run off the bar under `d48` and on it under
 `d50`, "broke" the reverse, "moved" any change of the end floor or capacity. The bar and its
 count are D48's ([above](#a-path-that-drops-who-bound-the-sample-d48)): the budget writers
@@ -4724,17 +4790,17 @@ flowchart LR
 ```
 
 **The closed loop (B4c).** `media_delivery::shaped_link::tcp_shape::closed_loop`
-(`agents/roomlerd/src/media_delivery.rs:9094`) runs the VP9-444 pump's own loop on a relay
+(`agents/roomlerd/src/media_delivery.rs:9306`) runs the VP9-444 pump's own loop on a relay
 session: the pump's gate and its 2 ms retry, a 30 fps capture, the real governor (its
 AIMD, fps cap, age loop, link loop and drain), and an encoder that spends its target over
 the gap between the pts it is handed (`encode::charge`), as libvpx's one-pass CBR does,
 against a viewer that reports as the browser does. The path is B3T's: 2 Mbit/s on the wire, of which SCTP's
 payload gets E_sat = 0.8137, behind a 512 KiB first hop as the relay's socket holds on
 TURN over TCP (`HOP`), with the relay's stalls on the agent's direction (`RELAY_STALLS`,
-`:9144`), deltas of at most 40 kB (`DELTA_MOST`, `:9130`) and an 800 kB opening key
-(`OPENING_KEY`, `:9137`). `run_loop` (`:9942`) runs one arm, `read` (`:10053`) and `gate`
-(`:10358`) read it, and `print_gate` (`:10617`) prints the trail the lab reads by
-heartbeat. The cell (`:10683`) runs `off` for 90 s, then `on` for 240 s. `off` must fill
+`:9356`), deltas of at most 40 kB (`DELTA_MOST`, `:9342`) and an 800 kB opening key
+(`OPENING_KEY`, `:9349`). `run_loop` (`:10154`) runs one arm, `read` (`:10265`) and `gate`
+(`:10570`) read it, and `print_gate` (`:10829`) prints the trail the lab reads by
+heartbeat. The cell (`:10895`) runs `off` for 90 s, then `on` for 240 s. `off` must fill
 at least 0.95 of the payload over a standing queue of more than 500 ms. For B4, `on`,
 from the prior's crossing of the band or else over its last 60 s, had to fill at least
 0.92 of the payload and 0.95 of `off`, with the fps divisor at 2 or more in at most a
@@ -4764,10 +4830,10 @@ the lab's 0.84-1.16 MB on TCP; that gap is the harness's, and it does not change
 
 | Step | What changed | Where |
 |---|---|---|
-| B4a-1 | A hold that shut the pass by itself is no AIMD event. The pass hears it (`Pass::hears_hold`), and the governor keeps the hold's capacity facts (the opener's `slow_start_congested`, FR-63's shadow sample) without the full-channel sample. A pass the send channel or a follower shut still decreases. A hold in a still span is neither (D46). | `agents/roomlerd/src/media_inflight.rs:1558` (`Pass::decreases`), `:1567` (`Pass::hears_hold`); `agents/roomlerd/src/media_delivery.rs:1218` (`DeliverySampler::on_skip`); `agents/roomlerd/src/encode/governor.rs:69` (`GateSkip`), `:1056` (`on_gate_skip`), `:1073` (`on_budget_hold`); `agents/roomlerd/src/peer.rs:4522` (the VP9-444 pump), `:8168` (the FFmpeg pump) |
-| B4b | While the budget held a frame in the last second outside a still span (`Budget::held_lately`), its measured rate bounds the target's ceiling, at gain 1.0, in a stage after FR-59 P3's arrival bound. The moves name it `ceiling(budget)`. | `agents/roomlerd/src/media_inflight.rs:811` (`Budget::held_lately`), `:602` (`open_hold`); `agents/roomlerd/src/encode/pipe.rs:215` (`PathRate::acts`), `:220` (`PathRate::held`); `agents/roomlerd/src/media_delivery.rs:1073` (`DeliverySampler::note_path_rate`); `agents/roomlerd/src/encode/governor.rs:2408` (`budget_held_bps`), `:1208` (the stage in `pre_encode_tick`); `agents/roomlerd/src/encode/aimd.rs:152` (`CeilingSource::Budget`) |
+| B4a-1 | A hold that shut the pass by itself is no AIMD event. The pass hears it (`Pass::hears_hold`), and the governor keeps the hold's capacity facts (the opener's `slow_start_congested`, FR-63's shadow sample) without the full-channel sample. A pass the send channel or a follower shut still decreases. A hold in a still span is neither (D46). | `agents/roomlerd/src/media_inflight.rs:1558` (`Pass::decreases`), `:1567` (`Pass::hears_hold`); `agents/roomlerd/src/media_delivery.rs:1235` (`DeliverySampler::on_skip`); `agents/roomlerd/src/encode/governor.rs:69` (`GateSkip`), `:1056` (`on_gate_skip`), `:1073` (`on_budget_hold`); `agents/roomlerd/src/peer.rs:4549` (the VP9-444 pump), `:8195` (the FFmpeg pump) |
+| B4b | While the budget held a frame in the last second outside a still span (`Budget::held_lately`), its measured rate bounds the target's ceiling, at gain 1.0, in a stage after FR-59 P3's arrival bound. The moves name it `ceiling(budget)`. | `agents/roomlerd/src/media_inflight.rs:811` (`Budget::held_lately`), `:602` (`open_hold`); `agents/roomlerd/src/encode/pipe.rs:215` (`PathRate::acts`), `:220` (`PathRate::held`); `agents/roomlerd/src/media_delivery.rs:1090` (`DeliverySampler::note_path_rate`); `agents/roomlerd/src/encode/governor.rs:2408` (`budget_held_bps`), `:1208` (the stage in `pre_encode_tick`); `agents/roomlerd/src/encode/aimd.rs:152` (`CeilingSource::Budget`) |
 | B4b-2 | The same rate is what the sender measured: `measured_bps` reads it where the blocked-send goodput stood (`sent_bps`). It re-anchors the prior (FR-70), and FR-59's relief and its learner stand on it. While the budget acts and has not held lately, the sender has no reading, and the opening's goodput is never read. | `agents/roomlerd/src/encode/governor.rs:2445` (`sent_bps`), `:2455` (`sent_tagged`), `:883` (`measured_bps`), `:1970` (the prior's reading in `tick_viewer_window`), `:2401` (`budget_acts`) |
-| B4a-2 | The envelope: S + the window's largest frame ÷ the budget's rate, the frame term at most 100 ms, carried on `PathRate::envelope_ms`. Both of the age loop's thresholds and the prior's `age_elevated` move up by it. | `agents/roomlerd/src/media_delivery.rs:359` (`envelope_ms`), `:353` (`ENVELOPE_FRAME_MAX_MS`), `:372` (`Largest`), `:1255` (`on_handed`, which notes each frame); `agents/roomlerd/src/encode/pipe.rs:224` (`PathRate::envelope_ms`); `agents/roomlerd/src/encode/viewer_rate.rs:779` (`AgeLoop::observe_within`); `agents/roomlerd/src/encode/governor.rs:1770` (the envelope in `tick_viewer_window`), `:2418` (`budget_envelope_ms`) |
+| B4a-2 | The envelope: S + the window's largest frame ÷ the budget's rate, the frame term at most 100 ms, carried on `PathRate::envelope_ms`. Both of the age loop's thresholds and the prior's `age_elevated` move up by it. | `agents/roomlerd/src/media_delivery.rs:359` (`envelope_ms`), `:353` (`ENVELOPE_FRAME_MAX_MS`), `:372` (`Largest`), `:1272` (`on_handed`, which notes each frame); `agents/roomlerd/src/encode/pipe.rs:224` (`PathRate::envelope_ms`); `agents/roomlerd/src/encode/viewer_rate.rs:779` (`AgeLoop::observe_within`); `agents/roomlerd/src/encode/governor.rs:1770` (the envelope in `tick_viewer_window`), `:2418` (`budget_envelope_ms`) |
 
 What stays:
 
@@ -4848,7 +4914,7 @@ the hold is the restoring force.
 | the interval | `1/target_fps`, or FR-112's paced rate while `paced_software_fps()` is in force, times the skip divisor (`RateGovernor::charge_most`) |
 | charged | the gap today's pts gives (the capture's time, or #3472's time since the last encode for a frame fed again), at most the interval; a budget hold, a channel-full skip, a drain pause or an idle stretch past it is not charged |
 | elsewhere | `off`, `shadow` and a direct session: no bound, and the pts handed is today's, byte for byte |
-| what stays | the gain (1.0), the encoder's `duration`, and the wire's frame stamp (`agent_epoch_us()` at framing, `agents/roomlerd/src/peer.rs:5247`), which the viewer paints by |
+| what stays | the gain (1.0), the encoder's `duration`, and the wire's frame stamp (`agent_epoch_us()` at framing, `agents/roomlerd/src/peer.rs:5274`), which the viewer paints by |
 
 The encoder keeps today's pts beside the one it was handed (`encode::charge::Stamp`), and
 only the gap is bounded. With no bound the pts handed is today's exactly; after a bounded
@@ -4964,7 +5030,7 @@ and no state the thread shares.
 | the interval | B4f's: `1/target_fps`, or FR-112's paced rate while it is in force, times the skip divisor (`RateGovernor::charge_interval`, B4f's `charge_most` renamed), now the charge's floor |
 | charged | `max(gap - gated, min(gap, interval))`: the gap today's pts gives (the capture's time, or #3472's time since the last encode for a frame fed again), less the time gated, never less than the interval, or than the gap where that is shorter (`encode::charge::charge`) |
 | elsewhere | `off`, `shadow` and a direct session: no gate, and the pts handed is today's, byte for byte. The FFmpeg pump is unchanged |
-| what stays | the gain (1.0), the encoder's `duration`, and the wire's frame stamp (`agent_epoch_us()` at framing, `agents/roomlerd/src/peer.rs:5247`), which the viewer paints by |
+| what stays | the gain (1.0), the encoder's `duration`, and the wire's frame stamp (`agent_epoch_us()` at framing, `agents/roomlerd/src/peer.rs:5274`), which the viewer paints by |
 
 **What the gate does not see.** Two waits B4f bounded are now charged, in whole or in
 part, because the gate did not make them. A third, the drain pause, is gated since FR-148:
@@ -4973,7 +5039,7 @@ part, because the gate did not make them. A third, the drain pause, is gated sin
   pass through, its capture included. The pump's drain arm marks that pass on the gate
   clock as one the gate skipped, from the instant the gate let it through
   (`GateClock::paused`, `agents/roomlerd/src/encode/charge.rs:141`, called at
-  `agents/roomlerd/src/peer.rs:4961`), and the next pass the gate lets through closes the
+  `agents/roomlerd/src/peer.rs:4988`), and the next pass the gate lets through closes the
   span. An encode after a pause with nothing else gated is charged the interval, where B4g
   charged its whole gap (C16, below); a span opened only where the pause sleeps would gate
   10 ms of each paused pass's 33. Where the budget does not act the clock's time is never
@@ -5107,36 +5173,36 @@ encoder is never handed.
 | Where | Anchor |
 |---|---|
 | the core | `agents/roomlerd/src/media_inflight.rs:544` (`Budget`), `:718` (`step`), `:1301` (`size`), `:1124` (`rate_at`), `:1222` (`held_throughout`), `:1101` (`fold_least`), `:1241` (`watch_still`), `:1079` (`take_window`), `:963` (`reset_least`), `:972` (`on_new_association`) |
-| the stall classifier | `agents/roomlerd/src/media_inflight.rs:115` (`BURST_PERMILLE`), `:121` (`BURST_WITHIN`), `:125` (`HOL_RELEASES`), `:235` (`Classifier`), `:1034` (`read_release`), `:1021` (`through`), `:1011` (`still_age`), `:1002` (`forget_releases`), `:748` (the write-through's verdict in `step`), `:1153` (the rate's start in `rate_at`); its fields: `agents/roomlerd/src/media_delivery.rs:1422` (`budget_released`) |
+| the stall classifier | `agents/roomlerd/src/media_inflight.rs:115` (`BURST_PERMILLE`), `:121` (`BURST_WITHIN`), `:125` (`HOL_RELEASES`), `:235` (`Classifier`), `:1034` (`read_release`), `:1021` (`through`), `:1011` (`still_age`), `:1002` (`forget_releases`), `:748` (the write-through's verdict in `step`), `:1153` (the rate's start in `rate_at`); its fields: `agents/roomlerd/src/media_delivery.rs:1431` (`budget_released`) |
 | the pump's side | `agents/roomlerd/src/media_inflight.rs:1598` (`Shadow`), `:1630` (`for_pump`), `:1667` (`on_frame`), `:1680` (`on_frame_with`), `:1844` (`on_pair_check`); the count: `:1316` (`PumpBytes`), `:1335` (`PumpCount`), `:1355` (`Unsent`) |
-| the sampler and the line | `agents/roomlerd/src/media_delivery.rs:656` (the field), `:1022` (`on_frame`), `:1093` (`on_pair_check`), `:1103` (`note_gate`), `:1255` (`on_handed`), `:1264` (`pump_count`), `:950` (`report`), `:1363` (`emit`) |
-| the VP9-444 pump | `agents/roomlerd/src/peer.rs:4295` (the send task's count), `:4310` and `:4339` (each frame taken, each chunk released), `:4394` (the pair), `:4512` (the gate's count), `:4531` (the step), `:5226` (the watermark), `:5261` (`on_handed`), `:5278` (a full channel) |
-| the FFmpeg pump | `agents/roomlerd/src/peer.rs:7315` (the send task's count), `:7337` and `:7393` (each frame taken, each chunk released), `:7728` (the pair), `:8122` (the gate's count, the ledger beside the channel), `:8197` (the step), `:9916` (`on_handed`), `:9942` (a full channel) |
-| the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3504` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2157` (its echo), `:2745` (its check) |
-| the harness's outages and reads | `agents/roomlerd/src/media_delivery.rs:4578` (`Outages`), `:4797` (`out_direction`), `:7274` (`outaged`), `:8424` (`print_releases`), `:8484` (`recoveries`), `:8640` (`stalls_against_today`), `:8869` (`outages_against_today`) |
+| the sampler and the line | `agents/roomlerd/src/media_delivery.rs:659` (the field), `:1039` (`on_frame`), `:1110` (`on_pair_check`), `:1120` (`note_gate`), `:1272` (`on_handed`), `:1281` (`pump_count`), `:965` (`report`), `:1388` (`emit`) |
+| the VP9-444 pump | `agents/roomlerd/src/peer.rs:4323` (the send task's count), `:4337` and `:4365` (each frame taken, each chunk released), `:4420` (the pair), `:4539` (the gate's count), `:4558` (the step), `:5253` (the watermark), `:5288` (`on_handed`), `:5305` (a full channel) |
+| the FFmpeg pump | `agents/roomlerd/src/peer.rs:7343` (the send task's count), `:7364` and `:7419` (each frame taken, each chunk released), `:7754` (the pair), `:8149` (the gate's count, the ledger beside the channel), `:8224` (the step), `:9943` (`on_handed`), `:9969` (a full channel) |
+| the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3513` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2165` (its echo), `:2754` (its check) |
+| the harness's outages and reads | `agents/roomlerd/src/media_delivery.rs:4790` (`Outages`), `:5009` (`out_direction`), `:7486` (`outaged`), `:8636` (`print_releases`), `:8696` (`recoveries`), `:8852` (`stalls_against_today`), `:9081` (`outages_against_today`) |
 | B2's view of the budget | `agents/roomlerd/src/media_inflight.rs:625` (`Over`), `:868` (`over`), `:925` (`held_each`), `:820` (`still_after`), `:833` (`take_mark`), `:738` (the mark in `step`), `:1873` (`Shadow::take_mark`); the opening: `:644` (`Over::opening`), `:897` (its reading in `over`), `:734` (the first measured rate, in `step`), `:1175` (the rate's provenance, in `rate_at`), `:986` (a new association's opening, in `on_new_association`) |
-| B2's push-backs | `agents/roomlerd/src/media_delivery.rs:255` (`SamplePushBack`), `:277` (`Burst`), `:321` (`BURST`), `:331` (`settle`), `:412` (`push_back_of`), `:454` (P3, with the opening's), `:889` (`Budget::over` at a sample's close), `:742` (`heartbeat`, the hand-off), `:775` (`due_read`), `:785` (`on_mark`), `:1022` (`on_frame`, the mark) |
+| B2's push-backs | `agents/roomlerd/src/media_delivery.rs:255` (`SamplePushBack`), `:277` (`Burst`), `:321` (`BURST`), `:331` (`settle`), `:412` (`push_back_of`), `:454` (P3, with the opening's), `:902` (`Budget::over` at a sample's close), `:755` (`heartbeat`, the hand-off), `:788` (`due_read`), `:798` (`on_mark`), `:1039` (`on_frame`, the mark) |
 | the shadow model and the memory | `agents/roomlerd/src/encode/pipe.rs:295` (`STALL_WINDOWS`), `:518` (`observe_sample_capacity`), `:537` (`note_stall`), `:938` (`PushedBy`), `:1016` (`PathModel::sample_pushed_back`); `agents/roomlerd/src/encode/governor.rs:1636` (the window's take), `:2359` (`on_sample_push_back`), `:2370` (`note_path_stall`); `agents/roomlerd/src/encode/pair_memory.rs:1071` (`sample_pushed_back_in`) |
-| the harness's B2 | `agents/roomlerd/src/media_delivery.rs:6249` (`handed`), `:6291` (`model_fold`), `:6566` (`print_b2`); the opening rules: `:6099` (`Open`), `:6117` (`OPENS`), `:6142` (`holds_over`), `:6167` (`opening_of`) |
+| the harness's B2 | `agents/roomlerd/src/media_delivery.rs:6461` (`handed`), `:6503` (`model_fold`), `:6778` (`print_b2`); the opening rules: `:6311` (`Open`), `:6329` (`OPENS`), `:6354` (`holds_over`), `:6379` (`opening_of`) |
 | B3's gate | `agents/roomlerd/src/media_inflight.rs:1507` (`Pass`), `:1535` (`Pass::shuts`), `:1558` (`decreases`), `:1573` (`sheds`), `:1738` (`Shadow::gate`), `:1761` (`gate_with`), `:1797` (`acts_on`), `:1804` (`acting`), `:1824` (`shut`), `:1835` (`shed`), `:1630` (`for_pump`, with no warning), `:839` (`Budget::stalled`), `:851` (`note_acted_hold`), `:299` (`WindowReport::acted`) |
-| B3's sampler | `agents/roomlerd/src/media_delivery.rs:1122` (`DeliverySampler::gate`), `:1184` (`gated`: the stall mark and the mode line), `:1204` (`shuts`), `:1218` (`on_skip`), `:1231` (`sheds`), `:1022` (`on_frame`, which reads nothing while the budget acts), `:1103` (`note_gate`), `:1339` (`say_budget_mode`), `:1424` (the fields) |
-| B3 in the pumps | the VP9-444 pump: `agents/roomlerd/src/peer.rs:4508` (the budget's gate), `:4509` (the capacity gate), `:4522` (the decrease), `:4527` (the 2 ms sleep), `:5213` (the watermark arm); the FFmpeg pump: `:8066` (today's byte gate), `:8093` (FR-70's check of it), `:8107` (the budget's gate), `:8108` (the capacity gate), `:8126` (the fps pause), `:8148` (FR-35's stuck timer), `:8166` (the grace), `:8168` (the decrease) |
-| the harness's B3 | `agents/roomlerd/src/media_delivery.rs:5540` (`Budgeted::On`), `:5683` (`Core::On`), `:7485` (its writer), `:7182` (`TcpRun::acted`), `:8585` (`turned_on`), `:9014` (`print_b3`), `:9055` (the cell) |
-| D48's sample rules | `agents/roomlerd/src/media_delivery.rs:442` (`sample_read_of`: rule 1's re-read, rule 4's ramp), `:264` (`SampleRead`), `:412` (`push_back_of`), `:775` (`due_read`), `:765` (the heartbeat's hand-off); `agents/roomlerd/src/media_inflight.rs:651` (`Over::ramp`), `:655` (`Over::rate`), `:954` (`ramp_sized`), `:759` (the mask, in `step`), `:529` (`whole_grains`), `:925` (`held_each`), `:104` (`HELD_SHARE_PERCENT`); `agents/roomlerd/src/encode/governor.rs:2380` (`on_sample_ruled`) |
-| D48's window rules | `agents/roomlerd/src/media_delivery.rs:342` (`path_rate`), `:1073` (`DeliverySampler::note_path_rate`); `agents/roomlerd/src/media_inflight.rs:913` (`Budget::loss`), `:979` (its sum across associations); `agents/roomlerd/src/encode/governor.rs:2393` (`note_path_rate`), `:1855` (the link loop's push-back); `agents/roomlerd/src/encode/pipe.rs:202` (`PathRate`), `:267` (`WindowRule`), `:284` (`HOLE_TENTHS`), `:621` (`close_window`), `:332` (`observe_delivered_in`), `:417` (`observe_capacity_in`), `:435` (`observe_link_capacity_in`) |
-| D48's line field | `agents/roomlerd/src/encode/pipe.rs:231` (`Ruled`), `:601` (`note_ruled`), `:607` (`ruled`), `:1254` (`PathView::model_ruled`); `agents/roomlerd/src/media_delivery.rs:1474` (`RuledShown`), `:1528` (the field) |
-| the harness's D48 | `agents/roomlerd/src/media_delivery.rs:6195` (`Rules`, the folds), `:6235` (`RULES`), `:6332` (`fold_with`), `:6298` (`path_rate_at`), `:5796` (`Step::ramp_held`), `:6925` (`print_drop`), `:6735` (`print_held`) |
+| B3's sampler | `agents/roomlerd/src/media_delivery.rs:1139` (`DeliverySampler::gate`), `:1201` (`gated`: the stall mark and the mode line), `:1221` (`shuts`), `:1235` (`on_skip`), `:1248` (`sheds`), `:1039` (`on_frame`, which reads nothing while the budget acts), `:1120` (`note_gate`), `:1363` (`say_budget_mode`), `:1433` (the fields) |
+| B3 in the pumps | the VP9-444 pump: `agents/roomlerd/src/peer.rs:4535` (the budget's gate), `:4536` (the capacity gate), `:4549` (the decrease), `:4554` (the 2 ms sleep), `:5240` (the watermark arm); the FFmpeg pump: `:8093` (today's byte gate), `:8120` (FR-70's check of it), `:8134` (the budget's gate), `:8135` (the capacity gate), `:8153` (the fps pause), `:8175` (FR-35's stuck timer), `:8193` (the grace), `:8195` (the decrease) |
+| the harness's B3 | `agents/roomlerd/src/media_delivery.rs:5752` (`Budgeted::On`), `:5895` (`Core::On`), `:7697` (its writer), `:7394` (`TcpRun::acted`), `:8797` (`turned_on`), `:9226` (`print_b3`), `:9267` (the cell) |
+| D48's sample rules | `agents/roomlerd/src/media_delivery.rs:442` (`sample_read_of`: rule 1's re-read, rule 4's ramp), `:264` (`SampleRead`), `:412` (`push_back_of`), `:788` (`due_read`), `:778` (the heartbeat's hand-off); `agents/roomlerd/src/media_inflight.rs:651` (`Over::ramp`), `:655` (`Over::rate`), `:954` (`ramp_sized`), `:759` (the mask, in `step`), `:529` (`whole_grains`), `:925` (`held_each`), `:104` (`HELD_SHARE_PERCENT`); `agents/roomlerd/src/encode/governor.rs:2380` (`on_sample_ruled`) |
+| D48's window rules | `agents/roomlerd/src/media_delivery.rs:342` (`path_rate`), `:1090` (`DeliverySampler::note_path_rate`); `agents/roomlerd/src/media_inflight.rs:913` (`Budget::loss`), `:979` (its sum across associations); `agents/roomlerd/src/encode/governor.rs:2393` (`note_path_rate`), `:1855` (the link loop's push-back); `agents/roomlerd/src/encode/pipe.rs:202` (`PathRate`), `:267` (`WindowRule`), `:284` (`HOLE_TENTHS`), `:621` (`close_window`), `:332` (`observe_delivered_in`), `:417` (`observe_capacity_in`), `:435` (`observe_link_capacity_in`) |
+| D48's line field | `agents/roomlerd/src/encode/pipe.rs:231` (`Ruled`), `:601` (`note_ruled`), `:607` (`ruled`), `:1254` (`PathView::model_ruled`); `agents/roomlerd/src/media_delivery.rs:1477` (`RuledShown`), `:1531` (the field) |
+| the harness's D48 | `agents/roomlerd/src/media_delivery.rs:6407` (`Rules`, the folds), `:6447` (`RULES`), `:6544` (`fold_with`), `:6510` (`path_rate_at`), `:6008` (`Step::ramp_held`), `:7137` (`print_drop`), `:6947` (`print_held`) |
 | D50's fall event | `agents/roomlerd/src/encode/pipe.rs:890` (`PathModel`: `run`, `fell`), `:1059` (`under_floor`: the event, the level and the run), `:1024` (`sample_pushed_back_clocked`), `:1124` (`pushed_back_clocked`), `:1163` (`raise`, which closes a run), `:148` (`CAPACITY_TTL`); the clock: `:580` (`Pipe::clock`), `:477-478` (`capacity_in`), `:528-529` (`observe_sample_capacity`); the memory's calls, with no clock: `agents/roomlerd/src/encode/pair_memory.rs:1047-1048` |
-| D50's line field | `agents/roomlerd/src/encode/pipe.rs:916` (`Fall`), `:1082` (`PathModel::fell`), `:1257` (`PathView::model_fell`); `agents/roomlerd/src/encode/governor.rs:2349` (`path_view`); `agents/roomlerd/src/media_delivery.rs:1487` (`FellShown`), `:1531` (the field) |
-| the harness's D50 | `agents/roomlerd/src/media_delivery.rs:6203` (`Rules::D50`, the product's fold), `:6229` (`Rules::clocked`), `:6343` (the law before D50 for the other folds: `Pipe::set_unclocked`, `agents/roomlerd/src/encode/pipe.rs:595`), `agents/roomlerd/src/media_delivery.rs:6383` and `:6487` (a fall marked at a sample's hand-off and at a window's push-back), `:6084` (`ModelFold::falls`), `:6925` (`print_drop`: the `D50 falls` and `D50 fall` lines) |
-| B4's owners (D51) | `agents/roomlerd/src/media_inflight.rs:1558` (`Pass::decreases`), `:1567` (`Pass::hears_hold`), `:811` (`Budget::held_lately`); `agents/roomlerd/src/media_delivery.rs:1218` (`on_skip`), `:1073` (`note_path_rate`), `:359` (`envelope_ms`), `:372` (`Largest`); `agents/roomlerd/src/encode/governor.rs:69` (`GateSkip`), `:1073` (`on_budget_hold`), `:1208` (the budget's ceiling), `:2445` (`sent_bps`), `:1770` (the envelope); `agents/roomlerd/src/encode/viewer_rate.rs:779` (`observe_within`); `agents/roomlerd/src/encode/aimd.rs:152` (`CeilingSource::Budget`) |
-| the harness's B4c | `agents/roomlerd/src/media_delivery.rs:9094` (`closed_loop`), `:9942` (`run_loop`), `:10053` (`read`), `:10358` (`gate`), `:10617` (`print_gate`), `:10683` (the cell) |
-| B4f's and B4g's charge (D51) | `agents/roomlerd/src/encode/charge.rs:30` (`Stamp`), `:52` (`refed_pts`, #3472's rule, moved from `encode::libvpx`), `:68` (`Gate`), `:82` (`charge`), `:115` (`GateClock`), `:125` (`skipped`), `:130` (`passed`), `:141` (`paused`, FR-148), `:149` (`take`); `agents/roomlerd/src/encode/governor.rs:2430` (`charge_interval`); `agents/roomlerd/src/encode/thread.rs:81` (`EncoderOps::encode_charged`), `:121` (`Cmd::Encode`, which carries the gate), `:238` (`EncoderThread::encode_charged`), `:316` (the encode arm of the thread's `serve`), `:427` (`EncoderHandle::encode_charged`); `agents/roomlerd/src/encode/libvpx.rs:168` (`last_pts`), `:649` (`encode_at`), `:727` (the charge in `encode_at`), `:755` (the stamp kept after an encode), `:844` (`encode_charged`); `agents/roomlerd/src/peer.rs:4032` (`gate_clock`), `:4511` (a pass the gate skipped), `:4530` (the pass it let through), `:4961` (a drain pause, FR-148), `:5041` (the hand-off before the encode), `:5046` (`encode_charged`), `:5247` (the wire's stamp, untouched) |
-| B4g's source of the measured reading | `agents/roomlerd/src/encode/pipe.rs:966` (`MeasuredBy`), `:987` (`word_of`), `:1230` (`PathView::measured_by`); `agents/roomlerd/src/encode/governor.rs:2475` (`measured_tagged`), `:2333` (in `path_view`); `agents/roomlerd/src/media_delivery.rs:1512` (the line's field) |
+| D50's line field | `agents/roomlerd/src/encode/pipe.rs:916` (`Fall`), `:1082` (`PathModel::fell`), `:1257` (`PathView::model_fell`); `agents/roomlerd/src/encode/governor.rs:2349` (`path_view`); `agents/roomlerd/src/media_delivery.rs:1490` (`FellShown`), `:1534` (the field) |
+| the harness's D50 | `agents/roomlerd/src/media_delivery.rs:6415` (`Rules::D50`, the product's fold), `:6441` (`Rules::clocked`), `:6555` (the law before D50 for the other folds: `Pipe::set_unclocked`, `agents/roomlerd/src/encode/pipe.rs:595`), `agents/roomlerd/src/media_delivery.rs:6595` and `:6699` (a fall marked at a sample's hand-off and at a window's push-back), `:6296` (`ModelFold::falls`), `:7137` (`print_drop`: the `D50 falls` and `D50 fall` lines) |
+| B4's owners (D51) | `agents/roomlerd/src/media_inflight.rs:1558` (`Pass::decreases`), `:1567` (`Pass::hears_hold`), `:811` (`Budget::held_lately`); `agents/roomlerd/src/media_delivery.rs:1235` (`on_skip`), `:1090` (`note_path_rate`), `:359` (`envelope_ms`), `:372` (`Largest`); `agents/roomlerd/src/encode/governor.rs:69` (`GateSkip`), `:1073` (`on_budget_hold`), `:1208` (the budget's ceiling), `:2445` (`sent_bps`), `:1770` (the envelope); `agents/roomlerd/src/encode/viewer_rate.rs:779` (`observe_within`); `agents/roomlerd/src/encode/aimd.rs:152` (`CeilingSource::Budget`) |
+| the harness's B4c | `agents/roomlerd/src/media_delivery.rs:9306` (`closed_loop`), `:10154` (`run_loop`), `:10265` (`read`), `:10570` (`gate`), `:10829` (`print_gate`), `:10895` (the cell) |
+| B4f's and B4g's charge (D51) | `agents/roomlerd/src/encode/charge.rs:30` (`Stamp`), `:52` (`refed_pts`, #3472's rule, moved from `encode::libvpx`), `:68` (`Gate`), `:82` (`charge`), `:115` (`GateClock`), `:125` (`skipped`), `:130` (`passed`), `:141` (`paused`, FR-148), `:149` (`take`); `agents/roomlerd/src/encode/governor.rs:2430` (`charge_interval`); `agents/roomlerd/src/encode/thread.rs:81` (`EncoderOps::encode_charged`), `:121` (`Cmd::Encode`, which carries the gate), `:238` (`EncoderThread::encode_charged`), `:316` (the encode arm of the thread's `serve`), `:427` (`EncoderHandle::encode_charged`); `agents/roomlerd/src/encode/libvpx.rs:168` (`last_pts`), `:649` (`encode_at`), `:727` (the charge in `encode_at`), `:755` (the stamp kept after an encode), `:844` (`encode_charged`); `agents/roomlerd/src/peer.rs:4059` (`gate_clock`), `:4538` (a pass the gate skipped), `:4557` (the pass it let through), `:4988` (a drain pause, FR-148), `:5068` (the hand-off before the encode), `:5073` (`encode_charged`), `:5274` (the wire's stamp, untouched) |
+| B4g's source of the measured reading | `agents/roomlerd/src/encode/pipe.rs:966` (`MeasuredBy`), `:987` (`word_of`), `:1230` (`PathView::measured_by`); `agents/roomlerd/src/encode/governor.rs:2475` (`measured_tagged`), `:2333` (in `path_view`); `agents/roomlerd/src/media_delivery.rs:1515` (the line's field) |
 | C11's reading | `agents/roomlerd/src/media_inflight.rs:811` (`Budget::held_lately`), `:607` (`own`), `:994` (`forget_reading`), `:963` (`reset_least`), `:972` (`on_new_association`), `:1180` (`own` in `rate_at`), `:381` (`Figure::from`) |
-| the harness's B4f and B4g | `agents/roomlerd/src/media_delivery.rs:9737` (the encoder model's charge), `:9566` (its gate clock), `:9583` and `:9608` (a pass skipped, a pass let through), `:9706` (a drain pause, FR-148), `:9733` (the take), `:9166` (`SLOW_CAPTURE`), `:10719` (C6s), `:9414` (the bar's marks in `Pumped`), `:9421` (each encode's gated and charged time), `:10503` (`Bar`), `:10524` (`settled_from`), `:10528` (`bar`), `:10577` (`bar_words`), `:10617` (`print_gate`, which carries the bar), `:10683` (the cell) |
-| the send wait (FR-148) | `agents/roomlerd/src/media_inflight.rs:1392` (`SendWait`), `:1402` (`sent`), `:1411` (`take`), `:1423` (`max_ms`), `:1431` (`SendWaitWindow`), `:1440` (`ms`), `:1456` (`SendWaitSince`), `:1464` (`avg_ms`); `agents/roomlerd/src/media_delivery.rs:674` (the sampler's field), `:1275` (`send_wait`); the VP9-444 pump: `agents/roomlerd/src/peer.rs:4270` (the channel, each frame with its hand-off instant), `:4296` (the send task's handle), `:4350` (a frame that reached the wire), `:5258` (the hand-off), `:5341` (the heartbeat's take); the FFmpeg pump: `:7115` and `:7142` (the sender window's and the direct gate's places), `:7307` (the send task's handle), `:7410` (a frame that reached the wire), `:8041` (the direct gate's read), `:9265` and `:9270` (the sender window's), `:10020` (the heartbeat's take) |
-| the harness's send wait | `agents/roomlerd/src/media_delivery.rs:9502` (the channel), `:9507` (the send task's handle), `:9540` (a frame that reached the wire), `:9781` (the heartbeat's take, every 30 frames), `:9424` (`Pumped::send_waits`), `:10519` (the bar's figures) |
+| the harness's B4f and B4g | `agents/roomlerd/src/media_delivery.rs:9949` (the encoder model's charge), `:9778` (its gate clock), `:9795` and `:9820` (a pass skipped, a pass let through), `:9918` (a drain pause, FR-148), `:9945` (the take), `:9378` (`SLOW_CAPTURE`), `:10931` (C6s), `:9626` (the bar's marks in `Pumped`), `:9633` (each encode's gated and charged time), `:10715` (`Bar`), `:10736` (`settled_from`), `:10740` (`bar`), `:10789` (`bar_words`), `:10829` (`print_gate`, which carries the bar), `:10895` (the cell) |
+| the send wait (FR-148) | `agents/roomlerd/src/media_inflight.rs:1392` (`SendWait`), `:1402` (`sent`), `:1411` (`take`), `:1423` (`max_ms`), `:1431` (`SendWaitWindow`), `:1440` (`ms`), `:1456` (`SendWaitSince`), `:1464` (`avg_ms`); `agents/roomlerd/src/media_delivery.rs:677` (the sampler's field), `:1292` (`send_wait`); the VP9-444 pump: `agents/roomlerd/src/peer.rs:4298` (the channel, each frame with its hand-off instant), `:4324` (the send task's handle), `:4376` (a frame that reached the wire), `:5285` (the hand-off), `:5368` (the heartbeat's take); the FFmpeg pump: `:7143` and `:7170` (the sender window's and the direct gate's places), `:7335` (the send task's handle), `:7436` (a frame that reached the wire), `:8068` (the direct gate's read), `:9292` and `:9297` (the sender window's), `:10047` (the heartbeat's take) |
+| the harness's send wait | `agents/roomlerd/src/media_delivery.rs:9714` (the channel), `:9719` (the send task's handle), `:9752` (a frame that reached the wire), `:9993` (the heartbeat's take, every 30 frames), `:9636` (`Pumped::send_waits`), `:10731` (the bar's figures) |
 
 ### The tests
 
@@ -5269,6 +5335,92 @@ The classifier's open edges, none of them measured on a real carrier yet:
   at 1.02 to 1.73 under the budget on the same cells. With the budget off nothing marks
   a stall, and today's writers' model floor ended at 0.68 to 1.45 there.
 
+## The deadline channel (FR-148 P4b-3) — a frame that cannot arrive in time is not sent
+
+FR-148 P4b-3 (D55), behind a switch that ships off. On TURN over TCP a lost segment stops the leg
+until it is sent again, and on the ordered `video-bytes` every frame behind it waits too, with no
+bound on how old a frame is when it reaches the viewer
+([§ The standing queue](#the-standing-queue-what-a-tcp-carrier-holds)). P4b-1 gave the vendored SCTP a
+deadline-limited stream, written in order, abandoned on loss and skipped by a FORWARD TSN, and P4b-2's
+viewer opens one, `video-deadline`, beside `video-bytes` on every framed session. P4b-3 moves a
+session's video onto it where the carrier is TCP somewhere, and bounds how old a frame may be when it
+is written there: D. The pick per carrier class, the switch at a key frame with its drain rule and the
+stream's mark are in
+[remote-control.md §11.20](remote-control.md#1120-two-video-channels-and-the-agents-pick-fr-148-p4b-3);
+this section is D, the counts and the switch.
+
+```text
+age = now - the frame's hand-off to the send task
+
+under on, on video-deadline, once, before the frame's first chunk is written:
+  age >  D (300 ms)   dropped whole: nothing written, its frame_seq consumed, late_dropped + 1,
+                      a key frame asked through the session's gate
+  age <= D            written whole, every chunk, however long the writes take
+```
+
+| Rule | Why |
+|---|---|
+| D is 300 ms, a constant (`DEADLINE`, `agents/roomlerd/src/media_deadline.rs:116`) | FR-148's O-b starts it there, counted under `shadow` first |
+| it is read once, at the frame's turn | the road is decided before the first write, so a frame begun is finished: cutting one after its first chunk would cost the viewer the whole frame and the link the chunks already sent |
+| from the hand-off | the instant each frame already carries through the send channel for the send wait ([§ Where it runs](#where-it-runs)): the VP9-444 send task's (`agents/roomlerd/src/peer.rs:4336`) and the FFmpeg one's (`:7362`) |
+| on `video-deadline` only | `video-bytes` stays reliable and ordered: D drops nothing there, under any value of the switch |
+| a drop consumes its `frame_seq` | the viewer reads it as a gap, as it reads a loss on that channel (P4b-2): on `video-deadline` a gap does not re-arm its decode gate |
+| the recovery key frame | asked through the session's gate, the one the viewer's `rc:keyframe` passes through (`KeyframeGate`, `media_deadline.rs:255`): one forced key frame per 500 ms at most, whoever asks (`MIN_KF_GAP`, `:246`). P4b-4's cost rule replaces it |
+
+The frames that follow a dropped one are written while they are young enough, and the viewer decodes
+them as it decodes the frames after a loss on that channel, until the key frame lands. Under `shadow`
+the lane computes the same age on the channel `on` would be on, counts the frames D would drop, and
+drops none.
+
+### The deadline channel's switch
+
+`ROOMLERD_VIDEO_DEADLINE`, or the config key `video_deadline`, read once per pump beside
+`ROOMLERD_PATH_MODEL` (`media_deadline::mode`, `agents/roomlerd/src/media_deadline.rs:77`, from
+`DeliverySampler::from_env`, `agents/roomlerd/src/media_delivery.rs:687`):
+
+| Value | The send tasks |
+|---|---|
+| `off`, unset, or any other value | today's writes, numbers and holds: every frame on `video-bytes`, no class read, no line, and the `path delivery` line is as before, to the byte |
+| `shadow` | the pick and D run on the channel `on` would be on; the lines and the counts say what `on` would do. Every write is `off`'s, byte for byte, with no mark, no drop and no ask |
+| `on` | on a carrier that is TCP somewhere, a framed session's video moves to `video-deadline` at a key frame once the old channel drained, its stream marked first, and D drops a frame older than 300 ms there |
+
+Unlike the in-flight budget's, this switch acts with `ROOMLERD_PATH_MODEL=off`: only its counts ride
+that line, and its own lines are written either way. The config key is built as `inflight_budget`'s: the
+field, its env fallback, the key's metadata, its echo and its check
+(`crates/agent-core/src/config.rs:1236`, `:3516`; `crates/agent-core/src/config_surface.rs:1459`,
+`:2166`, `:2756`). A set variable wins over the key, any value but `off`, `shadow` or `on` is refused
+at `config set`, and remote config cannot set it ([remote-config.md](remote-config.md)). The read is
+inside the FR-135 ratchet's media path, so the ratchet counts it (ledger `p4:DEADLINE-1`, which
+retires with FR-148 P5).
+
+### The deadline channel's fields
+
+Its counts close `path delivery (FR-148 P0, shadow, ≈10s)`, after the budget's fields, or after `loss`,
+or after `acked_bytes`, whichever ends the line without them, and only with the switch not `off`. They
+are a pump's: each data-channel pump's line carries its own send task's (`Counters`,
+`agents/roomlerd/src/media_deadline.rs:336`; the sampler's handle, `DeliverySampler::deadline`,
+`agents/roomlerd/src/media_delivery.rs:1299`).
+
+| Field | Meaning |
+|---|---|
+| `forward_tsns` | FORWARD TSN packets the association sent since it began (P4b-1's gauge, `Gauges::forward_tsns`), read at the line by a peek that resets nothing; `None` without the gauges |
+| `late_dropped` | the frames D dropped over the line; under `shadow`, the frames it would have dropped |
+| `drain_dropped` | the frames a switch dropped over the line, while the old channel drained and then until the key frame; 0 under `shadow`, whose switch drains nothing |
+| `channel_switches` | the switches completed over the line; under `shadow`, the ones `on` would have made |
+| `video_channel` | the channel the pump's video is on at the line, `none` before its first frame; under `shadow`, the one `on` would be on |
+
+A line with made-up values, the budget off:
+
+```text
+path delivery (FR-148 P0, shadow, ≈10s) session_id=… span_ms=10004 delivery_samples=(3, 2, 0) backlogged_bps=Some((1712000, 1840000, 1951000)) app_limited_bps=Some(1206000) stalled_ms=0 acked_bytes=2301441 ack_ms=Some((62, 74, 391)) standing_ms=Some((12, 329)) queued=1 inflight=(18240, 58650) cwnd=(61440, 98304) ssthresh=65536 rwnd_low=1015808 pending_high=24576 loss=(0, 0) forward_tsns=Some(41) late_dropped=3 drain_dropped=0 channel_switches=0 video_channel=video-deadline
+```
+
+`the_video_channel_s_counts_close_the_line` (`agents/roomlerd/src/media_delivery.rs:2200`) pins their
+order, that they close the line with and without the gauges' and the budget's fields, and the line with
+the switch `off`, to the byte past its timestamp, against the writer as master had it, kept beside the
+test (`emit_today`, `:2102`). The writer now builds each of the line's eight shapes from one list of
+fields per group (`emit`, `:1388`).
+
 ## Config / env reference
 
 All keys live in the agent config (`roomler config set …`) with
@@ -5299,6 +5451,7 @@ All keys live in the agent config (`roomler config set …`) with
 | `ROOMLERD_PATH_MODEL` (config key `path_model`) | shadow | FR-148 P0, P1 (D28) — `off` is the release before P0: no delivery sample, no path number, no path memory, none of their lines. `shadow` (unset, or any value but `off` and `on`) takes the samples and the tagged path numbers ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)) and keeps the path model's memory ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)); the opener reads today's rate memory. `on` is `shadow`, and a constrained session of the FFmpeg data-channel pump whose pair has a key and a fresh entry opens from the path memory ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)); ⚠️ it is set on no device until FR-148's O7 is ruled ([§ The switch](#the-switch-d28)). A set variable wins over the key; remote config cannot set it |
 | `ROOMLERD_INFLIGHT_BUDGET` (config key `inflight_budget`) | off | FR-148 D46 B1 — `shadow` computes the in-flight budget once a frame on both data-channel pumps, counts what it would have held, and writes its fields at the end of the `path delivery` line; it holds nothing. Since B2 what it sees also reaches the shadow model, and only it: a backlogged delivery sample with no still span is a push-back (P3), one a still span met is none, and the windows after a stall it saw are no reading ([§ The delivery samples' push-backs](#the-delivery-samples-push-backs-d46-b2)). Since D48 the same reading reads a path that drops: a P3 with a loss in it is re-read at the budget's rate, one the association's ramp bound is none, a sample is held only when the budget held in a fifth of each second's whole grains, and near a loss a window reaches the model at no more than the measured rate and makes no link push-back under 0.9 of it ([§ A path that drops](#a-path-that-drops-who-bound-the-sample-d48)); no switch of its own. Since D46's step B3 `on` acts on relay sessions: the budget's hold skips a pass before capture, a hold in a still span of `least + S` calls no AIMD decrease, and the FFmpeg relay byte gate and the VP9-444 watermark arm hold nothing; a direct session computes it as `shadow` does ([§ The budget acts under `on`](#the-budget-acts-under-on-d46-b3)). Any other value is `off`. With `ROOMLERD_PATH_MODEL=off` it stays off ([§ The in-flight budget](#the-in-flight-budget-fr-148-d46--what-may-be-out-in-time)). A set variable wins over the key; remote config cannot set it |
 | `qsv_rate_mode` / `ROOMLERD_QSV_RATE_MODE` | `cbr` | FR-148 P2 — `qvbr` opens an HEVC or H.264 QSV encoder off constant bitrate: its target at 0.9 × the cap, under `maxrate` at the cap, at the session's quality (QVBR), so a frame is no longer padded to the cap. A driver that refuses it opens at `cbr`. Every rebuild and reopen follows. This device only: not pushable ([`encoders.md`](encoders.md#qsv-off-constant-bitrate-fr-148-p2)) |
+| `ROOMLERD_VIDEO_DEADLINE` (config key `video_deadline`) | off | FR-148 P4b-3 (D55) — `shadow` runs the pick of a session's video channel per carrier class and the deadline D on both data-channel send tasks, writes the lines and counts what `on` would do, and sends exactly as `off`: no mark, no drop, no ask. `on` moves a framed session's video onto `video-deadline` on a carrier that is TCP somewhere, at a key frame once the old channel drained, marks that channel's SCTP stream first, and drops a frame older than 300 ms there whole ([§ The deadline channel](#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent), [remote-control.md §11.20](remote-control.md#1120-two-video-channels-and-the-agents-pick-fr-148-p4b-3)). Any other value is `off`. It acts with `ROOMLERD_PATH_MODEL=off` too; only its counts ride that line. A set variable wins over the key; remote config cannot set it |
 
 ⚠️ Three keys an older `config.toml` may still carry are **deleted, not off**
 — the daemon ignores them: `transit_classify` and `transit_hold` (FR-71
@@ -5362,6 +5515,7 @@ still waiting for its evidence.
 | `PATH_MODEL` | `agents/roomlerd/src/media_delivery.rs:157`, not `encode/mod.rs` | FR-148 P0 | shadow | the delivery samples and their line ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)), the path numbers' tags and their line ([§ Path numbers](#path-numbers-and-their-provenance-fr-148-p0--how-each-was-obtained-and-how-old-it-is)), and since P1 the path memory and its two lines ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)). Three values since P1 (D28): `off`, `shadow` (the default) and `on`, under which the path memory opens a constrained session of the FFmpeg data-channel pump ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)); ⚠️ `on` is set on no device until FR-148's O7 is ruled | P5 deletes it with the composition it measures | FR-148 P5 | — |
 | `QSV_RATE_MODE` | `agents/roomlerd/src/encode/ffmpeg/encoder.rs:3471`, not `encode/mod.rs` | FR-148 P2 (FR-62 A5) | `cbr` | constant bitrate on QSV: `qvbr` opens HEVC and H.264 QSV at QVBR, the target at 0.9 × the cap, and falls back to `cbr` on a refusal (`QsvRateOpen`, [`encoders.md`](encoders.md#qsv-off-constant-bitrate-fr-148-p2)) | FR-148 AC13 read with it on: a QSV keepalive no longer `maxrate ÷ fps ÷ 8` bytes, a still screen under 0.3 Mbit/s. FR-148 P5 then deletes the constant-bitrate path, and the switch with it | FR-148 P5 | — |
 | `INFLIGHT_BUDGET` | `agents/roomlerd/src/media_inflight.rs:160`, not `encode/mod.rs` | FR-148 D46 B1 | off | the in-flight budget, computed in shadow on both data-channel pumps, and its fields at the end of the `path delivery` line ([§ The in-flight budget](#the-in-flight-budget-fr-148-d46--what-may-be-out-in-time)). Since D46's step B3 `on` acts on relay sessions, in place of the relay byte gate and the VP9-444 watermark arm ([§ The budget acts under `on`](#the-budget-acts-under-on-d46-b3)). Since D48 the same computing reads a path that drops for the shadow model and the pair memory ([§ A path that drops](#a-path-that-drops-who-bound-the-sample-d48)) | B3's gates: D46's fresh-delivery bar on the stall shapes, O11's field read of the sessions that ride a TCP leg, and AC32 in the lab; B3 then holds on it on relay sessions. FR-148 P5 deletes the switch, kept or not | FR-148 P5 | — |
+| `VIDEO_DEADLINE` | `agents/roomlerd/src/media_deadline.rs:77`, not `encode/mod.rs` | FR-148 P4b-3 (D55) | off | the video channel's pick per carrier class, the switch at a key frame with its drain, the stream's mark and the deadline D on both data-channel send tasks ([§ The deadline channel](#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)) | FR-148 P5: one controller picks the channel and owns D, or the field read rejects the deadline channel. P5 deletes the switch either way | FR-148 P5 | — |
 
 **Heuristics with no switch of their own.** FR-62's A4 deletions, FR-63's B4 since 2026-11-05.
 Each one retires through this table too, and its deletion PR cites the precondition below.

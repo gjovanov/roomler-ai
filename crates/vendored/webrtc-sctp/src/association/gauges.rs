@@ -13,6 +13,9 @@
 //! carries, so a writer can size a message to one packet. Nothing in the
 //! association reads them back, so a reader changes nothing it sends: the
 //! twin test in `association_internal_test.rs` shows it packet by packet.
+//!
+//! roomler (FR-148 P4b-1, D55): one more counts the FORWARD TSN packets sent,
+//! for O-k's measure of the deadline-limited channel.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -34,6 +37,8 @@ pub(crate) struct GaugeCounters {
     pending_bytes: AtomicU64,
     fast_retransmits: AtomicU64,
     t3_expiries: AtomicU64,
+    /// roomler (FR-148 P4b-1, D55).
+    forward_tsns: AtomicU64,
     /// Microseconds; [`NONE`] before the first.
     ack_delay_us: AtomicU64,
     /// Microseconds; [`NONE`] when none came since the reader's last take.
@@ -53,6 +58,7 @@ impl Default for GaugeCounters {
             pending_bytes: AtomicU64::new(0),
             fast_retransmits: AtomicU64::new(0),
             t3_expiries: AtomicU64::new(0),
+            forward_tsns: AtomicU64::new(0),
             ack_delay_us: AtomicU64::new(NONE),
             ack_delay_min_us: AtomicU64::new(NONE),
         }
@@ -97,6 +103,11 @@ impl GaugeCounters {
         self.t3_expiries.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// roomler (FR-148 P4b-1, D55): one FORWARD TSN packet sent.
+    pub(crate) fn on_forward_tsn(&self) {
+        self.forward_tsns.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// How long the newest chunk one SACK newly acknowledged, of those sent
     /// once, took from its send to that SACK.
     pub(crate) fn on_ack_delay(&self, delay: Duration) {
@@ -122,6 +133,7 @@ impl GaugeCounters {
             pending_bytes: self.pending_bytes.load(Ordering::Relaxed),
             fast_retransmits: self.fast_retransmits.load(Ordering::Relaxed),
             t3_expiries: self.t3_expiries.load(Ordering::Relaxed),
+            forward_tsns: self.forward_tsns.load(Ordering::Relaxed),
             ack_delay: us(self.ack_delay_us.load(Ordering::Relaxed)),
             ack_delay_min: us(min),
         }
@@ -152,6 +164,9 @@ pub struct Gauges {
     pub fast_retransmits: u64,
     /// T3-rtx expiries since the association began.
     pub t3_expiries: u64,
+    /// roomler (FR-148 P4b-1, D55): FORWARD TSN packets sent since the
+    /// association began.
+    pub forward_tsns: u64,
     /// The latest acknowledgement delay: from the send of the newest chunk a
     /// SACK newly acknowledged, among the chunks it acknowledged that were
     /// sent once (Karn), to that SACK. A browser's delayed acknowledgement is

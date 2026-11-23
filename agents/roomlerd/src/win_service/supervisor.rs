@@ -442,7 +442,7 @@ fn worker_elevation_requested() -> bool {
 /// # Safety
 /// `token` must be a valid, live Win32 token handle with `TOKEN_QUERY`
 /// access (the WTSQueryUserToken result qualifies).
-unsafe fn token_elevation_type(token: HANDLE) -> Result<TOKEN_ELEVATION_TYPE> {
+pub(crate) unsafe fn token_elevation_type(token: HANDLE) -> Result<TOKEN_ELEVATION_TYPE> {
     let mut ty: TOKEN_ELEVATION_TYPE = 0;
     let mut ret_len: u32 = 0;
     // SAFETY: `&mut ty` is a valid out-buffer of exactly the declared
@@ -967,9 +967,11 @@ pub(crate) fn want_system_worker(
 }
 
 /// #3387 — SYSTEM can open, for reading, an enrollment a SystemContext worker
-/// runs: the machine config, or the SYSTEM profile's own. The two rungs the
-/// worker's ladder takes, through the same resolvers, read by the same account
-/// (this host is LocalSystem), so the host and the worker cannot disagree.
+/// runs: the machine config, or the SYSTEM profile's own (#4176: or, third,
+/// the copy a worker's start restores a missing machine config from,
+/// [`config_opens_in`]). The two rungs the worker's ladder takes, through the
+/// same resolvers, read by the same account (this host is LocalSystem), so the
+/// host and the worker cannot disagree.
 /// #3702 — the profile rung only for a config in the service account's own
 /// profile as the system names it, the rule the worker's ladder keeps.
 fn sc_config_opens() -> bool {
@@ -980,7 +982,11 @@ fn sc_config_opens() -> bool {
     config_opens_in(&MachineTree::here(), Switches::from_env(), profile)
 }
 
-/// #3609 — the host's question over `tree`: does any rung open.
+/// #3609 — the host's question over `tree`: does any rung open. #4176 — in
+/// the worker's order: the machine config, then the SYSTEM profile's, then
+/// the copy a start restores a missing machine config from
+/// ([`restorable_copy`]), which the worker's ladder reaches last, at the
+/// machine path it names when no rung opens.
 pub(crate) fn config_opens_in(
     tree: &roomler_node_core::machine_tree::MachineTree,
     switches: roomler_node_core::machine_tree::Switches,
@@ -988,6 +994,7 @@ pub(crate) fn config_opens_in(
 ) -> bool {
     rung_opens(tree, switches, &tree.config())
         || profile.is_some_and(|p| rung_opens(tree, switches, &p))
+        || restorable_copy(tree)
 }
 
 /// #3609 — one rung of the SystemContext ladder, the ONE function the host
@@ -1009,6 +1016,19 @@ pub(crate) fn rung(
     } else {
         Err(Refusal::Absent)
     }
+}
+
+/// #4176 — the machine config under `tree` is not there (`exists`, as the
+/// start reads it, `app::config_at_start::of`): does its copy pass the checks
+/// the config itself would, and hold an enrollment? That is when the SYSTEM
+/// worker's start restores it at the machine path its ladder names last
+/// (`app::config_at_start`, which asks the same function through
+/// `config::previous_copy`), so the host starts that worker for it. Otherwise
+/// the host keeps waiting, as with no copy, and the copy's reason is logged
+/// once (`config::machine_previous_copy`).
+fn restorable_copy(tree: &roomler_node_core::machine_tree::MachineTree) -> bool {
+    !tree.config().exists()
+        && crate::config::machine_previous_copy(tree) == crate::config::PreviousCopy::Enrolled
 }
 
 /// [`rung`] as a yes or no.

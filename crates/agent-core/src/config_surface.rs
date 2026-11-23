@@ -664,7 +664,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "R3 — keep established tunnel QUIC peers alive across a control-WS reattach instead of tearing them down on every transient WS drop, so a QUIC/derp data plane survives a corp-VPN control-WS blip. Needs the server-side grace. Agent (target) side. Built-in default: off.",
+        description: "R3 — keep established tunnel QUIC peers alive across a control-WS reattach instead of tearing them down on every transient WS drop, so a QUIC/derp data plane survives a corp-VPN control-WS blip. Needs the server-side grace. Daemon (target) side. Built-in default: off.",
     },
     KeyMeta {
         key: "overlay_mbb",
@@ -688,7 +688,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "WSL2 mirrored-networking guard: a mirrored guest shares the Windows host's adapters, so skip its LAN gather (binding the host's address starves the host agent). Built-in default: on.",
+        description: "WSL2 mirrored-networking guard: a mirrored guest shares the Windows host's adapters, so skip its LAN gather (binding the host's address starves the host's daemon). Built-in default: on.",
     },
     KeyMeta {
         key: "overlay_init_auth_first",
@@ -849,7 +849,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Standard,
         live: false,
         kind: "number",
-        description: "Concurrent remote-control sessions this agent accepts (1-8). Same-profile DC viewers share one capture+encoder (see shared_encoder); distinct profiles run their own — weak-GPU hosts may prefer 1. Built-in default: 2.",
+        description: "Concurrent remote-control sessions this daemon accepts (1-8). Same-profile DC viewers share one capture+encoder (see shared_encoder); distinct profiles run their own — weak-GPU hosts may prefer 1. Built-in default: 2.",
     },
     KeyMeta {
         key: "overlay_direct_port",
@@ -1213,7 +1213,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-56 P4 - capture ONE application window instead of the whole monitor (the RAIL-shaped half of Remote Apps: the viewer sees one app, not the desktop). Built-in default: OFF. ** ATTENDED BY CONSTRUCTION - the portal answers this by showing the person at the screen a WINDOW PICKER, and nothing agent-side can name a window (GNOME refuses Introspect.GetWindows), so on an unattended host the capture never starts.** Needs portal_capture on as well, and drm_capture not on: DRM is tried first. Env: ROOMLERD_WINDOW_CAPTURE. Restart required.",
+        description: "FR-56 P4 - capture ONE application window instead of the whole monitor (the RAIL-shaped half of Remote Apps: the viewer sees one app, not the desktop). Built-in default: OFF. ** ATTENDED BY CONSTRUCTION - the portal answers this by showing the person at the screen a WINDOW PICKER, and nothing daemon-side can name a window (GNOME refuses Introspect.GetWindows), so on an unattended host the capture never starts.** Needs portal_capture on as well, and drm_capture not on: DRM is tried first. Env: ROOMLERD_WINDOW_CAPTURE. Restart required.",
     },
     KeyMeta {
         key: "wayland_aware",
@@ -1405,7 +1405,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "Relay age feedback (2026-08-27, FR-15). Default ON: the viewer reports the true paint AGE of the frames it showed (the FR-1 P7 clock probe) on its rc:decodestat window; the agent learns the session's age FLOOR and treats sustained excess (>=70ms over floor for 2 consecutive windows) on a CONSTRAINED transport as over-rate - capping send-fps and feeding the AIMD a congestion sample, so the decrease lands through the normal (FR-10-deferred) apply path. It exists because a relay backlog sits BELOW every agent counter: the field measured 1000ms of viewer age against a 26KB agent queue. false = open-loop 0.4.7 relay posture. Direct sessions unaffected. Env: ROOMLERD_RELAY_AGE_FEEDBACK. Restart required.",
+        description: "Relay age feedback (2026-08-27, FR-15). Default ON: the viewer reports the true paint AGE of the frames it showed (the FR-1 P7 clock probe) on its rc:decodestat window; the daemon learns the session's age FLOOR and treats sustained excess (>=70ms over floor for 2 consecutive windows) on a CONSTRAINED transport as over-rate - capping send-fps and feeding the AIMD a congestion sample, so the decrease lands through the normal (FR-10-deferred) apply path. It exists because a relay backlog sits BELOW every daemon counter: the field measured 1000ms of viewer age against a 26KB daemon queue. false = open-loop 0.4.7 relay posture. Direct sessions unaffected. Env: ROOMLERD_RELAY_AGE_FEEDBACK. Restart required.",
     },
     KeyMeta {
         key: "measured_ceiling",
@@ -1437,7 +1437,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "enum:0|prio|1|route",
-        description: "FR-148 P4 - the carrier rank, for a remote-desktop session the mesh may carry: `0` (empty; off, as before), `prio`, `1` or `route`. On, the session reads its mesh link to the viewer's device at the offer; unless that link is direct, every candidate only the mesh carries (a host, a server-reflexive or a relay candidate on the mesh's own addresses) is signalled at priority 255, below every relay, so the session lands on TURN whenever TURN connects and on the mesh when nothing else does. `1` also ends each such candidate's line with ` network-cost 999`. `route` (D49) is `1` with the pair's route as the rank's unit instead of a candidate: a pair rides the mesh when its local candidate is ranked last or either end sits on a mesh address. Unless the link is direct, no pair is formed from a local candidate off the mesh to a remote one on it while the session has a local candidate or a TURN URL on the mesh, and the agent holds its pairs on the mesh while a relay off the mesh can still come, 2.5 s at most. On, a relay over TCP or TLS also ranks below one over UDP, and the agent keeps checking the pairs above its selection. Env: ROOMLERD_RC_CARRIER_RANK. This device only: never pushable. Restart required.",
+        description: "FR-148 P4 - the carrier rank, for a remote-desktop session the mesh may carry: `0` (empty; off, as before), `prio`, `1` or `route`. On, the session reads its mesh link to the viewer's device at the offer; unless that link is direct, every candidate only the mesh carries (a host, a server-reflexive or a relay candidate on the mesh's own addresses) is signalled at priority 255, below every relay, so the session lands on TURN whenever TURN connects and on the mesh when nothing else does. `1` also ends each such candidate's line with ` network-cost 999`. `route` (D49) is `1` with the pair's route as the rank's unit instead of a candidate: a pair rides the mesh when its local candidate is ranked last or either end sits on a mesh address. Unless the link is direct, no pair is formed from a local candidate off the mesh to a remote one on it while the session has a local candidate or a TURN URL on the mesh, and the daemon holds its pairs on the mesh while a relay off the mesh can still come, 2.5 s at most. On, a relay over TCP or TLS also ranks below one over UDP, and the daemon keeps checking the pairs above its selection. Env: ROOMLERD_RC_CARRIER_RANK. This device only: never pushable. Restart required.",
     },
     KeyMeta {
         key: "path_model",
@@ -1454,6 +1454,14 @@ const KEYS: &[KeyMeta] = &[
         live: false,
         kind: "enum:off|shadow|on",
         description: "FR-148 D46 - the in-flight budget's switch, for a remote-desktop session on a data-channel pump (VP9 4:4:4 or FFmpeg): `off` (empty; the default: nothing is computed and the path delivery line is as before), `shadow` (once a frame the budget is computed from SCTP's acknowledgements, the frames it would have held are counted, and its fields close the path delivery line; it holds nothing) or `on` (on a relayed session the budget acts: a frame it holds is skipped before capture, a hold while the acknowledgements stand still calls no rate decrease, and the relay byte gate and the VP9 4:4:4 watermark hold nothing; a direct session computes it as `shadow` does). Needs `path_model` other than `off`: that line carries its fields. Env: ROOMLERD_INFLIGHT_BUDGET (a set variable wins). This device only: never pushable. Restart required.",
+    },
+    KeyMeta {
+        key: "video_deadline",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:off|shadow|on",
+        description: "FR-148 P4b-3 - the deadline-limited video channel's switch, for a remote-desktop session on a data-channel pump (VP9 4:4:4 or FFmpeg) whose viewer opened `video-deadline` beside `video-bytes`: `off` (empty; the default: every frame goes on `video-bytes`, as before), `shadow` (the channel is picked per carrier and the frames older than 300 ms there are counted, and lines say what `on` would do; every frame still goes on `video-bytes`) or `on` (on a carrier that is TCP somewhere - TURN over TCP or TLS, or a relayed mesh path - frames go on the unordered `video-deadline`, switching at a key frame once the old channel drained, and a frame older than 300 ms there is dropped whole and a key frame asked). Its counts ride the path delivery line, so they need `path_model` other than `off`; the switch itself does not. Env: ROOMLERD_VIDEO_DEADLINE (a set variable wins). This device only: never pushable. Restart required.",
     },
     KeyMeta {
         key: "relay_max_kbps",
@@ -1541,7 +1549,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "Viewer-reported link clamp (2026-09-01, FR-59 P3). Default ON: the VIEWER reports the bytes/s it actually received and how much its transit queue GREW this window, and on a constrained transport a sustained growing queue caps send-fps, feeds the AIMD a congestion sample, and bounds the ceiling at 90% of the measured arrival rate. It exists because the agent structurally cannot see this: on a relayed path its own send channel reads empty (field 2026-09-01: bytes_inflight 1-4 KB, send_wait_max_ms 0.1 ms) while seconds of video sit in the relay and the carrier. Unlike the FR-15 age report it needs NO clock probe - a byte count is local and the queue drift is a difference of two intervals, so the unknown offset cancels - which matters because on exactly these links the age is absent or rejected in most windows. The arrival rate may bound the ceiling ONLY while the queue is growing, since otherwise it is merely whatever the agent happened to send. false = observe-and-report only. Env: ROOMLERD_VIEWER_RATE_CLAMP. Restart required.",
+        description: "Viewer-reported link clamp (2026-09-01, FR-59 P3). Default ON: the VIEWER reports the bytes/s it actually received and how much its transit queue GREW this window, and on a constrained transport a sustained growing queue caps send-fps, feeds the AIMD a congestion sample, and bounds the ceiling at 90% of the measured arrival rate. It exists because the daemon structurally cannot see this: on a relayed path its own send channel reads empty (field 2026-09-01: bytes_inflight 1-4 KB, send_wait_max_ms 0.1 ms) while seconds of video sit in the relay and the carrier. Unlike the FR-15 age report it needs NO clock probe - a byte count is local and the queue drift is a difference of two intervals, so the unknown offset cancels - which matters because on exactly these links the age is absent or rejected in most windows. The arrival rate may bound the ceiling ONLY while the queue is growing, since otherwise it is merely whatever the daemon happened to send. false = observe-and-report only. Env: ROOMLERD_VIEWER_RATE_CLAMP. Restart required.",
     },
     KeyMeta {
         key: "queue_drain",
@@ -1549,7 +1557,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "Queue drain (2026-09-01, FR-59 P4). Default ON: when the viewer reports a transit queue deeper than a rate cut can clear in reasonable time, the pump STOPS producing for a bounded sub-second pause so the queue drains. A rate cut alone drains at capacity minus inflow, which is the slowest possible way - converging to 90% of a 400 kbps pipe clears a 2 s backlog at 40 kbps, i.e. over ~20 s, which is why a field session stayed seconds behind even after it stopped growing. Pausing sets inflow to zero so the same backlog clears in the ~2 s it represents. Deliberately no forced keyframe on resume: a pause loses no frames so the delta chain survives, and an IDR at these rates is itself seconds of transit. Skipping production rather than discarding the agent queue is the only lever that reaches a queue living in the relay and the carrier - those bytes are already sent and cannot be recalled. false = rate control only. Env: ROOMLERD_QUEUE_DRAIN. Restart required.",
+        description: "Queue drain (2026-09-01, FR-59 P4). Default ON: when the viewer reports a transit queue deeper than a rate cut can clear in reasonable time, the pump STOPS producing for a bounded sub-second pause so the queue drains. A rate cut alone drains at capacity minus inflow, which is the slowest possible way - converging to 90% of a 400 kbps pipe clears a 2 s backlog at 40 kbps, i.e. over ~20 s, which is why a field session stayed seconds behind even after it stopped growing. Pausing sets inflow to zero so the same backlog clears in the ~2 s it represents. Deliberately no forced keyframe on resume: a pause loses no frames so the delta chain survives, and an IDR at these rates is itself seconds of transit. Skipping production rather than discarding the daemon's queue is the only lever that reaches a queue living in the relay and the carrier - those bytes are already sent and cannot be recalled. false = rate control only. Env: ROOMLERD_QUEUE_DRAIN. Restart required.",
     },
     KeyMeta {
         key: "measured_evidence",
@@ -1733,7 +1741,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-118 - keep a captured frame on the GPU until the encoder takes it, without a CPU copy, once the capability probe has proven that encoder's GPU-input form: the SystemContext DXGI capture's frames go to QSV (hevc_qsv, av1_qsv, h264_qsv), the WGC capture's to NVENC (hevc_nvenc, av1_nvenc, h264_nvenc), and on macOS the display stream's to VideoToolbox (hevc_videotoolbox, h264_videotoolbox). on: every proven encoder; off: none. Built-in default: unset, which takes the GPU form only on the encoders on the agent's built-in default list (FR-132), and that list is empty for now, so unset is off. Env: ROOMLERD_ZERO_COPY. Restart required.",
+        description: "FR-118 - keep a captured frame on the GPU until the encoder takes it, without a CPU copy, once the capability probe has proven that encoder's GPU-input form: the SystemContext DXGI capture's frames go to QSV (hevc_qsv, av1_qsv, h264_qsv), the WGC capture's to NVENC (hevc_nvenc, av1_nvenc, h264_nvenc), and on macOS the display stream's to VideoToolbox (hevc_videotoolbox, h264_videotoolbox). on: every proven encoder; off: none. Built-in default: unset, which takes the GPU form only on the encoders on the daemon's built-in default list (FR-132), and that list is empty for now, so unset is off. Env: ROOMLERD_ZERO_COPY. Restart required.",
     },
     KeyMeta {
         key: "color_description",
@@ -1741,7 +1749,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-130 - every encoder writes the colour description it converted with (the BT.601 matrix at limited range) into its stream: the H.264/HEVC SPS VUI, the AV1 sequence header, the VP9 header. Without it a browser decodes an HD picture as BT.709 and shifts every saturated colour. Built-in default: on; off writes the undescribed stream of earlier agents. Env: ROOMLERD_COLOR_DESCRIPTION. Pushable through remote config. Restart required.",
+        description: "FR-130 - every encoder writes the colour description it converted with (the BT.601 matrix at limited range) into its stream: the H.264/HEVC SPS VUI, the AV1 sequence header, the VP9 header. Without it a browser decodes an HD picture as BT.709 and shifts every saturated colour. Built-in default: on; off writes the undescribed stream of earlier releases. Env: ROOMLERD_COLOR_DESCRIPTION. Pushable through remote config. Restart required.",
     },
     KeyMeta {
         key: "zero_copy_deny",
@@ -1924,7 +1932,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Standard,
         live: false,
         kind: "json",
-        description: "Agent-side allowlist for tunnel forwards (JSON: {\"enabled\": bool, \"allowlist\": [...]}).",
+        description: "Daemon-side allowlist for tunnel forwards (JSON: {\"enabled\": bool, \"allowlist\": [...]}).",
     },
     KeyMeta {
         key: "virtual_desktop_apps",
@@ -2155,6 +2163,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "rc_carrier_rank" => cfg.rc_carrier_rank.clone(),
         "path_model" => cfg.path_model.clone(),
         "inflight_budget" => cfg.inflight_budget.clone(),
+        "video_deadline" => cfg.video_deadline.clone(),
         "relay_max_kbps" => cfg.relay_max_kbps.map(|p| p.to_string()),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
         "media_thread" => cfg.media_thread.map(fmt_bool),
@@ -2743,6 +2752,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // FR-148 D46 — as `path_model`: each word is stored, so a device set
         // to `off` stays off when the default moves.
         "inflight_budget" => cfg.inflight_budget = parse_declared(key, value, None)?,
+        // FR-148 P4b-3 — as `inflight_budget`.
+        "video_deadline" => cfg.video_deadline = parse_declared(key, value, None)?,
         "relay_max_kbps" => cfg.relay_max_kbps = parse_u32_range(key, value, 100, 100_000)?,
         "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
         "media_thread" => cfg.media_thread = parse_tribool(value)?,
@@ -5224,6 +5235,49 @@ mod tests {
         }
     }
 
+    /// FR-148 P4b-3 — `video_deadline`: `off`, `shadow` and `on` are stored,
+    /// blank clears the key (the default, `off`), and anything else is refused
+    /// rather than read as `off` without a word. It reaches the daemon's env
+    /// fallbacks under the switch's own name. Remote config's managed keys
+    /// have no field for it, so no push can set it.
+    #[test]
+    fn video_deadline_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "video_deadline"), None);
+        apply(&mut cfg, "video_deadline", Some(" Shadow ")).unwrap();
+        assert_eq!(cfg.video_deadline.as_deref(), Some("shadow"));
+        assert_eq!(
+            entry_for(&cfg, "video_deadline").unwrap().value.as_deref(),
+            Some("shadow")
+        );
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("VIDEO_DEADLINE")
+                .map(String::as_str),
+            Some("shadow")
+        );
+        apply(&mut cfg, "video_deadline", Some("on")).unwrap();
+        assert_eq!(cfg.video_deadline.as_deref(), Some("on"));
+        apply(&mut cfg, "video_deadline", Some("off")).unwrap();
+        assert_eq!(
+            cfg.video_deadline.as_deref(),
+            Some("off"),
+            "kept, not cleared"
+        );
+        apply(&mut cfg, "video_deadline", Some("")).unwrap();
+        assert_eq!(cfg.video_deadline, None, "blank clears to the default");
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg).get("VIDEO_DEADLINE"),
+            None
+        );
+        for bad in ["1", "true", "deadline", "on1", "shadow,on"] {
+            assert!(
+                apply(&mut cfg, "video_deadline", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
     /// FR-148 P4 — `rc_carrier_rank`: `prio`, `1` and (D49) `route` are
     /// stored, `0` and blank clear the key (off), and anything else is refused
     /// rather than stored and read as `0` without a word. It reaches the
@@ -5919,5 +5973,34 @@ mod enum_declared_values_tests {
             |cfg| cfg.ice_follow_renomination,
             &[None, Some(true), Some(false)],
         );
+    }
+}
+
+#[cfg(test)]
+mod description_words_tests {
+    use super::*;
+
+    /// FR-133 — the companion's Settings page shows each key's description, so
+    /// a description names the daemon as a person reads it: `roomlerd`, "the
+    /// daemon" or "this device", never an agent. A wire name keeps its spelling
+    /// (`rc:agent.key_rotate` is what the server sends), as does a key or an
+    /// identifier (`agent_id`: `_` joins it to the word).
+    #[test]
+    fn no_description_calls_the_daemon_an_agent() {
+        let mut said = Vec::new();
+        for m in KEYS {
+            let prose = m.description.replace("rc:agent.", "rc:");
+            let lower = prose.to_ascii_lowercase();
+            let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            let hit = lower.match_indices("agent").any(|(at, _)| {
+                let after = &lower[at + 5..];
+                let after = after.strip_prefix('s').unwrap_or(after);
+                !word(lower[..at].chars().next_back()) && !word(after.chars().next())
+            });
+            if hit {
+                said.push(m.key);
+            }
+        }
+        assert!(said.is_empty(), "these descriptions say agent: {said:?}");
     }
 }

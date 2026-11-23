@@ -237,6 +237,9 @@ pub mod resource_watch;
 /// FR-98 C6 — `playout-delay` 0/0 on the RTP fallback track, so the
 /// browser's jitter buffer renders as soon as it decodes (default off).
 pub mod rtp_playout;
+/// #4292 — an end of the daemon's own choosing (its removal, a lost duel, a
+/// log-out's quit on macOS) marks its run clean, so it never counts as a crash.
+pub mod run_end;
 /// FR-65 P2 / FR-70 AC1 — a 10 ms timer that records how late it woke, so a
 /// starved runtime shows up in the logs.
 pub mod runtime_canary;
@@ -532,6 +535,12 @@ pub mod busy;
 #[cfg(test)]
 mod config_enum_pins;
 pub mod daemon_error;
+/// FR-148 P4b-3 — the agent's half of the deadline-limited video channel:
+/// the pick per carrier class, the switch at a key frame, the drain rule, D.
+pub mod media_deadline;
+/// FR-133 — every needs-attention notice, rendered and read back whole.
+#[cfg(test)]
+mod notice_text_tests;
 
 #[cfg(test)]
 mod tests {
