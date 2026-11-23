@@ -531,7 +531,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:130`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:7063`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:7124`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2687`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
@@ -559,7 +559,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3624`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3628`,
 `virtual_desktop.rs:2261`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -736,7 +736,7 @@ takes anything down (§2.4). A `SIGTERM` listener made when the desktop starts
 would answer at once, but tokio installs the process's handler for good at
 the first listener, and one made then would come before the run loop's own:
 a `SIGTERM` landing between the two would be swallowed, and the daemon would
-run on. `terminate_signal` (`agents/roomlerd/src/app.rs:3707`) is the daemon's
+run on. `terminate_signal` (`agents/roomlerd/src/app.rs:3711`) is the daemon's
 only one (`STOP_GRACE`'s comment, `agents/roomlerd/src/virtual_desktop.rs:1087-1093`).
 
 **Xorg's directory is made, never adopted** (`private_dir` `:2985`). It
@@ -856,7 +856,7 @@ manager or an app that exited by itself stayed a zombie under the daemon, which
 waits for one pid at a time.
 
 So the daemon starts its own binary once per desktop as `roomlerd vd-keeper`.
-`main` answers that argument before anything else (`app.rs:1379`,
+`main` answers that argument before anything else (`app.rs:1383`,
 `answer_keeper` `virtual_desktop.rs:59`), so the desktop's keeper builds no
 runtime, reads no config, opens no log and takes no lock. It runs in the
 desktop's process group as a child subreaper, and it is the parent of the
@@ -985,7 +985,7 @@ stderr), a thread that follows that stderr, and the wait for `ready`, 5 s at
 most. A keeper the daemon gives up on adds up to 1 s, the wait to collect it
 after its SIGKILL. A Remote Apps launch on the desktop waits for the keeper's
 answer at most 4 s, the start's 3 s and 1 s of slack, on the blocking thread
-that serves the request (`peer.rs:11418`) and outside the daemon's state lock;
+that serves the request (`peer.rs:11390`) and outside the daemon's state lock;
 its write never waits.
 
 **What a person notices.** A program started from a terminal that the
@@ -1159,7 +1159,7 @@ two issues.
 | A session's capture (XShm) | the capture library returned shared memory's last picture for every ask, so the pump sent the frozen picture at the full rate (57 fps and 3.1 Mbps when measured) | the vendored library can say that its connection failed (`Capturer::connection_lost`, `crates/vendored/scrap/src/common/x11.rs:29`). The capture's worker latches it, warns once, drops its damage watcher and its cursor reader, and answers every later ask with no frame (`agents/roomlerd/src/capture/scrap_backend.rs:455-464`), which the pump reads as an idle screen | one `WARN` per session | none: it bounds a log line and stops a frozen picture | `capture::scrap_backend::x11_exit_tests` (CI, a real X server) |
 | The damage watcher | warned at every poll of the dead connection, about 56 lines a second | warns once and never polls the connection again; it stays blind, so every tick captures (`agents/roomlerd/src/capture/x11_damage.rs:229-231`, `:251`) | one `WARN` per watcher | none | `capture::x11_damage::tests::a_tracker_whose_server_went_away_says_so_once` (CI, a real X server) |
 | A shared encoder pipeline | a new viewer of the profile joined the frozen pipeline | retired after the stop grace and again once the desktop is up, where the device's plan is the virtual desktop (`retire_if`, `virtual_desktop.rs:545`; `media_share::retire_all`, `agents/roomlerd/src/media_share.rs:1006`). A later viewer runs a capture of its own on the new server. A pipeline whose owner is marked takes a joiner only when its capture is known not to read an X server (`docs/remote-control.md` §5.1a) | at most two `INFO` lines per exit, each only when it retired something | `ROOMLERD_INPUT_X11_FOLLOW=0` turns the join's refusal off; the retires have none | `media_share::tests` (the three retire tests, `a_pipeline_whose_owner_has_no_picture_takes_no_joiner`), `virtual_desktop::supervise_tests::an_x_server_exit_retires_the_shared_pipelines_after_the_grace_before_the_tell` |
-| The open session and its viewer | not told: `connected`, the last picture, no notice | marked at the exit, then told with the sentence a session opened while the desktop is down gets: `rc:media-unavailable` with `backend_error`, "this device's virtual desktop is down: … reconnect in a moment" (`sessions_told_via`, `virtual_desktop.rs:513`), through FR-80's notice (`peer::spawn_capture_unavailable_notice`, `agents/roomlerd/src/peer.rs:5698`). The viewer keeps the notice until the person connects again, even if frames reach it later (§5.1a of `docs/remote-control.md`) | told one grace (1 s) after the exit; one `WARN` per told session (FR-80's own line) | `ROOMLERD_VIRTUAL_DESKTOP_TELL_SESSIONS=0`: no notice, the marks stay | `virtual_desktop::supervise_tests::an_x_server_exit_tells_the_sessions_after_the_grace`, `the_sessions_are_told_only_when_the_plan_is_the_virtual_desktop`, `the_kill_switch_leaves_every_session_untold` |
+| The open session and its viewer | not told: `connected`, the last picture, no notice | marked at the exit, then told with the sentence a session opened while the desktop is down gets: `rc:media-unavailable` with `backend_error`, "this device's virtual desktop is down: … reconnect in a moment" (`sessions_told_via`, `virtual_desktop.rs:513`), through FR-80's notice (`peer::spawn_capture_unavailable_notice`, `agents/roomlerd/src/peer.rs:5703`). The viewer keeps the notice until the person connects again, even if frames reach it later (§5.1a of `docs/remote-control.md`) | told one grace (1 s) after the exit; one `WARN` per told session (FR-80's own line) | `ROOMLERD_VIRTUAL_DESKTOP_TELL_SESSIONS=0`: no notice, the marks stay | `virtual_desktop::supervise_tests::an_x_server_exit_tells_the_sessions_after_the_grace`, `the_sessions_are_told_only_when_the_plan_is_the_virtual_desktop`, `the_kill_switch_leaves_every_session_untold` |
 | A session opened while the desktop is down | refused with that sentence (#3643) | the same, and its refusal marks it (`input::told_no_picture`, `agents/roomlerd/src/input/mod.rs:93`): it has no input of the desktop until it reconnects | — | — | `input::arbiter::tests::a_session_whose_open_was_refused_while_down_controls_nothing_once_it_is_back` |
 | A session opened while it is down whose capture opens only once it is back | live, with dead input until a daemon restart | told nothing and not marked: it sees and types into the new desktop | — | — | `input::arbiter::tests::a_session_opened_while_down_and_never_told_types_once_the_desktop_is_back` |
 | A session opened after it is back | the new desktop, with dead input until a daemon restart | the new desktop, with input | — | — | `input::arbiter::x11_follow_tests` (CI, a real X server) |
@@ -1727,7 +1727,7 @@ flowchart LR
 
 | Phase | What changed | Where | Kill switch |
 |---|---|---|---|
-| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3999`, `:6763`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1513`; `set_output_cap`, `drm_backend.rs:1742` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
+| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3999`, `:6768`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1513`; `set_output_cap`, `drm_backend.rs:1742` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
 | **P2** | The CPU repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:713`; `band_threads`, `drm_backend.rs:741` | `ROOMLERD_DRM_THREADS=1` |
 | **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1618` | — (a timing fix) |
 | **P3** | The GPU reads the scanout. EGL imports its dma-buf through Mesa's surfaceless platform, on the render node, with no display server. One GLES pass renders it at **exactly** the pump's encode box (a box filter of up to 4×4 bilinear taps a pixel), and converts any of the eight RGB scanout formats to BGRA. The CPU reads back that small frame, and the pump's resample has nothing left to do. Imports are cached per buffer, keyed as the mapping is (FR-93 P3f). `libEGL.so.1` and `libGLESv2.so.2` are loaded at runtime, so no package gains a dependency. A host without them, with a software renderer (`llvmpipe`), or whose GPU pass fails keeps the CPU path, said once in the log. The idle skip (§3.2) and the cursor plane (§3.1) are unchanged | `Egl`, `agents/roomlerd/src/capture/drm_gpu.rs:316`; `Egl::retire`, `drm_gpu.rs:445`; `Converter::open`, `drm_gpu.rs:464`; `convert`, `drm_gpu.rs:754`; `via_gpu`, `drm_backend.rs:152` | `ROOMLERD_DRM_GPU=0` |
@@ -2192,7 +2192,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:7104`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7118`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2439,10 +2439,10 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:4874`) — the same `loginctl` walk the FR-27
+(`agents/roomlerd/src/companion.rs:4920`) — the same `loginctl` walk the FR-27
 consent companion uses, asked since #3857 through one walk in flight, 1.5 s at
-most (`graphical_session_within`, `companion.rs:8993`). It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:4927-4930`),
+most (`graphical_session_within`, `companion.rs:9039`). It accepts a session only when
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:4973-4976`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers
@@ -2851,7 +2851,7 @@ remote-control session is live, the daemon holds one. On the signal it tells
 each live session's controller over that session's own control channel, then
 lets go. Each session registers its control channel as it starts
 (`sleep_notice.rs:99`); the watcher (`sleep_notice.rs:544`, the rule
-`:149`) sends `peer.rs:5622`'s notice to all of them at once (`:93`):
+`:149`) sends `peer.rs:5627`'s notice to all of them at once (`:93`):
 
 ```mermaid
 sequenceDiagram
@@ -3007,7 +3007,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`app.rs:4613-4631`, `watchdog.rs:628`) and it forced
+watchdog's 90 s window (`app.rs:4617-4635`, `watchdog.rs:628`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a

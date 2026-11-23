@@ -428,19 +428,19 @@ sequenceDiagram
 | A dump holds | Why |
 |---|---|
 | per thread: name, run state, kernel `wchan`, and the syscall **with its arguments** from `/proc/self/task/<tid>/syscall` | `write#1 0x1 …` on a thread in `pipe_write` means it is blocked writing stdout |
-| per thread: its stack, symbolized in-process | each thread walks its own stack in a signal handler (`SIGRTMIN+5`, `crates/api/src/stall_watchdog.rs:499`), claimed per request so a late walk can't corrupt the next (`stack_of`, `:576`) |
+| per thread: its stack, symbolized in-process | each thread walks its own stack in a signal handler (`SIGRTMIN+5`, `crates/api/src/stall_watchdog.rs:565`), claimed per request so a late walk can't corrupt the next (`stack_of`, `:642`). The handler is installed **once per process** (`install_handler`, `:516`): a caller that arrives during the install waits for it, and every caller gets its one outcome, a foreign handler on the signal included (#3564) |
 | fd 1 and fd 2: what they are, `unread_bytes`, `pipe_capacity` | `unread == capacity`: the log reader stopped reading |
 | tokio `workers` / `alive_tasks` / `global_queue_depth` | `global_queue_depth` counts tasks woken from OUTSIDE the runtime (timers, I/O, other threads) that no worker has picked up |
 | `VmRSS`, cgroup `memory.current/max/events`, memory/cpu/io **PSI**, `cpu.stat` | rules reclaim thrash and CPU throttling in or out |
 
-A sample is written in **stages**, each synced before the next (`sample_process`, `:794`): the
+A sample is written in **stages**, each synced before the next (`sample_process`, `:860`): the
 header, then every thread's `/proc` line, then stacks one thread at a time. A sample cut short by
 the kill still keeps every earlier stage. Threads in `D`/`T`/`Z` cannot run a handler, so they are
 not asked; their `/proc` line is the evidence. A sample's stack walks share a 5 s budget. At most
 one stall is dumped per 10 min, and the watchdog retires when its runtime shuts down.
 
 ⚠️ **The dump never goes through stdout or `tracing`.** The dump is written to a file (`DumpOut`,
-`stall_watchdog.rs:237`). A copy goes to stderr from a throwaway thread (`:280`), so a blocked
+`stall_watchdog.rs:229`). A copy goes to stderr from a throwaway thread (`:282`), so a blocked
 pipe blocks only that thread.
 
 ### A log pipe that stops draining must not stop the server (#1731)

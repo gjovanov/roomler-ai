@@ -1371,8 +1371,12 @@ async fn verdict_for_a_question() -> TrayVerdict {
 // (crates/remote_control/src/consent.rs:149) past the window it announced for
 // the agent's verdict, so this wait stays under it: longer, and the hub's
 // backstop would answer a bare timeout first, throwing away the agent's reason.
+// FR-149 P1 — and before it, on a one-row Mac's root daemon, the wait for the
+// screen worker's word on its panel (`PANEL_WITHIN`), which a question that
+// goes on to the app waits out first.
 const _: () = assert!(
-    crate::signaling::COMPANION_START_BUDGET.as_millis()
+    crate::indicator::session_panel::PANEL_WITHIN.as_millis()
+        + crate::signaling::COMPANION_START_BUDGET.as_millis()
         + crate::consent_relay::RELAY_WITHIN.as_millis()
         < roomler_ai_remote_control::consent::CONSENT_VERDICT_GRACE.as_millis()
 );
@@ -2595,6 +2599,11 @@ mod tray_start_tests {
     const RUNS_WITHIN: Duration = Duration::from_secs(10);
     /// How late "on time" may be on a busy runner: #3836's bar.
     const AT_ONCE: Duration = Duration::from_millis(500);
+    /// How long a test waits for the starts it asked for to reach the held
+    /// step (#4138): far longer than a busy runner takes to schedule a
+    /// thread. A count already there returns at once, so only a start that
+    /// never gets there waits this out.
+    const BEGINS: Duration = Duration::from_secs(10);
 
     /// What a start answered: the outcome, or why it failed.
     type Answer = std::result::Result<EnsureOutcome, String>;
@@ -2631,6 +2640,27 @@ mod tray_start_tests {
         /// Starts that reached the held step.
         fn began(&self) -> usize {
             self.0.began.load(SeqCst)
+        }
+
+        /// The starts that reached the held step, once `want` of them have,
+        /// waited for `within` at most. A start counts when the thread it
+        /// runs on reaches the step, and an ask can answer before that: once
+        /// its wait is out. So a count read straight after the asks can miss
+        /// a start they began (#4138). The caller asserts the exact count, so
+        /// one start more than `want` still fails.
+        fn began_within(&self, want: usize, within: Duration) -> usize {
+            let deadline = Instant::now() + within;
+            loop {
+                let began = self.began();
+                if began >= want {
+                    return began;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{began} of {want} starts reached the held step within {within:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -2838,7 +2868,11 @@ mod tray_start_tests {
                 });
             assert!(started.is_err(), "nothing starts while held: {started:?}");
         }
-        assert_eq!(held.began(), 1, "one start, however many asked");
+        assert_eq!(
+            held.began_within(1, BEGINS),
+            1,
+            "one start, however many asked"
+        );
         assert!(ran.argvs().is_empty(), "nothing was started while held");
         held.open();
         let (started, _) =
@@ -3118,7 +3152,7 @@ mod tray_start_tests {
             rt.block_on(asking(StandIn::new(host_steps(host)), async move {
                 // The loop's side.
                 let surfaces = crate::signaling::RcSurfaces {
-                    native: false,
+                    shown: crate::indicator::session_panel::Prompted::plain(false),
                     marker: true,
                     behind: Some((start_for_prompt().await, rc_view("f6"))),
                     mark_up: None,
@@ -3178,7 +3212,7 @@ mod tray_start_tests {
             };
             rt.block_on(asking(stood, async move {
                 let surfaces = crate::signaling::RcSurfaces {
-                    native: false,
+                    shown: crate::indicator::session_panel::Prompted::plain(false),
                     marker: true,
                     behind: Some((start_for_prompt().await, rc_view("h8"))),
                     mark_up: None,
@@ -3280,7 +3314,7 @@ mod tray_start_tests {
             let stood = StandIn::new(host_steps(&works)).on_two_rows(road);
             rt.block_on(asking(stood, async move {
                 let surfaces = crate::signaling::RcSurfaces {
-                    native: false,
+                    shown: crate::indicator::session_panel::Prompted::plain(false),
                     marker: true,
                     behind: Some((start_for_prompt().await, rc_view("j9"))),
                     mark_up: None,
@@ -3394,7 +3428,7 @@ mod tray_start_tests {
             let asked = Instant::now();
             let reason = rt.block_on(asking(stood, async move {
                 let surfaces = crate::signaling::RcSurfaces {
-                    native: false,
+                    shown: crate::indicator::session_panel::Prompted::plain(false),
                     marker: true,
                     behind: Some((start_for_prompt().await, rc_view("m3"))),
                     mark_up: None,
@@ -3482,7 +3516,7 @@ mod tray_start_tests {
                 StandIn::new(host_steps(&host)),
                 walk::asking(walking, async move {
                     let surfaces = crate::signaling::RcSurfaces {
-                        native: false,
+                        shown: crate::indicator::session_panel::Prompted::plain(false),
                         marker: true,
                         behind: Some((start_for_prompt().await, rc_view("g7"))),
                         mark_up: None,
@@ -4255,7 +4289,13 @@ mod tray_start_tests {
         let words_at_the_windows_end = |host: &Host, marker: bool| {
             let ind = ind.clone();
             rt.block_on(asking(StandIn::new(host_steps(host)), async move {
-                let shown = crate::signaling::exec_surfaces_up(marker, &ind, exec_view("k1")).await;
+                let shown = crate::signaling::exec_surfaces_up(
+                    marker,
+                    &ind,
+                    exec_view("k1"),
+                    crate::indicator::session_panel::Prompted::plain(false),
+                )
+                .await;
                 crate::signaling::exec_refusal(Decision::Timeout, shown)
             }))
         };
@@ -4414,7 +4454,13 @@ mod tray_start_tests {
         let words_at_the_windows_end = |stood: StandIn, marker: bool| {
             let ind = ind.clone();
             rt.block_on(asking(stood, async move {
-                let shown = crate::signaling::exec_surfaces_up(marker, &ind, exec_view("q4")).await;
+                let shown = crate::signaling::exec_surfaces_up(
+                    marker,
+                    &ind,
+                    exec_view("q4"),
+                    crate::indicator::session_panel::Prompted::plain(false),
+                )
+                .await;
                 crate::signaling::exec_refusal(Decision::Timeout, shown)
             }))
         };
@@ -9175,6 +9221,27 @@ pub(crate) mod session_walk_stand_in {
         pub(crate) fn began(&self) -> usize {
             self.0.began.load(SeqCst)
         }
+
+        /// The walks that reached logind, once `want` of them have, waited
+        /// for `within` at most. A walk counts when the thread it runs on
+        /// reaches logind, and an ask can answer before that: once its wait
+        /// is out. So a count read straight after the asks can miss a walk
+        /// they began (#4138). The caller asserts the exact count, so one
+        /// walk more than `want` still fails.
+        pub(crate) fn began_within(&self, want: usize, within: std::time::Duration) -> usize {
+            let deadline = std::time::Instant::now() + within;
+            loop {
+                let began = self.began();
+                if began >= want {
+                    return began;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{began} of {want} walks reached logind within {within:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 
     /// Opens the gate when dropped: a failed assertion leaves nothing held,
@@ -9253,6 +9320,11 @@ mod session_walk_tests {
     const SLACK: Duration = Duration::from_secs(1);
     /// What a walk that answers may take on a busy runner.
     const RUNS_WITHIN: Duration = Duration::from_secs(10);
+    /// How long a test waits for the walks it asked for to reach logind
+    /// (#4138): far longer than a busy runner takes to schedule a thread. A
+    /// count already there returns at once, so only a walk that never gets
+    /// there waits this out.
+    const BEGINS: Duration = Duration::from_secs(10);
 
     type Walked = Result<GraphicalSession, NoGraphicalSession>;
 
@@ -9313,7 +9385,11 @@ mod session_walk_tests {
                 "logind held the walk, and it answered {walked:?}"
             );
         }
-        assert_eq!(held.began(), 1, "one walk, however many asked");
+        assert_eq!(
+            held.began_within(1, BEGINS),
+            1,
+            "one walk, however many asked"
+        );
         held.open();
         let (walked, _) = ask_on_a_thread(&stood, None, false)
             .recv_timeout(RUNS_WITHIN)

@@ -76,7 +76,7 @@ use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
 use crate::encode::governor::{GateSkip, RateGovernor};
 use crate::encode::pipe::{Fall, MeasuredBy, PathNumber, PathRate, PathView, PushedBy, Ruled};
-use crate::media_inflight::{Bound, Budget, Over, Pass, PumpCount, Shadow, WindowReport};
+use crate::media_inflight::{Bound, Budget, Over, Pass, PumpCount, SendWait, Shadow, WindowReport};
 
 /// A sample closes at the first heartbeat at least this long after the last.
 pub const SAMPLE_MIN: Duration = Duration::from_millis(1500);
@@ -670,6 +670,8 @@ pub struct DeliverySampler {
     /// FR-148 D51 B4a-2 — the largest frame handed lately, for the budget's
     /// envelope ([`envelope_ms`]). Nothing with the budget off.
     largest: Largest,
+    /// FR-148 — the pump's send wait, kept under every mode ([`Self::send_wait`]).
+    send_wait: std::sync::Arc<SendWait>,
 }
 
 impl DeliverySampler {
@@ -707,6 +709,7 @@ impl DeliverySampler {
             pass: Pass::default(),
             said: None,
             largest: Largest::default(),
+            send_wait: std::sync::Arc::default(),
         }
     }
 
@@ -1263,6 +1266,14 @@ impl DeliverySampler {
             .as_deref()
             .map(Shadow::pump_count)
             .unwrap_or_default()
+    }
+
+    /// FR-148 — the pump's send wait, under every mode: the send task's handle
+    /// records each frame that reached the wire, and each reader drains its
+    /// own window of it (the heartbeat takes it; the FFmpeg pump's sender
+    /// window and direct gate read it from where they last read).
+    pub fn send_wait(&self) -> &std::sync::Arc<SendWait> {
+        &self.send_wait
     }
 
     /// FR-148 D46 B3 — [`Self::gate`] on one frame's reading, as
@@ -2896,9 +2907,10 @@ mod tests {
     /// FR-148 D51 B4g — the VP9-444 pump times its capacity gate and hands
     /// that time to the encode, read from `peer.rs` as compiled: a skipped
     /// pass opens the gate clock's span in the gate's arm; the pass the gate
-    /// lets through closes it, before the step; and the pump's one encode
-    /// takes it with the interval, on the encode's own call, with no other
-    /// call handing the encoder a charge.
+    /// lets through closes it, before the step; a pass FR-59 P4's drain pause
+    /// holds after it counts as skipped, in the pause's arm (FR-148); and the
+    /// pump's one encode takes it with the interval, on the encode's own call,
+    /// with no other call handing the encoder a charge.
     #[test]
     fn the_vp9_pump_hands_the_encode_the_time_its_gate_held() {
         const PEER_RS: &str = include_str!("peer.rs");
@@ -2915,6 +2927,7 @@ mod tests {
         for (call, n) in [
             ("gate_clock.skipped(", 1),
             ("gate_clock.passed(", 1),
+            ("gate_clock.paused()", 1),
             ("gate_clock.take()", 1),
             (".encode_charged(&frame, gate)", 1),
             ("enc.encode(", 0),
@@ -2934,10 +2947,173 @@ mod tests {
             at < passed && passed < step,
             "the pass through, before the step"
         );
+        let drain = vp9
+            .find("if governor.draining(std::time::Instant::now()) {")
+            .expect("the drain pause");
+        let pause = &vp9[drain..];
+        let pause = &pause[..pause.find("continue;").expect("the pause's continue")];
+        assert!(
+            passed < drain && pause.contains("gate_clock.paused()"),
+            "a pass the drain pause holds, in the pause's arm, after the pass through"
+        );
         assert!(
             vp9.find("gate_clock.take()").unwrap() < vp9.find(".encode_charged(").unwrap(),
             "taken for the encode"
         );
+    }
+
+    /// The body of `async fn <name>(` in `peer.rs` as compiled, to its closing
+    /// brace at column 0, with `\n` line ends.
+    fn peer_fn(name: &str) -> String {
+        const PEER_RS: &str = include_str!("peer.rs");
+        let src = PEER_RS.replace("\r\n", "\n");
+        let head = format!("async fn {name}(");
+        assert_eq!(src.matches(&head).count(), 1, "one {head:?} in peer.rs");
+        let rest = &src[src.find(&head).unwrap()..];
+        rest[..rest.find("\n}\n").expect("the fn's end")].to_owned()
+    }
+
+    /// FR-148 — both pumps measure the send wait once, in the measure their
+    /// delivery sampler owns (`media_inflight::SendWait`), read from
+    /// `peer.rs` as compiled. Each send task takes the sampler's handle, its
+    /// channel carries each frame's hand-off instant, and it records a frame
+    /// once, after the frame's chunk loop, in the arm of a frame that reached
+    /// the wire: a failed send, a stale or dropped frame records nothing. The
+    /// FFmpeg pump's own atomics and cursors are gone, and its two readers
+    /// between heartbeats each read from a place of their own. The VP9-444
+    /// pump's governor gets nothing new: no sender window, and an age split
+    /// handed no send wait, as before.
+    #[test]
+    fn both_pumps_measure_the_send_wait_once() {
+        let vp9 = peer_fn("media_pump_vp9_444_dc");
+        let ffmpeg = peer_fn("media_pump_ffmpeg_dc");
+        for (name, body, channel, frame, hand_off) in [
+            (
+                "VP9-444",
+                &vp9,
+                "mpsc::channel::<(std::time::Instant, Bytes)>(send_depth)",
+                "while let Some((enqueued_at, wire)) = next.take() {",
+                "send_tx.try_send((std::time::Instant::now(), wire))",
+            ),
+            (
+                "FFmpeg",
+                &ffmpeg,
+                "channel::<(u64, std::time::Instant, bytes::Bytes)>(ffmpeg_send_depth)",
+                "while let Some((epoch, enqueued_at, wire)) = next.take() {",
+                "std::time::Instant::now(),\n                wire,\n            ))",
+            ),
+        ] {
+            for (call, n) in [
+                (channel, 1),
+                (frame, 1),
+                (hand_off, 1),
+                ("Arc::clone(delivery.send_wait())", 1),
+                ("send_wait.sent(enqueued_at, std::time::Instant::now())", 1),
+                ("send_wait.sent(", 1),
+            ] {
+                assert_eq!(body.matches(call).count(), n, "{name}: {call}");
+            }
+            let task = &body[body.find(frame).unwrap()..];
+            let chunks = task.find("while off < total {").expect("the chunk loop");
+            let ok = task
+                .find("if ok {")
+                .expect("the arm of a frame on the wire");
+            let indent = &task[task[..ok].rfind('\n').unwrap() + 1..ok];
+            let end = ok + task[ok..].find(&format!("\n{indent}}}\n")).unwrap();
+            let sent = task.find("send_wait.sent(").unwrap();
+            assert!(
+                chunks < ok && ok < sent && sent < end,
+                "{name}: recorded once the frame's last chunk went, in the arm of a frame on the wire"
+            );
+        }
+        for gone in [
+            "send_wait_us_sum",
+            "send_wait_us_max",
+            "send_wait_frames",
+            "win_sw_sum_last",
+            "win_sw_frames_last",
+            "gate_sw_sum_last",
+            "gate_sw_frames_last",
+        ] {
+            assert!(!ffmpeg.contains(gone), "FFmpeg: {gone} retired");
+        }
+        assert_eq!(
+            ffmpeg
+                .matches("crate::media_inflight::SendWaitSince::default()")
+                .count(),
+            2,
+            "FFmpeg: the sender window's and the direct gate's places"
+        );
+        for read in [
+            "gate_send_wait.avg_ms(delivery.send_wait())",
+            "win_send_wait.avg_ms(delivery.send_wait())",
+            "send_wait_max_ms: delivery.send_wait().max_ms(),",
+        ] {
+            assert_eq!(ffmpeg.matches(read).count(), 1, "FFmpeg: {read}");
+        }
+        assert!(
+            !vp9.contains("SendWaitSince"),
+            "VP9-444: one reader, its heartbeat"
+        );
+        assert!(
+            !vp9.contains("note_window_sender("),
+            "VP9-444: no sender window"
+        );
+        assert!(
+            vp9.contains("age_split = ?governor.viewer_age_split(None),"),
+            "VP9-444: the age split as before"
+        );
+    }
+
+    /// FR-148 (S3) — the VP9-444 heartbeat prints the send wait as the FFmpeg
+    /// one does: `send_wait_avg_ms` and `send_wait_max_ms`, with the same
+    /// names, units and meaning, over its own window. Neither line has a
+    /// format test, so this reads the piece that formats the two fields
+    /// (`SendWaitWindow::ms`: the window's average in whole µs, as ms, 0 with
+    /// no frame, and its longest, ms) and, from `peer.rs` as compiled, that
+    /// each heartbeat takes its window from the pump's measure through that
+    /// piece, once, and prints both fields on its line.
+    #[test]
+    fn the_vp9_heartbeat_prints_the_send_wait_as_the_ffmpeg_one_does() {
+        use crate::media_inflight::SendWaitWindow;
+        let window = |frames, sum_us, max_us| SendWaitWindow {
+            frames,
+            sum_us,
+            max_us,
+        };
+        assert_eq!(window(3, 70_000, 30_000).ms(), (23.333, 30.0));
+        assert_eq!(
+            window(2, 1_001, 1_000).ms(),
+            (0.5, 1.0),
+            "the average in whole µs"
+        );
+        assert_eq!(window(0, 0, 0).ms(), (0.0, 0.0), "no frame");
+        const TAKE: &str =
+            "let (send_wait_avg_ms, send_wait_max_ms) = delivery.send_wait().take().ms();";
+        for (pump, line) in [
+            (
+                "media_pump_vp9_444_dc",
+                "\"VP9-444 DC pump heartbeat (≈1s window)\"",
+            ),
+            (
+                "media_pump_ffmpeg_dc",
+                "\"FFmpeg DC pump heartbeat (≈2s window)\"",
+            ),
+        ] {
+            let body = peer_fn(pump);
+            assert_eq!(body.matches(line).count(), 1, "{pump}: its heartbeat line");
+            let end = body.find(line).unwrap();
+            let start = body[..end].rfind("info!(").expect("the line's info!");
+            assert!(
+                body[start..end].contains("send_wait_avg_ms, send_wait_max_ms,"),
+                "{pump}: the two fields on its heartbeat line"
+            );
+            assert_eq!(body.matches(TAKE).count(), 1, "{pump}: {TAKE}");
+            assert!(
+                body.find(TAKE).unwrap() < start,
+                "{pump}: taken for its line"
+            );
+        }
     }
 
     /// FR-148 D46 B2 — a sample read with gauges: `standing_ms` over the
@@ -9243,6 +9419,9 @@ pub(crate) mod shaped_link {
                 /// capacity gate kept frames back since the encode before it
                 /// (`encode::charge::GateClock`) and the gap it was charged, µs.
                 charged: Vec<(u64, u64, u64)>,
+                /// FR-148 — each heartbeat's take of the send wait (µs from
+                /// `t0`, its window), every 30 frames encoded, as the pump's.
+                send_waits: Vec<(u64, crate::media_inflight::SendWaitWindow)>,
             }
 
             /// A frame in the viewer's worker: its write stamp, when its last
@@ -9289,7 +9468,8 @@ pub(crate) mod shaped_link {
             /// skip's decrease through the pass, the budget's step, the newest
             /// capture, the viewer window, the drain, the divisor, the governor's
             /// tick, the encode, the watermark arm and the send channel; and the
-            /// send task behind it, one frame at a time into SCTP. Until `moves`
+            /// send task behind it, one frame at a time into SCTP, with each
+            /// frame's send wait and the heartbeat's take of it. Until `moves`
             /// the screen is still: a delta is `STILL_DELTA` whatever the target.
             /// The capture delivers a frame every `capture` (`CAPTURE`, or
             /// C6s's `SLOW_CAPTURE`) against the pump's `TARGET_FPS`.
@@ -9319,11 +9499,12 @@ pub(crate) mod shaped_link {
                     Arm::Off => DeliverySampler::new(true),
                     Arm::On => DeliverySampler::new(true).with_budget_on(),
                 };
-                let (send_tx, mut send_rx) = mpsc::channel::<Bytes>(SEND_DEPTH);
+                let (send_tx, mut send_rx) = mpsc::channel::<(Instant, Bytes)>(SEND_DEPTH);
                 let blocked: Arc<StdMutex<Vec<(u64, u64, u64)>>> = Arc::default();
                 let sender = {
                     let stream = Arc::clone(&stream);
                     let count = delivery.pump_count();
+                    let send_wait = Arc::clone(delivery.send_wait());
                     let written = Arc::clone(&written);
                     let sink = governor.goodput_sink();
                     let blocked = Arc::clone(&blocked);
@@ -9332,9 +9513,10 @@ pub(crate) mod shaped_link {
                     // written, and the frame's whole write is one goodput
                     // sample. Each message carries the frame's stamp; all but
                     // the last are marked `MORE`, and the viewer logs the frame
-                    // when its last message arrives.
+                    // when its last message arrives. A frame whose last
+                    // message went records its send wait (FR-148).
                     tokio::spawn(async move {
-                        'frames: while let Some(frame) = send_rx.recv().await {
+                        'frames: while let Some((enqueued_at, frame)) = send_rx.recv().await {
                             let total = frame.len();
                             let mut unsent = count.unsent(total);
                             let began = Instant::now();
@@ -9355,6 +9537,7 @@ pub(crate) mod shaped_link {
                                 unsent.sent(end - off);
                                 off = end;
                             }
+                            send_wait.sent(enqueued_at, Instant::now());
                             written.fetch_add(total as u64, Ordering::Relaxed);
                             let took = began.elapsed();
                             sink.record_frame(total as u64, took, frame[8] == 1);
@@ -9520,6 +9703,7 @@ pub(crate) mod shaped_link {
                         });
                     }
                     if governor.draining(Instant::now()) {
+                        gate_clock.paused();
                         p.drained += 1;
                         p.drained_at.push(us(t0.elapsed()));
                         tokio::time::sleep(DRAIN_POLL).await;
@@ -9582,7 +9766,7 @@ pub(crate) mod shaped_link {
                     let mut frame = vec![0x6b_u8; len];
                     frame[..8].copy_from_slice(&us(t0.elapsed()).to_le_bytes());
                     frame[8] = u8::from(key);
-                    match send_tx.try_send(Bytes::from(frame)) {
+                    match send_tx.try_send((Instant::now(), Bytes::from(frame))) {
                         Ok(()) => {
                             delivery.on_handed(len as u64);
                             p.sent_at.push(us(t0.elapsed()));
@@ -9593,6 +9777,10 @@ pub(crate) mod shaped_link {
                             key_asked = true;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                    if p.frames.len().is_multiple_of(30) {
+                        let window = delivery.send_wait().take();
+                        p.send_waits.push((us(t0.elapsed()), window));
                     }
                 }
                 drop(send_tx);
@@ -10325,6 +10513,10 @@ pub(crate) mod shaped_link {
                 /// before it (mean, p95) and the gap charged (mean), µs.
                 gated_us: (u64, u64),
                 charged_us: u64,
+                /// FR-148 — the VP9-444 heartbeat's send wait over the stretch:
+                /// its windows, `send_wait_avg_ms` p50 and p95, and
+                /// `send_wait_max_ms` p50, p95 and the longest, µs.
+                send_wait: (usize, (u64, u64), (u64, u64, u64)),
             }
 
             /// The settled stretch's start: the opening reading's confidence
@@ -10345,9 +10537,26 @@ pub(crate) mod shaped_link {
                     p.charged.iter().filter(|c| c.0 >= from).collect();
                 let n = (encodes.len() as u64).max(1);
                 let mut gated: Vec<u64> = encodes.iter().map(|c| c.1).collect();
+                let waits: Vec<_> = p.send_waits.iter().filter(|w| w.0 >= from).collect();
+                // The heartbeat's two fields, µs: the average in whole µs, 0
+                // with no frame, and the longest.
+                let mut avgs: Vec<u64> = waits
+                    .iter()
+                    .map(|w| w.1.sum_us.checked_div(w.1.frames).unwrap_or(0))
+                    .collect();
+                let mut maxes: Vec<u64> = waits.iter().map(|w| w.1.max_us).collect();
                 Bar {
                     gated_us: (gated.iter().sum::<u64>() / n, quantile(&mut gated, 95)),
                     charged_us: encodes.iter().map(|c| c.2).sum::<u64>() / n,
+                    send_wait: (
+                        waits.len(),
+                        (quantile(&mut avgs, 50), quantile(&mut avgs, 95)),
+                        (
+                            quantile(&mut maxes, 50),
+                            quantile(&mut maxes, 95),
+                            maxes.iter().copied().max().unwrap_or(0),
+                        ),
+                    ),
                     from_us: from,
                     read: read_from(r, from),
                     held: p.held_at.iter().filter(inside).count(),
@@ -10372,7 +10581,8 @@ pub(crate) mod shaped_link {
                     "bar from {} ms: fill {}.{:03} of payload ({} kbit/s), sent fps p50 {} p10 {}, transit \
                      p95 {} ms, rtt p95 {} ms, held passes {} in {} holds, holds read as decrease(full) {}, \
                      drain windows {} (passes paused {}), link cuts {}, gated per encode mean {} ms p95 {} ms, \
-                     charged per encode mean {} ms, moves {:?}",
+                     charged per encode mean {} ms, heartbeat send_wait_avg_ms p50 {} p95 {}, send_wait_max_ms \
+                     p50 {} p95 {} longest {} ({} heartbeats), moves {:?}",
                     b.from_us / 1_000,
                     x.of_payload / 1_000,
                     x.of_payload % 1_000,
@@ -10390,6 +10600,12 @@ pub(crate) mod shaped_link {
                     ms(b.gated_us.0),
                     ms(b.gated_us.1),
                     ms(b.charged_us),
+                    ms(b.send_wait.1.0),
+                    ms(b.send_wait.1.1),
+                    ms(b.send_wait.2.0),
+                    ms(b.send_wait.2.1),
+                    ms(b.send_wait.2.2),
+                    b.send_wait.0,
                     b.moves,
                 )
             }

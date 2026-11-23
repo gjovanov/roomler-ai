@@ -131,3 +131,35 @@ describe('members store FR-11', () => {
     expect(store.items.map((m) => m.id)).toEqual(['fresh'])
   })
 })
+
+// #4248 — the store holds one org's people at a time, and knows which.
+describe('members store: one org at a time (#4248)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+
+  it("a fetch for org B drops org A's people at once, and org A's late answer", async () => {
+    const store = useMembersStore()
+    mockApi.get.mockResolvedValueOnce(mkPage([mkMember({ id: 'ma' })]))
+    await store.fetchMembers(ORG_A)
+    let lateA!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (lateA = r)))
+    const pageTwoA = store.fetchMembers(ORG_A, { page: 2 })
+    // Paging or searching within one org keeps the rows while it loads.
+    expect(store.items.map((m) => m.id)).toEqual(['ma'])
+
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)))
+    const loadB = store.fetchMembers(ORG_B)
+    expect(store.items).toEqual([])
+    expect(store.total).toBe(0)
+    expect(store.membersTenantId).toBe(ORG_B)
+
+    answerB(mkPage([mkMember({ id: 'mb' })]))
+    await loadB
+    lateA(mkPage([mkMember({ id: 'ma2' })], { page: 2 }))
+    await pageTwoA
+    expect(store.items.map((m) => m.id)).toEqual(['mb'])
+    expect(store.page).toBe(1)
+    expect(store.loading).toBe(false)
+  })
+})

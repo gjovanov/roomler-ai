@@ -297,7 +297,7 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:3959`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:3990`), and the viewer ignores
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:10382`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
@@ -966,18 +966,18 @@ in.
 
 **How it reaches the server and the viewer.** The hello and the heartbeat announce one snapshot
 (#3992). One function reads every word a connection announces, the answer's generation first
-([`Announcer::now`](../agents/roomlerd/src/signaling.rs#L7040)), and one builds the caps from it
-([`Announcer::caps`](../agents/roomlerd/src/signaling.rs#L7088)). The hello carries the first
+([`Announcer::now`](../agents/roomlerd/src/signaling.rs#L7101)), and one builds the caps from it
+([`Announcer::caps`](../agents/roomlerd/src/signaling.rs#L7149)). The hello carries the first
 snapshot, and that is what the connection has announced until a beat reads one that differs
-([`Announcer::beat`](../agents/roomlerd/src/signaling.rs#L7171)) and re-announces (FR-43 P2c);
+([`Announcer::beat`](../agents/roomlerd/src/signaling.rs#L7232)) and re-announces (FR-43 P2c);
 the server replaces the row's blob. Only the hello makes that first value, so the comparison
 starts from nothing else. The generation is part of that comparison, per connection, with no
 wire change, and since #3439 a watch on it wakes every connection, so every organization's row
 gets it at once rather than within a beat. A supervised Mac's screen worker wakes the connections
 that hold its delegation host the same way: its caps, the person's floor or its leaving, once
-stored, move a second watch ([`DelegateHost::news`](../agents/roomlerd/src/delegate.rs#L1345)).
+stored, move a second watch ([`DelegateHost::news`](../agents/roomlerd/src/delegate.rs#L1677)).
 The hello subscribes to it before it reads its words
-([`Announcer::hello_with`](../agents/roomlerd/src/signaling.rs#L7148)), so a word said in between
+([`Announcer::hello_with`](../agents/roomlerd/src/signaling.rs#L7209)), so a word said in between
 is in the hello or wakes the loop. The beat still decides what is sent, and a word that changes
 nothing the row says costs no caps. A reconnect's hello reads the answer in force. A
 viewer sees the new matrix at its next page load or 5-minute status read. A session
@@ -1802,7 +1802,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10258-10291`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10230-10263`):
 
 | Field | Meaning |
 |---|---|
@@ -1814,7 +1814,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:856`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6616`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6630`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -1828,11 +1828,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6849`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6863`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6878`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6892`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
@@ -1878,7 +1878,7 @@ constant bitrate (`libavcodec/qsvenc.c:628-631`). The runtime then pads every fr
 and `global_quality` is never read. [FR-148](fr/FR-148-path-measured-plan-follows.md)
 measured what follows on CORPLAP-1: a still screen spends the cap (about 0.9 Mbit/s of
 keepalive filler in a 1.64 Mbit/s session), and every real frame, a caret blink's too,
-is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9764`), so
+is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9743`), so
 a rebuild-bound rate apply that waits for quiet waits for good: 0 rate moves in 16,719 s.
 
 `qsv_rate_mode = qvbr` (`ROOMLERD_QSV_RATE_MODE`) opens HEVC and H.264 QSV off that
@@ -1971,7 +1971,7 @@ read on silicon.
 Under `inflight_budget = on` the in-flight budget holds frames on a relayed session
 ([FR-148](fr/FR-148-path-measured-plan-follows.md) D51, B4). Both data-channel pumps run
 that gate before they capture: the FFmpeg pump re-polls it every 2 ms
-(`agents/roomlerd/src/peer.rs:8121-8206`) and captures after it (`:8253`), and its
+(`agents/roomlerd/src/peer.rs:8107-8192`) and captures after it (`:8239`), and its
 encoder stamps each frame with the capture's time (`encoder.rs:96-99`, `:2357-2362`), so
 a hold of H ms reaches the encoder as a pts gap of one interval plus H. libvpx, the
 VP9-444 pump's encoder, grants that gap: after a 500 ms hold its next three seconds
@@ -1985,7 +1985,7 @@ same gap.
 **Every NVENC and AMF encoder holds, to the byte.** `o18_spend_after_a_hold`
 (`encoder.rs:4882-5296`) opens each encoder as a relayed session does (`new_preferred`
 with `constrained`, as `FfmpegDcCodec::open` does at
-`agents/roomlerd/src/peer.rs:5470-5473`; `hevc_nvenc`
+`agents/roomlerd/src/peer.rs:5475-5478`; `hevc_nvenc`
 4:4:4 through `new_hevc_adaptive`) and feeds it two arms, a fresh encoder each: three
 seconds at the frame interval, a 500 ms jump in the pts, three more seconds (`hold`);
 and the same frames with no jump (`interval`). The content is the libvpx cell's, a grey

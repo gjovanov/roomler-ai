@@ -735,7 +735,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:4996`](../agents/roomlerd/src/companion.rs#L4996)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:2196`](../agents/roomlerd/src/companion.rs#L2196)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:5042`](../agents/roomlerd/src/companion.rs#L5042)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:2200`](../agents/roomlerd/src/companion.rs#L2200)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -1097,6 +1097,10 @@ sequenceDiagram
 - **Either half can refuse.** The worker refuses a via-service grant when its
   person's `ssh_enabled` is off, when `ssh_max_privilege = console_user` meets a
   `daemon` grant (M5 above), or when `ROOMLERD_SSH_VIA_SERVICE=0` is set.
+- **A copy rings nothing.** The worker rings the service once per grant id. A
+  copy of an id it has already handed on, or refused, is dropped with a warning
+  and answers nothing, because a refusal there could undo the first copy's
+  claim (#3558, [below](#a-grant-id-is-honoured-at-most-once-3558)).
 
 What the signed-in user controls, and why none of it widens port 2223:
 
@@ -1224,7 +1228,7 @@ life to dial in), and logs `confirmed_after_ms` on every confirmed grant.
 | recorded | where to dial |
 | `ssh_disabled` — gate 4 | `agent_disabled` |
 | `expired` — only from an agent released before #3511: its clock read the grant's timestamp as already past, because it ran ahead of the server's | `grant_expired_on_arrival` |
-| `invalid`, or a reason newer than the server | `grant_refused` |
+| `invalid` (a key that does not parse here, or since #3558 a copy of a grant id the device has already seen), or a reason newer than the server | `grant_refused` |
 | nothing within 10 s | `grant_unconfirmed` — **never an address**: the one thing known is that the device has not confirmed |
 
 ⚠️ `ssh-grant-ack` is **equality-matched** — `ssh` is its prefix exactly as it is
@@ -1256,6 +1260,11 @@ reason to accept an unbounded table or an eternal key:
 
 - **Single use.** A redeemed grant is removed, so a captured public key cannot
   be replayed into a second session even inside its lifetime.
+- **Each grant id at most once** (#3558). A copy of a grant whose id is still
+  pending, or left the table in the last ten minutes (redeemed, expired or
+  dropped), is refused and not recorded, so it can neither open a second
+  session nor give the key a fresh window. 256 ids are remembered, the oldest
+  forgotten first ([below](#a-grant-id-is-honoured-at-most-once-3558)).
 - **A local deadline**: 60 s from the grant's *arrival*, on the device's
   monotonic clock (`Instant`), whatever the server's timestamp says (#3511,
   next section). A skewed clock or a compromised control plane can neither
@@ -1294,7 +1303,7 @@ Now the window is the TTL from **arrival**, on the device's monotonic clock:
 
 | side | where | what it does |
 |---|---|---|
-| the device | `record_grant` ([`ssh.rs:3264`](../agents/roomlerd/src/ssh.rs#L3264)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3296-3305`), so a skewed clock stays visible |
+| the device | `record_grant` ([`ssh.rs:3289`](../agents/roomlerd/src/ssh.rs#L3289)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3321-3330`), so a skewed clock stays visible |
 | the server | `decide` ([`agent_ssh.rs:445`](../crates/modules/network/src/routes/agent_ssh.rs#L445)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2580`](../crates/remote_control/src/models.rs#L2580)), on `rc:ssh.grant` (`agent_ssh.rs:465`) and in the FR-105 `ssh_pending` row the service claims (`:491`). The caller's copy stays mint + 60 s |
 
 The slack is for agents released before #3511, which still take
@@ -1327,8 +1336,10 @@ server's. These bounds hold whatever the device's clock says:
    `agents/roomlerd/src/signaling.rs:66`, checked at `:2393`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
-   (`agents/roomlerd/src/ssh.rs:3211`), and no window longer than 60 s from
-   arrival.
+   (`agents/roomlerd/src/ssh.rs:3223`), and no window longer than 60 s from
+   arrival. A copy of a grant gets no window at all: it is refused while its
+   id is pending and for ten minutes after the id left the table (#3558, next
+   section).
 
 One case is left: a caller of the HTTP route who keeps a reusable key after a
 `grant_unconfirmed` and dials anyway (the route takes any OpenSSH public key,
@@ -1342,6 +1353,110 @@ most, `MAX_SESSION_SECS`, `models.rs:2596`). #3511 records that decision.
 |---|---|---|
 | **agent before #3511** | refuses every grant from about 60 s ahead | takes grants up to about 10 min ahead; the window stays ≤ 60 s from arrival |
 | **agent with #3511** | takes grants at any skew, 60 s from arrival | takes grants at any skew, 60 s from arrival |
+
+### A grant id is honoured at most once (#3558)
+
+`record_grant` used to append whatever arrived. A grant delivered twice became
+two redeemable entries, and `take_grant_for` matches by key and removes one, so
+two connections with that key could each redeem one. A copy that arrived after
+its grant was redeemed was recorded as new, and since #3511 with a fresh 60 s
+window from its own arrival. Today's server sends each grant once, on one path,
+so this takes a duplicated or replayed frame. The rule it broke is the one the
+table exists for: a captured key must not open a second session.
+
+Now a process honours a grant id at most once. `record_grant` checks the id
+after its prune and before the table changes
+([`ssh.rs:3348-3358`](../agents/roomlerd/src/ssh.rs#L3348)), and a copy is
+never recorded, so the first copy keeps its entry, its window and its
+acknowledgement:
+
+| What became of the first copy | A copy is refused | Where the id is remembered |
+|---|---|---|
+| pending: in the table, waiting for its connection | while it stays pending, then as below | the table itself refuses it |
+| redeemed by a connection | for ten minutes after the redemption | `take_grant_for` ([`ssh.rs:3410`](../agents/roomlerd/src/ssh.rs#L3410)) |
+| expired unredeemed: its 60 s ran out | for ten minutes after the prune that found it expired: a grant that timed out is burned too | `prune` ([`ssh.rs:3389`](../agents/roomlerd/src/ssh.rs#L3389)) |
+| dropped from a full table (16 pending) | for ten minutes after the drop | `record_grant` ([`ssh.rs:3369`](../agents/roomlerd/src/ssh.rs#L3369)) |
+
+`record_grant`, in order:
+
+```mermaid
+flowchart TD
+    A["rc:ssh.grant arrives"] --> B{"the key parses?"}
+    B -- no --> X1["refused: invalid"]
+    B -- yes --> C["the window: 60 s from arrival"]
+    C --> D["prune: an expired grant leaves the table,<br/>and its id is remembered"]
+    D --> E{"the id is pending,<br/>or remembered?"}
+    E -- yes --> X2["refused: invalid<br/>nothing recorded, the first copy untouched"]
+    E -- no --> F{"16 pending?"}
+    F -- yes --> G["drop the oldest,<br/>and remember its id"]
+    F -- no --> H["recorded: the key is in the table auth reads"]
+    G --> H
+```
+
+- **The horizon**, `GRANT_ID_HORIZON`
+  ([`ssh.rs:3437`](../agents/roomlerd/src/ssh.rs#L3437)): ten minutes, ten
+  windows of `GRANT_TTL_SECS`, counted from the moment the id left the table.
+  While the grant is pending the table itself refuses a copy, so an id is
+  refused for its whole window and ten minutes after: at least the window, by
+  construction.
+- **The bound**, `MAX_REMEMBERED_GRANTS`
+  ([`ssh.rs:3446`](../agents/roomlerd/src/ssh.rs#L3446)): 256 ids, the oldest
+  forgotten first, a few KiB. The server mints one grant per session asked for,
+  so 256 inside ten minutes is a scripted loop, not a person. The pending table
+  keeps its own bound of 16.
+- **The memory**, `SPENT` ([`ssh.rs:3527`](../agents/roomlerd/src/ssh.rs#L3527)),
+  is locked only while the pending table is held, and always after it: one lock
+  order, and no moment at which a grant has left the table and its id is not
+  yet remembered.
+- **Forgotten:** an id past the horizon or pushed out by the bound, and every id
+  at a restart. The memory belongs to the process, as the table does.
+
+**The refusal** is `invalid` (`SshGrantRefusal::Invalid`,
+[`ssh.rs:3260`](../agents/roomlerd/src/ssh.rs#L3260)), which the caller hears
+as `grant_refused`. The wire gets no new value, so every server release reads
+it. It is not `other`, a reason this build would not know, and not `expired`,
+which #3511 retired. The worker logs it as it logs any refusal of
+`record_grant`, `rc:ssh.grant rejected` with the grant id
+([`signaling.rs:6199`](../agents/roomlerd/src/signaling.rs#L6199)), and the
+error names the case: "a grant id is honoured at most once, and its first copy
+was redeemed" (or is still pending, expired unredeemed, or was dropped from a
+full table).
+
+**The first copy's acknowledgement stands**, and the two paths answer a copy
+differently so that it does:
+
+| Path | A copy is | Why the first copy's answer stands |
+|---|---|---|
+| the worker's own table | refused, `invalid` | One loop records and acknowledges each grant in order (`handle_server_msg`, [`signaling.rs:3326`](../agents/roomlerd/src/signaling.rs#L3326)), and its answers leave on one queue ([`signaling.rs:2760`](../agents/roomlerd/src/signaling.rs#L2760)). The server reads one socket's frames in order ([`socket.rs:560-583`](../crates/modules/fleet/src/socket.rs#L560)), and the first answer removes the caller's wait ([`ssh_grant_acks.rs:108-120`](../crates/modules/network/src/ssh_grant_acks.rs#L108)). The copy's refusal finds no wait, and the server logs `ssh: grant ack with no waiter` at debug ([`agent_socket.rs:141-155`](../crates/modules/network/src/agent_socket.rs#L141)) |
+| the SYSTEM service (FR-105) | dropped by the worker: no second ring and no acknowledgement, only a warning, `rc:ssh.grant already handed to the SYSTEM service (or refused); this copy is dropped, no ack` ([`signaling.rs:6097-6106`](../agents/roomlerd/src/signaling.rs#L6097)) | Here a refusal could undo the first copy. The service's claim is single use ([`ssh_pending.rs:44-68`](../crates/services/src/dao/ssh_pending.rs#L44)), so a copy's ring ends in a 404 ([`agent_ssh.rs:1253-1280`](../crates/modules/network/src/routes/agent_ssh.rs#L1253)), which the worker would answer as a refusal. The first copy's claim can land on a server instance other than the one holding the caller's wait. That wait reads the claim from the shared row every 400 ms, and until then it still takes a worker's refusal ([`ssh_grant_acks.rs:115`](../crates/modules/network/src/ssh_grant_acks.rs#L115)): its refusal arm would deny the caller ([`agent_ssh.rs:545-566`](../crates/modules/network/src/routes/agent_ssh.rs#L545)) while the service holds the grant. So the worker remembers each via-service id at first sight, before any outcome (`first_sight_via_service`, [`ssh.rs:3555`](../agents/roomlerd/src/ssh.rs#L3555)), in a memory of its own with the same horizon and bound, never the table's. A grant the worker refused is as dead as one the service took, and its first refusal already answered |
+
+Left as they are:
+
+- A copy delivered to both the worker and the SYSTEM service of one Windows
+  device: two processes, two memories. The server sends each grant down one
+  path.
+- A grant the worker refused at gate 4 (`ssh_enabled` off) never enters the
+  table, so its id is not remembered, and a copy that arrived after SSH was
+  turned on would be recorded. The first copy was never honoured, so the id is
+  still honoured once at most.
+- `record_grant`'s warning that the server's expiry is already past by this
+  device's clock still prints for a copy before the copy is refused. The order
+  of the checks is unchanged, and the warning is a log line only.
+
+Tested in `ssh::tests`: `the_same_grant_twice_is_held_once_and_admits_one_session`,
+`a_copy_of_a_redeemed_grant_is_refused`,
+`a_second_copy_does_not_extend_the_first_ones_window` and
+`a_copy_of_a_grant_that_expired_unredeemed_is_refused` connect with the key,
+and find the second session refused and the copy answered `invalid`. Before the
+fix each second session got in. `both_tables_stay_within_their_bounds` records
+320 ids, each followed by a copy, and holds the table to 16 and the memory to
+256 throughout. `a_via_service_grant_is_handed_on_at_first_sight_only`,
+`the_via_service_memory_stays_within_its_bound` and
+`a_via_service_id_is_forgotten_after_the_horizon` hold the worker's via-service
+memory to the same rule. On the server,
+`a_refusal_after_a_recorded_ack_lands_nowhere`
+([`ssh_grant_acks.rs:350`](../crates/modules/network/src/ssh_grant_acks.rs#L350))
+pins the worker path's argument.
 
 ### Operator consent (P5d — shipped)
 
@@ -1399,7 +1514,7 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4298`](../agents/roomlerd/src/signaling.rs#L4298), [`:5849`](../agents/roomlerd/src/signaling.rs#L5849)), as the recording question does
+first the same way ([`signaling.rs:4329`](../agents/roomlerd/src/signaling.rs#L4329), [`:5891`](../agents/roomlerd/src/signaling.rs#L5891)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
@@ -1412,7 +1527,7 @@ it. A different activity is a different question: the question names the
 activity (FR-27), so an Allow given for a command never opens a shell. Each
 question is filed under a fresh object id, never the grant's, and the daemon
 logs the two side by side. A channel that joins a standing question logs that
-question's id ([`ssh.rs:2518`](../agents/roomlerd/src/ssh.rs#L2518)), and the answer's line carries the grant ([`:2717`](../agents/roomlerd/src/ssh.rs#L2717)), so a
+question's id ([`ssh.rs:2518`](../agents/roomlerd/src/ssh.rs#L2518)), and the answer's line carries the grant ([`:2729`](../agents/roomlerd/src/ssh.rs#L2729)), so a
 joiner is matched to the answer it took by id, not by timing.
 
 **One Allow settles every channel of the grant that asks about the same
