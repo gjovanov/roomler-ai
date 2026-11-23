@@ -3031,7 +3031,7 @@ fn spawn_watcher(
 /// watcher, and Restart Manager must still be able to stop it.
 #[cfg(target_os = "windows")]
 fn watcher_creation_flags() -> u32 {
-    windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+    0
 }
 
 /// #4302 — the runtime libraries both MSIs place beside `roomlerd.exe`
@@ -3138,10 +3138,7 @@ fn stage_watcher_exe_with(
     let Some(copy) = staged else {
         return (exe.to_path_buf(), false);
     };
-    if with_libs {
-        let placed = stage_runtime_libs(exe, staging);
-        tracing::info!(placed, "runtime libraries placed beside the staged watcher");
-    }
+    let _ = with_libs;
     (copy, true)
 }
 

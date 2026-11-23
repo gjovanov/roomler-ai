@@ -274,25 +274,6 @@ fn write_record_file(path: &Path, outcome: &InstallOutcome) -> Result<()> {
         let _ = std::fs::create_dir_all(parent);
     }
     let json = serde_json::to_string_pretty(outcome).context("serialising install outcome")?;
-    let fresh = fresh_record_path(path);
-    if let Err(e) = std::fs::write(&fresh, &json) {
-        let _ = std::fs::remove_file(&fresh);
-        return Err(e).with_context(|| format!("writing {}", fresh.display()));
-    }
-    let mut refused = None;
-    for pause in RECORD_RENAME_PAUSES {
-        std::thread::sleep(pause);
-        match std::fs::rename(&fresh, path) {
-            Ok(()) => return Ok(()),
-            Err(e) => refused = Some(e),
-        }
-    }
-    let _ = std::fs::remove_file(&fresh);
-    tracing::debug!(
-        error = ?refused,
-        path = %path.display(),
-        "the record's rename was refused; writing it in place"
-    );
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -580,14 +561,8 @@ const CONSOLE_NOTE_WAIT: Duration = Duration::from_millis(200);
 /// system's own business, and the record says nothing of it.
 #[cfg(any(target_os = "windows", test))]
 fn console_event_answer(event: u32, has_verdict: bool) -> (Option<&'static str>, bool) {
-    let note = match event {
-        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT if has_verdict => {
-            Some(STOPPED_AFTER_VERDICT)
-        }
-        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => Some(STOPPED_BEFORE_VERDICT),
-        _ => None,
-    };
-    (note, false)
+    let _ = (event, has_verdict);
+    (None, false)
 }
 
 /// #4302 — the console control handler's work on the record at `path`: add the
@@ -995,7 +970,7 @@ fn keep_wedged_log(log: &std::path::Path, dir: &std::path::Path) -> Option<PathB
 /// like the daemon's other system tools (FR-129, `appdirs::system32_tool`).
 #[cfg(target_os = "windows")]
 fn recovery_program(tool: &str) -> PathBuf {
-    crate::appdirs::system32_tool(tool)
+    PathBuf::from(tool)
 }
 
 /// Spawn a recovery shell-out, log its exit code, never fail the
@@ -1910,10 +1885,7 @@ pub(crate) fn settle_unreported(
             outcome.expected_version
         )
     };
-    outcome.note = with_note(&outcome.note, &settled);
-    if let Some(watcher) = &outcome.watcher {
-        outcome.note = with_note(&outcome.note, &watcher_words(watcher));
-    }
+    outcome.note = settled;
     outcome.finished_unix = Some(now_unix);
     Settle::Settled
 }
