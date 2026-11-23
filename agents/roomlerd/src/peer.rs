@@ -11349,15 +11349,24 @@ fn attach_control_handler(
                 }
                 "rc:keyframe" => {
                     // Browser's decode queue backed up → it dropped deltas and
-                    // needs a fresh IDR to resync. Force one (min-gap clamped).
+                    // needs a fresh IDR to resync. Ask the session's gate for
+                    // one (`media_deadline::KeyframeGate`): it passes once
+                    // 500 ms have passed since the gate's last grant
+                    // (`media_deadline::MIN_KF_GAP`). Under
+                    // `ROOMLERD_VIDEO_DEADLINE=on`, while the session's lane is
+                    // on `video-deadline` or switching to it, FR-148 P4b-4's
+                    // cost rule spaces it instead (`media_deadline::kf_gap`),
+                    // and an ask the rule refuses is owed: the lane's first
+                    // frame after the rule's gap opens forces it, and a key
+                    // frame written first answers it.
                     // rc.217 — 200 ms → 500 ms: with the #166 worker retrying
                     // at ~4 req/s while gated AND runtime forces now actually
                     // producing IDRs (qsv forced_idr), the old gap allowed up
                     // to 5 big IDRs/s onto a struggling viewer — feeding the
                     // very backlog the resync was meant to clear. 2 IDRs/s is
                     // plenty for resync and halves the burst load. The gap is
-                    // the session's gate's (`media_deadline::MIN_KF_GAP`),
-                    // which FR-148 P4b-3's send tasks ask through too.
+                    // the session's gate's, which FR-148 P4b-3's send tasks
+                    // ask through too.
                     // FR-135 R0 (N12) — the gate counts every ask, and whether
                     // the gap dropped it: R1's slow recoveries pointed here
                     // with no counter.

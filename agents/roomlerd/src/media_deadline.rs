@@ -18,10 +18,10 @@
 //! | the pick ([`pick`]) | `video-deadline` when the carrier class is TCP somewhere ([`CarrierClass::is_tcp`]: TURN over TCP or TLS, by the carrier line's `relay_transport`, or a mesh path whose overlay tier is not `Direct`) and the viewer opened one on a framed session; `video-bytes` otherwise, and whenever the class is not known |
 //! | the class ([`Pump::read`]) | read from the selected pair, at the pump's start and at each 5 s transport re-check, never from `detect_constrained_transport`'s 3 s default: with no pair selected it is `unknown`, so the session starts on `video-bytes` and the re-check picks again once a pair is selected |
 //! | the switch | at a key frame, over one `frame_seq` space: a frame dropped for the switch or for D consumes its number too |
-//! | the drain rule | once the pick says switch, nothing more is written on the old channel, and every frame is dropped whole until its buffered amount reads 0 (acknowledged, or abandoned and forwarded); then a key frame is asked through the session's gate ([`KeyframeGate`]), frames are dropped until one comes, and it goes whole on the new channel. The wait has no time bound: the switch line says how long it held the video |
+//! | the drain rule | once the pick says switch, nothing more is written on the old channel, and every frame is dropped whole until its buffered amount reads 0 (acknowledged, or abandoned and forwarded); then a key frame is asked through the session's gate ([`KeyframeGate`]), at each frame until an ask passes its 500 ms gap (a switch's own key frame is not recovery, so the key frame rule never spaces it: [`LaneAsk::Switch`]), frames are dropped until one comes, and it goes whole on the new channel. The wait has no time bound: the switch line says how long it held the video |
 //! | the deadline D ([`DEADLINE`]) | under `on`, on `video-deadline` only: a frame older than D at its first write, counted from its hand-off to the send task, is dropped whole, and a key frame is asked through the gate; a frame begun is finished |
 //! | the mark | under `on`, once per stream, before the first write on `video-deadline`: `RTCSctpTransport::mark_deadline_stream` (FR-148 P4b-1). Refused, nothing switches, one line says so, and it is tried again at the next key frame |
-//! | the key frame rule ([`KeyframeGate`], FR-148 P4b-4) | under `on`, while the lane is on `video-deadline` or switching to it, a forced key frame passes only once [`kf_gap`] has passed since the session's last key frame written (or since the gate's last grant, if later): `max(MIN_KF_GAP, kf_bytes / (KF_SHARE × rate))`. A refused ask is owed, never forgotten: the first frame after the gap opens grants it (after rc.130's gap alone once the lane has left `video-deadline`), and a key frame written answers it. Everywhere else rc.130's 500 ms gap, grant for grant |
+//! | the key frame rule ([`KeyframeGate`], FR-148 P4b-4) | under `on`, while the lane is on `video-deadline` or switching to it, a recovery key frame (D's ask, the viewer's `rc:keyframe`) passes only once [`kf_gap`] has passed since the session's last key frame written (or since the gate's last grant, if later): `max(MIN_KF_GAP, 8 × kf_bytes / (KF_SHARE × rate))`, `kf_bytes` in bytes and `rate` in bit/s. A refused recovery ask is owed, never forgotten: the first frame after the gap opens grants it (after rc.130's gap alone once the lane has left `video-deadline`), and a key frame written answers it. A switch's own asks (FR-148 P4b-4b), and every ask elsewhere, get rc.130's 500 ms gap, grant for grant |
 //! | `shadow` | the pick and D run on the channel `on` would be on, and the lines and counts say what `on` would do, the key frame rule's included; every write and every grant is `off`'s, byte for byte |
 //!
 //! The switch is `ROOMLERD_VIDEO_DEADLINE`, or the config key
@@ -256,10 +256,10 @@ pub const MIN_KF_GAP: Duration = Duration::from_millis(500);
 pub const KF_SHARE: f64 = 0.25;
 
 /// FR-148 P4b-4 (D55) — the least time from a session's last key frame to a
-/// forced one under the rule: `max(MIN_KF_GAP, kf_bytes / (KF_SHARE × rate))`,
-/// with `kf_bytes` the size of the last key frame written and `rate` the
-/// path's, bit/s ([`kf_rate`]). Before the first key frame, or with no rate,
-/// [`MIN_KF_GAP`] alone.
+/// forced recovery one under the rule: `max(MIN_KF_GAP, 8 × kf_bytes /
+/// (KF_SHARE × rate))`, with `kf_bytes` the size of the last key frame
+/// written, in bytes, and `rate` the path's, in bit/s ([`kf_rate`]). Before
+/// the first key frame, or with no rate, [`MIN_KF_GAP`] alone.
 pub fn kf_gap(kf_bytes: Option<u64>, rate_bps: Option<u64>) -> Duration {
     let cost = match (kf_bytes, rate_bps) {
         (Some(bytes), Some(rate)) if rate > 0 => {
@@ -298,8 +298,9 @@ impl Scope {
         deadline: false,
     };
 
-    /// The rule acts on the session's asks: `on`, on `video-deadline` or
-    /// switching to it.
+    /// The rule acts on the session's recovery asks, D's and the viewer's:
+    /// `on`, on `video-deadline` or switching to it. A switch's own ask is
+    /// never the rule's ([`LaneAsk::Switch`]).
     fn acts(self) -> bool {
         self.mode == Mode::On && self.deadline
     }
@@ -311,16 +312,34 @@ impl Scope {
     }
 }
 
+/// FR-148 P4b-4b — why a session's lane asks for a key frame, which decides
+/// the gap that spaces it. D55's rule spaces recovery key frames, and a
+/// switch's own key frame is not one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneAsk {
+    /// D dropped a frame on `video-deadline`, in `Steady`: recovery, under the
+    /// key frame rule while it acts, as the viewer's `rc:keyframe` is.
+    Late,
+    /// A switch waits for the key frame it switches at: its `Keying` phase's
+    /// ask, and its ask again after a key frame there older than D. rc.130's
+    /// 500 ms gap, in both of the gate's worlds and toward either channel,
+    /// and a refusal is forgotten, so the lane asks again at its next frame.
+    /// A switch drops every frame until its key frame comes, so the rule's
+    /// gap there would freeze the picture while the link carries no video.
+    Switch,
+}
+
 /// What an ask got from the gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Answer {
     /// It passed, and set the flag.
     Granted,
-    /// Refused while the rule acts, by the 500 ms gap or by the rule's, and
-    /// owed: the first frame after the gap opens grants it, unless a key
-    /// frame is written before.
+    /// A recovery ask refused while the rule acts, by the 500 ms gap or by
+    /// the rule's, and owed: the first frame after the gap opens grants it,
+    /// unless a key frame is written before.
     Owed,
-    /// Refused by rc.130's gap outside the rule's scope, and forgotten.
+    /// Refused by rc.130's gap, outside the rule's scope or as a switch's own
+    /// ask (FR-148 P4b-4b), and forgotten.
     Refused,
 }
 
@@ -421,6 +440,11 @@ impl GateState {
 /// opens grants it ([`Self::on_frame`]). Everywhere else the gate is rc.130's,
 /// grant for grant; under `shadow` it also keeps the grants and the owed ask
 /// `on` would have had, for N12's counts.
+///
+/// FR-148 P4b-4b: the rule spaces recovery key frames, D's asks and the
+/// viewer's. A switch's own ask ([`LaneAsk::Switch`]) is rc.130's in both
+/// worlds, and never owed; the key frame it brings, written, restarts the
+/// rule's clock and answers an owed ask like any other.
 #[derive(Debug)]
 pub struct KeyframeGate {
     requested: Arc<AtomicBool>,
@@ -456,11 +480,13 @@ impl KeyframeGate {
         self.answer(KeyframeAsker::Viewer, session_id, now, None) == Answer::Granted
     }
 
-    /// FR-148 P4b-4 — the lane's ask at `now`, in the lane's `scope`: whether a
-    /// key frame will come without its asking again, because the ask passed or
-    /// the rule owes it.
-    pub fn ask_lane(&self, session_id: ObjectId, now: Instant, scope: Scope) -> bool {
-        self.answer(KeyframeAsker::Lane, session_id, now, Some(scope)) != Answer::Refused
+    /// FR-148 P4b-4 — the lane's ask at `now`, in the lane's `scope`, for
+    /// `why`: whether a key frame will come without its asking again, because
+    /// the ask passed or the rule owes it. FR-148 P4b-4b — a switch's own ask
+    /// is rc.130's and never owed, so it is answered only when it passes. The
+    /// gate keeps the lane's scope either way, for the viewer's asks.
+    pub fn ask_lane(&self, session_id: ObjectId, now: Instant, scope: Scope, why: LaneAsk) -> bool {
+        self.answer(KeyframeAsker::Lane, session_id, now, Some((scope, why))) != Answer::Refused
     }
 
     fn answer(
@@ -468,20 +494,25 @@ impl KeyframeGate {
         asker: KeyframeAsker,
         session_id: ObjectId,
         now: Instant,
-        scope: Option<Scope>,
+        lane: Option<(Scope, LaneAsk)>,
     ) -> Answer {
         let rate = self.rate();
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(scope) = scope {
+        if let Some((scope, _)) = lane {
             st.scope = scope;
         }
         let scope = st.scope;
-        let real = st.verdict(&st.real, scope.acts(), rate, now);
-        let real_paid = st.real.answered(real, scope.acts(), now);
+        // FR-148 P4b-4b — the rule spaces recovery key frames, D's and the
+        // viewer's. A switch's own is not one: rc.130's gap in both worlds,
+        // and a refusal is forgotten.
+        let recovery = !matches!(lane, Some((_, LaneAsk::Switch)));
+        let acts = recovery && scope.acts();
+        let real = st.verdict(&st.real, acts, rate, now);
+        let real_paid = st.real.answered(real, acts, now);
         // The world `on` would have had follows every ask under every value,
         // so under `shadow` it is `on`'s from the session's first ask; N12's
         // split reads it there.
-        let rule = scope.shadows();
+        let rule = recovery && scope.shadows();
         let would = st.verdict(&st.shadow, rule, rate, now);
         let would_paid = st.shadow.answered(would, rule, now);
         let (counted, paid) = match scope.mode {
@@ -491,7 +522,7 @@ impl KeyframeGate {
         drop(st);
         let answer = match real {
             Ok(()) => Answer::Granted,
-            Err(_) if scope.acts() => Answer::Owed,
+            Err(_) if acts => Answer::Owed,
             Err(_) => Answer::Refused,
         };
         let n12 = crate::session_telemetry::counters(session_id);
@@ -857,9 +888,10 @@ pub trait Wire: Send + Sync {
     fn mark(&self, dc: &Self::Dc) -> impl Future<Output = bool> + Send;
 
     /// One key frame ask through the session's gate, at `now`, the lane in
-    /// `scope`: whether a key frame comes without asking again, because it
-    /// passed or (FR-148 P4b-4) the rule owes it.
-    fn ask_keyframe(&self, now: Instant, scope: Scope) -> bool;
+    /// `scope`, for `why`: whether a key frame comes without asking again,
+    /// because it passed or (FR-148 P4b-4) the rule owes it, which it never
+    /// does for a switch's own ask (FR-148 P4b-4b).
+    fn ask_keyframe(&self, now: Instant, scope: Scope, why: LaneAsk) -> bool;
 
     /// FR-148 P4b-4 — a frame's road was decided at `now`, the lane in `scope`
     /// after it: `key_written`, the size of the key frame it wrote.
@@ -901,10 +933,10 @@ impl Wire for SessionWire {
         self.sctp.mark_deadline_stream(dc.id()).await
     }
 
-    fn ask_keyframe(&self, now: Instant, scope: Scope) -> bool {
+    fn ask_keyframe(&self, now: Instant, scope: Scope, why: LaneAsk) -> bool {
         self.session
             .as_ref()
-            .is_some_and(|s| s.gate.ask_lane(self.session_id, now, scope))
+            .is_some_and(|s| s.gate.ask_lane(self.session_id, now, scope, why))
     }
 
     fn frame_done(&self, now: Instant, scope: Scope, key_written: Option<u64>) {
@@ -1070,9 +1102,10 @@ impl<W: Wire> Lane<W> {
         }
     }
 
-    /// A key frame ask through the session's gate, the lane as it stands.
-    fn ask(&self, now: Instant) -> bool {
-        self.wire.ask_keyframe(now, self.scope())
+    /// A key frame ask through the session's gate, the lane as it stands, for
+    /// `why`.
+    fn ask(&self, now: Instant, why: LaneAsk) -> bool {
+        self.wire.ask_keyframe(now, self.scope(), why)
     }
 
     async fn on(
@@ -1124,7 +1157,7 @@ impl<W: Wire> Lane<W> {
                 (Some(Channel::Deadline), Some(dc)) => {
                     if age > DEADLINE {
                         self.drop_late();
-                        let _ = self.ask(now);
+                        let _ = self.ask(now, LaneAsk::Late);
                         return None;
                     }
                     Some(self.write(dc, held))
@@ -1154,7 +1187,9 @@ impl<W: Wire> Lane<W> {
 
     /// A drained switch's frame: dropped until a key frame, which goes whole
     /// on the new channel, or on `video-bytes` when `video-deadline` went while
-    /// the switch waited.
+    /// the switch waited. Its asks are the switch's own, its ask again after a
+    /// key frame older than D included ([`LaneAsk::Switch`], FR-148 P4b-4b):
+    /// asked at each frame until one passes rc.130's gap, never owed.
     fn keying(
         &mut self,
         keyframe: bool,
@@ -1169,7 +1204,7 @@ impl<W: Wire> Lane<W> {
         };
         if !keyframe {
             if !s.asked {
-                s.asked = self.ask(now);
+                s.asked = self.ask(now, LaneAsk::Switch);
                 self.phase = Phase::Keying(s);
             }
             return self.drop_switching();
@@ -1179,9 +1214,10 @@ impl<W: Wire> Lane<W> {
             _ => (Channel::Bytes, bytes),
         };
         if to == Channel::Deadline && age > DEADLINE {
-            // Too old for the new channel: dropped, and another asked.
+            // Too old for the new channel: dropped, and another asked, still
+            // the switch's own.
             self.drop_late();
-            s.asked = self.ask(now);
+            s.asked = self.ask(now, LaneAsk::Switch);
             self.phase = Phase::Keying(s);
             return None;
         }
@@ -1356,6 +1392,8 @@ mod tests {
         marks: Vec<u16>,
         ask_ok: bool,
         asks: u32,
+        /// FR-148 P4b-4b: why the lane made each ask, in order.
+        whys: Vec<LaneAsk>,
         /// FR-148 P4b-4: a session's gate the lane's asks and frames reach,
         /// in place of `ask_ok`.
         gate: Option<(Arc<KeyframeGate>, ObjectId)>,
@@ -1409,13 +1447,14 @@ mod tests {
             s.mark_ok
         }
 
-        fn ask_keyframe(&self, now: Instant, scope: Scope) -> bool {
+        fn ask_keyframe(&self, now: Instant, scope: Scope, why: LaneAsk) -> bool {
             let mut s = self.st();
             s.asks += 1;
+            s.whys.push(why);
             match s.gate.clone() {
                 Some((gate, id)) => {
                     drop(s);
-                    gate.ask_lane(id, now, scope)
+                    gate.ask_lane(id, now, scope, why)
                 }
                 None => s.ask_ok,
             }
@@ -2158,12 +2197,12 @@ mod tests {
         assert!(Session::of(id).is_none(), "found while its peer holds it");
     }
 
-    /// FR-148 P4b-4 (D55) — the rule's gap is `max(MIN_KF_GAP, kf_bytes /
-    /// (KF_SHARE × rate))`: 80 KB at 2 Mbit/s, 1.28 s; 20 KB at 16 Mbit/s,
-    /// 80 ms, so the 500 ms floor; no rate, or no key frame yet, 500 ms. At
-    /// the gate, under `on` on `video-deadline`, it runs from the last key
-    /// frame written: an ask a millisecond before it opens is refused, one
-    /// as it opens passes.
+    /// FR-148 P4b-4 (D55) — the rule's gap is `max(MIN_KF_GAP, 8 × kf_bytes /
+    /// (KF_SHARE × rate))`, bytes and bit/s: 80 KB at 2 Mbit/s, 1.28 s; 20 KB
+    /// at 16 Mbit/s, 40 ms, so the 500 ms floor; no rate, or no key frame yet,
+    /// 500 ms. At the gate, under `on` on `video-deadline`, it runs from the
+    /// last key frame written: an ask a millisecond before it opens is
+    /// refused, one as it opens passes.
     #[test]
     fn the_rule_s_gap_is_the_last_key_frame_at_a_quarter_of_the_rate() {
         assert_eq!(KF_SHARE, 0.25);
@@ -2181,7 +2220,10 @@ mod tests {
             assert_eq!(kf_gap(bytes, rate), gap, "{bytes:?} {rate:?}");
             let (gate, flag, id) = gate_at(rate);
             let t0 = Instant::now();
-            assert!(gate.ask_lane(id, t0, RULE), "the session's first ask");
+            assert!(
+                gate.ask_lane(id, t0, RULE, LaneAsk::Late),
+                "the session's first ask"
+            );
             assert!(flag.swap(false, Relaxed));
             if let Some(bytes) = bytes {
                 gate.on_frame(id, t0, RULE, Some(bytes));
@@ -2337,27 +2379,20 @@ mod tests {
         let s = split(id);
         assert_eq!((s.refused_gap, s.refused_rule, s.owed_granted), (2, 1, 2));
 
-        // One written on `video-bytes` counts too: a switch to
-        // `video-deadline` 10 ms after it waits out its gap for its key frame.
+        // One written on `video-bytes` counts too: while a switch to
+        // `video-deadline` drains, a recovery ask, the viewer's, 590 ms after
+        // it is the rule's. (A switch's own ask never is: FR-148 P4b-4b.)
         let mut rig = Rig::new(Mode::On);
         rig.class(C::Direct);
-        let (_gate, flag, _id) = rig.gated(Some(2_000_000));
+        let (gate, flag, id) = rig.gated(Some(2_000_000));
         assert_eq!(rig.sized(true, 0, 80_000), Some((BYTES, 1)));
         let t0 = rig.t;
+        rig.fake.st().buffered.insert(BYTES, 1);
         rig.class(C::TurnTcp);
-        assert_eq!(
-            rig.delta(),
-            None,
-            "drained at once: dropped, a key frame asked"
-        );
-        assert_eq!(rig.fake.st().asks, 1);
-        assert!(!flag.load(Relaxed), "owed");
-        while !flag.load(Relaxed) {
-            assert_eq!(rig.delta(), None, "dropped while the switch waits");
-        }
-        assert_eq!(rig.t - t0, ms(1_280));
-        assert_eq!(rig.fake.st().asks, 1, "owed, it is never asked again");
-        assert_eq!(rig.key(), Some((DL, 130)));
+        rig.deltas_until(t0 + ms(600));
+        assert!(!gate.ask_at(id, rig.t), "590 ms after it");
+        assert!(!flag.load(Relaxed));
+        assert_eq!(split(id).refused_rule, 1, "the rule's, from it");
     }
 
     /// FR-148 P4b-4 (D55, AC24) — a steady stream of D drops: 60 s at 30
@@ -2452,7 +2487,7 @@ mod tests {
                     };
                     let asked = match (r >> 16) % 5 {
                         0 => Some(gate.ask_at(id, t)),
-                        1 | 2 => Some(gate.ask_lane(id, t, scope)),
+                        1 | 2 => Some(gate.ask_lane(id, t, scope, LaneAsk::Late)),
                         3 => {
                             gate.on_frame(id, t, scope, Some(20_000 + (r >> 24) % 200_000));
                             None
@@ -2505,7 +2540,7 @@ mod tests {
                             gate.ask_at(id, t);
                         }
                         1 | 2 => {
-                            gate.ask_lane(id, t, scope);
+                            gate.ask_lane(id, t, scope, LaneAsk::Late);
                         }
                         3 => gate.on_frame(id, t, scope, Some(20_000 + (r >> 24) % 150_000)),
                         _ => gate.on_frame(id, t, scope, None),
@@ -2538,8 +2573,15 @@ mod tests {
         // The clock: 80 KB at 2 Mbit/s, 1.28 s.
         gate.on_frame(id, t0, RULE, Some(80_000));
         assert!(!gate.ask_at(id, at(100)), "viewer: the gap");
-        assert!(gate.ask_lane(id, at(200), RULE), "lane: the gap, owed");
-        assert!(gate.ask_lane(id, at(700), RULE), "lane: the rule, owed");
+        let late = LaneAsk::Late;
+        assert!(
+            gate.ask_lane(id, at(200), RULE, late),
+            "lane: the gap, owed"
+        );
+        assert!(
+            gate.ask_lane(id, at(700), RULE, late),
+            "lane: the rule, owed"
+        );
         assert!(!gate.ask_at(id, at(900)), "viewer: the rule");
         gate.on_frame(id, at(1_279), RULE, None);
         assert!(!flag.load(Relaxed));
@@ -2550,10 +2592,13 @@ mod tests {
             mode: Mode::On,
             deadline: false,
         };
-        assert!(!gate.ask_lane(id, at(1_500), bytes), "lane, on video-bytes");
+        assert!(
+            !gate.ask_lane(id, at(1_500), bytes, late),
+            "lane, on video-bytes"
+        );
         assert!(!flag.load(Relaxed));
         assert!(
-            gate.ask_lane(id, at(1_780), bytes),
+            gate.ask_lane(id, at(1_780), bytes, late),
             "500 ms after the grant"
         );
         assert!(flag.swap(false, Relaxed));
@@ -2580,6 +2625,230 @@ mod tests {
         let line = counters.take(None).unwrap();
         assert_eq!((line.asks.viewer, line.asks.refused_rule), (1, 1));
         assert_eq!(counters.take(None).unwrap().asks, KeyframeSplit::default());
+    }
+
+    /// FR-148 P4b-4b — a switch's own key frame is not recovery, so the key
+    /// frame rule never spaces it. Under `on`, at 1 Mbit/s, an 80 KB key frame
+    /// is written on `video-bytes` (the rule's gap from it: 2.56 s), a second
+    /// after the gate's last grant; 100 ms on, the carrier turns TCP and the
+    /// old channel reads drained at once. The switch's first ask passes
+    /// rc.130's 500 ms gap at that frame and sets the flag, the key frame it
+    /// brings goes whole on `video-deadline` at the next, and its line's
+    /// `dropped` counts the one frame before it. Written, that key frame
+    /// restarts the rule's clock: D's ask after it is the rule's. On P4b-4 the
+    /// switch's ask was owed until 2.56 s after the key frame on `video-bytes`,
+    /// every frame dropped meanwhile.
+    #[test]
+    fn a_switch_s_key_frame_comes_at_the_500_ms_gap_not_the_rule_s() {
+        let ms = Duration::from_millis;
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::Direct);
+        let (gate, flag, id) = rig.gated(Some(1_000_000));
+        let t0 = rig.t + ms(10);
+        assert!(gate.ask_at(id, t0 - ms(1_000)), "the gate's last grant");
+        flag.store(false, Relaxed);
+        assert_eq!(rig.sized(true, 0, 80_000), Some((BYTES, 1)));
+        assert_eq!((rig.t, gate.gap()), (t0, ms(2_560)), "80 KB at 1 Mbit/s");
+        rig.deltas_until(t0 + ms(100));
+        rig.class(C::TurnTcp);
+        let (wrote, out) = logged(|| {
+            let dropped = rig.delta();
+            // The pump: a key frame once the gate set the flag.
+            let key = flag.swap(false, Relaxed);
+            (dropped, key, rig.sized(key, 0, 80_000))
+        });
+        assert_eq!(
+            wrote,
+            (None, true, Some((DL, 12))),
+            "granted at t0 + 100 ms: {out}"
+        );
+        let line = "video channel: video-bytes -> video-deadline \
+                    (carrier=turn_tcp, frame_seq=12, held_ms=10, dropped=1)";
+        assert_eq!(out.matches(line).count(), 1, "{out}");
+        let s = split(id);
+        assert_eq!(
+            (s.viewer, s.lane, s.refused_gap, s.refused_rule),
+            (1, 1, 0, 0)
+        );
+        // The switch's key frame, written at t0 + 110 ms, restarts the rule's
+        // clock: D's ask after it is owed until 2.56 s after it.
+        assert_eq!(rig.frame(false, 301), None, "D drops it, and asks");
+        while !flag.load(Relaxed) {
+            assert!(rig.delta().is_some());
+        }
+        assert_eq!(rig.t, t0 + ms(110 + 2_560));
+        assert_eq!(rig.fake.st().whys, [LaneAsk::Switch, LaneAsk::Late]);
+        let s = split(id);
+        assert_eq!((s.lane, s.refused_gap, s.owed_granted), (2, 1, 1));
+    }
+
+    /// FR-148 P4b-4b — a switch's ask inside 500 ms of the gate's last grant
+    /// is refused by rc.130's gap and forgotten, never owed, so the lane asks
+    /// again at each frame until the gap has passed: toward `video-deadline`
+    /// and toward `video-bytes`, as P4b-3's did. N12 counts each ask as the
+    /// lane's and each refusal as the gap's. In the gate's other world, the
+    /// one N12 counts under `shadow`, a switch's ask is the 500 ms gap's too.
+    /// On P4b-4 the ask toward `video-deadline` was owed at once and never
+    /// asked again.
+    #[test]
+    fn a_switch_s_ask_inside_500_ms_of_the_last_grant_is_refused_not_owed() {
+        let ms = Duration::from_millis;
+        for (from, to, old, new) in [
+            (C::Direct, C::TurnTcp, BYTES, DL),
+            (C::TurnTls, C::Direct, DL, BYTES),
+        ] {
+            let mut rig = Rig::new(Mode::On);
+            rig.class(from);
+            let (gate, flag, id) = rig.gated(Some(1_000_000));
+            // The gate's last grant, the viewer's, 10 ms before the key frame
+            // it brings.
+            let granted = rig.t;
+            assert!(gate.ask_at(id, granted));
+            flag.store(false, Relaxed);
+            assert_eq!(rig.sized(true, 0, 80_000), Some((old, 1)), "{to:?}");
+            rig.deltas_until(granted + ms(100));
+            rig.class(to);
+            let mut asks = 0;
+            while !flag.load(Relaxed) {
+                assert_eq!(rig.delta(), None, "{to:?}: dropped while it waits");
+                asks += 1;
+                assert_eq!(rig.fake.st().asks, asks, "{to:?}: asked at each frame");
+                let owed = gate.state.lock().unwrap().real.owed;
+                assert_eq!(owed, None, "{to:?}: frame {asks}, never owed");
+                assert!(asks <= 100, "{to:?}: never granted");
+            }
+            assert_eq!(rig.t, granted + MIN_KF_GAP, "{to:?}: as the gap passed");
+            assert_eq!(asks, 41, "{to:?}");
+            assert!(
+                rig.fake.st().whys.iter().all(|&w| w == LaneAsk::Switch),
+                "{to:?}"
+            );
+            let want = KeyframeSplit {
+                viewer: 1,
+                lane: 41,
+                refused_gap: 40,
+                refused_rule: 0,
+                owed_granted: 0,
+            };
+            assert_eq!(split(id), want, "{to:?}");
+            flag.store(false, Relaxed);
+            assert_eq!(rig.key(), Some((new, 51)), "{to:?}");
+        }
+
+        // The other world: under `shadow` the gate keeps the grants and the
+        // owed ask `on` would have had, and N12 counts them. A switch's ask is
+        // the 500 ms gap's there too, inside the rule's 2.56 s, and never owed.
+        // (The shadow lane asks nothing, so this is the gate's word alone.)
+        let (gate, flag, id) = gate_at(Some(1_000_000));
+        let shadow = Scope {
+            mode: Mode::Shadow,
+            deadline: true,
+        };
+        let t0 = Instant::now();
+        gate.on_frame(id, t0, shadow, Some(80_000));
+        for (at, passes) in [(0, true), (499, false), (500, true)] {
+            let asked = gate.ask_lane(id, t0 + ms(at), shadow, LaneAsk::Switch);
+            let flagged = flag.swap(false, Relaxed);
+            assert_eq!((asked, flagged), (passes, passes), "{at} ms");
+        }
+        let st = gate.state.lock().unwrap();
+        assert_eq!((st.real.owed, st.shadow.owed), (None, None));
+        drop(st);
+        let s = split(id);
+        assert_eq!((s.lane, s.refused_gap, s.refused_rule), (3, 1, 0));
+    }
+
+    /// FR-148 P4b-4b — the viewer's asks during a switch toward
+    /// `video-deadline` stay recovery, under the rule as D59 scopes it: owed
+    /// inside the gap, and answered once. Under `on`, at 1 Mbit/s, a switch
+    /// drains for 700 ms after an 80 KB key frame on `video-bytes`. The
+    /// viewer's ask 590 ms after it, past 500 ms since any grant but inside
+    /// the rule's 2.56 s, is owed, not granted. Once drained, the switch's own
+    /// ask passes rc.130's gap, and its grant answers the owed ask. The viewer
+    /// asks again before the switch's key frame comes: owed, and that key
+    /// frame, written, clears it. No second key frame is forced for either,
+    /// past the rule's gap from it.
+    #[test]
+    fn a_viewer_s_ask_during_a_switch_stays_owed_and_is_answered_once() {
+        let ms = Duration::from_millis;
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::Direct);
+        let (gate, flag, id) = rig.gated(Some(1_000_000));
+        assert_eq!(rig.sized(true, 0, 80_000), Some((BYTES, 1)));
+        let t0 = rig.t;
+        rig.fake.st().buffered.insert(BYTES, 1);
+        rig.class(C::TurnTcp);
+        rig.deltas_until(t0 + ms(600));
+        assert!(!gate.ask_at(id, rig.t), "590 ms after the key frame");
+        assert!(gate.state.lock().unwrap().real.owed.is_some(), "owed");
+        rig.deltas_until(t0 + ms(700));
+        assert!(!flag.load(Relaxed), "the rule's gap has not opened");
+        rig.fake.st().buffered.insert(BYTES, 0);
+        assert_eq!(rig.delta(), None, "drained: dropped, the switch's ask");
+        assert!(flag.swap(false, Relaxed), "the switch's own: granted");
+        assert_eq!(split(id).owed_granted, 1, "its grant answered the owed ask");
+        assert!(!gate.ask_at(id, rig.t + ms(5)), "the viewer's again");
+        assert!(gate.state.lock().unwrap().real.owed.is_some(), "owed");
+        assert_eq!(rig.sized(true, 0, 80_000), Some((DL, 72)));
+        let owed = gate.state.lock().unwrap().real.owed;
+        assert_eq!(owed, None, "the switch's key frame, written, answered it");
+        for i in 0..300 {
+            assert!(rig.delta().is_some());
+            assert!(!flag.load(Relaxed), "frame {i}: no second key frame");
+        }
+        let want = KeyframeSplit {
+            viewer: 2,
+            lane: 1,
+            refused_gap: 1,
+            refused_rule: 1,
+            owed_granted: 1,
+        };
+        assert_eq!(split(id), want);
+        assert_eq!(rig.fake.st().whys, [LaneAsk::Switch]);
+    }
+
+    /// FR-148 P4b-4b — D's ask again in a switch's `Keying` is the switch's
+    /// own. Under `on`, at 1 Mbit/s, a switch to `video-deadline` begins 3 s
+    /// after an 80 KB key frame, past the rule's gap from it, so its first ask
+    /// passes in either gate. The key frame that comes is older than D at
+    /// `video-deadline`: it is dropped, and the ask after it goes through
+    /// rc.130's 500 ms gap from that grant, refused and asked again at each
+    /// frame until the gap has passed, never owed. On P4b-4 the re-ask was
+    /// owed, and granted 2.56 s after the grant.
+    #[test]
+    fn d_s_re_ask_in_keying_is_the_switch_s_own() {
+        let ms = Duration::from_millis;
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::Direct);
+        let (gate, flag, id) = rig.gated(Some(1_000_000));
+        assert_eq!(rig.sized(true, 0, 80_000), Some((BYTES, 1)));
+        let t0 = rig.t;
+        rig.deltas_until(t0 + ms(3_000));
+        rig.class(C::TurnTcp);
+        assert_eq!(rig.delta(), None, "drained at once: the switch's ask");
+        assert!(flag.swap(false, Relaxed), "past the rule's gap: granted");
+        let granted = rig.t;
+        assert_eq!(rig.sized(true, 400, 80_000), None, "older than D: dropped");
+        let mut asks = 2;
+        assert_eq!(rig.fake.st().asks, asks, "the ask again");
+        let owed = gate.state.lock().unwrap().real.owed;
+        assert_eq!(owed, None, "refused by the 500 ms gap, never owed");
+        while !flag.load(Relaxed) {
+            assert_eq!(rig.delta(), None, "dropped while the switch waits");
+            asks += 1;
+            assert_eq!(rig.fake.st().asks, asks, "asked again at each frame");
+            assert!(asks <= 100, "never granted");
+        }
+        assert_eq!(rig.t, granted + MIN_KF_GAP, "500 ms, not the rule's 2.56 s");
+        assert_eq!(asks, 51);
+        assert!(rig.fake.st().whys.iter().all(|&w| w == LaneAsk::Switch));
+        let s = split(id);
+        let counts = (s.lane, s.refused_gap, s.refused_rule, s.owed_granted);
+        assert_eq!(counts, (51, 49, 0, 0));
+        flag.store(false, Relaxed);
+        assert_eq!(rig.key(), Some((DL, 352)));
+        let line = rig.counters.take(None).unwrap();
+        assert_eq!((line.late, line.drained, line.switches), (1, 50, 1));
     }
 
     /// FR-148 P4b-4 (D59) — both pumps hand their encoder to the budget's
