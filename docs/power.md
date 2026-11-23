@@ -117,9 +117,9 @@ shell, none of 3 runs stalled, against 2 of 3 on 0.4.221.
 **A runtime that stood still, told from a slow runner (#4075).** Whether the
 runtime kept time is read from two 10 ms timers over the same stretch: the canary
 on the runtime, and a control on a thread of its own that no request can hold
-([`power.rs:1501`](../agents/roomlerd/src/power.rs#L1501) `ControlTimer`). The
+([`power.rs:1529`](../agents/roomlerd/src/power.rs#L1529) `ControlTimer`). The
 test fails when the runtime's timer was silent more than 200 ms longer than the
-control's ([`power.rs:1600`](../agents/roomlerd/src/power.rs#L1600)). A slow
+control's ([`power.rs:1628`](../agents/roomlerd/src/power.rs#L1628)). A slow
 runner holds both timers. On the macOS lane, for one, `thread_dump`'s test points
 `/usr/bin/sample` at the test process beside these, and `sample` suspends the
 process at every sample. In the run #4075 records, the runtime's timer woke 265 ms
@@ -133,7 +133,7 @@ the runtime's timer.
 | The same wait while another worker drives the timers | on time | on time | fails: the keeper's passes stop |
 
 The second row runs on Linux, Windows and macOS
-([`power.rs:1678`](../agents/roomlerd/src/power.rs#L1678)
+([`power.rs:1710`](../agents/roomlerd/src/power.rs#L1710)
 `a_pass_that_waits_for_the_request_on_the_runtime_fails_as_a_stall`): the stood-in
 OS puts #3871's wait back inside a pass, on a runtime of one worker, and the test
 must fail saying the runtime stood still. With the two workers of the other tests,
