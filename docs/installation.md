@@ -591,7 +591,7 @@ restores its missing machine config the same way (#4176), with one rule more: on
 would. That is the machine tree's check, and the rule that `%PROGRAMDATA%\roomler`, the machine folder and the copy were the machine's
 as found (#3609, #3666, [below](#windows)), read through one function
 (`crates/agent-core/src/machine_tree.rs:1135`). While only the copy is there, the repair leaves the tree as it found it unless the
-copy, the machine folder and its keys were the machine's as found, inherited entries counted (`machine_tree.rs:716`). The service host
+copy, the machine folder and its keys were the machine's as found, inherited entries counted (`machine_tree.rs:691`). The service host
 asks that function after the machine config and the SYSTEM profile's own config, the order of the worker's ladder
 (`agents/roomlerd/src/win_service/supervisor.rs:990`), so a SYSTEM-profile config that opens runs, and nothing is restored. For a copy
 that passes, it starts the SYSTEM worker, whose start restores the file as above: written from the bytes the check judged, and put in
@@ -850,9 +850,9 @@ Details worth knowing:
   and `keep-system-context`) the daemon repairs what drifted, in-process:
   - an entry of `%PROGRAMDATA%\roomler`'s own that lets another account change
     anything is cut to read and execute (Explorer adds one, full control, for
-    the account that confirms its folder-access prompt). What it inherits from
-    `%PROGRAMDATA%` stays, so an attended host's daemon still stages received
-    files below it;
+    the account that confirms its folder-access prompt), except in a tree the
+    as-found rule leaves as found (below). What it inherits from `%PROGRAMDATA%`
+    stays, so an attended host's daemon still stages received files below it;
   - the machine folder, once it holds a machine config that was the
     machine's as found (below), becomes Administrators', with SYSTEM and
     Administrators alone; the config gets the same, `.prev` and the keys only
@@ -878,14 +878,14 @@ Details worth knowing:
   to, a deny never offsets an allow, and an entry kind the check does not read
   counts against it. An administrator here is SYSTEM, the Administrators
   group, TrustedInstaller, or an account the computer's own account database
-  names, as above. Outside a save the repair takes the machine folder only
-  when its config was the machine's as found, and while the folder holds a
-  config it keeps such a replace right on `%PROGRAMDATA%\roomler` as it is,
-  for the check to refuse at every start and tick. With no config, the copy a
-  start would restore it from is read the same way (#4176): while only the
-  copy is there, the repair leaves the tree as it found it, a replace right
-  included, unless the copy, the folder and its keys were the machine's as
-  found, inherited entries counted. A config that was not the
+  names, as above. Outside a save, while the machine folder holds a config, or
+  with none the copy a start would restore it from (#4176), the repair leaves
+  the tree as it found it, a replace right on `%PROGRAMDATA%\roomler` included,
+  unless that file, the folder and its keys were the machine's as found,
+  inherited entries counted, and a `.prev` beside a config inherited no right for
+  another account to change it (`machine_tree.rs:691`). It repairs the attempt
+  record either way, and what was not closed stays refused at every start and
+  tick, until an elevated save writes a closed tree. A config that was not the
   machine's is never run, never folded into (below), and `roomlerd re-enroll`
   and `roomlerd org` refuse it with nothing sent. Such a device stays without
   SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd
