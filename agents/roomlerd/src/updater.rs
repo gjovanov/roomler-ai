@@ -449,72 +449,6 @@ pub fn should_self_unenroll(
     ephemeral && os_initiated_stop && !update_in_flight
 }
 
-/// #4352 rule 2 — the row a run started as: its primary enrollment's server,
-/// org, device id and kind, kept from the config the run starts from
-/// (`run_cmd`), never read again from the file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunRow {
-    pub server_url: String,
-    pub tenant_id: String,
-    pub agent_id: String,
-    pub ephemeral: bool,
-}
-
-impl RunRow {
-    /// The primary of `cfg`, the config a run starts from.
-    pub fn of(cfg: &crate::config::AgentConfig) -> Self {
-        Self {
-            server_url: cfg.server_url.clone(),
-            tenant_id: cfg.tenant_id.clone(),
-            agent_id: cfg.agent_id.clone(),
-            ephemeral: cfg.ephemeral,
-        }
-    }
-}
-
-/// What an OS stop removes ([`stop_removal`]): a row's server, and the token to
-/// remove it with.
-#[derive(Clone, PartialEq, Eq)]
-pub struct StopRemoval {
-    pub server_url: String,
-    pub agent_token: String,
-}
-
-/// Never prints the agent token.
-impl std::fmt::Debug for StopRemoval {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StopRemoval")
-            .field("server_url", &self.server_url)
-            .field("agent_token", &"<redacted>")
-            .finish()
-    }
-}
-
-/// #4352 rule 2 — which row a stop removes, and with which token: the second
-/// pure helper of the stop, after [`should_self_unenroll`] (which decides
-/// whether, from the RUN's own `ephemeral`). `run` is the row the run started
-/// as and `run_token` the token it holds now (its live slot); `file` is the
-/// config as the stop reads it, `None` when it does not load. A worker with no
-/// enrollment (`unenrolled`) is no row at all.
-pub fn stop_removal(
-    run: &RunRow,
-    run_token: &str,
-    file: Option<&crate::config::AgentConfig>,
-    unenrolled: bool,
-    os_initiated_stop: bool,
-    update_in_flight: bool,
-) -> Option<StopRemoval> {
-    // #4352 RED: master's behaviour — the row the FILE names, with the file's
-    // token. The fix removes the run's own row.
-    let _ = (run, run_token);
-    let file = file?;
-    let ephemeral = file.ephemeral && !unenrolled;
-    should_self_unenroll(ephemeral, os_initiated_stop, update_in_flight).then(|| StopRemoval {
-        server_url: file.server_url.clone(),
-        agent_token: file.agent_token.clone(),
-    })
-}
-
 /// A parsed release from the GitHub API. Only the fields we need.
 #[derive(Debug, Deserialize)]
 pub struct GithubRelease {
@@ -4572,6 +4506,104 @@ pub fn helper_owns_updates() -> Option<PathBuf> {
         UpdateOwner::Helper(link) => Some(link),
         UpdateOwner::InProcess(_) | UpdateOwner::InProcessBesideHelper(_) => None,
     }
+}
+
+/// #4352 rule 2 — the row a run started as: its primary enrollment's server,
+/// org, device id and kind, kept from the config the run starts from
+/// (`run_cmd`), never read again from the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRow {
+    pub server_url: String,
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub ephemeral: bool,
+}
+
+impl RunRow {
+    /// The primary of `cfg`, the config a run starts from.
+    pub fn of(cfg: &crate::config::AgentConfig) -> Self {
+        Self {
+            server_url: cfg.server_url.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            agent_id: cfg.agent_id.clone(),
+            ephemeral: cfg.ephemeral,
+        }
+    }
+}
+
+/// What an OS stop removes ([`stop_removal`]): a row's server, and the token to
+/// remove it with.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StopRemoval {
+    pub server_url: String,
+    pub agent_token: String,
+}
+
+/// Never prints the agent token.
+impl std::fmt::Debug for StopRemoval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StopRemoval")
+            .field("server_url", &self.server_url)
+            .field("agent_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// #4352 rule 2 — which row a stop removes, and with which token: the second
+/// pure helper of the stop, after [`should_self_unenroll`] (which decides
+/// whether, from the RUN's own `ephemeral`). `run` is the row the run started
+/// as and `run_token` the token it holds now (its live slot); `file` is the
+/// config as the stop reads it, `None` when it does not load. A worker with no
+/// enrollment (`unenrolled`) is no row at all.
+pub fn stop_removal(
+    run: &RunRow,
+    run_token: &str,
+    file: Option<&crate::config::AgentConfig>,
+    unenrolled: bool,
+    os_initiated_stop: bool,
+    update_in_flight: bool,
+) -> Option<StopRemoval> {
+    // The gate decides from the RUN's own kind: a row the file names and the
+    // run did not start as is never this stop's to remove.
+    if !should_self_unenroll(
+        run.ephemeral && !unenrolled,
+        os_initiated_stop,
+        update_in_flight,
+    ) {
+        return None;
+    }
+    // The run's own row, with the newest token for it: the file's while the
+    // file still names that row (an FR-103 renewal, a re-enrollment of the
+    // same row, `org set-primary` moving it to an `[[orgs]]` entry), else the
+    // run's own.
+    let agent_token = file
+        .and_then(|file| token_the_file_holds_for(file, run))
+        .unwrap_or(run_token)
+        .to_string();
+    Some(StopRemoval {
+        server_url: run.server_url.clone(),
+        agent_token,
+    })
+}
+
+/// The token `file` holds for the run's row, found as FR-103's renewal finds
+/// it (`RemoteConfigServices::stored_agent_token`): by the enrollment's
+/// (server, org), as the primary or an `[[orgs]]` entry, and only while that
+/// enrollment still names the run's device.
+fn token_the_file_holds_for<'a>(
+    file: &'a crate::config::AgentConfig,
+    run: &RunRow,
+) -> Option<&'a str> {
+    let (token, agent_id) = if file.is_primary_identity(&run.server_url, &run.tenant_id) {
+        (&file.agent_token, &file.agent_id)
+    } else {
+        let org = file
+            .orgs
+            .iter()
+            .find(|o| o.server_url == run.server_url && o.tenant_id == run.tenant_id)?;
+        (&org.agent_token, &org.agent_id)
+    };
+    (*agent_id == run.agent_id).then_some(token.as_str())
 }
 
 // RETIRED-NAME-ANCHOR-BEGIN

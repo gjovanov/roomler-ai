@@ -642,7 +642,7 @@ pub async fn self_unenroll(server_url: &str, agent_token: &str) -> Result<()> {
 /// it: the answer is an EPHEMERAL device row, for an organization the config
 /// would hold BESIDE its primary enrollment (an `[[orgs]]` entry, appended or
 /// refreshed). An `[[orgs]]` entry has no `ephemeral` of its own, and a stop
-/// removes only the primary's row, so nothing would ever remove that row.
+/// removes only the row its run started as, so nothing would ever remove it.
 /// [`apply_enrollment`] returns this as its error, so every caller stops
 /// before it writes: the config stays byte for byte as it was. Each caller
 /// then passes the error through [`remove_refused_row`], which removes a row
@@ -723,7 +723,7 @@ impl std::fmt::Display for EphemeralOrgRefused {
         )?;
         const WAY_ON: &str = "To add this organization to this device, join it again with a \
              standard enrollment token; to run this device in it as an ephemeral device, enroll \
-             that organization on a config of its own (`roomlerd --config <an empty path> \
+             that organization on a config of its own (`roomlerd --config <a new config file> \
              enroll ...`).";
         match &self.row {
             RefusedRow::Held => write!(
@@ -770,9 +770,23 @@ pub fn refuse_ephemeral_org(
     held: Option<&crate::config::OrgEntry>,
     fresh: &AgentConfig,
 ) -> Option<EphemeralOrgRefused> {
-    // #4352 RED: master's behaviour, nothing refused. The fix decides here.
-    let _ = (held, fresh);
-    None
+    if !fresh.ephemeral {
+        return None;
+    }
+    let row = match held {
+        Some(entry) if entry.agent_id == fresh.agent_id => RefusedRow::Held,
+        _ => RefusedRow::Made {
+            agent_token: fresh.agent_token.clone(),
+            removed: None,
+        },
+    };
+    Some(EphemeralOrgRefused {
+        label: held.map(|entry| entry.label.clone()),
+        tenant_id: fresh.tenant_id.clone(),
+        server_url: fresh.server_url.clone(),
+        agent_id: fresh.agent_id.clone(),
+        row,
+    })
 }
 
 /// #4352 — the ONE helper every caller of [`apply_enrollment`] passes a fold
@@ -782,8 +796,36 @@ pub fn refuse_ephemeral_org(
 /// refusal then says whether the removal happened. Any other error comes back
 /// as it was. Nothing here writes the config.
 pub async fn remove_refused_row(error: anyhow::Error) -> anyhow::Error {
-    // #4352 RED: master's behaviour, nothing removed. The fix removes here.
-    error
+    let Some(mut refused) = error.downcast_ref::<EphemeralOrgRefused>().cloned() else {
+        return error;
+    };
+    let RefusedRow::Made {
+        agent_token,
+        removed: removed @ None,
+    } = &mut refused.row
+    else {
+        return error;
+    };
+    let outcome = self_unenroll(&refused.server_url, agent_token)
+        .await
+        .map_err(|e| format!("{e:#}"));
+    match &outcome {
+        Ok(()) => tracing::info!(
+            agent_id = %refused.agent_id,
+            tenant_id = %refused.tenant_id,
+            "an ephemeral enrollment of a second organization was refused; the row it made is \
+             removed again (#4352)"
+        ),
+        Err(why) => tracing::warn!(
+            agent_id = %refused.agent_id,
+            tenant_id = %refused.tenant_id,
+            error = %why,
+            "an ephemeral enrollment of a second organization was refused; the row it made could \
+             not be removed (#4352)"
+        ),
+    }
+    *removed = Some(outcome);
+    refused.into()
 }
 
 /// Multi-org P1 — how [`apply_enrollment`] folded a fresh enrollment into
@@ -813,9 +855,13 @@ pub enum EnrollOutcome {
 ///      entry now duplicating the new primary identity is dropped;
 ///   3. (server, tenant) == the primary's → [`preserve_operator_config`]
 ///      (`RefreshedPrimary`) — this is exactly the pre-multi-org re-enroll;
-///   4. (server, tenant) == a secondary entry's → refresh that entry's
+///   4. an EPHEMERAL answer that would land in an `[[orgs]]` entry (arm 5 or
+///      6) → refused with [`EphemeralOrgRefused`], nothing folded (#4352,
+///      [`refuse_ephemeral_org`]); the caller passes it through
+///      [`remove_refused_row`];
+///   5. (server, tenant) == a secondary entry's → refresh that entry's
 ///      token / agent_id in place (`RefreshedOrg`);
-///   5. otherwise → APPEND a new secondary entry (`AppendedOrg`) with a
+///   6. otherwise → APPEND a new secondary entry (`AppendedOrg`) with a
 ///      freshly minted WireGuard key — NEVER a copy of another org's (a
 ///      shared pubkey would let two orgs correlate this device).
 ///
@@ -857,6 +903,18 @@ pub fn apply_enrollment(
             preserve_operator_config(fresh, existing),
             EnrollOutcome::RefreshedPrimary,
         ));
+    }
+
+    // #4352 — from here the answer lands beside the primary, in an `[[orgs]]`
+    // entry, which has no `ephemeral` and which no stop removes: an ephemeral
+    // answer is refused before anything is folded. The entry it would refresh
+    // is found as `find_org_by_identity_mut` finds it.
+    let held = existing
+        .orgs
+        .iter()
+        .find(|o| o.server_url == fresh.server_url && o.tenant_id == fresh.tenant_id);
+    if let Some(refused) = refuse_ephemeral_org(held, &fresh) {
+        return Err(refused.into());
     }
 
     let mut cfg = existing;

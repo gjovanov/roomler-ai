@@ -1820,7 +1820,16 @@ async fn daemon_main() -> Result<()> {
             re_enroll_cmd(&config_path, &token, org.as_deref()).await
         }
         Command::AdoptEnrollment { from, take } => {
-            adopt_enrollment_cmd(&config_path, &from, &take).map(|line| println!("{line}"))
+            // #4352 — the fold is synchronous; a refusal of it (an ephemeral
+            // answer for a second org) removes the row the enrollment made
+            // here, with the answer's own server and token.
+            match adopt_enrollment_cmd(&config_path, &from, &take) {
+                Ok(line) => {
+                    println!("{line}");
+                    Ok(())
+                }
+                Err(e) => Err(enrollment::remove_refused_row(e).await),
+            }
         }
         Command::Anchor { action } => {
             use roomlerd::exec_service::{AnchorAction, parse_ssh_ceiling};
@@ -2951,7 +2960,12 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // secondary org (with its own freshly minted WG key); `--replace` →
     // legacy whole-primary rebind.
     let folds = existing.is_some();
-    let (mut cfg, outcome) = enrollment::apply_enrollment(existing, fresh, label, replace)?;
+    // #4352 — a refusal (an ephemeral answer for a second org) leaves the file
+    // as it was, and the row the enrollment made is removed again.
+    let (mut cfg, outcome) = match enrollment::apply_enrollment(existing, fresh, label, replace) {
+        Ok(folded) => folded,
+        Err(e) => return Err(enrollment::remove_refused_row(e).await),
+    };
 
     // FR-51 P3 — the CREDENTIAL decided what was minted; say so when it
     // disagrees with the flag. `--ephemeral` with a standard token has
@@ -3421,7 +3435,13 @@ async fn re_enroll_cmd(
     // refresh-in-place arms and (fixing a pre-multi-org gap) preserves
     // operator state for the primary too, instead of writing the fresh
     // default-everything config wholesale.
-    let (merged, _outcome) = enrollment::apply_enrollment(Some(existing), new_cfg, None, false)?;
+    // #4352 — as `enroll`: a refusal writes nothing, and removes the row the
+    // enrollment made.
+    let (merged, _outcome) =
+        match enrollment::apply_enrollment(Some(existing), new_cfg, None, false) {
+            Ok(folded) => folded,
+            Err(e) => return Err(enrollment::remove_refused_row(e).await),
+        };
     let refreshed_agent_id = if is_primary {
         merged.agent_id.clone()
     } else {
@@ -4631,6 +4651,9 @@ async fn run_cmd(
     // every one of them. The renewal knobs are read from the environment once.
     let token_renewal = roomlerd::token_renewal::Settings::from_env();
     let primary_token = roomlerd::token_slot::TokenSlot::new(cfg.agent_token.clone());
+    // #4352 — the row this run starts as, kept for its stop: an ephemeral run
+    // removes this row and no other, whatever the file names by then.
+    let run_row = updater::RunRow::of(&cfg);
     let org_ctxs: Vec<signaling::OrgCtx> = org_partition
         .iter()
         .map(|(org, _)| {
@@ -5828,35 +5851,64 @@ async fn run_cmd(
         // The LocalAPI task is already aborted at this point, but the
         // clean-run promotion task may still be mid-save.
         let _write_guard = cfg_write_lock.lock().await;
-        if let Ok(mut current) = config::load(config_path) {
-            // FR-51 P3 — an EPHEMERAL device leaving on an OS stop removes
-            // itself NOW instead of waiting out the reap deadline. Bounded
-            // and best-effort (the fn caps at 3 s; the reaper is the backstop
-            // for every exit that never reaches this line), and only on the
-            // signal arms — the internal arm is the updater restarting us.
-            //
-            // #1683 — and never while an UPDATE is in flight. On Windows the
-            // MSI stops the service while it replaces the binary; by then the
-            // worker that spawned the installer has exited 0 and the SCM host
-            // has respawned this one, which receives that stop as an
-            // OS-initiated stop, indistinguishable from `sc stop`. Unenrolling
-            // here would delete the device on every auto-update and bring the
-            // new version up holding a dead token — the exact outcome the
-            // internal-arm rule above exists to prevent. `update_in_flight`
-            // reads the `update-attempt` marker the installer spawn touches
-            // (rollbacks included); the policy itself is one pure table
-            // (`updater::should_self_unenroll`). Platform-neutral on purpose.
-            let update_in_flight = updater::update_in_flight();
-            // FR-43 P3a — `current` is the person's file, and a worker with no
-            // enrollment is not the row in it, whatever kind that row is.
-            let ephemeral = current.ephemeral && !unenrolled;
-            if updater::should_self_unenroll(ephemeral, os_initiated_stop, update_in_flight) {
-                match enrollment::self_unenroll(&current.server_url, &current.agent_token).await {
-                    Ok(()) => tracing::info!("ephemeral device unenrolled itself on shutdown"),
-                    Err(e) => tracing::warn!(error = %e,
+        let current = config::load(config_path).ok();
+        // FR-51 P3 — an EPHEMERAL device leaving on an OS stop removes
+        // itself NOW instead of waiting out the reap deadline. Bounded
+        // and best-effort (the fn caps at 3 s; the reaper is the backstop
+        // for every exit that never reaches this line), and only on the
+        // signal arms — the internal arm is the updater restarting us.
+        //
+        // #1683 — and never while an UPDATE is in flight. On Windows the
+        // MSI stops the service while it replaces the binary; by then the
+        // worker that spawned the installer has exited 0 and the SCM host
+        // has respawned this one, which receives that stop as an
+        // OS-initiated stop, indistinguishable from `sc stop`. Unenrolling
+        // here would delete the device on every auto-update and bring the
+        // new version up holding a dead token — the exact outcome the
+        // internal-arm rule above exists to prevent. `update_in_flight`
+        // reads the `update-attempt` marker the installer spawn touches
+        // (rollbacks included); the policy itself is one pure table
+        // (`updater::should_self_unenroll`). Platform-neutral on purpose.
+        //
+        // #4352 — the row removed is the one this RUN started as
+        // (`run_row`), gated by its own `ephemeral`: a re-enrollment the
+        // file took while this daemon ran is the next run's row, and this
+        // stop never removes it. The token is the file's while the file
+        // still names the run's row, else the run's live one
+        // (`updater::stop_removal`). FR-43 P3a — a worker with no
+        // enrollment is no row at all.
+        let update_in_flight = updater::update_in_flight();
+        if let Some(file) = &current
+            && file.agent_id != run_row.agent_id
+            && !unenrolled
+        {
+            tracing::info!(
+                run_row = %run_row.agent_id,
+                file_row = %file.agent_id,
+                file_ephemeral = file.ephemeral,
+                "shutdown: the config names another device row than this run started as; \
+                 this stop acts on the run's row alone (#4352)"
+            );
+        }
+        match updater::stop_removal(
+            &run_row,
+            &primary_token.get(),
+            current.as_ref(),
+            unenrolled,
+            os_initiated_stop,
+            update_in_flight,
+        ) {
+            Some(removal) => {
+                match enrollment::self_unenroll(&removal.server_url, &removal.agent_token).await {
+                    Ok(()) => tracing::info!(
+                        agent_id = %run_row.agent_id,
+                        "ephemeral device unenrolled itself on shutdown"
+                    ),
+                    Err(e) => tracing::warn!(agent_id = %run_row.agent_id, error = %e,
                         "ephemeral self-unenroll failed; the server-side reaper will collect this device"),
                 }
-            } else if ephemeral && os_initiated_stop {
+            }
+            None if run_row.ephemeral && !unenrolled && os_initiated_stop => {
                 // The one way the gate says no to an ephemeral OS stop. Named,
                 // so "why is this row still here?" has an answer in the log.
                 tracing::info!(
@@ -5865,6 +5917,9 @@ async fn run_cmd(
                      stopped the service; this device stays enrolled"
                 );
             }
+            None => {}
+        }
+        if let Some(mut current) = current {
             config::mark_clean_shutdown(&mut current);
             if let Err(e) = config::save(config_path, &current) {
                 tracing::warn!(error = %e, "could not mark clean shutdown");

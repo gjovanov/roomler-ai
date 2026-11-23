@@ -136,7 +136,17 @@ pub async fn join_org(
 
     let existing = crate::config::load(&config_path.to_path_buf()).ok();
     let had_config = existing.is_some();
-    let (mut merged, outcome) = apply_enrollment(existing, fresh, label, false)?;
+    let (mut merged, outcome) = match apply_enrollment(existing, fresh, label, false) {
+        Ok(folded) => folded,
+        Err(e) => {
+            // #4352 — nothing was written. A refusal (an ephemeral answer for
+            // this second org) removes the row the enrollment made, with the
+            // answer's own server and token, off the write lock: the removal
+            // is a network call.
+            drop(_guard);
+            return Err(crate::enrollment::remove_refused_row(e).await);
+        }
+    };
 
     // A REFRESH is not a no-op: the admin may be re-sending the request
     // precisely to change this org's mesh participation on a device that is
