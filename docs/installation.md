@@ -662,7 +662,7 @@ question; two moved to `read_if_present`.
 ### What a save keeps: the keys this build does not know (#2078)
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
-start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
+start, clean stop and end of its own choosing (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2631`, `:2653`), at the clean-run promotion
 (`record_clean_run_at`, `:2640`), at every `ConfigSet`, and at enrollment. The daemon, the
 desktop app and the setup wizard all write it through `config::save` (`:4518`). Each save

@@ -4351,14 +4351,12 @@ async fn run_cmd(
         preflight_report.log();
     }
 
-    // Crash-loop bookkeeping: if the previous run was marked
-    // `last_run_unhealthy=true` (started, never reached the clean
-    // threshold, never exited gracefully) and neither the OS nor its
-    // service host ended it (#3289) → count it as a crash. Then mark
-    // THIS run as tentatively unhealthy; either the 5-min healthy
-    // task or the Ctrl-C handler will flip the flag back to false.
-    // Save before checking for rollback so the worst-case state is
-    // durable on disk if we then crash again.
+    // Crash-loop bookkeeping: if the previous run was marked `last_run_unhealthy=true` (started,
+    // never reached the clean threshold, never exited gracefully) and neither the OS nor its
+    // service host ended it (#3289) → count it as a crash. Then mark THIS run as tentatively
+    // unhealthy: the 5-min healthy task, a clean stop or, once this mark is saved, an end of its
+    // own choosing (#4292, `run_end`; never on a view, FR-43 P3a) takes it off. Save before the
+    // rollback check, so the worst-case state is durable on disk if we then crash again.
     let now_unix = unix_now();
     let current_pkg = env!("CARGO_PKG_VERSION");
     let boot_now = roomlerd::boot_id::current();
@@ -4382,6 +4380,8 @@ async fn run_cmd(
     cfg.last_run_boot = boot_now;
     if let Err(e) = startup_writes.save(&cfg) {
         tracing::warn!(error = %format!("{e:#}"), "could not persist crash-tracking state");
+    } else if !unenrolled {
+        roomlerd::run_end::open(config_path);
     }
 
     // If the crash counter has tripped the rollback threshold AND we
@@ -4834,11 +4834,11 @@ async fn run_cmd(
     let rtt_cache: roomlerd::localapi_state::RttCache =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let pinger_for_prober = pinger.clone();
-    // P6: the daemon-wide config-WRITE lock. Every daemon-side runtime
-    // writer of config.toml (route reconciler, clean-run promotion,
-    // graceful shutdown) holds it across load→mutate→save so one writer's
-    // full-struct save can't drop another's just-written field.
+    // P6: the daemon-wide config-WRITE lock. Every daemon-side runtime writer (route reconciler,
+    // clean-run promotion, graceful shutdown, a deliberate end: #4292) holds it across
+    // load→mutate→save, so one writer's full-struct save can't drop another's just-written field.
     let cfg_write_lock: config::WriteLock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    roomlerd::run_end::share_write_lock(&cfg_write_lock);
     // Remote config (docs/remote-config.md) — machine-wide, so ONE instance
     // shared by every org loop. Seeds the live `exec_enabled` from the config
     // this daemon actually loaded.
