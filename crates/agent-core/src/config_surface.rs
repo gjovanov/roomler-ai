@@ -508,7 +508,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Standard,
         live: false,
         kind: "list",
-        description: "Comma-separated OpenSSH public keys allowed to open an SSH session. Empty = nobody (ssh_enabled alone grants no access). Set ssh_account_mode too, or these keys authenticate and run nothing.",
+        description: "Comma-separated OpenSSH public keys allowed to open an SSH session: the break-glass route, for when the server cannot be reached. Empty = no key-list session; a server grant (roomler ssh) needs no key here. Set ssh_account_mode too, or these keys authenticate and run nothing.",
     },
     KeyMeta {
         key: "ssh_account_mode",

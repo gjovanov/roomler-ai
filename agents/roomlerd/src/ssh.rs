@@ -552,9 +552,9 @@ mod sshd {
     /// built rather than per connection.
     pub struct Ctx {
         pub config: Arc<russh::server::Config>,
-        /// Keys allowed to authenticate. Empty is a valid, safe state: the
-        /// transport answers, every authentication attempt fails, and the
-        /// operator sees exactly why in the log.
+        /// The break-glass keys, read only when no server grant matches. Empty
+        /// is the default and a safe state: a grant still signs in, a key-list
+        /// session is refused, and the start-up log says so (#4325).
         pub authorized: Vec<PublicKey>,
         /// What a key-list session runs as, resolved once from
         /// `ssh_account_mode`.
@@ -651,11 +651,11 @@ mod sshd {
                     ),
                 }
             }
-            if authorized.is_empty() {
-                warn!(
-                    "ssh: no usable entries in ssh_authorized_keys — the port will answer \
-                     but every authentication attempt will be refused"
-                );
+            // #4325 — what the list as a whole leaves able to sign in.
+            match super::key_list_line(cfg.ssh_authorized_keys.len(), authorized.len()) {
+                Some(super::KeyListLine::Info(line)) => info!("{line}"),
+                Some(super::KeyListLine::Warn(line)) => warn!("{line}"),
+                None => {}
             }
 
             let config = russh::server::Config {
@@ -3844,9 +3844,9 @@ mod tests {
         );
     }
 
-    /// An empty list is the default, and it must deny rather than allow.
+    /// An empty list is the default, and with no grant to redeem it must deny.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_empty_authorized_list_denies_everyone() {
+    async fn an_empty_authorized_list_denies_a_key_with_no_grant() {
         let (key, _) = client_key(3);
         let addr = serve_one(&cfg_with(Vec::new())).await;
 
@@ -7540,4 +7540,47 @@ mod tests {
         );
         assert!(log.contains("authorized_keys=1"), "{log}");
     }
+}
+
+// ===========================================================================
+// #4325 — the start-up line about `ssh_authorized_keys` as a whole.
+// ===========================================================================
+
+/// The line `sshd::Ctx::build` logs about `ssh_authorized_keys` as a whole,
+/// at the level it is logged at.
+#[cfg(feature = "ssh-server")]
+enum KeyListLine {
+    Info(String),
+    Warn(String),
+}
+
+/// What `listed` entries, `usable` of which parse, leave able to sign in.
+/// A server grant is tried before the list and needs no entry in it
+/// (`auth_publickey`), so whatever the list holds, a grant still signs in.
+/// `None` adds no line: `ssh: server ready` counts the usable keys.
+#[cfg(feature = "ssh-server")]
+fn key_list_line(listed: usize, usable: usize) -> Option<KeyListLine> {
+    const ONLY_GRANTS: &str = "only server grants (roomler ssh) can sign in";
+    if usable > 0 {
+        return None;
+    }
+    Some(match listed {
+        // The default. Nobody asked for a break-glass key, so this is no
+        // warning.
+        0 => KeyListLine::Info(format!(
+            "ssh: no break-glass key is set (ssh_authorized_keys is empty), so {ONLY_GRANTS}"
+        )),
+        // Someone wrote these entries to have a break-glass key, and none
+        // works: they would find out when the server cannot mint grants, the
+        // one time that route is for. Each entry has its own WARN, from
+        // `Ctx::build`.
+        1 => KeyListLine::Warn(format!(
+            "ssh: ssh_authorized_keys has 1 entry and it does not parse, so no break-glass key \
+             works: {ONLY_GRANTS}"
+        )),
+        n => KeyListLine::Warn(format!(
+            "ssh: ssh_authorized_keys has {n} entries and none parses, so no break-glass key \
+             works: {ONLY_GRANTS}"
+        )),
+    })
 }

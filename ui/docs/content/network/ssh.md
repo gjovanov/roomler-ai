@@ -56,7 +56,7 @@ true. Each is owned by a different party, and any one of them refuses:
 1. **The organization** enables remote SSH. It is a separate switch from remote command execution.
 2. **The user** has the SSH permission. Also separate — and not included in the default administrator role.
 3. **The device** has an SSH policy allowing it.
-4. **The machine itself** has SSH enabled in its own configuration, with an authorised key list. Enabling SSH without listing a key grants nobody anything.
+4. **The machine itself** has SSH enabled in its own configuration. A session the server grants (`roomler ssh`) needs no key list there: a list of authorised keys is a separate, break-glass route for when the server cannot be reached, and it is empty by default.
 :::
 
 :::danger The machine's own setting is the one that survives a compromised server
