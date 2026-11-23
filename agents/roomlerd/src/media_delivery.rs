@@ -1035,8 +1035,18 @@ impl DeliverySampler {
     /// `on`, on a constrained session, the step ran at [`Self::gate`], before
     /// the gate, and this reads nothing. FR-148 D48: beside the mark, the
     /// step's rate and SCTP's loss count go to the shadow model's window
-    /// rules ([`RateGovernor::note_path_rate`]).
-    pub fn on_frame(&mut self, pc: &RTCPeerConnection, governor: &mut RateGovernor) {
+    /// rules ([`RateGovernor::note_path_rate`]). FR-148 P4b-4 (D59): first,
+    /// whatever the pass, the session's key frame rule reads its rate, the
+    /// budget's last measured one or else `encoder`'s current target
+    /// (`media_deadline::Counters::note_rate`).
+    pub fn on_frame<E: crate::encode::thread::EncoderOps>(
+        &mut self,
+        pc: &RTCPeerConnection,
+        governor: &mut RateGovernor,
+        encoder: Option<&crate::encode::thread::EncoderHandle<E>>,
+    ) {
+        let target = encoder.map(|e| e.current_maxrate_bps());
+        self.deadline.note_rate(self.measured_rate_bps(), target);
         if self.pass.acts() {
             return;
         }
@@ -1300,6 +1310,14 @@ impl DeliverySampler {
         &self.deadline
     }
 
+    /// FR-148 P4b-4 (D59) — the in-flight budget's rate at its last step,
+    /// bit/s, when this association's own figures gave it; `None` while the
+    /// opening rate stands in, and with no budget.
+    pub fn measured_rate_bps(&self) -> Option<u64> {
+        let b = self.budget.as_deref()?.budget();
+        b.rate_bps().filter(|_| b.rate_measured())
+    }
+
     /// FR-148 D46 B3 — [`Self::gate`] on one frame's reading, as
     /// [`Self::on_frame_reading`] reads one; returns whether the acting budget
     /// marked a stall, which the pump hands the governor.
@@ -1384,7 +1402,8 @@ fn say_budget_mode(session_id: ObjectId, acts: bool) {
 /// sample of the line was read with SCTP's gauges, and are left out when none
 /// was. FR-148 D46's in-flight budget follows when its switch is not `off`,
 /// and FR-148 P4b-3's video channel closes the line when its switch is not
-/// `off`; with both off the line is as before, to the byte.
+/// `off`, FR-148 P4b-4's key frame asks and its rule's gap last; with both off
+/// the line is as before, to the byte.
 pub fn emit(session_id: ObjectId, line: &LineReport) {
     // The line's fields, each group after the first in its order:
     // `path_line!([] queue(q) budget(b) deadline(d))`.
@@ -1441,6 +1460,12 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
                 drain_dropped = $d.drained,
                 channel_switches = $d.switches,
                 video_channel = %$d.channel_label(),
+                kf_asks_viewer = $d.asks.viewer,
+                kf_asks_lane = $d.asks.lane,
+                kf_refused_gap = $d.asks.refused_gap,
+                kf_refused_rule = $d.asks.refused_rule,
+                kf_owed_granted = $d.asks.owed_granted,
+                kf_gap_ms = ?$d.kf_gap_ms,
             ] $($rest)*)
         };
     }
@@ -2196,15 +2221,28 @@ mod tests {
     /// field before them (the budget's too), in their order; with its switch
     /// off the line has none of them, to the byte. A sampler's switch is the
     /// pump's one read: `new` is `off`, and its line carries nothing of it.
+    /// FR-148 P4b-4 (D59) — N12's split of the key frame asks follows
+    /// P4b-3's five fields: the viewer's asks, the lane's, the refusals by
+    /// the 500 ms gap and by the rule, the owed asks granted; the rule's gap
+    /// closes the line.
     #[test]
     fn the_video_channel_s_counts_close_the_line() {
         use crate::media_deadline::{Channel, Counters, DeadlineLine, Mode};
+        use crate::session_telemetry::KeyframeSplit;
         let deadline = DeadlineLine {
             forward_tsns: Some(17),
             late: 3,
             drained: 5,
             switches: 1,
             channel: Some(Channel::Deadline),
+            asks: KeyframeSplit {
+                viewer: 4,
+                lane: 9,
+                refused_gap: 2,
+                refused_rule: 6,
+                owed_granted: 3,
+            },
+            kf_gap_ms: Some(1_280),
         };
         let fields = [
             "forward_tsns=Some(17)",
@@ -2212,6 +2250,12 @@ mod tests {
             "drain_dropped=5",
             "channel_switches=1",
             "video_channel=video-deadline",
+            "kf_asks_viewer=4",
+            "kf_asks_lane=9",
+            "kf_refused_gap=2",
+            "kf_refused_rule=6",
+            "kf_owed_granted=3",
+            "kf_gap_ms=Some(1280)",
         ];
         let off = logged(|| emit(sid(), &busy_line()));
         for (before, line) in [
@@ -2249,6 +2293,7 @@ mod tests {
                 !without.contains("video_channel") && !without.contains("forward_tsns"),
                 "{without:?}"
             );
+            assert!(!without.contains("kf_"), "{without:?}");
         }
         // Off, the line is today's to the byte, past its timestamp: with and
         // without the gauges' fields and the budget's.
@@ -2273,10 +2318,14 @@ mod tests {
             assert!(today.is_some());
             assert_eq!(body(logged(|| emit(sid(), &line))), today, "off");
         }
-        assert!(!off.contains("video_channel"), "{off:?}");
+        assert!(
+            !off.contains("video_channel") && !off.contains("kf_"),
+            "{off:?}"
+        );
         let none = DeadlineLine {
             channel: None,
             forward_tsns: None,
+            kf_gap_ms: None,
             ..deadline
         };
         let out = logged(|| {
@@ -2290,6 +2339,7 @@ mod tests {
         });
         assert!(out.contains("forward_tsns=None"), "{out:?}");
         assert!(out.contains("video_channel=none"), "{out:?}");
+        assert!(out.contains("kf_gap_ms=None"), "{out:?}");
         // The pump's read: `new` carries the switch off, and so no counts.
         let sampler = DeliverySampler::new(true);
         assert_eq!(sampler.deadline().mode(), Mode::Off);
@@ -2300,6 +2350,60 @@ mod tests {
             Some(DeadlineLine::default()),
             "on, before the first frame"
         );
+    }
+
+    /// FR-148 P4b-4 (D59) — the rate the key frame rule reads at the pump's
+    /// step: the in-flight budget's, once this association's own figures gave
+    /// it; none while the opening rate stands in, and none with no budget, so
+    /// the encoder's target stands in (`media_deadline::kf_rate`). The step
+    /// reads it first, whatever the budget's pass.
+    #[test]
+    fn the_key_frame_rule_reads_the_budget_s_rate_once_measured() {
+        assert_eq!(
+            DeliverySampler::new(true).measured_rate_bps(),
+            None,
+            "no budget"
+        );
+        let mut s = DeliverySampler::new(true).with_budget();
+        assert_eq!(s.measured_rate_bps(), None, "before its first step");
+        let t0 = Instant::now();
+        let g = Gauges {
+            max_payload: 1_200,
+            cwnd: 1_048_576,
+            ssthresh: 1_048_576,
+            rwnd: 131_072,
+            inflight_bytes: 200_000,
+            pending_bytes: 16_384,
+            ack_delay: Some(Duration::from_millis(40)),
+            ack_delay_min: Some(Duration::from_millis(30)),
+            ..Gauges::default()
+        };
+        // 3 Mbit/s acknowledged, against a 2 Mbit/s opening.
+        let mut opening = 0;
+        for frame in 0..90_u64 {
+            let now = at(t0, frame * 1_000 / 30);
+            s.on_frame_reading(now, frame * 375_000 / 30, g, 2_000_000);
+            let b = s.budget.as_deref().expect("a budget").budget();
+            match b.rate_measured() {
+                true => assert_eq!(s.measured_rate_bps(), b.rate_bps(), "frame {frame}"),
+                false => {
+                    assert_eq!(s.measured_rate_bps(), None, "frame {frame}");
+                    opening += u32::from(b.rate_bps().is_some());
+                }
+            }
+        }
+        assert!(opening > 0, "the opening rate stood in first");
+        let rate = s.measured_rate_bps().expect("measured by 3 s");
+        assert!((2_800_000..=3_200_000).contains(&rate), "{rate}");
+        let src = include_str!("media_delivery.rs").replace("\r\n", "\n");
+        let head = "    pub fn on_frame<E: crate::encode::thread::EncoderOps>(";
+        let body = &src[src.find(head).expect("the step")..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let read = "let target = encoder.map(|e| e.current_maxrate_bps());";
+        let feed = "self.deadline.note_rate(self.measured_rate_bps(), target);";
+        let pass = body.find("if self.pass.acts() {").expect("the pass");
+        assert!(body.find(read).expect(read) < pass);
+        assert!(body.find(feed).expect(feed) < pass);
     }
 
     /// FR-148 D46 B3 — `on` no longer runs as `shadow`: no warning where a
@@ -3038,7 +3142,7 @@ mod tests {
         const PEER_RS: &str = include_str!("peer.rs");
         const GATE: &str =
             "if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {";
-        const STEP: &str = "delivery.on_frame(&pc, &mut governor);";
+        const STEP: &str = "delivery.on_frame(&pc, &mut governor, encoder.as_ref());";
         let src = PEER_RS.replace("\r\n", "\n");
         let pump = |head: &str| {
             assert_eq!(src.matches(head).count(), 1, "one {head:?} in peer.rs");
@@ -3153,7 +3257,7 @@ mod tests {
         );
         let passed = vp9.find("gate_clock.passed(").unwrap();
         let step = vp9
-            .find("delivery.on_frame(&pc, &mut governor);")
+            .find("delivery.on_frame(&pc, &mut governor, encoder.as_ref());")
             .expect("the step");
         assert!(
             at < passed && passed < step,
