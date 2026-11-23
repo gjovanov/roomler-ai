@@ -3646,7 +3646,7 @@ mod tests {
         let mut outcome = unreported("agent-v0.4.234", 1000);
         outcome.watcher = Some(InstallWatcher {
             pid: 4242,
-            held: vec!["msvcp140.dll".into(), "vcruntime140.dll".into()],
+            held: vec!["one.dll".into(), "two.dll".into()],
         });
         write_outcome_at(&path, &outcome).unwrap();
         assert_eq!(read_outcome_at(&path).unwrap(), outcome);
@@ -3687,7 +3687,7 @@ mod tests {
     fn a_settled_note_says_what_the_watcher_held() {
         let held = InstallWatcher {
             pid: 4242,
-            held: vec!["msvcp140.dll".into(), "vcruntime140.dll".into()],
+            held: vec!["one.dll".into(), "two.dll".into()],
         };
         let mut o = unreported("agent-v0.4.234", 1000);
         o.watcher = Some(held.clone());
@@ -3697,7 +3697,7 @@ mod tests {
         assert!(
             o.note.ends_with(
                 "; the watcher (pid 4242) held these files in the install folder when it \
-                 began: msvcp140.dll, vcruntime140.dll"
+                 began: one.dll, two.dll"
             ),
             "{}",
             o.note
@@ -3750,19 +3750,19 @@ mod tests {
         let modules: Vec<PathBuf> = [
             r"C:\Program Files\Roomler\roomlerd.exe",
             r"C:\Windows\SYSTEM32\ntdll.dll",
-            r"\\?\C:\PROGRAM FILES\roomler\VCRUNTIME140.dll",
-            r"C:/Program Files/Roomler/msvcp140.dll",
+            r"\\?\C:\PROGRAM FILES\roomler\TWO.dll",
+            r"C:/Program Files/Roomler/one.dll",
             r"C:\Program Files\Roomler\sub\other.dll",
             r"C:\Program Files\Roomler2\roomlerd.exe",
-            r"C:\Program Files\Roomler\vcruntime140.dll",
+            r"C:\Program Files\Roomler\two.dll",
         ]
         .iter()
         .map(PathBuf::from)
         .collect();
         let want = vec![
-            "msvcp140.dll".to_string(),
+            "one.dll".to_string(),
             "roomlerd.exe".to_string(),
-            "vcruntime140.dll".to_string(),
+            "two.dll".to_string(),
         ];
         for dir in [
             r"C:\Program Files\Roomler",
