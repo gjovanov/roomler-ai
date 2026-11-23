@@ -5047,12 +5047,21 @@ export function isChromeWithBrokenScriptTransform(): boolean {
 }
 
 /** Wire-format constants for the `video-bytes` DataChannel. The label
- *  must match the agent's `on_data_channel` arm at peer.rs:494. The
- *  channel is reliable + ordered because (a) SCTP is doing the
- *  reassembly anyway and (b) dropping a P-frame would force the
- *  worker to wait for the next IDR — far worse than a few ms of
- *  retransmit latency. */
+ *  must match the agent's `on_data_channel` arm at peer.rs:1359, which
+ *  matches every label by equality. The channel is reliable + ordered
+ *  because (a) SCTP is doing the reassembly anyway and (b) dropping a
+ *  P-frame would force the worker to wait for the next IDR — far worse
+ *  than a few ms of retransmit latency (on a LAN; `videoDcOptions` has
+ *  the relay's side of it). */
 export const VP9_444_DC_LABEL = 'video-bytes'
+
+/** FR-148 P4b-2 (D55) — the label of the second video channel, unordered
+ *  with no retransmits (`videoDeadlineDcOptions`). The agent matches labels
+ *  by equality (its `video-bytes` arm is peer.rs:1359), and neither label
+ *  is a prefix of the other. An agent with no arm for this label attaches
+ *  the channel log-only (the `_ =>` arm, peer.rs:1396), so against one the
+ *  channel is one idle stream. */
+export const VIDEO_DEADLINE_DC_LABEL = 'video-deadline'
 
 /** FR-135 R3 — the name a data-channel video path goes by: `hevc` on the HEVC
  *  transport, `vp9-444` on VP9, AV1 and H.264, the names their two workers
@@ -5061,14 +5070,20 @@ export const VP9_444_DC_LABEL = 'video-bytes'
 export type DcPathLabel = 'vp9-444' | 'hevc'
 
 /**
- * FR-17 stage B — how the `video-bytes` channel is opened.
+ * FR-17 stage B, FR-148 P4b-2 (D55) — how the two video channels are opened.
  *
- * Historically `{ ordered: true }`, justified as "SCTP is doing the
- * reassembly anyway, and dropping a P-frame is far worse than a few ms
+ * `video-bytes` is `{ ordered: true }`, always, justified as "SCTP is doing
+ * the reassembly anyway, and dropping a P-frame is far worse than a few ms
  * of retransmit latency". True on a LAN; falsified on a 90-210 ms relay,
  * where one lost chunk head-of-line-blocks everything behind it and the
  * backlog has no bound — measured `send_wait_max` 10,263 ms on an agent
  * whose encoder was idle at 8-12 ms/frame.
+ *
+ * So a framed session opens `video-deadline` beside it
+ * ({@link videoDeadlineDcOptions}), unordered with `maxRetransmits: 0`, and
+ * the agent picks one of the two per carrier, at a key frame (FR-148 P4b-3).
+ * Until P4b-2 that unordered shape was `video-bytes` itself, behind a
+ * per-browser opt-in that P4b-2 retired.
  *
  * `maxRetransmits: 0` rather than a bounded retransmit was chosen for
  * stage B because it was coupled to the RECEIVER of the day. Stage A's
@@ -5079,37 +5094,26 @@ export type DcPathLabel = 'vp9-444' | 'hevc'
  * converting a recoverable frame into a lost one plus a keyframe request.
  * Stage C's reorder buffer (FR-59 P7, #1169, `rc-chunk-framing.ts`)
  * removed that coupling: a late chunk lands in its slot while its frame
- * is still open. The number is still 0 because 1-2 (or the
- * `maxPacketLifeTime` deadline FR-17 prefers) has not been MEASURED on a
- * relay-locked pair — it is now a measurement that can be run, not a
- * number that can be turned up without one.
+ * is still open. FR-148 keeps 0 on the wire (D55): a frame's deadline is
+ * the agent's, at its send task, and `maxPacketLifeTime` is not used.
  *
  * ⚠️ Unordered is only legal WITH framing. An unframed stream is a bare
  * byte sequence whose reassembly depends entirely on arrival order, so
  * delivering it out of order does not degrade the picture — it produces
- * garbage the decoder reports as corruption. This function is the single
- * place that pairing is enforced, so the two can never be set
- * independently by a caller who has not thought about it.
+ * garbage the decoder reports as corruption. These two builders are the
+ * single place that pairing is enforced: without framing there is no
+ * second channel at all.
  */
-export function videoDcOptions(
-  chunkFraming: boolean,
-  unordered: boolean,
-): RTCDataChannelInit {
-  if (!chunkFraming || !unordered) return { ordered: true }
-  return { ordered: false, maxRetransmits: 0 }
+export function videoDcOptions(): RTCDataChannelInit {
+  return { ordered: true }
 }
 
-/** Field opt-in for stage B, mirroring `storedDecodePref`'s A/B knob.
- *  Default OFF: this changes the delivery guarantee of the video path,
- *  and the FR's own acceptance bar is a measured relay-pair improvement,
- *  not a plausible argument. Pure + exported for tests. */
-export function storedUnorderedVideo(): boolean {
-  try {
-    return globalThis.localStorage?.getItem('roomler-rc-unordered-video') === '1'
-  } catch {
-    /* privacy mode - default off */
-    return false
-  }
+/** FR-148 P4b-2 — `video-deadline`'s options: unordered with no
+ *  retransmits, or null without chunk framing, when the channel is not
+ *  opened (see {@link videoDcOptions}). */
+export function videoDeadlineDcOptions(chunkFraming: boolean): RTCDataChannelInit | null {
+  if (!chunkFraming) return null
+  return { ordered: false, maxRetransmits: 0 }
 }
 
 /** Short codec name to pass into `new RTCRtpScriptTransform(worker,
@@ -8703,7 +8707,6 @@ export function useRemoteControl(
           colorSpace: sessionColorSpace,
           // FR-135 R1 — resolved per session; see `sessionDecodeRecover`.
           decodeRecover: sessionDecodeRecover,
-          unorderedVideo: videoDcOptions(sessionChunkFraming, storedUnorderedVideo()).ordered === false,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -8722,22 +8725,36 @@ export function useRemoteControl(
     // (transferred, not copied).
     let dc: RTCDataChannel
     try {
-      // FR-17 stage B - unordered ONLY when this session negotiated
-      // framing; `videoDcOptions` enforces that pairing.
-      dc = pc.createDataChannel(
-        VP9_444_DC_LABEL,
-        videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
-      )
+      // FR-148 P4b-2 - reliable and ordered, always: the unordered shape is
+      // `video-deadline`'s, below.
+      dc = pc.createDataChannel(VP9_444_DC_LABEL, videoDcOptions())
     } catch (err) {
       console.warn(`[rc] ${label} DC creation failed`, err)
       try { worker.terminate() } catch { /* ignore */ }
       return null
     }
+    // FR-148 P4b-2 (D55) - the second video channel, unordered with no
+    // retransmits, opened beside `video-bytes` in the same task whenever this
+    // session negotiated framing, so it rides the same offer. The agent picks
+    // one of the two per carrier, at a key frame (P4b-3); one that does not
+    // leaves it idle, and one without the label attaches it log-only. No
+    // opt-in and no capability: an idle channel costs one stream. Failing to
+    // open it costs nothing more: the session runs on `video-bytes` alone.
+    let deadline: RTCDataChannel | undefined
+    const deadlineOptions = videoDeadlineDcOptions(sessionChunkFraming)
+    if (deadlineOptions) {
+      try {
+        deadline = pc.createDataChannel(VIDEO_DEADLINE_DC_LABEL, deadlineOptions)
+      } catch (err) {
+        console.warn(`[rc] ${label} ${VIDEO_DEADLINE_DC_LABEL} DC creation failed - ${VP9_444_DC_LABEL} alone, as before`, err)
+      }
+    }
     // FR-135 R3 — the channel into the worker, in the task that made it (the
     // only one in which a channel can move), where this browser can transfer
     // one and this session asks. Refused, it is still the page's, untouched,
-    // and the relay below carries it as before.
-    const refused = sessionDcWorker ? moveVideoChannelToWorker(worker, dc) : 'off'
+    // and the relay below carries it as before. FR-148 P4b-2 — `video-deadline`
+    // goes with it, in the same message, or stays with it.
+    const refused = sessionDcWorker ? moveVideoChannelToWorker(worker, dc, deadline) : 'off'
     videoDcGap.reset() // fresh path - don't count the setup silence as a gap
     startJankDetector()
     if (refused === null) {
@@ -8752,20 +8769,28 @@ export function useRemoteControl(
       if (sessionDcWorker) {
         console.info(`[rc] ${label} video channel stays on the page, relayed to the worker: this browser refused to move it (${refused})`)
       }
-      dc.binaryType = 'arraybuffer'
-      dc.onmessage = (ev) => {
+      // One delivery-gap clock for both channels: the agent sends on one at a
+      // time, so a switch between them is no silence. FR-148 P4b-2 — a message
+      // off `video-deadline` is marked, so the worker reads it as the
+      // unordered channel's; one off `video-bytes` goes exactly as before.
+      const relay = (ev: MessageEvent, fromDeadline: boolean) => {
         if (!(ev.data instanceof ArrayBuffer)) return
         noteVideoDcDelivery()
         try {
           // P1 - sentAt stamps the main-to-worker forwarding hop (epoch-absolute).
+          const sentAt = performance.timeOrigin + performance.now()
           worker.postMessage(
-            { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
+            fromDeadline
+              ? { type: 'chunk', bytes: ev.data, sentAt, deadline: true }
+              : { type: 'chunk', bytes: ev.data, sentAt },
             [ev.data],
           )
         } catch (err) {
           console.warn(`[rc] ${label} worker post failed`, err)
         }
       }
+      dc.binaryType = 'arraybuffer'
+      dc.onmessage = (ev) => relay(ev, false)
       dc.onopen = () => {
         markConnect('dc_open')
         console.info(`[rc] ${label} DC opened`)
@@ -8774,6 +8799,13 @@ export function useRemoteControl(
         console.info(`[rc] ${label} DC closed`)
       }
       channels.videoBytes = dc
+      if (deadline) {
+        deadline.binaryType = 'arraybuffer'
+        deadline.onmessage = (ev) => relay(ev, true)
+        deadline.onopen = () => console.info(`[rc] ${label} ${VIDEO_DEADLINE_DC_LABEL} DC opened`)
+        deadline.onclose = () => console.info(`[rc] ${label} ${VIDEO_DEADLINE_DC_LABEL} DC closed`)
+        channels.videoDeadline = deadline
+      }
     }
     dcWorker = worker
     dcPathLabel = label
