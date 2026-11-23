@@ -2507,8 +2507,8 @@ mod tests {
     fn a_split_brain_config_pair_stays_and_a_data_pair_merges() {
         let tmp = tempfile::tempdir().unwrap();
         for per_child in [false, true] {
-            let old = tmp.path().join(per_child.to_string()).join(OLD_APP);
-            let new = tmp.path().join(per_child.to_string()).join(NEW_APP);
+            let old = tmp.path().join(per_child.to_string()).join("roomler-agent");
+            let new = tmp.path().join(per_child.to_string()).join("roomler");
             std::fs::create_dir_all(&old).unwrap();
             std::fs::create_dir_all(&new).unwrap();
             std::fs::write(old.join("stale.txt"), b"old").unwrap();
@@ -2554,8 +2554,8 @@ mod tests {
     #[test]
     fn a_refused_data_folder_merges_into_what_another_runner_made() {
         let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join(OLD_APP);
-        let new = tmp.path().join(NEW_APP);
+        let old = tmp.path().join("roomler-agent");
+        let new = tmp.path().join("roomler");
         std::fs::create_dir_all(old.join("crashes")).unwrap();
         std::fs::write(old.join("crashes").join("c1.dmp"), b"dump").unwrap();
         std::fs::write(old.join("config.toml"), b"tok").unwrap();
