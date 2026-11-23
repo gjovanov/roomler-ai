@@ -123,9 +123,9 @@ pub fn raise_attention_at_full(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    // The version line is omitted rather than written empty: absent has a
-    // specific meaning to the reader (see `clear_attention_on_healthy_connect`)
-    // and an empty string would muddy it.
+    let message = versions_not_tags(message); // FR-133: a person reads a version
+    // The version line is omitted rather than written empty: absent has a specific meaning to the
+    // reader (see `clear_attention_on_healthy_connect`) and an empty string would muddy it.
     let version_line = match failed_version {
         Some(v) if !v.trim().is_empty() => format!("Failed-version: {}\n", v.trim()),
         _ => String::new(),
@@ -293,6 +293,38 @@ fn rollback_is_stale(info: &AttentionInfo, running_version: &str) -> bool {
 /// Cheap stat calls, safe to poll.
 pub fn has_attention() -> bool {
     all_attention_paths().iter().any(|p| p.exists())
+}
+
+/// FR-133 — a release tag in a notice, shown as the version it names.
+///
+/// A tag (`agent-v0.4.232`, `tunnel-v…`, `setup-v…`) is a wire value: the updater,
+/// the proxies and the release lane key on it, so the reasons a notice carries hold
+/// it. A person reads the version, the way the wizard shows it. Only a tag standing
+/// as a word becomes its version: at the start, or after a space, an opening bracket
+/// or a quote. One inside an address (`/tags/agent-v0.4.1`, `?tag=agent-v0.4.1`) or
+/// glued to a word before it keeps its text, because it still has to lead somewhere.
+pub fn versions_not_tags(message: &str) -> String {
+    const TAGS: [&str; 3] = ["agent-v", "tunnel-v", "setup-v"];
+    let mut shown = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(c) = rest.chars().next() {
+        let stands = shown
+            .chars()
+            .next_back()
+            .is_none_or(|p| p.is_whitespace() || "([{'\"`".contains(p));
+        let tag = TAGS.iter().find(|t| {
+            rest.strip_prefix(**t)
+                .is_some_and(|v| v.starts_with(|d: char| d.is_ascii_digit()))
+        });
+        match tag {
+            Some(t) if stands => rest = &rest[t.len()..],
+            _ => {
+                shown.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    shown
 }
 
 // ─── rc.53: LocalSystem-aware sentinel path routing ────────────────
@@ -512,5 +544,74 @@ mod tests {
         let rb_path = raise_attention_at_with_reason(&rb, REASON_ROLLBACK, "broken").unwrap();
         let info = read_attention_at(&rb_path).unwrap();
         assert_eq!(info.reason.as_deref(), Some(REASON_ROLLBACK));
+    }
+
+    // ─── FR-133: a notice shows a release as its version, never as its tag ──
+
+    /// The tag (`agent-v0.4.232`) stays a wire value: the updater, the proxies
+    /// and the release lane key on it. What a person reads is the version, the
+    /// way the wizard shows it (`releaseVersion` in its app.js).
+    #[test]
+    fn a_notice_shows_a_release_as_its_version() {
+        for (raw, shown) in [
+            (
+                "Self-update to agent-v0.4.232 failed.",
+                "Self-update to 0.4.232 failed.",
+            ),
+            (
+                "no platform installer in release agent-v0.4.231",
+                "no platform installer in release 0.4.231",
+            ),
+            (
+                "pin fetch agent-v0.4.231: refused",
+                "pin fetch 0.4.231: refused",
+            ),
+            ("agent-v0.4.1 at the start", "0.4.1 at the start"),
+            ("(tunnel-v0.4.149, setup-v0.4.12)", "(0.4.149, 0.4.12)"),
+            ("'agent-v1.2.3'", "'1.2.3'"),
+        ] {
+            assert_eq!(versions_not_tags(raw), shown, "{raw}");
+        }
+    }
+
+    /// What is not a tag in prose stays as it is: an address that carries one
+    /// still has to lead somewhere, and a word that merely starts like one
+    /// (`-vpn`), or a tag glued to a word before it, is not a release.
+    #[test]
+    fn a_url_and_a_lookalike_keep_their_text() {
+        for raw in [
+            "https://example.invalid/releases/tags/agent-v0.4.231",
+            "GET /api/agent/release?tag=agent-v0.4.231",
+            "agent-vpn is up",
+            "build-agent-v0.4.1",
+            "agent-v",
+            "an agent-v.x tag",
+            "Version 0.4.232 has crashed",
+        ] {
+            assert_eq!(versions_not_tags(raw), raw);
+        }
+    }
+
+    /// …and the one writer applies it, so every reason that carries a tag (an
+    /// update's target, a pinned rollback's release) reads right in the file
+    /// the companion's banner and a fleet scanner both read. The footer's
+    /// machine fields are not prose and stay exactly as written.
+    #[test]
+    fn the_writer_shows_a_version_where_a_reason_carried_a_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = raise_attention_at_full(
+            tmp.path(),
+            REASON_ROLLBACK,
+            "Self-update to agent-v0.4.232 failed and this node is still on 0.4.231.",
+            Some("0.4.231"),
+        )
+        .unwrap();
+        let read = read_attention_at(&path).unwrap();
+        assert_eq!(
+            read.message,
+            "Self-update to 0.4.232 failed and this node is still on 0.4.231."
+        );
+        assert_eq!(read.reason.as_deref(), Some(REASON_ROLLBACK));
+        assert_eq!(read.failed_version.as_deref(), Some("0.4.231"));
     }
 }

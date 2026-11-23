@@ -532,6 +532,9 @@ pub mod busy;
 #[cfg(test)]
 mod config_enum_pins;
 pub mod daemon_error;
+/// FR-133 — every needs-attention notice, rendered and read back whole.
+#[cfg(test)]
+mod notice_text_tests;
 
 #[cfg(test)]
 mod tests {
