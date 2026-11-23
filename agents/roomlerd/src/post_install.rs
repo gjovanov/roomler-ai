@@ -139,6 +139,22 @@ pub struct InstallOutcome {
     /// record of an older watcher, which still parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon: Option<InstallDaemon>,
+    /// #4302 — the watcher that wrote this record, as it found itself when it
+    /// began. Absent from a record of an older watcher, which still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watcher: Option<InstallWatcher>,
+}
+
+/// #4302 — the watcher process behind a record. Written with the `InProgress`
+/// state, before the wait, so a record whose watcher never came back still says
+/// which process it was and what it held.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub struct InstallWatcher {
+    pub pid: u32,
+    /// The files in the install folder that the watcher held open when it began,
+    /// read from its own module list: file names, lower case, sorted, each once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -319,7 +335,29 @@ pub fn watch(
         status: InstallStatus::InProgress,
         note: String::new(),
         daemon: None,
+        watcher: None,
     };
+    // #4302 — which process this is, and which files of the install folder it
+    // holds: an update that replaces one of them may end the watcher before its
+    // verdict, and then this record is what is left to say so.
+    #[cfg(target_os = "windows")]
+    {
+        let me = watcher_self(origin_exe.as_deref());
+        if me.held.is_empty() {
+            tracing::info!(
+                pid = me.pid,
+                "the post-install watcher holds no file in the install folder"
+            );
+        } else {
+            tracing::warn!(
+                pid = me.pid,
+                held = %me.held.join(", "),
+                "the post-install watcher holds files in the install folder; an update that \
+                 replaces them may end it before its verdict"
+            );
+        }
+        outcome.watcher = Some(me);
+    }
     // Persist the InProgress state immediately so a watcher that
     // crashes mid-wait still leaves a forensic trail.
     let _ = write_outcome(&outcome);
@@ -423,6 +461,96 @@ fn install_flavour(origin: Option<&std::path::Path>) -> crate::updater::WindowsI
         Some(p) => crate::updater::classify_install_flavour_from_path(p),
         None => crate::updater::current_install_flavour(),
     }
+}
+
+/// #4302 — this watcher as its record names it: its pid, and the files of the
+/// install folder it holds. The install folder is `--origin-exe`'s, or, for a
+/// watcher started from the install folder itself, its own.
+#[cfg(target_os = "windows")]
+fn watcher_self(origin: Option<&Path>) -> InstallWatcher {
+    let exe = origin
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_exe().ok());
+    let held = match exe.as_deref().and_then(Path::parent) {
+        Some(dir) => held_in(&own_modules(), dir),
+        None => Vec::new(),
+    };
+    InstallWatcher {
+        pid: std::process::id(),
+        held,
+    }
+}
+
+/// #4302 — the files this process has open as modules, as its module list
+/// names them, the executable first. Empty when the list cannot be read.
+#[cfg(target_os = "windows")]
+fn own_modules() -> Vec<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::HMODULE;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32EnumProcessModules, K32GetModuleFileNameExW,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: the pseudo-handle of this process; it needs no closing.
+    let me = unsafe { GetCurrentProcess() };
+    let size_of = std::mem::size_of::<HMODULE>();
+    let mut mods: Vec<HMODULE> = vec![std::ptr::null_mut(); 256];
+    loop {
+        let mut needed = 0u32;
+        // SAFETY: `mods` holds the byte count passed; `needed` is a valid
+        // out-pointer.
+        let ok = unsafe {
+            K32EnumProcessModules(
+                me,
+                mods.as_mut_ptr(),
+                (mods.len() * size_of) as u32,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return Vec::new();
+        }
+        let count = needed as usize / size_of;
+        if count <= mods.len() {
+            mods.truncate(count);
+            break;
+        }
+        // A module was loaded between the two calls: read the list again.
+        mods.resize(count, std::ptr::null_mut());
+    }
+    let mut buf = vec![0u16; 32_768];
+    mods.iter()
+        .filter_map(|&module| {
+            // SAFETY: `module` is a module of this process; `buf` is sized as
+            // passed.
+            let n =
+                unsafe { K32GetModuleFileNameExW(me, module, buf.as_mut_ptr(), buf.len() as u32) };
+            (n > 0).then(|| PathBuf::from(OsString::from_wide(&buf[..n as usize])))
+        })
+        .collect()
+}
+
+/// #4302 — the file names among `modules` that sit directly in `dir`, compared
+/// the way Windows compares paths: lower case, sorted, each once.
+#[cfg(target_os = "windows")]
+fn held_in(modules: &[PathBuf], dir: &Path) -> Vec<String> {
+    use crate::win_service::companion_procs::normalize;
+    let dir = normalize(dir);
+    let dir = dir.trim_end_matches('\\');
+    let mut held: Vec<String> = modules
+        .iter()
+        .filter(|m| {
+            m.parent()
+                .is_some_and(|p| normalize(p).trim_end_matches('\\') == dir)
+        })
+        .filter_map(|m| m.file_name())
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .collect();
+    held.sort();
+    held.dedup();
+    held
 }
 
 // RETIRED-NAME-ANCHOR(4): names the folder hosts installed BEFORE P4b; the
@@ -1568,8 +1696,28 @@ pub(crate) fn settle_unreported(
             outcome.expected_version
         );
     }
+    if let Some(watcher) = &outcome.watcher {
+        outcome.note = format!("{}; {}", outcome.note, watcher_words(watcher));
+    }
     outcome.finished_unix = Some(now_unix);
     Settle::Settled
+}
+
+/// #4302 — what a settled record says of the watcher that left it: the files of
+/// the install folder it held when it began.
+fn watcher_words(watcher: &InstallWatcher) -> String {
+    if watcher.held.is_empty() {
+        format!(
+            "the watcher (pid {}) held no file in the install folder when it began",
+            watcher.pid
+        )
+    } else {
+        format!(
+            "the watcher (pid {}) held these files in the install folder when it began: {}",
+            watcher.pid,
+            watcher.held.join(", ")
+        )
+    }
 }
 
 /// #3302 — [`settle_unreported`] on the record on disk. Returns how long to wait
@@ -1963,6 +2111,7 @@ mod tests {
             status: InstallStatus::InProgress,
             note: String::new(),
             daemon: None,
+            watcher: None,
         }
     }
 
@@ -2346,6 +2495,7 @@ mod tests {
                 status: InstallStatus::InProgress,
                 note: String::new(),
                 daemon: None,
+                watcher: None,
             })),
             Some(path),
         );
@@ -2377,6 +2527,7 @@ mod tests {
                 status: InstallStatus::SucceededVerified,
                 note: "new binary at /usr/bin/roomlerd reports roomlerd 0.4.172".into(),
                 daemon: None,
+                watcher: None,
             })),
             Some(path),
         );
@@ -2588,6 +2739,7 @@ mod tests {
             status: InstallStatus::SucceededVerified,
             note: "ok".into(),
             daemon: None,
+            watcher: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(json.contains("\"installer_pid\":1234"));
@@ -2610,6 +2762,7 @@ mod tests {
             status: InstallStatus::InProgress,
             note: "".into(),
             daemon: None,
+            watcher: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(json.contains("\"finished_unix\":null"));
@@ -3267,5 +3420,176 @@ mod tests {
         assert_eq!(summary.daemon, None);
         let summary = summarize(Ok(Some(outcome)), Some(path.as_path()));
         assert_eq!(summary.daemon.map(|d| d.running), Some(false));
+    }
+
+    /// #4302 — the record's `watcher` field round-trips through the file, an empty
+    /// `held` is left out of it, and a record an older watcher wrote still parses.
+    #[test]
+    fn the_records_watcher_field_round_trips_and_an_old_record_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-install.json");
+        let mut outcome = unreported("agent-v0.4.234", 1000);
+        outcome.watcher = Some(InstallWatcher {
+            pid: 4242,
+            held: vec!["msvcp140.dll".into(), "vcruntime140.dll".into()],
+        });
+        write_outcome_at(&path, &outcome).unwrap();
+        assert_eq!(read_outcome_at(&path).unwrap(), outcome);
+
+        outcome.watcher = Some(InstallWatcher {
+            pid: 4242,
+            held: Vec::new(),
+        });
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"watcher\":{\"pid\":4242}"), "{json}");
+        let back: InstallOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, outcome);
+
+        let old = serde_json::json!({
+            "installer_pid": 2876,
+            "installer_path": "C:\\T\\roomlerd-0.4.233-perMachine-x86_64-pc-windows-msvc.msi",
+            "expected_version": "agent-v0.4.233",
+            "started_unix": 1_795_185_131u64,
+            "finished_unix": null,
+            "installer_exit_code": null,
+            "new_binary_path": null,
+            "new_binary_version": null,
+            "status": "InProgress",
+            "note": ""
+        });
+        std::fs::write(&path, old.to_string()).unwrap();
+        let back = read_outcome_at(&path).unwrap();
+        assert_eq!(back.watcher, None);
+        assert_eq!(back.status, InstallStatus::InProgress);
+        let json = serde_json::to_string(&back).unwrap();
+        assert!(!json.contains("watcher"), "{json}");
+    }
+
+    /// #4302 — a record settled for a watcher that never came back says what that
+    /// watcher held in the install folder, on both settle branches; a record of an
+    /// older watcher, which names no watcher, keeps today's note.
+    #[test]
+    fn a_settled_note_says_what_the_watcher_held() {
+        let held = InstallWatcher {
+            pid: 4242,
+            held: vec!["msvcp140.dll".into(), "vcruntime140.dll".into()],
+        };
+        let mut o = unreported("agent-v0.4.234", 1000);
+        o.watcher = Some(held.clone());
+        assert_eq!(settle_unreported(&mut o, "0.4.234", 1010), Settle::Settled);
+        assert_eq!(o.status, InstallStatus::SucceededVerified);
+        assert!(o.note.contains("no verdict"), "{}", o.note);
+        assert!(
+            o.note.ends_with(
+                "; the watcher (pid 4242) held these files in the install folder when it \
+                 began: msvcp140.dll, vcruntime140.dll"
+            ),
+            "{}",
+            o.note
+        );
+
+        let life = WATCHER_LIFETIME.as_secs();
+        let mut o = unreported("agent-v0.4.234", 1000);
+        o.watcher = Some(InstallWatcher {
+            pid: 77,
+            held: Vec::new(),
+        });
+        assert_eq!(
+            settle_unreported(&mut o, "0.4.233", 1000 + life),
+            Settle::Settled
+        );
+        assert_eq!(o.status, InstallStatus::WatcherStopped);
+        assert!(o.note.contains("agent-v0.4.234"), "{}", o.note);
+        assert!(
+            o.note.ends_with(
+                "; the watcher (pid 77) held no file in the install folder when it began"
+            ),
+            "{}",
+            o.note
+        );
+
+        // Too soon: the note is not touched, the watcher's facts included.
+        let mut o = unreported("agent-v0.4.234", 1000);
+        o.watcher = Some(held);
+        assert!(matches!(
+            settle_unreported(&mut o, "0.4.233", 1010),
+            Settle::TooSoon(_)
+        ));
+        assert_eq!(o.note, "");
+
+        let mut o = unreported("agent-v0.4.234", 1000);
+        assert_eq!(settle_unreported(&mut o, "0.4.234", 1010), Settle::Settled);
+        assert_eq!(
+            o.note,
+            "the watcher left no verdict; this daemon is 0.4.234, and has stayed up on it"
+        );
+        assert!(!o.note.contains("pid"), "{}", o.note);
+    }
+
+    /// #4302 — the install folder's files among a module list, compared the way
+    /// Windows compares paths: case, the `\\?\` prefix, a trailing separator and
+    /// `/` do not matter; another folder and a subfolder are not the folder.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn held_in_compares_folders_the_way_windows_does() {
+        let modules: Vec<PathBuf> = [
+            r"C:\Program Files\Roomler\roomlerd.exe",
+            r"C:\Windows\SYSTEM32\ntdll.dll",
+            r"\\?\C:\PROGRAM FILES\roomler\VCRUNTIME140.dll",
+            r"C:/Program Files/Roomler/msvcp140.dll",
+            r"C:\Program Files\Roomler\sub\other.dll",
+            r"C:\Program Files\Roomler2\roomlerd.exe",
+            r"C:\Program Files\Roomler\vcruntime140.dll",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let want = vec![
+            "msvcp140.dll".to_string(),
+            "roomlerd.exe".to_string(),
+            "vcruntime140.dll".to_string(),
+        ];
+        for dir in [
+            r"C:\Program Files\Roomler",
+            r"c:\program files\roomler\",
+            r"\\?\C:\Program Files\Roomler",
+        ] {
+            assert_eq!(held_in(&modules, Path::new(dir)), want, "{dir}");
+        }
+        assert!(held_in(&modules, Path::new(r"C:\Windows\Temp")).is_empty());
+    }
+
+    /// #4302 — the module list this process reads of itself: the executable
+    /// first, `ntdll.dll` in it, and the watcher's own entry from it.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_watcher_reads_its_own_modules() {
+        let modules = own_modules();
+        let exe = std::env::current_exe().unwrap();
+        let first = modules.first().expect("a module list");
+        assert_eq!(
+            crate::win_service::companion_procs::normalize(first),
+            crate::win_service::companion_procs::normalize(&exe),
+            "{modules:?}"
+        );
+        assert!(
+            modules.iter().any(|m| m
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("ntdll.dll"))),
+            "{modules:?}"
+        );
+
+        // Started from the install folder itself: it holds its own executable.
+        let me = watcher_self(Some(&exe));
+        assert_eq!(me.pid, std::process::id());
+        let own = exe.file_name().unwrap().to_string_lossy().to_lowercase();
+        assert!(me.held.contains(&own), "{:?}", me.held);
+        assert_eq!(watcher_self(None).held, me.held);
+
+        // A staged copy whose install folder it holds nothing of.
+        let elsewhere = std::env::temp_dir()
+            .join("w4302-no-such-folder")
+            .join("roomlerd.exe");
+        assert!(watcher_self(Some(&elsewhere)).held.is_empty());
     }
 }
