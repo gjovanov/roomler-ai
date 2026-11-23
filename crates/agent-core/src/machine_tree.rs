@@ -619,10 +619,10 @@ fn is_exactly(sd: &Sd, want: &[Ace]) -> bool {
 /// #4176 — while only a copy is there (the `.prev` a start restores a missing
 /// config from), R leaves the tree as it found it unless the copy, the folder
 /// and the keys were the machine's as found, inherited entries counted
-/// ([`holds_the_machines_copy`]): a cut of the parent, or a seal of a folder,
-/// rewrites what every entry below it inherits, so the check that follows
-/// ([`read_machine_copy`]) would judge what R did, not what it found. When
-/// they were, R takes the folder for the copy, and the parent's cut spares a
+/// ([`holds_the_machines_copy`]), and the check that follows
+/// ([`read_machine_copy`]) then refuses the copy, at this tick and at every
+/// one after, until the tree is closed. When they were the machine's as
+/// found, R takes the folder for the copy, and the parent's cut spares a
 /// replace right as above.
 ///
 /// What it leaves, it says once in `left`, and the check refuses.
@@ -1128,9 +1128,9 @@ fn there(path: &Path) -> bool {
 /// this one function (`config::machine_previous_copy`), and the restore runs on
 /// these bytes, so they cannot disagree. It repairs nothing: while only a copy
 /// is there, the [`repair`] before it leaves the tree as it found it unless the
-/// copy, the folder and the keys were the machine's as found, so what a repair
-/// did never makes a copy pass that did not. The check's switch does not relax
-/// it: no copy of a missing config was ever run without it.
+/// copy, the folder and the keys were the machine's as found. The check's
+/// switch does not relax it: no copy of a missing config was ever run without
+/// it.
 #[cfg(windows)]
 pub fn read_machine_copy(tree: &MachineTree) -> Result<Option<Vec<u8>>, String> {
     match machine_copy(tree) {
@@ -3622,9 +3622,9 @@ mod tests {
 
         /// #4176 — while only a copy is there, R leaves the tree as it found
         /// it unless the copy, the folder and the keys were the machine's as
-        /// found, inherited entries counted: an entry a cut of the parent or a
-        /// seal of a folder would rewrite below it stays, and the check
-        /// refuses the copy at this tick and the next.
+        /// found, inherited entries counted, and the check refuses the copy at
+        /// this tick and the next: the parent, the folder, the copy, the keys
+        /// folder and a key file each read as they were found.
         #[test]
         fn while_only_a_copy_is_there_a_tree_that_was_not_the_machines_is_left_as_found() {
             if !elevated_or_skip("a copy in a tree that was not the machine's") {
