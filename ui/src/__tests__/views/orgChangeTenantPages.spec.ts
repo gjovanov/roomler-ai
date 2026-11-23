@@ -26,7 +26,7 @@ import { createMemoryHistory, createRouter, useRoute, type RouteRecordRaw, type 
 import en from '@/locales/en.json'
 
 vi.mock('@/api/client', () => ({
-  api: { get: vi.fn(), post: vi.fn(), put: vi.fn(), delete: vi.fn() },
+  api: { get: vi.fn(), post: vi.fn(), put: vi.fn(), delete: vi.fn(), upload: vi.fn() },
   ApiError: class ApiError extends Error {},
 }))
 // The charts are not what these test: the mesh graph names its nodes, so a
@@ -58,6 +58,9 @@ import KeyedRouterView from '@/components/layout/KeyedRouterView.vue'
 import TenantDashboard from '@/views/dashboard/TenantDashboard.vue'
 import RoomList from '@/views/rooms/RoomList.vue'
 import ExploreView from '@/views/rooms/ExploreView.vue'
+import FilesBrowser from '@/views/files/FilesBrowser.vue'
+import InviteManageView from '@/views/invite/InviteManageView.vue'
+import BatchInviteDialog from '@/components/invite/BatchInviteDialog.vue'
 import { useRouteTenantSync } from '@/composables/useRouteTenantSync'
 import { useTenantStore } from '@/stores/tenant'
 import { useRoomStore } from '@/stores/rooms'
@@ -129,6 +132,72 @@ const ORGS: Record<
 }
 const A_ENG_ROOM = hex(0xa012)
 
+function fileRow(id: string, filename: string) {
+  return {
+    id,
+    tenant_id: '',
+    filename,
+    content_type: 'text/plain',
+    size: 2048,
+    uploaded_by: 'u',
+    created_at: '2026-11-01T00:00:00Z',
+  }
+}
+function inviteRow(id: string, tenant: string, email: string) {
+  return {
+    id,
+    code: `code${id.slice(-4)}`,
+    tenant_id: tenant,
+    inviter_id: 'u',
+    target_email: email,
+    use_count: 0,
+    status: 'active',
+    assign_role_ids: [],
+    created_at: '2026-11-01T00:00:00Z',
+  }
+}
+function roleRow(id: string, tenant: string, name: string) {
+  return { id, tenant_id: tenant, name, position: 10, permissions: 0, is_default: false, is_managed: false, is_mentionable: false }
+}
+
+/** Each org's grids: its files, a room's files, its invites and its roles.
+ *  Org A's files and invites fill three pages, so a test can leave the first. */
+const GRIDS: Record<
+  string,
+  {
+    files: ReturnType<typeof fileRow>[]
+    fileTotal: number
+    roomFiles: Record<string, ReturnType<typeof fileRow>[]>
+    invites: ReturnType<typeof inviteRow>[]
+    inviteTotal: number
+    roles: ReturnType<typeof roleRow>[]
+  }
+> = {
+  [ORG_A]: {
+    files: [fileRow(hex(0xa031), 'Org A plan.txt')],
+    fileTotal: 60,
+    roomFiles: { [A_ENG_ROOM]: [fileRow(hex(0xa032), 'Org A eng diagram.txt')] },
+    invites: [inviteRow(hex(0xa041), ORG_A, 'guest@org-a.example')],
+    inviteTotal: 60,
+    roles: [roleRow(hex(0xa002), ORG_A, 'Org A operators')],
+  },
+  [ORG_B]: {
+    files: [fileRow(hex(0xb031), 'Org B notes.txt')],
+    fileTotal: 1,
+    roomFiles: {},
+    invites: [inviteRow(hex(0xb041), ORG_B, 'guest@org-b.example')],
+    inviteTotal: 1,
+    roles: [roleRow(hex(0xb002), ORG_B, 'Org B operators')],
+  },
+}
+const A_ROLE = hex(0xa002)
+
+/** One page of a server grid. */
+function pageOf(items: unknown[], total: number, q: URLSearchParams) {
+  const perPage = Number(q.get('per_page') ?? 25)
+  return { items, total, page: Number(q.get('page') ?? 1), per_page: perPage, total_pages: Math.ceil(total / perPage) }
+}
+
 /** What each org's dashboard tiles read. */
 const TILES = ['Devices Online', 'Tunnels', 'Rooms', 'Active Calls', 'Messages'] as const
 const SHOWS: Record<string, Record<(typeof TILES)[number], string>> = {
@@ -150,7 +219,22 @@ function answer(path: string): unknown {
     return []
   }
   const q = new URLSearchParams(m[3] ?? '')
+  const grid = GRIDS[m[1]!]!
+  const roomFiles = /^room\/([0-9a-f]{24})\/file$/.exec(m[2]!)
+  if (roomFiles) {
+    const files = grid.roomFiles[roomFiles[1]!]
+    if (files) return pageOf(files, files.length, q)
+    // A room of another org, asked under this one.
+    unexpected.push(path)
+    return pageOf([], 0, q)
+  }
   switch (m[2]) {
+    case 'file':
+      return pageOf(grid.files, grid.fileTotal, q)
+    case 'invite':
+      return pageOf(grid.invites, grid.inviteTotal, q)
+    case 'role':
+      return grid.roles
     case 'room':
       return org.rooms
     case 'room/explore': {
@@ -241,6 +325,8 @@ function makeRouter(): Router {
           page('tenant-dashboard', TenantDashboard),
           page('rooms', RoomList),
           page('explore', ExploreView),
+          page('files', FilesBrowser),
+          page('invites', InviteManageView),
           { path: 'tutorial', name: 'tutorial', component: Blank },
         ],
       },
@@ -569,6 +655,238 @@ describe('Explore follows its org (#4257)', () => {
     await settle()
     expect(results()).toEqual(['Org A new'])
     expect(spinning()).toBe(false)
+    expectNothingRaised()
+  })
+})
+
+// ── the paging grids (slice 5) ──────────────────────────────────────────
+
+/** A grid's search box waits 300 ms after a keystroke, a clear included. */
+const debounce = () => new Promise((r) => setTimeout(r, 350))
+const pageText = () => wrapper!.text()
+
+async function clickButton(text: string, root: ParentNode = document.body) {
+  const b = [...root.querySelectorAll<HTMLElement>('button')].find((x) => x.textContent?.trim() === text)
+  expect(b, `a "${text}" button`).toBeTruthy()
+  b!.click()
+  await settle()
+}
+
+async function typeIn(placeholder: string, value: string) {
+  const box = document.body.querySelector<HTMLInputElement>(`input[placeholder="${placeholder}"]`)!
+  box.value = value
+  box.dispatchEvent(new Event('input'))
+  await debounce()
+  await settle()
+  return box
+}
+
+/** Under org A, search `q` and go to the grid's second page; then a link to
+ *  org B's page. Every GET of org B's grid asks for page 1, unfiltered. */
+async function searchPageThenChange(route: string, placeholder: string, q: string) {
+  await open(`/tenant/${ORG_A}/${route}`)
+  const box = await typeIn(placeholder, q)
+  ;(document.body.querySelector('button[aria-label="Next page"]') as HTMLElement).click()
+  await settle()
+  const forA = asked().filter(getOf(ORG_A, route === 'files' ? 'file' : 'invite'))
+  expect(forA.at(-1)).toContain('page=2&')
+  expect(forA.at(-1)).toContain(`q=${q}`)
+  const since = asked().length
+
+  await go(`/tenant/${ORG_B}/${route}`)
+  await debounce()
+  await settle()
+  const forB = asked().slice(since).filter(getOf(ORG_B, route === 'files' ? 'file' : 'invite'))
+  expect(forB.length).toBeGreaterThan(0)
+  for (const path of forB) {
+    expect(path).toContain('page=1&')
+    expect(path).not.toContain('q=')
+  }
+  expect(box.value).toBe('')
+}
+
+describe('The Files page follows its org (#4257)', () => {
+  it("a link to org B's files asks for org B's files and lists them", async () => {
+    await open(`/tenant/${ORG_A}/files`)
+    expect(pageText()).toContain('Org A plan.txt')
+    const since = asked().length
+
+    await go(`/tenant/${ORG_B}/files`)
+    expect(asked().slice(since).filter(getOf(ORG_B, 'file'))).toHaveLength(1)
+    expect(pageText()).toContain('Org B notes.txt')
+    expect(pageText()).not.toContain('Org A plan.txt')
+    expectNothingRaised()
+  })
+
+  it("drops org A's files when they answer after the change", async () => {
+    const lateA = gate(getOf(ORG_A, 'file'))
+    await open(`/tenant/${ORG_A}/files`)
+    await go(`/tenant/${ORG_B}/files`)
+    lateA.open()
+    await settle()
+    expect(pageText()).toContain('Org B notes.txt')
+    expect(pageText()).not.toContain('Org A plan.txt')
+    expectNothingRaised()
+  })
+
+  it('a search and a page chosen under org A do not carry over: org B is asked for its first page, unfiltered', async () => {
+    await searchPageThenChange('files', 'Search files', 'plan')
+    expectNothingRaised()
+  })
+
+  it("the room view under org A goes back to all files: org B's files, never org A's room asked under org B", async () => {
+    // The person had opened org A's eng room: the room view lists its files.
+    useRoomStore().setCurrent(ORGS[ORG_A]!.rooms[1] as never)
+    await open(`/tenant/${ORG_A}/files`)
+    await clickButton('Room Files')
+    expect(pageText()).toContain('Org A eng diagram.txt')
+    const since = asked().length
+
+    await go(`/tenant/${ORG_B}/files`)
+    expect(asked().slice(since).filter(getOf(ORG_B, 'file')).length).toBeGreaterThan(0)
+    expect(pageText()).toContain('Org B notes.txt')
+    expect(pageText()).not.toContain('Org A eng diagram.txt')
+    expectNothingRaised()
+  })
+
+  it('an upload started under org A sends every file of its batch to org A', async () => {
+    useRoomStore().setCurrent(ORGS[ORG_A]!.rooms[1] as never)
+    const sent: string[] = []
+    let firstAnswers!: () => void
+    mockApi.upload.mockImplementation(async (path: string) => {
+      sent.push(path)
+      if (sent.length === 1) await new Promise<void>((r) => (firstAnswers = r))
+      return fileRow(hex(0xa0f0 + sent.length), `upload ${sent.length}.txt`) as never
+    })
+    await open(`/tenant/${ORG_A}/files`)
+    const input = document.body.querySelector<HTMLInputElement>('input[type="file"]')!
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: [new File(['1'], 'one.txt'), new File(['2'], 'two.txt')],
+    })
+    input.dispatchEvent(new Event('change'))
+    await settle()
+    expect(sent).toEqual([`/tenant/${ORG_A}/file/upload`])
+
+    await go(`/tenant/${ORG_B}/files`)
+    firstAnswers()
+    await settle()
+    expect(sent).toEqual([`/tenant/${ORG_A}/file/upload`, `/tenant/${ORG_A}/file/upload`])
+    expectNothingRaised()
+  })
+})
+
+describe('The Invites page follows its org (#4257)', () => {
+  /** What the server answers for a POST: a create or a batch of org A, held
+   *  until `releaseA` when `holdA` is set. */
+  let holdA = false
+  let releaseA: () => void = () => {
+    throw new Error('no POST of org A was held')
+  }
+  beforeEach(() => {
+    holdA = false
+    mockApi.post.mockImplementation(async (path: string, body?: unknown) => {
+      const m = /^\/tenant\/([0-9a-f]{24})\/invite(\/batch)?$/.exec(path)
+      if (!m) {
+        unexpected.push(`POST ${path}`)
+        return {} as never
+      }
+      if (holdA && m[1] === ORG_A) await new Promise<void>((r) => (releaseA = r))
+      if (!m[2]) {
+        const b = body as { target_email?: string }
+        return inviteRow(hex(0xc001), m[1]!, b.target_email ?? '') as never
+      }
+      const rows = (body as { invites: Array<{ target_email: string }> }).invites
+      return {
+        results: rows.map((r, i) => ({ invite: inviteRow(hex(0xc010 + i), m[1]!, r.target_email), target_email: r.target_email })),
+        created: rows.length,
+        failed: 0,
+      } as never
+    })
+  })
+
+  it("a link to org B's invites asks for org B's invites and roles, and lists org B's invites", async () => {
+    await open(`/tenant/${ORG_A}/invites`)
+    expect(pageText()).toContain('guest@org-a.example')
+    const since = asked().length
+
+    await go(`/tenant/${ORG_B}/invites`)
+    const after = asked().slice(since)
+    expect(after.filter(getOf(ORG_B, 'invite'))).toHaveLength(1)
+    expect(after).toContain(`/tenant/${ORG_B}/role`)
+    expect(pageText()).toContain('guest@org-b.example')
+    expect(pageText()).not.toContain('guest@org-a.example')
+    expectNothingRaised()
+  })
+
+  it("drops org A's invites when they answer after the change", async () => {
+    const lateA = gate(getOf(ORG_A, 'invite'))
+    await open(`/tenant/${ORG_A}/invites`)
+    await go(`/tenant/${ORG_B}/invites`)
+    lateA.open()
+    await settle()
+    expect(pageText()).toContain('guest@org-b.example')
+    expect(pageText()).not.toContain('guest@org-a.example')
+    expectNothingRaised()
+  })
+
+  it('a search and a page chosen under org A do not carry over: org B is asked for its first page, unfiltered', async () => {
+    await searchPageThenChange('invites', 'Search code or email', 'guest')
+    expectNothingRaised()
+  })
+
+  it('closes the create dialog opened under org A; a create from the dialog opened again goes to org B', async () => {
+    await open(`/tenant/${ORG_A}/invites`)
+    await clickButton('Create Invite')
+    expect(activeDialog()?.textContent).toContain('Create Invite')
+
+    await go(`/tenant/${ORG_B}/invites`)
+    expect(activeDialog()).toBeNull()
+    await clickButton('Create Invite')
+    await clickButton('Create', activeDialog()!)
+    expect(mockApi.post.mock.calls.map((c) => c[0])).toEqual([`/tenant/${ORG_B}/invite`])
+    expectNothingRaised()
+  })
+
+  it("closes the batch dialog opened under org A; opened again under org B it holds none of org A's rows and is handed org B's roles", async () => {
+    await open(`/tenant/${ORG_A}/invites`)
+    await clickButton('Batch Invite')
+    const email = activeDialog()!.querySelector<HTMLInputElement>('input[type="email"]')!
+    email.value = 'new@org-a.example'
+    email.dispatchEvent(new Event('input'))
+    const dialog = wrapper!.findComponent(BatchInviteDialog)
+    dialog.findComponent({ name: 'VSelect' }).vm.$emit('update:modelValue', A_ROLE)
+    await settle()
+    expect(dialog.findComponent({ name: 'VSelect' }).props('modelValue')).toBe(A_ROLE)
+
+    await go(`/tenant/${ORG_B}/invites`)
+    expect(activeDialog()).toBeNull()
+    await clickButton('Batch Invite')
+    expect(activeDialog()!.querySelector<HTMLInputElement>('input[type="email"]')!.value).toBe('')
+    expect(dialog.findComponent({ name: 'VSelect' }).props('modelValue')).toBe('')
+    expect(dialog.props('tenantId')).toBe(ORG_B)
+    expect((dialog.props('roles') as Array<{ name: string }>).map((r) => r.name)).toEqual(['Org B operators'])
+    expectNothingRaised()
+  })
+
+  it("a batch sent under org A that answers after the change stays out of org B's list, and its result never shows under org B", async () => {
+    holdA = true
+    await open(`/tenant/${ORG_A}/invites`)
+    await clickButton('Batch Invite')
+    const email = activeDialog()!.querySelector<HTMLInputElement>('input[type="email"]')!
+    email.value = 'late@org-a.example'
+    email.dispatchEvent(new Event('input'))
+    await settle()
+    await clickButton('Send All (1)', activeDialog()!)
+
+    await go(`/tenant/${ORG_B}/invites`)
+    releaseA()
+    await settle()
+    expect(pageText()).toContain('guest@org-b.example')
+    expect(pageText()).not.toContain('late@org-a.example')
+    await clickButton('Batch Invite')
+    expect(activeDialog()!.textContent).not.toContain('invites created')
+    expect(activeDialog()!.textContent).not.toContain('late@org-a.example')
     expectNothingRaised()
   })
 })

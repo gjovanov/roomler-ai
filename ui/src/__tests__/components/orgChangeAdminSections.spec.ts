@@ -31,6 +31,7 @@ import OverlaySubnetRoutesSection from '@/components/admin/OverlaySubnetRoutesSe
 import MagicDnsSection from '@/components/admin/MagicDnsSection.vue'
 import SettingsSection from '@/components/admin/SettingsSection.vue'
 import RolesSection from '@/components/admin/RolesSection.vue'
+import MembersSection from '@/components/admin/MembersSection.vue'
 import { useAgentStore } from '@/stores/agents'
 import { useTenantStore } from '@/stores/tenant'
 import { api } from '@/api/client'
@@ -57,6 +58,8 @@ function makeOrg(tenant: string, tag: string, slug: string, on: boolean) {
     node: hex(base + 3),
     key: hex(base + 6),
     newRole: hex(base + 7),
+    person: hex(base + 8),
+    personName: `${tag} person`,
     roleName: `${tag} operators`,
     nodeName: `${tag} gateway`,
     keyLabel: `${tag} runners`,
@@ -138,6 +141,27 @@ function answer(method: string, path: string, body?: unknown): unknown {
   switch (route) {
     case 'GET member/me':
       return { permissions: 0, is_owner: true }
+    case 'GET member': {
+      // Org A's people fill three pages, so a test can leave its first one.
+      const q = new URLSearchParams(m[3] ?? '')
+      const total = org.on ? 60 : 1
+      return {
+        items: [
+          {
+            id: org.person,
+            user_id: org.person,
+            display_name: org.personName,
+            email: `person@${org.domain}`,
+            role_ids: [org.role],
+            joined_at: '2026-11-01T00:00:00Z',
+          },
+        ],
+        total,
+        page: Number(q.get('page') ?? 1),
+        per_page: 25,
+        total_pages: Math.ceil(total / 25),
+      }
+    }
     case 'GET agent':
       return { items: [], total: 0, page: 1, per_page: 100, total_pages: 0 }
     case 'GET tunnel-client':
@@ -641,6 +665,124 @@ describe("RolesSection: the org's roles (#4257)", () => {
     await settle()
     expect(w.text()).toContain(B.roleName)
     expect(w.text()).not.toContain('Org A auditors')
+    expectNothingRaised()
+    w.unmount()
+  })
+})
+
+describe("MembersSection: the org's people and their roles (#4257)", () => {
+  const mountMembers = () =>
+    mount(MembersSection, { props: { tenantId: ORG_A }, global: globalOpts(), attachTo: document.body })
+
+  /** A button by its text, on the grid row that names `who`. */
+  function rowButton(w: VueWrapper, who: string, text: string): HTMLElement {
+    const row = Array.from(w.element.querySelectorAll<HTMLElement>('tbody tr')).find((r) =>
+      r.textContent?.includes(who),
+    )
+    if (!row) throw new Error(`no row for ${who}`)
+    return buttonIn(row, text)
+  }
+
+  /** The search box waits 300 ms after a keystroke, a clear included. */
+  const debounce = () => new Promise((r) => setTimeout(r, 350))
+
+  it("mounted for org A, then org B: asks for org B's people and roles, and lists org B's people with org B's roles", async () => {
+    const w = mountMembers()
+    await settle()
+    expect(w.text()).toContain(A.personName)
+    expect(w.text()).toContain(A.roleName)
+    const since = asked().length
+
+    await changeOrg(w, ORG_B)
+    const after = asked().slice(since)
+    expect(after.filter(pathOf(ORG_B, 'member'))).toHaveLength(1)
+    expect(after).toContain(`/tenant/${ORG_B}/role`)
+    expect(w.text()).toContain(B.personName)
+    expect(w.text()).toContain(B.roleName)
+    expect(w.text()).not.toContain(A.personName)
+    expect(w.text()).not.toContain(A.roleName)
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it("org A's people and roles answering after the change do not land", async () => {
+    const latePeople = hold('GET', pathOf(ORG_A, 'member'))
+    const lateRoles = hold('GET', pathOf(ORG_A, 'role'))
+    const w = mountMembers()
+    await settle()
+
+    await changeOrg(w, ORG_B)
+    latePeople.release()
+    lateRoles.release()
+    await settle()
+    expect(w.text()).toContain(B.personName)
+    expect(w.text()).toContain(B.roleName)
+    expect(w.text()).not.toContain(A.personName)
+    expect(w.text()).not.toContain(A.roleName)
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('a search and a page chosen under org A do not carry over: org B is asked for its first page, unfiltered', async () => {
+    const w = mountMembers()
+    await settle()
+    const box = w.get('input[placeholder="Search name or email"]').element as HTMLInputElement
+    await typeInto(box, 'person')
+    await debounce()
+    await settle()
+    await click(w.get('button[aria-label="Next page"]').element as HTMLElement)
+    const forA = asked().filter(pathOf(ORG_A, 'member'))
+    expect(forA.at(-1)).toContain('page=2&')
+    expect(forA.at(-1)).toContain('q=person')
+    const since = asked().length
+
+    await changeOrg(w, ORG_B)
+    await debounce()
+    await settle()
+    const forB = asked().slice(since).filter(pathOf(ORG_B, 'member'))
+    expect(forB.length).toBeGreaterThan(0)
+    for (const path of forB) {
+      expect(path).toContain('page=1&')
+      expect(path).not.toContain('q=')
+    }
+    expect(box.value).toBe('')
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('the add dialog opened under org A closes on the change', async () => {
+    const w = mountMembers()
+    await settle()
+    await click(buttonIn(w.element, 'Add member'))
+    expect(openDialog()?.textContent).toContain('Add member by email')
+
+    await changeOrg(w, ORG_B)
+    expect(openDialog()).toBeNull()
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('the remove prompt opened on an org A person closes on the change, and nothing is removed', async () => {
+    const w = mountMembers()
+    await settle()
+    await click(rowButton(w, A.personName, 'Remove'))
+    expect(openDialog()?.textContent).toContain(`Remove ${A.personName}`)
+
+    await changeOrg(w, ORG_B)
+    expect(openDialog()).toBeNull()
+    expect(mockApi.delete).not.toHaveBeenCalled()
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it("the roles dialog opened on an org A person closes on the change", async () => {
+    const w = mountMembers()
+    await settle()
+    await click(rowButton(w, A.personName, 'Roles'))
+    expect(openDialog()?.textContent).toContain(`Roles — ${A.personName}`)
+
+    await changeOrg(w, ORG_B)
+    expect(openDialog()).toBeNull()
     expectNothingRaised()
     w.unmount()
   })
