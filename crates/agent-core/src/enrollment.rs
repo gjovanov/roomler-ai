@@ -1196,6 +1196,60 @@ mod tests {
         assert_eq!(new.as_object().unwrap().len(), 6);
     }
 
+    // ---- #3565: the program that enrolls, on the wire --------------------
+
+    /// The enroll body a server from before #3565 reads: `agent_version` is
+    /// REQUIRED there (no default), and a field it does not know is ignored
+    /// (no `deny_unknown_fields`).
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OlderServerEnrollRequest {
+        enrollment_token: String,
+        machine_id: String,
+        machine_name: String,
+        os: OsKind,
+        agent_version: String,
+    }
+
+    /// AC5: the request names the program that enrolled, in a field of its
+    /// own, and still carries `agent_version`, so an older server accepts it.
+    /// Both carry the enrolling program's own version.
+    #[test]
+    fn the_request_names_its_program_and_still_carries_agent_version() {
+        let inputs = EnrollInputs {
+            server_url: "https://example.test",
+            enrollment_token: "t",
+            machine_id: "m",
+            machine_name: "n",
+            install: None,
+            program: EnrollingProgram::new(EnrollingProgramName::RoomlerSetup, "0.4.215"),
+        };
+        let body = serde_json::to_value(EnrollRequest::of(&inputs, OsKind::Windows)).unwrap();
+        assert_eq!(body["agent_version"], "0.4.215");
+        assert_eq!(
+            body["enrolling_program"],
+            serde_json::json!({ "name": "roomler-setup", "version": "0.4.215" })
+        );
+        assert!(body.get("install").is_none());
+
+        let older: OlderServerEnrollRequest =
+            serde_json::from_value(body).expect("a server from before #3565 accepts the request");
+        assert_eq!(older.agent_version, "0.4.215");
+    }
+
+    /// Each enrolling binary names itself with one of these spellings; the
+    /// server stores them as sent and locks them by its own test.
+    #[test]
+    fn each_enrolling_program_has_its_wire_spelling() {
+        let wire = |n| EnrollingProgram::new(n, "1.2.3").name;
+        assert_eq!(wire(EnrollingProgramName::Roomlerd), "roomlerd");
+        assert_eq!(wire(EnrollingProgramName::RoomlerSetup), "roomler-setup");
+        assert_eq!(
+            wire(EnrollingProgramName::RoomlerDesktop),
+            "roomler-desktop"
+        );
+    }
+
     /// CLI over env over the default: a hand-typed enroll is `manual` with
     /// an `unknown` scope; the scripts speak through the env; a flag wins.
     #[test]
