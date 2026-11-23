@@ -961,7 +961,7 @@ async fn fetch_releases_from(url: &str) -> Result<GithubRelease> {
                 })
                 .unwrap_or(0);
             bail!(
-                "GitHub API returned 403 Forbidden — rate-limited (limit={limit}, remaining={remaining}, resets in {resets_in_secs}s). Multiple agents on one IP share the unauthenticated 60/hr quota; cadence has been bumped to 24h to stay under it."
+                "GitHub API returned 403 Forbidden — rate-limited (limit={limit}, remaining={remaining}, resets in {resets_in_secs}s). Multiple devices on one IP share the unauthenticated 60/hr quota; cadence has been bumped to 24h to stay under it."
             );
         }
         bail!("GitHub API returned {}", status);
@@ -1475,7 +1475,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
                 discard_download(&path);
                 bail!(
                     "refusing to install {}: {e}. The download was discarded and this \
-                     agent keeps its current version.",
+                     device keeps its current version.",
                     asset.name
                 );
             }
@@ -1527,7 +1527,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
                 discard_download(&path);
                 bail!(
                     "refusing to install {}: {e:#}. The download was discarded and this \
-                     agent keeps its current version.",
+                     device keeps its current version.",
                     asset.name
                 );
             }
@@ -1564,7 +1564,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
             discard_download(&path);
             bail!(
                 "refusing to install {}: {e}. The download was discarded and this \
-                 agent keeps its current version.",
+                 device keeps its current version.",
                 asset.name
             );
         }
@@ -2469,7 +2469,7 @@ fn install_tarball_linux(euid: u32, tarball: &std::path::Path) -> Result<u32> {
         // extracting into /usr needs the privilege directly. Say so plainly
         // rather than failing deep inside a copy.
         bail!(
-            "the tarball install needs root (euid {euid}); run the agent as a \
+            "the tarball install needs root (euid {euid}); run the daemon as a \
              system service, or install {} manually",
             tarball.display()
         );
@@ -2710,8 +2710,8 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
         if euid != 0 {
             bail!(
                 "refusing to self-update: `installer -target /` requires root, but this \
-                 agent runs as uid {euid} (the per-user LaunchAgent). Exiting here would \
-                 take the agent offline without installing anything. Updates on macOS are \
+                 daemon runs as uid {euid} (the per-user LaunchAgent). Exiting here would \
+                 take the daemon offline without installing anything. Updates on macOS are \
                  owned by the root update helper (com.roomler.update) — wake it with \
                  `touch {MACOS_UPDATE_TRIGGER}` and watch /var/log/roomler/update.log, \
                  or install by hand: `sudo installer -pkg <pkg> -target /`."

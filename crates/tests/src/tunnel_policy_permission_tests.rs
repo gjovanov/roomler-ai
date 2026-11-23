@@ -192,6 +192,137 @@ pub(crate) fn holder_answer_problem(
     None
 }
 
+/// A gate a write decides before it reads its body, as the caller it refuses
+/// sees it (#4218).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Gate {
+    /// A member of the org without the bit: 403 `forbidden`, and the message
+    /// names the bit.
+    Bit(&'static str),
+    /// Someone outside the org: 403 `not_a_member`.
+    NotAMember,
+    /// Anyone but a platform operator, on a platform operator's route: 404
+    /// `not_found`, so the route stays unseen.
+    Unseen,
+}
+
+impl Gate {
+    /// What is wrong with `(status, text)` as this gate's refusal. `None`
+    /// when it is that refusal.
+    pub(crate) fn problem(self, status: u16, text: &str) -> Option<String> {
+        let body: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        let (want_status, want_error) = match self {
+            Gate::Bit(_) => (403, "forbidden"),
+            Gate::NotAMember => (403, "not_a_member"),
+            Gate::Unseen => (404, "not_found"),
+        };
+        if status != want_status || body["error"] != want_error {
+            return Some(format!(
+                "answered {status} {text:?}, want {want_status} `{want_error}`"
+            ));
+        }
+        if let Gate::Bit(bit) = self
+            && !body["message"].as_str().is_some_and(|m| m.contains(bit))
+        {
+            return Some(format!("the refusal does not name {bit}: {text}"));
+        }
+        None
+    }
+}
+
+/// One gated write, as a caller sends it (#4218): the method and path, a body
+/// the route reads, and a body with a field the route's own body type refuses
+/// (the 422 kind of [`unparsed_bodies`]).
+pub(crate) struct GatedWrite {
+    pub method: &'static str,
+    pub path: String,
+    pub reads: Value,
+    pub refused_field: &'static str,
+}
+
+/// What is wrong with how a caller `gate` refuses (`who`, `token`) is
+/// answered on `write` (#4218). A body the route reads must get the gate's
+/// refusal, and each body axum's `Json` extractor refuses (not JSON, a field
+/// of the wrong type, not sent as JSON) must get that same answer, the status
+/// and the words both. Empty when the gate answers first, whatever the body.
+///
+/// While a gated write took `Json<T>` as an extractor, axum answered such a
+/// body before the handler ran, with a 400, 415 or 422 decided by the body
+/// alone, and the gate was never asked.
+pub(crate) async fn gate_problems(
+    app: &TestApp,
+    who: &str,
+    token: &str,
+    gate: Gate,
+    write: &GatedWrite,
+) -> Vec<String> {
+    let GatedWrite {
+        method,
+        path,
+        reads,
+        refused_field,
+    } = write;
+    let (status, _, text) = call_raw(
+        app,
+        method,
+        path,
+        token,
+        "application/json",
+        &reads.to_string(),
+    )
+    .await;
+    if let Some(why) = gate.problem(status, &text) {
+        return vec![format!("{who}: {method} {path} with {reads}: {why}")];
+    }
+    let mut wrong = Vec::new();
+    for b in unparsed_bodies(refused_field) {
+        let (s, _, t) = call_raw(app, method, path, token, b.content_type, b.body).await;
+        if (s, t.as_str()) != (status, text.as_str()) {
+            wrong.push(format!(
+                "{who}: {method} {path} {} ({:?} as {}): answered {s} {t:?}, \
+                 a body it reads is answered {status} {text:?}",
+                b.what, b.body, b.content_type
+            ));
+        }
+    }
+    wrong
+}
+
+/// What is wrong with how a caller the gate lets through (`token`) is
+/// answered each body of `method path` that axum's `Json` extractor refuses
+/// (#4218): the extractor's own answer for the route's body type `T`, the
+/// status and the plain-text words, which is what the route answered while it
+/// took `Json<T>` as an extractor. Only bodies that do not parse are sent, so
+/// nothing is written.
+pub(crate) async fn holder_problems<T: serde::de::DeserializeOwned>(
+    app: &TestApp,
+    token: &str,
+    method: &str,
+    path: &str,
+    refused_field: &'static str,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for b in unparsed_bodies(refused_field) {
+        let want = extractor_answer::<T>(b.content_type, b.body).await;
+        let (s, answered_as, text) =
+            call_raw(app, method, path, token, b.content_type, b.body).await;
+        if let Some(why) = holder_answer_problem(&b, &want, (s, &answered_as, &text)) {
+            wrong.push(format!("{method} {path} {}: {why}", b.what));
+        }
+    }
+    wrong
+}
+
+/// Fails with every problem `wrong` lists, one a line.
+pub(crate) fn assert_no_problems(what: &str, wrong: &[String]) {
+    assert!(
+        wrong.is_empty(),
+        "{what}: {} answers are wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 fn policies(seeded: &SeededTenant) -> String {
     format!("/api/tenant/{}/tunnel-policy", seeded.tenant_id)
 }

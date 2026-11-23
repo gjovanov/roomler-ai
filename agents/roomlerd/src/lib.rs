@@ -535,6 +535,12 @@ pub mod daemon_error;
 /// FR-151 — the Mac's root update helper waits for live work: the pure
 /// decision its macOS arm (`updater::run_update_helper`) runs.
 pub mod helper_gate;
+/// FR-148 P4b-3 — the agent's half of the deadline-limited video channel:
+/// the pick per carrier class, the switch at a key frame, the drain rule, D.
+pub mod media_deadline;
+/// FR-133 — every needs-attention notice, rendered and read back whole.
+#[cfg(test)]
+mod notice_text_tests;
 
 #[cfg(test)]
 mod tests {

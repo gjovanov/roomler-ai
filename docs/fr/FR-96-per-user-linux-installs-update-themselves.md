@@ -106,8 +106,8 @@ longer depends on how the package arrived.
 ### 3.2 The per-user daemon wakes the helper instead of installing (P2a, as built)
 
 `run_periodic` forks once, at the daemon's start (`updater.rs:3427-3488`). macOS takes `forward_triggers` (the
-shared successor of `macos_forward_triggers`, `:3895-3977`) as before. Linux asks a pure
-`decide_update_owner(euid, kill switch, enable link)` (`:3836-3854`):
+shared successor of `macos_forward_triggers`, `:4058-4151`) as before. Linux asks a pure
+`decide_update_owner(euid, kill switch, enable link)` (`:3998-4016`):
 
 | daemon | `ROOMLERD_UPDATE_HELPER` | helper enabled | owner |
 |---|---|---|---|
@@ -164,7 +164,7 @@ hand install alike, and the helper never speaks to a daemon.
 
 - ⚠️ **An SSH session counts as a session.** The likeliest replacement outside the helper is an admin's
   `apt upgrade` typed into a roomler SSH session on that very device. `ssh.rs` now counts its open connections
-  (`live_connections`, `ssh.rs:3129-3139`), and the restart waits for them.
+  (`live_connections`, `ssh.rs:3131-3141`), and the restart waits for them.
 - **`auto_update = false` does not stop it.** Running what is already installed is not an update. The kill switch
   is the FR's, `ROOMLERD_UPDATE_HELPER=0` (AC7).
 - **Root daemons are unchanged** (AC4). An admin's `apt upgrade` on a system install still leaves the root daemon

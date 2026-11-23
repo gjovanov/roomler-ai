@@ -176,7 +176,7 @@ const DENY_LABEL: Record<string, string> = {
   device_disabled: 'device switched off',
   caller_not_allowed: 'caller not allowed',
   origin_not_allowed: 'origin not allowed',
-  unsupported: 'agent too old',
+  unsupported: 'roomlerd too old',
   offline: 'device offline',
   no_overlay_address: 'not on the mesh',
   rate_limited: 'rate limited',

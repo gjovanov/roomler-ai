@@ -22,7 +22,7 @@ describe('sshAsChip (FR-105)', () => {
   it("never calls the worker's daemon identity SYSTEM: on an attended install it is the user", () => {
     for (const ranAs of ['worker', null, undefined]) {
       const chip = sshAsChip('daemon', ranAs)
-      expect(chip?.label).toBe("agent's account")
+      expect(chip?.label).toBe('daemon account')
       expect(chip?.label).not.toContain('SYSTEM')
       expect(chip?.title).toBe(AGENT_ACCOUNT_TITLE)
       expect(chip?.title).toContain('signed-in user on an attended Windows install')

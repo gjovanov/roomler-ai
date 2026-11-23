@@ -1597,13 +1597,13 @@ async fn daemon_main() -> Result<()> {
         companion_running,
         installer_step,
         own_profile.as_deref(),
+        own_data_merge(),
     );
 
-    // Same one-shot, same reason, different axis: a Linux SYSTEM install's
-    // config belongs at `/etc/roomler/config.toml` (what the packaged unit
-    // passes as `--config`), not in root's profile. Before `default_config_path`
-    // or any config read, and before logging::init, so it collects notes the
-    // same way.
+    // Same one-shot, same reason, different axis: a Linux SYSTEM install's config
+    // belongs at `/etc/roomler/config.toml` (what the packaged unit passes as
+    // `--config`), not in root's profile. Before `default_config_path` or any config
+    // read, and before logging::init, so it collects notes the same way.
     #[cfg(target_os = "linux")]
     roomlerd::appdirs::migrate_system_config(own_profile.as_deref());
 
@@ -2641,14 +2641,14 @@ async fn post_install_watch_cmd(
 /// `ROOMLERD_ENCODER` → config file field → default (Auto).
 /// Invalid values fall through to Auto with a warning, so a typo can't
 /// prevent the agent from starting.
-fn rollback_attention_msg(
+pub(crate) fn rollback_attention_msg(
     current: &str,
     target: &str,
     crash_count: u32,
     failure_reason: Option<&str>,
 ) -> String {
     let mut msg = format!(
-        "Roomler agent: crash loop detected (auto-rollback failed).\n\n\
+        "roomlerd: crash loop detected (auto-rollback failed).\n\n\
          Version {current} has crashed {crash_count} times within \
          {win_min} min. Last known good version: {target}.\n",
         win_min = config::CRASH_WINDOW_SECS / 60,
@@ -2669,9 +2669,9 @@ fn rollback_attention_msg(
 /// and running the older installer over this version is the one thing it refuses.
 /// The way back it gives is measured: an uninstall keeps the config and the
 /// enrollment, and with updates left on the older version took this one back in 25 s.
-fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
+pub(crate) fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
     format!(
-        "Roomler agent: crash loop detected.\n\n\
+        "roomlerd: crash loop detected.\n\n\
          Version {current} has crashed {crash_count} times within {win_min} min. \
          Last known good version: {target}.\n\n\
          This device did not roll back: the Windows installer refuses to install an \
@@ -7575,6 +7575,19 @@ fn peer_presence_status_cmd() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// #3746 — whether this process runs the data folders' merge in the one-time
+/// folder move: a process running elevated from a split token leaves it to
+/// the account's own unelevated daemon, which runs it at its next start, so
+/// the merge never runs above the integrity level of the folder owner's own
+/// processes.
+fn own_data_merge() -> roomlerd::appdirs::DataMerge {
+    #[cfg(target_os = "windows")]
+    let elevated = roomlerd::win_identity::own_token_is_elevated_from_split();
+    #[cfg(not(target_os = "windows"))]
+    let elevated = Some(false);
+    roomlerd::appdirs::DataMerge::from_split_elevation(elevated)
 }
 
 #[cfg(test)]

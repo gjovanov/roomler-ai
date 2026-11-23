@@ -110,16 +110,16 @@
     and none of these paths has changed since 0.4.199, the build that ran. The line comes from
     `overlay_remote_is_relay_tier` (`peer.rs:2291`), a LocalAPI read that changes nothing. The
     FFmpeg DC pump calls it on its transport recheck, every 5 s (`TRANSPORT_RECHECK_INTERVAL`,
-    `peer.rs:2093`; the recheck at `:7726`). The answer goes two places:
+    `peer.rs:2120`; the recheck at `:7752`). The answer goes two places:
     - into `constrained`, which sets the rate ceiling and, on a flip, re-sends `rc:video-info`
-      (`:7739`);
+      (`:7766`);
     - into `FlipTracker` (`encode/rate_profile.rs:81`). It rebuilds the encoder only after two
       consecutive checks disagree with the state the pump was built for, at least 60 s after
       the last rebuild, and only when the frame rate changes. That rebuild logs its own line
-      (`peer.rs:7753`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
-      bumps, only the inline open's (`:9071`) can follow from this path, through that rebuild.
-      The others are a dims swap (`:7571`), a rate swap (`:7649`) and a deferred rebuild
-      (`:9614`).
+      (`peer.rs:7780`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
+      bumps, only the inline open's (`:9098`) can follow from this path, through that rebuild.
+      The others are a dims swap (`:7597`), a rate swap (`:7675`) and a deferred rebuild
+      (`:9641`).
 
     Neither happened: every heartbeat read `constrained=true`, and `idr_count` never restarted.
     The 1–3 s is the line's cadence. The heartbeat's `constrained` is the variable the recheck

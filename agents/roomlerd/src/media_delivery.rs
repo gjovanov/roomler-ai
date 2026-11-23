@@ -511,6 +511,9 @@ pub struct LineReport {
     /// FR-148 D46 B1 — the in-flight budget's window, computed in shadow;
     /// `None` when its switch is off.
     pub budget: Option<WindowReport>,
+    /// FR-148 P4b-3 — the video channel's counts over the line; `None` when
+    /// its switch is off.
+    pub deadline: Option<crate::media_deadline::DeadlineLine>,
 }
 
 /// The standing queue over one line's samples.
@@ -672,16 +675,23 @@ pub struct DeliverySampler {
     largest: Largest,
     /// FR-148 — the pump's send wait, kept under every mode ([`Self::send_wait`]).
     send_wait: std::sync::Arc<SendWait>,
+    /// FR-148 P4b-3 — the deadline channel's switch as this pump read it, and
+    /// its counts ([`Self::deadline`]).
+    deadline: std::sync::Arc<crate::media_deadline::Counters>,
 }
 
 impl DeliverySampler {
     /// On unless `ROOMLERD_PATH_MODEL=off`: the pump's one read of the switch,
-    /// and of FR-148 D46's, `ROOMLERD_INFLIGHT_BUDGET`, beside it.
+    /// and of FR-148 D46's, `ROOMLERD_INFLIGHT_BUDGET`, and FR-148 P4b-3's,
+    /// `ROOMLERD_VIDEO_DEADLINE`, beside it.
     pub fn from_env() -> Self {
         let mode = mode();
         let mut sampler = Self::new(mode.samples());
         sampler.mode = mode;
         sampler.budget = Shadow::for_pump(crate::media_inflight::mode(), sampler.on).map(Box::new);
+        sampler.deadline = std::sync::Arc::new(crate::media_deadline::Counters::new(
+            crate::media_deadline::mode(),
+        ));
         sampler
     }
 
@@ -710,6 +720,9 @@ impl DeliverySampler {
             said: None,
             largest: Largest::default(),
             send_wait: std::sync::Arc::default(),
+            deadline: std::sync::Arc::new(crate::media_deadline::Counters::new(
+                crate::media_deadline::Mode::Off,
+            )),
         }
     }
 
@@ -946,10 +959,14 @@ impl DeliverySampler {
         (!self.fold.is_empty()).then(|| self.report())
     }
 
-    /// The fold's report, and FR-148 D46's budget window beside it.
+    /// The fold's report, and FR-148 D46's budget window and FR-148 P4b-3's
+    /// video channel beside it. The FORWARD TSN count is a look at the gauges
+    /// (`GaugeReader::peek`), which takes nothing.
     fn report(&mut self) -> LineReport {
+        let forward_tsns = self.gauges.as_ref().map(|g| g.peek().forward_tsns);
         LineReport {
             budget: self.budget.as_deref_mut().map(Shadow::take_window),
+            deadline: self.deadline.take(forward_tsns),
             ..std::mem::take(&mut self.fold).report
         }
     }
@@ -1276,6 +1293,13 @@ impl DeliverySampler {
         &self.send_wait
     }
 
+    /// FR-148 P4b-3 — the deadline channel's switch, as the pump read it, and
+    /// the counts its lane keeps, which this pump's line carries under
+    /// `shadow` and `on` (`media_deadline::Pump::start`).
+    pub fn deadline(&self) -> &std::sync::Arc<crate::media_deadline::Counters> {
+        &self.deadline
+    }
+
     /// FR-148 D46 B3 — [`Self::gate`] on one frame's reading, as
     /// [`Self::on_frame_reading`] reads one; returns whether the acting budget
     /// marked a stall, which the pump hands the governor.
@@ -1358,98 +1382,77 @@ fn say_budget_mode(session_id: ObjectId, acts: bool) {
 /// The line. Its field names and their order are pinned by a test, since a
 /// field read greps for them. The standing queue's fields follow when a
 /// sample of the line was read with SCTP's gauges, and are left out when none
-/// was. FR-148 D46's in-flight budget closes the line when its switch is not
-/// `off`; with it off the line is as before, to the byte.
+/// was. FR-148 D46's in-flight budget follows when its switch is not `off`,
+/// and FR-148 P4b-3's video channel closes the line when its switch is not
+/// `off`; with both off the line is as before, to the byte.
 pub fn emit(session_id: ObjectId, line: &LineReport) {
-    match (&line.queue, &line.budget) {
-        (Some(q), None) => tracing::info!(
-            %session_id,
-            span_ms = line.span_ms,
-            delivery_samples = ?line.samples,
-            backlogged_bps = ?line.backlogged_bps,
-            app_limited_bps = ?line.app_limited_bps,
-            stalled_ms = line.stalled_ms,
-            acked_bytes = line.acked_bytes,
-            ack_ms = ?q.ack_ms,
-            standing_ms = ?q.standing_ms,
-            queued = q.queued,
-            inflight = ?q.inflight,
-            cwnd = ?q.cwnd,
-            ssthresh = q.ssthresh,
-            rwnd_low = q.rwnd_low,
-            pending_high = q.pending_high,
-            loss = ?q.loss,
-            "{LINE}"
-        ),
-        (None, None) => tracing::info!(
-            %session_id,
-            span_ms = line.span_ms,
-            delivery_samples = ?line.samples,
-            backlogged_bps = ?line.backlogged_bps,
-            app_limited_bps = ?line.app_limited_bps,
-            stalled_ms = line.stalled_ms,
-            acked_bytes = line.acked_bytes,
-            "{LINE}"
-        ),
-        (Some(q), Some(b)) => tracing::info!(
-            %session_id,
-            span_ms = line.span_ms,
-            delivery_samples = ?line.samples,
-            backlogged_bps = ?line.backlogged_bps,
-            app_limited_bps = ?line.app_limited_bps,
-            stalled_ms = line.stalled_ms,
-            acked_bytes = line.acked_bytes,
-            ack_ms = ?q.ack_ms,
-            standing_ms = ?q.standing_ms,
-            queued = q.queued,
-            inflight = ?q.inflight,
-            cwnd = ?q.cwnd,
-            ssthresh = q.ssthresh,
-            rwnd_low = q.rwnd_low,
-            pending_high = q.pending_high,
-            loss = ?q.loss,
-            budget_held = ?b.held,
-            budget_max = b.budget_max,
-            budget_out_max = b.out_max,
-            budget_rate_bps = b.rate_bps,
-            budget_least_ms = ?b.least_ms,
-            budget_slack_ms = b.slack_ms,
-            budget_ack_over_ms = ?b.ack_over_ms,
-            budget_still = ?b.still,
-            bound_watermark = b.bounds.0,
-            bound_ledger = b.bounds.1,
-            bound_full = b.bounds.2,
-            budget_released = ?b.released,
-            budget_still_admitted = b.still_admitted,
-            budget_acted = ?b.acted,
-            budget_acted_stalled = b.acted_stalled,
-            "{LINE}"
-        ),
-        (None, Some(b)) => tracing::info!(
-            %session_id,
-            span_ms = line.span_ms,
-            delivery_samples = ?line.samples,
-            backlogged_bps = ?line.backlogged_bps,
-            app_limited_bps = ?line.app_limited_bps,
-            stalled_ms = line.stalled_ms,
-            acked_bytes = line.acked_bytes,
-            budget_held = ?b.held,
-            budget_max = b.budget_max,
-            budget_out_max = b.out_max,
-            budget_rate_bps = b.rate_bps,
-            budget_least_ms = ?b.least_ms,
-            budget_slack_ms = b.slack_ms,
-            budget_ack_over_ms = ?b.ack_over_ms,
-            budget_still = ?b.still,
-            bound_watermark = b.bounds.0,
-            bound_ledger = b.bounds.1,
-            bound_full = b.bounds.2,
-            budget_released = ?b.released,
-            budget_still_admitted = b.still_admitted,
-            budget_acted = ?b.acted,
-            budget_acted_stalled = b.acted_stalled,
-            "{LINE}"
-        ),
+    // The line's fields, each group after the first in its order:
+    // `path_line!([] queue(q) budget(b) deadline(d))`.
+    macro_rules! path_line {
+        ([$($fields:tt)*]) => {
+            tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                $($fields)*
+                "{LINE}"
+            )
+        };
+        ([$($fields:tt)*] queue($q:ident) $($rest:tt)*) => {
+            path_line!([$($fields)*
+                ack_ms = ?$q.ack_ms,
+                standing_ms = ?$q.standing_ms,
+                queued = $q.queued,
+                inflight = ?$q.inflight,
+                cwnd = ?$q.cwnd,
+                ssthresh = $q.ssthresh,
+                rwnd_low = $q.rwnd_low,
+                pending_high = $q.pending_high,
+                loss = ?$q.loss,
+            ] $($rest)*)
+        };
+        ([$($fields:tt)*] budget($b:ident) $($rest:tt)*) => {
+            path_line!([$($fields)*
+                budget_held = ?$b.held,
+                budget_max = $b.budget_max,
+                budget_out_max = $b.out_max,
+                budget_rate_bps = $b.rate_bps,
+                budget_least_ms = ?$b.least_ms,
+                budget_slack_ms = $b.slack_ms,
+                budget_ack_over_ms = ?$b.ack_over_ms,
+                budget_still = ?$b.still,
+                bound_watermark = $b.bounds.0,
+                bound_ledger = $b.bounds.1,
+                bound_full = $b.bounds.2,
+                budget_released = ?$b.released,
+                budget_still_admitted = $b.still_admitted,
+                budget_acted = ?$b.acted,
+                budget_acted_stalled = $b.acted_stalled,
+            ] $($rest)*)
+        };
+        ([$($fields:tt)*] deadline($d:ident) $($rest:tt)*) => {
+            path_line!([$($fields)*
+                forward_tsns = ?$d.forward_tsns,
+                late_dropped = $d.late,
+                drain_dropped = $d.drained,
+                channel_switches = $d.switches,
+                video_channel = %$d.channel_label(),
+            ] $($rest)*)
+        };
+    }
+    match (&line.queue, &line.budget, &line.deadline) {
+        (None, None, None) => path_line!([]),
+        (Some(q), None, None) => path_line!([] queue(q)),
+        (None, Some(b), None) => path_line!([] budget(b)),
+        (Some(q), Some(b), None) => path_line!([] queue(q) budget(b)),
+        (None, None, Some(d)) => path_line!([] deadline(d)),
+        (Some(q), None, Some(d)) => path_line!([] queue(q) deadline(d)),
+        (None, Some(b), Some(d)) => path_line!([] budget(b) deadline(d)),
+        (Some(q), Some(b), Some(d)) => path_line!([] queue(q) budget(b) deadline(d)),
     }
 }
 
@@ -1779,6 +1782,7 @@ mod tests {
                 acked_bytes: 850_000,
                 queue: None,
                 budget: None,
+                deadline: None,
             }
         );
         // The next line starts empty and comes ten seconds after this one.
@@ -1909,6 +1913,7 @@ mod tests {
                 loss: (0, 1),
             }),
             budget: None,
+            deadline: None,
         }
     }
 
@@ -1961,6 +1966,7 @@ mod tests {
                 ..QueueLine::default()
             }),
             budget: None,
+            deadline: None,
         };
         let idle = logged(|| emit(sid(), &idle));
         for want in [
@@ -2088,6 +2094,212 @@ mod tests {
         );
         println!("delivery line with the budget: {} bytes", out.len());
         assert!(out.len() < 1_024, "{} bytes: {out:?}", out.len());
+    }
+
+    /// FR-148 P4b-3 — `emit` as master had it before the video channel's
+    /// counts joined the line, kept here to hold the line with the switch off
+    /// to today's, byte for byte.
+    fn emit_today(session_id: ObjectId, line: &LineReport) {
+        match (&line.queue, &line.budget) {
+            (Some(q), None) => tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                ack_ms = ?q.ack_ms,
+                standing_ms = ?q.standing_ms,
+                queued = q.queued,
+                inflight = ?q.inflight,
+                cwnd = ?q.cwnd,
+                ssthresh = q.ssthresh,
+                rwnd_low = q.rwnd_low,
+                pending_high = q.pending_high,
+                loss = ?q.loss,
+                "{LINE}"
+            ),
+            (None, None) => tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                "{LINE}"
+            ),
+            (Some(q), Some(b)) => tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                ack_ms = ?q.ack_ms,
+                standing_ms = ?q.standing_ms,
+                queued = q.queued,
+                inflight = ?q.inflight,
+                cwnd = ?q.cwnd,
+                ssthresh = q.ssthresh,
+                rwnd_low = q.rwnd_low,
+                pending_high = q.pending_high,
+                loss = ?q.loss,
+                budget_held = ?b.held,
+                budget_max = b.budget_max,
+                budget_out_max = b.out_max,
+                budget_rate_bps = b.rate_bps,
+                budget_least_ms = ?b.least_ms,
+                budget_slack_ms = b.slack_ms,
+                budget_ack_over_ms = ?b.ack_over_ms,
+                budget_still = ?b.still,
+                bound_watermark = b.bounds.0,
+                bound_ledger = b.bounds.1,
+                bound_full = b.bounds.2,
+                budget_released = ?b.released,
+                budget_still_admitted = b.still_admitted,
+                budget_acted = ?b.acted,
+                budget_acted_stalled = b.acted_stalled,
+                "{LINE}"
+            ),
+            (None, Some(b)) => tracing::info!(
+                %session_id,
+                span_ms = line.span_ms,
+                delivery_samples = ?line.samples,
+                backlogged_bps = ?line.backlogged_bps,
+                app_limited_bps = ?line.app_limited_bps,
+                stalled_ms = line.stalled_ms,
+                acked_bytes = line.acked_bytes,
+                budget_held = ?b.held,
+                budget_max = b.budget_max,
+                budget_out_max = b.out_max,
+                budget_rate_bps = b.rate_bps,
+                budget_least_ms = ?b.least_ms,
+                budget_slack_ms = b.slack_ms,
+                budget_ack_over_ms = ?b.ack_over_ms,
+                budget_still = ?b.still,
+                bound_watermark = b.bounds.0,
+                bound_ledger = b.bounds.1,
+                bound_full = b.bounds.2,
+                budget_released = ?b.released,
+                budget_still_admitted = b.still_admitted,
+                budget_acted = ?b.acted,
+                budget_acted_stalled = b.acted_stalled,
+                "{LINE}"
+            ),
+        }
+    }
+
+    /// FR-148 P4b-3 — the video channel's counts close the line, after every
+    /// field before them (the budget's too), in their order; with its switch
+    /// off the line has none of them, to the byte. A sampler's switch is the
+    /// pump's one read: `new` is `off`, and its line carries nothing of it.
+    #[test]
+    fn the_video_channel_s_counts_close_the_line() {
+        use crate::media_deadline::{Channel, Counters, DeadlineLine, Mode};
+        let deadline = DeadlineLine {
+            forward_tsns: Some(17),
+            late: 3,
+            drained: 5,
+            switches: 1,
+            channel: Some(Channel::Deadline),
+        };
+        let fields = [
+            "forward_tsns=Some(17)",
+            "late_dropped=3",
+            "drain_dropped=5",
+            "channel_switches=1",
+            "video_channel=video-deadline",
+        ];
+        let off = logged(|| emit(sid(), &busy_line()));
+        for (before, line) in [
+            ("loss=(0, 1)", busy_line()),
+            (
+                "budget_acted_stalled=12",
+                LineReport {
+                    budget: Some(budget_window()),
+                    ..busy_line()
+                },
+            ),
+            (
+                "acked_bytes=3012345",
+                LineReport {
+                    queue: None,
+                    ..busy_line()
+                },
+            ),
+        ] {
+            let with = LineReport {
+                deadline: Some(deadline),
+                ..line.clone()
+            };
+            let out = logged(|| emit(sid(), &with));
+            let mut rest = &out[out.find(before).expect(before)..];
+            for want in fields {
+                let at = rest
+                    .find(want)
+                    .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+                rest = &rest[at + want.len()..];
+            }
+            assert_eq!(rest.trim(), "", "the counts close the line: {out:?}");
+            let without = logged(|| emit(sid(), &line));
+            assert!(
+                !without.contains("video_channel") && !without.contains("forward_tsns"),
+                "{without:?}"
+            );
+        }
+        // Off, the line is today's to the byte, past its timestamp: with and
+        // without the gauges' fields and the budget's.
+        let body = |out: String| out.split_once(" INFO ").map(|(_, b)| b.to_owned());
+        for line in [
+            busy_line(),
+            LineReport {
+                queue: None,
+                ..busy_line()
+            },
+            LineReport {
+                budget: Some(budget_window()),
+                ..busy_line()
+            },
+            LineReport {
+                queue: None,
+                budget: Some(budget_window()),
+                ..busy_line()
+            },
+        ] {
+            let today = body(logged(|| emit_today(sid(), &line)));
+            assert!(today.is_some());
+            assert_eq!(body(logged(|| emit(sid(), &line))), today, "off");
+        }
+        assert!(!off.contains("video_channel"), "{off:?}");
+        let none = DeadlineLine {
+            channel: None,
+            forward_tsns: None,
+            ..deadline
+        };
+        let out = logged(|| {
+            emit(
+                sid(),
+                &LineReport {
+                    deadline: Some(none),
+                    ..busy_line()
+                },
+            )
+        });
+        assert!(out.contains("forward_tsns=None"), "{out:?}");
+        assert!(out.contains("video_channel=none"), "{out:?}");
+        // The pump's read: `new` carries the switch off, and so no counts.
+        let sampler = DeliverySampler::new(true);
+        assert_eq!(sampler.deadline().mode(), Mode::Off);
+        assert_eq!(sampler.deadline().take(Some(1)), None);
+        let on = Counters::new(Mode::On);
+        assert_eq!(
+            on.take(None),
+            Some(DeadlineLine::default()),
+            "on, before the first frame"
+        );
     }
 
     /// FR-148 D46 B3 — `on` no longer runs as `shadow`: no warning where a

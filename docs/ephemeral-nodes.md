@@ -23,8 +23,8 @@ roomlerd run          … the device works like any other …
         │     • Unix: SIGTERM / SIGINT (e.g. `docker stop`, `systemctl stop`)
         │     • Windows SCM service: SCM Stop / Preshutdown — the service host
         │       signals the worker's stop event and waits (#1683)
-        │       (an update's OWN service stop is not a leave — the device
-        │        stays enrolled; see below)
+        │       (an auto-update's OWN service stop is not a leave — the
+        │        device stays enrolled; see below)
         │     • Windows per-user install (the Scheduled Task): `roomlerd service
         │       stop`, sign-out, shutdown (FR-97 P4d; see below)
         │       → the daemon calls POST /api/agent/self/unenroll
@@ -142,7 +142,7 @@ exec roomlerd run
 - **A per-user Windows install** (the perUser MSI's Scheduled Task) has no
   service host to ask it, so it holds a stop channel of its own and listens for
   the session's end: [below](#a-per-user-windows-install-fr-97-p4d).
-- **An update's own service stop never unenrolls.** The MSI stops the service
+- **An auto-update's own service stop never unenrolls.** The MSI stops the service
   while it replaces the binary — by then the worker that spawned the installer
   has already exited 0 and the SCM host has respawned a fresh one, which receives
   that stop as an OS-initiated stop, indistinguishable from `sc stop`. So the
@@ -152,6 +152,24 @@ exec roomlerd run
   `spawn_installer_with_watch` touches, rollbacks included) keeps the device
   enrolled and logs why. An operator stop inside that window leaves the row to
   the reaper — which is what every Windows-service stop did before #1683.
+- **A perMachine MSI the updater did not launch still unenrolls**
+  ([#4322](https://github.com/gjovanov/roomler-ai/issues/4322)). Run by hand
+  (`msiexec`), by `install.ps1`, by the setup wizard or by an RMM push, it writes
+  no marker: the updater writes one right before it spawns the installer
+  ([`updater.rs:2000`](../agents/roomlerd/src/updater.rs#L2000)). Every run that
+  is not a full removal restarts the service through the SCM
+  (`EnableSystemContext`, `DisableSystemContext` or `KeepSystemContext`,
+  [`wix-perMachine/main.wxs:689-697`](../agents/roomlerd/wix-perMachine/main.wxs#L689-L697)),
+  which stops it when it is running and then starts it
+  ([`win_service/environment.rs:401-408`](../agents/roomlerd/src/win_service/environment.rs#L401-L408)).
+  A major upgrade stops it earlier, when the old product's removal runs
+  `service uninstall --as-service`
+  ([`wix-perMachine/main.wxs:698-700`](../agents/roomlerd/wix-perMachine/main.wxs#L698-L700),
+  [`win_service/lifecycle.rs:293`](../agents/roomlerd/src/win_service/lifecycle.rs#L293)).
+  The worker takes either stop as an OS-initiated stop
+  ([`app.rs:5778-5784`](../agents/roomlerd/src/app.rs#L5778-L5784)), finds no
+  update in flight, and an ephemeral device deletes its own row
+  ([`app.rs:5851-5855`](../agents/roomlerd/src/app.rs#L5851-L5855)).
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
@@ -201,9 +219,16 @@ flowchart LR
   stops the daemon.
 - **Why Restart Manager is ignored.** An installer that finds the daemon's files
   in use asks it to close with `ENDSESSION_CLOSEAPP`. Read as a leave, a manual
-  MSI upgrade would delete an ephemeral device, the trap #1683 closed for the
-  service. The auto-updater's own stop is the internal arm, which never
-  unenrolls.
+  MSI upgrade would delete an ephemeral device. The service has the same trap,
+  and #1683 closed it for the auto-updater's installer. A perMachine MSI run by
+  hand, by `install.ps1`, by the setup wizard or by an RMM push still deletes the
+  row ([above](#the-ci--container-recipe),
+  [#4322](https://github.com/gjovanov/roomler-ai/issues/4322)). The
+  auto-updater's own exit is the internal arm, which never unenrolls
+  ([`updater.rs:3385`](../agents/roomlerd/src/updater.rs#L3385)). A stop its
+  installer issues after that takes the OS-initiated arm, and the
+  `update-attempt` marker written before the spawn is what keeps the row
+  ([`updater.rs:2000`](../agents/roomlerd/src/updater.rs#L2000)).
 - **`service uninstall` does not stop the daemon, on purpose.** On a major
   upgrade, Windows Installer runs the old product's uninstall, which runs
   `service uninstall` from the outgoing binary (`UnregisterAutostart` in

@@ -186,7 +186,7 @@ the `next_host: {$gt: host}` sanity filter, the `$addToSet` dedup and the
 pool's size cap. On a carved `/22` (1 022 addresses, not the `/10`'s 4.19 M)
 the holes are no longer cosmetic, so FR-47 P3 recovers them the guarded way.
 `POST /api/tenant/{tid}/overlay-block/reconcile-hosts`
-([`overlay_block.rs:1139`](../crates/modules/network/src/routes/overlay_block.rs#L1139))
+([`overlay_block.rs:1157`](../crates/modules/network/src/routes/overlay_block.rs#L1157))
 computes `(1..next_host) − live − pooled` server-side and returns each number
 through `release_host`, so every guard still applies. It is platform-operator
 only, and anyone else gets a 404. It is a dry run unless the body says

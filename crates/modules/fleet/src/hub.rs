@@ -1069,7 +1069,7 @@ impl Hub {
             let goodbye = ServerMsg::Goodbye {
                 reason: AgentCloseReason::ReplacedByNewerConnection,
                 message: format!(
-                    "Another agent is connecting with the same agent_id ({agent_id}); \
+                    "Another daemon is connecting with the same agent_id ({agent_id}); \
                      this connection is being closed. Check for a duplicate install \
                      (another physical host with a copy of this config.toml, the tray \
                      companion, etc.) or re-enrol to mint a fresh agent_id."
@@ -8139,6 +8139,39 @@ mod tests {
         assert!(
             !hub.deliver_exec_result("req-4", ExecOutcome::default()),
             "waiter must have been deregistered"
+        );
+    }
+
+    /// FR-133 P2b: the displaced daemon's notice quotes this goodbye to a
+    /// person (its duplicate-instance notice), so the text names the daemon,
+    /// never an "agent". `agent_id` is the field's own name and stays.
+    #[tokio::test]
+    async fn displacement_goodbye_names_the_daemon_not_an_agent() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let register = || {
+            hub.register_agent(
+                agent_id,
+                ObjectId::new(),
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                false,
+            )
+        };
+        let (_tx1, _cancel1, mut rx1) = register();
+        let (_tx2, _cancel2, _rx2) = register();
+        let Ok(ServerMsg::Goodbye { message, .. }) = rx1.try_recv() else {
+            panic!("the displaced connection should receive a Goodbye");
+        };
+        let says_agent = message
+            .replace("agent_id", "")
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w.eq_ignore_ascii_case("agent") || w.eq_ignore_ascii_case("agents"));
+        assert!(
+            !says_agent,
+            "a person reads this in the daemon's notice: {message}"
         );
     }
 }

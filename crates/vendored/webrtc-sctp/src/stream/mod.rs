@@ -80,6 +80,9 @@ pub struct Stream {
     pub(crate) unordered: AtomicBool,
     pub(crate) reliability_type: AtomicU8, //ReliabilityType,
     pub(crate) reliability_value: AtomicU32,
+    // roomler (FR-148 P4b-1, D55): marked deadline-limited by the association
+    // (`AssociationInternal::mark_deadline_stream`), never cleared.
+    pub(crate) deadline: AtomicBool,
     pub(crate) buffered_amount: AtomicUsize,
     pub(crate) buffered_amount_low: AtomicUsize,
     pub(crate) on_buffered_amount_low: ArcSwapOption<Mutex<OnBufferedAmountLowFn>>,
@@ -102,6 +105,7 @@ impl fmt::Debug for Stream {
             .field("unordered", &self.unordered)
             .field("reliability_type", &self.reliability_type)
             .field("reliability_value", &self.reliability_value)
+            .field("deadline", &self.deadline)
             .field("buffered_amount", &self.buffered_amount)
             .field("buffered_amount_low", &self.buffered_amount_low)
             .field("name", &self.name)
@@ -137,6 +141,7 @@ impl Stream {
             unordered: AtomicBool::new(false),
             reliability_type: AtomicU8::new(0), //ReliabilityType::Reliable,
             reliability_value: AtomicU32::new(0),
+            deadline: AtomicBool::new(false), // roomler (FR-148 P4b-1)
             buffered_amount: AtomicUsize::new(0),
             buffered_amount_low: AtomicUsize::new(0),
             on_buffered_amount_low: ArcSwapOption::empty(),
@@ -168,6 +173,17 @@ impl Stream {
         self.reliability_type
             .store(rel_type as u8, Ordering::SeqCst);
         self.reliability_value.store(rel_val, Ordering::SeqCst);
+    }
+
+    /// roomler (FR-148 P4b-1, D55): whether this stream's chunks are abandoned
+    /// on loss instead of at their first send: marked deadline-limited, with
+    /// `maxRetransmits: 0`. Any other reliability keeps today's rules, mark
+    /// or not.
+    pub(crate) fn abandons_on_loss(&self) -> bool {
+        self.deadline.load(Ordering::SeqCst)
+            && ReliabilityType::from(self.reliability_type.load(Ordering::SeqCst))
+                == ReliabilityType::Rexmit
+            && self.reliability_value.load(Ordering::SeqCst) == 0
     }
 
     /// Reads a packet of len(p) bytes, dropping the Payload Protocol Identifier.

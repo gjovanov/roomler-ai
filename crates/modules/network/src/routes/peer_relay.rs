@@ -24,7 +24,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -141,12 +141,15 @@ pub async fn get_settings(
     Ok(Json(PeerRelaySettings { mode, relays }))
 }
 
-/// `PUT /api/tenant/{tenant_id}/peer-relay` — gate 1.
+/// `PUT /api/tenant/{tenant_id}/peer-relay` — gate 1. `MANAGE_TENANT` is
+/// decided before the body is read (#4218): a caller without it gets the
+/// gate's answer whatever the body is, and a holder is answered one that does
+/// not parse as the `Json` extractor answered it (`ApiError::JsonBody`).
 pub async fn set_mode(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<PeerRelayModeBody>,
+    body: Result<Json<PeerRelayModeBody>, JsonRejection>,
 ) -> Result<Json<PeerRelayModeBody>, ApiError> {
     let tid = tenant_of(&tenant_id)?;
     require_permission(
@@ -157,6 +160,7 @@ pub async fn set_mode(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     state
         .overlay_networks
         .set_peer_relay_mode(tid, body.mode)

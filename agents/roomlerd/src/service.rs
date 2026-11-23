@@ -206,7 +206,7 @@ impl Install {
             }
             Self::WindowsTask => {
                 "then start it: roomlerd service start\n\
-                 (its task does not restart an agent the server removed)."
+                 (its task does not restart a daemon the server removed)."
             }
             Self::MacOs => "and launchd starts it again within seconds, with the new token.",
             Self::Other => "then start the daemon again.",
