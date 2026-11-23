@@ -1222,13 +1222,13 @@ pub fn next_backoff(consecutive_failures: u32) -> Duration {
 /// faster concern than version-rollback's longer clean-run threshold.
 pub const HEALTHY_UPTIME_THRESHOLD: Duration = Duration::from_secs(30);
 
-/// rc.51: once `consecutive_failures` reaches this, the supervisor
-/// emits a throttled `error!` so a crash-looping host surfaces in log
-/// aggregation. ~8 failures is roughly where `next_backoff` saturates
-/// at the 60 s cap. The supervisor never *gives up* (infinite respawn
-/// is the M3/M5 resilience design — a give-up would convert a
-/// recoverable loop into a permanently-dark host); this is purely an
-/// observability signal.
+/// rc.51: once the failures it counts reach this, the supervisor emits a
+/// throttled `error!` so a crash-looping host surfaces in log aggregation.
+/// #4324: a worker's exit with nothing to run counts toward none ([`ExitTally`]).
+/// ~8 failures is roughly where `next_backoff` saturates at the 60 s cap. The
+/// supervisor never *gives up* (infinite respawn is the M3/M5 resilience design —
+/// a give-up would convert a recoverable loop into a permanently-dark host); this
+/// is purely an observability signal.
 pub const RESPAWN_ALARM_THRESHOLD: u32 = 8;
 
 /// rc.51: should a worker exit reset the `consecutive_failures`
@@ -1254,8 +1254,26 @@ pub fn worker_had_nothing_to_run(code: u32) -> bool {
 /// #4324 — the reap's own count beside the backoff ladder, for the crash-loop
 /// alarm and the way-forward line. It follows the ladder (`consecutive_failures`)
 /// and never changes it, so the backoff and the respawns are what they were.
+///
+/// - **The alarm** counts the ladder's failures less the nothing-to-run exits
+///   among them ([`worker_had_nothing_to_run`]), and is due only at an exit it
+///   counts, or at AGENT_DELETED's as before. Such an exit neither adds to that
+///   count nor starts it again: only what starts the ladder again does (a run
+///   past [`HEALTHY_UPTIME_THRESHOLD`], an exit that resets it). A spawn that
+///   fails climbs the ladder, and the alarm counts it, as before.
+/// - **The way-forward line** ([`nothing_to_run_way_forward`]) is due at a
+///   nothing-to-run exit, unless the exit before it was one too and no worker
+///   ran past its start since: another code, or a run past the start
+///   ([`ExitTally::ran_past_start`]), says it again.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ExitTally {}
+pub struct ExitTally {
+    /// The nothing-to-run exits among the ladder's failures since it last
+    /// started again.
+    nothing_to_run: u32,
+    /// The way-forward line was said, and neither another exit nor a run past
+    /// its start came since.
+    said: bool,
+}
 
 /// What [`ExitTally::reap`] decides for one exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1272,28 +1290,51 @@ impl ExitTally {
     /// The host reaped `code`. `prior` is the ladder's count the exit was decided
     /// on (0 after a run past the healthy threshold), `failures` its count after
     /// the exit ([`decide_exit_reaction`]).
-    pub fn reap(&mut self, code: u32, _prior: u32, failures: u32) -> ExitNotice {
-        // The rule `run` raises the alarm by before #4324, for every exit alike.
+    pub fn reap(&mut self, code: u32, prior: u32, failures: u32) -> ExitNotice {
+        let nothing = worker_had_nothing_to_run(code);
+        if prior == 0 {
+            // The ladder starts again at this exit, and the count with it.
+            *self = Self::default();
+        }
+        self.nothing_to_run = if failures == 0 {
+            0
+        } else {
+            self.nothing_to_run.saturating_add(u32::from(nothing))
+        };
+        let alarm_failures = failures.saturating_sub(self.nothing_to_run);
+        let alarm_due = code == crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
+            || (!nothing && alarm_failures >= RESPAWN_ALARM_THRESHOLD);
+        let way_forward = nothing && !self.said;
+        self.said = nothing;
         ExitNotice {
-            alarm_failures: failures,
-            alarm_due: code == crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
-                || failures >= RESPAWN_ALARM_THRESHOLD,
-            way_forward: false,
+            alarm_failures,
+            alarm_due,
+            way_forward,
         }
     }
 
     /// A worker this host started ran past its start ([`reap_resets_counter`]),
     /// whether it exits later or the host ends it: the next nothing-to-run exit is
     /// said again.
-    pub fn ran_past_start(&mut self) {}
+    pub fn ran_past_start(&mut self) {
+        self.said = false;
+    }
 }
 
 /// #4324 — the way forward for a worker with nothing to run, from what the host
 /// knows: which worker it started. The SYSTEM worker runs the machine's own
 /// enrollment, every other the signed-in person's (`app.rs`, `pick_config_path`).
-pub fn nothing_to_run_way_forward(_system_context: bool) -> &'static str {
-    // No such line before #4324.
-    ""
+/// It names no path: the host never resolves the worker's config.
+pub fn nothing_to_run_way_forward(system_context: bool) -> &'static str {
+    if system_context {
+        "SYSTEM can open no machine enrollment on this device, nor a copy of one to \
+         restore. Enroll the device for the machine (the setup wizard, or \
+         `roomlerd enroll --machine-global`), or put the machine config back"
+    } else {
+        "the account signed in at the console has no enrollment on this device, nor \
+         a copy of one to restore. Enroll the device as that account (the setup \
+         wizard, or `roomlerd enroll`), or put the account's config back"
+    }
 }
 
 /// rc.51: the supervisor's live worker handle plus the metadata that
@@ -1527,6 +1568,9 @@ pub fn run(
     // once per minute so a looping host surfaces in log aggregation
     // without flooding it.
     let mut last_alarm_at: Option<Instant> = None;
+    // #4324 — that alarm's own count beside the ladder, and the way-forward
+    // line's memory: a worker with nothing to run raises no alarm.
+    let mut exit_tally = ExitTally::default();
     // Most recent active console session id observed. Used by
     // `decide_spawn`'s SpawnSystemInSession arm when the active
     // session disappears mid-stream (sign-out / fast-user-switch
@@ -1658,6 +1702,12 @@ pub fn run(
 
         // Reap a finished worker.
         if let Some(w) = current.as_ref() {
+            // #4324 — a worker alive past its start says the way-forward line
+            // again at the next exit with nothing to run, even one this host
+            // ends (a sign-out, a session change), which no reap sees.
+            if reap_resets_counter(w.spawned_at.elapsed()) {
+                exit_tally.ran_past_start();
+            }
             match w.process.try_wait() {
                 Ok(Some(code)) => {
                     // rc.51: gate the counter reset on worker UPTIME,
@@ -1676,6 +1726,7 @@ pub fn run(
                     let (reaction, next_failures) = decide_exit_reaction(code, prior);
                     consecutive_failures = next_failures;
                     prior_end = worker_end_is_no_crash(code);
+                    let notice = exit_tally.reap(code, prior, next_failures);
                     match reaction {
                         ExitReaction::Respawn => {
                             // 0 = a clean exit (an auto-update's, or FR-84
@@ -1771,11 +1822,13 @@ pub fn run(
                             //     backoff) while the operator is staring at the
                             //     wedge wondering why the host won't connect.
                             //
-                            //   * rc.51 generic crash-loop: consecutive_failures
-                            //     ≥ RESPAWN_ALARM_THRESHOLD (~ where backoff
+                            //   * rc.51 generic crash-loop: the failures the alarm
+                            //     counts ≥ RESPAWN_ALARM_THRESHOLD (~ where backoff
                             //     saturates at the 60 s cap). Any non-zero exit
-                            //     code; covers the boot-loop case where there is
-                            //     no Goodbye on the wire.
+                            //     code but a worker's with nothing to run (#4324,
+                            //     `ExitTally`), which neither counts nor raises it;
+                            //     covers the boot-loop case where there is no
+                            //     Goodbye on the wire.
                             //
                             // The supervisor NEVER gives up — infinite respawn is
                             // intentional (a re-enrol or auto-update can still
@@ -1784,9 +1837,7 @@ pub fn run(
                             // sane during a sustained loop.
                             let is_agent_deleted_exit =
                                 code == crate::watchdog::AGENT_DELETED_EXIT_CODE as u32;
-                            let alarm_due = is_agent_deleted_exit
-                                || consecutive_failures >= RESPAWN_ALARM_THRESHOLD;
-                            if alarm_due {
+                            if notice.alarm_due {
                                 let now = Instant::now();
                                 let throttle_passed = last_alarm_at.is_none_or(|t| {
                                     now.duration_since(t) >= Duration::from_secs(60)
@@ -1801,13 +1852,28 @@ pub fn run(
                                         );
                                     } else {
                                         tracing::error!(
-                                            consecutive_failures,
+                                            consecutive_failures = notice.alarm_failures,
                                             last_exit_code = code,
                                             "supervisor: worker has failed {} times in a row — host likely needs operator attention (still respawning)",
-                                            consecutive_failures
+                                            notice.alarm_failures
                                         );
                                     }
                                 }
+                            }
+
+                            // #4324 — a worker with nothing to run: one line
+                            // names the way forward, at the first such exit,
+                            // and again only after another code or a run past
+                            // its start (`ExitTally`).
+                            if notice.way_forward {
+                                tracing::warn!(
+                                    pid = w.process.pid,
+                                    code,
+                                    system_context = w.is_system_context,
+                                    "supervisor: the worker had no config to run (exit {}): {}. It is respawned on the usual backoff, with no crash-loop alarm; this line comes again only after another exit code or a run past its start",
+                                    code,
+                                    nothing_to_run_way_forward(w.is_system_context)
+                                );
                             }
 
                             // Phase 1B (Task 9): record a crash
@@ -4197,8 +4263,8 @@ mod tests {
     }
 
     /// The backoff is an exit 1's: the same arm and the same delays at every
-    /// rung of the ladder, the same uptime rule, the same alarm, and the next
-    /// worker is told the same of this end (nothing).
+    /// rung of the ladder, the same uptime rule, and the next worker is told the
+    /// same of this end (nothing). The alarm is not (#4324, the cells below).
     #[test]
     fn a_worker_with_no_enrollment_backs_off_exactly_as_an_exit_1() {
         for prior in (0..=12).chain([RESPAWN_ALARM_THRESHOLD, u32::MAX - 1, u32::MAX]) {
@@ -4241,8 +4307,8 @@ mod tests {
         // The next worker is told nothing of this end, as of an exit 1's.
         assert_eq!(worker_end_is_no_crash(NO_ENROLLMENT), None);
         assert_eq!(worker_end_is_no_crash(1), None);
-        // Only AGENT_DELETED takes the alarm's fast path; this code takes the
-        // count, as 1 does.
+        // Only AGENT_DELETED takes the alarm's fast path. This code takes no part
+        // in the alarm at all (#4324, `which_exits_raise_the_crash_loop_alarm`).
         assert_ne!(
             NO_ENROLLMENT,
             crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
