@@ -8,7 +8,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -1546,16 +1546,20 @@ pub fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, ApiError> {
     Ok(out)
 }
 
+/// `PUT /api/tenant/{tenant_id}/agent/{agent_id}`. `MANAGE_AGENTS` is decided
+/// before the body is read and before the device's id is (#4254): a caller
+/// without it gets the gate's answer whatever the body and the id are. A
+/// holder is answered a body that does not parse as the `Json` extractor
+/// answered it, whatever the id, since the extractor answered before any id
+/// was read. Only the org's id, which the gate needs, is parsed first.
 pub async fn update_agent(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    Json(body): Json<UpdateAgentRequest>,
+    body: Result<Json<UpdateAgentRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let aid = ObjectId::parse_str(&agent_id)
-        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     require_permission(
         &state,
@@ -1565,6 +1569,9 @@ pub async fn update_agent(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
+    let aid = ObjectId::parse_str(&agent_id)
+        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     // LIVE, before anything below writes (#1821): this handler used to go
     // straight to the setters, so a stale page holding a removed device's id
@@ -1802,19 +1809,22 @@ fn device_refusal(
 /// POST /api/tenant/{tid}/agent/{agent_id}/update — push `rc:agent.update`
 /// to one agent. MANAGE_AGENTS. Pre-S1a agents ignore the unknown message
 /// (decode-and-drop, same contract as `rc:goodbye`).
+///
+/// The bit is decided before the body is read and before the device's id is
+/// (#4254): a caller without it gets the gate's answer whatever the body and
+/// the id are. A holder is answered a body that does not parse as the `Json`
+/// extractor answered it, whatever the id.
 pub async fn trigger_agent_update(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    // Body is required (send `{}` for defaults) — plain `Json` keeps us off
-    // axum 0.8's `OptionalFromRequest` surface, which the codebase doesn't
-    // use anywhere else.
-    Json(body): Json<TriggerUpdateRequest>,
+    // Body is required (send `{}` for defaults): a `Json`, not an
+    // `Option<Json<_>>`, so a request without one is refused as the
+    // extractor refuses it.
+    body: Result<Json<TriggerUpdateRequest>, JsonRejection>,
 ) -> Result<Json<TriggerUpdateResult>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let aid = ObjectId::parse_str(&agent_id)
-        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     require_permission(
         &state,
@@ -1824,6 +1834,9 @@ pub async fn trigger_agent_update(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
+    let aid = ObjectId::parse_str(&agent_id)
+        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     // Tenant-scope the target (404 for a foreign agent id) — LIVE, because an
     // update order for a removed device has nowhere to go (#1821).
@@ -1893,11 +1906,15 @@ pub struct BulkTriggerUpdateResponse {
 /// POST /api/tenant/{tid}/agent/update — push `rc:agent.update` to selected
 /// (or all) agents in the tenant. MANAGE_AGENTS. Fleet-side stampede control
 /// is the agents' own 5-min install-storm cooldown + the release proxy cache.
+///
+/// The bit is decided before the body is read (#4254): a caller without it
+/// gets the gate's answer whatever the body is, and a holder is answered one
+/// that does not parse as the `Json` extractor answered it.
 pub async fn trigger_agents_update(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<BulkTriggerUpdateRequest>,
+    body: Result<Json<BulkTriggerUpdateRequest>, JsonRejection>,
 ) -> Result<Json<BulkTriggerUpdateResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -1910,6 +1927,7 @@ pub async fn trigger_agents_update(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
 
     // (id, running version, the device's own refusal) — the FR-2 guard needs
     // the version per target, FR-67 P7 what the device's hello said.

@@ -64,48 +64,6 @@ use syn::visit::Visit;
 /// its entry; the test fails while a fixed one is still listed.
 const DEFERRED: &[(&str, &str, &str)] = &[
     (
-        "crates/modules/fleet/src/agent.rs",
-        "trigger_agent_update",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/agent.rs",
-        "trigger_agents_update",
-        "#4254",
-    ),
-    ("crates/modules/fleet/src/agent.rs", "update_agent", "#4254"),
-    (
-        "crates/modules/fleet/src/agent_exec.rs",
-        "set_org_settings",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/agent_exec.rs",
-        "set_policy",
-        "#4254",
-    ),
-    ("crates/modules/fleet/src/agent_org.rs", "join_org", "#4254"),
-    (
-        "crates/modules/fleet/src/enroll_key.rs",
-        "mint_key",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/enroll_key.rs",
-        "set_org_settings",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/external_access.rs",
-        "set_enabled",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/keep_busy.rs",
-        "set_org_settings",
-        "#4254",
-    ),
-    (
         "crates/modules/remote/src/session_policy.rs",
         "set_limits",
         "#4254",

@@ -53,7 +53,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -440,12 +440,15 @@ pub async fn get_settings(
 /// `PUT /api/tenant/{tenant_id}/external-access` — gate 1.
 ///
 /// `MANAGE_TENANT`, not `MANAGE_AGENTS`: this decides whether the org can be
-/// reached from outside at all.
+/// reached from outside at all. It is decided before the body is read
+/// (#4254): a caller without it gets the gate's answer whatever the body is,
+/// and a holder is answered one that does not parse as the `Json` extractor
+/// answered it.
 pub async fn set_enabled(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<ExternalAccessEnabledBody>,
+    body: Result<Json<ExternalAccessEnabledBody>, JsonRejection>,
 ) -> Result<Json<ExternalAccessEnabledBody>, ApiError> {
     let tid = tenant_of(&tenant_id)?;
     require_permission(
@@ -456,6 +459,7 @@ pub async fn set_enabled(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     state
         .tenants
         .base
