@@ -1177,3 +1177,89 @@ describe('useAgentStore: one org at a time (#4248)', () => {
     expect(s.loading).toBe(false)
   })
 })
+
+// #4257 — the org's members (the device owner picker, the audit logs' names,
+// the policy dialogs' pickers) are one org's at a time too, and the store
+// knows which. A dialog or a log that only names or picks them asks with
+// `ensureTenantMembers`, which fetches only when the store does not hold them.
+describe("useAgentStore: the org's members, one org at a time (#4257)", () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  const membersOf = (ids: string[]) => ({
+    items: ids.map((user_id) => ({ user_id, display_name: user_id, nickname: null })),
+  })
+  const userIds = () => useAgentStore().tenantMembers.map((m) => m.user_id)
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    // A test that stops before its held GET is sent must not hand it to the next.
+    mockApi.get.mockReset()
+  })
+
+  it("a fetch for org B drops org A's members at once, and org A's late answer", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(membersOf(['ua']))
+    await s.fetchTenantMembers(ORG_A)
+    let lateA!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (lateA = r)))
+    const refreshA = s.fetchTenantMembers(ORG_A)
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)))
+    const loadB = s.fetchTenantMembers(ORG_B)
+    expect(userIds()).toEqual([])
+
+    answerB(membersOf(['ub']))
+    await loadB
+    lateA(membersOf(['ua', 'ua2']))
+    await refreshA
+    expect(userIds()).toEqual(['ub'])
+  })
+
+  it("org A's late failure leaves org B's members", async () => {
+    const s = useAgentStore()
+    let failA!: (e: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((_, reject) => (failA = reject)))
+    const loadA = s.fetchTenantMembers(ORG_A)
+    mockApi.get.mockResolvedValueOnce(membersOf(['ub']))
+    await s.fetchTenantMembers(ORG_B)
+
+    failA(new Error('Missing permission'))
+    await loadA
+    expect(userIds()).toEqual(['ub'])
+  })
+
+  it("ensureTenantMembers for org B while holding org A's: one fetch, for org B", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(membersOf(['ua']))
+    await s.fetchTenantMembers(ORG_A)
+    mockApi.get.mockResolvedValueOnce(membersOf(['ub']))
+    await s.ensureTenantMembers(ORG_B)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/member`, `/tenant/${ORG_B}/member`])
+    expect(userIds()).toEqual(['ub'])
+    expect(s.tenantMembersTenantId).toBe(ORG_B)
+  })
+
+  it("ensureTenantMembers for org A while holding org A's, or loading them: no fetch, for an org with none too", async () => {
+    const s = useAgentStore()
+    let answer!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answer = r)))
+    const first = s.fetchTenantMembers(ORG_A)
+    await s.ensureTenantMembers(ORG_A)
+    answer(membersOf([]))
+    await first
+    await s.ensureTenantMembers(ORG_A)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/member`])
+  })
+
+  it('ensureTenantMembers after a failed fetch: fetches', async () => {
+    const s = useAgentStore()
+    mockApi.get.mockRejectedValueOnce(new Error('network'))
+    await s.fetchTenantMembers(ORG_A)
+    mockApi.get.mockResolvedValueOnce(membersOf(['ua']))
+    await s.ensureTenantMembers(ORG_A)
+    expect(asked()).toHaveLength(2)
+    expect(userIds()).toEqual(['ua'])
+  })
+})

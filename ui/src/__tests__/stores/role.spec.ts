@@ -167,3 +167,47 @@ describe('role store: one org at a time (#4248)', () => {
     expect(store.loading).toBe(false)
   })
 })
+
+// #4257 — a dialog or a list that only names or picks the org's roles asks
+// with `ensureRoles`, which fetches only when the store does not hold them.
+describe('role store: ensureRoles (#4257)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+
+  // A test that stops before its held GET is sent must not hand it to the next.
+  beforeEach(() => mockApi.get.mockReset())
+
+  it("asked for org B while holding org A's: one fetch, for org B", async () => {
+    const store = useRoleStore()
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'ra' })])
+    await store.fetchRoles(ORG_A)
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'rb', tenant_id: ORG_B })])
+    await store.ensureRoles(ORG_B)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/role`, `/tenant/${ORG_B}/role`])
+    expect(store.roles.map((r) => r.id)).toEqual(['rb'])
+  })
+
+  it("asked for org A while holding org A's, or loading them: no fetch, for an org with none too", async () => {
+    const store = useRoleStore()
+    let answer!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answer = r)))
+    const first = store.fetchRoles(ORG_A)
+    await store.ensureRoles(ORG_A)
+    answer([])
+    await first
+    await store.ensureRoles(ORG_A)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/role`])
+  })
+
+  it('asked again after a failed fetch: fetches', async () => {
+    const store = useRoleStore()
+    mockApi.get.mockRejectedValueOnce(new Error('network'))
+    await store.fetchRoles(ORG_A)
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'ra' })])
+    await store.ensureRoles(ORG_A)
+    expect(asked()).toHaveLength(2)
+    expect(store.roles.map((r) => r.id)).toEqual(['ra'])
+    expect(store.error).toBeNull()
+  })
+})
