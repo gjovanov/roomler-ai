@@ -3583,9 +3583,9 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   alone and checked with the config ([`repair`, `machine_tree.rs:630`](../crates/agent-core/src/machine_tree.rs#L630)),
   so a key file another account owns keeps the service from running that enrollment as SYSTEM until it is
   fixed. Any other file in the folder (a backup, a temporary file) is neither repaired nor checked. #3666:
-  outside a save the repair seals the keys folder and a key file only when that entry gave no account other than
-  an administrator a right to change it as found; one another account could have written stays refused until an
-  elevated Setup or `roomlerd enroll --machine-global` seals it.
+  outside a save the repair seals the keys folder and a key file only when they, with the rest of the tree, were the
+  machine's as found, inherited entries counted ([the as-found rule](installation.md#windows)); an entry another
+  account could have written stays refused until an elevated Setup or `roomlerd enroll --machine-global` seals it.
 - **The daemon writes them as that repair leaves them** (#3956). A new enrollment's device key, a browser key
   the device has not seen before, and a `peer-auth\` the daemon makes for them are made sealed (owner
   Administrators, protected, SYSTEM and Administrators alone) in the call that creates them, then renamed into
