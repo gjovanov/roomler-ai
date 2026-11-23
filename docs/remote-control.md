@@ -7395,7 +7395,8 @@ jump. At the clean-run threshold the daemon reads the record, and
 `post_install::settle_unreported` turns an `InProgress` into
 `SucceededVerified` when this daemon is the expected version, or, once the
 watcher's whole life has passed, into `WatcherStopped`. Younger than that
-it looks once more when the time is up.
+it looks once more when the time is up. A note the watcher wrote, a wedge's
+or a console stop's, stays first, and the settle's words follow it (#4302).
 
 ⚠️ **The record is read in two places.** A SystemContext worker logs to
 `service-logs`, and the watcher it spawns has no service role, so the
@@ -7426,11 +7427,16 @@ through their console, and either half is enough on its own: holding the
 runtime makes you a target, and sharing a console with a target gets you the
 same event.
 
-⚠️ **A staged copy does not keep a watcher off that list.** A copy in `%TEMP%`
-still loads `VCRUNTIME140.dll` from the install folder. What saves one is having
-no console at all: with the launcher's daemon (`roomlerdw.exe`) the record reached
-`SucceededVerified`, with no event 10002. `CREATE_NO_WINDOW` would not do it,
-because that hands the watcher a console of its own, which is stand-in A.
+⚠️ **A staged copy alone does not keep a watcher off that list.** A copy that
+still holds files the update replaces is stand-in A or B, and one that shares a
+console with such a process is stand-in D. With the launcher's daemon
+(`roomlerdw.exe`) the record reached `SucceededVerified`, with no event 10002.
+Since #4302 a watcher the updater stages in its own staging folder is set up as stand-in C:
+everything the copy loads sits beside it, and `CREATE_NO_WINDOW` alone gives it a
+console of its own (`watcher_creation_flags`, `agents/roomlerd/src/updater.rs:3033`).
+Read on a per-Machine hop before that, the installer's second Restart Manager
+session ended the staged watcher before its verdict
+([update-outcome.md](update-outcome.md) §3).
 
 **Each attempt keeps its own MSI log (#2107).** The verbose `/l*v` log
 exists to name the action a wedged run stopped in, and the watcher's
@@ -7469,7 +7475,9 @@ settles the `Roomler` SCM service (`post_install.rs`,
 QUERY_STATUS, waits out a STOP_PENDING / START_PENDING it did not
 cause, starts the service whenever it reads STOPPED (at most 3 starts),
 and believes RUNNING only once it has held for 15 s, all inside a 2 min
-budget.
+budget. On a per-Machine hop the installer's Restart Manager session
+could end the watcher before it got here, until #4302
+([update-outcome.md](update-outcome.md) §3).
 
 ```mermaid
 sequenceDiagram

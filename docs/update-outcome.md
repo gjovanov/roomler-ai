@@ -9,7 +9,9 @@ one Windows perMachine host (attended), read on 0.4.172 and again on 0.4.174
 and 0.4.177, §7.
 
 Claims about behaviour were checked against the code at `5f126955b` plus
-#2924; anchors say where a check would need repeating.
+#2924; anchors say where a check would need repeating. The #4302 parts (§2's
+`watcher` row and the record written whole, §3's per-Machine hop) were checked
+against the code of #4330.
 
 ## 1. The problem
 
@@ -49,6 +51,17 @@ reading was wrong about which mattered:
 | `installer_pid`, `installer_path`, `installer_exit_code` | the installer as the watcher saw it. ⚠️ On Linux the pid is the daemon's own or already reaped — forensic, never waited on (§1) |
 | `new_binary_path`, `new_binary_version` | the binary the version probe ran, and what it printed |
 | `note` | the watcher's own sentence: the probe's answer, the exit code, on Windows the service settle's verdict (`service Roomler: running (0 starts; seen Running)`) |
+| `watcher` | Windows, since #4302: which process the watcher is (`pid`) and which files of the install folder it held when it began (`held`, left out when empty), written with the first `InProgress` (`InstallWatcher`, `post_install.rs:164`; filled in `watch`, `:430-450`). A record an older watcher wrote has no such field and still parses |
+
+**The record is written whole** (#4302). Each write goes into a fresh file beside the record,
+named for the process and the write (`fresh_record_path`, `post_install.rs:301`), which is
+then renamed over it, so a reader finds the last record or the new one and never part of one
+(`write_record_file`, `:272`). A refused rename is tried again after 10 and 40 ms, for a
+scanner holding a file it has just seen (`RECORD_RENAME_PAUSES`, `:261`). After the third
+refusal the fresh file is removed and the record is written in place, as before. One lock
+covers every write in the process (`RECORD_LOCK`, `:225`), because the watcher's console
+control handler writes from a thread of its own (§3). A daemon's settle runs in another
+process and stays outside that lock, as before.
 
 `<log_dir>` is `logging::resolve_log_dir`'s
 (`crates/agent-core/src/logging.rs:1028`): the process's per-user data dir plus
@@ -97,6 +110,40 @@ sequenceDiagram
 > is why the daemon reads the file **on every answer** rather than once at
 > startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:1063`),
 > and why a fresh `InProgress` is "still at work", not a failure (§4).
+
+### On a per-Machine hop: what ended the watcher, and what #4302 changes
+
+Read on a Windows 11 guest, the released per-Machine 0.4.232 updating itself to 0.4.233
+(§7): when the upgrade removes the old version, the installer opens a second Restart Manager
+session. The staged watcher still held files that the update replaces, so that session ended
+it with a console control event (`0xC000013A`) 1.88 s after it started, before its verdict and
+its service check (#2711). The record stayed `InProgress` until the next daemon settled it at
+its clean-run threshold (§4, #3302). The service came back by itself on every hop read; the
+watcher's service check is the net for the hop where it does not.
+
+| | What changed | Where |
+|---|---|---|
+| 1 | The staged copy has the runtime libraries the MSIs place beside `roomlerd.exe` beside it, so everything it loads sits beside it. They go only into the updater's own staging folder; anywhere else the copy is staged as before | `stage_watcher_exe`, `agents/roomlerd/src/updater.rs:3096`; the list, `WATCHER_RUNTIME_LIBS`, `:3042`, which a test ties to what both MSIs ship |
+| 2 | A console of its own, with no window: `CREATE_NO_WINDOW` alone. Before, the watcher shared the old worker's console, and a control event sent to a console reaches every process in it. Not `DETACHED_PROCESS`: a console tool the watcher runs (`taskkill` on a wedge) would open a window on the signed-in desktop. Not a new process group: that turns Ctrl+C off for the watcher | `watcher_creation_flags`, `updater.rs:3033`, at the spawn `:3007` |
+| 3 | The record names the watcher and any file of the install folder it holds when it begins (`watcher`, §2), and a console control event that stops it is noted in the record before the stop goes on | `watch`, `post_install.rs:430-458` |
+
+The console control handler (`on_console_event`, `post_install.rs:641`) never handles an
+event. It answers FALSE, so Windows' own handler ends the watcher as it did before, and the
+installer can still stop it. For Ctrl+C, Ctrl+Break and a closed console it adds "the watcher
+was stopped by a console control event before its verdict" to the record's note, or "after its
+verdict" when the record already holds one, a stop during the service check. A log-off or a
+shut-down adds nothing (`console_event_answer`, `:582`). It waits at most 200 ms for the
+record's lock (`CONSOLE_NOTE_WAIT`, `:573`; `note_console_event_at`, `:598`) and then lets the
+stop go on without its note.
+
+A note the watcher wrote stays first when the next daemon settles the record, the wedge's or
+a console stop's, and the settle's words follow it (`settle_unreported`, `:1885`):
+
+```text
+the watcher was stopped by a console control event before its verdict; the watcher left no
+verdict; this daemon is <version>, and has stayed up on it; the watcher (pid <pid>) held no
+file in the install folder when it began
+```
 
 ## 4. The eight words
 
@@ -251,6 +298,7 @@ $ roomler status
 | 2026-11-03 | a Win11 guest, per-user, a standard user at the console; candidate 0.4.223 (#2924 with #3345 and the `WatcherStopped` word), after a self-update from 0.4.221 | `roomler status`, `--json`, the startup line | the watcher's own verdict: `ok — agent-v0.4.223 installed 6m ago, verified: roomlerd 0.4.223`, INFO. An hour-old `InProgress` for the running version, written by hand: `NEVER REPORTED`, WARN, and after the clean-run threshold the daemon settled it to `ok`. A two-hour-old `InProgress` for another release: `WATCHER STOPPED`, WARN. The record deleted: `none recorded`, INFO. `--json` carried `last_install` with `path` in every state |
 | 2026-11-03 | a Win11 guest, per-machine SystemContext; released 0.4.197 updated itself to candidate 0.4.223 | the startup line; `roomler status`, elevated | 0.4.197's watcher was stopped before its verdict. The new daemon logged `last install: in progress` at its start and settled the record at its threshold, and `roomler status` read `ok — agent-v0.4.223 installed 6m ago, verified: roomlerd 0.4.223` with `path` in SYSTEM's profile (§5) |
 | 2026-11-03 | an Ubuntu guest, a root `.deb` daemon under systemd, candidate 0.4.223 installed by hand | `roomler status`, `journalctl -u roomlerd` | `none recorded` with no record, INFO; `NEVER REPORTED` for an hour-old `InProgress`, WARN. A crash loop rolled the device back to 0.4.197 on a real `dpkg` downgrade, and the candidate went in again by hand: `ok — agent-v0.4.197 installed 4m ago, verified: roomlerd 0.4.197 — but this daemon runs 0.4.223`, from the record the rollback's own watcher wrote. `none recorded` after the delete |
+| 2026-11-23 | a Win11 guest, per-Machine with `ENABLE_SYSTEM_CONTEXT=1`; released 0.4.232 updating itself to 0.4.233 from a local feed (#4302) | a process sampler at 250 ms (start, parent, console host, exit code) and the installer's verbose log | the upgrade's second Restart Manager session logged "Successfully shut down all applications that held files in use" at 03:21:09.782Z, and the staged watcher exited 8 ms later with `0xC000013A`, 1.88 s after it started, with no verdict: the record stayed `InProgress`. The old daemon processes had exited `0x0` 0.8 s before, no `taskkill`, `sc` or `net` ran in the window, and the console host stayed up until the installer finished. Restart Manager's own event naming the process was not captured ([the read](https://github.com/gjovanov/roomler-ai/issues/4302#issuecomment-7091434679)) |
 | — | the release that carries P3 — none yet: 0.4.198, the newest at this writing, predates #2924, and the three rows above are candidates | `roomler exec <host> -- roomler status`, `journalctl -g "last install"` | **owed**: the `last update` line and the startup line on a fleet host; then a synthetic stale `InProgress` and a deleted record on one host, to read `NEVER REPORTED` and `none recorded` apart in the field |
 
 ## 8. Not built

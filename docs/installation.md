@@ -1139,11 +1139,13 @@ that is online. Any other answer keeps the launcher, so a person who is not sign
 that moment gets the launcher, and the block, until the next registration. Once the policy
 allows the launcher, the next update takes the window away.
 
-**`last-install.json` can stay at `InProgress` on a self-update.** The staged watcher
-holds the install folder's VC runtime through `PATH`, and Restart Manager can shut it down
-(event 10002) before it writes a verdict: read on both jumps, while another
-launcher-to-launcher update read `SucceededVerified`. Nothing reads the file, and the
-device comes back either way.
+**`last-install.json` can stay at `InProgress` on a self-update.** Restart Manager can shut
+the staged watcher down (event 10002) before it writes a verdict: read on both jumps, while
+another launcher-to-launcher update read `SucceededVerified`. The device comes back either
+way, and the next daemon settles the record at its clean-run threshold (#3302). A watcher
+from a release with #4302 adds to the record that a console control event stopped it, and
+which files of the install folder it held when it began
+([update-outcome.md](update-outcome.md) §3).
 
 **A resume from sleep needs no start.** The processes sleep with the machine and carry
 on, with the same process ids: after a hibernate the row was back online 13 s after the
