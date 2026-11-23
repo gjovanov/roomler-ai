@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:4028`, `crates/agent-core/src/config.rs:4522`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:4028`, `crates/agent-core/src/config.rs:4553`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:996`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -576,7 +576,7 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3588`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3658`, `:3666`), and the load fails. Each line is worded for what happened to the live file (below) |
+| `config::load` (`crates/agent-core/src/config.rs:3588`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3673`, `:3681`), and the load fails. Each line is worded for what happened to the live file (below) |
 | `config::read_if_present` (`:3697`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 A start restores a missing file too (#4157). An enrolled device's start whose `config.toml` is missing but whose `config.toml.prev`
@@ -590,10 +590,14 @@ So removing `config.toml` alone does not make a device forget its enrollment: re
 restores its missing machine config the same way (#4176), with one rule more: only from a copy that passes every check the config itself
 would. That is the machine tree's check, and the rule that `%PROGRAMDATA%\roomler`, the machine folder and the copy were the machine's
 as found (#3609, #3666, [below](#windows)), read through one function
-(`crates/agent-core/src/machine_tree.rs:1083`). The service host asks the same function at its ladder rung
-(`agents/roomlerd/src/win_service/supervisor.rs:1004`), so for such a copy it starts the SYSTEM worker, whose start restores the file as
-above. For a copy that fails a check, does not load or holds no enrollment, it keeps running the signed-in person's own enrollment as
-that person, and says why once: *"config: the machine config is missing, and its copy is not restored: …"*.
+(`crates/agent-core/src/machine_tree.rs:1135`). While only the copy is there, the repair leaves the tree as it found it unless the
+copy, the machine folder and its keys were the machine's as found, inherited entries counted (`machine_tree.rs:716`). The service host
+asks that function after the machine config and the SYSTEM profile's own config, the order of the worker's ladder
+(`agents/roomlerd/src/win_service/supervisor.rs:990`), so a SYSTEM-profile config that opens runs, and nothing is restored. For a copy
+that passes, it starts the SYSTEM worker, whose start restores the file as above: written from the bytes the check judged, and put in
+place only where no `config.toml` is. For a copy that fails a check, does not load or holds no enrollment, it keeps running the
+signed-in person's own enrollment as that person, and says why once: *"config: the machine config is missing, and its copy is not
+restored: …"*. The desktop's "Two configurations found" clean-up sets the copy aside with the config it retires.
 
 ```mermaid
 flowchart TD
@@ -616,7 +620,7 @@ host now runs on an older config, and that must never look like a normal boot.
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3622` |
+| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3626` |
 | **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3630` |
 
 "Not there" is read off the read's own error (`not_found`, `:3863`), never off an `exists()`
@@ -632,7 +636,7 @@ copy could not be used).
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3658` |
+| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3673` |
 | **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3666` |
 
 Before #4102 both took the second line, so a device with no config at all, such as one never
@@ -641,7 +645,7 @@ enrolled where `roomlerd org ls` ran, was told its config was unreadable.
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
 supervisor's `netd_enabled()` flag probe
-(`agents/roomlerd/src/win_service/supervisor.rs:1300`), on **every service
+(`agents/roomlerd/src/win_service/supervisor.rs:1290`), on **every service
 start** of every user-context install; and enrollment itself, reusing an
 existing `machine_id` — during the very operation that enrolls the machine.
 The noise also buried the genuine case, which prints the identical line.
@@ -661,7 +665,7 @@ question; two moved to `read_if_present`.
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2623`, `:2645`), at the clean-run promotion
 (`record_clean_run_at`, `:2632`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4474`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4505`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -777,7 +781,7 @@ serving its zip. One wizard, four roles:
 |---|---|---|
 | **Daemon — system** | perMachine MSI + SystemContext enabled | SCM service `Roomler` (LocalSystem) — controls lock screen, UAC, pre-logon |
 | **Daemon — per user** | perUser MSI | the account's own Scheduled Task, `Roomler-<SID>` ([one per account](#two-accounts-on-one-machine-a-task-each-3801)), at logon (limited), with no window: [what the task runs](#what-the-per-user-scheduled-task-runs-3292) |
-| **Daemon — machine (attended)** | perMachine MSI | SCM service, no SystemContext. Its worker runs only as the person signed in at the **console**: an RDP session never gets one, and while nobody is signed in there the service runs with no worker and the device shows offline (`agents/roomlerd/src/win_service/supervisor.rs:826` spawns in the console session, `:1998` idles without a user token). A server reached only over RDP wants **Daemon — system** |
+| **Daemon — machine (attended)** | perMachine MSI | SCM service, no SystemContext. Its worker runs only as the person signed in at the **console**: an RDP session never gets one, and while nobody is signed in there the service runs with no worker and the device shows offline (`agents/roomlerd/src/win_service/supervisor.rs:826` spawns in the console session, `:1988` idles without a user token). A server reached only over RDP wants **Daemon — system** |
 | **Tunnel client** | CLI archive + PATH entry | on demand |
 
 Details worth knowing:
@@ -833,7 +837,8 @@ Details worth knowing:
   location: step 2 of [the SystemContext checklist](operator-systemcontext-smoke.md)
   gives a machine its own. A machine config that went missing counts as there
   when its `config.toml.prev` passes every check the config itself would and
-  holds an enrollment (#4176): the service starts the SYSTEM worker, whose
+  holds an enrollment (#4176), after the SYSTEM profile's own config, which
+  runs first when it opens: the service starts the SYSTEM worker, whose
   start restores the file
   ([above](#the-host-must-be-re-enrolled--when-to-believe-it); step 2d of the
   checklist).
@@ -877,9 +882,10 @@ Details worth knowing:
   when its config was the machine's as found, and while the folder holds a
   config it keeps such a replace right on `%PROGRAMDATA%\roomler` as it is,
   for the check to refuse at every start and tick. With no config, the copy a
-  start would restore it from is read the same way (#4176): the folder is
-  taken for it only when it was the machine's as found, and the replace right
-  is kept while it is there. A config that was not the
+  start would restore it from is read the same way (#4176): while only the
+  copy is there, the repair leaves the tree as it found it, a replace right
+  included, unless the copy, the folder and its keys were the machine's as
+  found, inherited entries counted. A config that was not the
   machine's is never run, never folded into (below), and `roomlerd re-enroll`
   and `roomlerd org` refuse it with nothing sent. Such a device stays without
   SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd
@@ -919,17 +925,17 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4809`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4869`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
   again for that owner, so the entry `%PROGRAMDATA%` hands whoever made it
-  names Administrators (`machine_tree.rs:908`). A link is refused, never taken
+  names Administrators (`machine_tree.rs:958`). A link is refused, never taken
   over. What that person made below them stays theirs. Setup also seals
   `%PROGRAMDATA%\roomler` (rc.52), by path, so only once it is a plain folder
   that belongs to Administrators. And with `roomlerd adopt-enrollment` they carry an
   existing machine config over only when it is private to the computer's
-  administrators once the repair has run (`machine_tree.rs:1200`), and was the
+  administrators once the repair has run (`machine_tree.rs:1252`), and was the
   machine's as found before it (#3666; Setup reads it before it seals
   `%PROGRAMDATA%\roomler`): one that is not is set aside, and a fresh one is
   written in its place, keeping no `.prev` and no key this build does not know

@@ -3530,13 +3530,17 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   has an enrollment SYSTEM may run, the service host keeps its worker on the waiting arm: the signed-in person's
   own enrollment, as that person. A machine config that went missing beside its `config.toml.prev` ends that
   wait only when the copy passes every check the config itself would, as found and as it is, and holds an
-  enrollment ([`read_machine_copy`, `machine_tree.rs:1083`](../crates/agent-core/src/machine_tree.rs#L1083)).
-  The host's rung ([`rung`, `supervisor.rs:1004`](../agents/roomlerd/src/win_service/supervisor.rs#L1004)), the
-  SYSTEM worker's ladder and its start ask that one function, so the host starts the SYSTEM worker exactly when
-  its start restores the file. For any other copy the host stays on the waiting arm and logs why once.
+  enrollment ([`read_machine_copy`, `machine_tree.rs:1135`](../crates/agent-core/src/machine_tree.rs#L1135)).
+  While only the copy is there, the repair leaves the tree as it found it unless the copy, the machine folder and
+  its keys were the machine's as found. The order is the SYSTEM worker's ladder: the machine config, then the
+  SYSTEM profile's own config, then the copy. The host asks that function third
+  ([`config_opens_in`, `supervisor.rs:990`](../agents/roomlerd/src/win_service/supervisor.rs#L990)), and the
+  worker's start asks it at the machine path its ladder names when neither config opens: there, the host starts
+  the SYSTEM worker exactly when its start restores the file. For any other copy the host stays on the waiting arm
+  and logs why once.
 - **On a machine-wide install the keys share the machine config's check** (#3609). `peer-auth\` and each
   `<tenant>.json` and `<tenant>.controllers.json` the daemon loads are repaired to SYSTEM and Administrators
-  alone and checked with the config ([`repair`, `machine_tree.rs:627`](../crates/agent-core/src/machine_tree.rs#L627)),
+  alone and checked with the config ([`repair`, `machine_tree.rs:630`](../crates/agent-core/src/machine_tree.rs#L630)),
   so a key file another account owns keeps the service from running that enrollment as SYSTEM until it is
   fixed. Any other file in the folder (a backup, a temporary file) is neither repaired nor checked. #3666:
   outside a save the repair seals the keys folder and a key file only when that entry gave no account other than
@@ -7534,7 +7538,7 @@ is the one table that decides, on every start:
 | How the last run ended | Who can say | `PreviousRun` | Counts |
 |---|---|---|---|
 | It marked itself clean (`mark_clean_shutdown`) or reached `CLEAN_RUN_THRESHOLD_SECS=300` (`record_clean_run_at`) | `last_run_unhealthy` is false | `Clean` | no |
-| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1108)) | `EndedByItsHost` | no |
+| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1098)) | `EndedByItsHost` | no |
 | The OS restarted during it: a restart, a power cut, a kernel fault | `last_run_boot` differs from [`boot_id::current`](../crates/agent-core/src/boot_id.rs#L17) | `EndedWithTheOs` | no |
 | Anything else: a kill, an access violation, a panic, a stall | nobody | `Crashed` | **yes** |
 | Either boot unknown, and no word from a host | nobody | `Crashed` | **yes** |
@@ -7584,7 +7588,7 @@ config itself would, and the service starts that worker for such a copy
 restores a config from its last good copy (`config.toml.prev`), the live
 file missing or unreadable, it clears the copy's run marks first:
 `last_run_unhealthy` and `last_run_boot` (`clear_run_marks`,
-[`crates/agent-core/src/config.rs:5006`](../crates/agent-core/src/config.rs#L5006)).
+[`crates/agent-core/src/config.rs:5145`](../crates/agent-core/src/config.rs#L5145)).
 A save kept that copy while its run went on, so its mark says nothing of
 how the run ended. Before #4157 the copy kept the mark, and the start after
 a restore read the run before it as `Crashed` on the same boot, one step
@@ -8114,8 +8118,8 @@ sequenceDiagram
   wall clock. On the vmtest guest whose clock had been corrected backwards by
   nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
   replaced it, so an "older than this host" rule would have left it running.
-- **When it runs.** Once before the first spawn (`supervisor.rs:1508`). Again in
-  the `Stop` arm (`supervisor.rs:1657`) before it gives up: if that pass ended an
+- **When it runs.** Once before the first spawn (`supervisor.rs:1498`). Again in
+  the `Stop` arm (`supervisor.rs:1647`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
   with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).

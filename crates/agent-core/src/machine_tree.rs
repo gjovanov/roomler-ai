@@ -616,11 +616,14 @@ fn is_exactly(sd: &Sd, want: &[Ace]) -> bool {
 ///   spares a right to replace the folder that an account other than an
 ///   administrator holds (`Role::Parent`).
 ///
-/// #4176 — with no config, the copy a start would restore it from counts as
-/// the folder's config: the folder is taken only when the copy was the
-/// machine's as found, and while the copy is there the parent's cut spares
-/// that right too, so the copy's check ([`read_machine_copy`]) refuses at this
-/// tick and every one after.
+/// #4176 — while only a copy is there (the `.prev` a start restores a missing
+/// config from), R leaves the tree as it found it unless the copy, the folder
+/// and the keys were the machine's as found, inherited entries counted
+/// ([`holds_the_machines_copy`]): a cut of the parent, or a seal of a folder,
+/// rewrites what every entry below it inherits, so the check that follows
+/// ([`read_machine_copy`]) would judge what R did, not what it found. When
+/// they were, R takes the folder for the copy, and the parent's cut spares a
+/// replace right as above.
 ///
 /// What it leaves, it says once in `left`, and the check refuses.
 #[cfg(windows)]
@@ -638,9 +641,13 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
     // config: a wrong answer may only keep a right the check then refuses.
     let holds_a_config = there(&tree.config());
     let holds_a_copy = !holds_a_config && there(&tree.prev());
+    if !writing && holds_a_copy && !holds_the_machines_copy(tree, &mut out) {
+        repair_path(&tree.record(), win::Kind::File, Role::Record, &mut out);
+        return out;
+    }
     match win::open(tree.folder(), win::Kind::Dir, false, true) {
         Ok(Some(folder)) => {
-            if writing || holds_the_machines_config(tree, holds_a_config, &mut out) {
+            if writing || holds_a_copy || holds_the_machines_config(tree, &mut out) {
                 repair_path(&tree.config(), win::Kind::File, Role::Private, &mut out);
                 repair_path_if_closed(&tree.prev(), win::Kind::File, Role::Private, &mut out);
                 match win::open(&tree.keys(), win::Kind::Dir, false, true) {
@@ -681,27 +688,70 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
 /// does, the folder is a waiting or attended host's, where the person's own
 /// daemon stages files, and R leaves it as `%ProgramData%` hands it down. A
 /// config another account could have put there, or chosen what it holds, does
-/// not make it the machine's: taken, the check would pass it. #4176 — with no
-/// config (`config` false), the copy a start would restore it from, read the
-/// same way.
+/// not make it the machine's: taken, the check would pass it.
 #[cfg(windows)]
-fn holds_the_machines_config(tree: &MachineTree, config: bool, out: &mut Repairs) -> bool {
-    let (file, what) = if config {
-        (tree.config(), "the config it holds")
-    } else {
-        (tree.prev(), "the copy of a missing config it holds")
-    };
-    match found_as_the_machines(tree, &file) {
+fn holds_the_machines_config(tree: &MachineTree, out: &mut Repairs) -> bool {
+    match as_found(tree) {
         Ok(()) => true,
         Err(Refusal::Absent) => false,
         Err(Refusal::NotPrivate(why)) => {
             out.left.push(format!(
-                "{} is left as it is: {what} was not the machine's as found ({why})",
+                "{} is left as it is: the config it holds was not the machine's as found ({why})",
                 tree.folder().display()
             ));
             false
         }
     }
+}
+
+/// #4176 — while the machine folder holds no config and holds a copy: were
+/// the copy, the folder and the keys the machine's AS FOUND, before anything
+/// in this tick changed them? The parent, the folder and the copy as
+/// [`found_as_the_machines`] reads them, and the keys folder and each key file
+/// the daemon loads closed to [`PLANT`] ([`keys_as_found`]), inherited entries
+/// counted in each. Only then does R change anything above or below the copy;
+/// otherwise it leaves the tree as it found it, says why once in `left`, and
+/// the check refuses the copy.
+#[cfg(windows)]
+fn holds_the_machines_copy(tree: &MachineTree, out: &mut Repairs) -> bool {
+    match found_as_the_machines(tree, &tree.prev()).and_then(|()| keys_as_found(tree)) {
+        Ok(()) => true,
+        Err(Refusal::Absent) => false,
+        Err(Refusal::NotPrivate(why)) => {
+            out.left.push(format!(
+                "{} and {} are left as they are: the copy of a missing config the folder holds, \
+                 with the folder and its keys, was not the machine's as found ({why})",
+                tree.parent().display(),
+                tree.folder().display()
+            ));
+            false
+        }
+    }
+}
+
+/// #4176 — the keys folder and each key file the daemon loads, as
+/// [`check_keys`] opens them, closed to [`PLANT`] as found
+/// ([`closed_as_found`]). `Ok` with no keys folder.
+#[cfg(windows)]
+fn keys_as_found(tree: &MachineTree) -> Result<(), Refusal> {
+    let closed = |path: &Path, entry: &win::Entry| {
+        closed_as_found(
+            &security(path, entry)?,
+            PLANT,
+            &path.display().to_string(),
+            win::is_administrator,
+        )
+        .map_err(Refusal::NotPrivate)
+    };
+    if let Some(keys) = open_entry(&tree.keys(), win::Kind::Dir, false)? {
+        closed(&tree.keys(), &keys)?;
+        for key in key_files(&tree.keys()) {
+            if let Some(file) = open_entry(&key, win::Kind::File, false)? {
+                closed(&key, &file)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// #3666 — was the entry R opened at `path` closed to [`PLANT`] as found
@@ -1067,18 +1117,20 @@ fn there(path: &Path) -> bool {
 /// [`check_chain`]'s check (the parent: no account other than SYSTEM or
 /// Administrators may rename or replace what it holds; the folder, the copy,
 /// the keys folder and each key file: no such account may change them). The
-/// copy is opened for reading and its bytes are read through the handle its
+/// parent, the folder and the copy are opened by path, all three, and then
+/// judged ([`check_config`] judges each entry before it opens the next); the
+/// copy is opened for reading, and its bytes are read through the handle its
 /// owner and DACL were judged on. `Ok(None)`: there is no copy. `Err` names the
 /// entry and the reason.
 ///
-/// The service host's rung, the SYSTEM worker's ladder and its start read the
-/// copy through this one function (`config::machine_previous_copy`), and the
-/// restore (`config::load`) runs on these bytes, so the four cannot disagree.
-/// It repairs nothing: the [`repair`] before it takes the machine folder for a
-/// copy only when the copy was the machine's as found, and while a copy is
-/// there it keeps a replace right on the parent for this check to refuse, so
-/// what a repair did never makes a copy pass that did not. The check's switch
-/// does not relax it: no copy of a missing config was ever run without it.
+/// The service host (after the machine config and the SYSTEM profile's), the
+/// SYSTEM worker's start and the restore (`config::load`) read the copy through
+/// this one function (`config::machine_previous_copy`), and the restore runs on
+/// these bytes, so they cannot disagree. It repairs nothing: while only a copy
+/// is there, the [`repair`] before it leaves the tree as it found it unless the
+/// copy, the folder and the keys were the machine's as found, so what a repair
+/// did never makes a copy pass that did not. The check's switch does not relax
+/// it: no copy of a missing config was ever run without it.
 #[cfg(windows)]
 pub fn read_machine_copy(tree: &MachineTree) -> Result<Option<Vec<u8>>, String> {
     match machine_copy(tree) {
@@ -1155,9 +1207,9 @@ fn security(path: &Path, entry: &win::Entry) -> Result<Sd, Refusal> {
 /// its start (`roomlerd`'s `win_service::supervisor::rung_opens`, one function
 /// for both). With the check switched off a refusal is logged and the
 /// config's read open decides, as before #3609. A refusal is logged once per
-/// reason, not once per tick. #4176 — with no config it is `Absent`, and the
-/// rung then asks the copy a start would restore ([`read_machine_copy`]), after
-/// this repair.
+/// reason, not once per tick. #4176 — with no config it is `Absent`; the host
+/// then asks, after the SYSTEM profile's config, the copy a start would
+/// restore ([`read_machine_copy`]), after this repair.
 #[cfg(windows)]
 pub fn private_machine_config(tree: &MachineTree, switches: Switches) -> Result<(), Refusal> {
     if switches.repair {

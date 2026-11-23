@@ -299,9 +299,9 @@ verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
   group or others can write, and the package sets 644 (`postinstall:360-361`). It writes the config with its
   recorded owner bits, 0600 when none was recorded: the file holds a token and a key.
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
-  (`crates/agent-core/src/config.rs:4036-4052`): the same rules, no path, unknown keys noted from the text
-  (`note_unknown_keys` reads by path, `:4440-4444`), and no `.prev` repair, which belongs to the person's own agent
-  (`:3614-3646`). A config that does not parse stops Read, as before (`find_people`, `one_row.rs:1413`). Root never parses the
+  (`crates/agent-core/src/config.rs:4051-4067`): the same rules, no path, unknown keys noted from the text
+  (`note_unknown_keys` reads by path, `:4471-4475`), and no `.prev` repair, which belongs to the person's own agent
+  (`:3614-3661`). A config that does not parse stops Read, as before (`find_people`, `one_row.rs:1413`). Root never parses the
   plist's bytes.
 - **Failure.** A non-zero exit, a death by signal, a reply that does not parse, exceeds its bound or carries another
   identity or version, or the deadline: at Read the command stops with nothing changed; during the conversion it is
@@ -667,7 +667,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - The running two-row worker saving the person's config during the conversion, as today.
 - Repairing a `~/Library/LaunchAgents` that an earlier package made (#3763).
 - The person's `config.toml.prev` after a conversion still holds the enrollment that moved to root (a save keeps the
-  previous file), and the person's agent's `.prev` repair (`config.rs:3614-3646`) could bring it back: its own issue
+  previous file), and the person's agent's `.prev` repair (`config.rs:3614-3661`) could bring it back: its own issue
   (#4184). The worker root's supervisor starts never restores it at its start (#4157): with `--unenrolled` it writes
   a blank file, and without it (`macos_one_row` turned off by hand, with no `--revert`) it ends with 78 as before.
 - Linux and Windows: their root steps take their folders from the system already (#3702). On Linux that holds for

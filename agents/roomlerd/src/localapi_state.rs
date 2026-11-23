@@ -2300,7 +2300,7 @@ impl LocalApiState for DaemonState {
     ///   * both copies must parse and carry the SAME `agent_id` (a different
     ///     id = a second enrollment — refused, an operator must decide),
     ///   * the stale copy is renamed aside (`config.toml.stale-<ts>`), never
-    ///     deleted.
+    ///     deleted, its `.prev` with it ([`set_aside`], #4176).
     async fn config_cleanup_stale(&self) -> Response {
         let Some((live_path, lock)) = self.config_persist.as_ref() else {
             return Response::Error {
@@ -2388,7 +2388,17 @@ impl LocalApiState for DaemonState {
 }
 
 /// S1b — set the stale config at `stale` aside as `config.toml.stale-<ts>`.
+/// #4176 — its last good copy (`.prev`) first, as `config.toml.prev.stale-<ts>`:
+/// a start restores a missing config from that copy, so a copy left beside it
+/// would bring back the config this sets aside. A copy that cannot be moved
+/// moves nothing; with no copy, the config alone.
 fn set_aside(stale: &std::path::Path, ts: u64) -> std::io::Result<std::path::PathBuf> {
+    let copy = crate::config::prev_path(stale);
+    match std::fs::rename(&copy, copy.with_extension(format!("prev.stale-{ts}"))) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let archived = stale.with_extension(format!("toml.stale-{ts}"));
     std::fs::rename(stale, &archived)?;
     Ok(archived)

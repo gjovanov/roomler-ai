@@ -525,7 +525,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3697`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3712`),
 not `load`, because `load` self-heals. When the live file is missing or unreadable and
 its `.prev` copy loads, `load` promotes that copy back over it, without the copy's run
 marks (#4157), and logs *RESTORED* or *RECOVERED from the previous good copy* at ERROR.

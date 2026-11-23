@@ -1103,20 +1103,20 @@ enum ServiceAction {
 ///    check; the operator named it deliberately).
 /// 2. A SystemContext worker (LocalSystem) runs the machine's own enrollment
 ///    and nothing else (#3387):
-///    - the machine-global `%PROGRAMDATA%` config, when it opens, or #4176
-///      when its start restores it from its copy: readable before sign-in;
+///    - the machine-global `%PROGRAMDATA%` config, when it opens: the
+///      canonical one, readable before anyone signs in;
 ///    - else the SYSTEM profile's own config (`roomlerd enroll` run as SYSTEM
 ///      without `--machine-global`), when it lies in the service account's
 ///      own profile as the system names it (`system_profile`,
 ///      `appdirs::system_profile`) and opens;
-///    - else the machine-global path, so `config::load` fails with an honest
-///      "not found" naming where the machine's enrollment belongs.
+///    - else the machine-global path: its start restores a missing config from
+///      a copy that passes (#4176), or `config::load` fails with "not found".
 ///
 ///    The config of the person signed in at the console is never one of them.
 ///    That enrollment runs as that person, on the service host's user-context
 ///    arm, until the machine has its own
 ///    (`win_service::supervisor::want_system_worker`, which reads the same two
-///    rungs).
+///    rungs, then the copy).
 /// 3. Every other process: the platform default (`%APPDATA%` per user).
 fn pick_config_path(
     explicit: Option<PathBuf>,
@@ -1176,9 +1176,9 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
         // The service host's own question (`sc_config_opens`), through the
         // same function: a read open for the SYSTEM profile's config (a file
         // in a folder that refuses SYSTEM lists, and does not open), and for
-        // the machine config #3609's repair, then its check (#4176: a missing
-        // one's copy's). The SYSTEM worker never runs a machine config that
-        // fails it: the last rung names the machine path, and `Run` refuses.
+        // the machine config #3609's repair, then its check. The SYSTEM
+        // worker never runs a machine config that fails it: the last rung
+        // still names the machine path, and `Run` refuses to load it then.
         let tree = roomler_node_core::machine_tree::MachineTree::here();
         let switches = roomler_node_core::machine_tree::Switches::from_env();
         let refused = std::cell::RefCell::new(None);
