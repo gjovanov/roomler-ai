@@ -1,10 +1,12 @@
 # FR-152: A cold hub continues from its handoff — a prompt nobody typed starts a fresh context, not a full re-read
 
-**Issue:** [#4290](https://github.com/gjovanov/roomler-ai/issues/4290) · **Status:** spec, claimed 2026-11-22; D1
-decided the same day (allow); P0 done the same day. Builds on [FR-131](FR-131-hub-coordinator.md) (the hub) and
-[FR-136](FR-136-hub-process-hygiene.md) (hub-guard, the idle handoff and its gate). The engineering reference is
-[`agent-hub.md` §12.4](../agent-hub.md#124-the-idle-handoff). Like FR-136, it changes the operator's tooling under
-`~/.claude/` and no product code, so the design names files and functions there rather than repository lines.
+**Issue:** [#4290](https://github.com/gjovanov/roomler-ai/issues/4290) · **Status:** live on every hub since
+2026-11-23 18:17:35Z, and AC8's seven days are running. Claimed 2026-11-22; D1 decided the same day (allow); P0 done
+the same day; P1, P2 and P3's lab done 2026-11-23; P4 is the docs. Builds on [FR-131](FR-131-hub-coordinator.md)
+(the hub) and [FR-136](FR-136-hub-process-hygiene.md) (hub-guard, the idle handoff and its gate). The engineering
+reference is [`agent-hub.md` §12.5](../agent-hub.md#125-the-cold-rotation), beside §12.4, the idle handoff. Like
+FR-136, it changes the operator's tooling under `~/.claude/` and no product code, so the design names files and
+functions there rather than repository lines.
 
 ## Goal
 
@@ -191,8 +193,10 @@ Pure functions in `hub-guard/hooks/core.ts`, beside 0.5.0's `idleDue()`:
 - a toast, and an `events.log` line for each rotation and for each cold prompt it let through, with the condition that
   failed.
 
-Its seams follow 0.5.0's: `HUB_GUARD_COLD_MIN_K` (the threshold in thousands of tokens; 0 turns the part off),
-`HUB_GUARD_COLD_INBOX` and `HUB_GUARD_CACHE_LIVE`.
+Its seams follow 0.5.0's: `HUB_GUARD_COLD_MIN_K` (the threshold in thousands of tokens; 0 turns the part off) and
+`HUB_GUARD_CACHE_LIVE`. As built, the inbox has no seam of its own: `HUB_GUARD_HUBS` moves the hubs' folder for a lab,
+`HUB_GUARD_STATE` gives one session its own off file and records, and `HUB_GUARD_COLD_CMD` and
+`HUB_GUARD_COLD_GAP_MIN` set the skill's command and the gap between rotations.
 
 ### What the engine must allow: P0's questions
 
@@ -224,10 +228,10 @@ file, or `HUB_GUARD=off`, turns off the whole guard. `HUB_GUARD_COLD_MIN_K=0` al
 | Phase | Scope | Status | Kill switch |
 |---|---|---|---|
 | P0 | Prove the engine points (P0's questions) on throwaway sessions in the pty harness, at no model cost where a question allows | **done 2026-11-22**: every answer allows the design (P0's answers above, and the field log) | — (nothing changes) |
-| P1 | The hub skill: the person-turn line, the handoff's newest block and its archive, `/hub resume <id> cold` with its three reads, a tick that resumes first, the note on schedules | not started | the skill's previous commit |
-| P2 | hub-guard 0.6.0, the `cold` part: the pure functions with their unit tests, the hook, the steps, the inbox, the toast and the `events.log` lines. **D1 decided 2026-11-22: allow.** | not started | the part `cold`; `HUB_GUARD_COLD_MIN_K=0`; the hub flag |
-| P3 | Field: a lab hub through each condition, with a seam that judges the cache cold sooner so that no cell waits an hour; then a live hub's next real cold prompt, and seven days of its `events.log` | not started | as P2 |
-| P4 | Docs: a §12 section of `agent-hub.md` with the flowchart, the conditions, the inbox and the kill switches; the FR-131 and FR-136 cross-links | not started | — |
+| P1 | The hub skill: the person-turn line, the handoff's newest block and its archive, `/hub resume <id> cold` with its three reads, a tick that resumes first, the note on schedules | **done 2026-11-23**, in the skill's own repository outside roomler, and installed live: it is backward compatible (field log) | the skill's previous commit |
+| P2 | hub-guard 0.6.0, the `cold` part: the pure functions with their unit tests, the hook, the steps, the inbox, the toast and the `events.log` lines. **D1 decided 2026-11-22: allow.** | **done 2026-11-23**: 113 tests and a smoke pass. Installed dark at 13:17Z, the part off in every session by the word `cold` in hub-guard's off file (field log) | the part `cold`; `HUB_GUARD_COLD_MIN_K=0`; the hub flag |
+| P3 | Field: a lab hub through each condition, with a seam that judges the cache cold sooner so that no cell waits an hour; then a live hub's next real cold prompt, and seven days of its `events.log` | **the lab done 2026-11-23**: GREEN on every cell of AC1 to AC7 (field log). **Live on every hub since 2026-11-23 18:17:35Z**, and AC8's seven days are running | as P2 |
+| P4 | Docs: a §12 section of `agent-hub.md` with the flowchart, the conditions, the inbox and the kill switches; the FR-131 and FR-136 cross-links | this PR: [`agent-hub.md` §12.5](../agent-hub.md#125-the-cold-rotation), these rows, and the FR-131 and FR-136 cross-links | — |
 
 ## Acceptance criteria
 
@@ -289,6 +293,18 @@ with links to FR-131 and FR-136. `agent-hub.md` already has its `docs/README.md`
 | 2026-11-22 | P0: the time a `/clear` takes on the operator's machine | 5.7, 14.8 and 18.9 s until the new session had started (crestore's `SessionEnd` hook sets the pace), then 6 to 17 s until the context settled; plugin timers stall meanwhile |
 | 2026-11-22 | P0: the throwaway's environment | It inherited `CRESTORE_WAKE` from the session that started it, so crestore recorded it as carrying on that session's predecessor (harmless here: that one already had a successor). The pty harness now leaves `CRESTORE_*` out, as it does `CLAUDE*` and `HUB_*`; P3's lab sessions must start without them too. |
 | 2026-11-22 | P0: the cost | 3 throwaway turns on Haiku 5.5, about $0.02 |
+| 2026-11-23 | P1: the hub skill, in its own repository outside roomler | `/hub resume <id> cold` continues from three reads: the handoff's newest block, the `events.log` lines since it and the cold inbox. The handoff is dated blocks, and a cold resume moves all but the newest three to the archive. Each turn a person started ends with the person-turn line (`hub.mjs turn`). A tick reads the cold inbox first (`hub.mjs inbox`) and, in a context that has not resumed yet, resumes first. `hub.mjs set <dir> hub cold_rotate=off\|on` is the hub's own switch. P1b: `--sid "$CLAUDE_CODE_SESSION_ID"` at every Resume and Tick keeps `state.json`'s `hub.sessionId` on the coordinator's current session, which is how hub-guard recognises it; a re-bind by name had found nothing in a process that lost its session file at a `/clear`. 40 tests pass, and all 8 mutations of the bind were caught. Installed live and backward compatible: a status read of three live hubs before and after the install differed only in live readings. |
+| 2026-11-23 | P2: hub-guard 0.6.0's smoke, in one throwaway Haiku session in the pty harness, with a lab hub, fake cache snapshots and a stand-in for the hub skill. The candidate was loaded for that session alone; the engine gave it the name and did not load the installed copy. | 113 tests and `claude plugin validate` pass. A worker's message was kept word for word in the cold inbox and dropped with no model request; `/clear` was awaited, then exactly one resume with `cold` ran in the fresh context. A cron tick was dropped and rotated the same way. A message that arrived over a draft in the prompt box was let through, and `events.log` named condition 7. No defect, so no new commit; about $0.03. |
+| 2026-11-23 | P2: the install, 13:17Z | Installed dark: the word `cold` in hub-guard's off file kept the part off in every session, while a lab session could turn it on for itself alone (`HUB_GUARD_STATE`). |
+| 2026-11-23 | P3, the lab, 14:21–18:02Z: the installed hub-guard 0.6.0 and hub skill, unchanged, in throwaway Haiku sessions in the pty harness. A lab coordinator ran a lab hub with no repository and no issue, and a second throwaway was its worker. The part was on for the lab's sessions alone, and fake cache snapshots stood in for an hour's wait. From 15:45Z the gap between two rotations of the hub was 12 minutes instead of 30 (`HUB_GUARD_COLD_GAP_MIN`), so that a cell could keep condition 8 without a 30-minute wait. | **GREEN on every cell of AC1 to AC7**, with no defect in hub-guard or the hub skill, and neither changed. 4 rotations, 13 logged let-throughs and 37 throwaway turns; each resume took 7 to 8.5 minutes on the lab's machine. The rows below are its cells. Its five findings, none a defect, are the known limits in [`agent-hub.md` §12.5](../agent-hub.md#125-the-cold-rotation). |
+| 2026-11-23 | P3, AC1: a cron tick on a cold cache, with a 212k re-read and a current handoff | Dropped at 14:54:34Z with no model request in the old context: no assistant record after the drop, no `turn.start`, and the session's real Cache Keeper snapshot not rewritten. `/clear` followed 9 s later, and `/hub resume <id> cold` ran in the fresh context; `events.log` read `cold: rotated (tick; re-read 212k; inbox 0 files)`. The fresh context's first request was 73,176 tokens (AC1 asks under 120k), and its resume bound `state.json` to the new session. |
+| 2026-11-23 | P3, AC2: a worker's message on a cold cache | Kept word for word in the cold inbox at 15:28:01Z and dropped. The fresh context read it with `hub.mjs cold`, which moved it to `read/`, and answered through the hub's mail; the worker had the answer at 15:33:15Z. `events.log`: `cold: rotated (peer; re-read 212k; inbox 1 file)`. First request 73,179 tokens. |
+| 2026-11-23 | P3, AC3: background tasks across a rotation | A tick rotated at 16:57:49Z while two of the old context's background tasks ran, and `tasks.md` named both (`cold: rotated (tick; re-read 212k; inbox 0 files; 2 tasks in tasks.md)`); one reported into the fresh context during its resume. The other's notification met a cold cache at 17:12:12Z, was kept and started the fourth rotation, and a fresh context's `hub.mjs cold` printed it at 17:19:36Z. First request 73,178 tokens. |
+| 2026-11-23 | P3, AC4: the cron and the workers carry on | After each rotation the resume's `CronList` showed exactly one heartbeat, and no resume made a second. `hub.mjs status` showed the same worker row across the rotations. A process restart once lost the heartbeat, a known limit in `agent-hub.md` §12.5; the coordinator made it again at 16:52Z, and every later resume listed only that one. |
+| 2026-11-23 | P3, AC5: each condition failing alone | Twelve cells: a rotation 10 minutes earlier, a warm cache, a 100k re-read, a stale snapshot, a handoff older than the last person turn, the off file, the hub's `cold_rotate=off`, a draft in the box, a session the hub's `state.json` does not name, a hub worker, `HUB_GUARD=off:cold` and `HUB_GUARD_COLD_MIN_K=0`. Just before each trigger, the cell's real inputs were run through hub-guard's own condition code, which showed every other condition holding. Each prompt went in with no `/clear`. The logged ones named their condition, such as `cold: let through (condition 6: the handoff is older than the last person turn)`, and the quiet ones wrote nothing, as designed. As a control, the same relaunched process with only the gap changed had rotated twice, so the passes of the last three cells are the switches' alone. |
+| 2026-11-23 | P3, AC6: a prompt a person typed | Typed on a cold cache with every other condition holding (16:14:41Z), and on a warm one (16:52:13Z): each went straight in, with no drop, hold, `/clear` or log line. |
+| 2026-11-23 | P3, AC7: no loop | A fresh context at its real 92k was let through at the next tick by condition 5 (the gap held it too) and not rotated. A resume cut short by Esc, standing in for one refused at a usage limit, was followed at the next tick by exactly one resume in that tick's own turn (17:17:49Z), and the tick after it was a plain tick: no second rotation. |
+| 2026-11-23 | The flip, 18:17:35Z: the off file under `~/.claude/hub-guard/` was deleted; it held only the word `cold` | **The part is live on every hub.** AC8's seven days on the live hubs run from here. |
 
 ## Related
 
