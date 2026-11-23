@@ -1,7 +1,7 @@
 # FR-152: A cold hub continues from its handoff — a prompt nobody typed starts a fresh context, not a full re-read
 
 **Issue:** [#4290](https://github.com/gjovanov/roomler-ai/issues/4290) · **Status:** spec, claimed 2026-11-22; D1
-decided the same day (allow); no phase started. Builds on [FR-131](FR-131-hub-coordinator.md) (the hub) and
+decided the same day (allow); P0 done the same day. Builds on [FR-131](FR-131-hub-coordinator.md) (the hub) and
 [FR-136](FR-136-hub-process-hygiene.md) (hub-guard, the idle handoff and its gate). The engineering reference is
 [`agent-hub.md` §12.4](../agent-hub.md#124-the-idle-handoff). Like FR-136, it changes the operator's tooling under
 `~/.claude/` and no product code, so the design names files and functions there rather than repository lines.
@@ -117,13 +117,13 @@ costs what today costs, and a wrong "yes" clears someone's session.
 
 | # | Condition | Read from | Why |
 |---|---|---|---|
-| 1 | The prompt starts a turn and nobody typed it: a cron tick, a worker's message or a task notification | the prompt's origin; P0 records each kind's live shape | A person's prompt is Cache Keeper's to hold. Any other origin counts as a person. |
+| 1 | The prompt starts a turn and nobody typed it: a cron tick, a worker's message or a task notification | the prompt's origin: `scheduled-trigger`, `peer` or `task-notification` (P0). A typed prompt's is `composer`, and hub-guard's own command runs are `plugin` | A person's prompt is Cache Keeper's to hold. Any other origin counts as a person. |
 | 2 | The session is hub X's coordinator and not a hub worker: it has run X's tick or resume, and X's `state.json` names it (`hub.sessionId` or `hub.name`, the keys `hub.mjs` already matches a coordinator by) | hub-guard's record of the session's prompts; `~/.claude/hub/<X>/state.json`; `HUB_WORKER` | Two independent signals, because a wrong yes clears a session. Workers rotate on their own at about 250k. |
 | 3 | Cache Keeper's snapshot is current: written after the session's last turn ended, or less than a minute before | the snapshot's `at` | The rule hub-guard 0.5.0 already applies. |
 | 4 | The cache is cold: now ≥ `cache.lastAt` + `cache.ttl` | the snapshot | `lastAt` is the start of the last request, where the hour counts from (the comment on `lastAt` in Cache Keeper's `core.mjs`). |
 | 5 | The re-read would write at least 150k tokens | `cache.recacheTokens`, the number Cache Keeper's own hold uses | Below that a fresh resume costs about as much (D2). |
 | 6 | `hub-handoff.md` was written after the last turn a person started had ended; an unknown time counts as just now | the file's mtime; hub-guard's record of person turns | Ticks and workers leave `events.log` and `state.json` behind; what a person said may be on no other disk (D3). |
-| 7 | The prompt box is empty | `$.prompt.read` | A draft, or a prompt Cache Keeper held and put back, means a person is deciding. |
+| 7 | The prompt box is empty | `$.prompt.read` | A draft, or a prompt Cache Keeper held and put back, means a person is deciding. P0: a `/clear` leaves the box as it was, so a draft would survive a rotation; the condition stays because a person is there. |
 | 8 | No rotation of this hub in the last 30 minutes, and the part is on | hub-guard's state; the kill switches | No loops. |
 
 ### What is kept
@@ -134,11 +134,17 @@ Before a prompt is dropped, hub-guard writes it to `~/.claude/hub/<X>/cold-inbox
 - `tasks.md`: the background tasks that hub-guard's registry (FR-136) still knows as running in the old session. Their
   notifications reach the fresh context, which did not start them.
 
+These files are the only copy: P0 found that the transcript keeps no text of a dropped worker message, and nothing at
+all of one consumed at `session.receive`.
+
 A cron tick is not kept, because the resume ends with a tick. The resume moves each file it has read to
 `cold-inbox/read/`, and a later tick reads any file the resume missed.
 
-From the drop until the resume's turn starts, every further prompt nobody typed is kept and dropped the same way, so a
-queued worker message cannot reach the fresh context before the resume does.
+From the drop until hub-guard submits `/hub resume`, every further prompt nobody typed is kept and dropped the same
+way, so a queued worker message cannot reach the fresh context before the resume does. The window is not keyed to a
+`turn.complete`: P0 saw a tick that fired during a turn reach `prompt.submit` after that turn's last step and before
+its `turn.complete`. hub-guard's own mail, which it delivers through `$.prompt.submit` with origin `plugin`, waits in
+the window too.
 
 ### What the fresh context reads
 
@@ -172,11 +178,16 @@ Pure functions in `hub-guard/hooks/core.ts`, beside 0.5.0's `idleDue()`:
 
 `register.ts`:
 
-- the `prompt.submit` hook, or an earlier hook where P0 finds one for a kind (`session.receive` answered with
-  `{ consumed }` for a worker's message);
-- the keep, drop, clear and resume steps on timers, because `$.command.run` rejects inside a hook that a turn waits on;
-- the new session id read by polling `$.session.id()`, because `session.start` does not fire after `/clear`. hub-guard
-  already re-keys on a new session id this way;
+- the `prompt.submit` hook, keyed on `e.origin.kind`. P0 found that it sees all three kinds and that answering without
+  `next` stops the request for each. `session.receive` answered with `{ consumed }` also stops a worker's message, but
+  is not needed;
+- the keep, drop, clear and resume steps on timers, because `$.command.run` rejects inside a hook that a turn waits on.
+  Each step awaits the one before it, never a fixed delay: a `/clear` resolves only once the new session has started
+  (5.7 to 18.9 s in P0, paced by crestore's `SessionEnd` hook), and the new context settles 6 to 17 s later;
+- the new session id read by polling `$.session.id()`, because `session.start` does not fire after `/clear` (P0: one
+  `session.start` in three clears). hub-guard already re-keys on a new session id this way;
+- no message to itself: a plugin's `$.session.send` to its own session is refused (P0), so the fresh context learns
+  why it started from `/hub resume <id> cold` and the cold inbox;
 - a toast, and an `events.log` line for each rotation and for each cold prompt it let through, with the condition that
   failed.
 
@@ -187,17 +198,20 @@ Its seams follow 0.5.0's: `HUB_GUARD_COLD_MIN_K` (the threshold in thousands of 
 
 From the engine's type definitions (Claude Code 2.1.322) and the plugins that already use them:
 
-| Question | What is known | What P0 proves |
-|---|---|---|
-| Does a `prompt.submit` hook see a cron tick, a worker's message and a task notification, and with which origin? | The types list `scheduled-trigger`, `peer` and `task-notification`. In transcripts a cron tick is a meta prompt with `turnOrigin: scheduled` and no `origin` object. | the live event of each kind |
-| Does answering without `next` stop the model request for each kind? | "Answering without `next` enters nothing." What becomes of a dropped cron tick or worker message is not documented, and a rewrite is ignored for a meta prompt that starts a turn. | no request; the cron's next fire still comes; a dropped prompt is not sent again. If not, whether aborting at `turn.start` stops the request first. |
-| Can a timer run `/clear` and then `/hub resume <id> cold`? | Cache Keeper and the auto-handoff plugin clear and then submit this way, and hub-guard 0.5.0 runs `/hub-handoff` through `$.command.run`. | the same with a skill and its arguments |
-| Does the cron survive `/clear`, and does the session keep its name? | `CronList` right after a `/clear` still listed the hub's tick in three sessions. A `/clear` can change the session's name, which workers address. | the next fire reaches the fresh context; how long a worker's message can miss the hub |
-| Does Cache Keeper leave a clear it did not start alone? | Its `cleared()` pastes only after a clear it started itself. | no paste and no hold after ours |
-| Does `/clear` empty the prompt box? | not known | what condition 7 can rely on |
+| Question | What is known | What P0 proves | P0's answer (2026-11-22, Claude Code 2.1.322) |
+|---|---|---|---|
+| Does a `prompt.submit` hook see a cron tick, a worker's message and a task notification, and with which origin? | The types list `scheduled-trigger`, `peer` and `task-notification`. In transcripts a cron tick is a meta prompt with `turnOrigin: scheduled` and no `origin` object. | the live event of each kind | **Yes, all three.** A tick has origin `scheduled-trigger` and `isMeta: true`; a worker's message has `peer` and `isMeta: true`, and `session.receive` sees it first; a task notification has `task-notification`. `peer-send-message` never appeared. |
+| Does answering without `next` stop the model request for each kind? | "Answering without `next` enters nothing." What becomes of a dropped cron tick or worker message is not documented, and a rewrite is ignored for a meta prompt that starts a turn. | no request; the cron's next fire still comes; a dropped prompt is not sent again. If not, whether aborting at `turn.start` stops the request first. | **Yes, for each kind.** No assistant record followed any dropped prompt, and Cache Keeper's `lastAt` did not move. The cron's next fire came every minute, and a later request carried none of the dropped prompts. The `turn.start` fallback was not needed. |
+| Can a timer run `/clear` and then `/hub resume <id> cold`? | Cache Keeper and the auto-handoff plugin clear and then submit this way, and hub-guard 0.5.0 runs `/hub-handoff` through `$.command.run`. | the same with a skill and its arguments | **Yes.** A timer awaited `/clear` through `$.command.run`, then ran a probe skill with three arguments, which it received exactly. The skill's run reaches `prompt.submit` with origin `plugin`. |
+| Does the cron survive `/clear`, and does the session keep its name? | `CronList` right after a `/clear` still listed the hub's tick in three sessions. A `/clear` can change the session's name, which workers address. | the next fire reaches the fresh context; how long a worker's message can miss the hub | **Yes to both.** 39 ticks in 39 minutes across three clears, none missed. The name, the pid and the messaging socket stayed the same; only the session id changed. A message that arrived during a clear reached the fresh context 17.3 s later, and none was lost. |
+| Does Cache Keeper leave a clear it did not start alone? | Its `cleared()` pastes only after a clear it started itself. | no paste and no hold after ours | **Yes.** No paste, no hold and no held file after any of the three clears. |
+| Does `/clear` empty the prompt box? | not known | what condition 7 can rely on | **No.** A draft typed before the clear stayed in the box after each clear and after the skill's turn. |
+| Does handoff-guard hold a `/clear` that a plugin runs? | It holds a typed `/exit`, `/clear` or `/resume` until the session's handoff is current. | that our clear goes through | **No.** It holds only the origins `composer` and `bridge`. Two clears went through while its record said the handoff was not current. |
 
-If no hook can stop a cron tick before its request, the fallback rotates as soon as the cache goes cold while the hub is
-idle, before any prompt arrives (D5).
+If no hook could stop a cron tick before its request, the fallback would rotate as soon as the cache goes cold while the
+hub is idle, before any prompt arrives (D5). P0 found that a drop stops the request for every kind, so D5 is not
+needed. P0 ran in a throwaway session in the pty harness, with its probe plugin loaded for that session alone; the
+field log has its numbers.
 
 ### Kill switches
 
@@ -209,7 +223,7 @@ file, or `HUB_GUARD=off`, turns off the whole guard. `HUB_GUARD_COLD_MIN_K=0` al
 
 | Phase | Scope | Status | Kill switch |
 |---|---|---|---|
-| P0 | Prove the engine points (P0's questions) on throwaway sessions in the pty harness, at no model cost where a question allows | not started | — (nothing changes) |
+| P0 | Prove the engine points (P0's questions) on throwaway sessions in the pty harness, at no model cost where a question allows | **done 2026-11-22**: every answer allows the design (P0's answers above, and the field log) | — (nothing changes) |
 | P1 | The hub skill: the person-turn line, the handoff's newest block and its archive, `/hub resume <id> cold` with its three reads, a tick that resumes first, the note on schedules | not started | the skill's previous commit |
 | P2 | hub-guard 0.6.0, the `cold` part: the pure functions with their unit tests, the hook, the steps, the inbox, the toast and the `events.log` lines. **D1 decided 2026-11-22: allow.** | not started | the part `cold`; `HUB_GUARD_COLD_MIN_K=0`; the hub flag |
 | P3 | Field: a lab hub through each condition, with a seam that judges the cache cold sooner so that no cell waits an hour; then a live hub's next real cold prompt, and seven days of its `events.log` | not started | as P2 |
@@ -246,7 +260,7 @@ file, or `HUB_GUARD=off`, turns off the whole guard. `HUB_GUARD_COLD_MIN_K=0` al
 | D2 | The threshold for the re-read. | 150k, the same as Cache Keeper's hold. A fresh resume reaches about 150k after twenty requests. |
 | D3 | When is the handoff current enough? | When it was written after the last turn a person started had ended (condition 6). |
 | D4 | A tick schedule longer than an hour. | Keep it allowed, and say what it costs: with FR-152 each slow tick is a fresh resume; without it, each one re-reads the whole context. |
-| D5 | Only if P0 finds that no hook can stop a cron tick before its request: rotate as soon as the cache goes cold while the hub is idle. | It needs the operator's word, because it also decides for a person who comes back to a cold hub, whom Cache Keeper would otherwise ask. |
+| D5 | Only if P0 finds that no hook can stop a cron tick before its request: rotate as soon as the cache goes cold while the hub is idle. | **Not needed (P0, 2026-11-22): a drop stops the request for every kind.** It would have needed the operator's word, because it also decides for a person who comes back to a cold hub, whom Cache Keeper would otherwise ask. |
 
 ## Out of scope
 
@@ -271,6 +285,10 @@ with links to FR-131 and FR-136. `agent-hub.md` already has its `docs/README.md`
 | 2026-11-22 | bl1's coordinator transcript, 2026-11-04 → 11-19 (1,308 responses) | 90 cold re-reads, all started by prompts nobody typed: 79 ticks and 11 worker messages, 43.5M tokens written. The three-hour tick schedule caused them. |
 | 2026-11-22 | the 28 sessions of the same weeks that began with `/hub resume` | first request median 74k; the 20th about 150k, about 7 minutes in |
 | 2026-11-22 | bl1's cold tick at 10:53 | about 325k re-read after a usage limit; $2.60 at $8 per million |
+| 2026-11-22 | P0: a throwaway Haiku session in the pty harness, 22:50–23:46Z, its probe plugin loaded for that session alone: a cron every minute, a background task, four worker messages, and three `/clear`s run by the probe | 39 ticks, 1 task notification and 4 worker messages arrived. 42 were dropped at `prompt.submit` and 1 was consumed at `session.receive`, all with no model request; 1 tick was let through on purpose as a control. `turn.start` fired only for the 3 turns started on purpose. Every answer allows the design (P0's questions). |
+| 2026-11-22 | P0: the time a `/clear` takes on the operator's machine | 5.7, 14.8 and 18.9 s until the new session had started (crestore's `SessionEnd` hook sets the pace), then 6 to 17 s until the context settled; plugin timers stall meanwhile |
+| 2026-11-22 | P0: the throwaway's environment | It inherited `CRESTORE_WAKE` from the session that started it, so crestore recorded it as carrying on that session's predecessor (harmless here: that one already had a successor). The pty harness now leaves `CRESTORE_*` out, as it does `CLAUDE*` and `HUB_*`; P3's lab sessions must start without them too. |
+| 2026-11-22 | P0: the cost | 3 throwaway turns on Haiku 5.5, about $0.02 |
 
 ## Related
 
