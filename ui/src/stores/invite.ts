@@ -88,6 +88,16 @@ export const useInviteStore = defineStore('invite', () => {
   let listSeq = 0
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** #4257 — which org `invites` describes: the org of the latest list,
+   *  answered or not. A list for another org drops the rows first, so one
+   *  org's invites never show under another org's page, while that org's
+   *  list loads or after it failed. */
+  const invitesTenantId = ref<string | null>(null)
+
+  /** An invite created for `tenantId` joins the list only when the list is
+   *  not another org's. */
+  const listIsOf = (tenantId: string) =>
+    invitesTenantId.value === null || invitesTenantId.value === tenantId
 
   async function fetchInviteInfo(code: string) {
     loading.value = true
@@ -119,6 +129,11 @@ export const useInviteStore = defineStore('invite', () => {
     // Back-compat: the pre-FR-11 signature was (tenantId, page).
     const o: InviteFetchOpts = typeof opts === 'number' ? { page: opts } : opts
     const mySeq = ++listSeq
+    if (invitesTenantId.value !== null && invitesTenantId.value !== tenantId) {
+      invites.value = []
+      total.value = 0
+    }
+    invitesTenantId.value = tenantId
     loading.value = true
     error.value = null
     try {
@@ -154,7 +169,9 @@ export const useInviteStore = defineStore('invite', () => {
     error.value = null
     try {
       const invite = await api.post<Invite>(`/tenant/${tenantId}/invite`, params)
-      invites.value.unshift(invite)
+      // #4257 — a create answered after the page moved on to another org
+      // happened all the same; it stays out of that org's list.
+      if (listIsOf(tenantId)) invites.value.unshift(invite)
       return invite
     } catch (e) {
       error.value = (e as Error).message
@@ -175,9 +192,10 @@ export const useInviteStore = defineStore('invite', () => {
         `/tenant/${tenantId}/invite/batch`,
         { invites: params },
       )
-      // Add successfully created invites to the list
+      // Add successfully created invites to the list, when it is this org's
+      // (#4257: a batch answered for an org the page has left stays out).
       for (const r of result.results) {
-        if (r.invite) {
+        if (r.invite && listIsOf(tenantId)) {
           invites.value.unshift(r.invite)
         }
       }
@@ -208,6 +226,7 @@ export const useInviteStore = defineStore('invite', () => {
   return {
     inviteInfo,
     invites,
+    invitesTenantId,
     total,
     page,
     perPage,

@@ -676,7 +676,7 @@ describe("MembersSection: the org's people and their roles (#4257)", () => {
 
   /** A button by its text, on the grid row that names `who`. */
   function rowButton(w: VueWrapper, who: string, text: string): HTMLElement {
-    const row = Array.from(w.element.querySelectorAll<HTMLElement>('tbody tr')).find((r) =>
+    const row = Array.from((w.element as HTMLElement).querySelectorAll<HTMLElement>('tbody tr')).find((r) =>
       r.textContent?.includes(who),
     )
     if (!row) throw new Error(`no row for ${who}`)

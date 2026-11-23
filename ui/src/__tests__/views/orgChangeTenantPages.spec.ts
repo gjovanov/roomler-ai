@@ -864,8 +864,10 @@ describe('The Invites page follows its org (#4257)', () => {
     await clickButton('Batch Invite')
     expect(activeDialog()!.querySelector<HTMLInputElement>('input[type="email"]')!.value).toBe('')
     expect(dialog.findComponent({ name: 'VSelect' }).props('modelValue')).toBe('')
-    expect(dialog.props('tenantId')).toBe(ORG_B)
-    expect((dialog.props('roles') as Array<{ name: string }>).map((r) => r.name)).toEqual(['Org B operators'])
+    // Under bun's runtime vue-tsc knows no props of a .vue component.
+    const handed = dialog.props() as unknown as { tenantId: string; roles: Array<{ name: string }> }
+    expect(handed.tenantId).toBe(ORG_B)
+    expect(handed.roles.map((r) => r.name)).toEqual(['Org B operators'])
     expectNothingRaised()
   })
 
