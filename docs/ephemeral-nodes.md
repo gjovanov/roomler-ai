@@ -280,6 +280,11 @@ device left").
 - A reaped-but-still-running device (unclean-stop survivor, network partition)
   hears **401** on its next control-plane call — its credential died with the
   row — and its self-unenroll treats 401/404 as "already gone".
+- **`sudo roomlerd one-row` refuses an ephemeral row on a Mac** before it
+  changes anything (#4312, [FR-147](fr/FR-147-root-out-of-homes-macos.md)'s
+  "Refusals at Plan"): its restart and its bootout are stops, on which the row
+  deletes itself, and a row it retires sits offline for the reaper, so
+  `--revert` could bring neither back.
 - Every reap logs
   `ephemeral device reaped` with tenant, device, silence and TTL; every
   self-removal logs `ephemeral device unenrolled itself`. The lifecycle also
