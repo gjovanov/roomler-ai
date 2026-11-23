@@ -16,7 +16,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
 };
 use bson::oid::ObjectId;
 use roomler_ai_db::models::{RcFeaturePolicy, RcSessionLimits, RcSessionPolicy, role::permissions};
@@ -101,11 +101,16 @@ pub async fn get_policy(
 /// decides for every session in the org at once. Answers with the stored
 /// policy. Each change is logged naming the admin; the per-session effect is
 /// in each session's `session_requested` audit row (`features_stripped`).
+///
+/// The bit is decided before the body is read (#4254): a caller without it
+/// gets the gate's answer whatever the body is, and a holder is answered one
+/// that does not parse as the `Json` extractor answered it, before the
+/// handler judges the values it sets.
 pub async fn set_policy(
     State(state): State<RemoteState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<RcSessionPolicyUpdate>,
+    body: Result<Json<RcSessionPolicyUpdate>, JsonRejection>,
 ) -> Result<Json<RcSessionPolicy>, ApiError> {
     let tid = tenant_of(&tenant_id)?;
     require_permission(
@@ -116,6 +121,7 @@ pub async fn set_policy(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     let clipboard = body
         .clipboard
         .as_deref()
@@ -242,11 +248,16 @@ pub async fn get_limits(
 /// `PUT /api/tenant/{tenant_id}/rc-session-limits` — `MANAGE_TENANT`. A new
 /// limit applies to sessions that go live after it; a live session keeps the
 /// one it started with.
+///
+/// The bit is decided before the body is read (#4254): a caller without it
+/// gets the gate's answer whatever the body is, and a holder is answered one
+/// that does not parse as the `Json` extractor answered it, before the
+/// handler judges the limits it sets.
 pub async fn set_limits(
     State(state): State<RemoteState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<RcSessionLimitsUpdate>,
+    body: Result<Json<RcSessionLimitsUpdate>, JsonRejection>,
 ) -> Result<Json<RcSessionLimitsDto>, ApiError> {
     let tid = tenant_of(&tenant_id)?;
     require_permission(
@@ -257,6 +268,7 @@ pub async fn set_limits(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     if body.max_secs.is_none() && body.idle_secs.is_none() {
         return Err(ApiError::BadRequest(
             "Nothing to set: max_secs, idle_secs".into(),
