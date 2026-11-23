@@ -4060,11 +4060,16 @@ mod tests {
             "tenant t1",
             "is ephemeral, and the root half holds that org",
             "`--revert` could not bring it back",
-            "a key that is not ephemeral, into a new config",
+            "Remove it on the Devices page (an ephemeral row never turns permanent)",
+            "enroll casey's half again with a key that is not ephemeral: that half's config",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
     }
 
     /// #4312 — the unheld refusal keeps its meaning, and its way on no longer
@@ -4086,12 +4091,17 @@ mod tests {
             "tenant t2",
             "the root half does not hold that org",
             "lives only with the half that enrolled it",
-            "a key that is not ephemeral, into a new config",
+            "Remove it on the Devices page (an ephemeral row never turns permanent)",
+            "enroll casey's half again with a key that is not ephemeral: that half's config",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
         assert!(!e.contains("enroll the root half there"), "{e}");
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
     }
 
     #[test]
@@ -5058,12 +5068,16 @@ mod tests {
             "tenant t1",
             "is ephemeral",
             "one-row restarts the daemon, and on that stop an ephemeral row deletes itself",
-            "Enroll the root half again with a key that is not ephemeral, into a new \
-             /etc/roomler/config.toml",
+            "Remove it on the Devices page (an ephemeral row never turns permanent) and enroll",
+            "the root half again with a key that is not ephemeral: /etc/roomler/config.toml keeps",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
         assert_eq!(mac.files(), before);
         assert!(!mac.wrote(), "{:?}", mac.calls);
         assert!(mac.loaded.contains(&501), "casey's agent is not booted out");
@@ -5161,12 +5175,17 @@ mod tests {
             "tenant t1",
             "is ephemeral",
             "an ephemeral row deletes itself",
-            "a key that is not ephemeral, into a new /etc/roomler/config.toml",
-            "remove /etc/roomler/config.toml.pre-one-row",
+            "Remove it on the Devices page (an ephemeral row never turns permanent)",
+            "remove /etc/roomler/config.toml.pre-one-row, whose enrollment cannot come back, and",
+            "a key that is not ephemeral: /etc/roomler/config.toml keeps its settings",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
         assert_eq!(mac.files(), before);
         assert!(!mac.wrote(), "{:?}", mac.calls);
         // Converted by an older release: its revert reads root's own file.
@@ -5179,11 +5198,16 @@ mod tests {
             "--revert is refused",
             "tenant t1",
             "is ephemeral",
-            "a key that is not ephemeral, into a new /etc/roomler/config.toml",
+            "Remove it on the Devices page (an ephemeral row never turns permanent) and enroll",
+            "a key that is not ephemeral: /etc/roomler/config.toml keeps its settings",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
         assert!(!e.contains(".pre-one-row"), "{e}");
         assert_eq!(old.files(), before);
         assert!(!old.wrote(), "{:?}", old.calls);
