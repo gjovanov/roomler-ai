@@ -230,7 +230,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:3232`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:3255`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:999`) and `folder_words` (`:1132`), with `r5_words` (`:1178`); `refusals` (`:1520`) says them.
 
 ### Refusals at Plan
@@ -254,19 +254,23 @@ Each comes before Keep, so no file is written and launchd is asked nothing, and 
 A person's line comes from the pure `plan`, before the plan is said. The root half's comes after it, beside R1 to R5,
 and `--revert`'s after its own plan.
 
-Each line ends with the way on: enroll that half again with a key that is not ephemeral, into a new config. An
-enrollment folded into an existing config keeps that config's `ephemeral` (`preserve_operator_config`,
-`crates/agent-core/src/enrollment.rs:813-825`; `OVER_EPHEMERAL`, `one_row.rs:712`). The line before #4312 also
-offered "unenroll it first" and "enroll the root half there", and neither gets past it now: no command takes an
-enrollment out of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5868-5871`),
-and an org the root half holds is refused too.
+Each line ends with the way on: remove the row on the Devices page, then enroll that half again with a key that is
+not ephemeral. The same file serves. Since #4331 an enrollment that folds into a file keeps the file's settings and
+takes `ephemeral` from the server's answer, which is the row's (`preserve_operator_config`,
+`crates/agent-core/src/enrollment.rs:816-829`; the answer, `crates/modules/fleet/src/agent.rs:462`). The row goes
+first because a live ephemeral row stays ephemeral when a standard token enrolls over it (`OVER_EPHEMERAL`,
+`one_row.rs:712`; [`ephemeral-nodes.md`](../ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)). Until
+#4331 the way on was a new config, since a fold kept the old file's flag. The line before #4312 also offered
+"unenroll it first" and "enroll the root half there", and neither gets past it: no command takes an enrollment out
+of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5868-5871`), and an org
+the root half holds is refused too.
 
 | Case | The line, after `Error: ` (exit 1) |
 |---|---|
-| The root half | `the root half's enrollment (<server>, tenant <tenant>) is ephemeral: one-row restarts the daemon, and on that stop an ephemeral row deletes itself. Enroll the root half again with a key that is not ephemeral, into a new /etc/roomler/config.toml (an enrollment over an ephemeral one stays ephemeral), then run this again. Nothing has changed` |
-| A person, held | ``<name>'s enrollment (<server>, tenant <tenant>) is ephemeral, and the root half holds that org: one-row would retire that row. Its half deletes it when the bootout stops it, and the server's reaper, where it runs, deletes it while it sits offline, so `--revert` could not bring it back. Enroll <name>'s half again with a key that is not ephemeral, into a new config (an enrollment over an ephemeral one stays ephemeral), then run this again. Nothing has changed`` |
-| A person, not held | `<name>'s enrollment (<server>, tenant <tenant>) is ephemeral, and the root half does not hold that org: an ephemeral row lives only with the half that enrolled it, so it cannot move to the root half. Enroll <name>'s half again with a key that is not ephemeral, into a new config (an enrollment over an ephemeral one stays ephemeral), then run this again. Nothing has changed` |
-| `--revert`, root's kept copy | `--revert is refused: the root half's enrollment (<server>, tenant <tenant>) in /etc/roomler/config.toml.pre-one-row, which --revert puts back first, is ephemeral: --revert restarts the daemon onto that file, and on that stop an ephemeral row deletes itself, so the root half would come back on a dead token. Enroll the root half again with a key that is not ephemeral, into a new /etc/roomler/config.toml (an enrollment over an ephemeral one stays ephemeral), and remove /etc/roomler/config.toml.pre-one-row, whose enrollment cannot come back, then run this again. Nothing has changed` |
+| The root half | `the root half's enrollment (<server>, tenant <tenant>) is ephemeral: one-row restarts the daemon, and on that stop an ephemeral row deletes itself. Remove it on the Devices page (an ephemeral row never turns permanent) and enroll the root half again with a key that is not ephemeral: /etc/roomler/config.toml keeps its settings. Then run this again. Nothing has changed` |
+| A person, held | ``<name>'s enrollment (<server>, tenant <tenant>) is ephemeral, and the root half holds that org: one-row would retire that row. Its half deletes it when the bootout stops it, and the server's reaper, where it runs, deletes it while it sits offline, so `--revert` could not bring it back. Remove it on the Devices page (an ephemeral row never turns permanent) and enroll <name>'s half again with a key that is not ephemeral: that half's config keeps its settings. Then run this again. Nothing has changed`` |
+| A person, not held | `<name>'s enrollment (<server>, tenant <tenant>) is ephemeral, and the root half does not hold that org: an ephemeral row lives only with the half that enrolled it, so it cannot move to the root half. Remove it on the Devices page (an ephemeral row never turns permanent) and enroll <name>'s half again with a key that is not ephemeral: that half's config keeps its settings. Then run this again. Nothing has changed` |
+| `--revert`, root's kept copy | `--revert is refused: the root half's enrollment (<server>, tenant <tenant>) in /etc/roomler/config.toml.pre-one-row, which --revert puts back first, is ephemeral: --revert restarts the daemon onto that file, and on that stop an ephemeral row deletes itself, so the root half would come back on a dead token. Remove it on the Devices page (an ephemeral row never turns permanent), remove /etc/roomler/config.toml.pre-one-row, whose enrollment cannot come back, and enroll the root half again with a key that is not ephemeral: /etc/roomler/config.toml keeps its settings. Then run this again. Nothing has changed` |
 | `--revert`, no kept copy | the same, naming `/etc/roomler/config.toml` and with nothing to remove |
 
 ### Root's records
@@ -335,9 +339,9 @@ verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
   group or others can write, and the package sets 644 (`postinstall:360-361`). It writes the config with its
   recorded owner bits, 0600 when none was recorded: the file holds a token and a key.
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
-  (`crates/agent-core/src/config.rs:4049-4065`): the same rules, no path, unknown keys noted from the text
-  (`note_unknown_keys` reads by path, `:4453-4457`), and no `.prev` repair, which belongs to the person's own agent
-  (`:3627-3659`). A config that does not parse stops Read, as before (`find_people`, `one_row.rs:1450`). Root never parses the
+  (`crates/agent-core/src/config.rs:4064-4080`): the same rules, no path, unknown keys noted from the text
+  (`note_unknown_keys` reads by path, `:4484-4488`), and no `.prev` repair, which belongs to the person's own agent
+  (`:3627-3674`). A config that does not parse stops Read, as before (`find_people`, `one_row.rs:1450`). Root never parses the
   plist's bytes.
 - **Failure.** A non-zero exit, a death by signal, a reply that does not parse, exceeds its bound or carries another
   identity or version, or the deadline: at Read the command stops with nothing changed; during the conversion it is
@@ -636,7 +640,7 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2973`, its sequence at `:3001`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2996`, its sequence at `:3024`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:3196`): one-row's row, and
@@ -710,7 +714,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - The running two-row worker saving the person's config during the conversion, as today.
 - Repairing a `~/Library/LaunchAgents` that an earlier package made (#3763).
 - The person's `config.toml.prev` after a conversion still holds the enrollment that moved to root (a save keeps the
-  previous file), and the person's agent's `.prev` repair (`config.rs:3627-3659`) could bring it back: its own issue
+  previous file), and the person's agent's `.prev` repair (`config.rs:3627-3674`) could bring it back: its own issue
   (#4184). The worker root's supervisor starts never restores it at its start (#4157): with `--unenrolled` it writes
   a blank file, and without it (`macos_one_row` turned off by hand, with no `--revert`) it ends with 78 as before.
 - Linux and Windows: their root steps take their folders from the system already (#3702). On Linux that holds for

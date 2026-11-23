@@ -2300,7 +2300,7 @@ impl LocalApiState for DaemonState {
     ///   * both copies must parse and carry the SAME `agent_id` (a different
     ///     id = a second enrollment — refused, an operator must decide),
     ///   * the stale copy is renamed aside (`config.toml.stale-<ts>`), never
-    ///     deleted.
+    ///     deleted, its `.prev` with it ([`set_aside`], #4176).
     async fn config_cleanup_stale(&self) -> Response {
         let Some((live_path, lock)) = self.config_persist.as_ref() else {
             return Response::Error {
@@ -2364,9 +2364,8 @@ impl LocalApiState for DaemonState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let archived = stale_path.with_extension(format!("toml.stale-{ts}"));
-        match std::fs::rename(&stale_path, &archived) {
-            Ok(()) => {
+        match set_aside(&stale_path, ts) {
+            Ok(archived) => {
                 tracing::info!(
                     stale = %stale_path.display(),
                     archived = %archived.display(),
@@ -2386,6 +2385,23 @@ impl LocalApiState for DaemonState {
             },
         }
     }
+}
+
+/// S1b — set the stale config at `stale` aside as `config.toml.stale-<ts>`.
+/// #4176 — its last good copy (`.prev`) first, as `config.toml.prev.stale-<ts>`:
+/// a start restores a missing config from that copy, so a copy left beside it
+/// would bring back the config this sets aside. A copy that cannot be moved
+/// moves nothing; with no copy, the config alone.
+fn set_aside(stale: &std::path::Path, ts: u64) -> std::io::Result<std::path::PathBuf> {
+    let copy = crate::config::prev_path(stale);
+    match std::fs::rename(&copy, copy.with_extension(format!("prev.stale-{ts}"))) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let archived = stale.with_extension(format!("toml.stale-{ts}"));
+    std::fs::rename(stale, &archived)?;
+    Ok(archived)
 }
 
 /// Overlay [`ConnectionType::Tunnel`] onto every peer whose WG carrier is down
@@ -2511,6 +2527,43 @@ pub(crate) mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tunnel_core::localapi::ConnectionType;
+
+    /// #4176 — the cleanup sets the stale config's last good copy (`.prev`)
+    /// aside with it, the copy first: a start restores a missing config from
+    /// its copy, and a copy left behind would bring back the config the
+    /// cleanup set aside. A copy that cannot be set aside moves nothing.
+    #[test]
+    fn the_cleanup_sets_the_last_good_copy_aside_with_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = dir.path().join("config.toml");
+        let copy = dir.path().join("config.toml.prev");
+        std::fs::write(&stale, "config").expect("the config");
+        std::fs::write(&copy, "copy").expect("its copy");
+        let archived = set_aside(&stale, 7).expect("set aside");
+        assert_eq!(archived, dir.path().join("config.toml.stale-7"));
+        assert!(!stale.exists() && !copy.exists(), "both set aside");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.prev.stale-7")).ok(),
+            Some("copy".to_string())
+        );
+
+        // No copy: the config alone.
+        std::fs::write(&stale, "config").expect("the config");
+        assert_eq!(
+            set_aside(&stale, 8).expect("set aside"),
+            dir.path().join("config.toml.stale-8")
+        );
+        assert!(!stale.exists());
+
+        // A copy that cannot take its new name: nothing moves.
+        std::fs::write(&stale, "config").expect("the config");
+        std::fs::write(&copy, "copy").expect("its copy");
+        let taken = dir.path().join("config.toml.prev.stale-9");
+        std::fs::create_dir(&taken).expect("a folder in the way");
+        std::fs::write(taken.join("x"), "x").expect("not empty");
+        assert!(set_aside(&stale, 9).is_err());
+        assert!(stale.exists() && copy.exists(), "nothing moved");
+    }
 
     /// P8-cosmetics — the locale-tolerant ping-output parse: English, German,
     /// sub-millisecond, and Linux fractional forms all yield the right integer;
