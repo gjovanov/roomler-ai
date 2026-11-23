@@ -263,10 +263,10 @@ $ roomler status
   the sentence per word, `last_install_line`, `:2966`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:2208`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4313`). `journalctl -u
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4341`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
-  level is `startup_level`'s (`:1265`): the two quiet states and a watcher
+  level is `startup_level`'s (`post_install.rs:2192`): the two quiet states and a watcher
   still at work are INFO; everything else is WARN.
 - **The watcher's own line — a surface that ends at 0.4.176.** Written as
   the verdict lands: `post-install verdict: SucceededVerified (new binary at
