@@ -27,7 +27,7 @@
 //! | LaunchAgent | booted out by label | | the same |
 //! | Read again | where an agent's save as it stopped moved only its own run state, that person's files kept again, `record.json` last ([`since_read`], #4097) | `read` again, for each person whose agent was booted out | the same; anything else that moved stops it here |
 //! | Root's file | both switches on, moved enrollments appended to `[[orgs]]` | | the same |
-//! | People's files | | `convert`, over the bytes root kept last: identity blanked, `[[orgs]]` emptied, every other key kept; the plist removed | `put-back` for every person started, answered or not, but one whose process refused before any change ([`before_any_change`]) |
+//! | People's files | | `convert`, over the bytes root kept last: identity blanked, `[[orgs]]` emptied, every other key kept, the new file kept as its `.prev` too (#4184); the plist removed. A `.prev` it cannot replace stops it before the config (exit 1) | `put-back` for every person started, answered or not, but one whose process refused before any change ([`before_any_change`]) |
 //! | Restart | `launchctl kickstart -k`, which ends live sessions | | puts everything back, and restarts |
 //! | Verify | within 60 s: connected, the worker attached, `screen-capture` | | the same, and says what it saw |
 //! | Report | each retired row, and where a person deletes it | | |

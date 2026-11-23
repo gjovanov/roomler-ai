@@ -49,8 +49,8 @@
 //! `rename`, as the daemon saves its config. `convert` writes only from the
 //! bytes it checked, and reads no file again by path: the new config is the
 //! text a save would write over them (`config::serialise_over`, which keeps
-//! the keys this build does not know), and they are kept as the config's
-//! `.prev` (0600), as a save keeps the outgoing file. `put-back` gives the
+//! the keys this build does not know), kept first as its `.prev` too (0600):
+//! root's records alone keep the outgoing bytes (#4184). `put-back` gives the
 //! plist its recorded mode less group and other write (0644 when none was
 //! recorded: launchd ignores a plist others can write) and the config its
 //! recorded owner bits (0600 when none), and makes a missing
@@ -980,10 +980,10 @@ fn not_writable(fs: &impl Fs, path: &Path) -> Fail {
 /// `convert`: both live files checked against what root named, both folders
 /// it changes checked writable, and the new config made from the bytes it
 /// checked and held to its bound, before anything changes; then the plist
-/// goes, those bytes are kept as the config's `.prev` and the new config is
-/// written. The reply's sha256 is of the bytes it wrote: no file is read
-/// again by path. The keys of the outgoing config it could not keep, and a
-/// `.prev` it could not write, go in `said`.
+/// goes, and the new config is written as the config's `.prev` (#4184), then
+/// as the config. The reply's sha256 is of the bytes it wrote: no file is
+/// read again by path. The keys of the outgoing config it could not keep go
+/// in `said`; a `.prev` it could not write is exit 1, before the config.
 fn convert(
     at: &Places,
     want_config: Expect,
@@ -1024,7 +1024,7 @@ fn convert(
                     lost.join(", ")
                 ));
             }
-            Some((bytes, blank))
+            Some(blank)
         }
         None => None,
     };
@@ -1037,16 +1037,20 @@ fn convert(
         None => false,
     };
     let config_sha256 = match blank {
-        Some((outgoing, blank)) => {
-            // Kept as a save keeps the outgoing file: it parsed, and a copy
-            // that cannot be made costs its recovery, not the verb.
+        Some(blank) => {
+            // #4184 — the new file is the `.prev` too, written first: a load
+            // restores the `.prev` of a config that is missing or does not
+            // load, and one left as it was may hold the enrollments.
             let prev = crate::config::prev_path(&at.config);
-            if let Err(e) = fs.write(&prev, outgoing, 0o600) {
-                said.push(format!(
-                    "the outgoing config was not kept as {}: {e}",
+            fs.write(&prev, blank.as_bytes(), 0o600).map_err(|e| {
+                Fail::Error(format!(
+                    "{} could not be replaced ({e}), so {origin} was not converted: what is at \
+                     that name may hold the enrollments this conversion takes out, and a load of \
+                     the config restores it. Remove what is there or free disk space, then run \
+                     `sudo roomlerd one-row` again",
                     prev.display()
-                ));
-            }
+                ))
+            })?;
             fs.write(&at.config, blank.as_bytes(), 0o600)
                 .map_err(|e| Fail::Error(format!("saving {origin}: {e}")))?;
             Some(sha256_hex(blank.as_bytes()))
