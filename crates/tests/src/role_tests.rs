@@ -572,3 +572,108 @@ async fn invite_paths_cannot_grant_roles_the_caller_does_not_hold() {
     );
     assert_eq!(body["failed"], 1, "the escalating one is refused: {body}");
 }
+
+/// #4254 — the role writes decide `MANAGE_ROLES` before they read their body
+/// at all, and the update before it reads the role's id: a member without the
+/// bit gets the one 403 `forbidden` for a body that does not even parse, on a
+/// role of the org, on an id that names nothing and on one that is not an id
+/// alike, the answer a body the route reads gets; someone outside the org gets
+/// the one `not_a_member`. While they took `Json<T>` as an extractor, axum
+/// answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone, and the update answered an id that is not an id
+/// with a 400 before it asked the bit.
+#[tokio::test]
+async fn the_role_writes_decide_the_bit_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, call, gate_problems,
+    };
+    use serde_json::json;
+
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("role-unparsed").await;
+    let other = app.seed_tenant("role-unparsed-b").await;
+    let roles = format!("/api/tenant/{}/role", tenant.tenant_id);
+    let (status, listed) = call(&app, "GET", &roles, &tenant.admin.access_token, None).await;
+    assert_eq!(status, 200, "{listed}");
+    let role_id = listed[0]["id"]
+        .as_str()
+        .expect("a role of the org")
+        .to_owned();
+    let fresh = bson::oid::ObjectId::new().to_hex();
+
+    let mut writes = vec![GatedWrite {
+        method: "POST",
+        path: roles.clone(),
+        reads: json!({ "name": "x" }),
+        refused_field: r#"{"name": 7}"#,
+    }];
+    for id in [role_id.as_str(), fresh.as_str(), "not-an-id"] {
+        writes.push(GatedWrite {
+            method: "PUT",
+            path: format!("{roles}/{id}"),
+            reads: json!({ "name": "x" }),
+            refused_field: r#"{"name": 7}"#,
+        });
+    }
+
+    let mut wrong = Vec::new();
+    for (who, token, gate) in [
+        (
+            "a member without the bit",
+            &tenant.member.access_token,
+            Gate::Bit("MANAGE_ROLES"),
+        ),
+        (
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+        ),
+    ] {
+        for write in &writes {
+            wrong.extend(gate_problems(&app, who, token, gate, write).await);
+        }
+    }
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4254's control. The owner is answered a role write that does not parse
+/// exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words, on a role of the org and on an id that is not an id
+/// alike (the extractor answered before the role's id was read, and still
+/// does), and the org's roles are as they were.
+#[tokio::test]
+async fn a_holder_is_answered_a_role_write_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, call, holder_problems};
+    use roomler_ai_api::routes::role::{CreateRoleRequest, UpdateRoleRequest};
+
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("role-unparsed-holder").await;
+    let owner = &tenant.admin.access_token;
+    let roles = format!("/api/tenant/{}/role", tenant.tenant_id);
+    let (status, before) = call(&app, "GET", &roles, owner, None).await;
+    assert_eq!(status, 200, "{before}");
+    let role_id = before[0]["id"]
+        .as_str()
+        .expect("a role of the org")
+        .to_owned();
+
+    let mut wrong =
+        holder_problems::<CreateRoleRequest>(&app, owner, "POST", &roles, r#"{"name": 7}"#).await;
+    for id in [role_id.as_str(), "not-an-id"] {
+        wrong.extend(
+            holder_problems::<UpdateRoleRequest>(
+                &app,
+                owner,
+                "PUT",
+                &format!("{roles}/{id}"),
+                r#"{"name": 7}"#,
+            )
+            .await,
+        );
+    }
+    assert_no_problems("the org's owner", &wrong);
+
+    let (status, after) = call(&app, "GET", &roles, owner, None).await;
+    assert_eq!(status, 200, "{after}");
+    assert_eq!(after, before, "no role was written");
+}

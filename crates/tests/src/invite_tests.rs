@@ -914,3 +914,113 @@ async fn invite_list_supports_q_status_and_sort() {
     assert!(json["items"][0]["target_email"].is_null());
     assert!(json["total_pages"].is_number());
 }
+
+/// #4254 — the invite writes decide `INVITE_MEMBERS` before they read their
+/// body at all: a member without the bit gets the one 403 `forbidden` for a
+/// body that does not even parse, the answer a body the route reads gets, and
+/// someone outside the org the one `not_a_member`. While they took `Json<T>`
+/// as an extractor, axum answered such a body before the handler ran, with a
+/// 400, 415 or 422 decided by the body alone.
+#[tokio::test]
+async fn the_invite_writes_decide_the_bit_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+    use serde_json::json;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("inv-unparsed").await;
+    let other = app.seed_tenant("inv-unparsed-b").await;
+    let org = format!("/api/tenant/{}", seeded.tenant_id);
+    let writes = [
+        GatedWrite {
+            method: "POST",
+            path: format!("{org}/invite"),
+            reads: json!({ "max_uses": 1 }),
+            refused_field: r#"{"max_uses": "x"}"#,
+        },
+        GatedWrite {
+            method: "POST",
+            path: format!("{org}/invite/batch"),
+            reads: json!({ "invites": [{ "max_uses": 1 }] }),
+            refused_field: r#"{"invites": 7}"#,
+        },
+        GatedWrite {
+            method: "POST",
+            path: format!("{org}/member"),
+            reads: json!({ "user_id": other.admin.id }),
+            refused_field: r#"{"user_id": 7}"#,
+        },
+    ];
+
+    let mut wrong = Vec::new();
+    for (who, token, gate) in [
+        (
+            "a member without the bit",
+            &seeded.member.access_token,
+            Gate::Bit("INVITE_MEMBERS"),
+        ),
+        (
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+        ),
+    ] {
+        for write in &writes {
+            wrong.extend(gate_problems(&app, who, token, gate, write).await);
+        }
+    }
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4254's control. The owner is answered an invite write that does not
+/// parse exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words, and no invite is written.
+#[tokio::test]
+async fn a_holder_is_answered_an_invite_write_that_does_not_parse_as_the_json_extractor_answers_it()
+{
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, call, holder_problems};
+    use roomler_ai_api::routes::invite::{
+        AddMemberRequest, BatchCreateInviteRequest, CreateInviteRequest,
+    };
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("inv-unparsed-holder").await;
+    let owner = &seeded.admin.access_token;
+    let org = format!("/api/tenant/{}", seeded.tenant_id);
+
+    let mut wrong = holder_problems::<CreateInviteRequest>(
+        &app,
+        owner,
+        "POST",
+        &format!("{org}/invite"),
+        r#"{"max_uses": "x"}"#,
+    )
+    .await;
+    wrong.extend(
+        holder_problems::<BatchCreateInviteRequest>(
+            &app,
+            owner,
+            "POST",
+            &format!("{org}/invite/batch"),
+            r#"{"invites": 7}"#,
+        )
+        .await,
+    );
+    wrong.extend(
+        holder_problems::<AddMemberRequest>(
+            &app,
+            owner,
+            "POST",
+            &format!("{org}/member"),
+            r#"{"user_id": 7}"#,
+        )
+        .await,
+    );
+    assert_no_problems("the org's owner", &wrong);
+
+    // Nothing was written: the org holds no invite.
+    let (status, listed) = call(&app, "GET", &format!("{org}/invite"), owner, None).await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(listed["total"].as_u64(), Some(0), "{listed}");
+}
