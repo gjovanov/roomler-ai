@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:11391`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:11405`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -504,7 +504,7 @@ label    = "Safari"
 
 | Key | Where | Default | Notes |
 |---|---|---|---|
-| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1930`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
+| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1938`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
 | `virtual_desktop_apps.allowlist.<key>` | config | `bash` on Linux and macOS, `cmd` on Windows | `command` is argv; an empty command is skipped from `launchable` and refused on launch. On a Mac a `terminal`/`tmux` entry opens a new Terminal window running it, and an app is `["open", "-b", "<bundle id>"]` (§2b) |
 | `ROOMLERD_APPS` | env (`apps::APPS_ENV`); published as `0` by `env_fallbacks` from a config that says `false` | unset | FR-97 P2c — a **floor**: `0`/`false`/`no`/`off` switches Remote Apps off (`switched_off`), nothing switches them on. A supervised Mac's root forwards it to its GUI worker, which is how the root's `enabled = false` reaches the sessions |
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1211`) | **off** | P4 — attended by construction; restart required |
@@ -525,7 +525,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3697`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3710`),
 not `load`, because `load` self-heals. When the live file is missing or unreadable and
 its `.prev` copy loads, `load` promotes that copy back over it, without the copy's run
 marks (#4157), and logs *RESTORED* or *RECOVERED from the previous good copy* at ERROR.
