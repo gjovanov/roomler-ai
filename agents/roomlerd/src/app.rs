@@ -40,7 +40,7 @@ use tunnel_core::env::node_env_os;
 
 #[derive(Debug, Parser)]
 #[command(name = "roomlerd", version, about, long_about = None)]
-struct Cli {
+pub(crate) struct Cli {
     /// Override config file location. Defaults to the platform config dir.
     #[arg(long, global = true)]
     config: Option<PathBuf>,

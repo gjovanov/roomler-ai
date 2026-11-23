@@ -61,7 +61,7 @@ impl CliTransport {
 
 #[derive(Debug, Parser)]
 #[command(name = "roomler", version, about, long_about = None)]
-struct Cli {
+pub struct Cli {
     // RETIRED-NAME-ANCHOR(4): the config segment is frozen — it holds the
     // ENROLLED credential on tunnel-only hosts, and renaming it strands
     // every one of them. agents/roomler-cli/src/config.rs
