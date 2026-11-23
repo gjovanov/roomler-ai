@@ -1414,15 +1414,15 @@ pub async fn run(
                         "failed to write needs-attention sentinel for FatalGoodbye"
                     ),
                 }
-                // Exit with the documented code so the SCM
-                // supervisor's rc.53 code-7 fast-alarm fires on this
-                // FIRST exit (not after 8). Operator sees the
-                // structured error within <1 minute.
+                // Exit with the documented code so the SCM supervisor's rc.53
+                // code-7 fast-alarm fires on this FIRST exit (not after 8), with
+                // the run marked clean first: a removal is no crash (#4292).
+                // Operator sees the structured error within <1 minute.
                 // P5/A2 — a fatal goodbye is a PERMANENT stop (the row is gone);
                 // no restart will run the boot reconciler, so drop any exit-node
                 // split-default now or the host stays blackholed until reboot.
                 crate::purge_exit_routes();
-                std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
+                crate::run_end::exit_removed();
             }
             Err(ConnectError::KeyRotated {
                 secret_base64,
@@ -1470,8 +1470,8 @@ pub async fn run(
                 );
 
                 // Legacy escalation (`ws_replaced_exit = true`): sentinel +
-                // process exit at the 3rd displacement, exactly as before
-                // W4(d). Off by default — see below.
+                // process exit at the 3rd displacement, as before W4(d), and
+                // no crash since #4292. Off by default — see below.
                 if displacements >= 3 && cfg.ws_replaced_exit.unwrap_or(false) {
                     // Multi-org P1: a secondary org's duel terminates only
                     // its own loop (see the FatalGoodbye arm's rationale).
@@ -1492,7 +1492,7 @@ pub async fn run(
                     // P5/A2 — bypasses RAII; drop any exit-node split-default so
                     // a duel-losing instance doesn't leave the host blackholed.
                     crate::purge_exit_routes();
-                    std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
+                    crate::run_end::exit_duel_lost();
                 }
 
                 // W4(d) — NO process exit by default. Field (winhost-a, every

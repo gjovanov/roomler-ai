@@ -2959,7 +2959,8 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    `roomlerd-main` thread (#3195), a requested restart, an error, the quit
    backstop, the watchdog, and AppKit's exit 0 after the delegate answers a
    log-out's quit with `NSTerminateNow`, which the delegate marks as chosen
-   (`indicator/mac.rs:557`, #3164). The hook cannot see an `_exit`, a signal
+   (`indicator/mac.rs:557`, #3164) and whose run it marks clean, so the next
+   start does not count it as a crash (`:558`, #4292). The hook cannot see an `_exit`, a signal
    or an exit on another thread. There the seat and the console session,
    read before any window, are what hold.
 
@@ -7718,6 +7719,7 @@ is the one table that decides, on every start:
 | How the last run ended | Who can say | `PreviousRun` | Counts |
 |---|---|---|---|
 | It marked itself clean (`mark_clean_shutdown`) or reached `CLEAN_RUN_THRESHOLD_SECS=300` (`record_clean_run_at`) | `last_run_unhealthy` is false | `Clean` | no |
+| It ended by its own choice: the server removed or refused the device (exit 7), it lost a duplicate-instance duel (exit 7), or macOS asked it to quit and AppKit exited 0 | the run itself, which marks itself clean before the exit ([`run_end`](../agents/roomlerd/src/run_end.rs), #4292) | `Clean` | no |
 | Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1078)) | `EndedByItsHost` | no |
 | The OS restarted during it: a restart, a power cut, a kernel fault | `last_run_boot` differs from [`boot_id::current`](../crates/agent-core/src/boot_id.rs#L17) | `EndedWithTheOs` | no |
 | Anything else: a kill, an access violation, a panic, a stall | nobody | `Crashed` | **yes** |
@@ -7773,6 +7775,47 @@ toward `should_rollback`. Since #4157 a start restores a missing config
 itself, so that start reads `Clean`. The crash count stays the copy's, and
 a crash of the run started on the restored config counts as any crash does.
 
+**A deliberate end counts nowhere** (#4292). Three ends are the daemon's own
+choice, and none of them takes the graceful path that marks a run clean:
+
+| The end | Exit | Where | In `run_end` |
+|---|---|---|---|
+| The server removed or refused the device (`rc:goodbye` with `AgentDeleted` or `PolicyRejected`) | 7 | [`signaling.rs:1425`](../agents/roomlerd/src/signaling.rs#L1425) | `exit_removed` |
+| A third displacement by another process using this `agent_id`, with `ws_replaced_exit = true` | 7 | [`signaling.rs:1495`](../agents/roomlerd/src/signaling.rs#L1495) | `exit_duel_lost` |
+| macOS asked the app to quit and the delegate let AppKit exit: a log-out's quit from `loginwindow`, or a quit with no supervisor | 0 | [`indicator/mac.rs:558`](../agents/roomlerd/src/indicator/mac.rs#L558) | `mark_quit_by_macos` |
+
+Only the primary org's loop reaches them: a secondary org's goodbye or duel
+ends that org's loop alone. Before #4292 each of them left its run marked
+unhealthy. A device removed in its run's first five minutes and enrolled
+again, which keeps the file's bookkeeping, started its next run at
+`crash_count` 1 (FR-150's C14 cell, 0.4.231).
+
+Each one now marks its run clean before it ends, through
+[`agents/roomlerd/src/run_end.rs`](../agents/roomlerd/src/run_end.rs):
+
+- `run_cmd` opens the run's book once the start's mark is saved
+  ([`app.rs:4384`](../agents/roomlerd/src/app.rs#L4384)), and never on the
+  read-only view an unenrolled GUI worker runs on (FR-43 P3a). It shares the
+  P6 write lock with the book
+  ([`app.rs:4841`](../agents/roomlerd/src/app.rs#L4841)).
+- The mark takes that lock, reads the file again, calls
+  `mark_clean_shutdown` and saves, on a thread of its own. The end waits for
+  it at most `MARK_BUDGET` (2 s) and then exits anyway. A mark that comes too
+  late leaves the run counted, as before #4292, and never holds the exit.
+- ⚠️ It reads with `config::read_if_present`, never `config::load`. `load`
+  restores a missing or unreadable file from `config.toml.prev` and writes it
+  back, and a removal that lands after an uninstall must not bring the
+  enrollment back. With nothing to read, nothing is written.
+- Then `logging::finish` writes the log's last lines, and the process exits
+  with the same code as before.
+
+⚠️ **Every other end still counts** when it ends a run inside its first five
+minutes: the watchdog's stall (2), the exit net's 32, a stop that wedged
+past its backstop, an error out of the primary loop, a panic, a kill from
+outside. Those are failures, and the crash-loop handling exists for them. A
+new `process::exit` after the start's mark is one or the other: a deliberate
+end goes through `run_end`, and a failure does not.
+
 ⚠️ **The boot is an id, never a time.** A boot time worked out from the
 wall clock moves when the clock is stepped, and two starts of one boot
 then read as two boots. Linux reads `/proc/sys/kernel/random/boot_id`,
@@ -7788,7 +7831,7 @@ nothing. This is the one crash loop the ladder cannot see.
 After 5 min of healthy signaling, a background tokio task promotes the
 running version to `last_known_good_version` and resets the counter via
 `record_clean_run_at`. Ctrl-C handler also clears the unhealthy flag
-(`mark_clean_shutdown`).
+(`mark_clean_shutdown`), and so does a deliberate end (`run_end`, #4292).
 
 ### 19.3 SHA256 verification + automatic rollback (0.1.52)
 
