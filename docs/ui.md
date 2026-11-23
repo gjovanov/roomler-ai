@@ -405,7 +405,7 @@ org's rows at a time and record which. A fetch for another org drops the rows at
 once, only the latest fetch writes, and a save answered for another org leaves the
 list alone (`stores/tunnelPolicies.ts:159-165`, `stores/overlayAcl.ts:78-84`). A
 page that only names or picks devices asks with `ensureAgents` or
-`ensureTunnelClients` (`stores/agents.ts:1036`, `stores/tunnelClients.ts:117`),
+`ensureTunnelClients` (`stores/agents.ts:1062`, `stores/tunnelClients.ts:117`),
 which fetch unless the store already holds, or is loading, that org's rows. Never
 gate a fetch on an empty list: a list that holds another org's rows is not empty.
 
