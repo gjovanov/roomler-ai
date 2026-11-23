@@ -145,7 +145,7 @@ function expectRecordedDraft() {
   expect(switchState('exec_enabled')).toBe('On')
   expect(switchState('ssh_enabled')).toBe('Off')
   expect(field('encoder_cells_deny')?.value).toBe('hevc_qsv:yuv444')
-  expect(selection('color_description')).toBe('Off: no colour description, as earlier agents sent')
+  expect(selection('color_description')).toBe('Off: no colour description, as earlier roomlerd versions sent')
   expect(button('Request')?.disabled).toBe(true)
 }
 

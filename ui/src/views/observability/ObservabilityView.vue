@@ -149,7 +149,7 @@
                 share of peer links currently <em>on</em> a relay carrier.
                 <strong>Connections, not bytes</strong> — direct traffic is
                 deliberately never measured, so a byte share is not computable.
-                Agent-reported, and it counts freshly-created pairs that
+                Daemon-reported, and it counts freshly-created pairs that
                 start relayed and are still upgrading, so read the trend
                 rather than the absolute. An alarm, not a bill.
               </div>

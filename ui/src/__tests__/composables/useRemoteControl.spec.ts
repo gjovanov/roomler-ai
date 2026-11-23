@@ -5814,8 +5814,8 @@ describe('FR-27: friendlyEndReason', () => {
   it('#2810: says who the wait is for', () => {
     expect(awaitingConsentLabel('owner')).toMatch(/device's owner to approve/)
     expect(awaitingConsentLabel('both')).toMatch(/someone at that device, or the device's owner/)
-    expect(awaitingConsentLabel('host')).toBe('Waiting for the agent to allow the connection…')
-    expect(awaitingConsentLabel(null)).toBe('Waiting for the agent to allow the connection…')
+    expect(awaitingConsentLabel('host')).toBe('Waiting for the host to allow the connection…')
+    expect(awaitingConsentLabel(null)).toBe('Waiting for the host to allow the connection…')
   })
 
   it("FR-101 P4b: names the org's maximum length when that is the limit that ended it", () => {

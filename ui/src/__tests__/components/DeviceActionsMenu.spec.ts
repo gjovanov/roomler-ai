@@ -120,7 +120,7 @@ describe('DeviceActionsMenu', () => {
       'Update now',
       'Rotate overlay key…',
       'Crash reports',
-      'Agent logs',
+      'Daemon logs',
       'Device console',
       'Edit name & tags',
       'Add to another organization',
