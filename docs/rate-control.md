@@ -5365,7 +5365,7 @@ under on, on video-deadline, once, before the frame's first chunk is written:
 | from the hand-off | the instant each frame already carries through the send channel for the send wait ([§ Where it runs](#where-it-runs)): the VP9-444 send task's (`agents/roomlerd/src/peer.rs:4336`) and the FFmpeg one's (`:7362`) |
 | on `video-deadline` only | `video-bytes` stays reliable and ordered: D drops nothing there, under any value of the switch |
 | a drop consumes its `frame_seq` | the viewer reads it as a gap, as it reads a loss on that channel (P4b-2): on `video-deadline` a gap does not re-arm its decode gate |
-| the recovery key frame | asked through the session's gate, the one the viewer's `rc:keyframe` passes through (`KeyframeGate`, `media_deadline.rs:425`). P4b-3 let one forced key frame through per 500 ms at most, whoever asked (`MIN_KF_GAP`, `:251`). Under `on`, on `video-deadline`, P4b-4's key frame rule spaces them by their cost on the path instead ([§ The key frame rule](#the-key-frame-rule-fr-148-p4b-4--recovery-costs-at-most-a-quarter-of-the-path)) |
+| the recovery key frame | asked through the session's gate, the one the viewer's `rc:keyframe` passes through (`KeyframeGate`, `media_deadline.rs:449`). P4b-3 let one forced key frame through per 500 ms at most, whoever asked (`MIN_KF_GAP`, `:251`). Under `on`, on `video-deadline`, P4b-4's key frame rule spaces them by their cost on the path instead ([§ The key frame rule](#the-key-frame-rule-fr-148-p4b-4--recovery-costs-at-most-a-quarter-of-the-path)) |
 
 The frames that follow a dropped one are written while they are young enough, and the viewer decodes
 them as it decodes the frames after a loss on that channel, until the key frame lands. Under `shadow`
@@ -5378,28 +5378,36 @@ FR-148 P4b-4 builds D55's **Recovery** rule (O6) with D59's rulings, as part of 
 frame is a session's largest frame, and on a carrier that is TCP somewhere D drops frames in runs: one
 ask per dropped frame and one forced key frame per 500 ms can put more key frames onto a thin path than
 it carries. While a session's lane is on `video-deadline`, or switching to it, the session's gate spaces
-forced key frames by what the last one cost:
+recovery key frames, the ones D and the viewer's `rc:keyframe` ask for, by what the last one cost:
 
 ```text
-gap = max(MIN_KF_GAP, kf_bytes / (KF_SHARE × rate))       MIN_KF_GAP = 500 ms, KF_SHARE = 0.25
+gap = max(MIN_KF_GAP, 8 × kf_bytes / (KF_SHARE × rate))   MIN_KF_GAP = 500 ms, KF_SHARE = 0.25,
+                                                          kf_bytes in bytes, rate in bit/s
 
-an ask passes    once gap has passed since the later of the last key frame written and the last grant
-an ask refused   is owed, never forgotten: the first frame the send task hands its lane after the gap
-                 opens grants it, with no further ask; a key frame written before then answers it
+a recovery ask passes   once gap has passed since the later of the last key frame written and the last grant
+a recovery ask refused  is owed, never forgotten: the first frame the send task hands its lane after the gap
+                        opens grants it, with no further ask; a key frame written before then answers it
+a switch's own ask      passes once 500 ms have passed since the last grant, rc.130's gap (P4b-4b); refused,
+                        it is forgotten, and the lane asks again at its next frame
 ```
 
-So forced key frames take at most a quarter of the path's rate, AC24's bound: 80 KB at 2 Mbit/s are
+So recovery key frames take at most a quarter of the path's rate, AC24's bound: 80 KB at 2 Mbit/s are
 1.28 s apart, while 20 KB at 16 Mbit/s keep the 500 ms floor (`kf_gap`,
-`agents/roomlerd/src/media_deadline.rs:263`).
+`agents/roomlerd/src/media_deadline.rs:263`). A switch's own key frame is not recovery (FR-148 P4b-4b,
+`LaneAsk::Switch`, `media_deadline.rs:329`): the switch drops every frame until it comes, so the
+rule's gap there would hold the picture still while the link carries no video. One is written per
+switch, a switch begins only when the pick changes, and the class it picks by is read again every 5 s;
+once written it restarts the rule's clock like any other key frame, so the next recovery key frame
+waits a whole gap after it.
 
 | Ruling (D59) | As built |
 |---|---|
-| scope | the rule acts only under `on`, while the lane is on `video-deadline` or switching to it (`Draining` or `Keying` toward it): the lane hands the gate its scope with each ask and each frame (`Lane::scope`, `media_deadline.rs:1062`). Under `off`, under `shadow`, on `video-bytes` and for an older viewer the gate grants what P4b-3's granted, ask for ask |
+| scope | the rule acts only under `on`, while the lane is on `video-deadline` or switching to it (`Draining` or `Keying` toward it): the lane hands the gate its scope with each ask and each frame (`Lane::scope`, `media_deadline.rs:1094`). It acts on recovery asks alone, D's and the viewer's: a switch's own asks, its `Keying` ask and its ask again after a key frame older than D, get the 500 ms gap in both of the gate's worlds and toward either channel (P4b-4b: the lane says why it asks, `KeyframeGate::answer`, `media_deadline.rs:492`). Under `off`, under `shadow`, on `video-bytes` and for an older viewer the gate grants what P4b-3's granted, ask for ask |
 | `shadow` | the gate also keeps the grants and the owed ask `on` would have had, from the session's first ask, and N12's split counts that world; every grant is `off`'s. The shadow lane asks nothing (P4b-3), so under `shadow` the split counts the viewer's asks alone, not the ones D and a switch would add under `on` |
-| `kf_bytes` | the size of the last key frame the send task wrote, on either channel and whatever asked for it, read from the record's key frame flag: the record as `frame_video_bytes` built it, its 13-byte header in, the chunks' 8-byte headers out (`Lane::route_at`, `:1012`). Before the first one there is no cost term, and the floor applies alone |
-| `rate` | the in-flight budget's rate at its last step when this association's own figures gave it (`Budget::rate_measured`), else the encoder's current target (`current_maxrate_bps`), else none and the floor alone (`kf_rate`, `:278`). Each pump hands it over at every frame past the capacity gate, in its one call to the budget's step (`DeliverySampler::on_frame`, `agents/roomlerd/src/media_delivery.rs:1042`; `peer.rs:4558`, `:8224`) |
-| the clock | the last key frame written, or the gate's last grant when that is later. Counted from the key frame alone, a grant whose key frame D then dropped would leave the gate open to every ask after it, and a steady run of drops would force a key frame at every frame (`GateState::verdict`, `media_deadline.rs:379`) |
-| owed asks | one at most: asks coalesce as the flag does, and the oldest is kept. Each frame the lane is handed checks it, with no timer task (`KeyframeGate::on_frame`, `:520`). An ask owed when the lane leaves `video-deadline` is granted under the 500 ms gap alone. A switch waiting for its key frame stops asking once its ask is owed |
+| `kf_bytes` | the size of the last key frame the send task wrote, on either channel and whatever asked for it, read from the record's key frame flag: the record as `frame_video_bytes` built it, its 13-byte header in, the chunks' 8-byte headers out (`Lane::route_at`, `media_deadline.rs:1044`). Before the first one there is no cost term, and the floor applies alone |
+| `rate` | the in-flight budget's rate at its last step when this association's own figures gave it (`Budget::rate_measured`), else the encoder's current target (`current_maxrate_bps`), else none and the floor alone (`kf_rate`, `media_deadline.rs:278`). Each pump hands it over at every frame past the capacity gate, in its one call to the budget's step (`DeliverySampler::on_frame`, `agents/roomlerd/src/media_delivery.rs:1042`; `peer.rs:4558`, `:8224`) |
+| the clock | the last key frame written, or the gate's last grant when that is later. Counted from the key frame alone, a grant whose key frame D then dropped would leave the gate open to every ask after it, and a steady run of drops would force a key frame at every frame (`GateState::verdict`, `media_deadline.rs:398`) |
+| owed asks | one at most: asks coalesce as the flag does, and the oldest is kept. Each frame the lane is handed checks it, with no timer task (`KeyframeGate::on_frame`, `media_deadline.rs:551`). An ask owed when the lane leaves `video-deadline` is granted under the 500 ms gap alone. A switch's own ask is never owed: refused, it is forgotten, and the switch asks again at each frame until an ask passes the 500 ms gap (P4b-4b); its grant also grants an owed ask, and its key frame, written, answers one |
 | no new switch | the rule is `video_deadline`'s `on`: no new variable and no new environment read, and the FR-135 ratchet's baseline does not move |
 
 ### The deadline channel's switch
@@ -5428,7 +5436,7 @@ retires with FR-148 P5).
 Its counts close `path delivery (FR-148 P0, shadow, ≈10s)`, after the budget's fields, or after `loss`,
 or after `acked_bytes`, whichever ends the line without them, and only with the switch not `off`. They
 are a pump's: each data-channel pump's line carries its own send task's (`Counters`,
-`agents/roomlerd/src/media_deadline.rs:623`; the sampler's handle, `DeliverySampler::deadline`,
+`agents/roomlerd/src/media_deadline.rs:654`; the sampler's handle, `DeliverySampler::deadline`,
 `agents/roomlerd/src/media_delivery.rs:1309`).
 
 | Field | Meaning |
@@ -5443,14 +5451,14 @@ are a pump's: each data-channel pump's line carries its own send task's (`Counte
 | `kf_refused_gap` | the asks the 500 ms gap refused over the line; under `shadow`, the ones it would have refused in `on`'s world |
 | `kf_refused_rule` | the asks the key frame rule refused over the line, past the 500 ms gap; under `shadow`, the ones `on` would have refused |
 | `kf_owed_granted` | the owed asks granted over the line, at a frame once the gap opened or by a later ask that passed; under `shadow`, the ones `on` would have granted |
-| `kf_gap_ms` | the key frame rule's gap at the line, from the last key frame the send task wrote and the rate the pump last handed the gate (`KeyframeGate::gap`, `agents/roomlerd/src/media_deadline.rs:571`): `Some(500)` before the first key frame or with no rate, `None` for a pump that serves no session's gate. It spaces forced key frames only while `video_channel` is `video-deadline` (under `shadow`, `on`'s) |
+| `kf_gap_ms` | the key frame rule's gap at the line, from the last key frame the send task wrote and the rate the pump last handed the gate (`KeyframeGate::gap`, `agents/roomlerd/src/media_deadline.rs:602`): `Some(500)` before the first key frame or with no rate, `None` for a pump that serves no session's gate. It spaces recovery key frames only while `video_channel` is `video-deadline` (under `shadow`, `on`'s) |
 
 P4b-4's five counts are the session's, not the pump's: N12's split (`KeyframeSplit`,
 `agents/roomlerd/src/session_telemetry.rs:196`), taken from the pump's start (`Counters::follow`,
-`agents/roomlerd/src/media_deadline.rs:687`), so a pump's line counts every ask its session's gate
+`agents/roomlerd/src/media_deadline.rs:718`), so a pump's line counts every ask its session's gate
 heard over the line, the viewer's too; `kf_gap_ms` is that gate's too. Under `on`, on
-`video-deadline`, every refused ask is owed, and N12's `kf_asks_gapped` counts it as an ask not let
-through.
+`video-deadline`, every refused recovery ask is owed and a switch's own is forgotten, and N12's
+`kf_asks_gapped` counts either as an ask not let through.
 
 A line with made-up values, the budget off, `video_deadline` at `on` (`shadow` is the path model's):
 
