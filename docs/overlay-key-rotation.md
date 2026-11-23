@@ -370,7 +370,7 @@ holds, and DERP is the floor that connects a node when nothing else does.
 | key | where | default | effect |
 |---|---|---|---|
 | `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:1091-1096`, `config_surface.rs:1266-1273`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
-| `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1873`, `:1998-2000`) | `0` | bumped per rotation; presented on every join, shown in the grid |
+| `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1881`, `:2006-2008`) | `0` | bumped per rotation; presented on every join, shown in the grid |
 | server switch for the route | — | — | **none, deliberately**: the route is admin-initiated and permission-gated; a defective push is stopped by the device switch |
 | `retired_key_mode` (P2) | the org's `overlay_networks` row, `GET/PUT /api/tenant/{tid}/overlay-retired-keys` (`MANAGE_AGENTS`; `crates/modules/network/src/routes/overlay_key.rs:353`, `:383`) | **`off`** | `warn` logs what it would refuse; `enforce` refuses a retired key at join and DERP and orders a device with the verb to rotate. Read per join and DERP registration — **no restart**, no live session disturbed. A stored value a build does not know reads `off`; a typo in the `PUT` is a 400 |
 
@@ -444,7 +444,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:838-846` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6309-6451`, `:3563-3605`, `:3607-3628`, `:1427-1454` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
-| kill switch · epoch | `crates/agent-core/src/config.rs:1091-1096`, `:1868-1873`, `:1998-2000`; `config_surface.rs:1266-1273` |
+| kill switch · epoch | `crates/agent-core/src/config.rs:1091-1096`, `:1876-1881`, `:2006-2008`; `config_surface.rs:1266-1273` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2100-2201`; `ui/src/stores/agents.ts:1210-1224` |
 | P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3224`, `:3242`, `:3964`, `:3212`, `:10560`, `:10842`; the node and network fields `:7027`, `:7269` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7421` |

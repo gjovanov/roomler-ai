@@ -409,7 +409,7 @@ kept a task past its baseline in those 90 runs.
 **A close while a channel is still being taken up (#4103).** The SCTP transport takes up each
 channel the browser opens on a task of its own (`accept_data_channels`,
 `crates/vendored/webrtc/src/sctp_transport/mod.rs:246`), and the loop's body awaits the agent's
-`on_data_channel` handler (`:335`), which awaits in turn (`agents/roomlerd/src/peer.rs:1260`).
+`on_data_channel` handler (`:335`), which awaits in turn (`agents/roomlerd/src/peer.rs:1269`).
 Upstream's stop woke that task with one `notify_waiters()`, which wakes only the waiters of that
 instant and stores nothing, and the loop made its next wait after the body. So a stop that came
 while the task was in its body was lost: the task waited for good, holding the association, the
@@ -472,8 +472,8 @@ RTP sender's `stop()` sets its flag and wakes with one `notify_waiters()`
 (`crates/vendored/webrtc/src/rtp_transceiver/rtp_sender/mod.rs:565-566`). Its RTCP `read`
 never reads the flag, and it makes its second wait after an await (`:593-611`), so a stop
 before the call, or between its two waits, is lost to that read. The agent's RTCP reader
-calls `read_rtcp`, which wraps it, in a loop (`agents/roomlerd/src/peer.rs:792`), but the
-agent's close aborts that task before it closes the peer (`stop_serving`, `:1952-1954`). Once
+calls `read_rtcp`, which wraps it, in a loop (`agents/roomlerd/src/peer.rs:795`), but the
+agent's close aborts that task before it closes the peer (`stop_serving`, `:1979-1981`). Once
 the sender has sent, the read also ends when `stop()` closes the sender's SRTCP stream
 (`crates/vendored/webrtc/src/rtp_transceiver/srtp_writer_future.rs:164-179`). That close ends in webrtc-util's `Buffer::close`, which has
 the same shape: its read checks the flag, lets its lock go, and only then makes its wait
@@ -573,7 +573,7 @@ sequenceDiagram
 ```
 
 The agent drops send futures on purpose. On the control channel, `send_control_notice`
-(`agents/roomlerd/src/peer.rs:6203`) bounds each attempt with a timeout and retries, and the
+(`agents/roomlerd/src/peer.rs:6230`) bounds each attempt with a timeout and retries, and the
 idle warning (`agents/roomlerd/src/session_idle.rs:465`) and the session's `rc:ended`
 (`agents/roomlerd/src/session_table.rs:362`) each have a 2 s budget. Other sends race the
 session's end in a `select!` or die with an aborted pump. A tunnel flow's cancel cuts its
@@ -673,7 +673,7 @@ writer busy. The rule was written before the counted runs, and it and every run 
 | 0.4.222, three runs | 6.4 s | 661,403 to 666,457 B | 4.6 to 4.9 s after the lock, 0.5 to 0.9 s after the cut's end | every later lock and unlock shows within 2 s, on one stream from start to end |
 
 **What a person saw on 0.4.221 was a reconnect, not a chip that stays wrong.** The lock
-notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10684`) was lost, and nothing the agent
+notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10711`) was lost, and nothing the agent
 sent on the control channel after it was read. On this guest a locked session sends no video.
 The viewer's media watchdog spares only an agent that said it cannot capture or that it waits
 (`ui/src/composables/useRemoteControl.ts:5824`), and no such word could arrive. So it asked
@@ -685,9 +685,9 @@ never shows it:
 
 | Condition | Why | Anchor |
 |---|---|---|
-| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4248`, `:5213`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2579` |
-| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7256`, `:2207`, `agents/roomlerd/src/peer.rs:11313`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
-| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1507`, `:6203`, `agents/roomlerd/src/lock_state.rs:333` |
+| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4276`, `:5240`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2579` |
+| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7256`, `:2207`, `agents/roomlerd/src/peer.rs:11335`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
+| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1533`, `:6230`, `agents/roomlerd/src/lock_state.rs:333` |
 
 A real path failure cuts both directions. The second row is read from the source: two runs on
 0.4.221 with only the agent's outgoing packets cut, and a waiting writer, delivered every
