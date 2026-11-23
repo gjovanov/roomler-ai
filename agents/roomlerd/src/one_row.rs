@@ -706,19 +706,19 @@ fn retirement_notes(notes: &mut Vec<String>, user: &str, overlay_on: bool, held:
     }
 }
 
-/// #4312 — why the way on past an ephemeral row is a new file: an enrollment
-/// folded into a config keeps that config's `ephemeral`
-/// (`enrollment::preserve_operator_config`).
-const OVER_EPHEMERAL: &str = "an enrollment over an ephemeral one stays ephemeral";
+/// #4312, #4331 — why the way on past an ephemeral row removes it first: the
+/// same file takes the next enrollment's `ephemeral` from the server's answer
+/// (`enrollment::preserve_operator_config`), and a live ephemeral row stays one.
+const OVER_EPHEMERAL: &str = "an ephemeral row never turns permanent";
 
 /// #4312 — the root half's enrollment is ephemeral. One-row's restart is a
 /// stop, and on it the daemon deletes its own row.
 fn ephemeral_root(root: &AgentConfig) -> anyhow::Error {
     anyhow::anyhow!(
         "the root half's enrollment ({}, tenant {}) is ephemeral: one-row restarts the daemon, \
-         and on that stop an ephemeral row deletes itself. Enroll the root half again with a \
-         key that is not ephemeral, into a new {ROOT_CONFIG} ({OVER_EPHEMERAL}), then run this \
-         again. Nothing has changed",
+         and on that stop an ephemeral row deletes itself. Remove it on the Devices page \
+         ({OVER_EPHEMERAL}) and enroll the root half again with a key that is not ephemeral: \
+         {ROOT_CONFIG} keeps its settings. Then run this again. Nothing has changed",
         root.server_url,
         root.tenant_id
     )
@@ -737,9 +737,9 @@ fn ephemeral_person(name: &str, cfg: &AgentConfig, held: bool) -> anyhow::Error 
          that enrolled it, so it cannot move to the root half"
     };
     anyhow::anyhow!(
-        "{name}'s enrollment ({}, tenant {}) is ephemeral, {why}. Enroll {name}'s half again \
-         with a key that is not ephemeral, into a new config ({OVER_EPHEMERAL}), then run this \
-         again. Nothing has changed",
+        "{name}'s enrollment ({}, tenant {}) is ephemeral, {why}. Remove it on the Devices page \
+         ({OVER_EPHEMERAL}) and enroll {name}'s half again with a key that is not ephemeral: \
+         that half's config keeps its settings. Then run this again. Nothing has changed",
         cfg.server_url,
         cfg.tenant_id
     )
@@ -3151,7 +3151,7 @@ fn ephemeral_revert<H: Host>(host: &H, r: &Revert) -> Result<Option<String>> {
     let (file, remove) = if kept {
         (
             format!("{ROOT_CONFIG}.{KEPT_EXT}, which --revert puts back first,"),
-            format!(", and remove {ROOT_CONFIG}.{KEPT_EXT}, whose enrollment cannot come back"),
+            format!(", remove {ROOT_CONFIG}.{KEPT_EXT}, whose enrollment cannot come back,"),
         )
     } else {
         (ROOT_CONFIG.to_string(), String::new())
@@ -3159,9 +3159,9 @@ fn ephemeral_revert<H: Host>(host: &H, r: &Revert) -> Result<Option<String>> {
     Ok(Some(format!(
         "--revert is refused: the root half's enrollment ({}, tenant {}) in {file} is \
          ephemeral: --revert restarts the daemon onto that file, and on that stop an ephemeral \
-         row deletes itself, so the root half would come back on a dead token. Enroll the root \
-         half again with a key that is not ephemeral, into a new {ROOT_CONFIG} \
-         ({OVER_EPHEMERAL}){remove}, then run this again. Nothing has changed",
+         row deletes itself, so the root half would come back on a dead token. Remove it on the \
+         Devices page ({OVER_EPHEMERAL}){remove} and enroll the root half again with a key that is \
+         not ephemeral: {ROOT_CONFIG} keeps its settings. Then run this again. Nothing has changed",
         cfg.server_url, cfg.tenant_id
     )))
 }
@@ -4075,11 +4075,16 @@ mod tests {
             "tenant t1",
             "is ephemeral, and the root half holds that org",
             "`--revert` could not bring it back",
-            "a key that is not ephemeral, into a new config",
+            "Remove it on the Devices page (an ephemeral row never turns permanent)",
+            "enroll casey's half again with a key that is not ephemeral: that half's config",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
     }
 
     /// #4312 — the unheld refusal keeps its meaning, and its way on no longer
@@ -4101,12 +4106,17 @@ mod tests {
             "tenant t2",
             "the root half does not hold that org",
             "lives only with the half that enrolled it",
-            "a key that is not ephemeral, into a new config",
+            "Remove it on the Devices page (an ephemeral row never turns permanent)",
+            "enroll casey's half again with a key that is not ephemeral: that half's config",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
         assert!(!e.contains("enroll the root half there"), "{e}");
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
     }
 
     #[test]
@@ -5076,12 +5086,16 @@ mod tests {
             "tenant t1",
             "is ephemeral",
             "one-row restarts the daemon, and on that stop an ephemeral row deletes itself",
-            "Enroll the root half again with a key that is not ephemeral, into a new \
-             /etc/roomler/config.toml",
+            "Remove it on the Devices page (an ephemeral row never turns permanent) and enroll",
+            "the root half again with a key that is not ephemeral: /etc/roomler/config.toml keeps",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
         assert_eq!(mac.files(), before);
         assert!(!mac.wrote(), "{:?}", mac.calls);
         assert!(mac.loaded.contains(&501), "casey's agent is not booted out");
@@ -5179,12 +5193,17 @@ mod tests {
             "tenant t1",
             "is ephemeral",
             "an ephemeral row deletes itself",
-            "a key that is not ephemeral, into a new /etc/roomler/config.toml",
-            "remove /etc/roomler/config.toml.pre-one-row",
+            "Remove it on the Devices page (an ephemeral row never turns permanent)",
+            "remove /etc/roomler/config.toml.pre-one-row, whose enrollment cannot come back, and",
+            "a key that is not ephemeral: /etc/roomler/config.toml keeps its settings",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
         assert_eq!(mac.files(), before);
         assert!(!mac.wrote(), "{:?}", mac.calls);
         // Converted by an older release: its revert reads root's own file.
@@ -5197,11 +5216,16 @@ mod tests {
             "--revert is refused",
             "tenant t1",
             "is ephemeral",
-            "a key that is not ephemeral, into a new /etc/roomler/config.toml",
+            "Remove it on the Devices page (an ephemeral row never turns permanent) and enroll",
+            "a key that is not ephemeral: /etc/roomler/config.toml keeps its settings",
             "Nothing has changed",
         ] {
             assert!(e.contains(want), "{want:?} in {e}");
         }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
         assert!(!e.contains(".pre-one-row"), "{e}");
         assert_eq!(old.files(), before);
         assert!(!old.wrote(), "{:?}", old.calls);

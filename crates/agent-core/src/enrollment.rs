@@ -804,7 +804,10 @@ fn unique_org_label(
 /// 2026-07-21: the P4 wizard field-proofs re-enrolled the box and it fell out
 /// of the mesh unnoticed). Keep the EXISTING config as the base — it carries
 /// every operator-owned knob, including ones this function has never heard of
-/// — and take only the enrollment-owned identity fields from the fresh one.
+/// — and take only the enrollment-owned fields from the fresh one: the
+/// identity, and `ephemeral`, which is what the server answered THIS
+/// enrollment (#4331: kept from the old file, a device enrolled again with the
+/// other kind of key disagreed with its row).
 ///
 /// `ws_url` intentionally follows the FRESH config (i.e. resets to `None`): a
 /// pinned override derived for the OLD server would break the new enrollment's
@@ -819,6 +822,7 @@ pub fn preserve_operator_config(fresh: AgentConfig, existing: AgentConfig) -> Ag
         tenant_id: fresh.tenant_id,
         machine_id: fresh.machine_id,
         machine_name: fresh.machine_name,
+        ephemeral: fresh.ephemeral,
         config_schema_version: fresh.config_schema_version,
         ..existing
     }
@@ -1418,6 +1422,60 @@ mod tests {
         assert_eq!(cfg.agent_token, "tok1");
         assert!(cfg.orgs.is_empty());
         assert!(cfg.keep_busy_enabled);
+    }
+
+    /// #4331 — FR-51: a primary's `ephemeral` is what the server answered THIS
+    /// enrollment, on each path that folds it into an existing file. Both ways:
+    /// a permanent answer over an ephemeral file clears the flag, and an
+    /// ephemeral answer over a permanent file sets it. The file's own value is
+    /// what the row was, never what it is now.
+    #[test]
+    fn a_fold_takes_ephemeral_from_the_server_answer_on_every_primary_path() {
+        let blank = crate::config::AgentConfig::for_person_with_no_enrollment("mac").unwrap();
+        let enrolled = crate::config::test_fixture(); // example.invalid / tid
+        let paths = [
+            (
+                "onto a file with no enrollment in it",
+                blank,
+                fresh_for("https://a.invalid", "t1", "tok1"),
+                false,
+                EnrollOutcome::FreshPrimary,
+            ),
+            (
+                "a forced replace",
+                enrolled.clone(),
+                fresh_for("https://b.invalid", "t2", "tok2"),
+                true,
+                EnrollOutcome::ReplacedPrimary,
+            ),
+            (
+                "a re-enrollment into the same server and tenant",
+                enrolled,
+                fresh_for("https://example.invalid", "tid", "tok3"),
+                false,
+                EnrollOutcome::RefreshedPrimary,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (path, existing, fresh, replace, want) in paths {
+            for (file_says, server_said) in [(true, false), (false, true)] {
+                let mut existing = existing.clone();
+                existing.ephemeral = file_says;
+                let mut fresh = fresh.clone();
+                fresh.ephemeral = server_said;
+                let (cfg, outcome) =
+                    apply_enrollment(Some(existing), fresh, None, replace).unwrap();
+                assert_eq!(outcome, want, "{path}");
+                if cfg.ephemeral != server_said {
+                    wrong.push(format!(
+                        "{path}: the file said {file_says}, the server {server_said}, the fold \
+                         wrote {}",
+                        cfg.ephemeral
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
