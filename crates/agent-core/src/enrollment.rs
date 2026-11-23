@@ -638,6 +638,154 @@ pub async fn self_unenroll(server_url: &str, agent_token: &str) -> Result<()> {
     }
 }
 
+/// #4352 — an enrollment this device refuses once the server has answered
+/// it: the answer is an EPHEMERAL device row, for an organization the config
+/// would hold BESIDE its primary enrollment (an `[[orgs]]` entry, appended or
+/// refreshed). An `[[orgs]]` entry has no `ephemeral` of its own, and a stop
+/// removes only the primary's row, so nothing would ever remove that row.
+/// [`apply_enrollment`] returns this as its error, so every caller stops
+/// before it writes: the config stays byte for byte as it was. Each caller
+/// then passes the error through [`remove_refused_row`], which removes a row
+/// the enrollment made, and shows it: its `Display` is the person's words.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EphemeralOrgRefused {
+    /// The `[[orgs]]` label of the entry the answer would have refreshed;
+    /// `None` for an organization this config does not hold yet.
+    pub label: Option<String>,
+    /// The organization and its server, as the answer named them.
+    pub tenant_id: String,
+    pub server_url: String,
+    /// The device row the server answered with.
+    pub agent_id: String,
+    /// What becomes of that row.
+    pub row: RefusedRow,
+}
+
+/// [`EphemeralOrgRefused::row`].
+#[derive(Clone, PartialEq, Eq)]
+pub enum RefusedRow {
+    /// The row this config already holds for that organization: never
+    /// removed. Only a server without #4352's 409 answers this (a standard
+    /// token refreshed a live ephemeral row).
+    Held,
+    /// A row this enrollment made. It is removed with the ANSWER's server
+    /// ([`EphemeralOrgRefused::server_url`]) and this token: the file holds no
+    /// credential for it.
+    Made {
+        agent_token: String,
+        /// `None` until [`remove_refused_row`] has tried; then its result.
+        removed: Option<Result<(), String>>,
+    },
+}
+
+/// Never prints the agent token.
+impl std::fmt::Debug for RefusedRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Held => f.write_str("Held"),
+            Self::Made { removed, .. } => f
+                .debug_struct("Made")
+                .field("agent_token", &"<redacted>")
+                .field("removed", removed)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for EphemeralOrgRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EphemeralOrgRefused")
+            .field("label", &self.label)
+            .field("tenant_id", &self.tenant_id)
+            .field("server_url", &self.server_url)
+            .field("agent_id", &self.agent_id)
+            .field("row", &self.row)
+            .finish()
+    }
+}
+
+/// The person's words: what was refused and why, what became of the row, and
+/// the way on. One wording for every caller.
+impl std::fmt::Display for EphemeralOrgRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let org = match &self.label {
+            Some(label) => format!("the organization this device holds as \"{label}\""),
+            None => format!("the organization {} on {}", self.tenant_id, self.server_url),
+        };
+        write!(
+            f,
+            "this enrollment was refused: the server enrolled this device in {org} as an \
+             EPHEMERAL device (row {}), and an organization added beside this device's primary \
+             enrollment is never ephemeral, since nothing would remove its row when the device \
+             stops. The config was not changed. The enrollment has already used its token (or \
+             one use of the ephemeral key).",
+            self.agent_id
+        )?;
+        const WAY_ON: &str = "To add this organization to this device, join it again with a \
+             standard enrollment token; to run this device in it as an ephemeral device, enroll \
+             that organization on a config of its own (`roomlerd --config <an empty path> \
+             enroll ...`).";
+        match &self.row {
+            RefusedRow::Held => write!(
+                f,
+                " Nothing was removed: that row is the one this config already holds for the \
+                 organization, and it stays on the server as an ephemeral device. Remove it on \
+                 that organization's Devices page, then join again with a standard enrollment \
+                 token."
+            ),
+            RefusedRow::Made {
+                removed: Some(Ok(())),
+                ..
+            } => write!(
+                f,
+                " The row this enrollment made was removed again. {WAY_ON}"
+            ),
+            RefusedRow::Made {
+                removed: Some(Err(why)),
+                ..
+            } => write!(
+                f,
+                " The row this enrollment made could not be removed ({why}): remove it on that \
+                 organization's Devices page. {WAY_ON}"
+            ),
+            RefusedRow::Made { removed: None, .. } => write!(
+                f,
+                " The row this enrollment made is still on the server: remove it on that \
+                 organization's Devices page. {WAY_ON}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EphemeralOrgRefused {}
+
+/// #4352 rule 1 — THE decision, for an answer that lands beside the primary
+/// enrollment (`apply_enrollment`'s `[[orgs]]` arms): `held` is the entry the
+/// answer would refresh, `None` for an organization the config does not hold.
+/// A permanent answer is folded as always. An ephemeral one is refused; the
+/// refusal names the row to remove when the answer is NOT the row the file
+/// already holds for that organization (the equal case never removes the
+/// device's own row), with the answer's own server and token.
+pub fn refuse_ephemeral_org(
+    held: Option<&crate::config::OrgEntry>,
+    fresh: &AgentConfig,
+) -> Option<EphemeralOrgRefused> {
+    // #4352 RED: master's behaviour, nothing refused. The fix decides here.
+    let _ = (held, fresh);
+    None
+}
+
+/// #4352 — the ONE helper every caller of [`apply_enrollment`] passes a fold
+/// error through, before it shows it. When the error is the refusal of an
+/// ephemeral second organization and the enrollment made a row, that row is
+/// removed with the ANSWER's server and token, never the file's, and the
+/// refusal then says whether the removal happened. Any other error comes back
+/// as it was. Nothing here writes the config.
+pub async fn remove_refused_row(error: anyhow::Error) -> anyhow::Error {
+    // #4352 RED: master's behaviour, nothing removed. The fix removes here.
+    error
+}
+
 /// Multi-org P1 — how [`apply_enrollment`] folded a fresh enrollment into
 /// the on-disk config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1766,5 +1914,353 @@ mod tests {
                 label: "roomler-ai-2".into()
             }
         );
+    }
+
+    // ---- #4352 rule 1: a second organization is never ephemeral ----------
+
+    /// The server's answer, ephemeral.
+    fn ephemeral(mut fresh: AgentConfig) -> AgentConfig {
+        fresh.ephemeral = true;
+        fresh
+    }
+
+    /// The refusal a fold answered, or a panic that says what it did instead.
+    fn refusal(folded: anyhow::Result<(AgentConfig, EnrollOutcome)>) -> EphemeralOrgRefused {
+        match folded {
+            Ok((cfg, outcome)) => panic!(
+                "the fold was not refused: {outcome:?}, the file would record {} org(s)",
+                cfg.orgs.len()
+            ),
+            Err(e) => e
+                .downcast_ref::<EphemeralOrgRefused>()
+                .cloned()
+                .unwrap_or_else(|| panic!("refused for another reason: {e:#}")),
+        }
+    }
+
+    /// T1 — an ephemeral answer that would ADD a secondary organization
+    /// (`AppendedOrg`) is refused, and the refusal carries the ANSWER's server
+    /// and token, for the removal of the row it made.
+    #[test]
+    fn t1_an_ephemeral_answer_for_a_new_org_is_refused_with_its_row_to_remove() {
+        let existing = crate::config::test_fixture(); // example.invalid / tid / tok
+        let answer = ephemeral(fresh_for("https://b.invalid", "t-acme", "ANSWER-TOK"));
+        let refused = refusal(apply_enrollment(
+            Some(existing),
+            answer.clone(),
+            Some("acme"),
+            false,
+        ));
+        assert_eq!(
+            refused.label, None,
+            "an organization the file does not hold"
+        );
+        assert_eq!(refused.server_url, "https://b.invalid");
+        assert_eq!(refused.tenant_id, "t-acme");
+        assert_eq!(refused.agent_id, answer.agent_id);
+        assert_eq!(
+            refused.row,
+            RefusedRow::Made {
+                agent_token: "ANSWER-TOK".into(),
+                removed: None
+            }
+        );
+    }
+
+    /// T2 — an ephemeral answer that would refresh a secondary the file holds,
+    /// with a NEW row (another `agent_id`), is refused, with that row to remove.
+    #[test]
+    fn t2_an_ephemeral_new_row_for_a_held_org_is_refused_with_its_row_to_remove() {
+        let mut existing = crate::config::test_fixture();
+        existing.orgs = vec![org("acme", "https://b.invalid", "t-acme")]; // aid-acme / tok-acme
+        let answer = ephemeral(fresh_for("https://b.invalid", "t-acme", "ANSWER-TOK"));
+        assert_ne!(answer.agent_id, "aid-acme", "a new row");
+        let refused = refusal(apply_enrollment(
+            Some(existing),
+            answer.clone(),
+            None,
+            false,
+        ));
+        assert_eq!(refused.label.as_deref(), Some("acme"));
+        assert_eq!(refused.server_url, "https://b.invalid");
+        assert_eq!(refused.agent_id, answer.agent_id);
+        assert_eq!(
+            refused.row,
+            RefusedRow::Made {
+                agent_token: "ANSWER-TOK".into(),
+                removed: None
+            },
+            "removed with the answer's token, never the entry's (tok-acme)"
+        );
+    }
+
+    /// T3 — the equal case: an ephemeral answer that names the row the file
+    /// already holds for that organization is refused, and NOTHING is removed.
+    /// A refusal never removes the device's own row.
+    #[test]
+    fn t3_an_ephemeral_answer_naming_the_held_row_removes_nothing() {
+        let mut existing = crate::config::test_fixture();
+        existing.orgs = vec![org("acme", "https://b.invalid", "t-acme")];
+        let mut answer = ephemeral(fresh_for("https://b.invalid", "t-acme", "REFRESHED-TOK"));
+        answer.agent_id = "aid-acme".into(); // the row the file holds
+        let refused = refusal(apply_enrollment(Some(existing), answer, None, false));
+        assert_eq!(refused.label.as_deref(), Some("acme"));
+        assert_eq!(refused.row, RefusedRow::Held);
+        let said = refused.to_string();
+        assert!(
+            said.contains("Nothing was removed") && said.contains("Devices page"),
+            "{said}"
+        );
+    }
+
+    /// T4 — a PRIMARY enrollment with an ephemeral answer is folded as #4339
+    /// made it, and the file records ephemeral: a first enrollment, a file with
+    /// no enrollment in it, `--replace`, and the same server and org again,
+    /// each for a new row and for the same row. (The #4339 fold test,
+    /// `a_fold_takes_ephemeral_from_the_server_answer_on_every_primary_path`,
+    /// stays as it is.)
+    #[test]
+    fn t4_a_primary_takes_an_ephemeral_answer_as_before() {
+        let blank = crate::config::AgentConfig::for_person_with_no_enrollment("mac").unwrap();
+        let mut enrolled = crate::config::test_fixture(); // example.invalid / tid / aid
+        enrolled.orgs = vec![org("acme", "https://b.invalid", "t-acme")];
+        let same_row = |server: &str, tenant: &str, token: &str| {
+            let mut fresh = fresh_for(server, tenant, token);
+            fresh.agent_id = "aid".into();
+            fresh
+        };
+        let cases = [
+            (
+                "a first enrollment",
+                None,
+                fresh_for("https://a.invalid", "t1", "tok1"),
+                false,
+                EnrollOutcome::FreshPrimary,
+            ),
+            (
+                "onto a file with no enrollment in it",
+                Some(blank),
+                fresh_for("https://a.invalid", "t1", "tok1"),
+                false,
+                EnrollOutcome::FreshPrimary,
+            ),
+            (
+                "a forced replace, a new row",
+                Some(enrolled.clone()),
+                fresh_for("https://c.invalid", "t2", "tok2"),
+                true,
+                EnrollOutcome::ReplacedPrimary,
+            ),
+            (
+                "a forced replace, the same row",
+                Some(enrolled.clone()),
+                same_row("https://example.invalid", "tid", "tok2"),
+                true,
+                EnrollOutcome::ReplacedPrimary,
+            ),
+            (
+                "the same server and org, a new row",
+                Some(enrolled.clone()),
+                fresh_for("https://example.invalid", "tid", "tok3"),
+                false,
+                EnrollOutcome::RefreshedPrimary,
+            ),
+            (
+                "the same server and org, the same row",
+                Some(enrolled),
+                same_row("https://example.invalid", "tid", "tok3"),
+                false,
+                EnrollOutcome::RefreshedPrimary,
+            ),
+        ];
+        for (path, existing, fresh, replace, want) in cases {
+            let fresh = ephemeral(fresh);
+            let (cfg, outcome) = apply_enrollment(existing, fresh.clone(), None, replace)
+                .unwrap_or_else(|e| panic!("{path}: refused: {e:#}"));
+            assert_eq!(outcome, want, "{path}");
+            assert!(cfg.ephemeral, "{path}: the file records ephemeral");
+            assert_eq!(cfg.agent_id, fresh.agent_id, "{path}");
+            assert_eq!(cfg.agent_token, fresh.agent_token, "{path}");
+        }
+    }
+
+    /// T5 — a PERMANENT answer, on every path, folds as before: never refused,
+    /// and the identity lands where it always did.
+    #[test]
+    fn t5_a_permanent_answer_folds_as_before_on_every_path() {
+        let blank = crate::config::AgentConfig::for_person_with_no_enrollment("mac").unwrap();
+        let mut existing = crate::config::test_fixture();
+        existing.orgs = vec![org("acme", "https://b.invalid", "t-acme")];
+        let mut held_row = fresh_for("https://b.invalid", "t-acme", "ROTATED");
+        held_row.agent_id = "aid-acme".into();
+        let cases = [
+            (
+                "a first enrollment",
+                None,
+                fresh_for("https://a.invalid", "t1", "tok1"),
+                None,
+                false,
+                EnrollOutcome::FreshPrimary,
+            ),
+            (
+                "onto a file with no enrollment in it",
+                Some(blank),
+                fresh_for("https://a.invalid", "t1", "tok1"),
+                None,
+                false,
+                EnrollOutcome::FreshPrimary,
+            ),
+            (
+                "a forced replace",
+                Some(existing.clone()),
+                fresh_for("https://c.invalid", "t3", "tok3"),
+                None,
+                true,
+                EnrollOutcome::ReplacedPrimary,
+            ),
+            (
+                "the same server and org",
+                Some(existing.clone()),
+                fresh_for("https://example.invalid", "tid", "tok4"),
+                None,
+                false,
+                EnrollOutcome::RefreshedPrimary,
+            ),
+            (
+                "a held org, the same row",
+                Some(existing.clone()),
+                held_row,
+                None,
+                false,
+                EnrollOutcome::RefreshedOrg {
+                    label: "acme".into(),
+                },
+            ),
+            (
+                "a held org, a new row",
+                Some(existing.clone()),
+                fresh_for("https://b.invalid", "t-acme", "tok5"),
+                None,
+                false,
+                EnrollOutcome::RefreshedOrg {
+                    label: "acme".into(),
+                },
+            ),
+            (
+                "a new org",
+                Some(existing),
+                fresh_for("https://d.invalid", "t-new", "tok6"),
+                Some("new"),
+                false,
+                EnrollOutcome::AppendedOrg {
+                    label: "new".into(),
+                },
+            ),
+        ];
+        for (path, existing, fresh, label, replace, want) in cases {
+            assert!(!fresh.ephemeral, "{path}: a permanent answer");
+            let (cfg, outcome) = apply_enrollment(existing, fresh.clone(), label, replace)
+                .unwrap_or_else(|e| panic!("{path}: refused: {e:#}"));
+            assert_eq!(outcome, want, "{path}");
+            assert_eq!(
+                enrolled_identity(&cfg, &outcome),
+                (fresh.agent_id.clone(), fresh.tenant_id.clone()),
+                "{path}"
+            );
+            assert!(!cfg.ephemeral, "{path}");
+        }
+    }
+
+    /// The refusal of a NEW row of an organization on `server`, as the fold
+    /// makes it, with the answer's token.
+    fn made_row_on(server: &str) -> EphemeralOrgRefused {
+        EphemeralOrgRefused {
+            label: None,
+            tenant_id: "t-acme".into(),
+            server_url: server.to_string(),
+            agent_id: "aid-new".into(),
+            row: RefusedRow::Made {
+                agent_token: "ANSWER-TOK".into(),
+                removed: None,
+            },
+        }
+    }
+
+    /// T6 — the shared helper removes the row a refused enrollment made with
+    /// the ANSWER's server and token (`POST /api/agent/self/unenroll`, bearer
+    /// the answer's token), and the refusal then says it was removed.
+    #[tokio::test]
+    async fn t6_the_made_row_is_removed_with_the_answers_server_and_token() {
+        use crate::pairing::test_http::scripted_server;
+        let (server, seen) = scripted_server(vec![("200 OK", r#"{"removed":true}"#)]).await;
+        let said = remove_refused_row(made_row_on(&server).into()).await;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one removal: {seen:?}");
+        assert_eq!(seen[0].path, "/api/agent/self/unenroll");
+        assert!(
+            seen[0]
+                .head
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("authorization: Bearer ANSWER-TOK")),
+            "the answer's own token: {}",
+            seen[0].head
+        );
+        let refused = said
+            .downcast_ref::<EphemeralOrgRefused>()
+            .unwrap_or_else(|| panic!("not the refusal: {said:#}"));
+        assert_eq!(
+            refused.row,
+            RefusedRow::Made {
+                agent_token: "ANSWER-TOK".into(),
+                removed: Some(Ok(()))
+            }
+        );
+        let words = said.to_string();
+        assert!(words.contains("removed again"), "{words}");
+        assert!(!words.contains("ANSWER-TOK"), "never the token: {words}");
+    }
+
+    /// T6 — a removal that fails is reported, with the way on: the person
+    /// removes the row on the Devices page.
+    #[tokio::test]
+    async fn t6_a_failed_removal_is_said() {
+        use crate::pairing::test_http::scripted_server;
+        let (server, seen) = scripted_server(vec![("500 Internal Server Error", "boom")]).await;
+        let said = remove_refused_row(made_row_on(&server).into()).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "the removal was tried");
+        let refused = said
+            .downcast_ref::<EphemeralOrgRefused>()
+            .unwrap_or_else(|| panic!("not the refusal: {said:#}"));
+        assert!(
+            matches!(
+                refused.row,
+                RefusedRow::Made {
+                    removed: Some(Err(_)),
+                    ..
+                }
+            ),
+            "{:?}",
+            refused.row
+        );
+        let words = said.to_string();
+        assert!(
+            words.contains("could not be removed") && words.contains("Devices page"),
+            "{words}"
+        );
+    }
+
+    /// T3/T6 — the equal case sends nothing, and any other fold error passes
+    /// through the helper as it was.
+    #[tokio::test]
+    async fn t6_the_held_row_and_other_errors_send_nothing() {
+        use crate::pairing::test_http::scripted_server;
+        let (server, seen) = scripted_server(vec![("200 OK", "{}")]).await;
+        let mut held = made_row_on(&server);
+        held.row = RefusedRow::Held;
+        let said = remove_refused_row(held.clone().into()).await;
+        assert_eq!(said.downcast_ref::<EphemeralOrgRefused>(), Some(&held));
+        let other = remove_refused_row(anyhow::anyhow!("--label \"x\" is already in use")).await;
+        assert_eq!(other.to_string(), "--label \"x\" is already in use");
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
     }
 }
