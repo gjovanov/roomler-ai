@@ -11,8 +11,8 @@ Today the question has an answer computed for it, and that answer is thrown away
 
 `roomlerd` already computes a verdict for every install: `InstallStatus` is a
 five-state enum (`InProgress | SucceededVerified | SucceededUnverified |
-InstallerFailed | Timeout`, `post_install.rs:144-172`) persisted to
-`<log_dir>/last-install.json` (`post_install.rs:187`).
+InstallerFailed | Timeout`, `post_install.rs:172-200`) persisted to
+`<log_dir>/last-install.json` (`post_install.rs:212`).
 
 Measured on the fleet:
 
@@ -32,8 +32,8 @@ updates, and not one recorded an outcome.
 `Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2265`). That pid is
 handed to the watcher as `--installer-pid`, and `watch()` calls
 `wait_for_pid(installer_pid, INSTALLER_BUDGET)` unconditionally
-(`post_install.rs:299`), polling `kill(pid, 0)` for up to 600 s
-(`post_install.rs:1440-1465`).
+(`post_install.rs:405`), polling `kill(pid, 0)` for up to 600 s
+(`post_install.rs:1795-1820`).
 
 So the watcher's only exit condition is the daemon's exit — while the daemon's
 exit is precisely what tears down the cgroup and kills the watcher. There is
@@ -55,9 +55,9 @@ mostly moot. Fixing (2) alone would be building a systemd mechanism to support a
 wait that should not exist.
 
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
-(`post_install.rs:263`) has **zero callers**. The module doc's claim that "the new
+(`post_install.rs:369`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:85-86`, echoed at `:10`, `:124`, `docs/remote-control.md:1256`)
+(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:1256`)
 was never wired. So even on Windows — where the staged watcher does produce a
 verdict — nothing surfaces it. **P3 wires it** (2026-10-26): the daemon reads
 the record at startup and on every `roomler status`, see the P3 section below.
@@ -124,7 +124,7 @@ flowchart LR
 | Piece | Where |
 |---|---|
 | The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:581`; `NodeStatus.last_install`, `:484` |
-| The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1751`), its pure half `summarize` (`:1770`) |
+| The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:2130`), its pure half `summarize` (`:2149`) |
 | The startup line and its level | `log_at_startup` (`:1829`), `startup_level` (`:1813`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4341`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:1063`) |
 | The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2955`), printed under `version` (`:2556`) |
@@ -187,7 +187,7 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:365`); `UpdateRefusal` and `update_refusal()` (`:585`, `:1270`) |
-| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5601`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3166`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3137`), else `self` |
+| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5601`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3252`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3223`), else `self` |
 | Stamped at **every** announcement | `stub_caps` (`signaling.rs:7250`, `:7266`) |
 | Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1793`): a 409 on one device (`:1840`), a `refused` row with its `refused_code` in a bulk (`:1972`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
@@ -292,7 +292,7 @@ sequenceDiagram
 
 ## Out of scope
 
-- A Unix `ensure_service_running` equivalent (`post_install.rs:675`). Windows needs
+- A Unix `ensure_service_running` equivalent (`post_install.rs:1030`). Windows needs
   it because the SCM does not auto-restart; Linux has `Restart=always` +
   `RestartPreventExitStatus=7 8`, and a watcher running `systemctl start` would
   fight the supervisor.
@@ -314,7 +314,7 @@ sequenceDiagram
 | 2026-09-02 | Found while field-testing `agent-v0.4.48` | `last-install.json` stuck at `InProgress` on two hosts, one since 2026-08-29 for `agent-v0.4.16` while running 0.4.50 |
 | 2026-09-02 | Preconditions measured on two distros | `systemd-run` present and `INVOCATION_ID` set in the unit process on both (Fedora/systemd 257, Ubuntu/systemd 255); `KillMode=control-group` on both |
 | 2026-09-02 | ⚠️ Measurement hazard | `pgrep -x roomlerd` matched a **container's** process on a host running containerised test nodes (cgroup `/system.slice/docker-….scope`). A first reading wrongly showed `INVOCATION_ID` absent on Ubuntu. Probe `systemctl show roomlerd -p MainPID` instead |
-| 2026-09-02 | ⛔ First design refuted before implementation | A systemd transient unit was the initial P1. Adversarial review found its safety premise false without `--service-type=exec`, its kill switch inert against the mode it guards, and that it would *create* a PID-reuse false-`Timeout` mode. The real defect is the self-pid wait (`updater.rs:1577` + `post_install.rs:221`) — removing it needs no systemd at all |
+| 2026-09-02 | ⛔ First design refuted before implementation | A systemd transient unit was the initial P1. Adversarial review found its safety premise false without `--service-type=exec`, its kill switch inert against the mode it guards, and that it would *create* a PID-reuse false-`Timeout` mode. The real defect is the self-pid wait (`updater.rs:1577` + `post_install.rs:327`) — removing it needs no systemd at all |
 | 2026-10-19 | ❌ P7's "before", on the fleet | The operator's **Update all** counted a two-org aarch64 device (Fedora/Asahi) as pushed three times. Its journal logged `rc:agent.update ignored — only the primary enrollment drives the machine-wide self-updater` three times: the dashboard's org was its secondary enrollment. That day's remedy was `roomlerd org set-primary` on the device, which exposed #2540 (both meshes off; fixed in #2541) |
 | 2026-10-19 | ❌ The "before" on a cell | A kept vmtest Ubuntu cell in two orgs, on 0.4.145 and the then-prod server `hosted-20261019-dd59ede`. A push to its secondary org's row: `HTTP 200 {"delivered":true}`, and in the same second the device logged `rc:agent.update ignored … ignored_total=1` |
 | 2026-10-19 | ✅ **P7 field-verified on 0.4.146** | Server `hosted-20261019-e46da07`, candidate run 39331259421 (its `.deb` byte-identical to the published one). AC1: a push from the secondary org → `HTTP 409` naming `roomlerd org set-primary`, and 0 `rc:agent.update` lines on the device. AC2: `auto_update false` → row `update_mode=off` → `HTTP 409` (`auto_update_off`). AC3: a 0.4.145 agent (no word) → `HTTP 200 delivered`, as before. AC4: a live `keep_busy_enabled` flip made both connections re-announce their caps (`announcing changed capabilities on the heartbeat`), and both rows still carried the word. A lock/unlock first changed no caps, so it re-announced nothing and is not counted. A Win11 SYSTEM install laid over 0.4.145 reads `update_mode=self` |

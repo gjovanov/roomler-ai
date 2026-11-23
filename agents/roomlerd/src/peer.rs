@@ -4555,7 +4555,7 @@ async fn media_pump_vp9_444_dc(
             continue;
         }
         gate_clock.passed(std::time::Instant::now()); // FR-148 D51 B4g
-        delivery.on_frame(&pc, &mut governor); // FR-148 D46
+        delivery.on_frame(&pc, &mut governor, encoder.as_ref()); // FR-148 D46, P4b-4
 
         // FR-112 P2 — cadence pacing, as the FFmpeg pump's (FR-1 P5): when the
         // software encoder cannot hold the target, take frames on an even grid
@@ -8221,7 +8221,7 @@ async fn media_pump_ffmpeg_dc(
         // Not congested: the gate cost only its own predicate, but record it so
         // the accounting is complete on every pass, not only on the skips.
         PassWatch::stop(gate_start, &mut gate_us);
-        delivery.on_frame(&pc, &mut governor); // FR-148 D46
+        delivery.on_frame(&pc, &mut governor, encoder.as_ref()); // FR-148 D46, P4b-4
 
         // P5 (FR-1) — cadence pacing: when the HW encoder can't hold
         // target_fps, consume frames on an even grid at the sustainable

@@ -3995,7 +3995,7 @@ sequenceDiagram
 | the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2634`; sent by `reportDecodeError` (`:7860`) from all three worker handlers |
 | the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2608`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10823` |
 | the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11368`; `viewer_decode_error`, `peer.rs:10798` |
-| the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:407` |
+| the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:505` |
 | the early samples | the first `de` and each of the first eight errors send one `rc:session.stats` at once, by the carrier's road (§11.9): a session someone leaves right after a black screen still records its count, and a short clean one its zero | the FR-102 P9d channel, `peer.rs` `attach_control_handler` |
 | the wire | `decode_errors: Option<u32>` on `rc:session.stats`, absent unless counted; an older server ignores it | `crates/remote_control/src/signaling.rs:764` |
 | the row | `remote_sessions.stats.decode_errors`, `$set` only from a sample that counted: a sample without it never writes a zero over a stored count | `merge_live_stats`, `crates/services/src/dao/remote_session.rs:187` |
@@ -4065,7 +4065,7 @@ with no grep of `agent_logs`.
 | Piece | What it does | Where |
 |---|---|---|
 | the reading | taken at the pump's 2 s heartbeat: the encoder's name, the capturer's `backend()` (`wgc`, `scrap`, `system-context`, `portal`, `mutter`, `drm`), and the input form's path and reason. Only the FFmpeg DC pump has an input form to name | `media_pump_ffmpeg_dc`, `agents/roomlerd/src/peer.rs:10145` |
-| a failed read | a heartbeat whose `rate_stats` failed reads `InputForm`'s default, CPU with no reason. A real CPU form always names its reason, so this one is dropped and the reading before it stands | `SessionCounters::note_video`, `agents/roomlerd/src/session_telemetry.rs:195` |
+| a failed read | a heartbeat whose `rate_stats` failed reads `InputForm`'s default, CPU with no reason. A real CPU form always names its reason, so this one is dropped and the reading before it stands | `SessionCounters::note_video`, `agents/roomlerd/src/session_telemetry.rs:249` |
 | the early sample | a new reading sends one `rc:session.stats` at once, by the carrier's road (§11.9), so the row has it within a heartbeat and follows a form that moves in the session's first seconds | same |
 | the wire | `video: Option<SessionVideo>` on `rc:session.stats`, absent until the pump's first heartbeat; an older server ignores it | `crates/remote_control/src/signaling.rs:771` |
 | the check | the device is the only writer, so a reading with any field that is not a short lowercase name is dropped whole, and the row keeps its last | `SessionVideo::checked`, `crates/remote_control/src/models.rs:6025` |
@@ -4091,7 +4091,7 @@ say which cell it ran and how long it was in motion. Before this, those numbers 
 (`MediaWindow`, `agents/roomlerd/src/media_window.rs:198`), and two things are built from it: new
 heartbeat fields, and a **summary** that rides P1d's reading into `remote_sessions.video`. The
 VP9 pump folds its window at `agents/roomlerd/src/peer.rs:4395`, the FFmpeg one at `:7479`, each
-into the session's tally (`note_media_fold`, `agents/roomlerd/src/session_telemetry.rs:281`).
+into the session's tally (`note_media_fold`, `agents/roomlerd/src/session_telemetry.rs:335`).
 
 ```mermaid
 flowchart LR
@@ -4145,7 +4145,7 @@ line's older `frames_encoded` is.
 | `window_ms` | ledger L03 | the window's real length; "≈2s" is only its floor |
 | `cap_to_handoff_ms`, `_p50_ms`, `_p95_ms` | N7 | from when the pump took a real frame to its hand-off to the channel, in the process's one clock. On a push arm (WGC, the portal) it starts when the pump takes the frame, not at capture |
 | `handoff_gap_ms` | N10, the agent's half | the cadence the channel is fed at |
-| `kf_ask_to_queued_ms`, `kf_asks`, `kf_asks_gapped` | N12 | how long the oldest unanswered `rc:keyframe` waited for a key frame, and the session's asks so far with how many the 500 ms gap dropped. FR-135 R1's slow recoveries pointed at that gap with no counter. Under `ROOMLERD_VIDEO_DEADLINE=on` the send tasks' own asks are counted with the viewer's (§11.20) |
+| `kf_ask_to_queued_ms`, `kf_asks`, `kf_asks_gapped` | N12 | how long the oldest unanswered `rc:keyframe` waited for a key frame, and the session's asks so far with how many the 500 ms gap dropped. FR-135 R1's slow recoveries pointed at that gap with no counter. Under `ROOMLERD_VIDEO_DEADLINE=on` the send tasks' own asks are counted with the viewer's (§11.20), and an ask the key frame rule owes counts as one not let through, its wait running until the key frame (FR-148 P4b-4) |
 | `idr_causes` | IDR by cause | forces per window: `[asked, shared, lock, backstop, resync, settle]` (`IdrCause`, `media_window.rs:158`). `asked` is the session's key-frame flag, which the viewer, the settle request and the channel-not-open request all set; `shared` is the pipeline's. ⚠️ The causes overlap: one force with both flags set counts `asked` and `shared`, a settle counts `settle` when requested and `asked` when forced, and each pass while the channel is not open forces and counts `asked`. Their sum is not the number of key frames, and `idr_count` minus it means nothing |
 | `dc_lock_ms` | §2.5 | the video channel's mutex wait, which `send_wait` does not contain |
 | `maxrate_bps` | R12's red | the bitrate ceiling the encoder runs now, from the handle's own copy, which a failed `rate_stats` read cannot zero |
@@ -4196,7 +4196,7 @@ cumulative for the worker's session.
 | the wire | drops a key it cannot read and keeps the rest; every key it sent before is unchanged | `decodeStatWireMessage`, `ui/src/composables/useRemoteControl.ts:2566` |
 | the parse | the viewer is the untrusted side: a histogram must be exactly twelve counts that fit a `u32`, and a count must sit inside the row's bounds, so no viewer can make the agent send a reading the server drops whole | `ViewerReport::parse`, `agents/roomlerd/src/media_window.rs:389` |
 | the gate | kept only with `stats` on the session's new path | `note_viewer_decodestat`, `agents/roomlerd/src/peer.rs:10833` |
-| the tally | windows summed between two heartbeats, and the counts as last reported | `SessionCounters::note_viewer_report` / `take_viewer_window`, `agents/roomlerd/src/session_telemetry.rs:239` |
+| the tally | windows summed between two heartbeats, and the counts as last reported | `SessionCounters::note_viewer_report` / `take_viewer_window`, `agents/roomlerd/src/session_telemetry.rs:293` |
 | the reading | `frames_painted` beside `frames_encoded`, and `freezes`, bounded by `checked` (30 days at 240 fps; five freezes a second) | `SessionVideo`, `crates/remote_control/src/models.rs:5997` |
 
 ⚠️ **`frames_painted` and `freezes` are the viewer's word.** They are bounded on intake, never
@@ -5336,7 +5336,7 @@ session not yet live, and an external one, end as before FR-138.
 | What ends it | What the device does | Proven by |
 |---|---|---|
 | a stop or a restart | the `Shutdown` arm closes every peer | `arm_shutdown_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2381`); `a_terminal_exit_closes_kept_sessions_too` (`:2912`) |
-| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:7718`) |
+| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:7895`) |
 | sleep, a resume from suspend | the `Sleep` and `ResumeFromSuspend` arms close every peer. A pause of at least 120 s, measured at the RX deadline, is read as a resume (M2) | `arm_sleep_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2382`); `arm_resume_from_suspend_closes_every_peer` (`:2383`); `the_rx_deadline_reads_a_long_pause_as_a_resume_from_suspend` (`:3159`) |
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1155`) |
@@ -5378,11 +5378,11 @@ features, `agents/roomlerd/src/media_deadline.rs`, which the two send tasks only
 
 | Piece | Rule | Where |
 |---|---|---|
-| the arm | `video-deadline` has an arm of its own in the data-channel match, by equality like every arm there (`video-bytes`' is `:1368`). It stashes the channel in the session's `media_deadline::Session`, which `AgentPeer::new` registers (`:1195`) and both pumps find by session, and logs `video-deadline DC stashed (FR-148 P4b-3)` with the channel's `ordered`, `max_retransmits` and `stream_id` | `agents/roomlerd/src/peer.rs:1411`; `Session`, `agents/roomlerd/src/media_deadline.rs:293` |
-| the class | the carrier of the selected pair, one of seven (below) | `class_of`, `media_deadline.rs:187`; `class_now`, `:227` |
-| the pick | `video-deadline` when the class is TCP somewhere (`turn_tcp`, `turn_tls`, `mesh_relay`) and the session has one open; `video-bytes` otherwise, and whenever the class is `unknown` | `pick`, `media_deadline.rs:218`; `CarrierClass::is_tcp`, `:164` |
-| when the class is read | at the pump's start, once `detect_constrained_transport` returned, and again at each 5 s transport re-check (`TRANSPORT_RECHECK_INTERVAL`, `peer.rs:2120`), under every override. Never from `detect_constrained_transport`'s 3 s default: with no pair selected the class is `unknown`, so the session starts on `video-bytes` and the next re-check picks again. A change writes `video channel: carrier class (FR-148 P4b-3)` with `from` and `to` | `Pump::start`, `media_deadline.rs:424`; `Pump::read`, `:446`; the VP9-444 pump, `peer.rs:4090` and `:4421`; the FFmpeg pump, `:6660` and `:7755` |
-| the lane | each send task routes every frame through its lane once, before the frame's first write: the channel and the `frame_seq`, or nothing. The lane holds `video-bytes`' stash through the frame's chunked send, as the send task's `if let` did, so the FFmpeg pump's `dc_lock` (FR-65) still waits out a frame's send | `Lane::route`, `media_deadline.rs:642`; the VP9-444 send task, `peer.rs:4338`; the FFmpeg one, `:7373` |
+| the arm | `video-deadline` has an arm of its own in the data-channel match, by equality like every arm there (`video-bytes`' is `:1368`). It stashes the channel in the session's `media_deadline::Session`, which `AgentPeer::new` registers (`:1195`) and both pumps find by session, and logs `video-deadline DC stashed (FR-148 P4b-3)` with the channel's `ordered`, `max_retransmits` and `stream_id` | `agents/roomlerd/src/peer.rs:1411`; `Session`, `agents/roomlerd/src/media_deadline.rs:580` |
+| the class | the carrier of the selected pair, one of seven (below) | `class_of`, `media_deadline.rs:192`; `class_now`, `:232` |
+| the pick | `video-deadline` when the class is TCP somewhere (`turn_tcp`, `turn_tls`, `mesh_relay`) and the session has one open; `video-bytes` otherwise, and whenever the class is `unknown` | `pick`, `media_deadline.rs:223`; `CarrierClass::is_tcp`, `:169` |
+| when the class is read | at the pump's start, once `detect_constrained_transport` returned, and again at each 5 s transport re-check (`TRANSPORT_RECHECK_INTERVAL`, `peer.rs:2120`), under every override. Never from `detect_constrained_transport`'s 3 s default: with no pair selected the class is `unknown`, so the session starts on `video-bytes` and the next re-check picks again. A change writes `video channel: carrier class (FR-148 P4b-3)` with `from` and `to` | `Pump::start`, `media_deadline.rs:769`; `Pump::read`, `:794`; the VP9-444 pump, `peer.rs:4090` and `:4421`; the FFmpeg pump, `:6660` and `:7755` |
+| the lane | each send task routes every frame through its lane once, before the frame's first write: the channel and the `frame_seq`, or nothing. The lane holds `video-bytes`' stash through the frame's chunked send, as the send task's `if let` did, so the FFmpeg pump's `dc_lock` (FR-65) still waits out a frame's send | `Lane::route`, `media_deadline.rs:1002`; the VP9-444 send task, `peer.rs:4338`; the FFmpeg one, `:7373` |
 
 **The classes.** The pair, what carries the agent's own relay and whether the pair rides the mesh are
 the carrier line's own reads (§11.9): `session_carrier::nominated_pair`
@@ -5417,8 +5417,8 @@ stateDiagram-v2
 
 | Rule | What the lane does |
 |---|---|
-| the drain rule | once the pick says switch, nothing more is written on the old channel. Every frame that arrives, a key frame too, is dropped whole while the old channel's buffered amount is above 0, that is until each of its chunks was acknowledged, or abandoned and forwarded (P4b-1). Then a key frame is asked through the session's gate, asked again at each frame until an ask passes, and the frames before the key frame are dropped. The wait has no time bound: the switch line says how long it held the video |
-| one `frame_seq` space | a frame written, a frame a switch dropped and a frame D dropped each take the next number, so the viewer reads every drop as a gap and the numbers it receives never repeat (`Lane::write`, `media_deadline.rs:667`; `drop_switching`, `:888`; `drop_late`, `:898`) |
+| the drain rule | once the pick says switch, nothing more is written on the old channel. Every frame that arrives, a key frame too, is dropped whole while the old channel's buffered amount is above 0, that is until each of its chunks was acknowledged, or abandoned and forwarded (P4b-1). Then a key frame is asked through the session's gate, asked again at each frame until an ask passes (or, toward `video-deadline`, until the key frame rule owes it: P4b-4), and the frames before the key frame are dropped. The wait has no time bound: the switch line says how long it held the video |
+| one `frame_seq` space | a frame written, a frame a switch dropped and a frame D dropped each take the next number, so the viewer reads every drop as a gap and the numbers it receives never repeat (`Lane::write`, `media_deadline.rs:1047`; `drop_switching`, `:1286`; `drop_late`, `:1296`) |
 | the first pick | at the pump's first frame: no old channel, so no drain and no wait |
 | a channel that closes | the drain of a closed channel is over at once. A switch whose `video-deadline` closed while it waited ends on `video-bytes` at the key frame, and a session on `video-deadline` whose channel closed is picked back onto `video-bytes` |
 | an unframed session | never leaves `video-bytes`: an unframed stream on an unordered channel cannot be put back together |
@@ -5428,19 +5428,33 @@ deadline-limited (`RTCSctpTransport::mark_deadline_stream`,
 `crates/vendored/webrtc/src/sctp_transport/mod.rs:493`, FR-148 P4b-1): once per stream, when the pick
 says switch, before the drain. A refused mark (no association, its slot held, no such stream) switches
 nothing: the session stays on `video-bytes`, one WARN line says so, and the mark is tried again at the
-next key frame (`Lane::mark`, `media_deadline.rs:862`). `off` and `shadow` never mark.
+next key frame (`Lane::mark`, `media_deadline.rs:1260`). `off` and `shadow` never mark.
 
 **D.** Under `on`, on `video-deadline` only, a frame older than 300 ms at its first write, counted
 from its hand-off to the send task, is dropped whole, and a key frame is asked through the session's
 gate ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)).
 
-**The key frame gate is the session's** (`KeyframeGate`, `media_deadline.rs:255`). The viewer's
+**The key frame gate is the session's** (`KeyframeGate`, `media_deadline.rs:425`). The viewer's
 `rc:keyframe` used to keep its 500 ms gap in the control channel's handler. The gap moved into the gate
-(`MIN_KF_GAP`, `:244`), which `AgentPeer::new` hands that handler, whose `rc:keyframe` arm asks
+(`MIN_KF_GAP`, `:249`), which `AgentPeer::new` hands that handler, whose `rc:keyframe` arm asks
 through it (`peer.rs:11364`), as the send tasks do. So at most one forced key frame passes per 500 ms,
 whoever asks. The gate counts every ask in the session's telemetry, the viewer's and the send tasks'
 alike (`kf_asks`, `kf_asks_gapped` and `kf_ask_to_queued_ms`, FR-135 R0's N12, §11.13), so under `on`
 those fields also count the asks of a switch and of D.
+
+**From P4b-4 the gate spaces forced key frames by their cost** under `on`, while the lane is on
+`video-deadline` or switching to it: an ask passes once `max(500 ms, kf_bytes / (0.25 × rate))` has
+passed since the later of the last key frame written and the gate's last grant, with `kf_bytes` the size
+of the last key frame the send task wrote and `rate` the in-flight budget's measured rate, or else the
+encoder's target. A refused ask is owed, never forgotten: the first frame the lane is handed after the
+gap opens grants it, and a key frame written first answers it
+([rate-control.md](rate-control.md#the-key-frame-rule-fr-148-p4b-4--recovery-costs-at-most-a-quarter-of-the-path)).
+So a switch waiting for its key frame asks once and waits for the grant, and a run of D's drops forces
+one key frame per gap. Everywhere else the 500 ms gap holds, grant for grant. N12 also tells the asker
+apart: the viewer's asks and the lane's, and refusals by the 500 ms gap and by the rule, on the
+`path delivery` line under `shadow` and `on` (`kf_asks_viewer` … `kf_owed_granted`), with the rule's
+gap at the line (`kf_gap_ms`). Under `shadow` they count the viewer's asks alone, since the shadow lane
+asks nothing.
 
 **The switch's values.** `ROOMLERD_VIDEO_DEADLINE`, or the local config key `video_deadline`, read once
 per pump ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)):
@@ -5448,7 +5462,7 @@ per pump ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a
 | Value | What a session does |
 |---|---|
 | `off`: the default, unset, or any other value | today's writes, numbers and holds: every frame on `video-bytes`, no class read, no line, no count |
-| `shadow` | the pick and D run on the channel `on` would be on, and the lines say what `on` would do, with `(shadow)` after `channel`. Every write is `off`'s, byte for byte: no mark, no drop, no ask. Its switch has no drain, since nothing was written on the channel it leaves: it completes at the next key frame, and its line's `dropped` is 0 |
+| `shadow` | the pick and D run on the channel `on` would be on, and the lines say what `on` would do, with `(shadow)` after `channel`. Every write is `off`'s, byte for byte: no mark, no drop, no ask. The key frame gate grants what `off`'s does, and counts what P4b-4's rule would refuse, owe and grant. Its switch has no drain, since nothing was written on the channel it leaves: it completes at the next key frame, and its line's `dropped` is 0 |
 | `on` | the pick, the switch with its drain, the mark and D act |
 
 **Mixed versions.**
@@ -7600,7 +7614,8 @@ jump. At the clean-run threshold the daemon reads the record, and
 `post_install::settle_unreported` turns an `InProgress` into
 `SucceededVerified` when this daemon is the expected version, or, once the
 watcher's whole life has passed, into `WatcherStopped`. Younger than that
-it looks once more when the time is up.
+it looks once more when the time is up. A note the watcher wrote, a wedge's
+or a console stop's, stays first, and the settle's words follow it (#4302).
 
 ⚠️ **The record is read in two places.** A SystemContext worker logs to
 `service-logs`, and the watcher it spawns has no service role, so the
@@ -7631,11 +7646,18 @@ through their console, and either half is enough on its own: holding the
 runtime makes you a target, and sharing a console with a target gets you the
 same event.
 
-⚠️ **A staged copy does not keep a watcher off that list.** A copy in `%TEMP%`
-still loads `VCRUNTIME140.dll` from the install folder. What saves one is having
-no console at all: with the launcher's daemon (`roomlerdw.exe`) the record reached
-`SucceededVerified`, with no event 10002. `CREATE_NO_WINDOW` would not do it,
-because that hands the watcher a console of its own, which is stand-in A.
+⚠️ **A staged copy alone does not keep a watcher off that list.** A copy that
+still holds files the update replaces is stand-in A or B, and one that shares a
+console with such a process is stand-in D. With the launcher's daemon
+(`roomlerdw.exe`) the record reached `SucceededVerified`, with no event 10002.
+Since #4302 a watcher the updater stages in its own staging folder is stand-in C:
+everything the copy loads sits beside it, and `CREATE_NO_WINDOW` alone gives it a
+console of its own (`watcher_creation_flags`, `agents/roomlerd/src/updater.rs:3033`).
+Read on per-Machine hops ([the cells](https://github.com/gjovanov/roomler-ai/issues/4302#issuecomment-7099732479)):
+from the released 0.4.233 the installer's second Restart Manager session named the
+staged watcher (event 10002, application type console) and ended it before its verdict;
+from a candidate the watcher had a console host of its own, no event named it, and it
+wrote its verdict and ran its service check ([update-outcome.md](update-outcome.md) §3).
 
 **Each attempt keeps its own MSI log (#2107).** The verbose `/l*v` log
 exists to name the action a wedged run stopped in, and the watcher's
@@ -7647,7 +7669,7 @@ wedged.
 |---|---|---|
 | `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:2030`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
 | `<msi>.2.log`, `<msi>.3.log` | each later attempt on the same path | the same |
-| `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:639`) | until the next wedge moves it to `msi-wedged.prev.log` |
+| `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:984`) | until the next wedge moves it to `msi-wedged.prev.log` |
 
 The record's `note` in `last-install.json` names the kept copy.
 
@@ -7674,7 +7696,9 @@ settles the `Roomler` SCM service (`post_install.rs`,
 QUERY_STATUS, waits out a STOP_PENDING / START_PENDING it did not
 cause, starts the service whenever it reads STOPPED (at most 3 starts),
 and believes RUNNING only once it has held for 15 s, all inside a 2 min
-budget.
+budget. On a per-Machine hop the installer's Restart Manager session
+could end the watcher before it got here, until #4302
+([update-outcome.md](update-outcome.md) §3).
 
 ```mermaid
 sequenceDiagram

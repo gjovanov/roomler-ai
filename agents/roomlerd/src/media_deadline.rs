@@ -21,7 +21,8 @@
 //! | the drain rule | once the pick says switch, nothing more is written on the old channel, and every frame is dropped whole until its buffered amount reads 0 (acknowledged, or abandoned and forwarded); then a key frame is asked through the session's gate ([`KeyframeGate`]), frames are dropped until one comes, and it goes whole on the new channel. The wait has no time bound: the switch line says how long it held the video |
 //! | the deadline D ([`DEADLINE`]) | under `on`, on `video-deadline` only: a frame older than D at its first write, counted from its hand-off to the send task, is dropped whole, and a key frame is asked through the gate; a frame begun is finished |
 //! | the mark | under `on`, once per stream, before the first write on `video-deadline`: `RTCSctpTransport::mark_deadline_stream` (FR-148 P4b-1). Refused, nothing switches, one line says so, and it is tried again at the next key frame |
-//! | `shadow` | the pick and D run on the channel `on` would be on, and the lines and counts say what `on` would do; every write is `off`'s, byte for byte |
+//! | the key frame rule ([`KeyframeGate`], FR-148 P4b-4) | under `on`, while the lane is on `video-deadline` or switching to it, a forced key frame passes only once [`kf_gap`] has passed since the session's last key frame written (or since the gate's last grant, if later): `max(MIN_KF_GAP, kf_bytes / (KF_SHARE × rate))`. A refused ask is owed, never forgotten: the first frame after the gap opens grants it (after rc.130's gap alone once the lane has left `video-deadline`), and a key frame written answers it. Everywhere else rc.130's 500 ms gap, grant for grant |
+//! | `shadow` | the pick and D run on the channel `on` would be on, and the lines and counts say what `on` would do, the key frame rule's included; every write and every grant is `off`'s, byte for byte |
 //!
 //! The switch is `ROOMLERD_VIDEO_DEADLINE`, or the config key
 //! `video_deadline` (`off` · `shadow` · `on`; unset or anything else is
@@ -36,7 +37,10 @@
 //! `<from>` at a pump's first pick), with `(shadow)` after `channel` for the
 //! switch `on` would make; one line when the carrier wants `video-deadline`
 //! and the session has none open; one when its stream's mark is refused. The
-//! counts go on the `path delivery` line (FR-148 P0) under `shadow` and `on`.
+//! counts go on the `path delivery` line (FR-148 P0) under `shadow` and `on`,
+//! and after them FR-148 P4b-4's: the session's key frame asks over the line
+//! by who asked, the refusals by the 500 ms gap and by the rule, the owed asks
+//! granted, and the rule's gap at the line.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -52,6 +56,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::sctp_transport::RTCSctpTransport;
 
 use crate::session_carrier::{OverlayPath, PairView, RelayTransport, SessionCarrier};
+use crate::session_telemetry::{KeyframeAsker, KeyframeRefusal, KeyframeSplit, SessionCounters};
 
 /// The switch, `ROOMLERD_VIDEO_DEADLINE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,16 +250,184 @@ async fn class_now(pc: &RTCPeerConnection) -> CarrierClass {
 /// request.
 pub const MIN_KF_GAP: Duration = Duration::from_millis(500);
 
+/// FR-148 P4b-4 (D55's Recovery, O6) — the share of the path's rate a
+/// session's forced key frames may take on `video-deadline`: recovery costs at
+/// most a quarter of the path, and AC24's bound is this rule's rate.
+pub const KF_SHARE: f64 = 0.25;
+
+/// FR-148 P4b-4 (D55) — the least time from a session's last key frame to a
+/// forced one under the rule: `max(MIN_KF_GAP, kf_bytes / (KF_SHARE × rate))`,
+/// with `kf_bytes` the size of the last key frame written and `rate` the
+/// path's, bit/s ([`kf_rate`]). Before the first key frame, or with no rate,
+/// [`MIN_KF_GAP`] alone.
+pub fn kf_gap(kf_bytes: Option<u64>, rate_bps: Option<u64>) -> Duration {
+    let cost = match (kf_bytes, rate_bps) {
+        (Some(bytes), Some(rate)) if rate > 0 => {
+            let secs = bytes as f64 * 8.0 / (KF_SHARE * rate as f64);
+            Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
+        }
+        _ => Duration::ZERO,
+    };
+    cost.max(MIN_KF_GAP)
+}
+
+/// FR-148 P4b-4 (D59) — the rate [`kf_gap`] divides by, bit/s: the in-flight
+/// budget's when this association's own figures gave it
+/// (`media_inflight::Budget::rate_measured`), the encoder's current target
+/// otherwise, and `None` with neither.
+pub fn kf_rate(measured_bps: Option<u64>, target_bps: Option<u32>) -> Option<u64> {
+    measured_bps
+        .filter(|&r| r > 0)
+        .or_else(|| target_bps.filter(|&t| t > 0).map(u64::from))
+}
+
+/// FR-148 P4b-4 (D59) — where a session's key frame rule stands, as its lane
+/// last said: the switch's value as the pump read it, and whether the lane is
+/// on `video-deadline` or switching to it (under `shadow`, whether `on` would
+/// be).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scope {
+    pub mode: Mode,
+    pub deadline: bool,
+}
+
+impl Scope {
+    /// Under `off`, and before any lane has said anything: rc.130's gate.
+    pub const TODAY: Scope = Scope {
+        mode: Mode::Off,
+        deadline: false,
+    };
+
+    /// The rule acts on the session's asks: `on`, on `video-deadline` or
+    /// switching to it.
+    fn acts(self) -> bool {
+        self.mode == Mode::On && self.deadline
+    }
+
+    /// Under `shadow`, the rule would act: `on`'s lane would be on
+    /// `video-deadline` or switching to it.
+    fn shadows(self) -> bool {
+        self.mode == Mode::Shadow && self.deadline
+    }
+}
+
+/// What an ask got from the gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    /// It passed, and set the flag.
+    Granted,
+    /// Refused while the rule acts, by the 500 ms gap or by the rule's, and
+    /// owed: the first frame after the gap opens grants it, unless a key
+    /// frame is written before.
+    Owed,
+    /// Refused by rc.130's gap outside the rule's scope, and forgotten.
+    Refused,
+}
+
+/// One world's grants and its owed ask: the session's own, or under `shadow`
+/// those `on` would have had.
+#[derive(Clone, Copy, Debug, Default)]
+struct World {
+    /// When an ask last passed. rc.130's gap runs from it.
+    granted: Option<Instant>,
+    /// FR-148 P4b-4 — the one owed ask (asks coalesce, as the flag does):
+    /// when the oldest still owed was refused.
+    owed: Option<Instant>,
+}
+
+impl World {
+    /// The world after an ask at `now`: one that passed is its last grant and
+    /// grants the owed ask too (true when one was owed); one refused while
+    /// the rule acts (`rule`) is owed.
+    fn answered(&mut self, verdict: Result<(), KeyframeRefusal>, rule: bool, now: Instant) -> bool {
+        match verdict {
+            Ok(()) => {
+                self.granted = Some(now);
+                self.owed.take().is_some()
+            }
+            Err(_) => {
+                if rule {
+                    self.owed.get_or_insert(now);
+                }
+                false
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GateState {
+    /// The session's grants, and under `on` its owed ask.
+    real: World,
+    /// Under `shadow`: the grants and the owed ask `on` would have had.
+    shadow: World,
+    /// What the session's lane last said ([`Scope::TODAY`] before it said).
+    scope: Scope,
+    /// FR-148 P4b-4 (D59) — the last key frame the session's send task wrote,
+    /// on either channel and whatever asked for it: when, and its record's
+    /// size.
+    key: Option<(Instant, u64)>,
+}
+
+impl GateState {
+    /// Whether `world` lets an ask through at `now`. rc.130: once
+    /// [`MIN_KF_GAP`] has passed since its last grant. Under the rule (`rule`):
+    /// once [`kf_gap`] has passed since the later of its last grant and the
+    /// last key frame written, so a grant whose key frame is still on its way
+    /// is never granted again. Refused, by what: the 500 ms gap, or the rule's
+    /// cost past it.
+    fn verdict(
+        &self,
+        world: &World,
+        rule: bool,
+        rate_bps: Option<u64>,
+        now: Instant,
+    ) -> Result<(), KeyframeRefusal> {
+        let since = match rule {
+            true => world.granted.max(self.key.map(|(at, _)| at)),
+            false => world.granted,
+        };
+        let Some(since) = since else {
+            return Ok(());
+        };
+        let waited = now.saturating_duration_since(since);
+        if waited < MIN_KF_GAP {
+            Err(KeyframeRefusal::Gap)
+        } else if rule && waited < kf_gap(self.key.map(|(_, bytes)| bytes), rate_bps) {
+            Err(KeyframeRefusal::Rule)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `world` owes an ask, and its gap has opened at `now`: the rule's while
+    /// it acts (`rule`), rc.130's once the lane has left `video-deadline`.
+    fn owes(&self, world: &World, rule: bool, rate_bps: Option<u64>, now: Instant) -> bool {
+        world.owed.is_some() && self.verdict(world, rule, rate_bps, now).is_ok()
+    }
+}
+
 /// rc.130 — a session's gate for forced key frames: the viewer's
 /// `rc:keyframe` and, from FR-148 P4b-3, the send tasks' own asks go through
 /// it. The flag it sets coalesces (a pump forces at most one IDR per encode
 /// however often it is set), and the gap bounds a misbehaving or old
 /// controller to one forced IDR per [`MIN_KF_GAP`], so a resync storm cannot
 /// pile the largest frames onto a congested link.
+///
+/// FR-148 P4b-4 (D55's Recovery, D59): under `on`, while the session's lane is
+/// on `video-deadline` or switching to it, the gap is [`kf_gap`], counted from
+/// the last key frame written (or the last grant, if later), and a refused
+/// ask is owed instead of forgotten: the lane's next frame after the gap
+/// opens grants it ([`Self::on_frame`]). Everywhere else the gate is rc.130's,
+/// grant for grant; under `shadow` it also keeps the grants and the owed ask
+/// `on` would have had, for N12's counts.
 #[derive(Debug)]
 pub struct KeyframeGate {
     requested: Arc<AtomicBool>,
-    last: Mutex<Option<Instant>>,
+    state: Mutex<GateState>,
+    /// FR-148 P4b-4 — the rate the rule divides by, bit/s, as the pump last
+    /// read it ([`kf_rate`]); 0 for none.
+    rate_bps: AtomicU64,
 }
 
 impl KeyframeGate {
@@ -262,29 +435,143 @@ impl KeyframeGate {
     pub fn new(requested: Arc<AtomicBool>) -> Self {
         Self {
             requested,
-            last: Mutex::new(None),
+            state: Mutex::new(GateState {
+                real: World::default(),
+                shadow: World::default(),
+                scope: Scope::TODAY,
+                key: None,
+            }),
+            rate_bps: AtomicU64::new(0),
         }
     }
 
-    /// One ask, now: whether it passed. FR-135 R0 (N12) counts every ask, and
-    /// whether the gap dropped it.
+    /// The viewer's ask, now: whether it passed. FR-135 R0 (N12) counts every
+    /// ask, and whether it was let through; FR-148 P4b-4 counts it as the
+    /// viewer's, and by what refused it.
     pub fn ask(&self, session_id: ObjectId) -> bool {
         self.ask_at(session_id, Instant::now())
     }
 
     fn ask_at(&self, session_id: ObjectId, now: Instant) -> bool {
-        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-        let allow = last
-            .map(|t| now.duration_since(t) >= MIN_KF_GAP)
-            .unwrap_or(true);
-        crate::session_telemetry::counters(session_id).note_keyframe_ask(allow);
-        if allow {
-            *last = Some(now);
-            drop(last);
-            self.requested.store(true, Relaxed);
-            crate::session_telemetry::counters(session_id).note_keyframe();
+        self.answer(KeyframeAsker::Viewer, session_id, now, None) == Answer::Granted
+    }
+
+    /// FR-148 P4b-4 — the lane's ask at `now`, in the lane's `scope`: whether a
+    /// key frame will come without its asking again, because the ask passed or
+    /// the rule owes it.
+    pub fn ask_lane(&self, session_id: ObjectId, now: Instant, scope: Scope) -> bool {
+        self.answer(KeyframeAsker::Lane, session_id, now, Some(scope)) != Answer::Refused
+    }
+
+    fn answer(
+        &self,
+        asker: KeyframeAsker,
+        session_id: ObjectId,
+        now: Instant,
+        scope: Option<Scope>,
+    ) -> Answer {
+        let rate = self.rate();
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(scope) = scope {
+            st.scope = scope;
         }
-        allow
+        let scope = st.scope;
+        let real = st.verdict(&st.real, scope.acts(), rate, now);
+        let real_paid = st.real.answered(real, scope.acts(), now);
+        // The world `on` would have had follows every ask under every value,
+        // so under `shadow` it is `on`'s from the session's first ask; N12's
+        // split reads it there.
+        let rule = scope.shadows();
+        let would = st.verdict(&st.shadow, rule, rate, now);
+        let would_paid = st.shadow.answered(would, rule, now);
+        let (counted, paid) = match scope.mode {
+            Mode::Shadow => (would, would_paid),
+            Mode::Off | Mode::On => (real, real_paid),
+        };
+        drop(st);
+        let answer = match real {
+            Ok(()) => Answer::Granted,
+            Err(_) if scope.acts() => Answer::Owed,
+            Err(_) => Answer::Refused,
+        };
+        let n12 = crate::session_telemetry::counters(session_id);
+        n12.note_keyframe_ask(answer == Answer::Granted);
+        n12.note_keyframe_split(asker, counted.err());
+        if paid {
+            n12.note_keyframe_owed_grant();
+        }
+        match answer {
+            Answer::Granted => {
+                self.requested.store(true, Relaxed);
+                n12.note_keyframe();
+            }
+            Answer::Owed => n12.note_keyframe_owed(),
+            Answer::Refused => {}
+        }
+        answer
+    }
+
+    /// FR-148 P4b-4 — a frame the session's lane was handed, its road decided
+    /// at `now`: the rule's scope after it, and the size of the key frame it
+    /// wrote, if it wrote one. A key frame written, whatever asked for it,
+    /// starts the rule's gap again and answers the owed ask. Any other frame
+    /// grants the owed ask once the gap has opened: checked here, at each
+    /// frame, with no timer, so a session with no frames costs nothing.
+    pub fn on_frame(
+        &self,
+        session_id: ObjectId,
+        now: Instant,
+        scope: Scope,
+        key_written: Option<u64>,
+    ) {
+        let rate = self.rate();
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.scope = scope;
+        if let Some(bytes) = key_written {
+            st.key = Some((now, bytes));
+            st.real.owed = None;
+            st.shadow.owed = None;
+            return;
+        }
+        // Only an ask the rule refused is ever owed, so under `off` and
+        // `shadow`, and before the lane first reaches `video-deadline`,
+        // nothing is granted here.
+        let real = st.owes(&st.real, scope.acts(), rate, now);
+        if real {
+            st.real.answered(Ok(()), scope.acts(), now);
+        }
+        let would = scope.mode == Mode::Shadow && st.owes(&st.shadow, scope.shadows(), rate, now);
+        if would {
+            st.shadow.answered(Ok(()), scope.shadows(), now);
+        }
+        drop(st);
+        if real || would {
+            let n12 = crate::session_telemetry::counters(session_id);
+            n12.note_keyframe_owed_grant();
+            if real {
+                self.requested.store(true, Relaxed);
+                n12.note_keyframe();
+            }
+        }
+    }
+
+    /// FR-148 P4b-4 — the rate the rule divides by, as the pump reads it at
+    /// its budget's step ([`Counters::note_rate`]).
+    pub fn set_rate(&self, rate_bps: Option<u64>) {
+        self.rate_bps.store(rate_bps.unwrap_or(0), Relaxed);
+    }
+
+    fn rate(&self) -> Option<u64> {
+        Some(self.rate_bps.load(Relaxed)).filter(|&r| r > 0)
+    }
+
+    /// FR-148 P4b-4 — the rule's gap as it stands: [`kf_gap`] of the last key
+    /// frame written and the rate the pump last handed over. It spaces forced
+    /// key frames only in the rule's scope; the `path delivery` line reads it.
+    pub fn gap(&self) -> Duration {
+        let rate = self.rate();
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        kf_gap(st.key.map(|(_, bytes)| bytes), rate)
     }
 }
 
@@ -340,6 +627,19 @@ pub struct Counters {
     switches: AtomicU64,
     /// 0 before the first pick, then 1 + [`Channel`]'s index.
     channel: AtomicU8,
+    /// FR-148 P4b-4 — under `shadow` and `on`, from the pump's start: the
+    /// session's gate and its key frame asks.
+    asks: Mutex<Option<Asks>>,
+}
+
+/// FR-148 P4b-4 — what a pump's line reads of its session's key frame asks:
+/// the gate the pump feeds the rate, and N12's split as the last line took
+/// it.
+#[derive(Debug)]
+struct Asks {
+    gate: Arc<KeyframeGate>,
+    n12: Arc<SessionCounters>,
+    taken: KeyframeSplit,
 }
 
 impl Counters {
@@ -350,6 +650,7 @@ impl Counters {
             drained: AtomicU64::new(0),
             switches: AtomicU64::new(0),
             channel: AtomicU8::new(0),
+            asks: Mutex::new(None),
         }
     }
 
@@ -364,6 +665,7 @@ impl Counters {
         if self.mode == Mode::Off {
             return None;
         }
+        let (asks, kf_gap) = self.take_asks();
         Some(DeadlineLine {
             forward_tsns,
             late: self.late.swap(0, Relaxed),
@@ -374,7 +676,43 @@ impl Counters {
                 2 => Some(Channel::Deadline),
                 _ => None,
             },
+            asks,
+            kf_gap_ms: kf_gap.map(|gap| u64::try_from(gap.as_millis()).unwrap_or(u64::MAX)),
         })
+    }
+
+    /// FR-148 P4b-4 — at the pump's start, under `shadow` and `on`: the
+    /// session's gate, which [`Self::note_rate`] feeds, and N12's counts,
+    /// whose split each line takes from here on.
+    fn follow(&self, gate: Arc<KeyframeGate>, n12: Arc<SessionCounters>) {
+        let taken = n12.keyframe_split();
+        *self.asks.lock().unwrap_or_else(PoisonError::into_inner) = Some(Asks { gate, n12, taken });
+    }
+
+    /// FR-148 P4b-4 (D59) — the rate the session's key frame rule divides by,
+    /// as the pump reads it at each frame's budget step: the in-flight
+    /// budget's when measured, else the encoder's current target
+    /// ([`kf_rate`]). Under `off`, and with no session, nothing.
+    pub fn note_rate(&self, measured_bps: Option<u64>, target_bps: Option<u32>) {
+        let asks = self.asks.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(asks) = asks.as_ref() {
+            asks.gate.set_rate(kf_rate(measured_bps, target_bps));
+        }
+    }
+
+    /// N12's split since the last line: every key frame ask by who asked, the
+    /// refusals by what refused them, and the owed asks granted (under
+    /// `shadow`, what `on` would have refused, owed and granted); and the
+    /// rule's gap at the line ([`KeyframeGate::gap`]), `None` with no session.
+    fn take_asks(&self) -> (KeyframeSplit, Option<Duration>) {
+        let mut asks = self.asks.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(asks) = asks.as_mut() else {
+            return (KeyframeSplit::default(), None);
+        };
+        let now = asks.n12.keyframe_split();
+        let over = now.since(asks.taken);
+        asks.taken = now;
+        (over, Some(asks.gate.gap()))
     }
 
     fn set_channel(&self, channel: Channel) {
@@ -401,6 +739,13 @@ pub struct DeadlineLine {
     /// The channel in use at the line (under `shadow`: `on`'s); `None` before
     /// the first frame.
     pub channel: Option<Channel>,
+    /// FR-148 P4b-4 (D59) — N12's split of the session's key frame asks over
+    /// the line.
+    pub asks: KeyframeSplit,
+    /// FR-148 P4b-4 — the key frame rule's gap at the line, ms: `kf_gap` of
+    /// the last key frame written and the pump's rate; `None` for a pump that
+    /// serves no session's gate.
+    pub kf_gap_ms: Option<u64>,
 }
 
 impl DeadlineLine {
@@ -430,6 +775,9 @@ impl Pump {
             Mode::Off => None,
             Mode::Shadow | Mode::On => Session::of(session_id),
         };
+        if let Some(s) = &session {
+            counters.follow(s.gate(), crate::session_telemetry::counters(session_id));
+        }
         let pump = Self {
             session_id,
             counters: Arc::clone(counters),
@@ -508,8 +856,14 @@ pub trait Wire: Send + Sync {
     /// Marks `dc`'s stream deadline-limited; false when refused.
     fn mark(&self, dc: &Self::Dc) -> impl Future<Output = bool> + Send;
 
-    /// One key frame ask through the session's gate: whether it passed.
-    fn ask_keyframe(&self) -> bool;
+    /// One key frame ask through the session's gate, at `now`, the lane in
+    /// `scope`: whether a key frame comes without asking again, because it
+    /// passed or (FR-148 P4b-4) the rule owes it.
+    fn ask_keyframe(&self, now: Instant, scope: Scope) -> bool;
+
+    /// FR-148 P4b-4 — a frame's road was decided at `now`, the lane in `scope`
+    /// after it: `key_written`, the size of the key frame it wrote.
+    fn frame_done(&self, now: Instant, scope: Scope, key_written: Option<u64>);
 }
 
 /// A lane's wire in a live session.
@@ -547,10 +901,16 @@ impl Wire for SessionWire {
         self.sctp.mark_deadline_stream(dc.id()).await
     }
 
-    fn ask_keyframe(&self) -> bool {
+    fn ask_keyframe(&self, now: Instant, scope: Scope) -> bool {
         self.session
             .as_ref()
-            .is_some_and(|s| s.gate.ask(self.session_id))
+            .is_some_and(|s| s.gate.ask_lane(self.session_id, now, scope))
+    }
+
+    fn frame_done(&self, now: Instant, scope: Scope, key_written: Option<u64>) {
+        if let Some(s) = &self.session {
+            s.gate.on_frame(self.session_id, now, scope, key_written);
+        }
     }
 }
 
@@ -641,10 +1001,30 @@ impl<W: Wire> Lane<W> {
     /// task.
     pub async fn route(&mut self, wire: &[u8], enqueued_at: Instant) -> Option<Routed<W>> {
         let keyframe = crate::peer::video_bytes_is_keyframe(wire);
-        self.route_at(keyframe, enqueued_at, Instant::now()).await
+        self.route_at(keyframe, wire.len(), enqueued_at, Instant::now())
+            .await
     }
 
+    /// The road of a frame `len` bytes long; then, under `shadow` and `on`,
+    /// the session's gate hears of it (FR-148 P4b-4): the key frame rule's
+    /// clock restarts at a key frame written, and any other frame grants an
+    /// owed ask once the rule's gap has opened.
     async fn route_at(
+        &mut self,
+        keyframe: bool,
+        len: usize,
+        enqueued_at: Instant,
+        now: Instant,
+    ) -> Option<Routed<W>> {
+        let out = self.road(keyframe, enqueued_at, now).await;
+        if self.counters.mode != Mode::Off {
+            let written = (keyframe && out.is_some()).then_some(len as u64);
+            self.wire.frame_done(now, self.scope(), written);
+        }
+        out
+    }
+
+    async fn road(
         &mut self,
         keyframe: bool,
         enqueued_at: Instant,
@@ -675,6 +1055,24 @@ impl<W: Wire> Lane<W> {
 
     fn class(&self) -> CarrierClass {
         CarrierClass::of_code(self.class.load(Relaxed))
+    }
+
+    /// FR-148 P4b-4 — the key frame rule's scope as the lane stands: on
+    /// `video-deadline`, or switching to it (under `shadow`, `on`'s lane).
+    fn scope(&self) -> Scope {
+        let on = match self.phase {
+            Phase::Draining(s) | Phase::Keying(s) => Some(s.to),
+            Phase::Steady => self.on,
+        };
+        Scope {
+            mode: self.counters.mode,
+            deadline: on == Some(Channel::Deadline),
+        }
+    }
+
+    /// A key frame ask through the session's gate, the lane as it stands.
+    fn ask(&self, now: Instant) -> bool {
+        self.wire.ask_keyframe(now, self.scope())
     }
 
     async fn on(
@@ -726,7 +1124,7 @@ impl<W: Wire> Lane<W> {
                 (Some(Channel::Deadline), Some(dc)) => {
                     if age > DEADLINE {
                         self.drop_late();
-                        let _ = self.wire.ask_keyframe();
+                        let _ = self.ask(now);
                         return None;
                     }
                     Some(self.write(dc, held))
@@ -771,7 +1169,7 @@ impl<W: Wire> Lane<W> {
         };
         if !keyframe {
             if !s.asked {
-                s.asked = self.wire.ask_keyframe();
+                s.asked = self.ask(now);
                 self.phase = Phase::Keying(s);
             }
             return self.drop_switching();
@@ -783,7 +1181,7 @@ impl<W: Wire> Lane<W> {
         if to == Channel::Deadline && age > DEADLINE {
             // Too old for the new channel: dropped, and another asked.
             self.drop_late();
-            s.asked = self.wire.ask_keyframe();
+            s.asked = self.ask(now);
             self.phase = Phase::Keying(s);
             return None;
         }
@@ -958,6 +1356,9 @@ mod tests {
         marks: Vec<u16>,
         ask_ok: bool,
         asks: u32,
+        /// FR-148 P4b-4: a session's gate the lane's asks and frames reach,
+        /// in place of `ask_ok`.
+        gate: Option<(Arc<KeyframeGate>, ObjectId)>,
     }
 
     /// A session's wire, scripted: its channels are their stream ids.
@@ -1008,15 +1409,59 @@ mod tests {
             s.mark_ok
         }
 
-        fn ask_keyframe(&self) -> bool {
+        fn ask_keyframe(&self, now: Instant, scope: Scope) -> bool {
             let mut s = self.st();
             s.asks += 1;
-            s.ask_ok
+            match s.gate.clone() {
+                Some((gate, id)) => {
+                    drop(s);
+                    gate.ask_lane(id, now, scope)
+                }
+                None => s.ask_ok,
+            }
+        }
+
+        fn frame_done(&self, now: Instant, scope: Scope, key_written: Option<u64>) {
+            let gate = self.st().gate.clone();
+            if let Some((gate, id)) = gate {
+                gate.on_frame(id, now, scope, key_written);
+            }
         }
     }
 
     fn sid() -> ObjectId {
         ObjectId::parse_str("65a1b2c3d4e5f60718293a4c").unwrap()
+    }
+
+    /// FR-148 P4b-4 — a gate over a fresh flag, for a session of its own,
+    /// its rate `rate_bps`.
+    fn gate_at(rate_bps: Option<u64>) -> (KeyframeGate, Arc<AtomicBool>, ObjectId) {
+        let flag = Arc::new(AtomicBool::new(false));
+        let gate = KeyframeGate::new(Arc::clone(&flag));
+        gate.set_rate(rate_bps);
+        (gate, flag, ObjectId::new())
+    }
+
+    /// The rule's scope: `on`, the lane on `video-deadline`.
+    const RULE: Scope = Scope {
+        mode: Mode::On,
+        deadline: true,
+    };
+
+    /// N12's split of a session's key frame asks.
+    fn split(id: ObjectId) -> KeyframeSplit {
+        crate::session_telemetry::counters(id).keyframe_split()
+    }
+
+    /// The cells' draws (xorshift64), from `seed`.
+    fn draws(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
     }
 
     /// A lane on a scripted wire, its counts and its class, and a clock that
@@ -1062,10 +1507,34 @@ mod tests {
         /// One frame, `age_ms` old at its turn: its channel and number when
         /// written.
         fn frame(&mut self, keyframe: bool, age_ms: u64) -> Option<(u16, u32)> {
+            self.sized(keyframe, age_ms, 1_000)
+        }
+
+        /// [`Self::frame`], `len` bytes long.
+        fn sized(&mut self, keyframe: bool, age_ms: u64, len: usize) -> Option<(u16, u32)> {
             self.t += Duration::from_millis(10);
             let enqueued = self.t - Duration::from_millis(age_ms);
-            futures::executor::block_on(self.lane.route_at(keyframe, enqueued, self.t))
+            futures::executor::block_on(self.lane.route_at(keyframe, len, enqueued, self.t))
                 .map(|r| (r.dc, r.frame_seq))
+        }
+
+        /// FR-148 P4b-4 — the lane's asks and frames go through a session's
+        /// gate, whose rate is `rate_bps`: the gate, its flag and the session.
+        fn gated(
+            &mut self,
+            rate_bps: Option<u64>,
+        ) -> (Arc<KeyframeGate>, Arc<AtomicBool>, ObjectId) {
+            let (gate, flag, id) = gate_at(rate_bps);
+            let gate = Arc::new(gate);
+            self.fake.st().gate = Some((Arc::clone(&gate), id));
+            (gate, flag, id)
+        }
+
+        /// Frames on time, until the next one is due at `at`.
+        fn deltas_until(&mut self, at: Instant) {
+            while self.t + Duration::from_millis(10) < at {
+                self.delta();
+            }
         }
 
         fn key(&mut self) -> Option<(u16, u32)> {
@@ -1313,6 +1782,8 @@ mod tests {
                 drained: 5,
                 switches: 1,
                 channel: Some(Channel::Deadline),
+                asks: KeyframeSplit::default(),
+                kf_gap_ms: None,
             })
         );
         let line = "video channel: video-bytes -> video-deadline \
@@ -1604,7 +2075,7 @@ mod tests {
                     (BYTES, today)
                 });
                 let run = |lane: &mut Lane<Fake>| {
-                    futures::executor::block_on(lane.route_at(key, enqueued, now))
+                    futures::executor::block_on(lane.route_at(key, wire.len(), enqueued, now))
                         .map(|r| (r.dc, r.frame_seq))
                 };
                 let want = messages(todays, &wire);
@@ -1685,6 +2156,447 @@ mod tests {
         ));
         drop(session);
         assert!(Session::of(id).is_none(), "found while its peer holds it");
+    }
+
+    /// FR-148 P4b-4 (D55) — the rule's gap is `max(MIN_KF_GAP, kf_bytes /
+    /// (KF_SHARE × rate))`: 80 KB at 2 Mbit/s, 1.28 s; 20 KB at 16 Mbit/s,
+    /// 80 ms, so the 500 ms floor; no rate, or no key frame yet, 500 ms. At
+    /// the gate, under `on` on `video-deadline`, it runs from the last key
+    /// frame written: an ask a millisecond before it opens is refused, one
+    /// as it opens passes.
+    #[test]
+    fn the_rule_s_gap_is_the_last_key_frame_at_a_quarter_of_the_rate() {
+        assert_eq!(KF_SHARE, 0.25);
+        let table = [
+            (Some(80_000), Some(2_000_000), 1_280),
+            (Some(20_000), Some(16_000_000), 500),
+            (Some(250_000), Some(1_000_000), 8_000),
+            (Some(80_000), None, 500),
+            (Some(80_000), Some(0), 500),
+            (None, Some(2_000_000), 500),
+            (None, None, 500),
+        ];
+        for (bytes, rate, gap_ms) in table {
+            let gap = Duration::from_millis(gap_ms);
+            assert_eq!(kf_gap(bytes, rate), gap, "{bytes:?} {rate:?}");
+            let (gate, flag, id) = gate_at(rate);
+            let t0 = Instant::now();
+            assert!(gate.ask_lane(id, t0, RULE), "the session's first ask");
+            assert!(flag.swap(false, Relaxed));
+            if let Some(bytes) = bytes {
+                gate.on_frame(id, t0, RULE, Some(bytes));
+            }
+            let early = t0 + gap - Duration::from_millis(1);
+            assert!(!gate.ask_at(id, early), "{bytes:?} {rate:?}");
+            assert!(!flag.load(Relaxed), "{bytes:?} {rate:?}");
+            assert!(gate.ask_at(id, t0 + gap), "{bytes:?} {rate:?}");
+            assert!(flag.load(Relaxed), "{bytes:?} {rate:?}");
+        }
+        assert_eq!(
+            kf_gap(Some(u64::MAX), Some(1)),
+            Duration::MAX,
+            "no overflow"
+        );
+    }
+
+    /// FR-148 P4b-4 (D59) — the rule's rate: the in-flight budget's, when
+    /// this association's figures gave it, wins; the encoder's target stands
+    /// in when the budget has none; with neither, the 500 ms floor. The
+    /// pump's read reaches its session's gate from the pump's start under
+    /// `shadow` and `on`, and never under `off`; the line's `kf_gap_ms` is the
+    /// gap at that rate.
+    #[tokio::test]
+    async fn the_rule_s_rate_is_the_measured_budget_s_else_the_encoder_s_target() {
+        assert_eq!(kf_rate(Some(3_200_000), Some(1_600_000)), Some(3_200_000));
+        assert_eq!(kf_rate(None, Some(1_600_000)), Some(1_600_000));
+        assert_eq!(kf_rate(Some(0), Some(1_600_000)), Some(1_600_000));
+        assert_eq!(kf_rate(None, Some(0)), None);
+        assert_eq!(kf_rate(None, None), None);
+        let pc = webrtc::api::APIBuilder::new()
+            .build()
+            .new_peer_connection(Default::default())
+            .await
+            .expect("a peer connection");
+        // 80 KB: 0.8 s at a measured 3.2 Mbit/s, 1.6 s at a 1.6 Mbit/s
+        // target, the floor with neither.
+        for (measured, target, gap_ms) in [
+            (Some(3_200_000), Some(1_600_000), 800),
+            (None, Some(1_600_000), 1_600),
+            (None, None, 500),
+        ] {
+            for mode in [Mode::Off, Mode::Shadow, Mode::On] {
+                let id = ObjectId::new();
+                let session = Session::register(id, Arc::new(AtomicBool::new(false)));
+                let counters = Arc::new(Counters::new(mode));
+                let _pump = Pump::start(id, &pc, &counters).await;
+                counters.note_rate(measured, target);
+                let gate = session.gate();
+                let want = match mode {
+                    Mode::Off => None,
+                    Mode::Shadow | Mode::On => kf_rate(measured, target),
+                };
+                assert_eq!(gate.rate(), want, "{mode:?} {measured:?} {target:?}");
+                let t0 = Instant::now();
+                let scope = Scope {
+                    mode,
+                    deadline: true,
+                };
+                gate.on_frame(id, t0, scope, Some(80_000));
+                // The line's gap is the rule's at that rate; `off` has no line.
+                let line = counters.take(None).map(|l| l.kf_gap_ms);
+                let want_line = (mode != Mode::Off).then_some(Some(gap_ms));
+                assert_eq!(line, want_line, "{mode:?} {measured:?} {target:?}");
+                if mode == Mode::On {
+                    let gap = Duration::from_millis(gap_ms);
+                    assert!(!gate.ask_at(id, t0 + gap - Duration::from_millis(1)));
+                    assert!(gate.ask_at(id, t0 + gap), "{measured:?} {target:?}");
+                }
+            }
+        }
+        pc.close().await.expect("closed");
+    }
+
+    /// FR-148 P4b-4 (D55, R5) — under `on`, on `video-deadline`: an ask the
+    /// rule refuses is owed, never forgotten, and the lane's first frame
+    /// after the gap opens grants it, with no further ask; another refused
+    /// ask meanwhile, the viewer's, coalesces into it. P4b-3 forgot it.
+    #[test]
+    fn a_refused_ask_is_granted_at_the_first_frame_after_the_gap_opens() {
+        let ms = Duration::from_millis;
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::TurnTcp);
+        let (gate, flag, id) = rig.gated(Some(2_000_000));
+        // 80 KB at 2 Mbit/s: 1.28 s.
+        assert_eq!(rig.sized(true, 0, 80_000), Some((DL, 1)));
+        let t0 = rig.t;
+        assert_eq!(rig.frame(false, 301), None, "D drops it, and asks");
+        assert_eq!(rig.fake.st().asks, 1);
+        assert!(!flag.load(Relaxed), "refused: 10 ms after the key frame");
+        rig.deltas_until(t0 + ms(600));
+        assert!(
+            !gate.ask_at(id, rig.t),
+            "the viewer's, past 500 ms: the rule's"
+        );
+        let mut frames = 0;
+        while !flag.load(Relaxed) {
+            assert!(rig.delta().is_some());
+            frames += 1;
+            assert!(frames < 1_000, "never granted");
+        }
+        assert_eq!(rig.t - t0, ms(1_280), "the first frame after the gap opens");
+        assert_eq!(rig.fake.st().asks, 1, "no further ask");
+        let s = split(id);
+        assert_eq!((s.lane, s.viewer), (1, 1));
+        assert_eq!((s.refused_gap, s.refused_rule, s.owed_granted), (1, 1, 1));
+        flag.store(false, Relaxed);
+        for _ in 0..200 {
+            assert!(rig.delta().is_some());
+        }
+        assert!(!flag.load(Relaxed), "one grant for the two asks");
+    }
+
+    /// FR-148 P4b-4 (D59, R4) — a key frame written restarts the rule's clock
+    /// and answers the owed ask, whatever asked for it: the encoder's own,
+    /// unasked; one a grant forced; one written on `video-bytes`. The gap is
+    /// the last key frame's own size at the rate.
+    #[test]
+    fn a_key_frame_written_restarts_the_clock_and_clears_an_owed_ask() {
+        let ms = Duration::from_millis;
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::TurnTcp);
+        let (gate, flag, id) = rig.gated(Some(2_000_000));
+        assert_eq!(rig.sized(true, 0, 80_000), Some((DL, 1)));
+        let t0 = rig.t;
+        assert_eq!(rig.frame(false, 400), None, "D: its ask is owed");
+        // The encoder's own key frame, 1 s on, before the gap opens: written,
+        // it answers the owed ask, and the gap runs from it.
+        rig.deltas_until(t0 + ms(1_000));
+        assert!(rig.sized(true, 0, 80_000).is_some());
+        assert_eq!(rig.t, t0 + ms(1_000));
+        rig.deltas_until(t0 + ms(1_600));
+        assert!(
+            !flag.load(Relaxed),
+            "nothing owed once the first gap opened"
+        );
+        // 1.59 s after the first key frame, 590 ms after the second: refused.
+        assert!(!gate.ask_at(id, rig.t), "the rule's, from the second");
+        while !flag.load(Relaxed) {
+            assert!(rig.delta().is_some());
+        }
+        assert_eq!(rig.t, t0 + ms(2_280), "1.28 s after the second");
+        // The key frame the grant forced, 20 KB: the floor, from it.
+        flag.store(false, Relaxed);
+        assert!(rig.sized(true, 0, 20_000).is_some());
+        let t2 = rig.t;
+        rig.deltas_until(t2 + ms(490));
+        assert_eq!(rig.frame(false, 400), None, "490 ms on: the gap's");
+        assert!(!flag.load(Relaxed));
+        assert!(rig.delta().is_some());
+        assert!(flag.load(Relaxed), "500 ms on: 20 KB at 2 Mbit/s is 320 ms");
+        assert_eq!(rig.t, t2 + ms(500));
+        let s = split(id);
+        assert_eq!((s.refused_gap, s.refused_rule, s.owed_granted), (2, 1, 2));
+
+        // One written on `video-bytes` counts too: a switch to
+        // `video-deadline` 10 ms after it waits out its gap for its key frame.
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::Direct);
+        let (_gate, flag, _id) = rig.gated(Some(2_000_000));
+        assert_eq!(rig.sized(true, 0, 80_000), Some((BYTES, 1)));
+        let t0 = rig.t;
+        rig.class(C::TurnTcp);
+        assert_eq!(
+            rig.delta(),
+            None,
+            "drained at once: dropped, a key frame asked"
+        );
+        assert_eq!(rig.fake.st().asks, 1);
+        assert!(!flag.load(Relaxed), "owed");
+        while !flag.load(Relaxed) {
+            assert_eq!(rig.delta(), None, "dropped while the switch waits");
+        }
+        assert_eq!(rig.t - t0, ms(1_280));
+        assert_eq!(rig.fake.st().asks, 1, "owed, it is never asked again");
+        assert_eq!(rig.key(), Some((DL, 130)));
+    }
+
+    /// FR-148 P4b-4 (D55, AC24) — a steady stream of D drops: 60 s at 30
+    /// frames a second, every frame late after the session's first key frame,
+    /// each framed as the send task frames it (`frame_video_bytes`), and a key
+    /// frame whenever the gate set the flag. Every late frame asks. The grants
+    /// never come closer than the rule's gap from the last key frame written
+    /// or the last grant, and each comes within one frame interval after the
+    /// gap opens, answering an owed ask. P4b-3 granted one every 500 ms.
+    #[test]
+    fn under_steady_d_drops_the_grants_keep_the_rule_s_gap() {
+        let interval = Duration::from_nanos(1_000_000_000 / 30);
+        for (rate, first) in [
+            (2_000_000_u64, 80_000_usize),
+            (600_000, 40_000),
+            (16_000_000, 20_000),
+        ] {
+            let mut rig = Rig::new(Mode::On);
+            rig.class(C::TurnTcp);
+            let (_gate, flag, id) = rig.gated(Some(rate));
+            let t0 = rig.t;
+            let mut gap = Duration::ZERO;
+            let mut since = t0;
+            let mut grants = 0_u32;
+            for i in 0..=1_800_u32 {
+                let now = t0 + interval * i;
+                let key = i == 0 || flag.swap(false, Relaxed);
+                let size = if key { first } else { 2_000 };
+                let payload: Vec<u8> = (0..size).map(|b| (b ^ i as usize) as u8).collect();
+                let wire = crate::peer::frame_video_bytes(&payload, key, u64::from(i));
+                let age = Duration::from_millis(if i == 0 { 0 } else { 400 });
+                let keyframe = crate::peer::video_bytes_is_keyframe(&wire);
+                let routed = rig.lane.route_at(keyframe, wire.len(), now - age, now);
+                let out = futures::executor::block_on(routed).map(|r| r.dc);
+                if i == 0 {
+                    assert_eq!(out, Some(DL));
+                    gap = kf_gap(Some(wire.len() as u64), Some(rate));
+                    continue;
+                }
+                assert_eq!(out, None, "frame {i}: late");
+                if flag.load(Relaxed) {
+                    let waited = now - since;
+                    assert!(waited >= gap, "{rate}: frame {i}, {waited:?} < {gap:?}");
+                    assert!(waited < gap + interval, "{rate}: frame {i}, {waited:?}");
+                    since = now;
+                    grants += 1;
+                }
+            }
+            assert!(grants >= 20, "{rate}: {grants} grants");
+            let s = split(id);
+            assert_eq!(s.lane, 1_800, "{rate}");
+            assert_eq!(s.owed_granted, grants, "{rate}: each answered an owed ask");
+            assert_eq!(s.refused_gap + s.refused_rule, 1_800 - grants, "{rate}");
+            assert_eq!(rig.counters.take(None).unwrap().late, 1_800, "{rate}");
+        }
+    }
+
+    /// FR-148 P4b-4 (R1) — outside the rule's scope the gate is P4b-3's,
+    /// grant for grant: under `off`, under `shadow` (its lane on
+    /// `video-deadline` or not), and under `on` on `video-bytes`. Over five
+    /// seeds of random asks from the viewer and the lane, with frames and key
+    /// frames between them on a thin path, every answer, every flag and
+    /// N12's counts equal P4b-3's gate's.
+    #[test]
+    fn outside_the_rule_s_scope_the_gate_grants_what_p4b_3_granted() {
+        /// P4b-3's gate: one ask passes per 500 ms, and every other is
+        /// forgotten.
+        #[derive(Default)]
+        struct Today(Option<Instant>);
+        impl Today {
+            fn ask(&mut self, now: Instant) -> bool {
+                let allow = self.0.is_none_or(|t| now.duration_since(t) >= MIN_KF_GAP);
+                if allow {
+                    self.0 = Some(now);
+                }
+                allow
+            }
+        }
+        let t0 = Instant::now();
+        for seed in [1_u64, 2, 3, 0x0d55, 0x5eed_f00d] {
+            for mode in [Mode::Off, Mode::Shadow, Mode::On] {
+                let mut next = draws(seed);
+                let (gate, flag, id) = gate_at(Some(300_000));
+                let mut today = Today::default();
+                let (mut t, mut asks, mut gapped) = (t0, 0_u32, 0_u32);
+                for i in 0..3_000 {
+                    let r = next();
+                    t += Duration::from_millis(r % 300);
+                    let scope = Scope {
+                        mode,
+                        deadline: mode == Mode::Shadow && (r >> 40).is_multiple_of(2),
+                    };
+                    let asked = match (r >> 16) % 5 {
+                        0 => Some(gate.ask_at(id, t)),
+                        1 | 2 => Some(gate.ask_lane(id, t, scope)),
+                        3 => {
+                            gate.on_frame(id, t, scope, Some(20_000 + (r >> 24) % 200_000));
+                            None
+                        }
+                        _ => {
+                            gate.on_frame(id, t, scope, None);
+                            None
+                        }
+                    };
+                    let want = asked.map(|_| today.ask(t));
+                    assert_eq!(asked, want, "seed {seed} {mode:?} event {i}");
+                    let granted = want == Some(true);
+                    assert_eq!(
+                        flag.swap(false, Relaxed),
+                        granted,
+                        "seed {seed} {mode:?} {i}"
+                    );
+                    asks += u32::from(want.is_some());
+                    gapped += u32::from(want == Some(false));
+                }
+                let n12 = crate::session_telemetry::counters(id);
+                assert_eq!(n12.keyframe_asks(), (asks, gapped), "seed {seed} {mode:?}");
+                assert!(gapped > 0 && asks > gapped, "seed {seed}: {asks} {gapped}");
+            }
+        }
+    }
+
+    /// FR-148 P4b-4 (R1) — `shadow` counts without acting: on one sequence of
+    /// asks from both sides and frames, the lane on `video-deadline`, its
+    /// counts of asks refused, by the gap and by the rule, and of owed asks
+    /// granted equal what `on` does, and its grants equal `off`'s.
+    #[test]
+    fn shadow_counts_what_on_would_refuse_and_grants_what_off_grants() {
+        let t0 = Instant::now();
+        for seed in [7_u64, 11, 0xd59, 0xfeed, 0x5eed_f00d] {
+            let run = |mode| {
+                let mut next = draws(seed);
+                let (gate, flag, id) = gate_at(Some(1_000_000));
+                let scope = Scope {
+                    mode,
+                    deadline: true,
+                };
+                let mut t = t0;
+                let mut grants = Vec::new();
+                for _ in 0..3_000 {
+                    let r = next();
+                    t += Duration::from_millis(r % 100 + 1);
+                    match (r >> 16) % 8 {
+                        0 => {
+                            gate.ask_at(id, t);
+                        }
+                        1 | 2 => {
+                            gate.ask_lane(id, t, scope);
+                        }
+                        3 => gate.on_frame(id, t, scope, Some(20_000 + (r >> 24) % 150_000)),
+                        _ => gate.on_frame(id, t, scope, None),
+                    }
+                    grants.push(flag.swap(false, Relaxed));
+                }
+                (grants, split(id))
+            };
+            let (off, _) = run(Mode::Off);
+            let (shadow, counted) = run(Mode::Shadow);
+            let (on, done) = run(Mode::On);
+            assert_eq!(shadow, off, "seed {seed}: shadow grants what off grants");
+            assert_eq!(counted, done, "seed {seed}: and counts what on does");
+            assert_ne!(on, off, "seed {seed}: the rule acted under on");
+            assert!(done.refused_rule > 0 && done.owed_granted > 0, "{done:?}");
+        }
+    }
+
+    /// FR-148 P4b-4 (R6) — N12's split: the viewer's asks and the lane's are
+    /// counted apart, every ask is still counted as before, and refusals by
+    /// the 500 ms gap and by the rule apart; an owed ask granted is counted
+    /// once, at the frame that grants it or at the ask that passes. An ask
+    /// owed on `video-deadline` stays owed after the lane has left it, and
+    /// rc.130's gap then grants it.
+    #[test]
+    fn n12_counts_the_viewer_s_asks_and_the_lane_s_and_refusals_by_gap_and_by_rule() {
+        let (gate, flag, id) = gate_at(Some(2_000_000));
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        // The clock: 80 KB at 2 Mbit/s, 1.28 s.
+        gate.on_frame(id, t0, RULE, Some(80_000));
+        assert!(!gate.ask_at(id, at(100)), "viewer: the gap");
+        assert!(gate.ask_lane(id, at(200), RULE), "lane: the gap, owed");
+        assert!(gate.ask_lane(id, at(700), RULE), "lane: the rule, owed");
+        assert!(!gate.ask_at(id, at(900)), "viewer: the rule");
+        gate.on_frame(id, at(1_279), RULE, None);
+        assert!(!flag.load(Relaxed));
+        gate.on_frame(id, at(1_280), RULE, None);
+        assert!(flag.swap(false, Relaxed), "the owed ask, granted");
+        assert!(!gate.ask_at(id, at(1_300)), "viewer: the gap, owed");
+        let bytes = Scope {
+            mode: Mode::On,
+            deadline: false,
+        };
+        assert!(!gate.ask_lane(id, at(1_500), bytes), "lane, on video-bytes");
+        assert!(!flag.load(Relaxed));
+        assert!(
+            gate.ask_lane(id, at(1_780), bytes),
+            "500 ms after the grant"
+        );
+        assert!(flag.swap(false, Relaxed));
+        assert_eq!(
+            split(id),
+            KeyframeSplit {
+                viewer: 3,
+                lane: 4,
+                refused_gap: 4,
+                refused_rule: 2,
+                owed_granted: 2,
+            }
+        );
+        let n12 = crate::session_telemetry::counters(id);
+        assert_eq!(n12.keyframe_asks(), (7, 6), "every ask, as before");
+        // The line takes the split over its span, and the rule's gap at it:
+        // 80 KB at 2 Mbit/s.
+        let counters = Counters::new(Mode::On);
+        counters.follow(Arc::new(gate), Arc::clone(&n12));
+        let line = counters.take(None).unwrap();
+        assert_eq!(line.asks, KeyframeSplit::default());
+        assert_eq!(line.kf_gap_ms, Some(1_280));
+        n12.note_keyframe_split(KeyframeAsker::Viewer, Some(KeyframeRefusal::Rule));
+        let line = counters.take(None).unwrap();
+        assert_eq!((line.asks.viewer, line.asks.refused_rule), (1, 1));
+        assert_eq!(counters.take(None).unwrap().asks, KeyframeSplit::default());
+    }
+
+    /// FR-148 P4b-4 (D59) — both pumps hand their encoder to the budget's
+    /// step, which reads the rule's rate from it at every frame past the
+    /// gate: the one call each pump had, edited in place.
+    #[test]
+    fn both_pumps_feed_the_rule_s_rate_at_each_frame() {
+        let src = peer_rs();
+        let call = "delivery.on_frame(&pc, &mut governor, encoder.as_ref()); // FR-148 D46, P4b-4";
+        for name in [
+            "async fn media_pump_vp9_444_dc(",
+            "async fn media_pump_ffmpeg_dc(",
+        ] {
+            let body = body_of(&src, name);
+            assert_eq!(body.matches(call).count(), 1, "{name}");
+            assert_eq!(body.matches("delivery.on_frame(").count(), 1, "{name}");
+        }
     }
 
     /// FR-148 P4b-3 — in a live session the lane holds `video-bytes`' stash
