@@ -68,9 +68,25 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
     }
 }
 
+/// #4351 — what [`Logged::install`] hands back: the scoped subscriber, and a
+/// SECOND registered dispatcher, never one alone. With exactly one registered,
+/// tracing-core rebuilds a callsite's interest from the default of whichever
+/// thread reaches it first (`Rebuilder::JustOne`) and caches it for every
+/// thread. A parallel test with no subscriber of its own makes it `never`, and
+/// the capture misses that line for good, though this thread logged it. The
+/// lane installs no global subscriber, so any line can be the first. Measured
+/// on CI: the timeout-line test captured 0 of its 2 lines while the slot-keep
+/// test beside it timed out on the same `warn!`. With two, every registered
+/// dispatcher is asked, as `extauth_tests`'s `CaptureGuard` holds it. The
+/// scope ends first, then the second.
+pub(crate) struct LoggedGuard {
+    _scoped: tracing::subscriber::DefaultGuard,
+    _second: tracing::Dispatch,
+}
+
 impl Logged {
-    pub(crate) fn install(&self) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
+    pub(crate) fn install(&self) -> LoggedGuard {
+        Self::hold(
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
                 .with_ansi(false)
@@ -82,8 +98,8 @@ impl Logged {
     /// #3952 — as [`Logged::install`], with the server's own DEBUG lines too
     /// (core and the network module), where a subscriber's dropped message
     /// and a probe's miss are logged.
-    pub(crate) fn install_debug(&self) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
+    pub(crate) fn install_debug(&self) -> LoggedGuard {
+        Self::hold(
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::new(
                     "info,roomler_core=debug,roomler_ai_mod_network=debug",
@@ -92,6 +108,16 @@ impl Logged {
                 .with_writer(self.clone())
                 .finish(),
         )
+    }
+
+    /// `subscriber` as this thread's default, beside a second registered
+    /// dispatcher ([`LoggedGuard`]).
+    fn hold(subscriber: impl tracing::Subscriber + Send + Sync + 'static) -> LoggedGuard {
+        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        LoggedGuard {
+            _scoped: tracing::subscriber::set_default(subscriber),
+            _second: second,
+        }
     }
 
     pub(crate) fn text(&self) -> String {
