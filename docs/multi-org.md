@@ -54,7 +54,7 @@ So: **one daemon, many orgs**. Everything below follows from that.
 
 A `roomlerd run` takes a guard that belongs to the machine, not to its config, before anything
 above: before the start's purge of the overlay's routes, the LocalAPI pipe and the first connect
-(`start_gate`, `agents/roomlerd/src/app.rs:3965`; the guard is
+(`start_gate`, `agents/roomlerd/src/app.rs:3975`; the guard is
 `agents/roomlerd/src/machine_guard.rs`). A run that finds it held leaves there, whatever config it
 loaded and elevated or not, and marks, saves and counts nothing.
 
