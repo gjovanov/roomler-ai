@@ -331,14 +331,18 @@ function onMeshSelect(nodeId: string) {
 }
 
 async function startCall() {
+  // #4257 — the org the call is created in. Its answer, landing after the page
+  // moved on to another org, opens nothing there.
+  const tid = tenantId.value
   const now = new Date()
   const name = `Call - ${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
-  const room = await roomStore.createRoom(tenantId.value, {
+  const room = await roomStore.createRoom(tid, {
     name,
     has_media: true,
     is_open: true,
   })
-  router.push({ name: 'room-call', params: { tenantId: tenantId.value, roomId: room.id } })
+  if (tid !== tenantId.value) return
+  router.push({ name: 'room-call', params: { tenantId: tid, roomId: room.id } })
 }
 
 // #4257 — the org's rows follow the org in the URL. No route remounts on the

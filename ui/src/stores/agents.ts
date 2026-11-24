@@ -1021,8 +1021,13 @@ export const useAgentStore = defineStore('agents', () => {
   let listSeq = 0
   // The latest list fetch failed: `ensureAgents` asks again.
   let listFailed = false
+  // The latest list fetch. One that a newer fetch superseded settles with it,
+  // not with its own dropped answer, as in the rooms store (#4257): a caller
+  // that reads the devices right after its await then reads the newest ones.
+  // The remote viewer takes its device's row so, and the welcome tour counts.
+  let latestFetch: Promise<void> = Promise.resolve()
 
-  async function fetchAgents(tenantId: string) {
+  function fetchAgents(tenantId: string): Promise<void> {
     const mySeq = ++listSeq
     if (agentsTenantId.value !== null && agentsTenantId.value !== tenantId) {
       agents.value = []
@@ -1032,35 +1037,42 @@ export const useAgentStore = defineStore('agents', () => {
     listFailed = false
     loading.value = true
     error.value = null
-    try {
-      // per_page=100 (the server cap): with no param the server defaulted to
-      // 25 and every consumer of this store silently saw a truncated fleet —
-      // the devices grid's menus, the dashboard tile, the pickers. Above 100
-      // agents the rich-store lookups degrade again; the unified /device
-      // endpoint is the paginated path for that scale.
-      const resp = await api.get<AgentListResponse>(`/tenant/${tenantId}/agent?per_page=100`)
-      if (mySeq !== listSeq) return
-      agents.value = resp.items
-      total.value = resp.total
-    } catch (e) {
-      if (mySeq !== listSeq) return
-      listFailed = true
-      error.value = (e as Error).message
-      agents.value = []
-      total.value = 0
-    } finally {
-      if (mySeq === listSeq) loading.value = false
-    }
+    const run = (async (): Promise<void> => {
+      try {
+        // per_page=100 (the server cap): with no param the server defaulted to
+        // 25 and every consumer of this store silently saw a truncated fleet —
+        // the devices grid's menus, the dashboard tile, the pickers. Above 100
+        // agents the rich-store lookups degrade again; the unified /device
+        // endpoint is the paginated path for that scale.
+        const resp = await api.get<AgentListResponse>(`/tenant/${tenantId}/agent?per_page=100`)
+        if (mySeq !== listSeq) return latestFetch
+        agents.value = resp.items
+        total.value = resp.total
+      } catch (e) {
+        if (mySeq !== listSeq) return latestFetch
+        listFailed = true
+        error.value = (e as Error).message
+        agents.value = []
+        total.value = 0
+      } finally {
+        if (mySeq === listSeq) loading.value = false
+      }
+    })()
+    latestFetch = run
+    return run
   }
 
   /** #4248 — the org's devices for a page that only names or picks them,
    *  fetched only when the store does not hold them already: the shell loads
    *  them for its nav, and the Devices page with its grid. A store that holds
-   *  another org's devices, or whose last fetch failed, fetches; one that holds
-   *  this org's (or is loading them) does not. It replaces a check of an empty
-   *  list, which never reloaded a list holding another org's devices. */
+   *  another org's devices, or whose last fetch failed, fetches. One that holds
+   *  this org's, or is loading them, answers with that fetch (#4257), as
+   *  `ensureRooms` does: it settles once the devices have landed, so the
+   *  remote viewer then takes the store's own row of its device. It replaces a
+   *  check of an empty list, which never reloaded a list holding another org's
+   *  devices. */
   function ensureAgents(tenantId: string): Promise<void> {
-    if (agentsTenantId.value === tenantId && !listFailed) return Promise.resolve()
+    if (agentsTenantId.value === tenantId && !listFailed) return latestFetch
     return fetchAgents(tenantId)
   }
 

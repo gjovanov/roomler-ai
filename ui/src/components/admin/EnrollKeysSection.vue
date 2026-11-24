@@ -278,7 +278,13 @@ async function refresh() {
   }
 }
 
+// #4257 — each opening of the mint dialog; closing it ends that opening. A
+// mint answered after its dialog closed (a change of org and back, or Cancel)
+// writes no secret: the key is in the list, to revoke.
+let mintOpening = 0
+
 function openMint() {
+  mintOpening++
   mintedKey.value = null
   mintError.value = null
   copied.value = false
@@ -287,6 +293,7 @@ function openMint() {
 
 async function mint() {
   const tenantId = props.tenantId
+  const opening = mintOpening
   minting.value = true
   mintError.value = null
   try {
@@ -299,7 +306,7 @@ async function mint() {
     // #4257 — minted for an org the page has left: its secret never shows
     // under this one (the key is in that org's list, to revoke).
     if (tenantId !== props.tenantId) return
-    mintedKey.value = resp.key
+    if (opening === mintOpening && mintOpen.value) mintedKey.value = resp.key
     void refresh()
   } catch (e) {
     if (tenantId === props.tenantId) mintError.value = (e as Error).message
@@ -320,6 +327,7 @@ async function copyKey() {
 }
 
 function closeMint() {
+  mintOpening++
   mintOpen.value = false
   // The reveal is over: never keep the secret in component state.
   mintedKey.value = null

@@ -133,7 +133,7 @@ export const useRoomStore = defineStore('rooms', () => {
    *  them, fetched only when the store does not hold them already: the shell
    *  loads them on every change of org. A store that holds another org's
    *  rooms, or whose last fetch failed, fetches. One that holds this org's
-   *  answers with that fetch, so unlike `ensureAgents` it settles only once
+   *  answers with that fetch, as `ensureAgents` does: it settles only once
    *  the rooms have landed, and fails with it. It replaces a check of an
    *  empty list, which never reloaded a list holding another org's rooms. */
   function ensureRooms(tenantId: string): Promise<void> {
@@ -349,6 +349,10 @@ export const useRoomStore = defineStore('rooms', () => {
   }
 
   async function fetchAllUnreadCounts(tenantId: string) {
+    // #4257 — over this org's rooms only: a fetch that a newer one superseded
+    // settles with it, and the shell's count after it would ask for the new
+    // org's rooms under the previous org.
+    if (!listIsOf(tenantId)) return
     for (const room of rooms.value) {
       fetchUnreadCount(tenantId, room.id)
     }

@@ -99,6 +99,12 @@ export const useInviteStore = defineStore('invite', () => {
   const listIsOf = (tenantId: string) =>
     invitesTenantId.value === null || invitesTenantId.value === tenantId
 
+  /** #4257 — the latest list fetch is in flight, and the spinner is its own: a
+   *  create or a batch never ends it. A write answered for an org the list is
+   *  not of leaves the spinner and the error alone (the page shows them above
+   *  another org's grid). */
+  let listInFlight = false
+
   async function fetchInviteInfo(code: string) {
     loading.value = true
     error.value = null
@@ -135,6 +141,7 @@ export const useInviteStore = defineStore('invite', () => {
     }
     invitesTenantId.value = tenantId
     loading.value = true
+    listInFlight = true
     error.value = null
     try {
       const params = new URLSearchParams()
@@ -160,7 +167,10 @@ export const useInviteStore = defineStore('invite', () => {
       error.value = (e as Error).message
       throw e
     } finally {
-      if (mySeq === listSeq) loading.value = false
+      if (mySeq === listSeq) {
+        loading.value = false
+        listInFlight = false
+      }
     }
   }
 
@@ -174,10 +184,10 @@ export const useInviteStore = defineStore('invite', () => {
       if (listIsOf(tenantId)) invites.value.unshift(invite)
       return invite
     } catch (e) {
-      error.value = (e as Error).message
+      if (listIsOf(tenantId)) error.value = (e as Error).message
       throw e
     } finally {
-      loading.value = false
+      if (listIsOf(tenantId) && !listInFlight) loading.value = false
     }
   }
 
@@ -201,10 +211,10 @@ export const useInviteStore = defineStore('invite', () => {
       }
       return result
     } catch (e) {
-      error.value = (e as Error).message
+      if (listIsOf(tenantId)) error.value = (e as Error).message
       throw e
     } finally {
-      loading.value = false
+      if (listIsOf(tenantId) && !listInFlight) loading.value = false
     }
   }
 
