@@ -1775,8 +1775,7 @@ jobs:
       # it runs as, not from the `HOME` sudo kept from its caller
       # (`crates/agent-core/src/appdirs.rs`). Its test runs children of itself
       # with another `HOME`; the rule's other tests run on every lane, and only
-      # a Mac runs the macOS rule against a real account database. #4157: and the restore of a missing config, which a root daemon's start now runs through.
-      # #4379 — and the load with no restore that the macOS supervisor's enrolled worker now runs on.
+      # a Mac runs the macOS rule against a real account database. #4157: and the restore of a missing config, which a root daemon's start now runs through. #4379: and the load with no restore that the macOS supervisor's enrolled worker now runs on.
       - name: cargo test the agent's folders and its config restore on a real Mac (#3802, #4157)
         run: cargo test -p roomler-node-core --lib -- appdirs::tests config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_restored_config_brings_no_crash_to_the_next_start config::tests::a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written config::tests::previous_copy_reads_the_copy_and_writes_nothing config::tests::load_without_restore_never_reads_or_writes_the_prev
 
