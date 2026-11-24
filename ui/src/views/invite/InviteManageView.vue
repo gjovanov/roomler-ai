@@ -235,7 +235,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import { useInviteStore } from '@/stores/invite'
@@ -261,7 +261,9 @@ const { isOpen, toggle } = useOpenRows<string>()
 const { showSuccess, showError } = useSnackbar()
 const { rules } = useValidation()
 
-const tenantId = ref(route.params.tenantId as string)
+// #4257 — the route's org, read live: a link to another org's invites reuses
+// this page, so a ref read once at setup would keep naming the previous org.
+const tenantId = computed(() => route.params.tenantId as string)
 const showCreateDialog = ref(false)
 const showBatchDialog = ref(false)
 const creating = ref(false)
@@ -375,13 +377,17 @@ function copyLink(code: string) {
 }
 
 async function handleCreate() {
+  // #4257 — the org the create was asked for. Its answer, landing after the
+  // page moved on to another org, neither closes, resets or toasts there.
+  const tid = tenantId.value
   creating.value = true
   try {
-    await inviteStore.createInvite(tenantId.value, {
+    await inviteStore.createInvite(tid, {
       target_email: inviteType.value === 'email' ? targetEmail.value : undefined,
       max_uses: inviteType.value === 'link' ? maxUses.value : undefined,
       expires_in_hours: expiresInHours.value,
     })
+    if (tid !== tenantId.value) return
     showCreateDialog.value = false
     targetEmail.value = ''
     maxUses.value = undefined
@@ -389,6 +395,7 @@ async function handleCreate() {
     showSuccess('Invite created')
     fetchGrid()
   } catch (e) {
+    if (tid !== tenantId.value) return
     showError(e instanceof Error ? e.message : 'Failed to create invite')
   } finally {
     creating.value = false
@@ -404,11 +411,29 @@ async function handleRevoke(inviteId: string) {
   }
 }
 
-onMounted(() => {
-  // The grid's own fetch fires from @update:options on mount — only the
-  // roles (for the batch dialog) load here.
-  roleStore.fetchRoles(tenantId.value)
-})
+// #4257 — the page follows its org: a watch that runs at once, not a one-shot
+// mount. The grid's own first fetch fires from @update:options on mount, so the
+// first run loads only the roles (for the batch dialog). A change also closes
+// the create and batch dialogs opened under the previous org (their save would
+// go to this one) and reloads the grid from a clean first page, as
+// AgentsSection's org watch does: nothing fires the table's options again.
+watch(
+  tenantId,
+  (tid, previous) => {
+    if (!tid) return
+    void roleStore.fetchRoles(tid)
+    if (previous === undefined) return
+    showCreateDialog.value = false
+    targetEmail.value = ''
+    maxUses.value = undefined
+    expiresInHours.value = undefined
+    showBatchDialog.value = false
+    gridSearch.value = ''
+    if (gridPage.value !== 1) gridPage.value = 1 // options handler fetches
+    else fetchGrid()
+  },
+  { immediate: true },
+)
 </script>
 
 <style scoped>

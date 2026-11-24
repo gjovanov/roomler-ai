@@ -335,9 +335,9 @@ watch(
       draft.value.account_mode = 'named'
       coercedFromConsoleUser.value = true
     }
-    if (!agentStore.tenantMembers.length) {
-      void agentStore.fetchTenantMembers(props.tenantId)
-    }
+    // #4257 — this org's people, not any: a list that holds another org's
+    // members is not empty.
+    void agentStore.ensureTenantMembers(props.tenantId)
     if (agentStore.orgSshEnabled === null) {
       void agentStore.fetchOrgSshEnabled(props.tenantId)
     }

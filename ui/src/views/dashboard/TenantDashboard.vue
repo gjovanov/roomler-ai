@@ -228,7 +228,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue'
+import { computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTenantStore } from '@/stores/tenant'
 import { useRoomStore } from '@/stores/rooms'
@@ -293,8 +293,10 @@ const canInvite = computed(() =>
 // deployment just sees no panel.
 usePolling(async () => {
   if (!tenantId.value) return
-  await statsStore.fetchOverview(tenantId.value)
-  await statsStore.fetchMesh(tenantId.value)
+  // Both at once (#4257): each fetch drops another org's snapshot as it
+  // starts, so a page the org switcher mounts never shows the previous org's
+  // mesh while the new org's overview loads.
+  await Promise.all([statsStore.fetchOverview(tenantId.value), statsStore.fetchMesh(tenantId.value)])
 }, 60_000)
 
 // The mesh payload keys edges by OVERLAY node id while presence and
@@ -327,32 +329,53 @@ function onMeshSelect(nodeId: string) {
     router.push(`/tenant/${tenantId.value}/devices`)
   }
 }
-watch(tenantId, (tid) => {
-  if (tid) void statsStore.fetchOverview(tid)
-})
 
 async function startCall() {
+  // #4257 — the org the call is created in. Its answer, landing after the page
+  // moved on to another org, opens nothing there.
+  const tid = tenantId.value
   const now = new Date()
   const name = `Call - ${now.toLocaleDateString()} ${now.toLocaleTimeString()}`
-  const room = await roomStore.createRoom(tenantId.value, {
+  const room = await roomStore.createRoom(tid, {
     name,
     has_media: true,
     is_open: true,
   })
-  router.push({ name: 'room-call', params: { tenantId: tenantId.value, roomId: room.id } })
+  if (tid !== tenantId.value) return
+  router.push({ name: 'room-call', params: { tenantId: tid, roomId: room.id } })
 }
 
-onMounted(() => {
-  if (tenantId.value) {
-    if (showChat.value) roomStore.fetchRooms(tenantId.value)
+// #4257 — the org's rows follow the org in the URL. No route remounts on the
+// org, so a link, back or forward to another org's dashboard reuses this
+// page, and the org switcher lands here: a watch that runs at once replaces
+// the one-shot mount load.
+// - The first run fetches, as the mount did. The overview and the mesh are
+//   the poll's on mount (`usePolling` above): this fetches them on a change.
+// - On a change the shell has already reloaded the rooms and the devices
+//   (AppLayout's org watches), so this asks the stores for THIS org's rows,
+//   which costs no second GET. Nothing but this page reloads the tunnel
+//   clients. Each store drops a late answer for the previous org.
+watch(
+  tenantId,
+  (tid, previous) => {
+    if (!tid) return
+    const changed = previous !== undefined
+    if (showChat.value) {
+      void (changed ? roomStore.ensureRooms(tid) : roomStore.fetchRooms(tid)).catch(() => {})
+    }
     if (showFleet.value) {
-      agentStore.fetchAgents(tenantId.value).catch(() => {})
+      void (changed ? agentStore.ensureAgents(tid) : agentStore.fetchAgents(tid)).catch(() => {})
       // ⚠️ Tunnel clients are the `network` module's, not `fleet`'s. Gating
       // them on `showFleet` fired the fetch on a `remote` profile (fleet yes,
       // network no) at a route that correctly 404s. The store now refuses it
       // too — this line states the intent, the store enforces it. (FR-75.)
-      if (caps.has('network')) tunnelClientStore.fetchTunnelClients(tenantId.value)
+      if (caps.has('network')) void tunnelClientStore.fetchTunnelClients(tid)
     }
-  }
-})
+    if (changed) {
+      void statsStore.fetchOverview(tid)
+      void statsStore.fetchMesh(tid)
+    }
+  },
+  { immediate: true },
+)
 </script>

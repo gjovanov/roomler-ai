@@ -16,11 +16,13 @@ import en from '@/locales/en.json'
 const hoisted = vi.hoisted(() => ({
   fetchKeepBusyHistory: vi.fn(),
   fetchAgents: vi.fn(),
+  ensureAgents: vi.fn(),
 }))
 vi.mock('@/stores/agents', () => ({
   useAgentStore: () => ({
     fetchKeepBusyHistory: hoisted.fetchKeepBusyHistory,
     fetchAgents: hoisted.fetchAgents,
+    ensureAgents: hoisted.ensureAgents,
     agents: [{ id: 'a1', name: 'laptop-01', display_name: 'The laptop' }],
   }),
 }))

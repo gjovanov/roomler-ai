@@ -139,7 +139,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import ExternalPeopleCard from '@/components/admin/ExternalPeopleCard.vue'
 import { useAgentStore } from '@/stores/agents'
@@ -174,24 +174,43 @@ function rowKey(e: ExternalAuditEntry, i: number): string {
   return e.id ?? `${e.at}-${i}`
 }
 
+// #4257 — only the latest load writes, and only while the org is still the
+// one it asked for: a log or a refusal for the previous org that lands after
+// a change of org is dropped.
+let loadSeq = 0
+
 async function load() {
+  const mine = ++loadSeq
+  const tenantId = props.tenantId
+  const current = () => mine === loadSeq && tenantId === props.tenantId
   loading.value = true
   error.value = null
   try {
-    const res = await agentStore.fetchExternalAudit(props.tenantId, { perPage: 100 })
-    entries.value = res.items
+    const res = await agentStore.fetchExternalAudit(tenantId, { perPage: 100 })
+    if (current()) entries.value = res.items
   } catch (e) {
-    error.value = (e as Error).message
-    entries.value = []
+    if (current()) {
+      error.value = (e as Error).message
+      entries.value = []
+    }
   } finally {
-    loading.value = false
+    if (current()) loading.value = false
   }
 }
 
-onMounted(() => {
-  void load()
-  ensureLoaded(props.tenantId)
-})
+// #4257 — a routed section: a change of org in the URL reuses it with a new
+// `tenantId`, so it follows its org from the start. A change empties the
+// previous org's rows until this org's land, and asks for the devices they
+// name.
+watch(
+  () => props.tenantId,
+  (tenantId, previous) => {
+    if (previous !== undefined) entries.value = []
+    void load()
+    ensureLoaded(tenantId)
+  },
+  { immediate: true },
+)
 
 defineExpose({ load })
 </script>

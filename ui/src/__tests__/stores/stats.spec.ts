@@ -74,3 +74,100 @@ describe('stats store', () => {
     expect(store.relayCurrent?.regions?.[0]?.id).toBe('us-east')
   })
 })
+
+// #4257 — the overview and the mesh are ONE org's. The org dashboard is
+// reused when only its org changes, and its poll and its org watch can each
+// have a fetch in flight: an answer for the org asked before must not land
+// over the org asked after, and a fetch for another org must not show the
+// previous org's numbers while it loads.
+describe('stats store: one org at a time (#4257)', () => {
+  const ORG_A = 'a'.repeat(24)
+  const ORG_B = 'b'.repeat(24)
+  const OVERVIEW_A = { enabled: true, machines: { online: 7, total: 9 } }
+  const OVERVIEW_B = { enabled: true, machines: { online: 2, total: 3 } }
+  const MESH_A = { enabled: true, nodes: [{ id: 'node-a' }] }
+  const MESH_B = { enabled: true, nodes: [{ id: 'node-b' }] }
+
+  function deferred() {
+    let resolve!: (v: unknown) => void
+    let reject!: (e: unknown) => void
+    const promise = new Promise((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    // clearAllMocks keeps a queued answer: start from none.
+    mockApi.get.mockReset()
+  })
+
+  it("a fetch for another org drops the previous org's overview and mesh at once", async () => {
+    const store = useStatsStore()
+    mockApi.get.mockResolvedValueOnce(OVERVIEW_A)
+    mockApi.get.mockResolvedValueOnce(MESH_A)
+    await store.fetchOverview(ORG_A)
+    await store.fetchMesh(ORG_A)
+    const overviewB = deferred()
+    const meshB = deferred()
+    mockApi.get.mockReturnValueOnce(overviewB.promise)
+    mockApi.get.mockReturnValueOnce(meshB.promise)
+
+    const o = store.fetchOverview(ORG_B)
+    const m = store.fetchMesh(ORG_B)
+    expect(store.overview).toBeNull()
+    expect(store.mesh).toBeNull()
+
+    overviewB.resolve(OVERVIEW_B)
+    meshB.resolve(MESH_B)
+    await o
+    await m
+    expect(store.overview).toEqual(OVERVIEW_B)
+    expect(store.mesh).toEqual(MESH_B)
+  })
+
+  it('an overview and a mesh answered for org A after org B was asked are dropped', async () => {
+    const store = useStatsStore()
+    const overviewA = deferred()
+    const meshA = deferred()
+    mockApi.get.mockReturnValueOnce(overviewA.promise)
+    mockApi.get.mockReturnValueOnce(meshA.promise)
+    const oa = store.fetchOverview(ORG_A)
+    const ma = store.fetchMesh(ORG_A)
+    mockApi.get.mockResolvedValueOnce(OVERVIEW_B)
+    mockApi.get.mockResolvedValueOnce(MESH_B)
+    await store.fetchOverview(ORG_B)
+    await store.fetchMesh(ORG_B)
+
+    overviewA.resolve(OVERVIEW_A)
+    meshA.resolve(MESH_A)
+    await oa
+    await ma
+    expect(store.overview).toEqual(OVERVIEW_B)
+    expect(store.mesh).toEqual(MESH_B)
+  })
+
+  it("a failure for org A that lands after org B was asked leaves org B's overview and mesh", async () => {
+    const store = useStatsStore()
+    const overviewA = deferred()
+    const meshA = deferred()
+    mockApi.get.mockReturnValueOnce(overviewA.promise)
+    mockApi.get.mockReturnValueOnce(meshA.promise)
+    const oa = store.fetchOverview(ORG_A)
+    const ma = store.fetchMesh(ORG_A)
+    mockApi.get.mockResolvedValueOnce(OVERVIEW_B)
+    mockApi.get.mockResolvedValueOnce(MESH_B)
+    await store.fetchOverview(ORG_B)
+    await store.fetchMesh(ORG_B)
+
+    overviewA.reject(new Error('HTTP 500'))
+    meshA.reject(new Error('HTTP 500'))
+    await oa
+    await ma
+    expect(store.overview).toEqual(OVERVIEW_B)
+    expect(store.mesh).toEqual(MESH_B)
+    expect(store.error).toBeNull()
+  })
+})

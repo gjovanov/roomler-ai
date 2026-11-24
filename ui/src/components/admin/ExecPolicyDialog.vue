@@ -331,9 +331,9 @@ watch(
   (v) => {
     if (!v) return
     draft.value = { ...emptyPolicy(), ...(agent.value?.exec_policy ?? {}) }
-    if (!agentStore.tenantMembers.length) {
-      void agentStore.fetchTenantMembers(props.tenantId)
-    }
+    // #4257 — this org's people, not any: a list that holds another org's
+    // members is not empty.
+    void agentStore.ensureTenantMembers(props.tenantId)
     if (agentStore.orgExecEnabled === null) {
       void agentStore.fetchOrgExecEnabled(props.tenantId)
     }
