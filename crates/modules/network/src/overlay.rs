@@ -2297,8 +2297,8 @@ async fn push_to_node(
             Ok(()) => Delivery::Sent,
             Err(e) => {
                 let miss = agent_miss(&e);
-                miss_line!(
-                    miss_at_debug(in_fan, miss),
+                miss_line!(miss_at_debug(in_fan, miss),
+                    // AGENT-WORD-KEPT: a log message; reads of the server log count this wording
                     agent_id = %agent_id, %e, "overlay: agent node unreachable; skipped"
                 );
                 miss
