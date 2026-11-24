@@ -5387,6 +5387,11 @@ async fn run_cmd(
         delegate_host.clone(),
         shutdown_rx.clone(),
     ));
+    // #4379 — beside it, the root daemon's sweep of people's `.prev` after a
+    // conversion to one row; never in a worker. Aborted below as well.
+    #[cfg(target_os = "macos")]
+    let one_row_sweep_task = (euid_is_root() && !supervised)
+        .then(|| tokio::spawn(roomlerd::one_row::sweep_at_start(shutdown_rx.clone())));
 
     // FR-43 P2a — the WORKER half. Inert unless `--supervised` says the root
     // daemon started us and put an attach secret on our stdin, so a
@@ -5936,6 +5941,10 @@ async fn run_cmd(
     }
     #[cfg(target_os = "linux")]
     if let Some(t) = replaced_task {
+        t.abort();
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(t) = one_row_sweep_task {
         t.abort();
     }
     // #1684 — take our own virtual desktop down BEFORE we leave. Under systemd

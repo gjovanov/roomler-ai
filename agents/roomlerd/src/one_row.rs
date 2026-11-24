@@ -46,6 +46,17 @@
 //! retires reads offline until a person deletes it, and until then `--revert`
 //! puts the two rows back.
 //!
+//! #4379 — the root daemon's sweep, after a conversion ([`sweep`]): once the
+//! daemon has run [`crate::config::CLEAN_RUN_THRESHOLD_SECS`], and only while
+//! root's tree holds a conversion's records (its kept copy, `root.json` or a uid
+//! folder under [`RECORDS`]), one `blank-prev` child per person, in uid order,
+//! console or not. Each is handed the server and tenant of every enrollment
+//! root's file holds ([`held_orgs`]) and replaces the config's `.prev` where it
+//! holds one: a conversion before #4184 kept the outgoing, enrolled config
+//! there, and a load restores that copy when the config does not load. One line
+//! per person in [`LOG`]; a child that fails is its line, and the next person
+//! goes on. No record of it is kept: the next start of the daemon asks again.
+//!
 //! The planner, the refusals' lines and the spawn and bootstrap plans are pure,
 //! and every effect goes through [`Host`], whose effects name no path in a home:
 //! a person's take `(account, verb, stdin)`, root's a [`RootFile`]. So the
@@ -1424,10 +1435,54 @@ pub struct Sweep {
     pub stdin: Vec<u8>,
 }
 
-/// #4379 — scaffolding for the red tests: nothing to do.
+/// #4379 — the sweep's reads, every one of them root's own: `None`, with
+/// nothing read past them, unless root's tree holds a conversion's records
+/// ([`RootFile::Kept`], `root.json`, a uid folder), and nothing to do when
+/// root's file holds no enrollment. Root's file is read and parsed as it is,
+/// never through [`Host::load_root`], whose load writes it when it does not
+/// load: the sweep writes nothing of root's. Then the accounts Read would ask
+/// ([`accounts_to_ask`]), in uid order, console or not. A read of root's that
+/// fails is one line, and the sweep stops: the next start asks again.
 pub fn sweep_plan<H: Host>(host: &mut H) -> Option<Sweep> {
-    let _ = host;
-    None
+    let root = match converted_root(host) {
+        Ok(Some(root)) => root,
+        Ok(None) => return None,
+        Err(e) => {
+            host.say(&format!(
+                "the sweep of people's config.toml.prev did not run: {e:#}"
+            ));
+            return None;
+        }
+    };
+    let orgs = held_orgs(&root);
+    if orgs.is_empty() {
+        return None;
+    }
+    let stdin = serde_json::to_vec(&crate::one_row_home::HeldOrgs {
+        v: crate::one_row_home::FORMAT,
+        orgs,
+    })
+    .ok()?;
+    let entries = host.users();
+    let accounts = accounts_to_ask(&entries, |uid| host.account(uid)).accounts;
+    Some(Sweep { accounts, stdin })
+}
+
+/// #4379 — root's file, parsed as it is, when root's tree holds a
+/// conversion's records; `None` when it holds none.
+fn converted_root<H: Host>(host: &H) -> Result<Option<AgentConfig>> {
+    let records = host.read_root(RootFile::Kept)?.is_some()
+        || host.read_root(RootFile::RootRecord)?.is_some()
+        || !host.record_uids()?.is_empty();
+    if !records {
+        return Ok(None);
+    }
+    let bytes = host
+        .read_root(RootFile::Config)?
+        .with_context(|| format!("{ROOT_CONFIG} is not there"))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{ROOT_CONFIG} is not UTF-8"))?;
+    crate::config::parse_text(&text, ROOT_CONFIG).map(Some)
 }
 
 /// #4379 — one `blank-prev` child per account of `sweep`, in its order, each
@@ -3605,26 +3660,73 @@ mod mac {
     }
 
     struct MacHost {
-        log: Option<std::fs::File>,
+        /// The log, once opened: at the start of the command, at the first
+        /// line of the daemon's sweep. `Some(None)`: it could not be opened.
+        log: Option<Option<std::fs::File>>,
+        /// #4379 — each line is printed too: the command's are; the daemon's
+        /// sweep's go to the log alone.
+        print: bool,
         started: std::time::Instant,
+    }
+
+    /// [`LOG`], opened to append, made 600 where it is missing.
+    fn open_log() -> Option<std::fs::File> {
+        let log_path = root_path(RootFile::Log);
+        if let Some(dir) = log_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)
+            .ok()
     }
 
     impl MacHost {
         fn new() -> Self {
-            let log_path = root_path(RootFile::Log);
-            if let Some(dir) = log_path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let log = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(&log_path)
-                .ok();
             Self {
-                log,
+                log: Some(open_log()),
+                print: true,
                 started: std::time::Instant::now(),
             }
+        }
+
+        /// #4379 — the daemon's sweep: a Mac with nothing to say gets no log.
+        fn for_daemon() -> Self {
+            Self {
+                log: None,
+                print: false,
+                started: std::time::Instant::now(),
+            }
+        }
+    }
+
+    /// #4379 — the root daemon's sweep ([`sweep`]), started beside FR-43's
+    /// supervisor by a root daemon that is not a worker: once it has run
+    /// [`crate::config::CLEAN_RUN_THRESHOLD_SECS`], its reads on the blocking
+    /// pool (an account lookup can be held up, #3853), then one child per
+    /// person. A stop of the daemon ends it at once, at any point; a child it
+    /// was waiting for ends by its own deadline ([`CHILD_DEADLINE`]).
+    pub(crate) async fn sweep_at_start(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let after = Duration::from_secs(crate::config::CLEAN_RUN_THRESHOLD_SECS);
+        let work = async {
+            tokio::time::sleep(after).await;
+            let read = tokio::task::spawn_blocking(|| {
+                let mut host = MacHost::for_daemon();
+                let planned = sweep_plan(&mut host);
+                (host, planned)
+            })
+            .await;
+            match read {
+                Ok((mut host, Some(planned))) => sweep_run(&mut host, &planned).await,
+                Ok((_, None)) => {}
+                Err(e) => tracing::warn!(error = %e, "the sweep of people's config.toml.prev"),
+            }
+        };
+        tokio::select! {
+            () = work => {}
+            _ = shutdown.wait_for(|stop| *stop) => {}
         }
     }
 
@@ -3634,8 +3736,10 @@ mod mac {
             // Never `println!`: under `roomler exec` the pipe behind stdout
             // belongs to the daemon being restarted, and `println!` panics on a
             // closed pipe, which would stop the verify and its undo midway.
-            let _ = writeln!(std::io::stdout(), "{line}");
-            if let Some(log) = self.log.as_mut() {
+            if self.print {
+                let _ = writeln!(std::io::stdout(), "{line}");
+            }
+            if let Some(log) = self.log.get_or_insert_with(open_log).as_mut() {
                 let _ = writeln!(log, "{} {line}", chrono::Utc::now().to_rfc3339());
             }
         }
@@ -3886,9 +3990,10 @@ mod mac {
 }
 
 /// FR-151 — the update helper starts the console person's `live-work` child
-/// with FR-147's own spawn and account lookup.
+/// with FR-147's own spawn and account lookup. #4379 — the root daemon starts
+/// its sweep.
 #[cfg(target_os = "macos")]
-pub(crate) use mac::{person_account, spawn_person};
+pub(crate) use mac::{person_account, spawn_person, sweep_at_start};
 
 #[cfg(test)]
 mod tests {

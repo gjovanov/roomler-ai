@@ -3724,11 +3724,6 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     }
 }
 
-/// #4379 — scaffolding for the red tests: [`load`].
-pub fn load_without_restore(path: &PathBuf) -> Result<AgentConfig> {
-    load(path)
-}
-
 /// Read a config that is EXPECTED to be absent — a probe, not a load.
 ///
 /// FR-66. [`load`] is deliberately **not** a neutral reader: with no usable
@@ -5227,6 +5222,19 @@ fn what_copy(copy: Result<AgentConfig>) -> PreviousCopy {
         Err(e) if not_found(&e) => PreviousCopy::Missing,
         Err(_) => PreviousCopy::Broken,
     }
+}
+
+/// #4379 — [`load`] without its restore: the config at `path` as it is, or the
+/// error its read or parse ends with (a missing file's holds an I/O "not
+/// found"). Its last good copy ([`prev_path`]) is neither read nor written,
+/// and no file is written. For a start that must not run on that copy:
+/// `roomlerd`'s enrolled worker under FR-43's macOS supervisor, whose copy on a
+/// Mac converted to one row can hold an enrollment that moved to the root
+/// daemon.
+pub fn load_without_restore(path: &PathBuf) -> Result<AgentConfig> {
+    let cfg = try_load(path)?;
+    note_unknown_keys(path);
+    Ok(cfg)
 }
 
 /// #4176 — what the machine config under `tree`, which is not there, can be

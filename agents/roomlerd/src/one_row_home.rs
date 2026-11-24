@@ -19,6 +19,7 @@
 //! | `put-back` | [`Kept`]: the kept bytes and modes of both files | `put_back`: the sha256 of each file written | 0; 4 when a folder it writes is not writable |
 //! | `put-back-legacy` | none | `put_back_legacy`: which old copies it renamed back | 0; 3 when anything but a file is at an old copy's name; 4, naming the roomler folder, when an old copy's name could not be looked at, and as `put-back`; 3 and that first 4 before anything is renamed |
 //! | `live-work` (FR-151) | none | `live_work`: how the person's own daemon answered `live_work` over the person's own socket, in the folder `confstr(_CS_DARWIN_USER_TEMP_DIR)` names: `answered` with its counts and ask age, `not_running`, `older` or `no_answer`. No file is read or written | 0 |
+//! | `blank-prev` (#4379) | [`HeldOrgs`]: the server and tenant of each enrollment root's file holds | `blank_prev`: whether the config's `.prev` held one of them, and the sha256 of the `.prev` it wrote in its place (none when it wrote none). The config is never written | 0; 4 when the roomler folder is not writable, before anything is written |
 //! | every verb | | | 2: usage, a failed check of itself, or another version; 4: not writable (stderr: the path, its owner and mode); 1: any other error |
 //!
 //! The reply is one JSON line on stdout, written only with exit 0: `"v":1`,
@@ -40,6 +41,10 @@
 //!    a check: the child reads no environment at all.
 //! 7. It runs the verb.
 //!
+//! Before step 1 it arms its own end at root's deadline for it
+//! ([`crate::one_row::CHILD_DEADLINE`], #4379): a child root no longer waits
+//! for, because the daemon that started it stopped, still ends by then.
+//!
 //! **Bounds.** A config of [`CONFIG_BOUND`], a plist of [`PLIST_BOUND`], stdin
 //! of [`STDIN_BOUND`]; anything larger is exit 1 (`read` reports it as
 //! `too_large`), and so is a new config `convert` would write over its bound,
@@ -51,7 +56,10 @@
 //! bytes it checked, and reads no file again by path: the new config is the
 //! text a save would write over them (`config::serialise_over`, which keeps
 //! the keys this build does not know), kept first as its `.prev` too (0600):
-//! root's records alone keep the outgoing bytes (#4184). `put-back` gives the
+//! root's records alone keep the outgoing bytes (#4184). `blank-prev` writes
+//! the `.prev` alone, the same way and 0600: the config's own bytes, or,
+//! beside a config that is missing or does not load, the `.prev`'s own
+//! settings with no enrollment, as `convert` makes them. `put-back` gives the
 //! plist its recorded mode less group and other write (0644 when none was
 //! recorded: launchd ignores a plist others can write) and the config its
 //! recorded owner bits (0600 when none), and makes a missing
@@ -73,13 +81,13 @@ use crate::one_row::{AGENT_PLIST, kept_path, without_enrollments};
 pub const VERB: &str = "one-row-home";
 /// The version the child answers for, and the one root passes in `--version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// The format of the reply and of `put-back`'s stdin.
+/// The format of the reply and of `put-back`'s and `blank-prev`'s stdin.
 pub const FORMAT: u32 = 1;
 /// The largest config the child reads or writes.
 pub const CONFIG_BOUND: usize = 256 * 1024;
 /// The largest LaunchAgent plist the child reads or writes.
 pub const PLIST_BOUND: usize = 64 * 1024;
-/// The most stdin the child reads (`put-back`).
+/// The most stdin the child reads (`put-back`, `blank-prev`).
 pub const STDIN_BOUND: usize = 1024 * 1024;
 /// The config's name in the roomler folder.
 const CONFIG: &str = "config.toml";
@@ -925,6 +933,9 @@ enum Answer {
 /// process itself (`RealMe`).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn run(args: &[OsString], me: &mut impl Me, fs: &mut impl Fs) -> Outcome {
+    // #4379 — first, its own end at root's deadline for it: a daemon that
+    // stops abandons its wait, and no one else would end this child then.
+    me.end_by(crate::one_row::CHILD_DEADLINE);
     // 1. What it makes is born private, whoever started it and however.
     me.umask_private();
     // 2. What the kernel says this process is, before any argument is read.
@@ -1241,18 +1252,149 @@ fn convert(
     })
 }
 
-/// #4379 — scaffolding for the red tests: answers, and changes nothing.
+/// #4379 — `blank-prev`: the config's `.prev` replaced when it holds an
+/// enrollment root's file holds, and nothing else written. In this order:
+///
+/// 1. Its input ([`HeldOrgs`]), before any file is read: exit 2 when it is
+///    not one of this format.
+/// 2. The `.prev`, read within [`CONFIG_BOUND`]. One that is not there, is not
+///    a regular file, may not be read or does not parse is left as it is: a
+///    load restores only a copy that parses. (The line says so for one that is
+///    there and was not read.) So is one that holds no enrollment root's file
+///    holds ([`holds_one_of`]): the equal case, a `.prev` that is the config's
+///    bytes since #4184, holds none.
+/// 3. The config. One that parses and holds such an enrollment is the
+///    person's live state: both files are left as they are, and the line
+///    names them. One that parses and holds none is the new `.prev`, byte for
+///    byte. One that is missing, may not be read or does not parse makes it
+///    the `.prev`'s own settings with no enrollment, as `convert` makes them,
+///    within [`CONFIG_BOUND`] (exit 1 over it, before anything changes).
+/// 4. The roomler folder must be writable (exit 4, before anything changes).
+/// 5. The `.prev` is written as `convert` writes it, 0600. A write that fails
+///    is exit 1, its line naming the file. The config is never written.
 fn blank_prev(
     at: &Places,
     stdin: &[u8],
     fs: &mut impl Fs,
     said: &mut Vec<String>,
 ) -> Result<BlankPrevAnswer, Fail> {
-    let _ = (at, stdin, fs, said);
-    Ok(BlankPrevAnswer {
+    let held: HeldOrgs = serde_json::from_slice(stdin).map_err(|e| {
+        Fail::Usage(format!(
+            "its input does not parse ({:?} at line {}, column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })?;
+    if held.v != FORMAT {
+        return Err(Fail::Usage(format!(
+            "its input is of format {}, not {FORMAT}",
+            held.v
+        )));
+    }
+    let left = BlankPrevAnswer {
         found: false,
         sha256: None,
+    };
+    let prev = crate::config::prev_path(&at.config);
+    let origin = prev.display().to_string();
+    let prev_bytes = match fs.read(&prev, CONFIG_BOUND) {
+        Held::Present { bytes, .. } => bytes,
+        Held::Absent => return Ok(left),
+        Held::Unreadable { error, .. } => {
+            said.push(format!(
+                "{origin} is there and was not read ({error:?}): it is left as it is"
+            ));
+            return Ok(left);
+        }
+    };
+    let Some((prev_text, prev_cfg)) = parsed(prev_bytes, &prev) else {
+        return Ok(left);
+    };
+    if !holds_one_of(&prev_cfg, &held.orgs) {
+        return Ok(left);
+    }
+    let config = at.config.display().to_string();
+    let config_parsed = match fs.read(&at.config, CONFIG_BOUND) {
+        Held::Present { bytes, .. } => parsed(bytes, &at.config),
+        Held::Absent | Held::Unreadable { .. } => None,
+    };
+    let (bytes, from) = match config_parsed {
+        Some((_, cfg)) if holds_one_of(&cfg, &held.orgs) => {
+            said.push(format!(
+                "{config} holds an enrollment root's file holds, and that config is the \
+                 person's own to change: it and {origin} are left as they are"
+            ));
+            return Ok(BlankPrevAnswer {
+                found: true,
+                sha256: None,
+            });
+        }
+        // Valid UTF-8 as read: its text's bytes are the file's.
+        Some((text, _)) => (text.into_bytes(), "the config's own bytes"),
+        None => {
+            let (blank, lost) =
+                crate::config::serialise_over(&without_enrollments(&prev_cfg), &prev_text, &prev)
+                    .map_err(|e| Fail::Error(format!("{e:#}")))?;
+            if blank.len() > CONFIG_BOUND {
+                return Err(Fail::Error(format!(
+                    "the new {origin} would be over {CONFIG_BOUND} bytes, so it was not \
+                     replaced: it still holds an enrollment root's file holds. Remove it: the \
+                     root daemon asks again at its next start"
+                )));
+            }
+            if !lost.is_empty() {
+                let lost: Vec<String> = lost.iter().map(|k| k.escape_debug().to_string()).collect();
+                said.push(format!(
+                    "keys of {origin} this build does not know were not kept: {}",
+                    lost.join(", ")
+                ));
+            }
+            (
+                blank.into_bytes(),
+                "its own settings with no enrollment, beside a config that is missing or does \
+                 not load",
+            )
+        }
+    };
+    if !fs.writable(&at.folder) {
+        return Err(not_writable(&*fs, &at.folder));
+    }
+    fs.write(&prev, &bytes, 0o600).map_err(|e| {
+        Fail::Error(format!(
+            "{origin} could not be replaced ({e}): it still holds an enrollment root's file \
+             holds, which a load restores when the config does not load. Remove it or free \
+             disk space: the root daemon asks again at its next start"
+        ))
+    })?;
+    said.push(format!(
+        "{origin} held an enrollment root's file holds, and now holds {from}"
+    ));
+    Ok(BlankPrevAnswer {
+        found: true,
+        sha256: Some(sha256_hex(&bytes)),
     })
+}
+
+/// A file's text and what it parses as, by the rules a load reads it with
+/// (`config::parse_text`); `None` when it is not UTF-8 or does not parse.
+fn parsed(bytes: Vec<u8>, path: &Path) -> Option<(String, crate::config::AgentConfig)> {
+    let text = String::from_utf8(bytes).ok()?;
+    let cfg = crate::config::parse_text(&text, &path.display().to_string()).ok()?;
+    Some((text, cfg))
+}
+
+/// #4379 — whether `cfg` holds an enrollment of `orgs`, by its server and
+/// tenant together, as the conversion tells an enrollment root's file holds
+/// (`one_row::held_by`): its primary, when it holds one, or any `[[orgs]]`
+/// entry. Equality of both strings, nothing less.
+fn holds_one_of(cfg: &crate::config::AgentConfig, orgs: &[HeldOrg]) -> bool {
+    let held = |server_url: &str, tenant_id: &str| {
+        orgs.iter()
+            .any(|o| o.server_url == server_url && o.tenant_id == tenant_id)
+    };
+    (cfg.has_primary_enrollment() && held(&cfg.server_url, &cfg.tenant_id))
+        || cfg.orgs.iter().any(|o| held(&o.server_url, &o.tenant_id))
 }
 
 /// Each folder of `chain`, outermost first, made with its mode where it is

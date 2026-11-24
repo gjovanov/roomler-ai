@@ -12,20 +12,28 @@
 //! lock, as before. Nor does the enrolled worker FR-43's macOS supervisor starts
 //! ([`may_restore`]): it ends with `NoConfig` as before, and its copy is not read.
 //!
+//! #4379 — nor does that worker restore a config that is there and does not
+//! load ([`load`]): on a Mac converted to one row the copy can hold an
+//! enrollment that moved to the root daemon. It ends with `ConfigDoesNotLoad`,
+//! 78 like `NoConfig`, and both files stay as they are. Every other run restores
+//! it, as before, the worker with no enrollment among them.
+//!
 //! #4176 — a Windows SystemContext worker's machine config is restored only from
 //! a copy that passes the checks the config itself would
 //! (`config::machine_previous_copy`, through [`config::previous_copy`]): the
 //! service host starts that worker for such a copy, through the same function.
 
 use super::config::{self, PreviousCopy};
+use roomlerd::daemon_error::ConfigDoesNotLoad;
 use roomlerd::supervision::Supervision;
 use std::path::Path;
 
 /// What a start does with its config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AtStart {
-    /// The file is there. [`config::load`] reads it, and recovers one that does
-    /// not load from its copy, as before.
+    /// The file is there. [`load`] reads it, and recovers one that does not
+    /// load from its copy, as before, but in the supervisor's enrolled worker
+    /// (#4379).
     Load,
     /// The file is missing, and its copy holds an enrollment: [`config::load`]
     /// restores it after the lock.
@@ -92,16 +100,24 @@ pub(super) fn of(path: &Path, unenrolled: bool, supervision: Supervision) -> AtS
     })
 }
 
-/// #4379 — scaffolding for the red tests: every run restores.
+/// #4379 — whether a run under `supervision` restores a config that is there
+/// and does not load from its last good copy: every run but the enrolled
+/// worker FR-43's macOS supervisor starts, the one [`may_restore`] names. The
+/// worker with no enrollment keeps it: its screen needs a config that loads,
+/// and it runs on no enrollment of the file's.
 pub(super) fn restores_a_config_that_does_not_load(
     unenrolled: bool,
     supervision: Supervision,
 ) -> bool {
-    let _ = (unenrolled, supervision);
-    true
+    unenrolled || may_restore(supervision)
 }
 
-/// #4379 — scaffolding for the red tests: the base's load.
+/// #4379 — the load a start makes after the lock, `run_cmd`'s only one:
+/// [`config::load`], as before, or, for the run that does not restore
+/// ([`restores_a_config_that_does_not_load`]), [`config::load_without_restore`].
+/// That one's config that does not load ends the run with
+/// [`ConfigDoesNotLoad`]: 78, its line naming the file, its copy not read, and
+/// nothing written.
 pub(super) fn load(
     path: &Path,
     unenrolled: bool,
@@ -112,7 +128,8 @@ pub(super) fn load(
     if restores_a_config_that_does_not_load(unenrolled, supervision) {
         return config::load(&path).context("loading config");
     }
-    config::load_without_restore(&path).context("loading config")
+    config::load_without_restore(&path)
+        .map_err(|e| anyhow::Error::new(ConfigDoesNotLoad::at(&path, &e)))
 }
 
 #[cfg(test)]

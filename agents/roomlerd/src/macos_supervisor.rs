@@ -260,10 +260,10 @@ const SIGNAL_NAMES: &[(i32, &str)] = &[
 /// - the codes the agent exits with on purpose (`ALREADY_RUNNING`,
 ///   `AGENT_DELETED`, `RESTART_REQUESTED`), and `STALL`, which the watchdog
 ///   recorded itself before it forced the exit;
-/// - `NO_ENROLLMENT` (78, #4071): `run` found no config, because the console
-///   user has no enrollment on this Mac (`daemon_error::NoConfig`). That is the
-///   device's state, which an enrollment ends, not a fault, and the give-up
-///   says so for certain ([`gave_up_reason`]). The Windows supervisor skips the
+/// - `NO_ENROLLMENT` (78, #4071): `run` found no config (`daemon_error::NoConfig`),
+///   or (#4379) one that does not load, which it does not restore. That is the
+///   device's state, not a fault, and the give-up says so for certain
+///   ([`gave_up_reason`]). The Windows supervisor skips the
 ///   same codes (`should_record_supervisor_crash`), plus a session-teardown
 ///   code that macOS has no equivalent of;
 /// - SIGTERM, SIGHUP and SIGINT: a logout, a closed terminal or a person
@@ -540,10 +540,10 @@ pub fn stale_workers(ps: &str, commands: &[String], own_pid: u32) -> Vec<(u32, u
 /// write.
 ///
 /// #4071 — a worker this supervisor started that finds no config exits 78
-/// (`daemon_error::NO_ENROLLMENT_EXIT_CODE`), so after a 78 the give-up says
-/// for certain that the console user has no enrollment on this Mac, and what
-/// ends it. Every other end keeps the reading it had: a likely cause and the
-/// command that checks it. `not_theirs` and `one_row` come first, as before.
+/// (`daemon_error::NO_ENROLLMENT_EXIT_CODE`); #4379: so does one whose config
+/// does not load, which it no longer restores. After a 78 the give-up names
+/// both, and the worker's own line. Every other end keeps the reading it had: a
+/// likely cause and the command that checks it. `not_theirs` and `one_row` first.
 pub fn gave_up_reason(
     last: Option<WorkerEnd>,
     one_row: bool,
@@ -573,10 +573,13 @@ pub fn gave_up_reason(
              Library/Application Support/live.roomler.roomler/logs"
         }
         Some(WorkerEnd::Code(crate::daemon_error::NO_ENROLLMENT_EXIT_CODE)) => {
-            "each worker exited 78: the console user has no enrollment on this Mac. The \
-             worker runs AS the console user, loads THAT user's config, and found none. That \
-             is the Mac's state, not a fault, so no crash is recorded for it. It ends once \
-             that user enrolls: roomlerd enroll, run as them"
+            "each worker exited 78: the console user has no enrollment on this Mac, or their \
+             config does not load and this worker no longer restores its last good copy. The \
+             worker runs AS the console user and loads THAT user's config; its own line says \
+             which, in its log under the console user's Library/Application \
+             Support/live.roomler.roomler/logs. That is the Mac's state, not a fault, so no \
+             crash is recorded for it. It ends once that user enrolls (roomlerd enroll, run as \
+             them) or their config loads again"
         }
         _ => {
             "almost always this Mac has no per-user enrollment: the worker runs AS the \

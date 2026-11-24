@@ -223,10 +223,10 @@ pub fn machine_held_exit_code() -> i32 {
 ///
 /// #4071 — and the code of the GUI worker FR-43's macOS supervisor started (`run
 /// --supervised`, without `--unenrolled`) whose console user has no enrollment on
-/// this Mac. That supervisor reaps `sudo`, which passes the code through as its
-/// own, and writes no crash record for it either (`macos_supervisor::crash_summary`).
-/// It counts the exit towards giving up as an exit 1, then says for certain why
-/// (`macos_supervisor::gave_up_reason`).
+/// this Mac, or (#4379) whose config does not load ([`ConfigDoesNotLoad`]). That
+/// supervisor reaps `sudo`, which passes the code through as its own, and records
+/// no crash for it either (`macos_supervisor::crash_summary`). It counts the exit
+/// towards giving up as an exit 1, then says why (`macos_supervisor::gave_up_reason`).
 ///
 /// FR-150 P2 — and the code of the per-user Scheduled Task's daemon (`run
 /// --supervisor task`), whose launcher (`agents/roomlerdw`) leaves on this code
