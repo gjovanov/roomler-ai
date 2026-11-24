@@ -392,3 +392,5 @@ Cleanup after the cells: the org's `remote_exec_enabled` was set back to `false`
 - FR-92 §3g: P10's local-On gate admits exec on Windows because exec runs in the console session. Under
   this FR it would arrive as SYSTEM in session 0 and be refused by that gate's existing session-0 rule.
 - `docs/fleet-rpc.md`, `docs/roomler-ssh.md`, FR-43 (the delegation model D3 would copy), FR-61 (vmtest).
+- #4244 (after #3429's slice 1, #4225): a command the service runs holds off the worker's periodic update.
+  The doorbell's health answer carries the count (`docs/installation.md` § A command the SYSTEM service runs).
