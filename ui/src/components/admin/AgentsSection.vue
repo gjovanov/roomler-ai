@@ -2736,6 +2736,7 @@ onMounted(() => {
 watch(() => props.tenantId, (tid) => {
   if (tid) {
     agentStore.fetchAgents(tid)
+    agentStore.fetchTenantMembers(tid)
     loadNetworkStores(tid)
     // Reset the grid to a clean first page for the new org.
     gridSearch.value = ''

@@ -693,7 +693,7 @@ impl TunnelSignalingSink for DaemonSink {
         self.tx
             .send(msg)
             .await
-            .map_err(|e| anyhow::anyhow!("agent WS egress closed: {e}"))
+            .map_err(|e| anyhow::anyhow!("daemon WS egress closed: {e}"))
     }
 }
 
@@ -1951,7 +1951,7 @@ fn server_msg_kind(msg: &ServerMsg) -> &'static str {
 /// route reconciler validates a RouteAdd with the SAME rule the hub will
 /// apply at create time.
 pub(crate) fn parse_node(node: &str) -> std::result::Result<ObjectId, String> {
-    ObjectId::parse_str(node).map_err(|_| format!("node must be a 24-hex agent id, got '{node}'"))
+    ObjectId::parse_str(node).map_err(|_| format!("node must be a 24-hex device id, got '{node}'"))
 }
 
 /// `auto` (default / empty / unknown) | `quic` | `webrtc`.
@@ -2449,8 +2449,8 @@ mod tests {
             session_error_summary(&chained),
             "waiting for DC pool to open: deadline has elapsed"
         );
-        let bare = anyhow::anyhow!("agent WS egress closed");
-        assert_eq!(session_error_summary(&bare), "agent WS egress closed");
+        let bare = anyhow::anyhow!("daemon WS egress closed");
+        assert_eq!(session_error_summary(&bare), "daemon WS egress closed");
     }
 
     #[test]

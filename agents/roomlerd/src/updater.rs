@@ -5035,6 +5035,104 @@ pub fn helper_owns_updates() -> Option<PathBuf> {
     }
 }
 
+/// #4352 rule 2 — the row a run started as: its primary enrollment's server,
+/// org, device id and kind, kept from the config the run starts from
+/// (`run_cmd`), never read again from the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRow {
+    pub server_url: String,
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub ephemeral: bool,
+}
+
+impl RunRow {
+    /// The primary of `cfg`, the config a run starts from.
+    pub fn of(cfg: &crate::config::AgentConfig) -> Self {
+        Self {
+            server_url: cfg.server_url.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            agent_id: cfg.agent_id.clone(),
+            ephemeral: cfg.ephemeral,
+        }
+    }
+}
+
+/// What an OS stop removes ([`stop_removal`]): a row's server, and the token to
+/// remove it with.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StopRemoval {
+    pub server_url: String,
+    pub agent_token: String,
+}
+
+/// Never prints the agent token.
+impl std::fmt::Debug for StopRemoval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StopRemoval")
+            .field("server_url", &self.server_url)
+            .field("agent_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// #4352 rule 2 — which row a stop removes, and with which token: the second
+/// pure helper of the stop, after [`should_self_unenroll`] (which decides
+/// whether, from the RUN's own `ephemeral`). `run` is the row the run started
+/// as and `run_token` the token it holds now (its live slot); `file` is the
+/// config as the stop reads it, `None` when it does not load. A worker with no
+/// enrollment (`unenrolled`) is no row at all.
+pub fn stop_removal(
+    run: &RunRow,
+    run_token: &str,
+    file: Option<&crate::config::AgentConfig>,
+    unenrolled: bool,
+    os_initiated_stop: bool,
+    update_in_flight: bool,
+) -> Option<StopRemoval> {
+    // The gate decides from the RUN's own kind: a row the file names and the
+    // run did not start as is never this stop's to remove.
+    if !should_self_unenroll(
+        run.ephemeral && !unenrolled,
+        os_initiated_stop,
+        update_in_flight,
+    ) {
+        return None;
+    }
+    // The run's own row, with the newest token for it: the file's while the
+    // file still names that row (an FR-103 renewal, a re-enrollment of the
+    // same row, `org set-primary` moving it to an `[[orgs]]` entry), else the
+    // run's own.
+    let agent_token = file
+        .and_then(|file| token_the_file_holds_for(file, run))
+        .unwrap_or(run_token)
+        .to_string();
+    Some(StopRemoval {
+        server_url: run.server_url.clone(),
+        agent_token,
+    })
+}
+
+/// The token `file` holds for the run's row, found as FR-103's renewal finds
+/// it (`RemoteConfigServices::stored_agent_token`): by the enrollment's
+/// (server, org), as the primary or an `[[orgs]]` entry, and only while that
+/// enrollment still names the run's device.
+fn token_the_file_holds_for<'a>(
+    file: &'a crate::config::AgentConfig,
+    run: &RunRow,
+) -> Option<&'a str> {
+    let (token, agent_id) = if file.is_primary_identity(&run.server_url, &run.tenant_id) {
+        (&file.agent_token, &file.agent_id)
+    } else {
+        let org = file
+            .orgs
+            .iter()
+            .find(|o| o.server_url == run.server_url && o.tenant_id == run.tenant_id)?;
+        (&org.agent_token, &org.agent_id)
+    };
+    (*agent_id == run.agent_id).then_some(token.as_str())
+}
+
 // RETIRED-NAME-ANCHOR-BEGIN
 // The fixtures below are REAL published release-asset names. Rewriting them would
 // make these tests assert against files that never existed, and the picker they
@@ -5405,6 +5503,151 @@ mod tests {
                 want,
                 "ephemeral={ephemeral} os_initiated_stop={os_stop} update_in_flight={in_flight}"
             );
+        }
+    }
+
+    // ---- #4352 rule 2: a stop removes only the row its run started as -----
+
+    const STOP_SERVER: &str = "https://roomler.invalid";
+
+    /// Row A, the one the run started as: ephemeral unless said otherwise.
+    fn run_a(ephemeral: bool) -> RunRow {
+        RunRow {
+            server_url: STOP_SERVER.into(),
+            tenant_id: "t-1".into(),
+            agent_id: "row-a".into(),
+            ephemeral,
+        }
+    }
+
+    /// The config file as the stop reads it, its primary naming `agent_id`.
+    fn file_naming(
+        tenant_id: &str,
+        agent_id: &str,
+        token: &str,
+        ephemeral: bool,
+    ) -> crate::config::AgentConfig {
+        let mut cfg = crate::config::test_fixture();
+        cfg.server_url = STOP_SERVER.into();
+        cfg.tenant_id = tenant_id.into();
+        cfg.agent_id = agent_id.into();
+        cfg.agent_token = token.into();
+        cfg.ephemeral = ephemeral;
+        cfg
+    }
+
+    fn removal(token: &str) -> Option<StopRemoval> {
+        Some(StopRemoval {
+            server_url: STOP_SERVER.into(),
+            agent_token: token.into(),
+        })
+    }
+
+    /// An OS stop with no update in flight, of an enrolled worker.
+    fn os_stop(
+        run: &RunRow,
+        run_token: &str,
+        file: Option<&crate::config::AgentConfig>,
+    ) -> Option<StopRemoval> {
+        stop_removal(run, run_token, file, false, true, false)
+    }
+
+    /// T7 — the run started ephemeral as row A, and the file now names an
+    /// ephemeral row B (a re-enrollment written while the daemon ran, then
+    /// any OS stop): A is removed, with the run's token; B is not. Also when
+    /// B is in another org (`enroll --replace`), and when the file does not
+    /// load at the stop.
+    #[test]
+    fn t7_a_stop_removes_the_runs_row_not_the_one_the_file_names() {
+        let run = run_a(true);
+        let b_same_org = file_naming("t-1", "row-b", "B-TOK", true);
+        let b_other_org = file_naming("t-2", "row-b", "B-TOK", true);
+        for (case, file) in [
+            ("B in the same org", Some(&b_same_org)),
+            ("B in another org", Some(&b_other_org)),
+            ("a file that does not load", None),
+        ] {
+            assert_eq!(os_stop(&run, "A-TOK", file), removal("A-TOK"), "{case}");
+        }
+    }
+
+    /// T8 — the run started PERMANENT as row A, and the file names an
+    /// ephemeral row B: nothing is removed.
+    #[test]
+    fn t8_a_permanent_run_removes_nothing_whatever_the_file_names() {
+        let run = run_a(false);
+        let b = file_naming("t-1", "row-b", "B-TOK", true);
+        assert_eq!(os_stop(&run, "A-TOK", Some(&b)), None);
+    }
+
+    /// T9 — the common case is unchanged: the run started ephemeral as row A,
+    /// the file still names A, with a newer token (an FR-103 renewal, or a
+    /// re-enrollment of the same row): A is removed, with the newer token.
+    /// The same when `org set-primary` has moved A to an `[[orgs]]` entry.
+    #[test]
+    fn t9_the_runs_row_still_in_the_file_is_removed_with_the_files_newer_token() {
+        let run = run_a(true);
+        let a = file_naming("t-1", "row-a", "A-NEWER-TOK", true);
+        assert_eq!(os_stop(&run, "A-TOK", Some(&a)), removal("A-NEWER-TOK"));
+        let same = file_naming("t-1", "row-a", "A-TOK", true);
+        assert_eq!(os_stop(&run, "A-TOK", Some(&same)), removal("A-TOK"));
+    }
+
+    /// T9 — row A moved beside a new primary by `org set-primary`: the file
+    /// still names A, in its `[[orgs]]` entry, and that entry's token is used.
+    #[test]
+    fn t9_the_runs_row_moved_to_an_org_entry_takes_that_entrys_token() {
+        let run = run_a(true);
+        let mut file = file_naming("t-9", "row-c", "C-TOK", false);
+        file.orgs = vec![crate::config::OrgEntry {
+            label: "was-primary".into(),
+            server_url: STOP_SERVER.into(),
+            ws_url: None,
+            agent_token: "A-ENTRY-TOK".into(),
+            agent_id: "row-a".into(),
+            tenant_id: "t-1".into(),
+            enabled: true,
+            overlay_mode: crate::config::OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        }];
+        assert_eq!(os_stop(&run, "A-TOK", Some(&file)), removal("A-ENTRY-TOK"));
+    }
+
+    /// T10 — today's table is unchanged: the internal arm (the updater
+    /// restarting us), an update in flight, and a worker with no enrollment
+    /// remove nothing, whatever the file names.
+    #[test]
+    fn t10_the_internal_arm_an_update_and_unenrolled_remove_nothing() {
+        let run = run_a(true);
+        let a = file_naming("t-1", "row-a", "A-TOK", true);
+        let b = file_naming("t-1", "row-b", "B-TOK", true);
+        for file in [Some(&a), Some(&b), None] {
+            for (case, unenrolled, os_initiated_stop, update_in_flight) in [
+                ("the internal arm", false, false, false),
+                ("the internal arm, an update in flight", false, false, true),
+                ("an update in flight", false, true, true),
+                ("unenrolled", true, true, false),
+                ("unenrolled, the internal arm", true, false, false),
+            ] {
+                assert_eq!(
+                    stop_removal(
+                        &run,
+                        "A-TOK",
+                        file,
+                        unenrolled,
+                        os_initiated_stop,
+                        update_in_flight
+                    ),
+                    None,
+                    "{case}, file {:?}",
+                    file.map(|f| &f.agent_id)
+                );
+            }
         }
     }
 

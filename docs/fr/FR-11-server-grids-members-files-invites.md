@@ -61,7 +61,7 @@ decision).
   address → 404 with "no account with that address — use Invites". Gate
   unchanged: `INVITE_MEMBERS` + `check_grant_roles` (`invite.rs:602`).
 - **Remove** (NEW — no route exists today, verified): `DELETE
-  /tenant/{tid}/member/{user_id}` on the member router (`lib.rs:167-172`),
+  /tenant/{tid}/member/{user_id}` on the member router (2026-08-27, `crates/api/src/lib.rs:167-172` at `1b25e3d8`),
   gated on **`KICK_MEMBERS`** (`role.rs:35` — defined, never consumed until
   now). Refusals: the tenant **owner** cannot be removed (409); self-removal
   is allowed (it is "leave"). New `TenantDao::remove_member` =

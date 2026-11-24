@@ -103,7 +103,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, reactive, provide } from 'vue'
+import { ref, computed, reactive, provide, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useRoomStore } from '@/stores/rooms'
 import { ApiError } from '@/api/client'
@@ -187,7 +187,24 @@ async function createRoom() {
   }
 }
 
-onMounted(() => {
-  roomStore.fetchRooms(tenantId.value)
-})
+// #4257 — the org's rooms follow the org in the URL. No route remounts on
+// the org, so a link, back or forward to another org's Rooms page reuses this
+// page: a watch that runs at once replaces the one-shot mount load. On a
+// change the shell has already reloaded the rooms (AppLayout's org watch), so
+// the page asks the store for THIS org's (no second GET), and it closes a
+// create dialog opened under the previous org: its parent picker offered that
+// org's rooms, and its save would create the room in the new one.
+watch(
+  tenantId,
+  (tid, previous) => {
+    if (previous === undefined) {
+      void roomStore.fetchRooms(tid).catch(() => {})
+      return
+    }
+    showCreate.value = false
+    newRoom.parent_id = null
+    void roomStore.ensureRooms(tid).catch(() => {})
+  },
+  { immediate: true },
+)
 </script>

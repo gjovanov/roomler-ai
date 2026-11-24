@@ -297,6 +297,19 @@ watch(viewMode, () => {
   else fetchGrid()
 })
 
+// #4257 — the grid follows the page's org. A link to another org's files
+// reuses this page, and nothing fires the table's @update:options again, so
+// the change itself reloads: a clean first page of all the org's files (the
+// room view named the previous org's room), as AgentsSection's org watch
+// does. Not immediate: the table's options event is the first load.
+watch(tenantId, (tid) => {
+  if (!tid) return
+  gridSearch.value = ''
+  if (viewMode.value !== 'all') viewMode.value = 'all' // its watch fetches
+  else if (gridPage.value !== 1) gridPage.value = 1 // options handler fetches
+  else fetchGrid()
+})
+
 function triggerUpload() {
   fileInputRef.value?.click()
 }
@@ -310,8 +323,11 @@ async function handleFileSelect(event: Event) {
   const roomId = currentRoomId.value
   if (!roomId) return
 
+  // #4257 — the batch goes to the org it was started under, with that org's
+  // room, even when the page moves on to another org before it ends.
+  const tid = tenantId.value
   for (const file of files) {
-    await fileStore.uploadFile(tenantId.value, roomId, file)
+    await fileStore.uploadFile(tid, roomId, file)
   }
   uploading.value = false
   input.value = ''

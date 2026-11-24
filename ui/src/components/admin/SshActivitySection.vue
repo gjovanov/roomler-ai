@@ -126,7 +126,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { useAgentStore, type SshActivityEntry, type SshActivityKind } from '@/stores/agents'
 import { deviceLabel } from '@/composables/useHideDeviceName'
@@ -207,27 +207,45 @@ function fmtWhen(at: string): string {
   return Number.isNaN(d.getTime()) ? at : d.toLocaleString()
 }
 
+// #4257 — only the latest load writes, and only while the org is still the
+// one it asked for: a log or a refusal for the previous org that lands after
+// a change of org is dropped.
+let loadSeq = 0
+
 async function load() {
+  const mine = ++loadSeq
+  const tenantId = props.tenantId
+  const current = () => mine === loadSeq && tenantId === props.tenantId
   loading.value = true
   error.value = null
   try {
-    const res = await agentStore.fetchSshActivity(props.tenantId, {
+    const res = await agentStore.fetchSshActivity(tenantId, {
       agentId: props.agentId,
       grantId: props.grantId,
       perPage: 100,
     })
-    entries.value = res.items
+    if (current()) entries.value = res.items
   } catch (e) {
-    error.value = (e as Error).message
-    entries.value = []
+    if (current()) {
+      error.value = (e as Error).message
+      entries.value = []
+    }
   } finally {
-    loading.value = false
+    if (current()) loading.value = false
   }
 }
 
-onMounted(() => {
-  void load()
-})
+// #4257 — a routed section: a change of org in the URL reuses it with a new
+// `tenantId`, so it follows its org from the start. A change empties the
+// previous org's rows until this org's land.
+watch(
+  () => props.tenantId,
+  (_tenantId, previous) => {
+    if (previous !== undefined) entries.value = []
+    void load()
+  },
+  { immediate: true },
+)
 
 defineExpose({ load })
 </script>

@@ -749,7 +749,7 @@ fn ephemeral_person(name: &str, cfg: &AgentConfig, held: bool) -> anyhow::Error 
 pub fn describe(read: &Read, plan: &Plan) -> Vec<String> {
     let mut out = vec!["one row: the plan. Nothing has changed yet.".to_string()];
     out.push(format!(
-        "the root half: \"{}\", agent {}, tenant {}, {}{}",
+        "the root half: \"{}\", device {}, tenant {}, {}{}",
         read.root.machine_name,
         read.root.agent_id,
         read.root.tenant_id,
@@ -784,7 +784,7 @@ pub fn describe(read: &Read, plan: &Plan) -> Vec<String> {
             .as_deref()
             .map_or_else(|| "primary".to_string(), |l| format!("org `{l}`"));
         out.push(format!(
-            "{}, {which}: \"{}\", agent {}, tenant {}, {}",
+            "{}, {which}: \"{}\", device {}, tenant {}, {}",
             item.user, item.name, item.agent_id, item.tenant_id, item.server_url
         ));
         out.push(match &item.fate {
@@ -2131,7 +2131,7 @@ pub fn since_read(
     match (std::str::from_utf8(was), std::str::from_utf8(is)) {
         (Ok(was), Ok(is)) => match crate::config::run_state_moved(was, is) {
             Some(moved) => Since::RunState(moved),
-            None => Since::Changed("their config changed beyond its agent's own run state"),
+            None => Since::Changed("their config changed beyond its daemon's own run state"),
         },
         _ => Since::Changed("their config changed"),
     }
@@ -2171,7 +2171,7 @@ fn rekept_line(name: &str, moved: &[&str]) -> String {
         moved.join(", ")
     };
     format!(
-        "{name}'s agent saved their config as it stopped, moving only its own run state \
+        "{name}'s daemon saved their config as it stopped, moving only its own run state \
          ({moved}): root keeps that save instead, and their files are converted from it"
     )
 }
@@ -2424,11 +2424,11 @@ async fn worker_gone<H: Host>(host: &mut H, uid: u32) -> Option<String> {
             return Some(match no_answer {
                 None => format!(
                     "the one-row daemon's screen worker still runs as uid {uid} after {secs} s, \
-                     holding the lock this agent takes"
+                     holding the lock this daemon takes"
                 ),
                 Some(e) => format!(
                     "`ps` gave no answer for {secs} s ({e:#}), so whether the one-row daemon's \
-                     screen worker, which holds the lock this agent takes, has stopped is not known"
+                     screen worker, which holds the lock this daemon takes, has stopped is not known"
                 ),
             });
         }
@@ -2457,7 +2457,7 @@ async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) ->
     let job = format!("gui/{uid}/com.roomler.agent");
     if wait && let Some(why) = worker_gone(host, uid).await {
         host.say(&format!(
-            "{job}: {why}. Nothing here stops a process: if the agent is not running once that \
+            "{job}: {why}. Nothing here stops a process: if roomlerd is not running once that \
              worker has stopped, `sudo launchctl kickstart {job}` starts it"
         ));
     }
@@ -2491,7 +2491,7 @@ fn not_bootstrapped<H: Host>(host: &mut H, uid: u32) -> String {
     if host.agent_loaded(uid) {
         format!(
             "{job}: already loaded, and not started here, as the daemon did not restart onto \
-             the files put back; if the agent is not running, `sudo launchctl kickstart {job}` \
+             the files put back; if roomlerd is not running, `sudo launchctl kickstart {job}` \
              starts it"
         )
     } else {
@@ -2554,7 +2554,7 @@ fn report<H: Host>(host: &mut H, read: &Read, plan: &Plan, after: &NodeStatus) {
         host.say("the rows this Mac no longer uses read offline until a person deletes them:");
         for item in &retired {
             host.say(&format!(
-                "  \"{}\", agent {}, tenant {}, {}: DELETE {}/api/tenant/{}/agent/{}",
+                "  \"{}\", device {}, tenant {}, {}: DELETE {}/api/tenant/{}/agent/{}",
                 item.name,
                 item.agent_id,
                 item.tenant_id,
@@ -5803,7 +5803,7 @@ mod tests {
         assert!(home.plist.is_none());
         let said = mac.said();
         assert!(
-            said.contains("casey's agent saved") && said.contains("last_run_unhealthy"),
+            said.contains("casey's daemon saved") && said.contains("last_run_unhealthy"),
             "{said}"
         );
     }
@@ -6616,7 +6616,7 @@ mod tests {
                                         loads it at the next login";
     const LOADED_NOT_STARTED_501: &str = "gui/501/com.roomler.agent: already loaded, and not \
                                           started here, as the daemon did not restart onto the \
-                                          files put back; if the agent is not running, `sudo \
+                                          files put back; if roomlerd is not running, `sudo \
                                           launchctl kickstart gui/501/com.roomler.agent` starts it";
 
     /// #4287 — a `--revert` whose restart does not answer starts no agent, and

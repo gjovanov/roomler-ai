@@ -124,26 +124,26 @@ impl AudioUnavailableCode {
         match self {
             Self::NoMonitor => {
                 "This host sends no sound. A session carries what the computer plays, never its \
-                 microphone, and this agent finds nothing here that captures the computer's sound. \
+                 microphone, and roomlerd finds nothing here that captures the computer's sound. \
                  The host's owner can name a capture device for it in ROOMLERD_AUDIO_SOURCE."
             }
             Self::SourceNotFound => {
                 "This host sends no sound: the capture device named in its ROOMLERD_AUDIO_SOURCE is \
-                 not there, and the agent does not open a microphone in its place."
+                 not there, and roomlerd does not open a microphone in its place."
             }
             Self::NoOutput => {
                 "This host sends no sound: it has no audio output device to capture, which is usual \
                  on a server or a virtual machine without a sound device."
             }
             Self::BackendError => {
-                "This host's audio capture failed, so the session carries no sound. The agent's own \
+                "This host's audio capture failed, so the session carries no sound. The daemon's own \
                  words follow."
             }
             Self::NotSupported => {
                 "This host's OS cannot capture the computer's sound yet, so the session carries none."
             }
             Self::NoSoundServer => {
-                "This host sends no sound: the agent could not reach the session's sound server \
+                "This host sends no sound: roomlerd could not reach the session's sound server \
                  (PulseAudio, or PipeWire's Pulse server), or this host has no Pulse client library."
             }
             Self::NoSession => {
