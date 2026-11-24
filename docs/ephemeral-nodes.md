@@ -156,7 +156,7 @@ exec roomlerd run
   ([#4322](https://github.com/gjovanov/roomler-ai/issues/4322)). Run by hand
   (`msiexec`), by `install.ps1`, by the setup wizard or by an RMM push, it writes
   no marker: the updater writes one right before it spawns the installer
-  ([`updater.rs:1955`](../agents/roomlerd/src/updater.rs#L1955)). Every run that
+  ([`updater.rs:2000`](../agents/roomlerd/src/updater.rs#L2000)). Every run that
   is not a full removal restarts the service through the SCM
   (`EnableSystemContext`, `DisableSystemContext` or `KeepSystemContext`,
   [`wix-perMachine/main.wxs:689-697`](../agents/roomlerd/wix-perMachine/main.wxs#L689-L697)),
@@ -167,10 +167,10 @@ exec roomlerd run
   ([`wix-perMachine/main.wxs:698-700`](../agents/roomlerd/wix-perMachine/main.wxs#L698-L700),
   [`win_service/lifecycle.rs:293`](../agents/roomlerd/src/win_service/lifecycle.rs#L293)).
   The worker takes either stop as an OS-initiated stop
-  ([`app.rs:5799-5805`](../agents/roomlerd/src/app.rs#L5799-L5805)), finds no
+  ([`app.rs:5801-5807`](../agents/roomlerd/src/app.rs#L5801-L5807)), finds no
   update in flight, and an ephemeral device deletes its own row, the one its
   run started as
-  ([`app.rs:5893-5902`](../agents/roomlerd/src/app.rs#L5893-L5902)).
+  ([`app.rs:5895-5904`](../agents/roomlerd/src/app.rs#L5895-L5904)).
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
@@ -226,10 +226,10 @@ flowchart LR
   row ([above](#the-ci--container-recipe),
   [#4322](https://github.com/gjovanov/roomler-ai/issues/4322)). The
   auto-updater's own exit is the internal arm, which never unenrolls
-  ([`updater.rs:3367`](../agents/roomlerd/src/updater.rs#L3367)). A stop its
+  ([`updater.rs:3471`](../agents/roomlerd/src/updater.rs#L3471)). A stop its
   installer issues after that takes the OS-initiated arm, and the
   `update-attempt` marker written before the spawn is what keeps the row
-  ([`updater.rs:1955`](../agents/roomlerd/src/updater.rs#L1955)).
+  ([`updater.rs:2000`](../agents/roomlerd/src/updater.rs#L2000)).
 - **`service uninstall` does not stop the daemon, on purpose.** On a major
   upgrade, Windows Installer runs the old product's uninstall, which runs
   `service uninstall` from the outgoing binary (`UnregisterAutostart` in
@@ -274,7 +274,7 @@ nature is fixed when the row is made:
 | A standard token, and the machine id's row is live and **ephemeral** | none: **409**, decided before the single-use token is spent, as the plan cap is (#4352: `refuse_live_ephemeral`, `crates/modules/fleet/src/agent.rs:616-630`, at `:379-381`, and again in every later round of `enroll_row`, `:536`) | nothing; the file is not written |
 
 A re-enrollment keeps the config's machine id
-(`agents/roomlerd/src/app.rs:2923-2930`), so the live row is the one it finds.
+(`agents/roomlerd/src/app.rs:2925-2932`), so the live row is the one it finds.
 An ephemeral device that enrolls again with a standard token while its row
 lives is therefore refused, and the token stays unused. Refreshed, the row
 would stay ephemeral, and the device, which records the row's kind, would
@@ -287,7 +287,7 @@ which stayed ephemeral; before #4331 the server also answered permanent for it,
 the token's kind rather than the row's.
 
 `--ephemeral` beside an existing config is still refused
-(`agents/roomlerd/src/app.rs:2914-2922`): the flag mints a random machine id,
+(`agents/roomlerd/src/app.rs:2916-2924`): the flag mints a random machine id,
 and a fold would put it on a real device's row.
 
 ### A second organization is never ephemeral (#4352)
@@ -323,11 +323,11 @@ collects its row.
 
 The daemon keeps the row it started as: its primary's server, org, `agent_id`
 and `ephemeral` (`updater::RunRow`, taken at
-`agents/roomlerd/src/app.rs:4656`). On an OS stop the gate
-(`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:444-450`,
+`agents/roomlerd/src/app.rs:4658`). On an OS stop the gate
+(`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
 unchanged) reads the run's own `ephemeral`, and the removal targets the run's
-own row (`updater::stop_removal`, `:4558-4587`, at
-`agents/roomlerd/src/app.rs:5893-5921`):
+own row (`updater::stop_removal`, `:5085-5114`, at
+`agents/roomlerd/src/app.rs:5895-5923`):
 
 | The file at the stop | The stop removes |
 |---|---|

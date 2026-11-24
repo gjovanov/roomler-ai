@@ -93,12 +93,12 @@ proxy for that. Falling back to the tarball when a Debian host somehow lacks the
 New `install_tarball_linux` alongside `run_linux_install_candidates`.
 
 ⚠️ **It has no privilege ladder**, whatever this design first said. It refuses any
-non-root daemon (`agents/roomlerd/src/updater.rs:2422-2431`). It places the files
+non-root daemon (`agents/roomlerd/src/updater.rs:2467-2476`). It places the files
 in-process rather than running one command it could hand to `sudo`, so there is
 nothing to escalate. A per-user tarball install therefore never updated (#2046)
 until FR-96 gave it a root helper ([below](#the-update-half-of-a-per-user-install-fr-96)).
 The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
-(`linux_install_candidates`, `updater.rs:2367-2382`). Every rung hands dpkg the options in
+(`linux_install_candidates`, `updater.rs:2412-2427`). Every rung hands dpkg the options in
 [Every package install keeps an edited configuration file and asks nothing](#every-package-install-keeps-an-edited-configuration-file-and-asks-nothing-3932).
 
 1. Extract to a staging dir under the same filesystem as `/usr`.
@@ -132,8 +132,8 @@ its own updater's next check installed the release a second time.
 
 Since #2724, on Linux, the command restarts the daemon running beside it once its
 install has completed, the way `roomler restart` does
-(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6557`, called
-at `app.rs:6534`):
+(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6583`, called
+at `app.rs:6560`):
 
 ```mermaid
 sequenceDiagram
@@ -557,9 +557,9 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 
 | Host | Who moves the companion | When |
 |---|---|---|
-| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3632`) | after every check that installs nothing; at the start after an update (`:3506`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3574`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4312`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3435`, `package_needs_sync`) |
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3736`) | after every check that installs nothing; at the start after an update (`:3610`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3678`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4430`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3539`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in
@@ -611,7 +611,7 @@ our stdin.
 
 | Road | Command | stdin |
 |---|---|---|
-| the daemon's own package, as root: a system daemon, or FR-96's helper (`linux_install_candidates`, `agents/roomlerd/src/updater.rs:2367-2382`) | `apt-get install -y -o Dpkg::Options::=--force-confold <deb>`, then `dpkg --force-confold --install <deb>` | `/dev/null` (`run_linux_install_candidates`, `:2564`) |
+| the daemon's own package, as root: a system daemon, or FR-96's helper (`linux_install_candidates`, `agents/roomlerd/src/updater.rs:2412-2427`) | `apt-get install -y -o Dpkg::Options::=--force-confold <deb>`, then `dpkg --force-confold --install <deb>` | `/dev/null` (`run_linux_install_candidates`, `:2609`) |
 | the daemon's own package, not root | `pkexec`, then `sudo -n`, in front of the same `apt-get` | `/dev/null` |
 | the companion's package (`install_commands`, `agents/roomlerd/src/companion/package_sync.rs:138`) | `apt-get install -y --no-remove -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold <deb>`, with `INSTALL_ENV` | `/dev/null` (`run_bounded`) |
 | the tunnel CLI's `self-update` (`dpkg_install_args`, `agents/roomler-cli/src/update.rs:592`) | `dpkg --force-confold -i <deb>` | the person's terminal; dpkg asks nothing there either |

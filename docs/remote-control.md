@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3911`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:4954`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:4956`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -3219,7 +3219,7 @@ account owns is refused (`:605`). An answer from the tray, from `roomlerd consen
 or from a native panel reaches the broker in process (`record_decision`, `:925`),
 which writes it there. `roomlerd consent` writes the file itself only when it
 cannot reach the device service, and then only a console-run agent in the same
-profile sees it (`consent_cmd`, [`app.rs:2557`](../agents/roomlerd/src/app.rs#L2557)).
+profile sees it (`consent_cmd`, [`app.rs:2559`](../agents/roomlerd/src/app.rs#L2559)).
 
 | The daemon's own folder | the file channel | questions and answers | the log, once at start |
 |---|---|---|---|
@@ -3229,8 +3229,8 @@ profile sees it (`consent_cmd`, [`app.rs:2557`](../agents/roomlerd/src/app.rs#L2
 With the file channel off, no other folder stands in for the daemon's own. Until
 issue #3939 a folder below the system's temporary folder did, or that folder
 itself. The LocalAPI still lists every question and decides it
-([`consent_pending`](../agents/roomlerd/src/localapi_state.rs#L1143) reads the
-broker's books, `:1097`), so the tray, `roomlerd consent --list` and
+([`consent_pending`](../agents/roomlerd/src/localapi_state.rs#L1198) reads the
+broker's books, `:1152`), so the tray, `roomlerd consent --list` and
 `--approve` / `--deny` and a native panel all work, and a question nobody answers
 ends at its window, as before. A question then takes one answer: the first
 decides, and a second is refused. The broker keeps its configured mode either way,
@@ -3398,7 +3398,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3621`](../crates/localapi/src/lib.rs#L3621), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3681`](../crates/localapi/src/lib.rs#L3681), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:523`](../crates/remote_control/src/models.rs#L523)) and re-announced on the heartbeat when it changes |
 
@@ -5336,7 +5336,7 @@ session not yet live, and an external one, end as before FR-138.
 | What ends it | What the device does | Proven by |
 |---|---|---|
 | a stop or a restart | the `Shutdown` arm closes every peer | `arm_shutdown_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2381`); `a_terminal_exit_closes_kept_sessions_too` (`:2912`) |
-| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:8138`) |
+| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:8690`) |
 | sleep, a resume from suspend | the `Sleep` and `ResumeFromSuspend` arms close every peer. A pause of at least 120 s, measured at the RX deadline, is read as a resume (M2) | `arm_sleep_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2382`); `arm_resume_from_suspend_closes_every_peer` (`:2383`); `the_rx_deadline_reads_a_long_pause_as_a_resume_from_suspend` (`:3159`) |
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1155`) |
@@ -7454,7 +7454,7 @@ ruled out by the rule above. The lock behind that borrow is what held it.
   feature includes `parking_lot`. It is task-fair: once a writer waits,
   a new `read()` parks, even on a thread that already holds a read guard.
 - `DaemonState::status()`
-  (`agents/roomlerd/src/localapi_state.rs:823`) built `NodeStatus` as
+  (`agents/roomlerd/src/localapi_state.rs:843`) built `NodeStatus` as
   one struct literal, and ten of its fields each called
   `self.overlay.borrow()`. A temporary lives until the literal is
   finished, so every field's guard was still held when the next field
@@ -7655,7 +7655,7 @@ console with such a process is stand-in D. With the launcher's daemon
 (`roomlerdw.exe`) the record reached `SucceededVerified`, with no event 10002.
 Since #4302 a watcher the updater stages in its own staging folder is stand-in C:
 everything the copy loads sits beside it, and `CREATE_NO_WINDOW` alone gives it a
-console of its own (`watcher_creation_flags`, `agents/roomlerd/src/updater.rs:3033`).
+console of its own (`watcher_creation_flags`, `agents/roomlerd/src/updater.rs:3078`).
 Read on per-Machine hops ([the cells](https://github.com/gjovanov/roomler-ai/issues/4302#issuecomment-7099732479)):
 from the released 0.4.233 the installer's second Restart Manager session named the
 staged watcher (event 10002, application type console) and ended it before its verdict;
@@ -7670,7 +7670,7 @@ wedged.
 
 | Log | Written by | Lives |
 |---|---|---|
-| `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:2030`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
+| `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:2075`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
 | `<msi>.2.log`, `<msi>.3.log` | each later attempt on the same path | the same |
 | `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:984`) | until the next wedge moves it to `msi-wedged.prev.log` |
 
@@ -7836,10 +7836,10 @@ Each one now marks its run clean before it ends, through
 [`agents/roomlerd/src/run_end.rs`](../agents/roomlerd/src/run_end.rs):
 
 - `run_cmd` opens the run's book once the start's mark is saved
-  ([`app.rs:4404`](../agents/roomlerd/src/app.rs#L4404)), and never on the
+  ([`app.rs:4406`](../agents/roomlerd/src/app.rs#L4406)), and never on the
   read-only view an unenrolled GUI worker runs on (FR-43 P3a). It shares the
   P6 write lock with the book
-  ([`app.rs:4864`](../agents/roomlerd/src/app.rs#L4864)).
+  ([`app.rs:4866`](../agents/roomlerd/src/app.rs#L4866)).
 - The mark takes that lock, reads the file again, calls
   `mark_clean_shutdown` and saves, on a thread of its own. The end waits for
   it at most `MARK_BUDGET` (2 s) and then exits anyway. A mark that comes too
@@ -7866,7 +7866,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4376`](../agents/roomlerd/src/app.rs#L4376),
+([`agents/roomlerd/src/app.rs:4378`](../agents/roomlerd/src/app.rs#L4378),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 
@@ -7890,12 +7890,12 @@ when digest is absent (pre-2024 releases or proxy that doesn't
 yet forward the field).
 
 **`updater::pin_version(tag)`**
-([`agents/roomlerd/src/updater.rs:1828`](../agents/roomlerd/src/updater.rs#L1828)) fetches one
+([`agents/roomlerd/src/updater.rs:1830`](../agents/roomlerd/src/updater.rs#L1830)) fetches one
 release by its tag, for the rollback and for an operator's pinned update (`rc:agent.update`). It
 looks the release up in the update feed on roomler.ai first (`/api/agent/latest-release`, or
 `ROOMLERD_UPDATE_URL`), the list the update check reads. Only when the feed cannot name the tag
 does it ask GitHub's by-tag endpoint, `https://api.github.com/repos/.../releases/tags/<tag>`, and
-it logs that fallback (#3818, `release_sources`, `:1674`). A tag can be missing from the feed
+it logs that fallback (#3818, `release_sources`, `:1676`). A tag can be missing from the feed
 because the feed lists only GitHub's newest page of releases (48 agent releases on 2026-11-13), or
 the feed can be down. A pinned lookup runs on one device, once per crash loop or once per pin, so
 there reaching the release counts for more than a single origin. Before #3818 it asked GitHub
@@ -7912,7 +7912,7 @@ again. That flag reads "handled" on Windows, where nothing is attempted.
 It is cleared by `record_clean_run_at`, so one sentinel per clean-run
 cycle. The rest depends on whether the installer here can go back at
 all (`updater::ROLLBACK_CAN_DOWNGRADE`,
-[`agents/roomlerd/src/updater.rs:1808`](../agents/roomlerd/src/updater.rs#L1808), #3289):
+[`agents/roomlerd/src/updater.rs:1810`](../agents/roomlerd/src/updater.rs#L1810), #3289):
 
 | Platform | What it does | Read |
 |---|---|---|

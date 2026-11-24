@@ -1182,7 +1182,7 @@ the daemon shows, below), and a consent answer
 (`ConsentDecide`, an approval or a denial) and a Disconnect (`RcDisconnect`) require the
 person at the screen the daemon shows, `SYSTEM` or an elevated administrator
 (`peer_may_decide_for_the_screen`,
-[`lib.rs:2718`](../crates/localapi/src/lib.rs#L2718)). An approval lets someone see and
+[`lib.rs:2766`](../crates/localapi/src/lib.rs#L2766)). An approval lets someone see and
 control the screen, and the pipe admits every interactive user, so the ACL alone does not
 say whose screen a caller is at. The peer is what the OS read at accept: the client's
 session, and its account and elevation from its token. `SYSTEM` is named by its SID
@@ -1192,10 +1192,10 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
   signed in, over RDP too. The person at the console is then someone else and is refused.
   A daemon in session 0 takes the console session; with neither known, only `SYSTEM` and
   an elevated administrator are taken (`screen_session`,
-  [`lib.rs:2691`](../crates/localapi/src/lib.rs#L2691)).
+  [`lib.rs:2739`](../crates/localapi/src/lib.rs#L2739)).
 - **Fail closed**: a peer whose session and account the pipe could not read is refused,
   in words, with a warn line, and nothing reaches the daemon (`not_the_screens_person`,
-  [`lib.rs:3964`](../crates/localapi/src/lib.rs#L3964)).
+  [`lib.rs:4032`](../crates/localapi/src/lib.rs#L4032)).
 - **On Unix nothing changes**: the daemon's own account or root are taken, who its
   owner-only socket admits. The person socket keeps its own seat check (below).
 - The tray's Approve, Deny and Disconnect and `roomlerd consent` run as the person in their
@@ -1204,8 +1204,8 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
 - **The console person's gates follow the same screen.** A console person's `ConfigSet`
   key (`CONSOLE_PERSON_KEYS`), the recording verbs, keep busy on and the external-access
   password's set and clear take, on Windows, a peer in the screen's session
-  (`peer_is_console_user`, [`lib.rs:2616`](../crates/localapi/src/lib.rs#L2616);
-  `peer_may_start_keep_busy`, [`lib.rs:2560`](../crates/localapi/src/lib.rs#L2560)).
+  (`peer_is_console_user`, [`lib.rs:2664`](../crates/localapi/src/lib.rs#L2664);
+  `peer_may_start_keep_busy`, [`lib.rs:2608`](../crates/localapi/src/lib.rs#L2608)).
   Nothing else about them changed: keep busy on still takes only a person's account
   (never root, `SYSTEM`, LocalService, NetworkService or an unreadable account),
   elevation passes none of them, and the person socket keeps its own rules. A machine-wide
@@ -1215,30 +1215,30 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
 
 **A LocalAPI client keeps an endpoint only when its own account or the system serves
 it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go
-through `localapi::connect()` ([`lib.rs:5581`](../crates/localapi/src/lib.rs#L5581)), and
+through `localapi::connect()` ([`lib.rs:5686`](../crates/localapi/src/lib.rs#L5686)), and
 each check runs on the connected endpoint, before the client sends anything:
 
 | OS | The endpoint is kept when | Otherwise |
 |---|---|---|
-| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4923`](../crates/localapi/src/lib.rs#L4923) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5607`](../crates/localapi/src/lib.rs#L5607) `connect_first_trusted`) |
-| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5856`](../crates/localapi/src/lib.rs#L5856) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5888`](../crates/localapi/src/lib.rs#L5888) `connect_windows_checked`) |
+| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:5028`](../crates/localapi/src/lib.rs#L5028) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5712`](../crates/localapi/src/lib.rs#L5712) `connect_first_trusted`) |
+| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5961`](../crates/localapi/src/lib.rs#L5961) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5993`](../crates/localapi/src/lib.rs#L5993) `connect_windows_checked`) |
 
 - **Where a per-user endpoint lives.** Only in a directory private to its account: a
   real directory, not a link, owned by that account and writable by neither its group nor
-  anyone else ([`lib.rs:4897`](../crates/localapi/src/lib.rs#L4897)
+  anyone else ([`lib.rs:5002`](../crates/localapi/src/lib.rs#L5002)
   `per_user_socket_path_for`). Off macOS that is `$XDG_RUNTIME_DIR` and nothing else; on
   macOS it is the per-user temp folder (`/var/folders/…/T`), and never for root. A caller
   with no such directory (root under `sudo`, a cron job, a system service) has no
   per-user candidate and goes straight to the system socket.
 - **What a daemon serves.** A system daemon serves `/var/run/roomler/roomler.sock`
   alone. A per-user daemon serves its own per-user socket, and with no private directory
-  it serves none and logs why ([`lib.rs:4937`](../crates/localapi/src/lib.rs#L4937)
+  it serves none and logs why ([`lib.rs:5042`](../crates/localapi/src/lib.rs#L5042)
   `unix_endpoints`); `roomler`'s "not running" line then says the same
   ([`localclient.rs:2179`](../agents/roomler-cli/src/localclient.rs#L2179)).
 - **The pipe client's open.** `GENERIC_READ | FILE_WRITE_DATA`, at identification level
   (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`): read and write data, never the
   right to create an instance of the pipe, and the server may learn who the client is but
-  never act as it ([`lib.rs:5868`](../crates/localapi/src/lib.rs#L5868)). It works
+  never act as it ([`lib.rs:5973`](../crates/localapi/src/lib.rs#L5973)). It works
   against every daemon version.
 - ⚠️ **An attended Windows install whose person is a standard user.** There the worker,
   and so the pipe, runs as that person. A CLI run as another account, `SYSTEM` included
@@ -1272,11 +1272,11 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
   decision) `ConfigGet` — the listing, no secret being on that surface, with every key
   the socket will not set marked `read_only = "root_only"` — and `ConfigSet` of exactly
   the keys that are the console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
-  `crates/localapi/src/lib.rs:3536`): the keys the daemon's own endpoint already
+  `crates/localapi/src/lib.rs:3596`): the keys the daemon's own endpoint already
   gated to that person because Windows' pipe admits every interactive user.
   Never the device-owned gates `exec_enabled`, `ssh_enabled` and
   `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
-  administrator's command (`not_on_the_person_socket_for_key`, `:3887`).
+  administrator's command (`not_on_the_person_socket_for_key`, `:3955`).
   Since #3967 it also takes `ConsentRelaying`, from its own person only and never
   from root: a two-row Mac's per-user half saying it lists the root half's consent
   questions. It reads nothing and grants nothing. The root half keeps it in memory
@@ -1337,14 +1337,18 @@ new verb cannot reach it by default. Widening it is a security change and needs
 review like one — #2871's design A was one: it admitted `ConfigGet`, and `ConfigSet`
 for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and left
 `exec_enabled`, `ssh_enabled` and `remote_config_enabled` root's on every root-mode
-install pending a separate policy call. The dispatcher gates the peer again, three ways
+install pending a separate policy call. FR-151's two verbs stay off it: `live_work`
+lists the root half's SSH connections and runs, and `ask_for_update` recorded by a
+root daemon would let the Mac's update helper install over everything, so a person
+records it only in the daemon behind their own socket
+(`live_work_and_the_ask_are_not_on_the_person_socket`). The dispatcher gates the peer again, three ways
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
-  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2659`, by
-  `person_peer_ok`, `:5147`). The listener makes that check before a byte is read, and a
+  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2707`, by
+  `person_peer_ok`, `:5252`). The listener makes that check before a byte is read, and a
   test drives the listener itself over a real socket: another account's connection is
   closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
-  (`serve_person_listener`, `:5298`). The gate makes the check again where the decision
+  (`serve_person_listener`, `:5403`). The gate makes the check again where the decision
   is, so the rule does not rest on that one call site. An unknown peer is refused;
 - **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
   and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the
@@ -1366,7 +1370,7 @@ install pending a separate policy call. The dispatcher gates the peer again, thr
   `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
   widen this one, so a new key reaches the person socket only by a decision.
 
-An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:4357`),
+An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:4436`),
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would
