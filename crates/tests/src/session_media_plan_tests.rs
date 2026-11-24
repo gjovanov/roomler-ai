@@ -68,9 +68,25 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
     }
 }
 
+/// #4351 — what [`Logged::install`] hands back: the scoped subscriber, and a
+/// SECOND registered dispatcher, never one alone. With exactly one registered,
+/// tracing-core rebuilds a callsite's interest from the default of whichever
+/// thread reaches it first (`Rebuilder::JustOne`) and caches it for every
+/// thread. A parallel test with no subscriber of its own makes it `never`, and
+/// the capture misses that line for good, though this thread logged it. The
+/// lane installs no global subscriber, so any line can be the first. Measured
+/// on CI: the timeout-line test captured 0 of its 2 lines while the slot-keep
+/// test beside it timed out on the same `warn!`. With two, every registered
+/// dispatcher is asked, as `extauth_tests`'s `CaptureGuard` holds it. The
+/// scope ends first, then the second.
+pub(crate) struct LoggedGuard {
+    _scoped: tracing::subscriber::DefaultGuard,
+    _second: tracing::Dispatch,
+}
+
 impl Logged {
-    pub(crate) fn install(&self) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
+    pub(crate) fn install(&self) -> LoggedGuard {
+        Self::hold(
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
                 .with_ansi(false)
@@ -82,8 +98,8 @@ impl Logged {
     /// #3952 — as [`Logged::install`], with the server's own DEBUG lines too
     /// (core and the network module), where a subscriber's dropped message
     /// and a probe's miss are logged.
-    pub(crate) fn install_debug(&self) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
+    pub(crate) fn install_debug(&self) -> LoggedGuard {
+        Self::hold(
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::new(
                     "info,roomler_core=debug,roomler_ai_mod_network=debug",
@@ -94,9 +110,61 @@ impl Logged {
         )
     }
 
+    /// `subscriber` as this thread's default, beside a second registered
+    /// dispatcher ([`LoggedGuard`]).
+    fn hold(subscriber: impl tracing::Subscriber + Send + Sync + 'static) -> LoggedGuard {
+        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        LoggedGuard {
+            _scoped: tracing::subscriber::set_default(subscriber),
+            _second: second,
+        }
+    }
+
     pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
+}
+
+/// #4351 — the capture sees every line its own thread logs, even one another
+/// thread with no subscriber reached first. CI lost both lines of
+/// `redis_bound_tests::timeouts_within_a_second_write_one_line_and_every_one_is_counted`
+/// that way, while a test beside it timed out on the same `warn!`.
+#[test]
+fn logged_sees_a_line_another_thread_reached_first() {
+    fn reach() {
+        tracing::warn!("logged probe: a line two threads reach");
+    }
+    let logged = Logged::default();
+    let _log = logged.install();
+    std::thread::spawn(reach).join().unwrap();
+    reach();
+    assert!(
+        logged
+            .text()
+            .contains("logged probe: a line two threads reach"),
+        "the capture missed a line this thread logged: {:?}",
+        logged.text()
+    );
+}
+
+/// #4351 — as [`logged_sees_a_line_another_thread_reached_first`], for
+/// [`Logged::install_debug`].
+#[test]
+fn logged_debug_sees_a_line_another_thread_reached_first() {
+    fn reach() {
+        tracing::warn!("logged debug probe: a line two threads reach");
+    }
+    let logged = Logged::default();
+    let _log = logged.install_debug();
+    std::thread::spawn(reach).join().unwrap();
+    reach();
+    assert!(
+        logged
+            .text()
+            .contains("logged debug probe: a line two threads reach"),
+        "the capture missed a line this thread logged: {:?}",
+        logged.text()
+    );
 }
 
 /// A viewer on a real session: the page's control channel, and each JSON message

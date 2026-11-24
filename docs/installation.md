@@ -585,7 +585,7 @@ line and without its run marks, so the next start counts no crash (`agents/rooml
 `agents/roomlerd/src/app.rs:3976-3981`). With no copy, or one that does not load or holds no enrollment, it stops with
 *"no config found"* before the lock, as before. An unenrolled one-row Mac's screen worker never restores at its start: it writes the
 person a new file with no enrollment (`agents/roomlerd/src/app.rs:4076-4088`). Nor does the macOS supervisor's enrolled worker
-(`run --supervised` without `--unenrolled`): it ends as before, with exit 78, because a converted one-row Mac's person `config.toml.prev` can still hold the enrollment that moved to root (#4184).
+(`run --supervised` without `--unenrolled`): it ends as before, with exit 78, because on a one-row Mac an earlier release converted, the person's `config.toml.prev` can still hold the enrollment that moved to root (#4184; a conversion now keeps its new file there).
 So removing `config.toml` alone does not make a device forget its enrollment: remove `config.toml.prev` too. A Windows SystemContext install
 restores its missing machine config the same way (#4176), with one rule more: only from a copy that passes every check the config itself
 would. That is the machine tree's check, and the rule that `%PROGRAMDATA%\roomler`, the machine folder and the copy were the machine's
@@ -3027,6 +3027,18 @@ the package's rule fits and otherwise words that name the section below; such a 
 keeps working two-row ([FR-147](fr/FR-147-root-out-of-homes-macos.md), "Refusals at
 Read").
 
+**What the person's folder keeps (#4184).** `convert` writes the new config, which
+holds no enrollment, twice, each a temporary file renamed in the folder: first as
+`config.toml.prev`, then as `config.toml`. No copy of the outgoing config stays in the
+home, since `config::load` restores the `.prev` of a config that is missing or does not
+load; the enrollments that leave it are in root's records alone, which the undo and
+`--revert` give back. A `.prev` the person's process cannot replace (a folder at that
+name, a file locked by a flag, a full disk) stops their `convert` with exit 1, after the
+plist went and before the config: the undo puts both files back, and that process's
+line in the output names the file and says to remove what is there or free disk space,
+then run `sudo roomlerd one-row` again. A Mac an earlier release converted keeps the
+outgoing config as that `.prev` until the person's next save.
+
 ```mermaid
 sequenceDiagram
     participant R as root, sudo roomlerd one-row
@@ -3039,7 +3051,7 @@ sequenceDiagram
     R->>D: bootout gui/uid/com.roomler.agent
     R->>R: root's file - both switches, the moved enrollments
     R->>C: convert, over the bytes root kept
-    C-->>R: the new config's sha256, the plist removed
+    C-->>R: the new config's sha256 (kept as its .prev too), the plist removed
     R->>R: kickstart -k, then within 60 s connected, worker attached, screen-capture
     alt a step or the verify fails
         R->>R: root's file back
@@ -3355,7 +3367,7 @@ console user are skipped and every root row runs as on any install
     worker makes the folder again, as the person, at its next start.
   - When it holds `com.roomler.agent.plist.pre-one-row` or
     `config.toml.pre-one-row`, which the revert reads there and nowhere else
-    (the person's own `put-back-legacy`, `agents/roomlerd/src/one_row_home.rs:1284-1326`,
+    (the person's own `put-back-legacy`, `agents/roomlerd/src/one_row_home.rs:1288-1330`,
     started by `--revert` where that person's `read` reports them,
     `agents/roomlerd/src/one_row.rs:2653`), the command stages first and
     moves last: `<test> && sudo -u '#<uid>' mkdir '<folder>.new-<stamp>' &&

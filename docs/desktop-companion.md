@@ -237,7 +237,7 @@ flowchart TD
 
 - ⚠️ **A registered service that is not running is no sign of an enrollment.** A daemon with no config, and no last good
   copy of one that holds an enrollment (#4157), exits ("no config found … Run 'roomlerd enroll' first"), so a fresh system
-  install's service is registered and stopped. The macOS supervisor's enrolled worker exits even beside such a copy (78, as before), because a converted one-row Mac's person copy can hold the enrollment that moved to root (#4184).
+  install's service is registered and stopped. The macOS supervisor's enrolled worker exits even beside such a copy (78, as before), because on a one-row Mac an earlier release converted, the person's copy can hold the enrollment that moved to root (#4184).
   Only the config being there decides: a host with none still reads "Not enrolled" and is offered set-up. A per-user
   install is never asked about the service's config, not even a machine-wide copy left behind.
 - **Nothing is remembered.** A one-row Mac is told by its person's file with no enrollment
