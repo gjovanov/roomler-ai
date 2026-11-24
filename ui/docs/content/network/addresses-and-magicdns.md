@@ -98,6 +98,5 @@ The mesh keeps running when a machine loses its connection to the server, so
 The connection type, round trip and last-seen columns are measured on the spot.
 The ● / ○ is what the server last said about each peer before the connection
 dropped. Once the server is reachable again the note goes away and the list is
-live. Agents older than this behaviour print `(no peers)` while the server is
-unreachable.
+live. An older `roomlerd` prints `(no peers)` while the server is unreachable.
 :::
