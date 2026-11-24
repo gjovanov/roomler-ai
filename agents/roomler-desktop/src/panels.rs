@@ -664,27 +664,27 @@ mod frame {
 
     /// #4376 — the strips round the main screen as it is now, ordered front:
     /// built the first time, moved every later time. With no screen to read
-    /// they stay as they are, and the next screen change puts them up.
+    /// they keep their last place, and the next screen change lays them out.
     fn put_up(mtm: MainThreadMarker, strips: &mut Vec<Retained<NSWindow>>) {
-        let Some(screen) = NSScreen::mainScreen(mtm) else {
-            return;
-        };
-        let f = screen.frame();
-        let screen = Frame {
-            x: f.origin.x,
-            y: f.origin.y,
-            w: f.size.width,
-            h: f.size.height,
-        };
-        let rects = frame_strips(screen, FRAME_BORDER)
-            .map(|r| NSRect::new(NSPoint::new(r.x, r.y), NSSize::new(r.w, r.h)));
-        if strips.is_empty() {
-            *strips = rects.into_iter().map(|r| strip(mtm, r)).collect();
-        } else {
-            for (s, r) in strips.iter().zip(rects) {
-                s.setFrame_display(r, true);
+        if let Some(screen) = NSScreen::mainScreen(mtm) {
+            let f = screen.frame();
+            let screen = Frame {
+                x: f.origin.x,
+                y: f.origin.y,
+                w: f.size.width,
+                h: f.size.height,
+            };
+            let rects = frame_strips(screen, FRAME_BORDER)
+                .map(|r| NSRect::new(NSPoint::new(r.x, r.y), NSSize::new(r.w, r.h)));
+            if strips.is_empty() {
+                *strips = rects.into_iter().map(|r| strip(mtm, r)).collect();
+            } else {
+                for (s, r) in strips.iter().zip(rects) {
+                    s.setFrame_display(r, true);
+                }
             }
         }
+        // With no screen, strips built before come up where they were, as before #4376.
         for s in strips.iter() {
             s.orderFrontRegardless();
         }
