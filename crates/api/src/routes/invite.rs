@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
 };
 use bson::oid::ObjectId;
@@ -357,15 +357,19 @@ pub async fn list_invites(
     })))
 }
 
-/// POST /api/tenant/{tenant_id}/invite — create invite
+/// POST /api/tenant/{tenant_id}/invite — create invite. `INVITE_MEMBERS` is
+/// decided before the body is read (#4254): a caller without it gets the
+/// gate's answer whatever the body is, and a holder is answered one that does
+/// not parse as the `Json` extractor answered it (`ApiError::JsonBody`).
 pub async fn create_invite(
     State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<CreateInviteRequest>,
+    body: Result<Json<CreateInviteRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<InviteResponse>), ApiError> {
     let tid = parse_oid(&tenant_id)?;
     let held = require_invite_permission(&state, tid, auth.user_id).await?;
+    let Json(body) = body?;
 
     let assign_role_ids: Vec<ObjectId> = body
         .assign_role_ids
@@ -408,15 +412,18 @@ pub async fn create_invite(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
-/// POST /api/tenant/{tenant_id}/invite/batch — create multiple invites
+/// POST /api/tenant/{tenant_id}/invite/batch — create multiple invites.
+/// `INVITE_MEMBERS` is decided before the body is read (#4254), as in
+/// [`create_invite`].
 pub async fn batch_create_invite(
     State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<BatchCreateInviteRequest>,
+    body: Result<Json<BatchCreateInviteRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<BatchCreateInviteResponse>), ApiError> {
     let tid = parse_oid(&tenant_id)?;
     let held = require_invite_permission(&state, tid, auth.user_id).await?;
+    let Json(body) = body?;
 
     if body.invites.is_empty() {
         return Err(ApiError::BadRequest("No invites provided".to_string()));
@@ -524,15 +531,18 @@ pub async fn revoke_invite(
     Ok(Json(serde_json::json!({ "revoked": true })))
 }
 
-/// POST /api/tenant/{tenant_id}/member — direct add member
+/// POST /api/tenant/{tenant_id}/member — direct add member.
+/// `INVITE_MEMBERS` is decided before the body is read (#4254), as in
+/// [`create_invite`].
 pub async fn add_member(
     State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<AddMemberRequest>,
+    body: Result<Json<AddMemberRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let tid = parse_oid(&tenant_id)?;
     let held = require_invite_permission(&state, tid, auth.user_id).await?;
+    let Json(body) = body?;
 
     let user_id = match (&body.user_id, &body.email) {
         (Some(uid), None) => parse_oid(uid)?,

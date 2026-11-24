@@ -50,6 +50,51 @@ worth recording why so nobody re-proposes it:
 
 So: **one daemon, many orgs**. Everything below follows from that.
 
+### The machine's guard: one daemon per machine, enforced (#4280)
+
+A `roomlerd run` takes a guard that belongs to the machine, not to its config, before anything
+above: before the start's purge of the overlay's routes, the LocalAPI pipe and the first connect
+(`start_gate`, `agents/roomlerd/src/app.rs:3965`; the guard is
+`agents/roomlerd/src/machine_guard.rs`). A run that finds it held leaves there, whatever config it
+loaded and elevated or not, and marks, saves and counts nothing.
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Who holds it | SYSTEM, or an elevated administrator | root | root |
+| An unprivileged run | reads whether it is held, and never creates it | takes none | takes none: the screen worker is a second run on purpose |
+| A run that finds it held leaves with | 8 | 8 | 0 |
+
+- **Only a privileged daemon can hold the machine's guard; an unprivileged start can check for it
+  but never creates it.** It is keyed by the overlay interface's name, and it is held only while its
+  owner lives, so a holder that ends, a crash included, leaves it free.
+- On Windows only SYSTEM and Administrators, at high integrity, can take it or change it; any other
+  signed-in account can only read whether it is held. On Linux and macOS it is the kernel's lock on
+  a 0600 file in the root daemon's own folder, `/var/run/roomler`.
+- **The first privileged holder stays.** A start under a supervisor (the service host, the per-user
+  task's launcher, systemd, launchd) waits up to 30 s for the guard, because its holder is most
+  likely its own predecessor, still exiting; any other start leaves at once.
+- **Every supervisor reads the code as "leave"** (`daemon_error::machine_held_exit_code`): systemd
+  does not restart on 8 (`RestartPreventExitStatus=7 8`), the per-user task's launcher stays down
+  on 8 (`agents/roomlerdw/src/ends.rs`), launchd leaves a clean exit alone, and the Windows service
+  host stops instead of respawning, unless its reaper ended a predecessor of its own.
+- The service host's worker hand-off has two covers: the bounded wait, and that reaper, which ends
+  this host's own predecessor that outlived the wait and then respawns the worker
+  ([remote-control.md §19.8.9](remote-control.md#1989-a-worker-its-host-left-behind-2465)). If an
+  elevated console `roomlerd run` holds the guard when the service's worker starts, the worker
+  leaves with 8 and the host stops the service until a reboot or a manual start.
+- A start that can neither take nor read the guard runs without it and logs
+  `machine guard unavailable; running without it` at WARN: a machine left with no daemon is the one
+  answer the guard must never give.
+- A daemon that runs unprivileged holds no guard, so a privileged start beside it still runs. That
+  is a per-user install's daemon on Linux, and two daemons on Windows: every per-user install's,
+  because its scheduled task runs at `LeastPrivilege` (`agents/roomlerd/src/service.rs:1506`), and
+  the service's user-context worker whenever the service starts it with the person's standard
+  rights: a standard user, `ROOMLERD_ELEVATE_WORKER=0`, or SystemContext waiting for a machine
+  enrollment (`user_arm_elevates`, `agents/roomlerd/src/win_service/supervisor.rs:1053`). None of
+  them can create the overlay interface: an unprivileged process cannot create a WireGuard TUN
+  ([vmtest.md](vmtest.md)); on Windows `WintunCreateAdapter` is a privileged device install
+  (`supervisor.rs:412`), and the service's optional `netd` child hosts nothing yet.
+
 ---
 
 ## 3. P1 — the foundation: `[[orgs]]` (shipped, #313)
