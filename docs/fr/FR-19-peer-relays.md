@@ -482,7 +482,7 @@ in P3c, after the identity gates, so a refusal is attributable and audited.
 
 **Multi-org: relay serving is PRIMARY-ORG ONLY, enforced.** ⚠️ The first draft said a device
 *"may serve N tenants"* and, two sentences later, that it *"should follow"* the primary-only
-rule. `docs/multi-org.md:268` makes exit-node and netstack primary-only because they are
+rule. `docs/multi-org.md:299` makes exit-node and netstack primary-only because they are
 **host-global singletons**; a UDP listener on a host-global port is exactly that. And
 `:114-116` adds the trust half for `rc:agent.update`: *"a secondary org's admin must not be
 able to force-update a shared binary"* — a secondary org's admin minting sessions onto the
