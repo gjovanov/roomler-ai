@@ -1128,9 +1128,12 @@ describe('useAgentStore: one org at a time (#4248)', () => {
     let answer!: (v: unknown) => void
     mockApi.get.mockReturnValueOnce(new Promise((r) => (answer = r)))
     const first = s.fetchAgents(ORG_A)
-    await s.ensureAgents(ORG_A)
+    // Not awaited before the answer: the ensure may answer with the fetch in
+    // flight (#4257, slice 7), and then settles only once it has landed.
+    const whileLoading = s.ensureAgents(ORG_A)
     answer(listOf(['a1']))
     await first
+    await whileLoading
     await s.ensureAgents(ORG_A)
     expect(asked()).toEqual([`/tenant/${ORG_A}/agent?per_page=100`])
     expect(s.agents.map((a) => a.id)).toEqual(['a1'])
@@ -1465,5 +1468,117 @@ describe("useAgentStore: the org's settings, one org at a time (#4257)", () => {
     await s.fetchOrgExecEnabled(ORG_A)
     await expect(s.setOrgExecRequireSystem(ORG_B, true)).rejects.toThrow('not loaded yet')
     expect(mockApi.put).not.toHaveBeenCalled()
+  })
+})
+
+// #4257 (the review's F1) — the remote viewer's load. On a fresh load the
+// shell's list fetch is in flight when the page asks (`RemoteControl.vue`
+// `loadAgent`: `await ensureAgents(tid)`, then the row from the list, else the
+// single-device GET). An ensure that answers at once lets the page take the
+// single-device row, which the list's answer then replaces in the store: the
+// page holds a row that presence updates no longer reach. An ensure answers
+// with the fetch in flight, as `ensureRooms` does, and a superseded fetch
+// settles with the newest one.
+describe('useAgentStore: an ensure answers with the fetch in flight (#4257)', () => {
+  const ORG_A = 'org_a'
+  const DEVICE = 'dev_1'
+  const LIST_A = `/tenant/${ORG_A}/agent?per_page=100`
+  const ONE_A = `/tenant/${ORG_A}/agent/${DEVICE}`
+  const listOf = (ids: string[]) => ({
+    items: ids.map((id) => mkAgent({ id })),
+    total: ids.length,
+    page: 1,
+    per_page: 100,
+    total_pages: 1,
+  })
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+  /** Every pending microtask, and the ones they queue, run. */
+  const flush = () => new Promise((r) => setTimeout(r, 0))
+
+  /** Each list GET of org A, held until the test answers it, in order. */
+  let lists: Array<(ids: string[]) => void>
+  /** The single-device GET's answer. */
+  let one: () => Promise<unknown>
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    lists = []
+    one = async () => mkAgent({ id: DEVICE })
+    mockApi.get.mockImplementation((async (path: string) => {
+      if (path === LIST_A) return new Promise((r) => lists.push((ids) => r(listOf(ids))))
+      if (path === ONE_A) return one()
+      throw new Error(`unexpected GET ${path}`)
+    }) as never)
+  })
+
+  /** What `loadAgent` does once the org is known: the row from the list, else
+   *  the single-device GET; nothing on a failed one. */
+  async function loadAgent(s: ReturnType<typeof useAgentStore>): Promise<Agent | null> {
+    await s.ensureAgents(ORG_A)
+    try {
+      return s.agents.find((a) => a.id === DEVICE) ?? (await s.fetchAgent(ORG_A, DEVICE))
+    } catch {
+      return null
+    }
+  }
+
+  it('settles only once the devices have landed, and asks nothing more', async () => {
+    const s = useAgentStore()
+    void s.fetchAgents(ORG_A)
+    let settled = false
+    const ensured = s.ensureAgents(ORG_A).then(() => (settled = true))
+    await flush()
+    expect(settled).toBe(false)
+
+    lists[0]!([DEVICE])
+    await ensured
+    expect(s.agents.map((a) => a.id)).toEqual([DEVICE])
+    expect(asked()).toEqual([LIST_A])
+  })
+
+  it("the remote viewer's load, with the shell's list in flight, holds the store's own row: a presence update reaches it", async () => {
+    const s = useAgentStore()
+    void s.fetchAgents(ORG_A)
+    const load = loadAgent(s)
+    // A single-device answer, if one was asked, lands before the list's, and
+    // the list's answer lands before the presence update.
+    await flush()
+    lists[0]!([DEVICE])
+    await flush()
+    const agent = await load
+    expect(agent?.id).toBe(DEVICE)
+
+    s.applyPresence([{ agent_id: DEVICE, presence: 'online' }])
+    expect(agent!.presence).toBe('online')
+    expect(agent!.is_online).toBe(true)
+    expect(asked().filter((p) => p === LIST_A)).toHaveLength(1)
+  })
+
+  it('a device the list holds is resolved from the list, whatever the single-device request does', async () => {
+    const s = useAgentStore()
+    one = async () => {
+      throw Object.assign(new Error('Service Unavailable'), { status: 503 })
+    }
+    void s.fetchAgents(ORG_A)
+    const load = loadAgent(s)
+    await flush()
+    lists[0]!([DEVICE])
+    const agent = await load
+    expect(agent?.id).toBe(DEVICE)
+    expect(asked()).not.toContain(ONE_A)
+  })
+
+  it('a superseded fetch settles with the newest one: a caller that reads the devices after its await reads the newest (the welcome tour counts them so)', async () => {
+    const s = useAgentStore()
+    const tourCount = s.fetchAgents(ORG_A).then(() => s.total)
+    // A page's fetch for the same org supersedes the tour's.
+    void s.fetchAgents(ORG_A)
+    await flush()
+    lists[0]!(['dropped'])
+    await flush()
+    lists[1]!([DEVICE, 'dev_2'])
+    expect(await tourCount).toBe(2)
+    expect(s.agents.map((a) => a.id)).toEqual([DEVICE, 'dev_2'])
   })
 })

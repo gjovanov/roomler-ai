@@ -470,4 +470,36 @@ describe('useRoomStore: one org at a time (#4257)', () => {
     expect(asked()).toHaveLength(2)
     expect(ids()).toEqual(['ra'])
   })
+
+  // #4257 (the review's F5) — the shell counts the unread messages of the rooms
+  // it fetched (`AppLayout.vue`: `fetchRooms(tid).then(() =>
+  // fetchAllUnreadCounts(tid))`). A superseded fetch settles with the newest
+  // one, so its count ran for the previous org over the new org's rooms: one
+  // request a room, each refused. A count runs over its own org's rooms only.
+  it('fetchAllUnreadCounts for an org the rooms are not of asks nothing', async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce([makeRoom({ id: 'rb', tenant_id: ORG_B })])
+    await s.fetchRooms(ORG_B)
+    mockApi.get.mockClear()
+    await s.fetchAllUnreadCounts(ORG_A)
+    await settle()
+    expect(asked()).toEqual([])
+  })
+
+  it("the shell's count after a fetch that the next org's superseded asks nothing for the previous org, and the next org's count runs", async () => {
+    const s = useRoomStore()
+    const answerA = heldGet()
+    const chainA = s.fetchRooms(ORG_A).then(() => s.fetchAllUnreadCounts(ORG_A))
+    const answerB = heldGet()
+    const chainB = s.fetchRooms(ORG_B).then(() => s.fetchAllUnreadCounts(ORG_B))
+    // Every later GET is an unread count.
+    mockApi.get.mockResolvedValue({ count: 3 })
+    answerA.resolve([makeRoom({ id: 'ra', tenant_id: ORG_A })])
+    answerB.resolve([makeRoom({ id: 'rb', tenant_id: ORG_B })])
+    await Promise.all([chainA, chainB])
+    await settle()
+    expect(asked().filter((p) => p.startsWith(`/tenant/${ORG_A}/room/`))).toEqual([])
+    expect(asked()).toContain(`/tenant/${ORG_B}/room/rb/message/unread-count`)
+    expect(s.unreadCounts.rb).toBe(3)
+  })
 })

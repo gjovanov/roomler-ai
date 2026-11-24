@@ -473,6 +473,52 @@ describe("EnrollKeysSection: the org's ephemeral keys (#4257)", () => {
     expectNothingRaised()
     w.unmount()
   })
+
+  // The review's F4: the org check alone passes again after A → B → A, and
+  // the secret then landed on a dialog the change had closed, to stay in the
+  // section's state until the next mint. An answer for a dialog closed in the
+  // meantime writes no secret; the list still shows the key, to revoke.
+  /** The secret the section holds in its state, shown or not. */
+  const heldSecret = (w: VueWrapper) => (w.vm as unknown as { mintedKey: string | null }).mintedKey
+
+  it('a key minted for org A that answers after org A → org B → org A writes no secret, and the list shows the key', async () => {
+    const lateMint = hold('POST', pathOf(ORG_A, 'agent/enroll-key'))
+    const w = mount(EnrollKeysSection, { props: { tenantId: ORG_A }, global: globalOpts(), attachTo: document.body })
+    await settle()
+    await mintFor(w)
+
+    await changeOrg(w, ORG_B)
+    await changeOrg(w, ORG_A)
+    const since = asked().length
+    lateMint.release()
+    await settle()
+    expect(openDialog()).toBeNull()
+    expect(heldSecret(w)).toBeNull()
+    expect(shownInABox(A.secret)).toBe(false)
+    expect(asked().slice(since)).toContain(`/tenant/${ORG_A}/agent/enroll-key`)
+    expect(w.text()).toContain(A.keyLabel)
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('a key minted for org A that answers after its dialog was cancelled writes no secret, and the list shows the key', async () => {
+    const lateMint = hold('POST', pathOf(ORG_A, 'agent/enroll-key'))
+    const w = mount(EnrollKeysSection, { props: { tenantId: ORG_A }, global: globalOpts(), attachTo: document.body })
+    await settle()
+    await mintFor(w)
+    await click(buttonIn(openDialog()!, 'Cancel'))
+    expect(openDialog()).toBeNull()
+
+    const since = asked().length
+    lateMint.release()
+    await settle()
+    expect(openDialog()).toBeNull()
+    expect(heldSecret(w)).toBeNull()
+    expect(shownInABox(A.secret)).toBe(false)
+    expect(asked().slice(since)).toContain(`/tenant/${ORG_A}/agent/enroll-key`)
+    expectNothingRaised()
+    w.unmount()
+  })
 })
 
 describe("OverlaySubnetRoutesSection: the org's overlay nodes (#4257)", () => {

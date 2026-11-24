@@ -50,4 +50,24 @@ describe('Shape 2 sites in the shell, the remote-control view and the Devices pa
     )
     expect(body).toContain('agentStore.fetchTenantMembers(tid)')
   })
+
+  // The review's F5: a superseded rooms fetch settles with the newest one, and
+  // the shell's count chain had no catch, so a failed newest fetch was an
+  // unhandled rejection; a reconnect and the mount awaited the fetch the same
+  // way. Each handles a failed fetch. (The count runs over its own org's rooms
+  // only: the rooms store's spec.)
+  it("the shell's rooms fetches handle a failed fetch: on a change of org, on a reconnect and on mount", () => {
+    const src = read('src/components/layout/AppLayout.vue')
+    const onChange = block(
+      src,
+      "if (tid && prevTid !== undefined && prevTid !== tid && caps.has('chat')) {",
+      '\n    }\n',
+    )
+    expect(onChange).toContain('roomStore.fetchAllUnreadCounts(tid)')
+    expect(onChange).toContain('.catch(')
+    const reconnect = block(src, 'async function onWsReconnected()', '\n}\n')
+    expect(reconnect).toMatch(/try \{\s*await roomStore\.fetchRooms\(/)
+    const mounted = block(src, 'onMounted(async () => {', '\n})\n')
+    expect(mounted).toMatch(/try \{\s*await roomStore\.fetchRooms\(/)
+  })
 })

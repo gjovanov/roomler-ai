@@ -129,4 +129,71 @@ describe('useInviteStore: the org its list is of (#4257)', () => {
     await store.createInvite(ORG_A, { target_email: 'third@org-a.example' })
     expect(store.invites.map((i) => i.id)).toEqual(['ia3', 'ia2'])
   })
+
+  // #4257 (the review's F3) — a create or a batch set the page's spinner and
+  // its error with no look at the org. One for org A answered after the list
+  // moved to org B took org B's spinner away while org B's list loaded, and a
+  // failed one showed org A's error above org B's grid. Such an answer leaves
+  // both alone, and a write never ends a list fetch's spinner.
+  type Store = ReturnType<typeof useInviteStore>
+  const writes: Array<{ name: string; run: (s: Store, t: string) => Promise<unknown>; answer: () => unknown }> = [
+    {
+      name: 'a create',
+      run: (s, t) => s.createInvite(t, { target_email: 'new@org-a.example' }),
+      answer: () => invite('ic', ORG_A, 'new@org-a.example'),
+    },
+    {
+      name: 'a batch',
+      run: (s, t) => s.batchCreateInvites(t, [{ target_email: 'new@org-a.example' }]),
+      answer: () => ({ results: [], created: 0, failed: 0 }),
+    },
+  ]
+  for (const write of writes) {
+    it(`${write.name} for org A answered after a list for org B leaves org B's spinner on while that list loads`, async () => {
+      const store = useInviteStore()
+      let answerWrite!: (v: unknown) => void
+      mockApi.post.mockReturnValueOnce(new Promise((r) => (answerWrite = r)) as never)
+      const writing = write.run(store, ORG_A)
+      let answerB!: (v: unknown) => void
+      mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)) as never)
+      const listing = store.listInvites(ORG_B)
+
+      answerWrite(write.answer())
+      await writing
+      expect(store.loading).toBe(true)
+      answerB(envelope([bInvite]))
+      await listing
+      expect(store.loading).toBe(false)
+    })
+
+    it(`${write.name} for org A that fails after a list for org B shows no error over org B's list`, async () => {
+      const store = useInviteStore()
+      let failWrite!: (e: unknown) => void
+      mockApi.post.mockReturnValueOnce(new Promise((_, rej) => (failWrite = rej)) as never)
+      const writing = write.run(store, ORG_A).catch((e: Error) => e.message)
+      mockApi.get.mockResolvedValueOnce(envelope([bInvite]))
+      await store.listInvites(ORG_B)
+
+      failWrite(new Error("org A's refusal"))
+      expect(await writing).toBe("org A's refusal")
+      expect(store.error).toBeNull()
+      expect(store.loading).toBe(false)
+    })
+  }
+
+  it("a create for org A never ends the spinner of org A's own list fetch", async () => {
+    const store = useInviteStore()
+    mockApi.get.mockResolvedValueOnce(envelope([aInvite]))
+    await store.listInvites(ORG_A)
+    let answerList!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerList = r)) as never)
+    const listing = store.listInvites(ORG_A, { page: 2 })
+
+    mockApi.post.mockResolvedValueOnce(invite('ic', ORG_A, 'new@org-a.example'))
+    await store.createInvite(ORG_A, { target_email: 'new@org-a.example' })
+    expect(store.loading).toBe(true)
+    answerList(envelope([aInvite]))
+    await listing
+    expect(store.loading).toBe(false)
+  })
 })

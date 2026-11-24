@@ -327,6 +327,7 @@ function makeRouter(): Router {
           page('explore', ExploreView),
           page('files', FilesBrowser),
           page('invites', InviteManageView),
+          page('room-call', Blank),
           { path: 'tutorial', name: 'tutorial', component: Blank },
         ],
       },
@@ -535,6 +536,34 @@ describe('The org dashboard follows its org (#4257)', () => {
     await settle()
     expect(tiles()).toEqual(SHOWS[ORG_B])
     expect(mesh()).toBe('Org B box')
+    expectNothingRaised()
+  })
+
+  // The review's F6: "Start Call" read the page's org after the room's create
+  // answered, so a call created in org A and answered after the page moved to
+  // org B opened org A's room under org B. A call answered for an org the page
+  // has left opens nothing there.
+  it('a call started in org A that answers after the change to org B opens no call page under org B', async () => {
+    const callRoom = hex(0xca11)
+    let releaseCreate: () => void = () => {
+      throw new Error('no room create was sent')
+    }
+    mockApi.post.mockImplementationOnce(async (path: string) => {
+      if (path !== `/tenant/${ORG_A}/room`) {
+        unexpected.push(`POST ${path}`)
+        return {} as never
+      }
+      await new Promise<void>((r) => (releaseCreate = r))
+      return { id: callRoom, tenant_id: ORG_A, name: 'Org A call' } as never
+    })
+    await open(`/tenant/${ORG_A}`)
+    await clickButton('Start Call')
+
+    await go(`/tenant/${ORG_B}`)
+    releaseCreate()
+    await settle()
+    expect(router.currentRoute.value.fullPath).toBe(`/tenant/${ORG_B}`)
+    expect(wrapper!.findComponent(TenantDashboard).exists()).toBe(true)
     expectNothingRaised()
   })
 })
