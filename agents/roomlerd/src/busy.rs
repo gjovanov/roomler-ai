@@ -20,8 +20,8 @@
 //! ⚠️ Only what THIS process serves. The Mac's root update helper reads it
 //! from each half it restarts, over the LocalAPI's `live_work`
 //! ([`crate::helper_gate`], FR-151); a per-user Linux install's helper
-//! installs without reading it, and a command a Windows service host runs
-//! for its worker (FR-94) is not counted in the worker.
+//! installs without reading it. The worker's gate asks a Windows service host
+//! for the commands it runs for the worker (FR-94): [`gate_now`], #4244.
 
 use std::sync::atomic::Ordering;
 
@@ -116,6 +116,24 @@ pub fn now(rc_sessions: &crate::rc_sessions::RcSessionRegistry) -> Busy {
         work: crate::updater::active_work(),
         net_transition: crate::updater::net_transition_recent(),
         install_in_flight: crate::updater::update_in_flight(),
+    }
+}
+
+/// #4244 — what the update gate reads now: [`now`], with the Fleet RPC runs
+/// the device's SYSTEM service holds for this worker (FR-94), asked over its
+/// doorbell ([`crate::exec_service::service_runs`]).
+pub async fn gate_now(rc_sessions: &crate::rc_sessions::RcSessionRegistry) -> Busy {
+    let service = crate::exec_service::service_runs().await;
+    now(rc_sessions).with_service_runs(&service)
+}
+
+impl Busy {
+    /// `self`, with the runs the device's SYSTEM service holds counted as
+    /// exec runs (#4244).
+    pub fn with_service_runs(self, service: &crate::exec_service::ServiceRuns) -> Busy {
+        // The seam: master's gate reads this process's `Busy` alone.
+        let _ = service;
+        self
     }
 }
 
@@ -241,5 +259,177 @@ mod tests {
         assert_eq!(with_ssh, 1);
         assert_eq!(after, 0);
         assert_eq!(runs.load(Ordering::Relaxed), 0);
+    }
+
+    // #4244 — a Fleet RPC run the SYSTEM service executes for the worker on
+    // an anchored device (FR-94). The worker never hears its end: its gate
+    // asks the service, over the doorbell's health exchange, what it holds.
+
+    use crate::exec_service::{
+        DoorbellReply, DoorbellRequest, HELD_AT_MOST, HeldRuns, RUNS_ASK_TIMEOUT, ServiceRuns,
+        Unread,
+    };
+    use crate::updater::{
+        DeferDecision, TRANSFER_DEFER_RECHECK, forced_update_warning, periodic_gate,
+    };
+    use std::time::Instant;
+
+    /// The worker's own `Busy` with nothing of its own live. `IDLE`, not a
+    /// read of `now`: another test's SSH connection is process-wide, and the
+    /// cells below are about the service's runs alone.
+    fn own() -> Busy {
+        Busy::IDLE
+    }
+
+    /// One health exchange over an in-memory doorbell, with the worker's
+    /// reading of it. The stand-in answers from `held` as the SYSTEM service's
+    /// `health` does, or, `older`, as a service from before #4244 does: with
+    /// no count.
+    async fn service_says(held: &HeldRuns, older: bool, handed: usize) -> ServiceRuns {
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        let exec_runs = (!older).then(|| held.reported_at(Instant::now()));
+        let served = tokio::spawn(crate::exec_service::serve_connection(
+            server,
+            move |req| async move {
+                match req {
+                    DoorbellRequest::Health => DoorbellReply::Health {
+                        anchored: true,
+                        agent_id: Some("6ace07367d06cf41e19e54b0".into()),
+                        exec_enabled: true,
+                        problem: None,
+                        version: "test".into(),
+                        ssh: None,
+                        exec_runs,
+                    },
+                    _ => DoorbellReply::Refused {
+                        error: "only the health exchange is asked".into(),
+                    },
+                }
+            },
+        ));
+        let reply =
+            crate::exec_service::exchange(client, &DoorbellRequest::Health, RUNS_ASK_TIMEOUT).await;
+        served.await.unwrap();
+        ServiceRuns::of(reply, handed)
+    }
+
+    /// RED first (#4244): the run the service holds is in the gate's `Busy`,
+    /// the gate defers on it with the hour's recheck, and the forced update's
+    /// warning names it. Its count ends with the run.
+    #[tokio::test]
+    async fn a_run_the_system_service_holds_defers_the_periodic_update() {
+        let held = HeldRuns::default();
+        let run = held.hold(Instant::now());
+        let service = service_says(&held, false, 0).await;
+        assert_eq!(service, ServiceRuns::Answered(1));
+        let busy = own().with_service_runs(&service);
+        assert_eq!(
+            busy.exec_runs, 1,
+            "the run the SYSTEM service holds is absent from the gate's Busy: {busy}"
+        );
+        assert_eq!(
+            periodic_gate(&busy, 0),
+            (DeferDecision::DeferOnce, TRANSFER_DEFER_RECHECK),
+            "the periodic gate does not defer on the service's run: {busy}"
+        );
+        assert_eq!(
+            forced_update_warning(&busy).as_deref(),
+            Some("forced update proceeding despite: 1 exec run(s)")
+        );
+        drop(run);
+        let service = service_says(&held, false, 0).await;
+        assert_eq!(
+            service,
+            ServiceRuns::Answered(0),
+            "the count outlived the run"
+        );
+        let busy = own().with_service_runs(&service);
+        assert_eq!(periodic_gate(&busy, 0).0, DeferDecision::Proceed, "{busy}");
+    }
+
+    /// Mixed versions (#4244): a service older than #4244 says nothing of its
+    /// runs, so the gate counts the runs this worker handed it, each for
+    /// [`HELD_AT_MOST`] at most. With none handed it holds nothing: an older
+    /// service is no reason to wait for the update that replaces it.
+    #[tokio::test]
+    async fn an_older_service_counts_the_runs_this_worker_handed_it() {
+        let held = HeldRuns::default();
+        let _running = held.hold(Instant::now());
+        let handed = HeldRuns::default();
+        let t0 = Instant::now();
+        handed.note(t0);
+
+        let service = service_says(&held, true, handed.count_at(t0)).await;
+        assert_eq!(
+            service,
+            ServiceRuns::Unread {
+                why: Unread::Older,
+                handed: 1
+            }
+        );
+        let busy = own().with_service_runs(&service);
+        assert_eq!(
+            periodic_gate(&busy, 0),
+            (DeferDecision::DeferOnce, TRANSFER_DEFER_RECHECK),
+            "a run handed to an older service is absent from the gate's Busy: {busy}"
+        );
+
+        // Its bound spent, the record holds nothing.
+        let service = service_says(&held, true, handed.count_at(t0 + HELD_AT_MOST)).await;
+        assert_eq!(service.counted(), 0);
+        let busy = own().with_service_runs(&service);
+        assert_eq!(periodic_gate(&busy, 0).0, DeferDecision::Proceed, "{busy}");
+    }
+
+    /// A lost doorbell (#4244): a service that never answers is read within
+    /// the bound, and then counts as what this worker handed it, until each
+    /// handed run's bound. Never longer.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_service_counts_the_handed_runs_until_their_bound() {
+        let (client, server) = tokio::io::duplex(1024);
+        let silent = tokio::spawn(async move {
+            let _open = server;
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        let reply =
+            crate::exec_service::exchange(client, &DoorbellRequest::Health, RUNS_ASK_TIMEOUT).await;
+        assert!(reply.is_err(), "{reply:?}");
+        silent.abort();
+
+        let handed = HeldRuns::default();
+        let t0 = Instant::now();
+        handed.note(t0);
+        let service = ServiceRuns::of(reply.clone(), handed.count_at(t0));
+        assert_eq!(
+            service,
+            ServiceRuns::Unread {
+                why: Unread::NoAnswer,
+                handed: 1
+            }
+        );
+        let busy = own().with_service_runs(&service);
+        assert_eq!(
+            periodic_gate(&busy, 0).0,
+            DeferDecision::DeferOnce,
+            "a run handed to a silent service is absent from the gate's Busy: {busy}"
+        );
+        let later = t0 + HELD_AT_MOST;
+        let service = ServiceRuns::of(reply, handed.count_at(later));
+        let busy = own().with_service_runs(&service);
+        assert_eq!(periodic_gate(&busy, 0).0, DeferDecision::Proceed, "{busy}");
+    }
+
+    /// A service started again since it took a run (a crash, an update by
+    /// hand) holds nothing, and says so: its word stands over the worker's
+    /// record of what it handed the service before.
+    #[tokio::test]
+    async fn a_restarted_service_is_believed_over_the_workers_record() {
+        let restarted = HeldRuns::default();
+        let handed = HeldRuns::default();
+        handed.note(Instant::now());
+        let service = service_says(&restarted, false, handed.count_at(Instant::now())).await;
+        assert_eq!(service, ServiceRuns::Answered(0));
+        let busy = own().with_service_runs(&service);
+        assert_eq!(periodic_gate(&busy, 0).0, DeferDecision::Proceed, "{busy}");
     }
 }
