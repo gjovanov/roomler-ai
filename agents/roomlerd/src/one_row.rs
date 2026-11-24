@@ -3455,7 +3455,11 @@ mod mac {
     /// each call checked. Never `Command::uid` or `gid`, whose group handling
     /// is not this hook's. Fed and read within [`CHILD_DEADLINE`] and
     /// [`CHILD_CAP`] on a blocking thread, never on a runtime worker.
-    async fn spawn_person(account: &Account, verb: Verb, stdin: &[u8]) -> Result<ChildOutput> {
+    pub(crate) async fn spawn_person(
+        account: &Account,
+        verb: Verb,
+        stdin: &[u8],
+    ) -> Result<ChildOutput> {
         use std::os::unix::process::CommandExt as _;
         let plan = spawn_plan(account, verb);
         let lstat = std::fs::symlink_metadata(plan.program).map(|m| (m.uid(), m.mode()));
@@ -3537,6 +3541,19 @@ mod mac {
                 }
             }
         }
+    }
+
+    /// The account `uid` as root starts a child for it: the one-row host's
+    /// lookup, and FR-151's update helper's for the console person.
+    pub(crate) fn person_account(uid: u32) -> Option<Account> {
+        let entry = crate::appdirs::account_entry(uid)?;
+        Some(Account {
+            uid: entry.uid,
+            gid: entry.gid,
+            name: entry.name.into_string().ok()?,
+            home: entry.home.into_os_string().into_string().ok()?,
+            uuid: account_uuid(entry.uid)?,
+        })
     }
 
     struct MacHost {
@@ -3689,14 +3706,7 @@ mod mac {
         }
 
         fn account(&self, uid: u32) -> Option<Account> {
-            let entry = crate::appdirs::account_entry(uid)?;
-            Some(Account {
-                uid: entry.uid,
-                gid: entry.gid,
-                name: entry.name.into_string().ok()?,
-                home: entry.home.into_os_string().into_string().ok()?,
-                uuid: account_uuid(entry.uid)?,
-            })
+            person_account(uid)
         }
 
         fn console_uid(&self) -> Option<u32> {
@@ -3826,6 +3836,11 @@ mod mac {
         }
     }
 }
+
+/// FR-151 — the update helper starts the console person's `live-work` child
+/// with FR-147's own spawn and account lookup.
+#[cfg(target_os = "macos")]
+pub(crate) use mac::{person_account, spawn_person};
 
 #[cfg(test)]
 mod tests {
@@ -4558,6 +4573,8 @@ mod tests {
                     }
                     reply.put_back_legacy = Some(Legacy { config, plist });
                 }
+                // FR-151: the one-row move never asks it.
+                Verb::LiveWork => return Err(2),
             }
             Ok(())
         }
@@ -4730,6 +4747,7 @@ mod tests {
                 convert: None,
                 put_back: None,
                 put_back_legacy: None,
+                live_work: None,
             };
             if let Err(code) = self.act(account.uid, verb, stdin, &mut reply) {
                 return Ok(out(Some(code), Vec::new()));

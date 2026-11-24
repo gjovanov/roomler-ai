@@ -538,6 +538,9 @@ pub mod daemon_error;
 /// FR-133 P2c — the viewer's sentences, the CLI and LocalAPI output, `--help`.
 #[cfg(test)]
 mod daemon_text_tests;
+/// FR-151 — the Mac's root update helper waits for live work: the pure
+/// decision its macOS arm (`updater::run_update_helper`) runs.
+pub mod helper_gate;
 /// FR-148 P4b-3 — the agent's half of the deadline-limited video channel:
 /// the pick per carrier class, the switch at a key frame, the drain rule, D.
 pub mod media_deadline;

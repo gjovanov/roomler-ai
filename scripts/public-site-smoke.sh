@@ -368,6 +368,25 @@ else
   bad "/version.json names '${vid:-nothing}', the SPA shell '${sid:-nothing}' (want the same build in both)"
 fi
 
+# 5f. AdSense's ads.txt: Google verifies the site by fetching /ads.txt, so the
+#     file must be served exactly as committed, as text/plain. A missing one
+#     would not 404: `location /` answers it with the SPA shell (200,
+#     text/html), and AdSense reads that as no ads.txt at all. Needs the repo;
+#     a revision without ui/public/ads.txt skips it.
+if [ -n "$REPO" ] && want="$(git -C "$REPO" show "$REV:ui/public/ads.txt" 2>/dev/null)"; then
+  got="$(curl -ksS -m 15 "$BASE/ads.txt" 2>/dev/null)"
+  act="$(header "$BASE/ads.txt" content-type)"
+  case "$act" in
+    text/plain*) plain=1 ;;
+    *) plain=0 ;;
+  esac
+  if [ "$got" = "$want" ] && [ "$plain" = 1 ]; then
+    ok "/ads.txt serves ui/public/ads.txt ($act)"
+  else
+    bad "/ads.txt does not serve ui/public/ads.txt (Content-Type '${act:-none}'): AdSense would find no ads.txt"
+  fi
+fi
+
 # 6. Every asset a page names is content-hashed — the only kind of name for
 #    which nginx's one-year `immutable` is true — and actually loads. Every
 #    image reserves its box (width + height). The og:image is absolute and
