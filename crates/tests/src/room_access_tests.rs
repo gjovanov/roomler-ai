@@ -595,6 +595,118 @@ async fn an_edit_is_the_authors_on_a_live_message_of_the_path_room() {
     );
 }
 
+/// The edit's body, field for field (`chat::message::UpdateMessageRequest`).
+/// This crate does not link the chat module, and what axum's `Json` extractor
+/// answers a body depends on the body type's shape alone.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct UpdateMessageRequest {
+    content: String,
+}
+
+/// #4254 — an edit answers whoever is not the message's author before it
+/// reads its body at all: a reader of the room gets the answer a missing
+/// message gets, and someone outside the org the one `not_a_member`, for a
+/// body that does not even parse, the answer a body the route reads gets.
+/// While it took `Json<T>` as an extractor, axum answered such a body before
+/// the handler ran, with a 400, 415 or 422 decided by the body alone. Nothing
+/// is written.
+#[tokio::test]
+async fn an_edit_answers_who_is_not_its_author_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let app = spawn().await;
+    let t = app.seed_tenant("editun").await;
+    let other = app.seed_tenant("editun-b").await;
+    let (tid, room) = (t.tenant_id.clone(), t.rooms[0].id.clone());
+    let author = t.admin.access_token.clone();
+    let reader = t.member.access_token.clone();
+    let mid = message(&app, &tid, &room, &author, "the first text").await;
+    let before = stored(&app, "messages", &mid).await;
+    let edit = |id: &str| format!("/api/tenant/{tid}/room/{room}/message/{id}");
+    let write = GatedWrite {
+        method: "PUT",
+        path: edit(&mid),
+        reads: json!({ "content": "a rewrite" }),
+        refused_field: r#"{"content": 7}"#,
+    };
+
+    // The answer a missing message gets, and the reader gets it too.
+    let missing = call(
+        &app,
+        "PUT",
+        &edit(&ObjectId::new().to_hex()),
+        &author,
+        Some(write.reads.clone()),
+    )
+    .await;
+    assert_eq!(missing.0, 404, "{}", missing.1);
+    let refused = call(&app, "PUT", &write.path, &reader, Some(write.reads.clone())).await;
+    assert_eq!(
+        refused, missing,
+        "the reader gets a missing message's answer"
+    );
+
+    // `Gate::Unseen` is that 404 `not_found`: each body that does not parse
+    // must be given it too.
+    let mut wrong = gate_problems(
+        &app,
+        "a reader who is not the author",
+        &reader,
+        Gate::Unseen,
+        &write,
+    )
+    .await;
+    wrong.extend(
+        gate_problems(
+            &app,
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+            &write,
+        )
+        .await,
+    );
+    assert_no_problems("answered before the author check", &wrong);
+    assert_eq!(
+        stored(&app, "messages", &mid).await,
+        before,
+        "nothing written"
+    );
+}
+
+/// #4254's control. The author is answered an edit that does not parse
+/// exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words, and the message is left as it was.
+#[tokio::test]
+async fn the_author_is_answered_an_edit_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+
+    let app = spawn().await;
+    let t = app.seed_tenant("editun-author").await;
+    let (tid, room) = (t.tenant_id.clone(), t.rooms[0].id.clone());
+    let author = t.admin.access_token.clone();
+    let mid = message(&app, &tid, &room, &author, "the first text").await;
+    let before = stored(&app, "messages", &mid).await;
+
+    let wrong = holder_problems::<UpdateMessageRequest>(
+        &app,
+        &author,
+        "PUT",
+        &format!("/api/tenant/{tid}/room/{room}/message/{mid}"),
+        r#"{"content": 7}"#,
+    )
+    .await;
+    assert_no_problems("the author", &wrong);
+    assert_eq!(
+        stored(&app, "messages", &mid).await,
+        before,
+        "nothing written"
+    );
+}
+
 #[tokio::test]
 async fn a_rooms_files_and_uploads_follow_the_rooms_visibility() {
     let app = spawn().await;

@@ -27,7 +27,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
 };
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
@@ -98,14 +98,36 @@ pub fn needs_restart_for_tun(overlay_mode: Option<&str>, caps_multi_org: &[Strin
 }
 
 /// POST /api/tenant/{tenant_id}/agent/{agent_id}/join-org
+///
+/// The first gate, `MANAGE_AGENTS` on the path's org, is decided before the
+/// body is read and before the device's id is (#4254): a caller without it
+/// gets the gate's answer whatever the body and the id are. The second gate,
+/// `MANAGE_AGENTS` on the target org, needs the target's id, which only the
+/// body carries, so it follows the body: a holder of the first bit is
+/// answered a body that does not parse as the `Json` extractor answered it,
+/// since no target was named. The same-org check stays ahead of the second
+/// gate, which would only ask again what the first one answered.
 pub async fn join_org(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    Json(body): Json<JoinOrgRequest>,
+    body: Result<Json<JoinOrgRequest>, JsonRejection>,
 ) -> Result<Json<JoinOrgResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+
+    // BOTH sides. See the module header for why neither alone is enough.
+    // The path's org first, before the body is read.
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+
+    let Json(body) = body?;
     let aid = ObjectId::parse_str(&agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
     let target = ObjectId::parse_str(&body.target_tenant_id)
@@ -117,15 +139,7 @@ pub async fn join_org(
         ));
     }
 
-    // BOTH sides. See the module header for why neither alone is enough.
-    require_permission(
-        &state,
-        tid,
-        auth.user_id,
-        permissions::MANAGE_AGENTS,
-        "MANAGE_AGENTS",
-    )
-    .await?;
+    // Then the target org, which only the body names.
     require_permission(
         &state,
         target,

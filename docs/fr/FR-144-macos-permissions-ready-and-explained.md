@@ -169,7 +169,7 @@ what is missing.
   controller: a reset only removes, and the grant needs a person. The root half's reset takes one thing from its
   caller, which row: the bundle id and the service names are fixed in the root half, so the verb reaches no other
   app's grants.
-- **When it is checked:** at every start of the person's half (where the preflight runs, `app.rs:4090`), so after
+- **When it is checked:** at every start of the person's half (where the preflight runs, `app.rs:4135`), so after
   our own update and after a macOS update without a separate trigger; and when a session's capture fails with
   `permission`.
 

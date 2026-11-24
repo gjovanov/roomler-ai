@@ -2550,7 +2550,7 @@ flowchart TD
 - **A restart, not a loop.** launchd relaunches the net's exit as it does any non-zero exit, one start per 10 s at most
   (the plist's `ThrottleInterval`). The net marks no clean shutdown, so a run that it ends before the run has been
   healthy for 5 minutes counts as a crash at the next start, as any other would, and the crash-loop rollback still
-  counts it (`app.rs:4386`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
+  counts it (`app.rs:4431`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
 - **Why a code of its own.** 9, `RESTART_REQUESTED_EXIT_CODE`, is a requested restart: it says no failure happened, and
   the macOS (FR-43) and Windows supervisors keep it out of their crash records. The net's exit is a failure, so it
   leaves with 32, `APPKIT_ENDED_EXIT_CODE`, which no other exit in the tree uses, which is outside the Linux units'

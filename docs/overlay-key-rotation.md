@@ -193,7 +193,7 @@ duplicate-delivery race below. Any report about a *different* order, and any
 Resolved **once, server-side**, from the order, the claim and the proof
 (`crates/modules/fleet/src/agent.rs:943-1036`); the grid only names the states
 (`AgentsSection.vue:2115-2216`). The device row also carries `overlay_public_key` and
-`overlay_key_epoch` straight from the proof (`agent.rs:2207-2208`), so an operator
+`overlay_key_epoch` straight from the proof (`agent.rs:2225-2226`), so an operator
 can *see* the key change instead of trusting a chip.
 
 ```mermaid
@@ -440,7 +440,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:649-672`; `crates/services/src/dao/agent.rs:1206` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1171-1201` |
-| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1160-1321`, `:2200-2208` |
+| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1160-1321`, `:2218-2226` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:838-846` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6309-6451`, `:3563-3605`, `:3607-3628`, `:1427-1454` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
