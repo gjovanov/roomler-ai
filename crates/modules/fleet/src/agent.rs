@@ -305,9 +305,9 @@ pub struct EnrollResponse {
     pub agent_id: String,
     pub tenant_id: String,
     pub agent_token: String,
-    /// FR-51 — true when this enrollment arrived on an ephemeral key: the
-    /// row will be reaped after its inactivity TTL, and re-enrolling later
-    /// creates a NEW device rather than reviving this one.
+    /// FR-51 — the ROW's nature, which the daemon records (#4331): true for a
+    /// row an ephemeral key made, and for one a standard token refreshed while
+    /// it lived, since nothing after enrollment flips a row. Reaped on its TTL.
     pub ephemeral: bool,
 }
 
@@ -459,7 +459,7 @@ pub async fn enroll_agent(
         agent_id: agent_id.to_hex(),
         tenant_id: tid.to_hex(),
         agent_token,
-        ephemeral: false,
+        ephemeral: agent.ephemeral,
     }))
 }
 

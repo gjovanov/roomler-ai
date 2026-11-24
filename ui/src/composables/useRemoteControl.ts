@@ -2504,6 +2504,7 @@ export function decodeStatWireMessage(
   arrival?: { avgMs: number } | null,
   media?: Partial<ViewerMediaWindow> | null,
   queueArrMs?: number | null,
+  relay?: string | null,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
   const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
@@ -2601,6 +2602,12 @@ export function decodeStatWireMessage(
     }
     if (typeof media.decoderHw === 'boolean') msg.decoder_hw = media.decoderHw
   }
+  // FR-148 P4b-3b (D58) — what carries this viewer's own TURN relay
+  // (`selectedRelayProtocol`), for the agent's pick of the video channel:
+  // exactly `udp`, `tcp` or `tls`, and no key in every other case. An agent
+  // of any version reads this message's keys by name, so an older one
+  // ignores it.
+  if (relay === 'udp' || relay === 'tcp' || relay === 'tls') msg.relay = relay
   // FR-132 P1 — this viewer counts its decode errors (one `rc:decode-error`
   // each, `decodeErrorWireMessage`), so the agent reports the session's count
   // and a zero is a measured one. An older viewer sends no `de`, and its
@@ -7237,6 +7244,9 @@ export function useRemoteControl(
   const struggleWindow = new StruggleWindow(flowParams.struggleWindows)
   let statsPrevBytes = 0
   let statsPrevTsMs = 0
+  // FR-148 P4b-3b — the newest stats poll's read of this viewer's own relay
+  // (`selectedRelayProtocol`), put on each `rc:decodestat` (`sendDecodeStat`).
+  let statsRelay: RelayProtocol | null = null
 
   // FR-1 P7 — agent clock sync for the HUD's end-to-end frame age. A probe
   // rides every stats tick (`rc:clock` on the control DC, ~60 B); the agent
@@ -7918,7 +7928,9 @@ export function useRemoteControl(
     if (!ch || ch.readyState !== 'open') return
     try {
       ch.send(
-        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media, queueArrMs)),
+        JSON.stringify(
+          decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media, queueArrMs, statsRelay),
+        ),
       )
     } catch {
       /* channel closed between check and send — drop */
@@ -9098,6 +9110,8 @@ export function useRemoteControl(
         stats.value = snap.next
         statsPrevBytes = snap.bytes
         statsPrevTsMs = snap.tsMs
+        // FR-148 P4b-3b — from the same report: no second getStats().
+        statsRelay = selectedRelayProtocol(report)
       } catch {
         /* getStats() can reject during teardown — just wait for next tick */
       }
@@ -9158,6 +9172,7 @@ export function useRemoteControl(
     }
     statsPrevBytes = 0
     statsPrevTsMs = 0
+    statsRelay = null
     stats.value = { ...EMPTY_STATS }
   }
 
@@ -14634,6 +14649,44 @@ export function extractStatsSnapshot(
     bytes,
     tsMs,
   }
+}
+
+/** FR-148 P4b-3b (D58) — what carries this viewer's own TURN relay. */
+export type RelayProtocol = 'udp' | 'tcp' | 'tls'
+
+/**
+ * FR-148 P4b-3b (D58) — the transport of this viewer's own TURN relay, for
+ * the agent's pick of the video channel. The agent can read only its own end
+ * of the pair, so a browser that reaches TURN only over TCP or TLS (behind a
+ * proxy that passes port 443 alone) must say so, on `rc:decodestat`'s `relay`.
+ *
+ * The `relayProtocol` of the selected pair's local candidate, when that
+ * candidate's `candidateType` is `relay`: exactly `udp`, `tcp` or `tls`, and
+ * `null` in every other case (no selected pair, a local candidate that is no
+ * relay, a relay with no `relayProtocol`, or any other value). The selected
+ * pair is the one a `transport` report names in `selectedCandidatePairId`
+ * (Chromium's shape); when no `transport` report names one, the
+ * `candidate-pair` whose `selected` is `true` (Firefox's shape). Pure over one
+ * report: the 500 ms stats poll calls it on the report it already reads.
+ */
+export function selectedRelayProtocol(report: RTCStatsReport): RelayProtocol | null {
+  let named: string | undefined
+  let flagged: Record<string, unknown> | undefined
+  for (const raw of report.values()) {
+    const s = raw as Record<string, unknown>
+    if (s.type === 'transport') {
+      const id = s.selectedCandidatePairId
+      if (named === undefined && typeof id === 'string' && id !== '') named = id
+    } else if (s.type === 'candidate-pair' && s.selected === true) {
+      flagged ??= s
+    }
+  }
+  const pair = named !== undefined ? (report.get(named) as Record<string, unknown> | undefined) : flagged
+  if (!pair || pair.type !== 'candidate-pair' || typeof pair.localCandidateId !== 'string') return null
+  const local = report.get(pair.localCandidateId) as Record<string, unknown> | undefined
+  if (!local || local.type !== 'local-candidate' || local.candidateType !== 'relay') return null
+  const p = local.relayProtocol
+  return p === 'udp' || p === 'tcp' || p === 'tls' ? p : null
 }
 
 /**

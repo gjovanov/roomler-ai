@@ -571,7 +571,7 @@ flowchart TD
 
 **A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
 daemon whose binary was replaced restarts through the same door once nothing it
-serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:359-418`).
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:364-423`).
 It runs the same supervisor proof, record and systemd read-back, but not
 `local_restart_enabled`, because no local client is asking. It is not a server
 lever: what sets it off is a file replaced ON the device, by the root update
@@ -615,12 +615,16 @@ which the daemon still refuses on the same terms as a local request.
      wire has three states and a switch has two — `undefined` means the device
      keeps what it has, and an operator toggling exec must not silently assert
      a value for every other key.
-   - **Combination warnings.** `ssh_enabled` alone grants nothing: without
-     `ssh_authorized_keys` nobody can connect, and with an unset
-     `ssh_account_mode` a key-list session authenticates and then runs nothing.
-     Both produce a device that is "on" and unreachable — the same
-     silent-nothing this whole feature exists to remove, so the dialog says so
-     before you save rather than leaving you to find out by `ssh`ing at it.
+   - **Combination warnings.** An empty `ssh_authorized_keys` is not one. A
+     server grant (`roomler ssh`) is tried before the list and needs no key in
+     it and no `ssh_account_mode`: it runs as the device's SSH policy says. So
+     the empty default still reaches every caller the server grants, and it
+     refuses only a key-list session, the break-glass route (#4325). The dialog
+     warns where a key-list session would authenticate and then run nothing:
+     keys with an unset `ssh_account_mode`. That is a device "on" for that
+     route and doing nothing — the same silent-nothing this whole feature
+     exists to remove, so the dialog says so before you save rather than
+     leaving you to find out by `ssh`ing at it.
    - **Grant bits mirrored** (`canGrantDeviceExec` / `canGrantDeviceSsh`), so a
      caller without `EXEC_DEVICE` sees a disabled control and the reason,
      rather than a 403 they cannot attribute to themselves or to the device.
@@ -652,15 +656,15 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3536`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3596`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check
    of the folder each time a recording starts. **Gate 4 is not among them.**
    `exec_enabled`, `ssh_enabled` and `remote_config_enabled` are served
    read-only there (`ConfigEntry::read_only = "root_only"`, `person_view`,
-   `:3664`), and a `ConfigSet` of them is refused by name with the
-   administrator's command (`not_on_the_person_socket_for_key`, `:3708`): on a
+   `:3724`), and a `ConfigSet` of them is refused by name with the
+   administrator's command (`not_on_the_person_socket_for_key`, `:3768`): on a
    root-mode install gate 4 stays `sudo roomler config set exec_enabled true`,
    on both OSes. The pane shows the root daemon's value of the switch, marked,
    instead of another daemon's — on a two-half Mac the machine-side rows come

@@ -396,7 +396,7 @@ One host on 0.4.48 took 60 s on every roll, the shape of the oldest agents, and 
   offsets between hosts do not enter it.
 - **A host can close in both waves.** A daemon with two enrollments runs one signaling loop for each
   (`agents/roomlerd/src/signaling.rs:632-636`) and uploads both loops' lines under its primary's row
-  (`agents/roomlerd/src/app.rs:4750-4763`). Five such rows closed in both waves, about 12 s apart, because their
+  (`agents/roomlerd/src/app.rs:4752-4765`). Five such rows closed in both waves, about 12 s apart, because their
   two organisations sit on different pods. Each socket is still cut once a roll.
 
 ### The switch-on half (2026-11-22)
@@ -611,7 +611,7 @@ out. AC3 to AC6 keep their words.
 
 ⚠️ What moved with AC1: the reader for it does not exist either. `video DC delivery gap` is console-only and logs
 only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:19`, warned at
-`ui/src/composables/useRemoteControl.ts:8518`).
+`ui/src/composables/useRemoteControl.ts:8530`).
 
 ## Out of scope
 

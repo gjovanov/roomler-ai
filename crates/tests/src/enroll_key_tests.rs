@@ -573,3 +573,91 @@ async fn self_unenroll_removes_ephemeral_and_refuses_permanent() {
         .unwrap();
     assert_eq!(resp.status(), 401);
 }
+
+/// A standard (single-use) enrollment token, minted by the org's admin.
+async fn standard_token(app: &TestApp, tenant_id: &str, admin_token: &str) -> String {
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{tenant_id}/agent/enroll-token"),
+            admin_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    et["enrollment_token"].as_str().unwrap().to_string()
+}
+
+/// #4331 — the enroll answer's `ephemeral` is what the ROW is, because a
+/// daemon records it into its config. A standard token over a LIVE ephemeral
+/// row with the same machine id refreshes that row, and the row stays
+/// ephemeral (nothing after enrollment flips a device), so the answer says
+/// ephemeral: a config that read `false` would not remove itself on a stop
+/// while the reaper still deletes its row. Once the row is removed, the same
+/// machine id enrolls a NEW permanent device, and the answer says that.
+#[tokio::test]
+async fn the_enroll_answer_is_the_rows_nature_not_the_tokens() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("ekey7").await;
+    let admin = t.admin.access_token.as_str();
+    enable_keys(&app, &t.tenant_id, admin).await;
+
+    let minted = mint_key(&app, &t.tenant_id, admin, json!({})).await;
+    let resp = enroll_raw(
+        &app,
+        minted["key"].as_str().unwrap(),
+        "ekey7-mid",
+        json!({}),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let eph: Value = resp.json().await.unwrap();
+    assert_eq!(eph["ephemeral"], json!(true));
+    let eph_id = eph["agent_id"].as_str().unwrap().to_string();
+
+    // A standard token, the same machine id, the row still live.
+    let token = standard_token(&app, &t.tenant_id, admin).await;
+    let resp = enroll_raw(&app, &token, "ekey7-mid", json!({})).await;
+    assert!(resp.status().is_success());
+    let refreshed: Value = resp.json().await.unwrap();
+    assert_eq!(
+        refreshed["agent_id"], eph["agent_id"],
+        "the live row is refreshed"
+    );
+    let row = agent_row(&app, &eph_id).await.unwrap();
+    assert!(
+        row.get_bool("ephemeral").unwrap_or(false),
+        "the row stays ephemeral"
+    );
+    assert_eq!(
+        refreshed["ephemeral"],
+        json!(true),
+        "the answer says what the row is"
+    );
+
+    // Removed (the Devices page), the same machine id is a new permanent device.
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{}/agent/{eph_id}", t.tenant_id),
+            admin,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let token = standard_token(&app, &t.tenant_id, admin).await;
+    let resp = enroll_raw(&app, &token, "ekey7-mid", json!({})).await;
+    assert!(resp.status().is_success());
+    let permanent: Value = resp.json().await.unwrap();
+    assert_ne!(permanent["agent_id"], eph["agent_id"], "a new row");
+    assert_eq!(permanent["ephemeral"], json!(false));
+    let row = agent_row(&app, permanent["agent_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        !row.get_bool("ephemeral").unwrap_or(true),
+        "a permanent row"
+    );
+}

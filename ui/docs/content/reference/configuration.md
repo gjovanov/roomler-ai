@@ -70,7 +70,7 @@ property these gates exist for.
 | `exec_enabled` | off | Allow remote command execution at all |
 | `ssh_enabled` | off | Run the SSH server |
 | `ssh_port` | `2222` | Not 22, so an existing `sshd` keeps serving during a migration |
-| `ssh_authorized_keys` | empty | **Empty means nobody.** Enabling SSH without listing a key grants nothing |
+| `ssh_authorized_keys` | empty | The break-glass keys, for when the server cannot be reached. Empty means no key-list session: a session the server grants (`roomler ssh`) needs no key here |
 | `ssh_account_mode` | unset | Which account a key-list session runs as. Unset means authenticate, then run nothing |
 | `ssh_host_key` | minted | Generated on first SSH-enabled start |
 | `forward_acl` | empty | SSH port-forward destinations. **Empty means nowhere** |

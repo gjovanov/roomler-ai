@@ -11,6 +11,11 @@
 //! the person's retired, enrolled config, and it writes its blank file after the
 //! lock, as before. Nor does the enrolled worker FR-43's macOS supervisor starts
 //! ([`may_restore`]): it ends with `NoConfig` as before, and its copy is not read.
+//!
+//! #4176 — a Windows SystemContext worker's machine config is restored only from
+//! a copy that passes the checks the config itself would
+//! (`config::machine_previous_copy`, through [`config::previous_copy`]): the
+//! service host starts that worker for such a copy, through the same function.
 
 use super::config::{self, PreviousCopy};
 use roomlerd::supervision::Supervision;
@@ -360,5 +365,158 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("config.toml.prev")]);
+    }
+
+    /// What the SYSTEM worker's start reads for a missing machine config's
+    /// copy: [`config::previous_copy`] at the machine path, which is
+    /// `config::machine_previous_copy` there (`roomler-node-core`'s
+    /// `config::tests::machine_copy` holds that on the same trees). Asked
+    /// directly: this test's trees are not the computer's own, which is all
+    /// `previous_copy` reads at the machine path.
+    #[cfg(target_os = "windows")]
+    fn worker_copy(tree: &roomler_node_core::machine_tree::MachineTree) -> PreviousCopy {
+        config::machine_previous_copy(tree)
+    }
+
+    /// #4176 — the service host (`want_system_worker` over
+    /// `config_opens_in`), the SYSTEM worker's ladder (`pick_config_path` over
+    /// `rung_opens`) and its start ([`decide`]) answer alike in every case a
+    /// missing machine config can leave, run in that order, as a host's tick
+    /// and then its worker's start run them. With no SYSTEM-profile config,
+    /// only a copy that passes the machine's checks and holds an enrollment
+    /// starts the SYSTEM worker, whose ladder names the machine config and
+    /// whose start restores it; in every other case the host waits and the
+    /// start would end with `NoConfig`. With a SYSTEM-profile config, that
+    /// config runs, ahead of any copy, and nothing is restored. On trees made
+    /// by `machine_tree::test_support`, on CI's elevated runner.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_host_the_ladder_and_the_start_agree_on_a_missing_machine_config() {
+        use roomler_node_core::machine_tree::Switches;
+        use roomler_node_core::machine_tree::test_support::*;
+        use roomlerd::win_service::supervisor::{config_opens_in, rung_opens, want_system_worker};
+        if !elevated_or_skip("the host, the ladder and the start on a missing machine config") {
+            return;
+        }
+        let mut wrong = Vec::new();
+        for with_profile in [false, true] {
+            for case in MissingConfig::ALL {
+                let root = tempfile::tempdir().expect("tempdir");
+                let tree = missing_config(root.path(), case);
+                let system_profile = root.path().join("systemprofile");
+                let profile = system_profile.join("AppData/Roaming/roomler/config.toml");
+                if with_profile {
+                    std::fs::create_dir_all(profile.parent().expect("its folder"))
+                        .expect("the profile's folder");
+                    std::fs::write(&profile, "agent_token = \"profile\"\n")
+                        .expect("the profile's config");
+                }
+                let host = want_system_worker(true, false, || {
+                    config_opens_in(&tree, Switches::ON, Some(profile.clone()))
+                });
+                let ladder = super::super::pick_config_path(
+                    None,
+                    true,
+                    Some(tree.config().as_path()),
+                    &profile,
+                    &system_profile,
+                    |p| rung_opens(&tree, Switches::ON, p),
+                );
+                let start = decide(
+                    ladder.exists(),
+                    false,
+                    may_restore(Supervision::WindowsScm),
+                    || worker_copy(&tree),
+                );
+                let want = if with_profile {
+                    (true, profile.clone(), AtStart::Load)
+                } else if case.restorable() {
+                    (true, tree.config(), AtStart::Restore)
+                } else {
+                    (false, tree.config(), AtStart::NoConfig)
+                };
+                if (host, ladder.clone(), start) != want {
+                    wrong.push(format!(
+                        "{case:?}, profile {with_profile}: host={host} ladder={} start={start:?}, \
+                         want {want:?}",
+                        ladder.display()
+                    ));
+                }
+                assert!(!tree.config().exists(), "{case:?}: nothing written");
+            }
+        }
+        assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+    }
+
+    /// While the machine config is there, the service host
+    /// (`want_system_worker` over `config_opens_in`), the SYSTEM worker's
+    /// ladder (`pick_config_path` over `rung_opens`), its start ([`decide`])
+    /// and the machine config's check at that start (`rung`: a SYSTEM worker's
+    /// `Run` loads no machine config it refuses) answer alike in every case of
+    /// `ConfigPresent`, run in that order, as a host's tick and then its
+    /// worker's start run them. A config that runs starts the SYSTEM worker
+    /// on it, at every tick. A refused one never runs: with a SYSTEM-profile
+    /// config that config runs; without one the host waits, and the ladder
+    /// names the machine path, which the start refuses. On trees made by
+    /// `machine_tree::test_support`, on CI's elevated runner.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_host_the_ladder_and_the_start_agree_on_a_machine_config_that_is_there() {
+        use roomler_node_core::machine_tree::Switches;
+        use roomler_node_core::machine_tree::test_support::*;
+        use roomlerd::win_service::supervisor::{
+            config_opens_in, rung, rung_opens, want_system_worker,
+        };
+        if !elevated_or_skip("the host, the ladder and the start on a machine config") {
+            return;
+        }
+        let mut wrong = Vec::new();
+        for with_profile in [false, true] {
+            for case in ConfigPresent::ALL {
+                let root = tempfile::tempdir().expect("tempdir");
+                let tree = config_present(root.path(), case);
+                let system_profile = root.path().join("systemprofile");
+                let profile = system_profile.join("AppData/Roaming/roomler/config.toml");
+                if with_profile {
+                    std::fs::create_dir_all(profile.parent().expect("its folder"))
+                        .expect("the profile's folder");
+                    std::fs::write(&profile, "agent_token = \"profile\"\n")
+                        .expect("the profile's config");
+                }
+                let host = want_system_worker(true, false, || {
+                    config_opens_in(&tree, Switches::ON, Some(profile.clone()))
+                });
+                let ladder = super::super::pick_config_path(
+                    None,
+                    true,
+                    Some(tree.config().as_path()),
+                    &profile,
+                    &system_profile,
+                    |p| rung_opens(&tree, Switches::ON, p),
+                );
+                let start = decide(
+                    ladder.exists(),
+                    false,
+                    may_restore(Supervision::WindowsScm),
+                    || worker_copy(&tree),
+                );
+                let runs = rung(&tree, Switches::ON, &tree.config()).is_ok();
+                let want = if case.runs() {
+                    (true, tree.config(), AtStart::Load, true)
+                } else if with_profile {
+                    (true, profile.clone(), AtStart::Load, false)
+                } else {
+                    (false, tree.config(), AtStart::Load, false)
+                };
+                if (host, ladder.clone(), start, runs) != want {
+                    wrong.push(format!(
+                        "{case:?}, profile {with_profile}: host={host} ladder={} start={start:?} \
+                         runs={runs}, want {want:?}",
+                        ladder.display()
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
     }
 }
