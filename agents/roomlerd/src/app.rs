@@ -2952,6 +2952,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         machine_id: &machine_id,
         machine_name,
         install: Some(install),
+        // #3565 — the daemon's own enroll names itself.
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .context("enrollment failed")?;
@@ -3417,6 +3422,11 @@ async fn re_enroll_cmd(
         // FR-102 P3 — a token refresh knows nothing about how the binary
         // got here; sending nothing leaves the row's recorded install alone.
         install: None,
+        // #3565 — the daemon's own re-enroll names itself.
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .context("re-enrollment failed")?;
@@ -5798,6 +5808,7 @@ async fn run_cmd(
     let mut os_initiated_stop = false;
     tokio::select! {
         res = sig_task => {
+            roomlerd::note_stopping(); // #4382: first, in every arm
             // FR-84 D3 — an accepted restart leaves through the graceful door
             // whatever the signalling loop did on its way out (an error, even
             // a panic): the shutdown is our own, and a crash counted here
@@ -5833,6 +5844,7 @@ async fn run_cmd(
             }
         }
         _ = tokio::signal::ctrl_c() => {
+            roomlerd::note_stopping(); // #4382
             tracing::info!("shutdown requested");
             graceful_shutdown = true;
             os_initiated_stop = true;
@@ -5844,6 +5856,7 @@ async fn run_cmd(
         // for what this cost before it existed (#1040 on Unix; #1683 on the
         // Windows SCM service, where the stop arrived only as a hard kill).
         _ = terminate_signal(stop_event, config_path) => {
+            roomlerd::note_stopping(); // #4382
             tracing::info!("OS/service-manager stop received; shutting down gracefully");
             graceful_shutdown = true;
             os_initiated_stop = true;

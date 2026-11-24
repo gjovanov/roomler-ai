@@ -721,9 +721,10 @@ async fn resolve_versions(
             .await
     {
         out.extend(rows.into_iter().map(|a| DeviceVersion {
+            // #3565 — "" while the daemon has not reported a version.
+            version: a.reported_version().unwrap_or_default().to_string(),
             name: a.name,
             kind: "agent",
-            version: a.agent_version,
             online: matches!(
                 a.status,
                 roomler_ai_remote_control::models::AgentStatus::Online
@@ -1396,7 +1397,7 @@ pub async fn orphans(
                     .find_by_id(*agent_id)
                     .await
                     .ok()
-                    .map(|a| a.agent_version),
+                    .and_then(|a| a.reported_version().map(str::to_string)),
                 _ => None,
             };
             rows.push(OrphanNode {

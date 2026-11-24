@@ -170,8 +170,8 @@ sequenceDiagram
 
 | Moment | Where | What happens |
 |---|---|---|
-| Join | `ConferenceView.vue:607`, `stores/rooms.ts:252` `callConnectionId`, `:258` `joinCall`; server `call.rs:152`, `dao/room.rs:749` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:242`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
-| Leave | `rooms.ts:267` `leaveCall`, `call.rs:225`, `finalize_call_leave_db` (`call.rs:302`), `leave_participant` (`dao/room.rs:951`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
+| Join | `ConferenceView.vue:613`, `stores/rooms.ts:273` `callConnectionId`, `:279` `joinCall`; server `call.rs:152`, `dao/room.rs:749` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:263`, 10 s) for its socket's id (`stores/ws.ts:416` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:644`). A join on a connection that already holds a session closes that one first |
+| Leave | `rooms.ts:288` `leaveCall`, `call.rs:225`, `finalize_call_leave_db` (`call.rs:302`), `leave_participant` (`dao/room.rs:951`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
 | Socket close | `ws_media.rs:83` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:134`), and the same leave runs naming the socket (`:141`) |
 | A miss | `dao/room.rs:960`, the close itself `close_sessions` (`:1028`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
 | Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
@@ -309,7 +309,7 @@ sequenceDiagram
   at count 0 until the next leave in it or the next pod start (`maintenance.rs:21`
   `stale_call_reset`), as before the check. An org removal's hook settles the call itself.
 - `room:call_ended` is what the web client already reads as "this call is over for you"
-  (`ui/src/stores/ws.ts:349`): it tears the call down, with no client change.
+  (`ui/src/stores/ws.ts:351`): it tears the call down, with no client change.
 - A join already on its way when the membership ends asks the gate again once its seat
   exists (`ws_media.rs:457`): either the withdrawal sees that seat, or the seat sees the
   membership gone and closes itself before the client hears anything.
@@ -667,7 +667,7 @@ sequenceDiagram
   is replaced. A request with no `reason`, as the previous image sends, closes the room as
   an ended call, as before.
 - The web client reads `room:call_ended` as "this call is over for you" whatever its reason
-  (`ui/src/stores/ws.ts:349`), so a deleted room needs no client change.
+  (`ui/src/stores/ws.ts:351`), so a deleted room needs no client change.
 
 **Tests.** `conference_gate_tests`: `deleting_a_room_mid_call_ends_its_call_for_everyone_in_it`,
 `deleting_a_room_leaves_a_call_in_another_room_alone` (the deleted room has no call, and
@@ -846,7 +846,7 @@ reaches every viewer whatever their view says. Locked against a real worker by
 scrolling ancestor, and emits `visible: { visible, w, h }` once per change and `false` on
 unmount (`:527`), while its parent still listens. Every layout forwards it with the stream
 key (`layouts/TiledLayout.vue:23`, `SpotlightLayout.vue:25`, `SidebarLayout.vue:25`), the
-call page hands it to the store (`ConferenceView.vue:435`), and the store keeps the tiles on
+call page hands it to the store (`ConferenceView.vue:441`), and the store keeps the tiles on
 screen, maps stream keys to the video producers it consumes
 (`ui/src/stores/conference.ts:428`) and sends one `media:view` at most every 100 ms
 (`:672-734`) — and again every 15 s while in the call and when the tab returns to the
@@ -918,7 +918,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
-| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1191`), `RETIRED_RC_TAG_FAMILIES` (`:1220`), `RETIRED_USER_WS_NAMESPACES` (`:1225`) and `RETIRED_MODULE_IDS` (`:1229`), locked by `retired_rpc_verbs_are_never_reused` (`:8334`), `retired_wire_families_and_module_ids_are_never_reused` (`:8403`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5308`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1297`), `RETIRED_RC_TAG_FAMILIES` (`:1326`), `RETIRED_USER_WS_NAMESPACES` (`:1331`) and `RETIRED_MODULE_IDS` (`:1335`), locked by `retired_rpc_verbs_are_never_reused` (`:8543`), `retired_wire_families_and_module_ids_are_never_reused` (`:8612`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5321`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 

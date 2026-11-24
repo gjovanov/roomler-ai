@@ -7,6 +7,8 @@ mod association_stats;
 pub mod delivery;
 // roomler (FR-148 P0): the congestion gauges (`Association::gauges`).
 pub mod gauges;
+// roomler (FR-148 P0, D43): the pacer a writer turns on (`Association::pacer`).
+pub mod pacer;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -254,6 +256,8 @@ pub struct Association {
     delivery: delivery::DeliveryClock,
     // roomler (FR-148 P0): read without `association_internal`'s lock.
     gauges: gauges::GaugeReader,
+    // roomler (FR-148 P0, D43): set without `association_internal`'s lock.
+    pacer: pacer::PaceSwitch,
 
     pub(crate) association_internal: Arc<Mutex<AssociationInternal>>,
 }
@@ -356,6 +360,7 @@ impl Association {
         let will_send_shutdown = Arc::clone(&ai.will_send_shutdown);
         let delivery = ai.delivery_clock(); // roomler (FR-148)
         let gauges = ai.gauge_reader(); // roomler (FR-148 P0)
+        let pacer = ai.pace_switch(); // roomler (FR-148 P0, D43)
 
         let mut init = ChunkInit {
             initial_tsn: ai.my_next_tsn,
@@ -441,6 +446,7 @@ impl Association {
                 bytes_sent,
                 delivery,
                 gauges,
+                pacer,
                 association_internal,
             },
             handshake_completed_ch_rx,
@@ -517,9 +523,12 @@ impl Association {
 
         'outer: while !done.load(Ordering::Relaxed) {
             //log::debug!("[{}] gather_outbound begin", name);
-            let (packets, continue_loop) = {
+            // roomler (FR-148 P0, D43): and when the pacer's next chunk may
+            // leave, if it held one; never while it is off.
+            let (packets, continue_loop, pace_wake) = {
                 let mut ai = association_internal.lock().await;
-                ai.gather_outbound().await
+                let (packets, continue_loop) = ai.gather_outbound().await;
+                (packets, continue_loop, ai.take_pace_wake())
             };
             //log::debug!("[{}] gather_outbound done with {}", name, packets.len());
 
@@ -617,6 +626,8 @@ impl Association {
                 _ = close_loop_ch.recv() => {
                     done.store(true, Ordering::Relaxed);
                 }
+                // roomler (FR-148 P0, D43): no timer unless the pacer holds a chunk.
+                _ = pacer::until(pace_wake) => {}
             };
             //log::debug!("[{}] wait awake_write_loop_ch done", name);
         }
@@ -646,6 +657,17 @@ impl Association {
     /// association stores them and never reads them back.
     pub fn gauges(&self) -> gauges::GaugeReader {
         self.gauges.clone()
+    }
+
+    /// roomler (FR-148 P0, D43): the switch of this association's pacer,
+    /// off until a writer turns it on. While it is on, new data moves from
+    /// the pending queue into flight at the share of the congestion window
+    /// its writer steers it to over the least round trip in slow start, the
+    /// whole window above the threshold, and waits while in flight is at or
+    /// above the cap its writer may set (`pacer`); off, the association
+    /// sends as it always did.
+    pub fn pacer(&self) -> pacer::PaceSwitch {
+        self.pacer.clone()
     }
 
     /// bytes_sent returns the number of bytes sent

@@ -67,6 +67,10 @@ async fn enrol(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> AgentC
         machine_id,
         machine_name: "External access test host",
         install: None,
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .expect("agent enrollment")

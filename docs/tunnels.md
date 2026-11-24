@@ -353,7 +353,7 @@ Three links had to break, one in each place that owned it:
 |---|---|---|
 | `webrtc` | `send`/`send_text` take the channel out of its slot instead of holding the slot's lock across the write. They take turns on a `send_lock` of their own, which `close()` and `buffered_amount()` never take: the slot lock was the only thing ordering a channel's writes, and two at once shared a stream sequence number or split a message | `crates/vendored/webrtc/src/data_channel/mod.rs:378`, `:89` |
 | `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:584`, `:324`, `queue/pending_queue.rs:261` |
-| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:280`, `queue/pending_queue.rs:254` |
+| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:284`, `queue/pending_queue.rs:254` |
 
 #1856's comment expected a transport that is really gone to fail the association's `recv`.
 Nothing below SCTP ever fails it on a dead path, because the ICE agent's conn ends only when
@@ -431,7 +431,7 @@ CPUs, left a task.
 `read_sctp` (`crates/vendored/webrtc-sctp/src/stream/mod.rs:202`). A stream is shut down two
 ways: by its own `shutdown`, which a channel's close runs (`:444`), and by the association's
 `unregister_stream`, which its close runs for every stream
-(`src/association/association_internal.rs:374`). Each sets `read_shutdown` and then wakes
+(`src/association/association_internal.rs:390`). Each sets `read_shutdown` and then wakes
 the reads of that instant with one `notify_waiters()`, and only the first one wakes anything.
 Upstream's read checked the flag and the queue, and made its wait only once it had found
 nothing to read. So a shutdown that landed between the check and the wait was lost. The read
@@ -605,8 +605,8 @@ the fix is there and no caller changed:
 ⚠️ **The product reaches only the first two.** The agent's associations keep the default
 maximum message size of 65,536 bytes: the vendored `webrtc` passes 0
 (`crates/vendored/webrtc/src/sctp_transport/mod.rs:177`), which means the default
-(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:113`,
-`association/mod.rs:65`), and `prepare_write` refuses a larger write before it waits
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:116`,
+`association/mod.rs:67`), and `prepare_write` refuses a larger write before it waits
 (`stream/mod.rs:350`). So every agent and tunnel send is below the large threshold and is all
 or nothing: a cut send was never sent. `send_control_notice`'s retry therefore sends its notice
 once, and a tunnel write (at most 65,535 bytes, `crates/tunnel-core/src/forward.rs:68`) is the
@@ -642,7 +642,7 @@ crate's in-memory bridge, with a queue of a few KiB, and close the pair at the e
 | `test_pending_queue_pops_during_a_drop_pay_its_debt_first` (`:750`) | a stand-in for the write loop on another thread pops 0 to 3 whole chunks at each step of a begun message's drop, every one after the debt was recorded: those pops pay the debt before they give room, so none of their room is left free while anything is owed, the accounting holds, and the rest goes out whole, in order | uses the fix's accessors |
 | `test_pending_queue_a_pop_split_around_a_drop_frees_at_most_its_chunk` (`:820`) | the race that is left: a `pop` on another thread, held between what it pays and the room it gives back while a drop records its debt and reads the room, leaves at most its own chunk free while the rest is owed; a large message that begins on it and is cut adds one rest, within (1 + races) times the largest message; every later `pop` pays first; the queue drains whole, in order, to rest | uses the fix's accessors |
 
-**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:3153`), which is not
+**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:3161`), which is not
 yet one of the checks the `rust` aggregator needs. The fork is not a workspace member, so no
 other `cargo test` builds it. The job seeds the fork's standalone build with the workspace's
 `Cargo.lock`, so the tests run against the tokio the agent ships, and skips the two
@@ -657,6 +657,10 @@ rm crates/vendored/webrtc-sctp/Cargo.lock   # before a revendor --regen or --che
 
 The fork's deltas, #3755's among them, are listed in its `Cargo.toml` header, and
 `crates/vendored/webrtc-sctp.patch` is the ledger `scripts/revendor-webrtc-sctp.sh` checks.
+The newest is FR-148's pacer (`association/pacer.rs`), which holds new data to a rate only
+while a writer has it on. Nothing in the product turns it on yet: only the open-time train's
+cells do (`docs/rate-control.md` § The open-time train). Off, it keeps no state and arms no
+timer, so a tunnel's association sends as it did.
 
 #### What the lab showed (#3755)
 
@@ -685,7 +689,7 @@ never shows it:
 
 | Condition | Why | Anchor |
 |---|---|---|
-| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4277`, `:5241`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2579` |
+| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4277`, `:5241`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2621` |
 | the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7266`, `:2207`, `agents/roomlerd/src/peer.rs:11343`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
 | the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1534`, `:6231`, `agents/roomlerd/src/lock_state.rs:333` |
 
@@ -1249,7 +1253,7 @@ Locked by lib tests, each shown red with a one-line negative control:
    ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
    The forward itself reads no permission bit: the policy is the grant, made to let
    people who hold no management bit reach what a holder named them for
-   (`crates/modules/network/src/tunnel.rs:1114`). Every decision lands in
+   (`crates/modules/network/src/tunnel.rs:1115`). Every decision lands in
    `tunnel_audit` (90 d). A device the org
    removed is refused as a target while it is removed; if its machine enrolls
    again, the device is taken out of every live policy's subjects and targets
@@ -1261,7 +1265,7 @@ Locked by lib tests, each shown red with a one-line negative control:
 ### Who a forward is matched as (#3635)
 
 A forward is matched in the org whose policies decide it, the target device's
-(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1108`); a forward from
+(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1109`); a forward from
 another org is refused `cross_tenant` whatever those policies say. In that org the
 originator is matched as the person it acts for, its `owner_user_id`:
 
@@ -1270,7 +1274,7 @@ originator is matched as the person it acts for, its `owner_user_id`:
 | A tunnel client: `roomler` on its own socket, with its tunnel-client credential | the person who enrolled it; for a paired client, whoever approved the pairing | a role that person holds in the org | `TunnelClientId` = this client; an `AgentId` never matches it | yes |
 | A device opening forwards over its own device socket: `forward --daemon`, a declared route, a supervised SOCKS5 listener ([tunnel-install.md](tunnel-install.md#declared-routes-daemon-supervised--p6)) | the device's owner, as read when the device's socket connected | a role the device's owner holds in the org | `AgentId` = this device; a `TunnelClientId` never matches it | yes |
 
-The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1000`),
+The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1001`),
 through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:757`),
 the same read every gate that matches a role makes
 ([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)):
@@ -1315,7 +1319,7 @@ flowchart TD
 | `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:398`) | a device forwards on its owner's role, and is refused once the owner left the org |
 | `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:455`) | a role of another org, and a role the org deleted, grant nothing here; the rule naming the other org's role is a stored one, because a policy write takes only the org's roles |
 | `…::the_other_subject_kinds_forward_as_before` (`:539`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
-| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2188`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
+| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2189`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
 
 ### A retired agent-session grant is refused (FR-137)
 
@@ -1329,7 +1333,7 @@ reach whatever the device may reach. So:
   (`crates/remote_control/src/signaling.rs:1363`), and no build sends it;
 - the server refuses any open that carries one, at step 3c
   (`crates/modules/network/src/tunnel.rs:698`), before a tunnel session exists
-  (step 4, `:780`), with `rc:error {code: net_grant_refused}`
+  (step 4, `:781`), with `rc:error {code: net_grant_refused}`
   (`NET_GRANT_REFUSED`, `signaling.rs:102`). An old device reads that code as the
   end of its grant, never as a reason to retry.
 

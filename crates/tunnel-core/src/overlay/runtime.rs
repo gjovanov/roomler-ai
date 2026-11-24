@@ -6521,7 +6521,8 @@ mod tests {
 
         let off = RouteRecordingTun::new();
         let t: Arc<dyn TunIo> = off.clone();
-        run_defense_wave_with(t, set(), false).await;
+        let said = std::sync::atomic::AtomicBool::new(false);
+        run_defense_wave_with(t, set(), false, &said).await;
         assert!(off.subnet_calls().is_empty(), "{:?}", off.subnet_calls());
         assert_eq!(
             off.calls(),
@@ -6536,8 +6537,66 @@ mod tests {
 
         let on = RouteRecordingTun::new();
         let t: Arc<dyn TunIo> = on.clone();
-        run_defense_wave_with(t, set(), SUBNET_GUARD_DEFAULT).await;
+        run_defense_wave_with(t, set(), SUBNET_GUARD_DEFAULT, &said).await;
         assert_eq!(on.subnet_calls(), two, "the default puts both back");
+    }
+
+    /// #4380 — the switch's INFO is said by the first wave that carries a
+    /// subnet while the switch is off, once per process (the flag a cell
+    /// passes in stands for the process's), and on the route guard's own
+    /// target. The daemon keeps that target at INFO under every `RUST_LOG`
+    /// (`roomler_node_core::logging::filter_for`), where the packaged Linux
+    /// units' spec drops this module's INFO. With the switch on, nothing of
+    /// it is said.
+    #[tokio::test]
+    async fn the_subnet_guard_switch_off_is_said_once_on_the_route_guards_target() {
+        const OFF: &str = "the route guard leaves subnet routes alone on this host";
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let router = Ipv4Addr::new(100, 64, 0, 2);
+        let two: &[&str] = &["10.1.0.0/16", "192.168.50.0/24"];
+        let (by_node, current_peers) = router_mesh(&[([1; 32], router, two)]);
+        let set = || {
+            defended_routes(
+                &by_node,
+                &current_peers,
+                self_v4,
+                subnets_held(&[([1; 32], two)]),
+            )
+        };
+        let (lines, _guard) = crate::overlay::said::Lines::start();
+
+        let on_said = std::sync::atomic::AtomicBool::new(false);
+        run_defense_wave_with(RouteRecordingTun::new(), set(), true, &on_said).await;
+        assert!(
+            lines.with(OFF).is_empty(),
+            "the switch on says nothing of it"
+        );
+
+        let off_said = std::sync::atomic::AtomicBool::new(false);
+        for _ in 0..3 {
+            run_defense_wave_with(RouteRecordingTun::new(), set(), false, &off_said).await;
+        }
+        let said = lines.with(OFF);
+        assert_eq!(
+            said.len(),
+            1,
+            "once, over three waves of two subnets: {said:?}"
+        );
+        assert_eq!(
+            said[0].target, "tunnel_core::overlay::route_guard",
+            "the target roomler_node_core's filter_for appends at INFO: {said:?}"
+        );
+        assert_eq!(said[0].level, tracing::Level::INFO, "{said:?}");
+        assert!(
+            said[0]
+                .text
+                .contains("(ROOMLERD_OVERLAY_SUBNET_GUARD is off)"),
+            "it names the switch: {said:?}"
+        );
+        assert!(
+            said[0].text.contains("cidr=10.1.0.0/16"),
+            "the first subnet the waves met: {said:?}"
+        );
     }
 
     /// The off-loop ALLOCATE queue's test twin (see `test_relay_bq`).

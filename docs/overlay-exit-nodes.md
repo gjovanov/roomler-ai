@@ -252,14 +252,14 @@ shows on the admin row and in `roomler status`, where the probe's reason does.
 | Any node with `ROOMLERD_EXIT_V6_STATEMENT=0` | absent | |
 
 The field rides `rc:overlay.join` (`crates/remote_control/src/signaling.rs:1716`),
-is stored on the node's row as sent (`crates/remote_control/src/models.rs:7177`;
+is stored on the node's row as sent (`crates/remote_control/src/models.rs:7310`;
 the rehydrate `$unset`s it for a join that states nothing,
 `crates/services/src/dao/overlay_node.rs:362`), and reaches every client in its
 netmap peer (`signaling.rs:4088`, `to_netmap_peer`
 `crates/modules/network/src/overlay.rs:3223`). Absent stays absent on every
 hop: never `null`, never read as `false`.
 
-A client decides with `v6_egress` (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:442`):
+A client decides with `v6_egress` (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:448`):
 
 | The exit says | The client pinned its v6 exemptions | IPv6 through the exit | `roomler status` |
 |---|---|---|---|
@@ -374,7 +374,7 @@ reads like a stale-route find.
 
 On Linux it finds prefix routes only. It lists `ip route show dev <tun>` and
 keeps the first fields that carry a length
-(`crates/tunnel-core/src/overlay/tun.rs:7859`), and iproute2 prints a host route
+(`crates/tunnel-core/src/overlay/tun.rs:7867`), and iproute2 prints a host route
 without its `/32`. The per-peer routes need no purge there, because the TUN is
 not persistent (`persist off`): the kernel removes it, and every route on it,
 when its last descriptor closes. So a Linux exit logs the exit line only when
@@ -407,7 +407,7 @@ purge finishes on a thread of its own.
 The last two rows say any Normal-priority child waits this way, so the bound
 alone does not get such a start to its probe. The next children on that path
 were the four `icacls` steps of the config save every start makes for its crash
-bookkeeping (`agents/roomlerd/src/app.rs:4422`). A save now reads the
+bookkeeping (`agents/roomlerd/src/app.rs:4432`). A save now reads the
 directory's owner and DACL in-process and runs the steps only when they would
 change something
 ([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
@@ -446,7 +446,7 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:408`, `:424`, called at `agents/roomlerd/src/app.rs:4330` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
+| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:408`, `:424`, called at `agents/roomlerd/src/app.rs:4340` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
 | Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:889` (`purge_exit_dns_within`), `:1272` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
 | Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:625` (`run_cmd`), `:1314` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
 | A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:1256` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
@@ -703,12 +703,12 @@ sequenceDiagram
 
 | Step | Where | What it guards against |
 |---|---|---|
-| Capture the uplink per family, re-read before every pin | `tun.rs:6127`, `current_uplink` `tun.rs:8622`, `bsd_default_uplink` `tun.rs:359` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
-| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:405`, `bsd_pin_row` `tun.rs:441`, `bsd_pin_holds` `tun.rs:454`, `bsd_table` `tun.rs:8107` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
-| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:7117` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
-| Re-check the pins | `stale_host_exemptions` `tun.rs:7205`, the gate `route_guard.rs:778` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
-| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:778` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
-| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:570`, `exemption_withheld_reason` `route_guard.rs:582` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
+| Capture the uplink per family, re-read before every pin | `tun.rs:6127`, `current_uplink` `tun.rs:8630`, `bsd_default_uplink` `tun.rs:359` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
+| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:405`, `bsd_pin_row` `tun.rs:441`, `bsd_pin_holds` `tun.rs:454`, `bsd_table` `tun.rs:8115` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
+| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:7125` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
+| Re-check the pins | `stale_host_exemptions` `tun.rs:7213`, the gate `route_guard.rs:784` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
+| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:784` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
+| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:576`, `exemption_withheld_reason` `route_guard.rs:588` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
 
 > ⚠️ **A lookup does not show a pin.** A destination a connection has used
 > keeps an interface-scoped clone of the default route (`WASCLONED,IFSCOPE`).
@@ -831,7 +831,7 @@ A node in netstack mode (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`, or
 mesh lives in a userspace stack inside the daemon, reached through a SOCKS5
 front on `127.0.0.1`. Selecting an exit there installs the split-default in
 that userspace router only
-([`route_guard.rs:862`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L862)),
+([`route_guard.rs:868`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L868)),
 so the exit carries exactly what the front dials and nothing else.
 
 ```mermaid
@@ -863,7 +863,7 @@ Before P0c-3 it printed `active, v6 on, DNS NOT steered`, as if every app on
 the host left through the exit (field, 2026-10-17; FR-97 §8).
 
 ⚠️ **A netstack node never steers the host's DNS**
-([`dns_steer_allowed`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L527)).
+([`dns_steer_allowed`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L533)).
 The steer is host-wide on Windows (an NRPT catch-all) and macOS (a resolver
 entry). On a node whose OS routes nothing through the exit it would only move
 every app to the public upstream over the uplink, and on a managed laptop cut

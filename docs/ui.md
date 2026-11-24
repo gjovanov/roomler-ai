@@ -338,7 +338,7 @@ reload that has not happened 20 s later gives the redial back and deletes the re
 or an F5 inside the minute would open the session a second time beside the redial. The next
 load takes the record out of storage before any page renders (`installStaleBuildWatch`,
 `staleBuildWatch.ts:515`, called before the router at `main.ts:46`). The viewer claims it once
-it has its device and the person (`resumeAfterNewBuild`, `RemoteControl.vue:5518`): once,
+it has its device and the person (`resumeAfterNewBuild`, `RemoteControl.vue:5519`): once,
 under a minute old, on the first page that load rendered, for the same person, device,
 organization and path (`resumeArgsFor`, `staleBuildPolicy.ts:318`). It resumes through the
 redial's own ladder (`resumeAfterReload`, `useRemoteControl.ts:9972`), never as a first
@@ -405,7 +405,7 @@ org's rows at a time and record which. A fetch for another org drops the rows at
 once, only the latest fetch writes, and a save answered for another org leaves the
 list alone (`stores/tunnelPolicies.ts:159-165`, `stores/overlayAcl.ts:78-84`). A
 page that only names or picks devices asks with `ensureAgents` or
-`ensureTunnelClients` (`stores/agents.ts:1124`, `stores/tunnelClients.ts:117`),
+`ensureTunnelClients` (`stores/agents.ts:1141`, `stores/tunnelClients.ts:117`),
 which fetch unless the store already holds, or is loading, that org's rows. Never
 gate a fetch on an empty list: a list that holds another org's rows is not empty.
 Every page that shows one org's data keeps the same rules ([Conventions](#conventions),
@@ -582,7 +582,7 @@ elements are muted.
 - **API client**: `ui/src/api/client.ts` — token injection + refresh handling.
 - **Dev proxy**: Vite proxies `/api` + `/ws` to `http://localhost:5001`.
 - ⚠️ **The ws store holds ONE handler per frame type** (`onMediaMessage` is a `Map.set`,
-  `stores/ws.ts:432`): a second registration of a type takes the first's frames away. Conference
+  `stores/ws.ts:434`): a second registration of a type takes the first's frames away. Conference
   registers its `media:*` types through it (`stores/conference.ts:146-151`).
 
 ## Conventions
@@ -615,11 +615,11 @@ by their own subject. So every such page, and each dialog it owns, keeps four ru
 | It watches its org from the start | A `watch` with `{ immediate: true }` replaces a one-shot load on mount. A routed view watches its `tenantId` computed, never a `ref` of the route param, which setup reads once (`views/invite/InviteManageView.vue:266` held one). A section watches `() => props.tenantId` | `views/rooms/RoomList.vue:197`, `components/admin/RolesSection.vue:471` |
 | A change closes what was opened under the previous org | An editor, a prompt or a dialog closes, because its save would go to the new org, and a secret minted there goes with its dialog. What names the previous org's rows resets: a device filter, a grid's search and its page. A paging grid fetches again, because nothing fires its `@update:options` on a change of org | `components/admin/EnrollKeysSection.vue:351`, `components/admin/MembersSection.vue:535` |
 | A late answer for the previous org is dropped | A store guards its own rows (next row). A page that keeps rows in its own state notes the org it asked for: its latest load writes its rows, its error and its spinner only while that is still the page's org | `components/admin/ExecAuditSection.vue:228-248` |
-| A store records its org, and a page asks it with an ensure | The store names that ref for its rows (`roomsTenantId`), never `tenantId`: a `${tenantId}` in one of its URLs would read the ref once a parameter is renamed. A fetch for another org drops the rows at once, only the latest fetch writes, and a create or a save answered for another org leaves the list alone (`listIsOf`). A page that only lists, names or picks the rows asks with `ensureRooms`, `ensureAgents`, `ensureTenantMembers`, `ensureRoles` or `ensureTunnelClients`, which fetch unless the store holds this org's rows or is loading them, and fetch again after a failed fetch. `ensureRooms` and `ensureAgents` answer with the fetch in flight, and a fetch that a newer one superseded settles with the newest, so a caller that reads the rows after its await reads this org's newest: the welcome tour counts the devices and the rooms so (`components/layout/AppLayout.vue:1093-1096`), and the remote viewer takes the store's own row of its device (`views/remote/RemoteControl.vue:5364`). A dialog that shows an org switch asks with `ensureOrgExecEnabled`, `ensureOrgSshEnabled` or `ensureExternalAccess` (a single value, below) | `stores/rooms.ts:102`, `:144`, `:151`; `stores/agents.ts:1124`, `:1311`, `:1503`, `:1581`, `:1836`; `stores/role.ts:62`; `stores/tunnelClients.ts:117` |
+| A store records its org, and a page asks it with an ensure | The store names that ref for its rows (`roomsTenantId`), never `tenantId`: a `${tenantId}` in one of its URLs would read the ref once a parameter is renamed. A fetch for another org drops the rows at once, only the latest fetch writes, and a create or a save answered for another org leaves the list alone (`listIsOf`). A page that only lists, names or picks the rows asks with `ensureRooms`, `ensureAgents`, `ensureTenantMembers`, `ensureRoles` or `ensureTunnelClients`, which fetch unless the store holds this org's rows or is loading them, and fetch again after a failed fetch. `ensureRooms` and `ensureAgents` answer with the fetch in flight, and a fetch that a newer one superseded settles with the newest, so a caller that reads the rows after its await reads this org's newest: the welcome tour counts the devices and the rooms so (`components/layout/AppLayout.vue:1093-1096`), and the remote viewer takes the store's own row of its device (`views/remote/RemoteControl.vue:5365`). A dialog that shows an org switch asks with `ensureOrgExecEnabled`, `ensureOrgSshEnabled` or `ensureExternalAccess` (a single value, below) | `stores/rooms.ts:110`, `:152`, `:159`; `stores/agents.ts:1141`, `:1328`, `:1522`, `:1600`, `:1855`; `stores/role.ts:62`; `stores/tunnelClients.ts:117` |
 
 Never gate a fetch on an empty list: a list that holds another org's rows is not empty. The
-stores that record their org: the devices and the org's people (`stores/agents.ts:1068`,
-`:1281`), rooms (`stores/rooms.ts:102`), roles (`stores/role.ts:29`), members
+stores that record their org: the devices and the org's people (`stores/agents.ts:1085`,
+`:1298`), rooms (`stores/rooms.ts:110`), roles (`stores/role.ts:29`), members
 (`stores/members.ts:49`), tunnel clients (`stores/tunnelClients.ts:59`), overlay nodes
 (`stores/overlayRoutes.ts:86`), the two policy lists (`stores/tunnelPolicies.ts:159`,
 `stores/overlayAcl.ts:78`), files (`stores/files.ts:49`), invites (`stores/invite.ts:95`), and
@@ -639,6 +639,15 @@ Never read the org, or whether a value is known, off the value itself. The API's
 no org: `Room.tenant_id` (`stores/rooms.ts:11`) is declared and never sent
 (`crates/modules/chat/src/room.rs:29-50`). A switch's answer can hold `null`
 (`orgExecRequireSystem` from an older server).
+
+**The current room is not the room a page shows (#4395).** `current` keeps naming the last
+room opened in a chat after the chat page is left, and the Files page relies on that. The
+unread check asks `shownRoomId` instead (`stores/ws.ts:267`): the room the chat page or the
+call page shows while it is mounted, claimed with `showRoom`, whose release clears it only
+while it is still that page's claim (`stores/rooms.ts:82`, `:234`). So a message for the last
+opened room counts once its page is left, and returning to the chat clears it with
+`markAllRead` (`views/chat/ChatView.vue:477`). A page whose browser tab is hidden still shows
+its room.
 
 **What the shell reloads on a change of org.** `AppLayout` keeps the tenant store on the
 URL's org (`useRouteTenantSync`, `components/layout/AppLayout.vue:997`). On a change it
@@ -668,7 +677,7 @@ room B's URL: a message typed there went to B, and Leave left B, a call it was n
 while the server still listed the person in A. A remount alone would leave A's call
 running with nothing on the page to say so, because the mini-call widget hides on every
 call page. So the page settles its own call first, in `onBeforeRouteUpdate`
-(`views/conference/ConferenceView.vue:693`), with the question the Join button asks:
+(`views/conference/ConferenceView.vue:699`), with the question the Join button asks:
 
 | The page, when another room's call is pushed onto it | What happens |
 |---|---|
@@ -677,7 +686,7 @@ call page. So the page settles its own call first, in `onBeforeRouteUpdate`
 | in no call here | it remounts for the other room with no question, and joins nothing |
 
 The join crosses the remount as a one-shot hand-off (`composables/callSwitch.ts:22`,
-taken at `ConferenceView.vue:776`). It is for that one room, spent by the next mount
+taken at `ConferenceView.vue:782`). It is for that one room, spent by the next mount
 whatever its room, and void after 10 s. It is never a query or `history.state`, so a reload
 or a back-and-forward cannot put a camera into a call nobody just asked to join.
 `ConferenceViewRoomSwitch.spec.ts` runs the real page against the real route record.
@@ -758,7 +767,7 @@ its desktop height** for the same data.
 | **A tab window over wide content takes `:touch="false"`; a tab row that can overflow takes `show-arrows`** | `GrowthView.vue`, `AnalyticsView.vue`, the viewer's Settings tabs | a sideways swipe across a wide table switched the **tab**; and below 1280 px Vuetify hides the arrows unless asked, so tabs past the edge gave no sign of themselves |
 | **A number or caption that must be read never sits at the end of a card title** on a phone — it moves into the card's text | `GrowthView.vue` (the weekly-active-orgs north star) | a title never wraps: at 360 px the caption pushed the number off the card |
 | **While a session runs, the remote viewer's toolbar holds only Back, the device's name, Disconnect and Fullscreen**, at every width; the session's state chips and every tool ride their own row under it (`#rc-tb-strip`, one `<Teleport>`: one instance of each control, moved, never copied), state first, scrolling sideways; from 960 px the stats readout comes last, in whole pills only, so it never pushes a tool out of view. Connect's phases keep the one row (below 960 px its items in flex `order`). The stage's alerts overlay the stage | `RemoteControl.vue` (`rc-tb-*`, `sessionToolsOnStrip`, `.rc-stage-alerts`) | the title went to 0 px and Disconnect started off-screen; with every tool still in that one row, the row overflowed and the name was held at its 96 px minimum on a phone ("FR-…" at 360 px) and at 0 px on a 1300 px desktop, with the state chips past the edge or squeezed to stubs (FR-116 P5c); each alert's coming and going resized the frame, re-sent `rc:resolution` and rebuilt the agent's encoder |
-| **On a phone held sideways, a running session takes the whole screen** (FR-125): with a coarse pointer, a page wider than tall and under 500 px tall (`isPhoneSideways`, `composables/useImmersiveViewer.ts:31`), the app bar hides (`AppLayout.vue:414`), the viewer's toolbar and tools strip become an overlay out of view (still mounted: the strip is the session tools' Teleport target), and the stage card loses its margin, border and corners. A pull-tab at the stage's top edge slides the bars back down **over** the stage; they hide again after 4 s without a touch, or on a tap on the stage. A per-browser setting in Settings → Display turns the mode off | `useImmersiveViewer.ts`, `RemoteControl.vue` (`immersive`, `:2786`; the pull-tab, `:949`; `.rc-immersive`, `:5918`) | the bars took 149 of a 340–412 px page, leaving the remote desktop 146–254 px, and every built-in touch preset ran off the stage's top (measured on production at six sizes, FR-125 §2) |
+| **On a phone held sideways, a running session takes the whole screen** (FR-125): with a coarse pointer, a page wider than tall and under 500 px tall (`isPhoneSideways`, `composables/useImmersiveViewer.ts:31`), the app bar hides (`AppLayout.vue:414`), the viewer's toolbar and tools strip become an overlay out of view (still mounted: the strip is the session tools' Teleport target), and the stage card loses its margin, border and corners. A pull-tab at the stage's top edge slides the bars back down **over** the stage; they hide again after 4 s without a touch, or on a tap on the stage. A per-browser setting in Settings → Display turns the mode off | `useImmersiveViewer.ts`, `RemoteControl.vue` (`immersive`, `:2787`; the pull-tab, `:949`; `.rc-immersive`, `:5919`) | the bars took 149 of a 340–412 px page, leaving the remote desktop 146–254 px, and every built-in touch preset ran off the stage's top (measured on production at six sizes, FR-125 §2) |
 | **Text that cannot break still wraps** (`overflow-wrap: anywhere`) | message content (`MessageBubble.vue`), stacked table values | one long URL or email widened a whole list past the screen |
 | **Sign-in fields say what they are**: `autocapitalize="none"`, `autocorrect="off"`, `spellcheck="false"` on the username, `autocomplete` on every credential | `LoginView.vue`, `RegisterView.vue` | iOS capitalised the username, and the server matches it exactly |
 | **The public landing page's sections are a ☰ menu below 960 px**, and its wordmark never shrinks (`flex-0-0` on the title) | `LandingView.vue` | the links were hidden below 600 px with no other way to them, and the wordmark was clipped to "Roo" |

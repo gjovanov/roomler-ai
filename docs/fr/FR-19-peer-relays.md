@@ -358,7 +358,7 @@ decide."*
 1. A node opts in locally (`relay_server_enabled`, `relay_server_port`) and advertises the
    capability verb `relay-server` through `models::RpcCap` — variant → `wire()` arm → `ALL`
    entry. ⚠️ Equality matching only: `relay` is a prefix of `relay-server`, the
-   `ssh`/`ssh-consent` trap. (`RpcCap::ALL` is `[RpcCap; 6]` at `models.rs:338`, a
+   `ssh`/`ssh-consent` trap. (`RpcCap::ALL` is `[RpcCap; 6]` at `models.rs:444`, a
    fixed-size array — the **compiler** forces the entry, not a test.)
 2. An admin approves the device — the offer is not the grant (§2, gate 3).
 3. The **server** mints the session and pushes it to both nodes plus the relay.
@@ -409,7 +409,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
 claimed four default-deny gates; there are three. `OverlayAclMode` derives `#[default] Off`
-(`crates/remote_control/src/models.rs:1804`), documented as *"every node sees every peer…
+(`crates/remote_control/src/models.rs:1910`), documented as *"every node sees every peer…
 The default, so enabling the feature never breaks a live mesh"*; `Warn` *"ship[s] the
 permissive netmap"*; and `CLAUDE.md`'s own open-issues list records that **nothing has ever
 run under `enforce` in the field**. Tailscale's `cap/relay` is an *affirmative grant*; a
@@ -482,7 +482,7 @@ in P3c, after the identity gates, so a refusal is attributable and audited.
 
 **Multi-org: relay serving is PRIMARY-ORG ONLY, enforced.** ⚠️ The first draft said a device
 *"may serve N tenants"* and, two sentences later, that it *"should follow"* the primary-only
-rule. `docs/multi-org.md:537-543` makes exit-node and netstack primary-only because they are
+rule. `docs/multi-org.md:537-538` keeps exit-node roles primary-only because they are
 **host-global singletons**; a UDP listener on a host-global port is exactly that. And
 `:222-223` adds the trust half for `rc:agent.update`: *"a secondary org's admin must not be
 able to force-update a shared binary"* — a secondary org's admin minting sessions onto the
@@ -706,7 +706,7 @@ never have measured, and an unmeasured capability is `None`, never `false` (`Cap
 `crates/remote_control/src/signaling.rs:3533-3537`).
 ⚠️ `relay_server` must resolve from **the requesting tenant's own node row**. A multi-org
 device has N per-tenant rows with independently-set names; resolving from any other would
-leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:140-143`.
+leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:139-141`.
 It does: the name is the one this network's netmap gives the relay node
 (`crates/tunnel-core/src/overlay/runtime.rs:3302`, `:4484`), and the netmap takes it from that
 network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:3187-3191`). A

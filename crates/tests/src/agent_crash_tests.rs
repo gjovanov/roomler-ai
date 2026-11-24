@@ -43,6 +43,10 @@ async fn enrol(app: &TestApp, slug: &str) -> (AgentConfig, String) {
         machine_id: &format!("mach-{slug}"),
         machine_name: "Crash test",
         install: None,
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .expect("enrol");

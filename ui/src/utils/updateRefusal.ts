@@ -28,8 +28,10 @@ export function updateRefusal(caps?: { update_mode?: string } | null): UpdateRef
   }
 }
 
-/** A short reason, for a list or a disabled menu item. Also covers FR-2's
- *  `pin_downgrade` code, which a bulk row can carry too. */
+/** A short reason, for a list or a disabled menu item. Also covers the
+ *  server's pin checks, which a bulk row can carry too: FR-2's
+ *  `pin_downgrade`, and #3565's `version_unreported` (a pin to a row with no
+ *  reported version is refused unless it is forced). */
 export function refusalShort(code?: string | null): string {
   switch (code) {
     case 'primary_org':
@@ -38,6 +40,8 @@ export function refusalShort(code?: string | null): string {
       return 'auto-update is off on the device'
     case 'pin_downgrade':
       return 'the pin would downgrade it'
+    case 'version_unreported':
+      return 'it has not reported its version yet'
     default:
       return 'refused'
   }
