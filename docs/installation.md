@@ -1613,7 +1613,7 @@ install's update, which has no service, logs nothing about the switch, #3889),
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6380`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6383`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1682,7 +1682,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6247`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6250`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1931,7 +1931,7 @@ One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1441`). It gives the role to `service install` and
 `service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
 and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
-(`agents/roomlerd/src/app.rs:7977`) reads every custom action with an `ExeCommand` in both WiX
+(`agents/roomlerd/src/app.rs:7980`) reads every custom action with an `ExeCommand` in both WiX
 files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
 installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
 
@@ -1947,7 +1947,7 @@ whole stack with no level, which tracing reads as TRACE in every daemon that kee
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
 `service uninstall --as-service` logs `Companion login start removed.` rather than printing it
-(`agents/roomlerd/src/app.rs:6188`), and its answer stays `Service deregistered`.
+(`agents/roomlerd/src/app.rs:6191`), and its answer stays `Service deregistered`.
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
@@ -1966,9 +1966,9 @@ error chain in the file (`crates/agent-core/src/logging.rs:1989`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:2019`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2062`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1958`). In `roomlerd`,
-`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8071`) and
-`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8104`)
+beside `stderr_capture` (`.github/workflows/ci.yml:1966`). In `roomlerd`,
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8074`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8107`)
 pin the role per command and the end line of a failure.
 
 ### Where a step on the service account finds its folders (#3702)
@@ -2060,7 +2060,7 @@ profile, or the machine's data folder) or is reached through a link below it (`k
   daemon, which runs unelevated, merges at its next start, so the merge never runs above the
   integrity level of the folder owner's own processes. When the token cannot be read, the merge
   is left too (`DataMerge`, `crates/agent-core/src/appdirs.rs:1343`;
-  `agents/roomlerd/src/app.rs:7695`). A data folder whose NEW folder is not there still moves by
+  `agents/roomlerd/src/app.rs:7698`). A data folder whose NEW folder is not there still moves by
   one rename.
 - Every run writes a note that names what it moved, what it kept beside, and what it left for
   the next start (`crates/agent-core/src/appdirs.rs:1456`).
@@ -2301,7 +2301,7 @@ neither line: its CLI names itself after an install (`installed: roomler <v>`, `
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
 feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
-records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3140-3151`).
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3148-3159`).
 Since #3931 it also runs every mode with every stand-in reading its stdin on every call, under dash
 with the script padded so that one of dash's 8 KiB reads ends inside the main block (from the
 `# ─── main ─` line to the end), and with the script cut short at sampled lines above the main block,
@@ -4071,7 +4071,7 @@ SIGPIPE, and the failed pipe read as "idle", as did a print that failed.
 container: a case for each reading, one where launchctl writes its answer in
 pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
-macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3138-3139`), and "macOS overlay
+macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3146-3147`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
 `:1437-1442`).
 

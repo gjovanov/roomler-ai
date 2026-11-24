@@ -1279,6 +1279,36 @@ match this node`), and an org-relay grant that needs them is refused.
   with a capped backoff (250 ms → 30 s), and each respawn sends one synthetic
   wake-up, so whatever changed while nothing was watching is re-sampled and
   re-asserted.
+
+  **A stop is not a death** (#4382). A service manager's stop signals every
+  process of the daemon's unit at once: the packaged systemd units keep the
+  default `KillMode`, and a terminal's Ctrl-C reaches the whole process group.
+  So the child usually exits before the daemon's run loop has heard the stop,
+  and #1867's WARN used to go out on every restart. The daemon now marks its
+  stop as the first thing each arm of `run`'s shutdown `select!` does
+  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5811`, `:5847`,
+  `:5859`). After the child exits, the supervisor waits out the first part of
+  the backoff, at most 1 s (`STOP_GRACE`,
+  `crates/tunnel-core/src/overlay/netstate.rs:1241`), before it says anything:
+
+  | The child exits | Logged | Respawned |
+  |---|---|---|
+  | and the stop is marked before that grace ends | one INFO, `exited as the process stops — not respawning it (#4382)` | no, and the supervisor ends |
+  | after nothing reads the feed any more | nothing | no |
+  | in any other way: a crash, an OOM kill, a `kill` of its pid (SIGTERM included) | #1867's WARN, once the grace has passed | yes |
+
+  The grace is carved out of the backoff, so a dead child comes back exactly
+  when it did before, and the WARN's `retry_in_ms` counts what is left of the
+  backoff (0 at a first death). The mark is a `watch` that is never cleared,
+  so a mark set before the grace began is seen at once, and one set during it
+  ends the wait at once. The same wait runs between respawn attempts, so a
+  mark that comes after the WARN still stops any attempt it finds waiting.
+  **What is left:** the mark is set when the arm runs, not when the signal
+  lands. An arm that runs later than the grace after the child's exit (250 ms
+  at a first death) still lets one WARN out at a stop, and at a first death
+  one respawn, whose child the process's exit then ends (`kill_on_drop`). The
+  packaged units' `RUST_LOG=roomlerd=info,warn` drops tunnel-core's INFO, so
+  on such a host a stop logs nothing from the monitor at all.
 * **The sample after a burst runs on the blocking pool** (#3018). It is two
   to six `route -n get` processes on macOS (~2.5 ms each on an idle Mac),
   `ip route get` on Linux, and on Windows a route-table read that can also

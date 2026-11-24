@@ -2819,10 +2819,10 @@ Approve granted the session.
 
 | | Until #3987 | Since |
 |---|---|---|
-| Where the prompt opens | on macOS and Windows, the top centre, 48 down: where the daemon's own panel is. On a Mac that panel is at the screen-saver level and covers the prompt. On Windows the prompt, shown later and focused, covers the overlay. Linux has opened it in the middle since #2286 (§12.2) | the middle of its screen on every OS: the primary monitor, and on a Mac since #3999 the screen the pointer is on (§10.9.3). Where the middle comes within 16 of the daemon's panel, 16 below the panel instead (`consent_origin`, `panels.rs:858`) |
-| When it is placed | when its window is built | each time it comes up from hidden. A prompt that is already up stays where it is (`placed_on_show`, `panels.rs:874`) |
+| Where the prompt opens | on macOS and Windows, the top centre, 48 down: where the daemon's own panel is. On a Mac that panel is at the screen-saver level and covers the prompt. On Windows the prompt, shown later and focused, covers the overlay. Linux has opened it in the middle since #2286 (§12.2) | the middle of its screen on every OS: the primary monitor, and on a Mac since #3999 the screen the pointer is on (§10.9.3). Where the middle comes within 16 of the daemon's panel, 16 below the panel instead (`consent_origin`, `panels.rs:918`) |
+| When it is placed | when its window is built | each time it comes up from hidden. A prompt that is already up stays where it is (`placed_on_show`, `panels.rs:934`) |
 | A click while it is not the key window | AppKit spent the click on making the window key, so the page never saw it and nothing logged it. The prompt is key when shown, and stops being key at the person's next click anywhere else, such as on the daemon's panel | acted on: both panels take their first click (`takes_first_click`, `panels.rs:428`) |
-| A click as it appears | held back by the rule above, which also held back a deliberate click 55 s later | held back for 1 s after its question came to the front, logged with the reason, and the page says why (`CONSENT_ARMING`, `panels.rs:884`) |
+| A click as it appears | held back by the rule above, which also held back a deliberate click 55 s later | held back for 1 s after its question came to the front, logged with the reason, and the page says why (`CONSENT_ARMING`, `panels.rs:944`) |
 
 **The place.** Every daemon panel fits in one box: the top centre of its screen, 48 down, at
 most 480 × 240 logical. On a Mac, since #3999, that screen is the one the pointer is on (§10.9.3).
@@ -2883,7 +2883,7 @@ What starts that second again, and what does not:
 
 Each click sends `shown`, the time in ms that the page has shown its question. The app counts
 from the later of that and its own last show or raise of the window (`in_front_for`,
-`panels.rs:908`).
+`panels.rs:968`).
 
 **Key.** The prompt still becomes the key window when it is shown, as before. Keys typed into
 another app after it appears go to the prompt and are dropped. No button has focus, so typing
@@ -3033,7 +3033,7 @@ could not keep the prompt clear of a panel on another screen.
 | Surface | Until #3999 | Since |
 |---|---|---|
 | the daemon's panel (`Panel::new`, `agents/roomlerd/src/indicator/mac.rs:798`) | the top centre of `NSScreen::mainScreen`, the screen of the window with the keyboard focus | the top centre of the chosen screen, 48 down as before (`question_screen`, `mac.rs:1209`). With no screen at all, the same 1440 × 900 stand-in as before |
-| the app's prompt (`place_consent`, `agents/roomler-desktop/src/panels.rs:930`) | #3987's place on the primary monitor, the menu bar's (Tauri's `primary_monitor`) | #3987's place on the chosen screen (`appkit_origin`, `panels.rs:994`), set through AppKit on the main thread (`place_on_pointer_screen`, `panels.rs:954`). Where no screen can be read, the primary monitor as before (`position_consent`, `panels.rs:401`) |
+| the app's prompt (`place_consent`, `agents/roomler-desktop/src/panels.rs:990`) | #3987's place on the primary monitor, the menu bar's (Tauri's `primary_monitor`) | #3987's place on the chosen screen (`appkit_origin`, `panels.rs:1054`), set through AppKit on the main thread (`place_on_pointer_screen`, `panels.rs:1014`). Where no screen can be read, the primary monitor as before (`position_consent`, `panels.rs:401`) |
 
 **The rule.** A surface opens on the screen that holds the pointer when it is shown. If no screen
 holds the pointer, it opens on the primary screen, the menu bar's (`NSScreen::screens()[0]`). One
@@ -3204,7 +3204,7 @@ also keeps a system install's Wayland capture opt-in.
 | Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:383` |
 | Stays through a failed read | a read of the sessions that fails, or a LocalAPI stall, never takes it down: only an answer with no live session does, or proven no service (§10.9.2) | `SessionWatch`, `agents/roomler-desktop/src/main.rs:444` |
 | Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
-| Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS). It follows the screen: laid out round the screen as it is at each show, and again at each screen change while it is up (#4376, below) | `panels.rs:588`; `frame::show` `:636`, `on_screen_change` `:739` |
+| Frame | a 2 px red frame for the whole session round the screen the viewer sees: the captured display, the menu bar's (#4392, below) — four click-through strips (macOS). It follows that screen: laid out round it as it is at each show, and again at each screen change while it is up (#4376, below) | `panels.rs:608`; `frame::show` `:658`, `marked_screen` `:730`, `on_screen_change` `:799` |
 
 ```mermaid
 stateDiagram-v2
@@ -3244,15 +3244,15 @@ session in the same companion process would have drawn it there too. Now:
 
 | When | What happens to the frame | Where |
 |---|---|---|
-| a session's show | laid out round the main screen as it is now, then brought up. The four windows are built at the first show that finds a screen, and moved after | `frame::show`, `panels.rs:636`; `put_up`, `:668` |
-| a screen change while it is up | laid out again. AppKit posts `NSApplicationDidChangeScreenParametersNotification` on the main thread when a display's mode, the arrangement or the set of displays changes: display-match's switch and its hand-back, a resolution change, a display plugged in or out | `on_screen_change`, `panels.rs:739` |
-| a screen change while it is down | nothing: the next show lays it out | `panels.rs:749` |
-| the session's end | taken down, and from then the observer leaves it be | `frame::hide`, `panels.rs:652` |
+| a session's show | laid out round the screen it marks (#4392, below) as it is now, then brought up. The four windows are built at the first show that finds a screen, and moved after | `frame::show`, `panels.rs:658`; `put_up`, `:691` |
+| a screen change while it is up | laid out again. AppKit posts `NSApplicationDidChangeScreenParametersNotification` on the main thread when a display's mode, the arrangement or the set of displays changes: display-match's switch and its hand-back, a resolution change, a display plugged in or out | `on_screen_change`, `panels.rs:799` |
+| a screen change while it is down | nothing: the next show lays it out | `panels.rs:809` |
+| the session's end | taken down, and from then the observer leaves it be | `frame::hide`, `panels.rs:674` |
 
 The observer is registered once a process, at the first show, with the default notification
-centre (`observe_screen_changes`, `panels.rs:713`). It holds nothing of its own. The frame's
+centre (`observe_screen_changes`, `panels.rs:773`). It holds nothing of its own. The frame's
 main-thread state holds it, the strips and whether the frame is up, for the companion's whole
-life (`State`, `panels.rs:613`). The strips come from one pure function, `frame_strips`
+life (`State`, `panels.rs:635`). The strips come from one pure function, `frame_strips`
 (`panels.rs:537`): a screen's frame in AppKit's coordinates (its bottom-left corner, y up) and
 the 2 pt thickness (`FRAME_BORDER`, `:527`) give the top, bottom, left and right strips. Its
 three tests (a screen at the origin, a second display with an origin of its own, the thickness
@@ -3261,8 +3261,42 @@ Windows job's "The desktop companion on Windows — clippy + unit tests (#3940)"
 AppKit, so the rest is a lab round on a Mac: a session with display-match on, the frame read
 during the switch and 15 s and 2 min after the hand-back, then a second session in the same
 companion process after a resolution change. At each read the frame runs round the whole
-current screen. Unchanged: which screen it marks, `NSScreen::mainScreen`, the screen of the
-window with the keyboard focus.
+current screen. Which screen it marks is #4392's, below.
+
+⚠️ **The frame marks the screen the viewer sees** (#4392). The capture shares the main display,
+the menu bar's: scrap's `Display::primary()` (`agents/roomlerd/src/capture/scrap_backend.rs:170`)
+is `CGMainDisplayID()` (`crates/vendored/scrap/src/quartz/display.rs:9-11`). Until #4392 the
+frame ran round `NSScreen::mainScreen`, which AppKit documents as the screen of the window with
+the keyboard focus, "not necessarily the same screen that contains the menu bar". On a Mac with
+two screens, with the focused window on the one without the menu bar as the frame came up, the
+frame marked that screen while the viewer saw the other, and a later change of focus, which posts
+no screen change, left it there. Now:
+
+| Case | The screen the frame marks | Where |
+|---|---|---|
+| a screen has the captured display's id | that screen: of `NSScreen::screens`, the one whose `NSScreenNumber` (an `NSNumber` in its `deviceDescription`, holding its `CGDirectDisplayID`) equals `CGMainDisplayID()`. Where the focused window is plays no part | `marked_screen`, `panels.rs:730`; `display_id`, `:743`; `CGMainDisplayID`, `:721` |
+| no screen has it | `NSScreen::mainScreen`, as before #4392 | `panels.rs:737` |
+| no screen at all | none: strips built before stay where they were (#4376) | `put_up`, `panels.rs:691` |
+
+The companion runs as the person, in its own process, and its `CGMainDisplayID()` names the
+daemon's captured display. Apple documents the main display as "the display with its screen
+location at (0,0) in the global display coordinate space", a fact of the display configuration
+and not of the process asking, and a display ID as one that "can persist across processes". The
+choice is one pure function, `captured_screen` (`panels.rs:581`): the screens' display ids in
+`NSScreen::screens`'s order (`None` for one whose id cannot be read, which never matches and keeps
+the index in line) and the captured display's id give the index of the screen to mark, or none.
+Its four tests (one screen that is the captured display; two screens, the captured one listed
+first and then second; the captured display on no screen, which gives none; no screens) run in
+the same two lanes as `frame_strips`'s. No test reaches AppKit, so the rest is a lab round: a Mac
+with two screens, one session started with the focused window on each screen in turn and the
+frame on the menu bar's screen both times, and a one-screen Mac, unchanged.
+
+One case stays open. If the main display changes during a session (the menu bar moved to another
+display in System Settings), the frame moves to the new main display at that screen change, but
+the capture keeps the display it opened (`agents/roomlerd/src/capture/scrap_backend.rs:170`,
+`crates/vendored/scrap/src/quartz/capturer.rs:54-55`) until it opens again: at an encode-box
+change (`scrap_backend.rs:337-339`) or at the next session. Until then the viewer sees the old
+main display while the frame marks the new one.
 
 Kill switches, each on its own: `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (the banner stays, as
 before P9) and `ROOMLER_DESKTOP_FRAME=0` (no frame).

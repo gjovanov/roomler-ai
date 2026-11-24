@@ -58,6 +58,9 @@ pub struct AssociationInternal {
     // roomler (FR-148 P4b-1, D55): the last FORWARD TSN sent: the point it
     // carried, and `my_next_tsn` when it went (`forward_tsn_due`).
     last_forward_tsn: Option<(u32, u32)>,
+    // roomler (FR-148 P0, D43): the pacer; off unless a writer turns it on
+    // (`Association::pacer`), and then inert.
+    pacer: super::pacer::Pacer,
 
     // Congestion control parameters
     pub(crate) max_receive_buffer_size: u32,
@@ -170,8 +173,9 @@ impl AssociationInternal {
             cumulative_tsn_ack_point: tsn - 1,
             advanced_peer_tsn_ack_point: tsn - 1,
             use_forward_tsn: false,
-            deadline_marked: false, // roomler (FR-148 P4b-1)
-            last_forward_tsn: None, // roomler (FR-148 P4b-1)
+            deadline_marked: false,    // roomler (FR-148 P4b-1)
+            last_forward_tsn: None,    // roomler (FR-148 P4b-1)
+            pacer: Default::default(), // roomler (FR-148 P0, D43)
 
             max_receive_buffer_size,
             cwnd,
@@ -356,6 +360,18 @@ impl AssociationInternal {
     /// without this struct's lock.
     pub(crate) fn gauge_reader(&self) -> super::gauges::GaugeReader {
         self.pending_queue.gauge_reader()
+    }
+
+    /// roomler (FR-148 P0, D43): the pacer's switch, which `Association`
+    /// keeps to set without this struct's lock.
+    pub(crate) fn pace_switch(&self) -> super::pacer::PaceSwitch {
+        self.pacer.switch(Arc::clone(&self.awake_write_loop_ch))
+    }
+
+    /// roomler (FR-148 P0, D43): when the chunk the last send held for the
+    /// pacer may leave; `None` when it held none, and always while it is off.
+    pub(crate) fn take_pace_wake(&mut self) -> Option<tokio::time::Instant> {
+        self.pacer.take_wake()
     }
 
     /// roomler (FR-148 P0): the windows and the bytes in flight into the
@@ -1397,6 +1413,9 @@ impl AssociationInternal {
         if let Some((_, since)) = newest_sent_once {
             if let Ok(delay) = SystemTime::now().duration_since(since) {
                 self.pending_queue.gauges().on_ack_delay(delay);
+                // roomler (FR-148 P0, D43): the pacer's round trip, kept only
+                // while it is on.
+                self.pacer.on_rtt(delay);
             }
         }
 
@@ -2099,6 +2118,12 @@ impl AssociationInternal {
         let mut chunks = vec![];
         let mut sis_to_reset = vec![]; // stream identifiers to reset
 
+        // roomler (FR-148 P0, D43): whether the pacer gates this send's new
+        // data. Off, false, and nothing below changes.
+        let paced = self
+            .pacer
+            .begin(tokio::time::Instant::now(), self.cwnd, self.ssthresh);
+
         if self.pending_queue.len() == 0 {
             return (chunks, sis_to_reset);
         }
@@ -2138,6 +2163,18 @@ impl AssociationInternal {
                 break; // no more rwnd
             }
 
+            // roomler (FR-148 P0, D43): new data waits for the pacer's tokens
+            // while it is on, and while in flight is at or above the cap its
+            // writer set; the write loop wakes when the tokens come, or at the
+            // next SACK.
+            if paced
+                && !self
+                    .pacer
+                    .admit(data_len, self.inflight_queue.get_num_bytes())
+            {
+                break;
+            }
+
             self.rwnd -= data_len as u32;
 
             if let Some(chunk) = self
@@ -2158,6 +2195,11 @@ impl AssociationInternal {
                     .move_pending_data_chunk_to_inflight_queue(beginning_fragment, unordered)
                     .await
                 {
+                    // roomler (FR-148 P0, D43): the probe never waits for the
+                    // pacer, which counts its bytes.
+                    if paced {
+                        self.pacer.spend(chunk.user_data.len());
+                    }
                     chunks.push(chunk);
                 }
             }

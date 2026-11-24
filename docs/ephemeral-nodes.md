@@ -167,10 +167,10 @@ exec roomlerd run
   ([`wix-perMachine/main.wxs:698-700`](../agents/roomlerd/wix-perMachine/main.wxs#L698-L700),
   [`win_service/lifecycle.rs:293`](../agents/roomlerd/src/win_service/lifecycle.rs#L293)).
   The worker takes either stop as an OS-initiated stop
-  ([`app.rs:5856-5862`](../agents/roomlerd/src/app.rs#L5856-L5862)), finds no
+  ([`app.rs:5858-5865`](../agents/roomlerd/src/app.rs#L5858-L5865)), finds no
   update in flight, and an ephemeral device deletes its own row, the one its
   run started as
-  ([`app.rs:5950-5959`](../agents/roomlerd/src/app.rs#L5950-L5959)).
+  ([`app.rs:5953-5962`](../agents/roomlerd/src/app.rs#L5953-L5962)).
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
@@ -330,7 +330,7 @@ and `ephemeral` (`updater::RunRow`, taken at
 (`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
 unchanged) reads the run's own `ephemeral`, and the removal targets the run's
 own row (`updater::stop_removal`, `:5085-5114`, at
-`agents/roomlerd/src/app.rs:5950-5978`):
+`agents/roomlerd/src/app.rs:5953-5981`):
 
 | The file at the stop | The stop removes |
 |---|---|

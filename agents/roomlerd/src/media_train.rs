@@ -12,13 +12,16 @@
 //! "write n bytes" or "stopped, and this is the reading". No session runs it
 //! yet (FR-148 P0's step 4b wires it in, behind a switch); the cells below
 //! drive it over the real vendored SCTP through `media_delivery`'s shaped
-//! link.
+//! link. While a train runs, its writer keeps the association's pacer on
+//! ([`Pacing`]), steered after every step to what [`Train::pace`] answers,
+//! and off from the stop on (D43, D64).
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use webrtc::sctp::association::delivery::Delivery;
 use webrtc::sctp::association::gauges::Gauges;
+use webrtc::sctp::association::pacer::{PaceSwitch, WHOLE};
 
 /// Bytes of SCTP payload a train writes at most (D38).
 pub const BUDGET: u64 = 512 * 1024;
@@ -106,6 +109,77 @@ const DELAYED_ACK: Duration = Duration::from_millis(200);
 /// SCTP's common header and a DATA chunk's header: what each packet of a
 /// message that fills one chunk adds to it.
 const PACKET_OVERHEAD: u64 = 12 + 16;
+
+/// The share of P-e's bound, max(the least round trip, [`QUEUE_FLOOR`]),
+/// that [`pace_share`]'s derivation leaves out: the queue it predicts stays
+/// within the rest. The derivation leaves out a step's lateness, the second
+/// packet a SACK waits for, and the serialisation a least round trip
+/// carries; its predictions sat within 15 % of what the cells measured. A
+/// quarter is also the most that keeps the whole window at a 250 ms round
+/// trip, where the whole window's queue is 0.73 of one.
+const PACE_MARGIN: f64 = 0.25;
+
+/// The share of the congestion window, in thousandths ([`WHOLE`] is all of
+/// it), that the association's pacer lets out per least round trip in slow
+/// start until the bottleneck queued: the largest up to the whole window
+/// whose queue, by the derivation below, stays within `1 - PACE_MARGIN` of
+/// P-e's bound. It comes from the least round trip and [`QUEUED`] alone.
+///
+/// Paced at a share G of cwnd over the least round trip R, with every SACK
+/// adding what it acknowledges to cwnd (slow start, while chunks wait), the
+/// window and the rate grow as e^(x t / R), where x e^x = G. Once the rate
+/// passes the link the SACKs still carry what left a round trip before, so
+/// the rate keeps that growth for one more round trip, and then rises by G
+/// times the link a round trip, as the link's SACKs add to the window. The
+/// queue is what the rate put above the link. The first packet that meets
+/// [`QUEUED`] of it is acknowledged a round trip and that queue later, and
+/// its sample engages the cap, which binds the association's sends from
+/// then on: the queue at that moment is the most the train causes.
+fn pace_share(least: Duration) -> u32 {
+    let r = least.as_secs_f64();
+    if r <= 0.0 {
+        return WHOLE;
+    }
+    let theta = QUEUED.as_secs_f64() / r;
+    let bound = (1.0 - PACE_MARGIN) * least.max(QUEUE_FLOOR).as_secs_f64() / r;
+    if pace_queue(1.0, theta) <= bound {
+        return WHOLE;
+    }
+    let g = bisect(0.0, 1.0, |g| pace_queue(g, theta) <= bound);
+    ((g * f64::from(WHOLE)) as u32).max(1)
+}
+
+/// The queue, in round trips, that a slow start paced at a share `g` of the
+/// window has built when a sample shows `theta` round trips of it: the
+/// derivation at [`pace_share`]. Time counts in round trips from when the
+/// rate passed the link.
+fn pace_queue(g: f64, theta: f64) -> f64 {
+    let x = bisect(0.0, 1.0, |x| x * x.exp() < g);
+    let ex = x.exp();
+    let queue = |tau: f64| {
+        if tau <= 1.0 {
+            ((x * tau).exp() - 1.0) / x - tau
+        } else {
+            let s = tau - 1.0;
+            (ex - 1.0) / x - 1.0 + (ex - 1.0) * s + g * s * s / 2.0
+        }
+    };
+    let met = bisect(0.0, 16.0, |tau| queue(tau) < theta);
+    queue(met + 1.0 + theta)
+}
+
+/// The point in `lo..hi` where `below` turns false, by bisection.
+fn bisect(mut lo: f64, mut hi: f64, below: impl Fn(f64) -> bool) -> f64 {
+    for _ in 0..60 {
+        let mid = (lo + hi) / 2.0;
+        if below(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
 
 /// Why a train stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +281,50 @@ pub enum Step {
     Stopped(Reading),
 }
 
+/// How the association's pacer runs while a train does (D43, D64), as
+/// [`Train::pace`] answers it after each step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pace {
+    /// The share of the congestion window, in thousandths, let out per least
+    /// round trip in slow start: [`pace_share`] of the least round trip until
+    /// the bottleneck queued, the whole window ([`WHOLE`]) from then on.
+    pub share: u32,
+    /// The in-flight cap, once the bottleneck queued: new data waits while
+    /// what is in flight is at or above it.
+    pub cap: Option<u64>,
+}
+
+/// The association's pacer, for as long as a train runs: [`Pacing::on`]
+/// turns it on, [`Pacing::follow`] steers it to each step's [`Train::pace`]
+/// and turns it off at the train's stop, and dropping it turns it off too,
+/// so an error that ends the train's writer, or a writer dropped with its
+/// train, leaves no pacing behind.
+#[derive(Debug)]
+#[must_use = "the pacer is off again as soon as this is dropped"]
+pub struct Pacing(PaceSwitch);
+
+impl Pacing {
+    /// Turns `switch`'s pacer on, at the whole window with no cap.
+    pub fn on(switch: PaceSwitch) -> Self {
+        switch.set(true);
+        Self(switch)
+    }
+
+    /// Steers the pacer to `pace`, or turns it off at `None`.
+    pub fn follow(&self, pace: Option<Pace>) {
+        match pace {
+            Some(p) => self.0.steer(p.share, p.cap),
+            None => self.0.set(false),
+        }
+    }
+}
+
+impl Drop for Pacing {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 /// What the first step saw.
 #[derive(Debug, Clone, Copy)]
 struct Start {
@@ -291,6 +409,9 @@ pub struct Train {
     /// The offered rate of the round that pushed back, bytes a second.
     high: Option<u64>,
     stopped: Option<Reading>,
+    /// The pacer's share of the window in slow start, from the least
+    /// acknowledgement delay ([`pace_share`]).
+    share: u32,
 }
 
 /// Bytes a second, of `bytes` over `d`.
@@ -337,12 +458,38 @@ impl Train {
             flat: 0,
             high: None,
             stopped: None,
+            share: WHOLE,
         }
     }
 
     /// The length of every message the train asks for.
     pub fn message_len(&self) -> usize {
         usize::try_from(self.msg).unwrap_or(usize::MAX)
+    }
+
+    /// How the association's pacer runs after this step: `None` once the
+    /// train stopped, whatever stopped it. Until the bottleneck queued it
+    /// lets out [`pace_share`] of the window over the least round trip in
+    /// slow start; from then on the whole window, with the in-flight cap,
+    /// which then binds what the association sends as well as what the
+    /// train writes: chunks already pending wait while in flight is at or
+    /// above it. A train that queued before anything estimated the rate has
+    /// no cap yet.
+    pub fn pace(&self) -> Option<Pace> {
+        if self.stopped.is_some() {
+            return None;
+        }
+        Some(if self.capped {
+            Pace {
+                share: WHOLE,
+                cap: Some(self.cap()).filter(|&c| c < u64::MAX),
+            }
+        } else {
+            Pace {
+                share: self.share,
+                cap: None,
+            }
+        })
     }
 
     /// One step: `at` is the time on any clock that does not go back,
@@ -492,6 +639,9 @@ impl Train {
         self.first_sample.get_or_insert(s);
         let min = self.min.map_or(s, |m| m.min(s));
         let max = self.max_sample.map_or(s, |m| m.max(s));
+        if self.min != Some(min) {
+            self.share = pace_share(min);
+        }
         self.min = Some(min);
         self.max_sample = Some(max);
         self.round.min = Some(self.round.min.map_or(s, |m| m.min(s)));
@@ -860,6 +1010,11 @@ mod cells {
         /// A line for each step that saw an acknowledgement, closed a round
         /// or stopped: what the train read and how it judged.
         trace: Vec<String>,
+        /// When the cap engaged, and the window, in flight and pending then;
+        /// the pacer's share once a sample came, and its last before the cap.
+        capped_at: Option<(Duration, u32, u64, u64)>,
+        share_first: Option<u32>,
+        share_at_cap: Option<u32>,
     }
 
     /// The trace line of one step, or `None` for a step that saw nothing:
@@ -1013,8 +1168,16 @@ mod cells {
         let gauges = agent.gauges();
         let acked_before = clock.read().acked_bytes;
         let mut train = Train::new(gauges.take().max_payload);
+        // The association paces while the train runs (D43): on now, steered
+        // after every step, and off at the stop.
+        let pacing = Pacing::on(agent.pacer());
         let message = Bytes::from(vec![0x7e; train.message_len()]);
         let mut limits = Limits::default();
+        // The pacer's first share once a sample came and its last before the
+        // cap, and the window, in flight and pending at the step the cap
+        // engaged.
+        let (mut share_first, mut share_at_cap) = (None, None);
+        let mut capped_at = None;
         let t0 = Instant::now();
         let reading = loop {
             let at = t0.elapsed();
@@ -1045,6 +1208,18 @@ mod cells {
                 last_acked,
                 &step,
             ));
+            let pace = train.pace();
+            match pace {
+                Some(_) if train.capped => {
+                    capped_at.get_or_insert((at, g.cwnd, g.inflight_bytes, g.pending_bytes));
+                }
+                Some(Pace { share, .. }) if train.min.is_some() => {
+                    share_first.get_or_insert(share);
+                    share_at_cap = Some(share);
+                }
+                _ => {}
+            }
+            pacing.follow(pace);
             match step {
                 Step::Write(n) => {
                     for _ in 0..n / msg {
@@ -1057,6 +1232,8 @@ mod cells {
             let late = step_draws.as_mut().map_or(Duration::ZERO, |d| d.late(due));
             tokio::time::sleep(TICK + late).await;
         };
+        assert!(!agent.pacer().is_on(), "the stop turned the pacer off");
+        drop(pacing);
         let stopped = Instant::now();
         let mut drained = false;
         while stopped.elapsed() < DRAIN {
@@ -1074,6 +1251,9 @@ mod cells {
             limits,
             reading,
             trace,
+            capped_at,
+            share_first,
+            share_at_cap,
         };
         let _ = agent.close().await;
         let _ = viewer.close().await;
@@ -1134,10 +1314,20 @@ mod cells {
     fn describe(cell: &Cell, o: &Outcome) -> String {
         let r = &o.reading;
         let mbps = |b: u64| b as f64 / 1e6;
+        let cap = o
+            .capped_at
+            .map_or("never".to_owned(), |(at, cwnd, infl, pend)| {
+                format!(
+                    "at {} ms cwnd {cwnd} infl {infl} pend {pend}",
+                    at.as_millis()
+                )
+            });
+        let share = |s: Option<u32>| s.map_or("-".to_owned(), |s| s.to_string());
         format!(
             "train cell {} window {}: {} low {:.3} ({:.2}) high {} floor_only {} rounds {} \
              written {} wire {} min_rtt {:?} ss0 {} fr {} t3 {} t {} ms; \
-             peak queue {:.1} ms, tail drops {}, drained {}, taken {}, limited by window {} cwnd {}",
+             peak queue {:.1} ms, tail drops {}, drained {}, taken {}, limited by window {} cwnd {}; \
+             capped {cap}; share {} then {}",
             cell.name(),
             if cell.window == 0 {
                 1 << 20
@@ -1164,6 +1354,8 @@ mod cells {
             o.taken,
             o.limits.window,
             o.limits.cwnd,
+            share(o.share_first),
+            share(o.share_at_cap),
         )
     }
 
@@ -1322,14 +1514,19 @@ mod cells {
         out
     }
 
-    /// RED, and kept as written: P-a does not hold here while SCTP's slow
-    /// start is the step law. A SACK of two packets releases four, so in a
-    /// round the queue grows by the window of the round before; a 20 ms queue,
-    /// a quarter of the pipe, overflows once that passes a quarter, and no
-    /// round closed before the loss is seen carries much more than half the
-    /// link's rate (docs/rate-control.md, "The open-time train").
+    /// D43's cell, green since the association paces while the train runs.
+    /// Unpaced, a SACK of two packets released four back to back, so in a
+    /// round the queue grew by the window of the round before; a 20 ms queue,
+    /// a quarter of the pipe, overflowed once that passed a quarter, and no
+    /// round closed before the loss carried much more than half the link's
+    /// rate (0.14 to 0.52 of it over twelve runs). Paced, a flight leaves
+    /// spread over its round trip, the queue builds only once a round carries
+    /// more than the link, and the round before the loss carries the link:
+    /// 0.84 to 1.02 of it, five runs of five, alone. It stays a measurement
+    /// (D44): it ends on a push-back whose low edge a busy runner can move
+    /// (docs/rate-control.md, "The open-time train").
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "P-a cannot hold under slow start's bursts: see the doc comment"]
+    #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): see docs/rate-control.md"]
     async fn path_i_a_shallow_buffer_stops_on_loss() {
         assert_cell(shallow(OpenPath::InitAck), stops_on_loss).await;
     }
@@ -1934,5 +2131,235 @@ mod machine {
         t.first_sample = Some(ms(105));
         t.best = 20_000;
         assert_eq!(t.write_budget(), None);
+    }
+
+    /// The pacer's share of the window is the largest whose queue, by the
+    /// derivation, stays within three quarters of P-e's bound, max(the least
+    /// round trip, 50 ms): a hundredth of the window more breaks it. From
+    /// about 235 ms on, the whole window's queue fits.
+    #[test]
+    fn the_pace_share_is_the_largest_whose_queue_keeps_within_three_quarters_of_p_e() {
+        for least in [5_u32, 20, 50, 80, 160, 200] {
+            let share = pace_share(ms(u64::from(least)));
+            let r = f64::from(least);
+            let theta = 10.0 / r;
+            let bound = 0.75 * r.max(50.0) / r;
+            let queue = |s: u32| pace_queue(f64::from(s) / f64::from(WHOLE), theta);
+            assert!(share < WHOLE, "{least} ms: {share}");
+            assert!(queue(share) <= bound, "{least} ms: {share}");
+            assert!(queue(share + 10) > bound, "{least} ms: {share}");
+        }
+        // Where the grid's paths are, 20 and 80 ms: under half the window.
+        assert!((380..=410).contains(&pace_share(ms(20))));
+        assert!((420..=460).contains(&pace_share(ms(80))));
+        for least in [ms(250), ms(1_000), Duration::ZERO] {
+            assert_eq!(pace_share(least), WHOLE, "{least:?}");
+        }
+    }
+
+    /// Until the bottleneck queued, the pacer lets out the share the least
+    /// round trip gives, and follows the least as it falls; from then on the
+    /// whole window, with the in-flight cap.
+    #[test]
+    fn the_pace_follows_the_least_round_trip_then_the_cap() {
+        let whole = Some(Pace {
+            share: WHOLE,
+            cap: None,
+        });
+        let mut t = Train::new(1_200);
+        assert_eq!(t.pace(), whole);
+        t.step(ms(0), &acked(0), &gauges(0, 0), false);
+        assert_eq!(t.pace(), whole, "no round trip yet");
+        let shared = |least| {
+            Some(Pace {
+                share: pace_share(ms(least)),
+                cap: None,
+            })
+        };
+        sack(&mut t, 75, 2 * MSG, 75);
+        assert_eq!(t.pace(), shared(75));
+        sack(&mut t, 85, 4 * MSG, 70);
+        assert_eq!(t.pace(), shared(70));
+        // 9 ms above the least: no queue yet.
+        sack(&mut t, 95, 6 * MSG, 79);
+        assert_eq!(t.pace(), shared(70));
+        // 10 ms above it: the bottleneck queued.
+        sack(&mut t, 105, 8 * MSG, 80);
+        assert!(t.capped && t.stopped.is_none());
+        let cap = t.cap();
+        assert!(cap < u64::MAX && cap.is_multiple_of(MSG), "{cap}");
+        assert_eq!(
+            t.pace(),
+            Some(Pace {
+                share: WHOLE,
+                cap: Some(cap)
+            })
+        );
+    }
+
+    /// Whatever stops the train, the pacing ends with it: `pace` answers
+    /// `None` from the stop on, so the writer's [`Pacing`] turns the pacer
+    /// off at the step that stopped it. Each path is set up as the tests
+    /// above set it up.
+    #[test]
+    fn the_pacing_ends_on_every_stop_path() {
+        let ready = started();
+        let loss = started();
+        let expiry = started();
+        let deadline = started();
+        let mut bytes = started();
+        bytes.written = BUDGET;
+        // As `a_spent_write_budget_holds_the_writer_and_ends_on_a_floor`.
+        let mut writes = started();
+        writes.capped = true;
+        writes.capped_acked = 6_000;
+        writes.min = Some(ms(100));
+        writes.first_sample = Some(ms(160));
+        writes.rounds = 1;
+        writes.round.mark = u64::MAX;
+        writes.written = 16 * MSG;
+        // A round of four samples, 40 ms above the least.
+        let mut round = started();
+        round.min = Some(ms(50));
+        round.best = 10_000_000;
+        round.round.min = Some(ms(90));
+        round.round.samples = ROUND_SAMPLES;
+        // As `a_run_of_samples_that_stand_stops_on_delay`.
+        let mut run = queued();
+        sack(&mut run, 200, 2 * MSG, 100);
+        for (at, bytes) in [(250, 4 * MSG), (300, 6 * MSG), (350, 8 * MSG)] {
+            sack(&mut run, at, bytes, 170);
+        }
+        // A round the cap held that grew less than 10 %, after one more.
+        let mut plateau = started();
+        plateau.round.held = true;
+        plateau.flat = PLATEAU_ROUNDS - 1;
+        plateau.last_round = 48_000;
+        // Nothing acknowledged for 600 ms of a 50 ms path.
+        let mut stall = started();
+        stall.min = Some(ms(50));
+        stall.last_ack_at = Some(ms(0));
+        stall.last_at = ms(590);
+
+        type Last = fn(&mut Train) -> Step;
+        let paths: [(Stop, Train, Last); 10] = [
+            (Stop::Ready, ready, |t| {
+                t.step(ms(300), &acked(0), &gauges(3 * MSG, MSG), true)
+            }),
+            (Stop::Loss, loss, |t| {
+                let g = Gauges {
+                    fast_retransmits: 1,
+                    ..gauges(3 * MSG, MSG)
+                };
+                t.step(ms(10), &acked(0), &g, false)
+            }),
+            (Stop::Loss, expiry, |t| {
+                let g = Gauges {
+                    t3_expiries: 1,
+                    ..gauges(3 * MSG, MSG)
+                };
+                t.step(ms(10), &acked(0), &g, false)
+            }),
+            (Stop::Deadline, deadline, |t| {
+                t.step(DEADLINE, &acked(0), &gauges(3 * MSG, MSG), false)
+            }),
+            (Stop::Budget, bytes, |t| {
+                t.step(ms(10), &acked(0), &gauges(3 * MSG, MSG), false)
+            }),
+            (Stop::Budget, writes, |t| {
+                t.step(ms(30), &acked(15 * MSG), &gauges(MSG, 0), false)
+            }),
+            (Stop::Delay, round, |t| {
+                t.step(ms(100), &acked(4 * MSG), &gauges(0, 0), false)
+            }),
+            (Stop::Delay, run, |t| sack(t, 400, 10 * MSG, 170)),
+            (Stop::Plateau, plateau, |t| {
+                t.step(ms(100), &acked(4 * MSG), &gauges(0, 0), false)
+            }),
+            (Stop::Stall, stall, |t| {
+                t.step(ms(600), &acked(0), &gauges(3 * MSG, 0), false)
+            }),
+        ];
+        for (stop, mut t, last) in paths {
+            let switch = PaceSwitch::default();
+            let pacing = Pacing::on(switch.clone());
+            pacing.follow(t.pace());
+            assert!(switch.is_on(), "{stop:?}: on before the stop");
+            let step = last(&mut t);
+            pacing.follow(t.pace());
+            assert_eq!(reading(step).stop, stop);
+            assert_eq!(t.pace(), None, "{stop:?}");
+            assert!(!switch.is_on(), "{stop:?}: off from the stop");
+            // A step after the stop leaves it off.
+            t.step(ms(2_000), &acked(1 << 20), &gauges(0, 0), false);
+            pacing.follow(t.pace());
+            assert!(!switch.is_on(), "{stop:?}");
+        }
+    }
+
+    /// The writer's pacing: on from the train's first step, steered to each
+    /// step's pace, off at the stop; and off when it is dropped without a
+    /// stop, as an error that ends the writer, or a writer dropped with its
+    /// train, drops it.
+    #[test]
+    fn the_pacing_is_off_once_the_writer_stops_ends_or_is_dropped() {
+        let switch = PaceSwitch::default();
+        let pacing = Pacing::on(switch.clone());
+        assert!(switch.is_on());
+        assert_eq!((switch.share(), switch.cap()), (WHOLE, None));
+        pacing.follow(Some(Pace {
+            share: 440,
+            cap: None,
+        }));
+        assert_eq!((switch.share(), switch.cap()), (440, None));
+        pacing.follow(Some(Pace {
+            share: WHOLE,
+            cap: Some(9_600),
+        }));
+        assert_eq!((switch.share(), switch.cap()), (WHOLE, Some(9_600)));
+        pacing.follow(None);
+        assert!(!switch.is_on());
+        assert_eq!((switch.share(), switch.cap()), (WHOLE, None));
+        drop(pacing);
+        assert!(!switch.is_on());
+
+        // A writer that ends on an error before its train stops.
+        fn writer(switch: PaceSwitch, fail: bool) -> Result<(), &'static str> {
+            let pacing = Pacing::on(switch);
+            pacing.follow(Some(Pace {
+                share: 440,
+                cap: Some(4_800),
+            }));
+            if fail {
+                return Err("the channel closed");
+            }
+            pacing.follow(None);
+            Ok(())
+        }
+        assert_eq!(writer(switch.clone(), false), Ok(()));
+        assert!(!switch.is_on());
+        assert_eq!(writer(switch.clone(), true), Err("the channel closed"));
+        assert!(!switch.is_on());
+        assert_eq!((switch.share(), switch.cap()), (WHOLE, None));
+
+        // A writer dropped with its train, mid-train.
+        struct Writer {
+            _train: Train,
+            _pacing: Pacing,
+        }
+        let w = Writer {
+            _train: started(),
+            _pacing: Pacing::on(switch.clone()),
+        };
+        assert!(switch.is_on());
+        drop(w);
+        assert!(!switch.is_on());
+    }
+
+    /// A train after its first step.
+    fn started() -> Train {
+        let mut t = Train::new(1_200);
+        t.step(ms(0), &acked(0), &gauges(0, 0), false);
+        t
     }
 }

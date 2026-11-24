@@ -3653,3 +3653,59 @@ async fn test_assoc_each_lone_packet_is_acknowledged_within_the_ack_interval() -
     );
     Ok(())
 }
+
+/// roomler (FR-148 P0, D43): the pacer in the association's own write loop.
+/// The other pacer tests call the send path directly; this one runs the write
+/// loop, whose wait wakes when the chunk the pacer held may leave
+/// (`pacer::until`). The pacer takes its round trip from the SACK of a message
+/// the bridge holds for 150 ms, so it lets out the congestion window of 4,380
+/// bytes over 150 ms or more: a chunk of 1,200 bytes takes 41 ms or more of
+/// its tokens. Then four messages are written at once and the bridge delivers
+/// nothing more, so no SACK comes and nothing else is written: only the
+/// pacer's own wake can let out the second and the third, and the window holds
+/// the fourth. T3-rtx would send again only at RTO.min, 1 s.
+#[tokio::test]
+async fn test_assoc_pacer_the_write_loop_wakes_for_the_chunk_it_held() -> Result<()> {
+    const SI: u16 = 1;
+    const HELD: Duration = Duration::from_millis(150);
+    const WITHIN: Duration = Duration::from_millis(700);
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
+
+    let outcome: Result<(usize, Duration)> = async {
+        let (s0, _s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+        let message = Bytes::from(vec![0u8; 1200]);
+        a0.pacer().set(true);
+        s0.write_sctp(&message, PayloadProtocolIdentifier::Binary)
+            .await?;
+        tokio::time::sleep(HELD).await;
+        flush_buffers(&br, &a0, &a1).await;
+
+        for _ in 0..4 {
+            s0.write_sctp(&message, PayloadProtocolIdentifier::Binary)
+                .await?;
+        }
+        let written = tokio::time::Instant::now();
+        while br.len(0).await < 3 && written.elapsed() < WITHIN {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok((br.len(0).await, written.elapsed()))
+    }
+    .await;
+
+    close_association_pair(&br, a0, a1).await;
+    let (sent, took) = outcome?;
+    println!(
+        "FR-148 D43: {sent} of 4 chunks sent in {} ms, with no SACK",
+        took.as_millis()
+    );
+    assert!(
+        sent >= 3,
+        "the write loop let out {sent} chunk(s) in {} ms with no SACK: it never woke for the \
+         chunk the pacer held",
+        took.as_millis()
+    );
+    Ok(())
+}

@@ -237,7 +237,7 @@ That section is `docs/installation.md:3273`; P1 adds one-row's row to it. The li
 
 An ephemeral row ([FR-51](../ephemeral-nodes.md)) is refused before anything changes (#4312, ruled 2026-11-23).
 One-row stops the half that holds it, the root half at its restart and a person's at the bootout, and on such a
-stop an ephemeral row deletes itself (`agents/roomlerd/src/app.rs:5911-5978`, by
+stop an ephemeral row deletes itself (`agents/roomlerd/src/app.rs:5914-5981`, by
 `updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`). One-row does not mark its own stops,
 as the updater's `update-attempt` marker does (#1683): a retired row stays offline for as long as the Mac stays
 one row, and the server's reaper deletes an offline ephemeral row however it stopped.
@@ -248,7 +248,7 @@ one row, and the server's reaper deletes an offline ephemeral row however it sto
 | A person's primary that the root half does not hold | move it, though it lives only with the half that enrolled it. Refused before #4312 too | the same |
 | The root half's primary | stop the daemon that holds it, at the restart and again at the undo's | `migrate` (`one_row.rs:1770-1772`), with `ephemeral_root` (`:716`), once the plan has something to do. A Mac that is one row already restarts nothing and still reads "nothing to do" (`:1758-1766`) |
 | Root's file that `--revert` restarts onto | stop the daemon at that restart, whose stop reads root's file as it is by then, the one put back | `revert_main` (`one_row.rs:3195-3197`), with `ephemeral_revert` (`:3137`): root's kept copy where there is one, since it goes back first, else root's own file |
-| An `[[orgs]]` entry, a person's or the root's | nothing new | not refused. An entry has no `ephemeral` (`OrgEntry`, `crates/agent-core/src/config.rs:1970-2028`), an enrollment appended as one is built without it (`crates/agent-core/src/enrollment.rs:956-986`), and the stop deletes only the primary's row (`agents/roomlerd/src/app.rs:5959`) |
+| An `[[orgs]]` entry, a person's or the root's | nothing new | not refused. An entry has no `ephemeral` (`OrgEntry`, `crates/agent-core/src/config.rs:1970-2028`), an enrollment appended as one is built without it (`crates/agent-core/src/enrollment.rs:956-986`), and the stop deletes only the primary's row (`agents/roomlerd/src/app.rs:5962`) |
 
 Each comes before Keep, so no file is written and launchd is asked nothing, and `--dry-run` refuses the same way.
 A person's line comes from the pure `plan`, before the plan is said. The root half's comes after it, beside R1 to R5,
@@ -262,7 +262,7 @@ first because a live ephemeral row stays ephemeral when a standard token enrolls
 `one_row.rs:712`; [`ephemeral-nodes.md`](../ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)). Until
 #4331 the way on was a new config, since a fold kept the old file's flag. The line before #4312 also offered
 "unenroll it first" and "enroll the root half there", and neither gets past it: no command takes an enrollment out
-of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5980-5983`), and an org
+of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5983-5986`), and an org
 the root half holds is refused too.
 
 | Case | The line, after `Error: ` (exit 1) |

@@ -569,6 +569,19 @@ fn frame_strips(
     ]
 }
 
+/// #4392 — which of a Mac's screens the red frame marks: the one whose
+/// display the capture shares, so the frame runs round the screen the viewer
+/// sees. `screens` holds each screen's display id in `NSScreen::screens`'s
+/// order: its `NSScreenNumber`, or `None` where that cannot be read.
+/// `captured` is the display the capture shares, `CGMainDisplayID()`. The
+/// index of the first screen with that id, or `None` when no screen has it
+/// (and with no screens): then the frame marks `NSScreen::mainScreen`, as
+/// before #4392.
+#[cfg(any(target_os = "macos", test))]
+fn captured_screen(screens: &[Option<u32>], captured: u32) -> Option<usize> {
+    screens.iter().position(|&id| id == Some(captured))
+}
+
 /// FR-27 P9 — the red frame round the screen while a session is up: the
 /// native Windows border's 2 px, as four click-through strips (no layer, no
 /// transparency: an opaque strip needs nothing beyond what `indicator/mac.rs`
@@ -576,14 +589,21 @@ fn frame_strips(
 /// our macOS capture is `CGDisplayStream`, which ignores
 /// `NSWindowSharingNone` (the operator's call, 2026-10-06: ship it anyway).
 ///
-/// #4376 — it runs round the main screen as that screen is now. Each show
-/// lays the strips out from it, and while the frame is up an observer lays
-/// them out again at each change of a display's mode, the arrangement or the
-/// set of displays. display-match (FR-108) switches the mode at a session's
+/// #4376 — it runs round its screen as that screen is now. Each show lays
+/// the strips out from it, and while the frame is up an observer lays them
+/// out again at each change of a display's mode, the arrangement or the set
+/// of displays. display-match (FR-108) switches the mode at a session's
 /// start and hands it back later. Until #4376 the strips were laid out once a
 /// process, at the frame's first show: one first shown during display-match
 /// stayed at 400 × 300 pt in a corner after the hand-back, and for every
 /// later session, until the companion restarted.
+///
+/// #4392 — its screen is the one the capture shares: the main display, the
+/// menu bar's (`CGMainDisplayID()`, which scrap's `Display::primary()`
+/// opens), found among `NSScreen::screens` by display id. Until #4392 it was
+/// `NSScreen::mainScreen`, the screen of the window with the keyboard focus:
+/// with that window on a second screen, the frame marked a screen the viewer
+/// did not see.
 #[cfg(target_os = "macos")]
 mod frame {
     use std::cell::RefCell;
@@ -594,19 +614,21 @@ mod frame {
     // — load-bearing import.
     use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     // `NSApplicationDidChangeScreenParametersNotification` is behind
-    // objc2-app-kit's `NSApplication` feature, which tauri's window layer
-    // (tao) turns on in this build; the Foundation half (the notification
+    // objc2-app-kit's `NSApplication` feature, which this crate's manifest
+    // names (tao turns it on too); the Foundation half (the notification
     // centre) comes with this crate's own `NSScreen` and `NSWindow` features.
     use objc2_app_kit::{
         NSApplicationDidChangeScreenParametersNotification, NSBackingStoreType, NSColor, NSScreen,
         NSScreenSaverWindowLevel, NSWindow, NSWindowCollectionBehavior, NSWindowSharingType,
         NSWindowStyleMask,
     };
-    use objc2_foundation::{NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize};
+    use objc2_foundation::{
+        NSNotification, NSNotificationCenter, NSNumber, NSPoint, NSRect, NSSize, NSString,
+    };
     use roomler_node_core::consent_screen::Frame;
     use tauri::{AppHandle, Runtime};
 
-    use super::{FRAME_BORDER, frame_strips};
+    use super::{FRAME_BORDER, captured_screen, frame_strips};
 
     /// The frame's state. Only the main thread touches it, so it lives in
     /// that thread's thread-local, for the companion process's whole life.
@@ -662,11 +684,12 @@ mod frame {
         });
     }
 
-    /// #4376 — the strips round the main screen as it is now, ordered front:
-    /// built the first time, moved every later time. With no screen to read
-    /// they keep their last place, and the next screen change lays them out.
+    /// #4376 — the strips round the screen the frame marks (`marked_screen`,
+    /// #4392) as it is now, ordered front: built the first time, moved every
+    /// later time. With no screen to read they keep their last place, and
+    /// the next screen change lays them out.
     fn put_up(mtm: MainThreadMarker, strips: &mut Vec<Retained<NSWindow>>) {
-        if let Some(screen) = NSScreen::mainScreen(mtm) {
+        if let Some(screen) = marked_screen(mtm) {
             let f = screen.frame();
             let screen = Frame {
                 x: f.origin.x,
@@ -688,6 +711,43 @@ mod frame {
         for s in strips.iter() {
             s.orderFrontRegardless();
         }
+    }
+
+    // #4392 — the display the capture shares (scrap's `Display::primary()`),
+    // declared as the daemon declares it (`capture/refresh.rs`,
+    // `display_match.rs`).
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+    }
+
+    /// #4392 — the screen the frame marks: the one the capture shares, the
+    /// main display (`CGMainDisplayID()`), picked from `NSScreen::screens` by
+    /// display id (`captured_screen`). Where no screen has that id,
+    /// `NSScreen::mainScreen`, as before #4392; with no screen at all, none.
+    /// `NSScreen::screens` and `deviceDescription` are nonnull in AppKit's
+    /// headers, so neither read panics inside the screen-change call.
+    fn marked_screen(mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
+        let screens = NSScreen::screens(mtm).to_vec();
+        let ids: Vec<Option<u32>> = screens.iter().map(|s| display_id(s)).collect();
+        // SAFETY: no arguments, no failure mode.
+        let captured = unsafe { CGMainDisplayID() };
+        captured_screen(&ids, captured)
+            .and_then(|i| screens.into_iter().nth(i))
+            .or_else(|| NSScreen::mainScreen(mtm))
+    }
+
+    /// #4392 — a screen's display id: the `NSScreenNumber` entry of its
+    /// `deviceDescription`, an `NSNumber` holding its `CGDirectDisplayID`.
+    /// `None` where the entry is missing or is not a number.
+    fn display_id(screen: &NSScreen) -> Option<u32> {
+        let key = NSString::from_str("NSScreenNumber");
+        let number = screen
+            .deviceDescription()
+            .objectForKey(&key)?
+            .downcast::<NSNumber>()
+            .ok()?;
+        Some(number.unsignedIntValue())
     }
 
     define_class!(
@@ -732,7 +792,7 @@ mod frame {
     }
 
     /// #4376 — a screen changed: while the frame is up, lay it out again
-    /// round the main screen as it is now. Nothing here may panic, because
+    /// round the screen it marks as it is now. Nothing here may panic, because
     /// it runs inside AppKit's call: the state is tried, never taken. Off the
     /// main thread (AppKit posts this on it) it does nothing, and the next
     /// show lays the frame out.
@@ -1554,5 +1614,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #4392 — two displays' ids, as `NSScreenNumber` and `CGMainDisplayID()`
+    /// give them. Neither is 0 or 1, the indexes of a two-screen list, so an
+    /// index taken for an id fails here.
+    const CAPTURED: u32 = 69_733_632;
+    const OTHER: u32 = 724_061_396;
+
+    /// #4392 — a Mac with one screen: the frame marks it when it is the
+    /// captured display, whatever that display's id (the built-in panel, or
+    /// an external display with the lid closed).
+    #[test]
+    fn with_one_screen_the_frame_marks_it_when_it_is_the_captured_display() {
+        assert_eq!(captured_screen(&[Some(CAPTURED)], CAPTURED), Some(0));
+        assert_eq!(captured_screen(&[Some(OTHER)], OTHER), Some(0));
+    }
+
+    /// #4392 — a Mac with two screens: the frame marks the captured display
+    /// whether `NSScreen::screens` lists it first or second. Which screen
+    /// holds the focused window is no input, so it cannot move the frame. A
+    /// screen whose id cannot be read keeps its place in the list, so the
+    /// index still names the captured display's screen.
+    #[test]
+    fn of_two_screens_the_frame_marks_the_captured_display_listed_first_or_second() {
+        assert_eq!(
+            captured_screen(&[Some(CAPTURED), Some(OTHER)], CAPTURED),
+            Some(0)
+        );
+        assert_eq!(
+            captured_screen(&[Some(OTHER), Some(CAPTURED)], CAPTURED),
+            Some(1)
+        );
+        assert_eq!(captured_screen(&[None, Some(CAPTURED)], CAPTURED), Some(1));
+    }
+
+    /// #4392 — no screen has the captured display's id (one went away
+    /// between the two reads, or no id could be read): none, and the frame
+    /// marks `NSScreen::mainScreen`, as before. A screen whose id cannot be
+    /// read never matches, not even a captured id of 0.
+    #[test]
+    fn a_captured_display_no_screen_has_gives_none_and_the_main_screen_stands_in() {
+        assert_eq!(captured_screen(&[Some(OTHER)], CAPTURED), None);
+        assert_eq!(
+            captured_screen(&[Some(OTHER), Some(OTHER + 1)], CAPTURED),
+            None
+        );
+        assert_eq!(captured_screen(&[None, Some(OTHER)], CAPTURED), None);
+        assert_eq!(captured_screen(&[None], 0), None);
+    }
+
+    /// #4392 — with no screens there is none to mark. `NSScreen::mainScreen`
+    /// has none either then, and the frame keeps its strips where they were.
+    #[test]
+    fn with_no_screens_there_is_no_screen_to_mark() {
+        assert_eq!(captured_screen(&[], CAPTURED), None);
+        assert_eq!(captured_screen(&[], 0), None);
     }
 }
