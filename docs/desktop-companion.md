@@ -3291,6 +3291,13 @@ the same two lanes as `frame_strips`'s. No test reaches AppKit, so the rest is a
 with two screens, one session started with the focused window on each screen in turn and the
 frame on the menu bar's screen both times, and a one-screen Mac, unchanged.
 
+One case stays open. If the main display changes during a session (the menu bar moved to another
+display in System Settings), the frame moves to the new main display at that screen change, but
+the capture keeps the display it opened (`agents/roomlerd/src/capture/scrap_backend.rs:170`,
+`crates/vendored/scrap/src/quartz/capturer.rs:54-55`) until it opens again: at an encode-box
+change (`scrap_backend.rs:337-339`) or at the next session. Until then the viewer sees the old
+main display while the frame marks the new one.
+
 Kill switches, each on its own: `ROOMLER_DESKTOP_BANNER_AUTOHIDE=0` (the banner stays, as
 before P9) and `ROOMLER_DESKTOP_FRAME=0` (no frame).
 
