@@ -138,7 +138,7 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:2498–2610`, parser `peer.rs:11194–11267`): `frames_lost`
+`decodeStatWireMessage` `useRemoteControl.ts:2498–2611`, parser `peer.rs:11194–11267`): `frames_lost`
 (chunk gaps, already in `rc-dc-worker.ts:459`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:106–145` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of
@@ -245,7 +245,7 @@ and in the FR-35 memory key (`peer.rs:4819` → `"{ip}|{class}"`, which fixes "a
 onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–34`
 has only `Relay`) so DERP / TURN / org relay are distinguishable. Mitigation for the one path lost
 (proxy-only egress, 443 only): a `turns:` listener on 443 on coturn, or the loopback-TURN opt-in.
-Update `docs/multi-org.md:623–624` (its "ICE never gathers on roomler-*" is true only on Linux) and
+Update `docs/multi-org.md:628–629` (its "ICE never gathers on roomler-*" is true only on Linux) and
 `docs/overlay-nat-traversal.md` with the rule.
 
 **Field verification** (CORPLAP-1 multi-org with the VPN on; CORPLAP-3 LAN): `ICE: gathered local

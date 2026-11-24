@@ -2505,6 +2505,7 @@ export function decodeStatWireMessage(
   media?: Partial<ViewerMediaWindow> | null,
   queueArrMs?: number | null,
   relay?: string | null,
+  kf?: unknown,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
   const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
@@ -2608,6 +2609,18 @@ export function decodeStatWireMessage(
   // of any version reads this message's keys by name, so an older one
   // ignores it.
   if (relay === 'udp' || relay === 'tcp' || relay === 'tls') msg.relay = relay
+  // FR-148 P4b-5a — the key frames the decode worker completed whole on
+  // `video-bytes` and on `video-deadline`, from the session's start, as it
+  // counted them: exactly two non-negative integers, and no key otherwise (an
+  // unframed session's worker counts none). The agent keeps the newest for its
+  // `path delivery` line (`viewer_kf`); an older one ignores it.
+  if (
+    Array.isArray(kf) &&
+    kf.length === 2 &&
+    kf.every((n) => typeof n === 'number' && Number.isInteger(n) && n >= 0)
+  ) {
+    msg.kf = kf.map((n: number) => Math.min(n, Number.MAX_SAFE_INTEGER))
+  }
   // FR-132 P1 — this viewer counts its decode errors (one `rc:decode-error`
   // each, `decodeErrorWireMessage`), so the agent reports the session's count
   // and a zero is a measured one. An older viewer sends no `de`, and its
@@ -7923,13 +7936,14 @@ export function useRemoteControl(
     arrival?: { avgMs: number } | null,
     media?: Partial<ViewerMediaWindow> | null,
     queueArrMs?: number | null,
+    kf?: unknown,
   ) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
       ch.send(
         JSON.stringify(
-          decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media, queueArrMs, statsRelay),
+          decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media, queueArrMs, statsRelay, kf),
         ),
       )
     } catch {
@@ -7960,6 +7974,9 @@ export function useRemoteControl(
     queueArrMs?: number | null
     /** FR-135 R0 — the worker's window for the agent (`rc-media-window.ts`). */
     media?: Partial<ViewerMediaWindow> | null
+    /** FR-148 P4b-5a — the key frames completed whole by channel, on a framed
+     *  session's stats alone. */
+    kf?: unknown
   }) {
     const drops = typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0
     const delta = Math.max(0, drops - lastBacklogDrops)
@@ -8008,6 +8025,8 @@ export function useRemoteControl(
       media,
       // FR-135 R3 — rides alone; `decodeStatWireMessage` sends it only when counted.
       typeof m.queueArrMs === 'number' ? m.queueArrMs : null,
+      // FR-148 P4b-5a — as it came; `decodeStatWireMessage` keeps two counts or none.
+      m.kf,
     )
   }
 

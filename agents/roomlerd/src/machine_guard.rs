@@ -9,7 +9,10 @@
 //! (`instance_lock`) is the config's, so it guards none of them. This guard is
 //! the machine's, keyed by the overlay interface's name ([`KEY`]), and `run`
 //! takes it before that lock and before anything host-global
-//! (`app::start_gate`).
+//! (`app::start_gate`). For the Windows service's own worker running as
+//! SYSTEM, which holds it, the guard alone decides that the worker runs; that
+//! worker still takes the lock, so every other start finds it as before
+//! ([`relaxes_config_lock`], #4403).
 //!
 //! Only a privileged daemon (SYSTEM or an elevated administrator on Windows,
 //! root on Linux and macOS) can hold the machine's guard; an unprivileged start
@@ -293,18 +296,55 @@ pub async fn take_waiting<F: Future<Output = ()>>(
     }
 }
 
-/// The guard this process holds, until it exits.
-static HELD: std::sync::OnceLock<Guard> = std::sync::OnceLock::new();
+/// What [`hold_here`] did with the machine's guard, for `run`'s gate
+/// (`app::start_gate`) to read. A guard that another daemon holds is
+/// `hold_here`'s `Err` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// This process holds it, taken under this privilege.
+    Taken(Privilege),
+    /// An unprivileged check found that no privileged daemon holds it.
+    Free,
+    /// This run takes no guard ([`Action::Skip`]).
+    Skipped,
+    /// It could not be taken or read, and this run goes on without it
+    /// ([`UNAVAILABLE`]).
+    Unavailable,
+}
+
+/// #4403 — the predicate: whether the machine's guard, rather than this config's
+/// single-instance lock, decides that this run goes on. True only for the
+/// Windows service's own worker running as SYSTEM that holds the guard: the
+/// guard already makes it the only privileged daemon of the machine. That
+/// worker still takes the lock whenever it can and holds it for its life
+/// (`instance_lock::acquire_beside_guard`), so every other start finds it as
+/// before. Every other run keeps the lock exactly as it was, Linux and macOS
+/// included: an elevated administrator, a run whose guard was unavailable, an
+/// unprivileged run, and a run under any other supervisor.
+pub fn relaxes_config_lock(platform: Platform, supervision: Supervision, hold: Hold) -> bool {
+    matches!(
+        (platform, supervision, hold),
+        (
+            Platform::Windows,
+            Supervision::WindowsScm,
+            Hold::Taken(Privilege::System)
+        )
+    )
+}
+
+/// The guard this process holds, until it exits, and the privilege it was
+/// taken under.
+static HELD: std::sync::OnceLock<(Guard, Privilege)> = std::sync::OnceLock::new();
 
 /// `run`'s guard, before anything host-global (#4280): take it, check it or
 /// skip it, as [`action`] says for this process's token, waiting as
 /// [`waits`] says for `supervision`. `Err` = another daemon of this machine
 /// holds it, and this run leaves (`daemon_error::MachineHeld`, the
-/// single-instance lock's exit code). Every other answer goes on: a guard taken
-/// stays held until the process exits.
-pub async fn hold_here(supervision: Supervision) -> Result<(), crate::daemon_error::MachineHeld> {
-    if HELD.get().is_some() {
-        return Ok(());
+/// single-instance lock's exit code). Every other answer goes on and says what
+/// it did ([`Hold`]): a guard taken stays held until the process exits.
+pub async fn hold_here(supervision: Supervision) -> Result<Hold, crate::daemon_error::MachineHeld> {
+    if let Some((_, privilege)) = HELD.get() {
+        return Ok(Hold::Taken(*privilege));
     }
     let privilege = privilege_here();
     let claim = match action(PLATFORM, privilege) {
@@ -324,10 +364,10 @@ pub async fn hold_here(supervision: Supervision) -> Result<(), crate::daemon_err
 }
 
 /// What `run` does with a claim, and its one log line.
-fn settle(claim: Claim, privilege: Privilege) -> Result<(), crate::daemon_error::MachineHeld> {
+fn settle(claim: Claim, privilege: Privilege) -> Result<Hold, crate::daemon_error::MachineHeld> {
     match claim {
         Claim::Taken(guard) => {
-            if let Err(guard) = HELD.set(guard) {
+            if let Err((guard, _)) = HELD.set((guard, privilege)) {
                 // Never: `hold_here` returns first when one is held. Kept, not
                 // dropped, so nothing here ever releases a guard.
                 std::mem::forget(guard);
@@ -337,7 +377,7 @@ fn settle(claim: Claim, privilege: Privilege) -> Result<(), crate::daemon_error:
                 ?privilege,
                 "machine guard taken: this process is the daemon of this machine until it exits"
             );
-            Ok(())
+            Ok(Hold::Taken(privilege))
         }
         Claim::Held => {
             tracing::warn!(
@@ -355,7 +395,7 @@ fn settle(claim: Claim, privilege: Privilege) -> Result<(), crate::daemon_error:
                 "machine guard: no privileged daemon holds this machine; this unprivileged run \
                  checked it and takes nothing"
             );
-            Ok(())
+            Ok(Hold::Free)
         }
         Claim::Skipped => {
             tracing::info!(
@@ -364,11 +404,11 @@ fn settle(claim: Claim, privilege: Privilege) -> Result<(), crate::daemon_error:
                 "machine guard: not taken by a non-root run, which cannot touch the overlay \
                  interface, its routes, DNS or the packet filter"
             );
-            Ok(())
+            Ok(Hold::Skipped)
         }
         Claim::Unavailable(why) => {
             tracing::warn!(key = KEY, ?privilege, %why, "{}", UNAVAILABLE);
-            Ok(())
+            Ok(Hold::Unavailable)
         }
     }
 }
@@ -1092,6 +1132,88 @@ mod tests {
             assert!(waits(supervision), "{supervision:?}");
         }
         assert!(!waits(Supervision::None));
+    }
+
+    /// #4403 — the predicate, as a table: only the Windows service's own worker
+    /// running as SYSTEM that holds the guard is decided by the guard alone.
+    /// Each input negated in turn (the platform, the privilege the guard was
+    /// taken under, what the run did with the guard, the supervisor) leaves the
+    /// config's lock deciding.
+    #[test]
+    fn only_the_service_system_worker_holding_the_guard_relaxes_the_config_lock() {
+        use Platform::{Unix, Windows};
+        use Privilege::{Elevated, Root, System, Unknown, Unprivileged};
+        let unit = crate::supervision::SystemdUnit {
+            name: "roomlerd.service",
+            user: false,
+        };
+        let scm = Supervision::WindowsScm;
+        for (platform, supervision, hold, want) in [
+            (Windows, scm, Hold::Taken(System), true),
+            // The platform.
+            (Unix, scm, Hold::Taken(System), false),
+            // The privilege the guard was taken under.
+            (Windows, scm, Hold::Taken(Elevated), false),
+            (Windows, scm, Hold::Taken(Root), false),
+            (Windows, scm, Hold::Taken(Unprivileged), false),
+            (Windows, scm, Hold::Taken(Unknown), false),
+            // What the run did with the guard.
+            (Windows, scm, Hold::Unavailable, false),
+            (Windows, scm, Hold::Free, false),
+            (Windows, scm, Hold::Skipped, false),
+            // The supervisor.
+            (
+                Windows,
+                Supervision::WindowsTask,
+                Hold::Taken(System),
+                false,
+            ),
+            (
+                Windows,
+                Supervision::Systemd(unit),
+                Hold::Taken(System),
+                false,
+            ),
+            (Windows, Supervision::Launchd, Hold::Taken(System), false),
+            (
+                Windows,
+                Supervision::MacosSupervisor,
+                Hold::Taken(System),
+                false,
+            ),
+            (Windows, Supervision::None, Hold::Taken(System), false),
+        ] {
+            assert_eq!(
+                relaxes_config_lock(platform, supervision, hold),
+                want,
+                "{platform:?} {supervision:?} {hold:?}"
+            );
+        }
+    }
+
+    /// #4403 — what `hold_here` says for each claim it settles. A guard another
+    /// daemon holds is its `Err`. (A claim that took the guard says `Taken` with
+    /// its privilege; settling one stores the guard for the whole process, so
+    /// that row is not run here.)
+    #[test]
+    fn each_claim_settles_to_what_the_run_did() {
+        for (claim, privilege, want) in [
+            (Claim::Free, Privilege::Unprivileged, Hold::Free),
+            (Claim::Skipped, Privilege::Unprivileged, Hold::Skipped),
+            (
+                Claim::Unavailable("a test".into()),
+                Privilege::System,
+                Hold::Unavailable,
+            ),
+            (
+                Claim::Unavailable("a test".into()),
+                Privilege::Elevated,
+                Hold::Unavailable,
+            ),
+        ] {
+            assert_eq!(settle(claim, privilege).ok(), Some(want), "{privilege:?}");
+        }
+        assert!(settle(Claim::Held, Privilege::System).is_err());
     }
 
     /// A clock the test moves: each sleep advances it, and every try is counted.

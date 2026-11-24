@@ -4366,7 +4366,7 @@ async fn media_pump_vp9_444_dc(
                             unsent.sent(end - off); // FR-148 D46
                             off = end;
                         }
-                        if ok {
+                        if lane.written(&out, ok) {
                             frames_sent.fetch_add(1, Relaxed);
                             bytes_written.fetch_add(total as u64, Relaxed);
                             goodput_sink.record_frame(
@@ -7420,7 +7420,7 @@ async fn media_pump_ffmpeg_dc(
                             unsent.sent(end - off); // FR-148 D46
                             off = end;
                         }
-                        if ok {
+                        if lane.written(&out, ok) {
                             frames_sent.fetch_add(1, Relaxed);
                             bytes_written.fetch_add(total as u64, Relaxed);
                             // Only a frame that reached the wire measures the

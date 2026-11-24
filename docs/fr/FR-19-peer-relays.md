@@ -482,9 +482,9 @@ in P3c, after the identity gates, so a refusal is attributable and audited.
 
 **Multi-org: relay serving is PRIMARY-ORG ONLY, enforced.** ⚠️ The first draft said a device
 *"may serve N tenants"* and, two sentences later, that it *"should follow"* the primary-only
-rule. `docs/multi-org.md:537-538` keeps exit-node roles primary-only because they are
+rule. `docs/multi-org.md:542-543` keeps exit-node roles primary-only because they are
 **host-global singletons**; a UDP listener on a host-global port is exactly that. And
-`:222-223` adds the trust half for `rc:agent.update`: *"a secondary org's admin must not be
+`:227-228` adds the trust half for `rc:agent.update`: *"a secondary org's admin must not be
 able to force-update a shared binary"* — a secondary org's admin minting sessions onto the
 device owner's listener is the same escalation. Refuse the mint server-side for a
 secondary-org node, and drop a relay grant arriving on a secondary org's WS agent-side.
@@ -706,7 +706,7 @@ never have measured, and an unmeasured capability is `None`, never `false` (`Cap
 `crates/remote_control/src/signaling.rs:3533-3537`).
 ⚠️ `relay_server` must resolve from **the requesting tenant's own node row**. A multi-org
 device has N per-tenant rows with independently-set names; resolving from any other would
-leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:139-141`.
+leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:144-146`.
 It does: the name is the one this network's netmap gives the relay node
 (`crates/tunnel-core/src/overlay/runtime.rs:3302`, `:4484`), and the netmap takes it from that
 network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:3187-3191`). A
