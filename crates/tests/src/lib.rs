@@ -127,6 +127,11 @@ mod device_diagnostics_tests;
 mod device_list_tests;
 #[cfg(test)]
 mod device_naming_tests;
+/// #3565 — a device row's version is its daemon's own: an enrollment stores
+/// the program that enrolled, in a field of its own, and a pin to a row with
+/// no reported version is refused unless it is forced.
+#[cfg(test)]
+mod device_version_tests;
 #[cfg(test)]
 mod enroll_key_tests;
 /// An enrollment credential works only while the person who minted it may

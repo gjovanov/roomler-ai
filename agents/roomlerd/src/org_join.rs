@@ -30,7 +30,9 @@ use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use crate::config::{AgentConfig, OrgEntry, OrgOverlayMode};
-use crate::enrollment::{EnrollInputs, EnrollOutcome, apply_enrollment};
+use crate::enrollment::{
+    EnrollInputs, EnrollOutcome, EnrollingProgram, EnrollingProgramName, apply_enrollment,
+};
 
 /// What `run_cmd` hands over so a join arriving hours later can write the
 /// config the daemon actually loaded and start a supervisor for the result.
@@ -126,6 +128,8 @@ pub async fn join_org(
         // already installed; the binary's own install trace is not known
         // here, and the new row records `unknown` honestly.
         install: None,
+        // #3565 — the daemon joins the org itself, so it names itself.
+        program: EnrollingProgram::new(EnrollingProgramName::Roomlerd, env!("CARGO_PKG_VERSION")),
     })
     .await
     .context("exchanging the pushed enrollment token")?;

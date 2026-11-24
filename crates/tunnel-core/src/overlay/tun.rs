@@ -6286,18 +6286,7 @@ mod system {
                         super::note_subnet_holder(&mut held, cidr, true)
                     };
                     if named {
-                        let holder = if on.is_empty() {
-                            "unnamed"
-                        } else {
-                            on.as_str()
-                        };
-                        tracing::info!(
-                            %cidr, dev = %self.if_name, %holder,
-                            "overlay: another route holds this subnet's prefix (a sibling \
-                             org's adapter, another product or the host's own LAN). The \
-                             route guard leaves it, and puts ours back only once the prefix \
-                             is free; the router peer's next carrier install takes it back."
-                        );
+                        say_subnet_held(cidr, &self.if_name, &on);
                     }
                     Ok(())
                 }
@@ -6310,6 +6299,25 @@ mod system {
                 }
             }
         }
+    }
+
+    /// #4279 — the INFO that names another route holding a subnet's prefix,
+    /// said once per hold ([`super::note_subnet_holder`]). `on` is the
+    /// interface that holds it, empty when the OS did not say. #4380 — on the
+    /// route guard's own target ([`crate::overlay::ROUTE_GUARD_LOG`]), which
+    /// the daemon keeps at INFO under every `RUST_LOG`, the packaged Linux
+    /// units' included.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn say_subnet_held(cidr: &str, dev: &str, on: &str) {
+        let holder = if on.is_empty() { "unnamed" } else { on };
+        tracing::info!(
+            target: crate::overlay::ROUTE_GUARD_LOG,
+            %cidr, %dev, %holder,
+            "overlay: another route holds this subnet's prefix (a sibling \
+             org's adapter, another product or the host's own LAN). The \
+             route guard leaves it, and puts ours back only once the prefix \
+             is free; the router peer's next carrier install takes it back."
+        );
     }
 
     #[async_trait]
@@ -12555,5 +12563,49 @@ mod macos_kernel_tests {
             panic!("TCP to {own}: {e} (segments handed back {handed})");
         }
         assert!(handed > 0, "its segments go through the hand-back");
+    }
+}
+
+/// #4380 — the INFO that names a subnet's other holder is said on the route
+/// guard's own target, which the daemon keeps at INFO under every `RUST_LOG`
+/// (`roomler_node_core::logging::filter_for`), where the packaged Linux units'
+/// spec drops this module's INFO. Pure: no device, no route is touched.
+#[cfg(all(
+    test,
+    feature = "overlay-l3",
+    any(target_os = "linux", target_os = "macos")
+))]
+mod subnet_held_line_tests {
+    use super::system::say_subnet_held;
+
+    /// It names the holder, or `unnamed` when the OS did not say, in the
+    /// words the cells under `route -n monitor` read.
+    #[test]
+    fn a_held_prefix_is_named_on_the_route_guards_target() {
+        const HELD: &str = "another route holds this subnet's prefix";
+        let (lines, _guard) = crate::overlay::said::Lines::start();
+        say_subnet_held("10.1.0.0/16", "roomler0", "eth0");
+        say_subnet_held("192.168.50.0/24", "roomler0", "");
+        let said = lines.with(HELD);
+        assert_eq!(said.len(), 2, "{said:?}");
+        for line in &said {
+            assert_eq!(
+                line.target, "tunnel_core::overlay::route_guard",
+                "the target roomler_node_core's filter_for appends at INFO: {line:?}"
+            );
+            assert_eq!(line.level, tracing::Level::INFO, "{line:?}");
+        }
+        assert!(
+            said[0]
+                .text
+                .contains("cidr=10.1.0.0/16 dev=roomler0 holder=eth0"),
+            "{said:?}"
+        );
+        assert!(
+            said[1]
+                .text
+                .contains("cidr=192.168.50.0/24 dev=roomler0 holder=unnamed"),
+            "{said:?}"
+        );
     }
 }

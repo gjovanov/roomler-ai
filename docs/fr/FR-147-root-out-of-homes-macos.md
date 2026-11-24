@@ -206,7 +206,7 @@ with "nothing has changed" (exit 1).
 | R1 | `<L>` is not writable by the person, and the plan removes `<P>` (#3763) | the administrator's line where it fits (below), else the no-command text |
 | R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3846's administrator's command where the package's rule fits (`move_aside`, `macos_supervisor.rs:638-763`: a `sudo mv` of `<F>` aside, then a restart), built from the child's report (`folder_not_theirs`, `:1061`), else its words without a command. No command the person runs can move `<F>`: macOS lets no account rename a directory another account owns. Whether anything replaces it is D8 |
 | R3 | the config exists and the person cannot read it (a copy of root's, mode 600) | the administrator's line for that file where it fits, else the no-command text |
-| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2: an administrator's command or words, never one for the person. Without R4 the worker's first save (`app.rs:4081`) fails after the restart, and the conversion undoes itself |
+| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2: an administrator's command or words, never one for the person. Without R4 the worker's first save (`app.rs:4091`) fails after the restart, and the conversion undoes itself |
 | R5 | the console person has `com.roomler.agent` loaded but is not a person to convert | no command; it says why that person was left alone (the verify would fail after the restart) |
 
 **A command for an administrator is printed only for the console administrator's own home**, when all of these
@@ -237,7 +237,7 @@ That section is `docs/installation.md:3273`; P1 adds one-row's row to it. The li
 
 An ephemeral row ([FR-51](../ephemeral-nodes.md)) is refused before anything changes (#4312, ruled 2026-11-23).
 One-row stops the half that holds it, the root half at its restart and a person's at the bootout, and on such a
-stop an ephemeral row deletes itself (`agents/roomlerd/src/app.rs:5904-5971`, by
+stop an ephemeral row deletes itself (`agents/roomlerd/src/app.rs:5914-5981`, by
 `updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`). One-row does not mark its own stops,
 as the updater's `update-attempt` marker does (#1683): a retired row stays offline for as long as the Mac stays
 one row, and the server's reaper deletes an offline ephemeral row however it stopped.
@@ -248,7 +248,7 @@ one row, and the server's reaper deletes an offline ephemeral row however it sto
 | A person's primary that the root half does not hold | move it, though it lives only with the half that enrolled it. Refused before #4312 too | the same |
 | The root half's primary | stop the daemon that holds it, at the restart and again at the undo's | `migrate` (`one_row.rs:1770-1772`), with `ephemeral_root` (`:716`), once the plan has something to do. A Mac that is one row already restarts nothing and still reads "nothing to do" (`:1758-1766`) |
 | Root's file that `--revert` restarts onto | stop the daemon at that restart, whose stop reads root's file as it is by then, the one put back | `revert_main` (`one_row.rs:3195-3197`), with `ephemeral_revert` (`:3137`): root's kept copy where there is one, since it goes back first, else root's own file |
-| An `[[orgs]]` entry, a person's or the root's | nothing new | not refused. An entry has no `ephemeral` (`OrgEntry`, `crates/agent-core/src/config.rs:1970-2028`), an enrollment appended as one is built without it (`crates/agent-core/src/enrollment.rs:929-959`), and the stop deletes only the primary's row (`agents/roomlerd/src/app.rs:5952`) |
+| An `[[orgs]]` entry, a person's or the root's | nothing new | not refused. An entry has no `ephemeral` (`OrgEntry`, `crates/agent-core/src/config.rs:1970-2028`), an enrollment appended as one is built without it (`crates/agent-core/src/enrollment.rs:956-986`), and the stop deletes only the primary's row (`agents/roomlerd/src/app.rs:5962`) |
 
 Each comes before Keep, so no file is written and launchd is asked nothing, and `--dry-run` refuses the same way.
 A person's line comes from the pure `plan`, before the plan is said. The root half's comes after it, beside R1 to R5,
@@ -257,12 +257,12 @@ and `--revert`'s after its own plan.
 Each line ends with the way on: remove the row on the Devices page, then enroll that half again with a key that is
 not ephemeral. The same file serves. Since #4331 an enrollment that folds into a file keeps the file's settings and
 takes `ephemeral` from the server's answer, which is the row's (`preserve_operator_config`,
-`crates/agent-core/src/enrollment.rs:1022-1035`; the answer, `crates/modules/fleet/src/agent.rs:468`). The row goes
+`crates/agent-core/src/enrollment.rs:1049-1062`; the answer, `crates/modules/fleet/src/agent.rs:493`). The row goes
 first because a live ephemeral row stays ephemeral when a standard token enrolls over it (`OVER_EPHEMERAL`,
 `one_row.rs:712`; [`ephemeral-nodes.md`](../ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)). Until
 #4331 the way on was a new config, since a fold kept the old file's flag. The line before #4312 also offered
 "unenroll it first" and "enroll the root half there", and neither gets past it: no command takes an enrollment out
-of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5973-5976`), and an org
+of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5983-5986`), and an org
 the root half holds is refused too.
 
 | Case | The line, after `Error: ` (exit 1) |
@@ -738,9 +738,9 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
   person's config (`config.rs:3652-3699`) could bring it back. #4184 fixed that for every conversion from its release
   on: `convert` keeps the new config as its `.prev` too ("Refusals at convert"). Left out of #4184, each named: a
   Mac converted before it keeps the enrolled `.prev` until that person's next save rotates the new file in, which
-  for the console person is the screen worker's clean-run save five minutes in (`app.rs:5722`), while a person not
+  for the console person is the screen worker's clean-run save five minutes in (`app.rs:5732`), while a person not
   at the console has no writer; on such a Mac, with `macos_one_row` turned off by hand, the supervisor's enrolled
-  worker that finds a config there that does not load restores that `.prev` through `app.rs:4089` and runs the
+  worker that finds a config there that does not load restores that `.prev` through `app.rs:4099` and runs the
   copy, since `may_restore` (`config_at_start.rs:74-85`, #4157) covers only a missing config; and a
   `.prev` beside a person config that is missing, which Read never sees and `convert` leaves. The worker root's
   supervisor starts never restores a missing config at its start (#4157): with `--unenrolled` it writes a blank

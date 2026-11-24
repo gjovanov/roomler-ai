@@ -51,7 +51,9 @@
 use std::path::Path;
 
 use roomlerd::config::{AgentConfig, MergeBase};
-use roomlerd::enrollment::{EnrollInputs, EnrollOutcome, InstallInfo, PreviousRow};
+use roomlerd::enrollment::{
+    EnrollInputs, EnrollOutcome, EnrollingProgram, EnrollingProgramName, InstallInfo, PreviousRow,
+};
 
 use crate::orchestrator_agent::AdvancedOptions;
 
@@ -149,6 +151,7 @@ pub async fn enroll_folded(
             machine_id: &machine_id,
             machine_name: device_name,
             install: Some(install),
+            program: wizard_program(),
         },
     )
     .await?;
@@ -158,6 +161,17 @@ pub async fn enroll_folded(
         Err(e) => Err(roomlerd::enrollment::remove_refused_row(e).await),
         folded => folded,
     }
+}
+
+/// #3565 — every enroll of the wizard names the wizard, with the version it
+/// was built as, which need not be the daemon's it installs. The server keeps
+/// it as how the device was enrolled; the device's version is its daemon's
+/// own, from its hello.
+fn wizard_program() -> EnrollingProgram {
+    EnrollingProgram::new(
+        EnrollingProgramName::RoomlerSetup,
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// #3432 — the wizard's client for an enroll: the one its other requests use
@@ -190,6 +204,7 @@ pub async fn enroll_issued(
             machine_id,
             machine_name: device_name,
             install: Some(install),
+            program: wizard_program(),
         },
     )
     .await
@@ -217,6 +232,7 @@ pub async fn enroll_fresh_as(
             machine_id,
             machine_name: device_name,
             install: Some(install),
+            program: wizard_program(),
         },
     )
     .await?;

@@ -64,7 +64,7 @@ control handler writes from a thread of its own (§3). A daemon's settle runs in
 process and stays outside that lock, as before.
 
 `<log_dir>` is `logging::resolve_log_dir`'s
-(`crates/agent-core/src/logging.rs:1028`): the process's per-user data dir plus
+(`crates/agent-core/src/logging.rs:1040`): the process's per-user data dir plus
 `logs`, except a Windows process with a service role, which logs under
 `%PROGRAMDATA%\Roomler\roomler\service-logs`: the SCM host, the SystemContext
 worker, `netd` and the per-Machine MSI's own steps (`ServiceLogRole`;
@@ -263,7 +263,7 @@ $ roomler status
   the sentence per word, `last_install_line`, `:2966`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:2208`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4408`). `journalctl -u
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4418`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`post_install.rs:2192`): the two quiet states and a watcher

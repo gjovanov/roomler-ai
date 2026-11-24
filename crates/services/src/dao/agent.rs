@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecAnchor,
-    ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, SshPolicy,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, EnrollingProgram,
+    ExecAnchor, ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
@@ -45,6 +45,10 @@ impl AgentDao {
     /// `install` is the enroll request's claim, already clamped by the route
     /// (FR-102 P3); `None` = the request did not say, stored as `unknown` so
     /// a row this code created can be told from one that predates it.
+    ///
+    /// `enrolling_program` (#3565) is the program that enrolled, already
+    /// clamped by the route. The row takes no version: only its daemon's
+    /// hello writes one ([`Self::update_hello`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
@@ -53,7 +57,7 @@ impl AgentDao {
         name: String,
         machine_id: String,
         os: OsKind,
-        agent_version: String,
+        enrolling_program: EnrollingProgram,
         agent_token_hash: String,
         install: Option<InstallInfo>,
     ) -> DaoResult<Agent> {
@@ -63,7 +67,7 @@ impl AgentDao {
             name,
             machine_id,
             os,
-            agent_version,
+            enrolling_program,
             agent_token_hash,
             install,
         );
@@ -85,7 +89,7 @@ impl AgentDao {
         name: String,
         machine_id: String,
         os: OsKind,
-        agent_version: String,
+        enrolling_program: EnrollingProgram,
         key_id: ObjectId,
         ttl_secs: Option<u64>,
         install: Option<InstallInfo>,
@@ -96,7 +100,7 @@ impl AgentDao {
             name,
             machine_id,
             os,
-            agent_version,
+            enrolling_program,
             String::new(),
             install,
         );
@@ -116,7 +120,7 @@ impl AgentDao {
         name: String,
         machine_id: String,
         os: OsKind,
-        agent_version: String,
+        enrolling_program: EnrollingProgram,
         agent_token_hash: String,
         install: Option<InstallInfo>,
     ) -> Agent {
@@ -141,7 +145,9 @@ impl AgentDao {
             // FR-97 P0d — the hello reports it; enrolment never does.
             arch: None,
             arch_emulated: false,
-            agent_version,
+            // #3565 — the daemon's hello reports it; an enrollment never does,
+            // whichever program enrolled. Not reported yet until then.
+            agent_version: None,
             // FR-27 — unknown until the device's first heartbeat, for the same
             // reason as the host key below: enrolment never reaches the machine.
             companion_version: None,
@@ -183,6 +189,8 @@ impl AgentDao {
             // Always `Some` on a row this code creates: `None` is reserved
             // for rows that predate the install trace.
             install: Some(install.unwrap_or_else(InstallInfo::unknown)),
+            // #3565 — how the device was enrolled: the program and its version.
+            enrolling_program: Some(enrolling_program),
             ssh_policy: SshPolicy::default(),
             peer_relay_policy: Default::default(),
             // FR-52 gate 2 closed, and NO connect code. A code is minted on
@@ -231,8 +239,8 @@ impl AgentDao {
     }
 
     /// Refresh a LIVE agent row at re-enrollment time, for a device nobody
-    /// removed (a lost token, a reinstall): update os / agent_version from the
-    /// new enrollment payload, bump `updated_at`. Returns the updated row so
+    /// removed (a lost token, a reinstall): update os and the enrolling
+    /// program from the new enrollment payload, bump `updated_at`. Returns the updated row so
     /// the caller can issue a fresh agent token against it. Everything the
     /// device was allowed stays.
     ///
@@ -251,18 +259,23 @@ impl AgentDao {
     /// SAID how it was installed: a re-enroll by an agent from before P3, or
     /// a `roomlerd re-enroll` (which sends nothing), must not downgrade a
     /// known method to `unknown`.
+    ///
+    /// #3565: the row's version is left as it is. It is its daemon's own,
+    /// written by its hello ([`Self::update_hello`]), whichever program
+    /// enrolls the machine again. `enrolling_program` records the program of
+    /// this enrollment instead.
     pub async fn rehydrate(
         &self,
         agent_id: ObjectId,
         name: &str,
         os: OsKind,
-        agent_version: &str,
+        enrolling_program: &EnrollingProgram,
         install: Option<&InstallInfo>,
     ) -> DaoResult<Agent> {
         let os_bson = bson::to_bson(&os).unwrap_or(bson::Bson::Null);
         let mut set = doc! {
             "os": os_bson,
-            "agent_version": agent_version,
+            "enrolling_program": bson::to_bson(enrolling_program).unwrap_or(bson::Bson::Null),
             "updated_at": DateTime::now(),
         };
         if let Some(install) = install {
@@ -329,7 +342,7 @@ impl AgentDao {
         owner_user_id: ObjectId,
         name: String,
         os: OsKind,
-        agent_version: String,
+        enrolling_program: EnrollingProgram,
         install: Option<InstallInfo>,
     ) -> DaoResult<Option<Agent>> {
         let (Some(id), Some(removed_at)) = (tombstone.id, tombstone.deleted_at) else {
@@ -337,13 +350,15 @@ impl AgentDao {
                 "only a removed row with an id can be revived".to_string(),
             ));
         };
+        // #3565: like a new row, a revived one has no version until its
+        // daemon's hello reports one.
         let mut row = Self::new_row(
             tombstone.tenant_id,
             owner_user_id,
             name,
             tombstone.machine_id.clone(),
             os,
-            agent_version,
+            enrolling_program,
             String::new(),
             install,
         );
@@ -537,6 +552,8 @@ impl AgentDao {
             .await
     }
 
+    /// #3565: the one writer of the row's `agent_version`, from the daemon's
+    /// own hello. An enrollment never writes it.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_hello(
         &self,
