@@ -2859,6 +2859,9 @@ jobs:
       - name: Report (always, so a red run shows WHAT moved)
         if: always()
         run: bash scripts/name-audit.sh --summary
+      - name: Person-facing text says roomlerd, not agent (FR-133 P4)
+        if: ${{ !cancelled() }}
+        run: node scripts/says-roomlerd.cjs --check
 
   frontend:
     name: Frontend checks
