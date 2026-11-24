@@ -429,6 +429,26 @@ pub(super) fn split_default_missing(current: &[crate::overlay::router::Cidr]) ->
     })
 }
 
+/// #3562 — what a client says while its exit serves IPv4 only.
+pub(super) const EXIT_SERVES_V4_ONLY: &str = "the exit serves IPv4 only";
+/// S3b — what a client says while it cannot pin every v6 address of its
+/// coordination server (no v6 uplink to exempt it through).
+pub(super) const NO_V6_EXEMPTION: &str = "no v6 uplink to exempt the coordination server";
+
+/// #3562 — whether global IPv6 routes through the exit: the exit's statement
+/// × whether this client pinned every v6 exemption. An exit that says nothing
+/// (`None`) is from before #3562 and keeps today's rule. Its "no" wins over a
+/// missing pin: it is the stable reason, the one an operator can act on.
+pub(super) fn v6_egress(exit_serves_v6: Option<bool>, v6_pinned: bool) -> Result<(), &'static str> {
+    if exit_serves_v6 == Some(false) {
+        return Err(EXIT_SERVES_V4_ONLY);
+    }
+    if !v6_pinned {
+        return Err(NO_V6_EXEMPTION);
+    }
+    Ok(())
+}
+
 /// P5 — is the chosen exit peer ready to carry this node's default egress?
 /// `Ok((id, np, pubkey))` when it is present in the netmap, admin-APPROVED
 /// (`peer_is_approved_exit`), AND has a live carrier; else `Err(reason)` — the
@@ -479,6 +499,17 @@ pub(super) fn exit_node_status(
         v6_active: state.split_default_installed
             && state.v6_active == Some(true)
             && state.socks5_port.is_none(),
+        // #3562 — and why IPv6 is fail-closed, while IPv4 routes through the
+        // exit. Never from a netstack node: it carries no global IPv6 at all,
+        // and its status already says so.
+        v6_withheld_reason: if state.split_default_installed
+            && state.v6_active != Some(true)
+            && state.socks5_port.is_none()
+        {
+            state.v6_withheld_reason.map(str::to_string)
+        } else {
+            None
+        },
         // S4b — DNS steered through the exit only while v4 egress is active.
         dns_steered: state.split_default_installed && state.dns_steered,
         socks5_port: state.socks5_port,
@@ -594,6 +625,10 @@ pub(super) struct ExitRoutingState {
     /// teardown. Independent of `split_default_installed` (v4) per BLOCKER-1 — v6
     /// never gates v4. Also the transition-log dedup key.
     pub(super) v6_active: Option<bool>,
+    /// #3562 — why v6 is fail-closed ([`v6_egress`]'s answer), for
+    /// `roomler status`. With `v6_active`, the transition-log dedup key; reset
+    /// with it on teardown.
+    pub(super) v6_withheld_reason: Option<&'static str>,
     /// S4b — exit-node DNS steering context + state. `dns_magic_domain`: `Some` =
     /// MagicDNS on (steer "." at the local resolver `dns_target` == self_v4, which
     /// forwards to the network upstream via the exit); `None` = MagicDNS off (steer
@@ -856,21 +891,28 @@ impl OverlayRuntime {
         // (the coordination server's AAAA) is pinned, so the WS-over-v6 control
         // channel stays direct (MAJOR-1). Otherwise `v6_exit=None` keeps the `::/1`
         // routes as a fail-closed blackhole — v6 never leaks, and v4 is unaffected.
-        let v6_ok = want
+        // #3562 — and only when the exit does not say it serves IPv4 only: v6
+        // sent to such an exit went nowhere, silently.
+        let v6_pinned = want
             .iter()
             .filter(|ip| ip.is_ipv6())
             .all(|ip| state.exemptions.contains(ip));
-        if v6_ok {
-            wg.set_v6_exit(Some(exit_pubkey));
-            if state.v6_active != Some(true) {
-                state.v6_active = Some(true);
-                info!(peer = %exit_id, "overlay exit-node: global IPv6 egress now routes through the exit peer");
+        match v6_egress(exit_np.exit_serves_v6, v6_pinned) {
+            Ok(()) => {
+                wg.set_v6_exit(Some(exit_pubkey));
+                state.v6_withheld_reason = None;
+                if state.v6_active != Some(true) {
+                    state.v6_active = Some(true);
+                    info!(peer = %exit_id, "overlay exit-node: global IPv6 egress now routes through the exit peer");
+                }
             }
-        } else {
-            wg.set_v6_exit(None);
-            if state.v6_active != Some(false) {
-                state.v6_active = Some(false);
-                warn!(exit = %selector, "overlay exit-node: IPv6 egress WITHHELD (no v6 uplink to exempt the coordination server) — v6 stays fail-closed while v4 routes through the exit");
+            Err(why) => {
+                wg.set_v6_exit(None);
+                if state.v6_active != Some(false) || state.v6_withheld_reason != Some(why) {
+                    state.v6_active = Some(false);
+                    state.v6_withheld_reason = Some(why);
+                    warn!(exit = %selector, "overlay exit-node: IPv6 egress WITHHELD ({why}) — v6 stays fail-closed while v4 routes through the exit");
+                }
             }
         }
 
@@ -954,6 +996,7 @@ impl OverlayRuntime {
         state.split_default_installed = false;
         state.active_peer = None;
         state.v6_active = None;
+        state.v6_withheld_reason = None;
         info!("overlay exit-node: default routing torn down; egress reverted to the local uplink");
     }
 }

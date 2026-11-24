@@ -95,6 +95,9 @@ pub struct NewOverlayNode {
     /// although the device was configured to offer routes. `None` = offering
     /// as configured.
     pub route_offer_withheld: Option<String>,
+    /// #3562 — the join's word on whether this exit serves IPv6. `None` = an
+    /// older agent, or a node that is no exit: the row keeps it absent.
+    pub exit_serves_v6: Option<bool>,
 }
 
 impl OverlayNodeDao {
@@ -183,6 +186,7 @@ impl OverlayNodeDao {
             supports_org_relay,
             advertised_routes,
             route_offer_withheld,
+            exit_serves_v6,
         } = new;
         let now = DateTime::now();
         let node = OverlayNode {
@@ -229,6 +233,7 @@ impl OverlayNodeDao {
             // P5 — never an exit node until an admin toggles it on.
             is_exit_node: false,
             route_offer_withheld,
+            exit_serves_v6,
             status: AgentStatus::Online,
             last_seen_at: now,
             created_at: now,
@@ -273,10 +278,11 @@ impl OverlayNodeDao {
         supports_org_relay: bool,
         advertised_routes: &[String],
         route_offer_withheld: Option<&str>,
+        exit_serves_v6: Option<bool>,
         retire: Option<&RetiredKey>,
     ) -> DaoResult<OverlayNode> {
         let node_ref_bson = bson::to_bson(node_ref).unwrap_or(bson::Bson::Null);
-        let set = doc! {
+        let mut set = doc! {
             "node_ref": node_ref_bson,
             // Phase 0 — the join handler passes the stable name
             // (existing name reused, or a freshly deduped one when
@@ -343,8 +349,31 @@ impl OverlayNodeDao {
             "updated_at": DateTime::now(),
             "deleted_at": bson::Bson::Null,
         };
+        // #3562 — the exit's IPv6 statement, refreshed with its routes. An
+        // older agent (or a node that is no exit) states nothing: UNSET, so
+        // the row keeps the field absent, never null, and every client of it
+        // keeps the pre-#3562 rule.
+        let mut unset = doc! {};
+        match exit_serves_v6 {
+            Some(v) => {
+                set.insert("exit_serves_v6", v);
+            }
+            None => {
+                unset.insert("exit_serves_v6", "");
+            }
+        }
         if let Some(entry) = retire {
             let entry_bson = bson::to_bson(entry).unwrap_or(bson::Bson::Null);
+            let mut update = doc! {
+                "$set": set.clone(),
+                "$push": { "retired_keys": {
+                    "$each": [entry_bson],
+                    "$slice": -OverlayNode::MAX_RETIRED_KEYS,
+                }},
+            };
+            if !unset.is_empty() {
+                update.insert("$unset", unset.clone());
+            }
             let retired = self
                 .base
                 .update_one(
@@ -353,22 +382,18 @@ impl OverlayNodeDao {
                         "wg_public_key": &entry.public_key,
                         "retired_keys.public_key": { "$ne": &entry.public_key },
                     },
-                    doc! {
-                        "$set": set.clone(),
-                        "$push": { "retired_keys": {
-                            "$each": [entry_bson],
-                            "$slice": -OverlayNode::MAX_RETIRED_KEYS,
-                        }},
-                    },
+                    update,
                 )
                 .await?;
             if retired {
                 return self.base.find_by_id(node_id).await;
             }
         }
-        self.base
-            .update_by_id(node_id, doc! { "$set": set })
-            .await?;
+        let mut update = doc! { "$set": set };
+        if !unset.is_empty() {
+            update.insert("$unset", unset);
+        }
+        self.base.update_by_id(node_id, update).await?;
         self.base.find_by_id(node_id).await
     }
 

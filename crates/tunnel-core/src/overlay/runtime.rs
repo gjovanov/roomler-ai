@@ -1261,8 +1261,13 @@ pub struct OverlayRuntime {
     /// to: the host cannot forward or NAT for the overlay ([`super::nat::gate_offer`],
     /// run at the top of [`Self::run`], before the first join). Sent in the
     /// join and published for `roomler status`. `None` = offering as
-    /// configured.
+    /// configured. #3562 — also why a setup that failed withdrew the offer
+    /// ([`super::nat::OfferTracker`]).
     route_offer_withheld: Option<String>,
+    /// #3562 — whether this exit serves IPv6, as its join states it: `None`
+    /// for a node that offers no default route, or with
+    /// `ROOMLERD_EXIT_V6_STATEMENT=0`.
+    exit_serves_v6: Option<bool>,
     /// Unification P1 — where to publish this node's live overlay view (self
     /// IP + peers with connection type) for the daemon's LocalAPI. `None` in
     /// test / direct mode (nothing reads it there).
@@ -1542,6 +1547,7 @@ impl OverlayRuntime {
             key_epoch: 0,
             advertised_routes: Vec::new(),
             route_offer_withheld: None,
+            exit_serves_v6: None,
             peer_view: None,
             org_primary: false,
             exit_node: None,
@@ -1578,6 +1584,7 @@ impl OverlayRuntime {
             key_epoch: 0,
             advertised_routes: Vec::new(),
             route_offer_withheld: None,
+            exit_serves_v6: None,
             peer_view: None,
             org_primary: false,
             exit_node: None,
@@ -2047,7 +2054,43 @@ impl OverlayRuntime {
             advertised_routes: self.advertised_routes.clone(),
             // FR-97 P0b — and, when we withheld them, why.
             route_offer_withheld: self.route_offer_withheld.clone(),
+            // #3562 — and whether this exit serves IPv6.
+            exit_serves_v6: self.exit_serves_v6,
         }
+    }
+
+    /// #3562 — publish the tracker's offer where the join, the view and the
+    /// ingress scope read it.
+    fn mirror_offer(&mut self, t: &super::nat::OfferTracker) {
+        self.advertised_routes = t.offer().routes.clone();
+        self.route_offer_withheld = t.offer().withheld.clone();
+        self.exit_serves_v6 = t.exit_serves_v6();
+    }
+
+    /// #3562 — run a [`rejoin_plan`] on the live socket. `false` when the
+    /// join itself could not be sent (the session died): the rest still runs,
+    /// as the Reattach arm always did, and the next session's Reattach
+    /// re-joins.
+    async fn run_rejoin_plan(
+        &self,
+        plan: Vec<RejoinStep>,
+        srflx_reattach_tx: &tokio::sync::watch::Sender<u64>,
+        netcheck_next: &mut Instant,
+    ) -> bool {
+        let mut joined = true;
+        for (i, step) in plan.into_iter().enumerate() {
+            match step {
+                RejoinStep::Send(m) => {
+                    let sent = self.outbound.send(*m).await.is_ok();
+                    if i == 0 {
+                        joined = sent;
+                    }
+                }
+                RejoinStep::SignalSrflxKeepalive => srflx_reattach_tx.send_modify(|n| *n += 1),
+                RejoinStep::ForceNetcheck => *netcheck_next = Instant::now(),
+            }
+        }
+        joined
     }
 
     /// `OverlayJoin`, waits for the first full netmap (which yields the
@@ -2069,8 +2112,16 @@ impl OverlayRuntime {
             warn!(reason = %why,
                 "overlay: route offer WITHHELD (no /0, no subnet route advertised): this host cannot forward or NAT for its peers");
         }
-        self.advertised_routes = offer.routes;
-        self.route_offer_withheld = offer.withheld;
+        // #3562 — the probe is not the outcome. From here the tracker holds
+        // the offer: the setup after the first netmap, and each retry of a
+        // failed one, may withdraw or restore it. An exit states that it does
+        // not serve IPv6 until its own setup says it does.
+        let mut offer_tracker = super::nat::OfferTracker::new(
+            offer,
+            crate::env::flag("EXIT_V6_STATEMENT", true),
+            crate::env::flag("ROUTE_OFFER_UNPROBED", false),
+        );
+        self.mirror_offer(&offer_tracker);
 
         // rc.131 — direct LAN path: bind a shared UDP socket + discover our
         // LAN endpoint so a same-subnet peer dials us directly and skips the
@@ -2204,12 +2255,39 @@ impl OverlayRuntime {
         // mesh; remote desktop's ICE reads them to keep a session off the
         // overlay when the device asks it to.
         crate::overlay_footprint::note_v4_nets(&nat_cidrs);
-        let _subnet_router = super::nat::enable(
-            nat_if.as_deref().unwrap_or(super::tun::IF_NAME),
-            &nat_cidrs,
-            &self.advertised_routes,
-        )
-        .await;
+        // #3562 — the setup's outcome decides the offer: a failed one
+        // withdraws it (re-sent to the server at once) and the loop retries it
+        // with a backoff; an exit whose own IPv6 NAT came up says so. It serves
+        // the tracker's `serve_routes` (what the probe passed), never
+        // `advertised_routes`, which a withdrawal empties.
+        let nat_if_name = nat_if.as_deref().unwrap_or(super::tun::IF_NAME).to_string();
+        let (mut subnet_router, setup_outcome) =
+            super::nat::enable(&nat_if_name, &nat_cidrs, offer_tracker.serve_routes()).await;
+        if offer_tracker.on_setup(&setup_outcome, Instant::now(), rand::random::<f64>()) {
+            self.mirror_offer(&offer_tracker);
+            log_offer_change(&offer_tracker);
+            if offer_tracker.withdrawn() {
+                // Revert what the failed setup left before anything uses it.
+                let failed = std::mem::replace(
+                    &mut subnet_router,
+                    super::nat::SubnetRouterGuard::inert(&nat_if_name, &nat_cidrs),
+                );
+                let _ = tokio::task::spawn_blocking(move || drop(failed)).await;
+            }
+            // Nothing but the first join has been advertised yet (srflx,
+            // relays and the netcheck come later), so the re-join alone brings
+            // the server, the admin row and every peer up to date.
+            if self
+                .outbound
+                .send(self.make_join(advertised.clone()))
+                .await
+                .is_err()
+            {
+                warn!(
+                    "overlay: the re-offer after setup could not be sent; the next join carries it"
+                );
+            }
+        }
 
         // P4 — publish the ingress destination scope from the SAME list that
         // just provisioned forwarding, so the filter and the forwarding it
@@ -2867,11 +2945,89 @@ impl OverlayRuntime {
             debug!("overlay: TUN reader ended; outbound pump exiting");
         });
 
+        // #3562 — a setup that failed is retried, with a backoff, only while
+        // the offer is withdrawn: a 5 s clock asks the tracker whether a retry
+        // is due, the retry runs off-loop (PowerShell takes seconds), and the
+        // failed guard's revert finishes before the retry adds rules (WinNAT
+        // skips an identical prefix, pf reuses the anchor's name). The netmap
+        // never runs setup, so a host that keeps failing never re-joins on it.
+        let mut nat_retry_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        nat_retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut nat_task: Option<
+            tokio::task::JoinHandle<(super::nat::SubnetRouterGuard, super::nat::SetupOutcome)>,
+        > = None;
+        let mut pending_revert: Option<tokio::task::JoinHandle<()>> = None;
+
         // Phase 2 — steady state. Control plane ONLY (P1): the data plane
         // runs reader → pump → carriers / demux → inbound writer, entirely
         // off-loop.
         loop {
             tokio::select! {
+                // #3562 — retry a failed setup once its backoff is due.
+                _ = nat_retry_tick.tick(), if nat_task.is_none() && offer_tracker.withdrawn() => {
+                    if offer_tracker.retry_due(Instant::now()) {
+                        let revert = pending_revert.take();
+                        let ifn = nat_if_name.clone();
+                        let cidrs = nat_cidrs.clone();
+                        let routes = offer_tracker.serve_routes().to_vec();
+                        nat_task = Some(tokio::spawn(async move {
+                            if let Some(r) = revert {
+                                let _ = r.await;
+                            }
+                            super::nat::enable(&ifn, &cidrs, &routes).await
+                        }));
+                    }
+                }
+                // #3562 — a retry's outcome. Still failing: revert off-loop,
+                // and re-join only if the failing step changed. Recovered: the
+                // new guard serves, and the offer goes back to the server at
+                // once, followed by what the server's rehydrate wipes.
+                res = async { nat_task.as_mut().expect("guarded by is_some").await }, if nat_task.is_some() => {
+                    nat_task = None;
+                    let (guard, outcome) = match res {
+                        Ok(done) => done,
+                        Err(e) => (
+                            super::nat::SubnetRouterGuard::inert(&nat_if_name, &nat_cidrs),
+                            super::nat::SetupOutcome {
+                                v4: Err(super::nat::SetupFailure {
+                                    step: super::nat::SetupStep::Task,
+                                    detail: e.to_string(),
+                                }),
+                                v6: false,
+                            },
+                        ),
+                    };
+                    let changed =
+                        offer_tracker.on_setup(&outcome, Instant::now(), rand::random::<f64>());
+                    if offer_tracker.withdrawn() {
+                        pending_revert = Some(tokio::task::spawn_blocking(move || drop(guard)));
+                    } else {
+                        // The guard it replaces is inert (retries run only
+                        // while withdrawn); dropped off-loop all the same.
+                        let old = std::mem::replace(&mut subnet_router, guard);
+                        let _ = tokio::task::spawn_blocking(move || drop(old));
+                    }
+                    if changed {
+                        self.mirror_offer(&offer_tracker);
+                        log_offer_change(&offer_tracker);
+                        wg.set_local_scope(Some(self_v4), &self.advertised_routes);
+                        let plan = rejoin_plan(
+                            self.make_join(advertised.clone()),
+                            srflx_keepalive.is_some(),
+                            &srflx_advertised,
+                            srflx_my_nat.clone(),
+                            super::dialer::advertised_dialer_ok(),
+                            relay.as_ref().map(|r| r.all_endpoints()),
+                            netcheck_enabled && !netcheck_pending,
+                        );
+                        if !self
+                            .run_rejoin_plan(plan, &srflx_reattach_tx, &mut netcheck_next)
+                            .await
+                        {
+                            warn!("overlay: the re-offer after a setup retry could not be sent; the next join carries it");
+                        }
+                    }
+                }
                 // P1 (S6) — the pump ending is the session-fatal signal the
                 // TUN-reader `None` used to be.
                 _ = &mut outbound_pump => {
@@ -3967,58 +4123,46 @@ impl OverlayRuntime {
                     Some(OverlayEvent::Reattach { outbound }) => {
                         let t_arm = Instant::now();
                         self.outbound.swap(outbound);
-                        // Join-send failure = the new session died within ms.
-                        // NEVER exit here (a rapid double-flap must not kill
-                        // the persistent runtime) — stay detached; the next
-                        // Reattach retries.
-                        if self
-                            .outbound
-                            .send(self.make_join(advertised.clone()))
-                            .await
-                            .is_err()
-                        {
-                            warn!("overlay: reattach join failed; awaiting the next session");
-                        } else {
-                            info!("overlay: control-WS reattached — re-joined with carriers intact");
-                        }
-                        // srflx restore: the re-join's server-side rehydrate
-                        // WIPED srflx_endpoints. The keepalive task owns the
-                        // EVOLVING advert — signal it; only when it doesn't
-                        // exist fall back to the startup snapshot.
-                        if srflx_keepalive.is_some() {
-                            srflx_reattach_tx.send_modify(|n| *n += 1);
-                        } else if !srflx_advertised.is_empty() {
-                            let _ = self
-                                .outbound
-                                .send(ClientMsg::OverlaySrflx {
-                                    candidates: srflx_advertised.clone(),
-                                    nat: srflx_my_nat.clone(),
-                                    udp_dialer_ok: Some(super::dialer::advertised_dialer_ok()),
-                                })
-                                .await;
-                        }
                         if let Some(r) = relay.as_mut() {
                             // A grant lost in flight (WS died between request
                             // and grant) would park its pair FOREVER now that
                             // the coordinator outlives sessions — `is_tracking`
                             // dedupes every later request. Forget ungranted
                             // pendings; the next netmap/sweep re-requests.
+                            // (It touches no advertised endpoint.)
                             let dropped = r.forget_ungranted_pending();
                             if dropped > 0 {
                                 info!(dropped, "overlay: reattach — re-requesting relays whose grant was lost in flight");
                             }
-                            // The rehydrate also replaced our endpoints with
-                            // the join's LAN-only list, wiping every LIVE
-                            // relayed address (surviving allocations don't
-                            // re-allocate, so nothing would re-trickle them).
-                            // Restore the full union; per-connection FIFO
-                            // guarantees it lands AFTER the join's rehydrate.
-                            let _ = self
-                                .outbound
-                                .send(ClientMsg::OverlayEndpoints {
-                                    candidates: r.all_endpoints(),
-                                })
-                                .await;
+                        }
+                        // The re-join, then what its server-side rehydrate
+                        // wipes ([`rejoin_plan`], shared with #3562's
+                        // re-offer): srflx (the keepalive task owns the
+                        // EVOLVING advert — signal it; only when it doesn't
+                        // exist fall back to the startup snapshot), and every
+                        // LIVE relayed address (surviving allocations don't
+                        // re-allocate, so nothing would re-trickle them);
+                        // per-connection FIFO lands them AFTER the rehydrate.
+                        // Join-send failure = the new session died within ms.
+                        // NEVER exit here (a rapid double-flap must not kill
+                        // the persistent runtime) — stay detached; the next
+                        // Reattach retries.
+                        let plan = rejoin_plan(
+                            self.make_join(advertised.clone()),
+                            srflx_keepalive.is_some(),
+                            &srflx_advertised,
+                            srflx_my_nat.clone(),
+                            super::dialer::advertised_dialer_ok(),
+                            relay.as_ref().map(|r| r.all_endpoints()),
+                            false,
+                        );
+                        if self
+                            .run_rejoin_plan(plan, &srflx_reattach_tx, &mut netcheck_next)
+                            .await
+                        {
+                            info!("overlay: control-WS reattached — re-joined with carriers intact");
+                        } else {
+                            warn!("overlay: reattach join failed; awaiting the next session");
                         }
                         // NB: peers see our endpoints wiped-then-restored and
                         // clear their path-monitor evidence for us twice
@@ -4460,6 +4604,18 @@ impl OverlayRuntime {
         self.teardown_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
             .await;
 
+        // #3562 — a setup retry or a revert still running finishes before the
+        // runtime returns: what a retry set up is reverted by its own guard,
+        // never left behind unguarded.
+        if let Some(t) = nat_task.take() {
+            if let Ok((guard, _)) = t.await {
+                let _ = tokio::task::spawn_blocking(move || drop(guard)).await;
+            }
+        }
+        if let Some(r) = pending_revert.take() {
+            let _ = r.await;
+        }
+
         inbound.abort();
         // rc.213 — stop the dedicated outbound TUN reader; aborting drops its
         // in-flight `read_packet()` future, and the TUN `Arc` it holds drops
@@ -4497,6 +4653,66 @@ impl OverlayRuntime {
             // successor cannot lose the race to its own aborted predecessor.
             let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
         }
+    }
+}
+
+/// #3562 — one step of a re-join. A join is an update on the server
+/// (`handle_overlay_join` rehydrates the row), and the rehydrate WIPES the
+/// srflx candidates, the NAT type, `udp_dialer_ok` and every relayed endpoint,
+/// so each re-join is followed by what puts them back. The Reattach arm and
+/// the re-offer after a setup retry run the same plan.
+pub(super) enum RejoinStep {
+    /// A frame for the control socket, in this order.
+    Send(Box<ClientMsg>),
+    /// The srflx keepalive task owns the EVOLVING advert: wake it to re-send.
+    SignalSrflxKeepalive,
+    /// The rehydrate wiped the measured capability vector: measure now.
+    ForceNetcheck,
+}
+
+/// #3562 — the frames that follow a re-join, in order: the join; srflx (the
+/// keepalive task re-sends its own advert, else the startup snapshot goes out
+/// once with the NAT type and the dialer bit); the full relayed endpoint
+/// union (surviving allocations do not re-allocate, so nothing would
+/// re-trickle them); and a fresh netcheck when one is asked for. Per-connection
+/// FIFO lands each AFTER the join's rehydrate.
+pub(super) fn rejoin_plan(
+    join: ClientMsg,
+    keepalive_live: bool,
+    srflx_snapshot: &[String],
+    nat: Option<String>,
+    udp_dialer_ok: bool,
+    relay_endpoints: Option<Vec<String>>,
+    force_netcheck: bool,
+) -> Vec<RejoinStep> {
+    let mut plan = vec![RejoinStep::Send(Box::new(join))];
+    if keepalive_live {
+        plan.push(RejoinStep::SignalSrflxKeepalive);
+    } else if !srflx_snapshot.is_empty() {
+        plan.push(RejoinStep::Send(Box::new(ClientMsg::OverlaySrflx {
+            candidates: srflx_snapshot.to_vec(),
+            nat,
+            udp_dialer_ok: Some(udp_dialer_ok),
+        })));
+    }
+    if let Some(candidates) = relay_endpoints {
+        plan.push(RejoinStep::Send(Box::new(ClientMsg::OverlayEndpoints {
+            candidates,
+        })));
+    }
+    if force_netcheck {
+        plan.push(RejoinStep::ForceNetcheck);
+    }
+    plan
+}
+
+/// #3562 — say what the exit setup made of the offer.
+fn log_offer_change(t: &super::nat::OfferTracker) {
+    match &t.offer().withheld {
+        Some(why) => warn!(reason = %why, exit_serves_v6 = ?t.exit_serves_v6(),
+            "overlay: route offer WITHDRAWN (no /0, no subnet route advertised): the exit setup failed; it is retried with a backoff"),
+        None => info!(routes = ?t.offer().routes, exit_serves_v6 = ?t.exit_serves_v6(),
+            "overlay: route offer follows the exit setup"),
     }
 }
 
@@ -4908,6 +5124,7 @@ mod tests {
             srflx_endpoints: srflx.iter().map(|s| s.to_string()).collect(),
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -5324,6 +5541,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             supports_quic: false,
@@ -5522,6 +5740,7 @@ mod tests {
                 srflx_endpoints: vec![],
                 srflx_nat: None,
                 udp_dialer_ok: None,
+                exit_serves_v6: None,
                 relay_home: None,
                 warm_relay_endpoint: None,
                 supports_quic: false,
@@ -7588,6 +7807,7 @@ mod tests {
                 srflx_endpoints: vec![],
                 srflx_nat: None,
                 udp_dialer_ok: None,
+                exit_serves_v6: None,
                 relay_home: None,
                 warm_relay_endpoint: None,
                 reachable,
@@ -7835,6 +8055,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -8395,6 +8616,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -8570,6 +8792,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,

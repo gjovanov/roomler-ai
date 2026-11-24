@@ -3190,10 +3190,12 @@ fn exit_node_state(ex: &tunnel_core::localapi::ExitNodeStatus) -> String {
              nothing else on this host uses it"
         );
     }
-    let v6 = if ex.v6_active {
-        "v6 on"
-    } else {
-        "v6 fail-closed"
+    // #3562 — a fail-closed v6 says why when the daemon knows: the exit
+    // serves IPv4 only, or this host cannot exempt its server over v6.
+    let v6 = match (ex.v6_active, ex.v6_withheld_reason.as_deref()) {
+        (true, _) => "v6 on".to_string(),
+        (false, Some(why)) => format!("v6 fail-closed: {why}"),
+        (false, None) => "v6 fail-closed".to_string(),
     };
     let dns = if ex.dns_steered {
         "DNS steered"
@@ -3920,6 +3922,7 @@ mod tests {
             active: true,
             withheld_reason: None,
             v6_active: true,
+            v6_withheld_reason: None,
             dns_steered: false,
             socks5_port: None,
         };

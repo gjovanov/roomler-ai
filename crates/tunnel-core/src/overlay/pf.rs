@@ -159,6 +159,15 @@ pub(crate) fn nat66_source(ifconfig: &str) -> Option<Ipv6Addr> {
 /// Whether `netstat -rn -f inet6` holds an UNSCOPED default. A Mac whose
 /// primary service has no v6 has only ifscoped ones (flags with `I`), and a
 /// forwarded v6 packet then has no route (field, FR-97 §8, 2026-10-16).
+/// #3562 — does this Mac exit serve IPv6, so that it may say so? Only when v6
+/// was to be served (an unscoped v6 default), v6 forwarding took, the anchor
+/// it loaded carries an `inet6` translation (an egress with a stable v6), and
+/// its IPv4 serve came up at all. Pure.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn served_v6(serve_v6: bool, fwd6_ok: bool, rules: &str, v4_ok: bool) -> bool {
+    serve_v6 && fwd6_ok && rules.contains(" inet6 from ") && v4_ok
+}
+
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn has_unscoped_v6_default(netstat: &str) -> bool {
     netstat.lines().any(|l| {
@@ -299,7 +308,7 @@ pub(crate) fn render(
 mod host {
     use super::{
         Ipv6Addr, StarterRef, anchor_for, egress, has_unscoped_v6_default, is_ifname,
-        is_our_anchor, nat66_source, parse_references, parse_token, render, still_ours,
+        is_our_anchor, nat66_source, parse_references, parse_token, render, served_v6, still_ours,
     };
     use crate::overlay::host_ledger::{PfRecord, PfToken};
     use std::sync::{Arc, Mutex};
@@ -591,9 +600,14 @@ mod host {
     }
 
     /// Serve the overlay adapter `overlay_if` for the IPv4 blocks `v4`.
-    /// `(fully ok, the serve to stop later)`; `None` only when nothing at all
-    /// could be set up.
-    pub(crate) async fn serve(overlay_if: &str, v4: &[String]) -> (bool, Option<Serve>) {
+    /// `(what the setup did, the serve to stop later)`; `None` only when
+    /// nothing at all could be set up. #3562 — the outcome names the first
+    /// step that left IPv4 dead, and whether IPv6 is served ([`served_v6`]).
+    pub(crate) async fn serve(
+        overlay_if: &str,
+        v4: &[String],
+    ) -> (crate::overlay::nat::SetupOutcome, Option<Serve>) {
+        use crate::overlay::nat::{SetupFailure, SetupOutcome, SetupStep};
         let overlay_if = overlay_if.to_string();
         let v4 = v4.to_vec();
         let started = tokio::task::spawn_blocking(move || {
@@ -613,16 +627,28 @@ mod host {
                 }
                 (f.v4_restore, serve_v6 && f.v6_restore)
             };
-            let mut ok = sysctl_set(FWD4, true);
-            if serve_v6 {
-                ok &= sysctl_set(FWD6, true);
-            } else {
-                info!("overlay: pf exit — no unscoped IPv6 default route here, so IPv6 is not served (clients stay v6 fail-closed)");
+            // #3562 — the first step that failed, in the order they run:
+            // each one alone leaves the exit's IPv4 dead.
+            let mut failure: Option<SetupFailure> = None;
+            if !sysctl_set(FWD4, true) {
+                failure = Some(SetupFailure {
+                    step: SetupStep::Forwarding,
+                    detail: format!("sysctl {FWD4}=1 failed"),
+                });
+            }
+            let fwd6_ok = serve_v6 && sysctl_set(FWD6, true);
+            if !serve_v6 {
+                info!("overlay: pf exit — no unscoped IPv6 default route here, so IPv6 is not served; this exit says so, and its clients keep v6 fail-closed");
             }
             let rules = render(&overlay_if, &current_egress(), &v4, serve_v6);
             if let Err(e) = load(&anchor, &rules) {
                 warn!(%anchor, err = %e, "overlay: pf anchor load failed");
-                ok = false;
+                if failure.is_none() {
+                    failure = Some(SetupFailure {
+                        step: SetupStep::Nat,
+                        detail: format!("pf anchor {anchor}: {e}"),
+                    });
+                }
             }
             let mut live = Live {
                 overlay_if,
@@ -635,21 +661,40 @@ mod host {
                 Some(t) => live.tokens.push(t),
                 None => {
                     warn!("overlay: pfctl -E returned no token; pf may not be enabled");
-                    ok = false;
+                    if failure.is_none() {
+                        failure = Some(SetupFailure {
+                            step: SetupStep::PfEnable,
+                            detail: "pfctl -E returned no token; pf may not be enabled".into(),
+                        });
+                    }
                 }
             }
             record(&anchor, &live, v4_restore, v6_restore);
             info!(%anchor, rules = %live.rules.trim().replace('\n', " | "), "overlay: pf NAT for the overlay loaded");
-            (ok, anchor, serve_v6, live)
+            let v6 = served_v6(serve_v6, fwd6_ok, &live.rules, failure.is_none());
+            let outcome = SetupOutcome {
+                v4: failure.map_or(Ok(()), Err),
+                v6,
+            };
+            (outcome, anchor, serve_v6, live)
         })
         .await;
-        let Ok((ok, anchor, serve_v6, live)) = started else {
-            return (false, None);
+        let Ok((outcome, anchor, serve_v6, live)) = started else {
+            return (
+                SetupOutcome {
+                    v4: Err(SetupFailure {
+                        step: SetupStep::Task,
+                        detail: "the pf setup task did not finish".into(),
+                    }),
+                    v6: false,
+                },
+                None,
+            );
         };
         let live = Arc::new(Mutex::new(live));
         let task = tokio::spawn(reassert(anchor.clone(), serve_v6, live.clone()));
         (
-            ok,
+            outcome,
             Some(Serve {
                 anchor,
                 v6: serve_v6,

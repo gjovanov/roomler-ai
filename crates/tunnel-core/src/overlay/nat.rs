@@ -8,9 +8,12 @@
 //! to the overlay CIDR at startup and reverts it on `Drop` (mirroring the WFP
 //! guard's cleanup pattern).
 //!
-//! Best-effort: every command failure is logged, never fatal — a node that can't
-//! set up NAT simply doesn't route (peers just can't reach its LAN). The agent
-//! runs as a privileged service, so it has the rights.
+//! Best-effort: every command failure is logged, never fatal to the daemon. The
+//! agent runs as a privileged service, so it has the rights. #3562 — but a
+//! failure that leaves the exit's IPv4 dead withdraws the node's route offer
+//! (with the failing step's own words as the reason) and is retried with a
+//! backoff ([`OfferTracker`]); one that leaves IPv4 working keeps the offer.
+//! The exit also states whether it serves IPv6, from its own IPv6 NAT outcome.
 //!
 //! - **Linux:** `sysctl net.ipv4.ip_forward=1` + `iptables -t nat -A POSTROUTING
 //!   -s <overlay-cidr> -j MASQUERADE`, plus `filter`/`FORWARD` ACCEPT rules for
@@ -83,13 +86,72 @@ static FORWARDING: std::sync::Mutex<super::host_ledger::ForwardingHolds> =
 /// THEIR device, not the historical singleton. Legacy callers pass the
 /// device's own OS name, falling back to
 /// [`tun::IF_NAME`](crate::overlay::tun::IF_NAME).
+///
+/// #3562 — it also says what the setup did ([`SetupOutcome`]): whether the
+/// exit's IPv4 forwarding and NAT came up, and whether it serves IPv6. It
+/// REPORTS and never reverts on its own: the runtime decides, through
+/// [`OfferTracker`], whether the offer stays, and drops a guard it withdraws
+/// (a forced offer keeps a partial guard exactly as before).
 pub async fn enable(
     if_name: &str,
     overlay_cidrs: &[String],
     advertised_routes: &[String],
-) -> SubnetRouterGuard {
+) -> (SubnetRouterGuard, SetupOutcome) {
     if advertised_routes.is_empty() {
-        return SubnetRouterGuard {
+        return (
+            SubnetRouterGuard::inert(if_name, overlay_cidrs),
+            SetupOutcome {
+                v4: Ok(()),
+                v6: false,
+            },
+        );
+    }
+    #[cfg(target_os = "windows")]
+    let (outcome, forwarding) = setup(if_name, overlay_cidrs, advertised_routes).await;
+    #[cfg(target_os = "macos")]
+    let (outcome, pf) = super::pf::serve(if_name, overlay_cidrs).await;
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let outcome = setup(if_name, overlay_cidrs, advertised_routes).await;
+    // Arm the guard on any platform where `setup` installs rules, so `Drop`
+    // reverts even a PARTIALLY-applied ruleset (each `-D` / `Remove-NetNat` is
+    // idempotent — reverting an absent rule is a harmless no-op). The outcome
+    // only drives the log level here. Previously `active = setup()`, which
+    // leaked the rules that DID apply whenever one of the (now multiple, P5/A4)
+    // commands failed. macOS: armed whenever a serve exists to stop.
+    #[cfg(target_os = "macos")]
+    let active = pf.is_some();
+    #[cfg(not(target_os = "macos"))]
+    let active = cfg!(any(target_os = "linux", target_os = "windows"));
+    match &outcome.v4 {
+        Ok(()) if active => {
+            info!(%if_name, cidrs = ?overlay_cidrs, routes = ?advertised_routes, v6 = outcome.v6,
+                "overlay: subnet-router forwarding + NAT enabled");
+        }
+        Err(f) if active => {
+            warn!(%if_name, cidrs = ?overlay_cidrs, reason = %f.reason(),
+                "overlay: subnet-router forwarding/NAT not fully enabled (see prior errors)");
+        }
+        _ => {}
+    }
+    (
+        SubnetRouterGuard {
+            if_name: if_name.to_string(),
+            overlay_cidrs: overlay_cidrs.to_vec(),
+            active,
+            #[cfg(target_os = "windows")]
+            forwarding,
+            #[cfg(target_os = "macos")]
+            pf,
+        },
+        outcome,
+    )
+}
+
+impl SubnetRouterGuard {
+    /// A guard that reverts nothing: nothing was set up, or what was set up
+    /// has been handed to a revert of its own (#3562).
+    pub(crate) fn inert(if_name: &str, overlay_cidrs: &[String]) -> Self {
+        SubnetRouterGuard {
             if_name: if_name.to_string(),
             overlay_cidrs: overlay_cidrs.to_vec(),
             active: false,
@@ -97,39 +159,7 @@ pub async fn enable(
             forwarding: Vec::new(),
             #[cfg(target_os = "macos")]
             pf: None,
-        };
-    }
-    #[cfg(target_os = "windows")]
-    let (fully_ok, forwarding) = setup(if_name, overlay_cidrs, advertised_routes).await;
-    #[cfg(target_os = "macos")]
-    let (fully_ok, pf) = super::pf::serve(if_name, overlay_cidrs).await;
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let fully_ok = setup(if_name, overlay_cidrs, advertised_routes).await;
-    // Arm the guard on any platform where `setup` installs rules, so `Drop`
-    // reverts even a PARTIALLY-applied ruleset (each `-D` / `Remove-NetNat` is
-    // idempotent — reverting an absent rule is a harmless no-op). `fully_ok`
-    // only drives the log level. Previously `active = setup()`, which leaked the
-    // rules that DID apply whenever one of the (now multiple, P5/A4) commands
-    // failed. macOS: armed whenever a serve exists to stop.
-    #[cfg(target_os = "macos")]
-    let active = pf.is_some();
-    #[cfg(not(target_os = "macos"))]
-    let active = cfg!(any(target_os = "linux", target_os = "windows"));
-    if active && fully_ok {
-        info!(%if_name, cidrs = ?overlay_cidrs, routes = ?advertised_routes,
-            "overlay: subnet-router forwarding + NAT enabled");
-    } else if active {
-        warn!(%if_name, cidrs = ?overlay_cidrs,
-            "overlay: subnet-router forwarding/NAT not fully enabled (see prior errors)");
-    }
-    SubnetRouterGuard {
-        if_name: if_name.to_string(),
-        overlay_cidrs: overlay_cidrs.to_vec(),
-        active,
-        #[cfg(target_os = "windows")]
-        forwarding,
-        #[cfg(target_os = "macos")]
-        pf,
+        }
     }
 }
 
@@ -204,6 +234,451 @@ async fn gate_offer_with(
             withheld: Some(why),
         },
     }
+}
+
+// ---- #3562: the offer follows what setup did, and the exit states IPv6 ----
+
+/// #3562 — the setup step whose failure leaves the exit's IPv4 dead, so the
+/// offer is withdrawn. A re-offer compares the step, never the error's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupStep {
+    /// IPv4 forwarding: `net.ipv4.ip_forward` reads 0 (Linux), the
+    /// forwarding script left a needed adapter off (Windows),
+    /// `net.inet.ip.forwarding` (macOS).
+    Forwarding,
+    /// The translation: MASQUERADE (Linux), `New-NetNat` with no other
+    /// WinNAT covering the block (Windows), the pf anchor (macOS).
+    Nat,
+    /// Linux: a FORWARD rule that did not append, on a chain whose policy
+    /// drops.
+    ForwardChain,
+    /// macOS: `pfctl -E` gave no reference token.
+    PfEnable,
+    /// The setup task itself did not finish.
+    Task,
+}
+
+impl SetupStep {
+    fn what(self) -> &'static str {
+        match self {
+            SetupStep::Forwarding => "IPv4 forwarding could not be enabled",
+            SetupStep::Nat => "NAT could not be set up",
+            SetupStep::ForwardChain => "the FORWARD chain drops the overlay's traffic",
+            SetupStep::PfEnable => "pf could not be enabled",
+            SetupStep::Task => "exit setup did not finish",
+        }
+    }
+}
+
+/// How long a reason may be on the device, as a probe's is ([`probe_cmd`]).
+/// The server bounds what it stores again.
+const REASON_MAX: usize = 200;
+
+/// #3562 — a setup step that failed, with the failing command's own words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupFailure {
+    pub step: SetupStep,
+    pub detail: String,
+}
+
+impl SetupFailure {
+    /// The withdrawal's reason, for `roomler status`, the join and the admin
+    /// row. Bounded.
+    pub fn reason(&self) -> String {
+        let detail = self.detail.trim();
+        let text = if detail.is_empty() {
+            self.step.what().to_string()
+        } else {
+            format!("{}: {detail}", self.step.what())
+        };
+        text.chars().take(REASON_MAX).collect()
+    }
+}
+
+/// #3562 — what [`enable`] did: whether the exit's IPv4 forwarding and NAT
+/// came up (`v4`), and whether it serves IPv6 (`v6`, from its own IPv6 NAT
+/// outcome: never on Windows, whose WinNAT is IPv4-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupOutcome {
+    pub v4: Result<(), SetupFailure>,
+    pub v6: bool,
+}
+
+/// Does the offer make this node an exit (a default route, by the clients'
+/// own rule, `route_guard::peer_is_approved_exit`)? Only an exit states
+/// whether it serves IPv6.
+fn offers_exit(routes: &[String]) -> bool {
+    routes
+        .iter()
+        .filter_map(|r| super::router::Cidr::parse(r))
+        .any(|c| c.is_default_route())
+}
+
+/// #3562 — the offer after a setup, and what the exit states about IPv6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetupOffer {
+    pub offer: RouteOffer,
+    pub exit_serves_v6: Option<bool>,
+    pub failed_step: Option<SetupStep>,
+}
+
+/// #3562 — the offer that follows a setup of `serve_routes` (what the probe
+/// passed). `None` when there is nothing to serve: the probe's decision
+/// stands. A failed IPv4 setup withdraws every route, all or nothing as the
+/// probe does, and states nothing; otherwise the exit states its IPv6 outcome
+/// when `state_v6` (`ROOMLERD_EXIT_V6_STATEMENT`, on by default). Pure.
+pub(crate) fn offer_after_setup(
+    serve_routes: &[String],
+    outcome: &SetupOutcome,
+    state_v6: bool,
+) -> Option<SetupOffer> {
+    if serve_routes.is_empty() {
+        return None;
+    }
+    Some(match &outcome.v4 {
+        Err(f) => SetupOffer {
+            offer: RouteOffer {
+                routes: Vec::new(),
+                withheld: Some(f.reason()),
+            },
+            exit_serves_v6: None,
+            failed_step: Some(f.step),
+        },
+        Ok(()) => SetupOffer {
+            offer: RouteOffer {
+                routes: serve_routes.to_vec(),
+                withheld: None,
+            },
+            exit_serves_v6: (state_v6 && offers_exit(serve_routes)).then_some(outcome.v6),
+            failed_step: None,
+        },
+    })
+}
+
+/// #3562 — the first retry of a failed setup comes this long after it, then
+/// twice as long each time, up to [`NAT_RETRY_CAP`].
+pub(crate) const NAT_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+/// #3562 — a structural failure (another WinNAT holding an overlapping
+/// prefix) waits for an admin: the host tries twice an hour.
+pub(crate) const NAT_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// #3562 — the wait before retry `attempt` (0 = the first):
+/// `min(30 s · 2^attempt, 30 min)`, jittered down by at most a fifth so a
+/// fleet that failed together does not retry together. `jitter` is clamped to
+/// `0..=1`. Never above the cap. Pure.
+pub(crate) fn nat_retry_delay(attempt: u32, jitter: f64) -> std::time::Duration {
+    let base = NAT_RETRY_BASE
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(NAT_RETRY_CAP);
+    let jitter = if jitter.is_nan() {
+        0.0
+    } else {
+        jitter.clamp(0.0, 1.0)
+    };
+    let permille = 800 + (200.0 * jitter).round() as u64;
+    std::time::Duration::from_millis(base.as_millis() as u64 * permille / 1000)
+}
+
+/// #3562 — a node's route offer over its life: the probe's before the first
+/// join, then each setup's, and when setup runs again. The runtime feeds it
+/// the outcomes and the clock; it says when the server's copy went stale.
+/// Pure.
+#[derive(Debug, Clone)]
+pub(crate) struct OfferTracker {
+    serve_routes: Vec<String>,
+    offer: RouteOffer,
+    exit_serves_v6: Option<bool>,
+    failed_step: Option<SetupStep>,
+    attempt: u32,
+    retry_at: Option<std::time::Instant>,
+    state_v6: bool,
+    force: bool,
+}
+
+impl OfferTracker {
+    /// From the probe's offer, before the first join. An exit that offers a
+    /// default route states that it does not serve IPv6 until its own setup
+    /// says otherwise: absent is reserved for an exit from before #3562.
+    /// `force` = `ROOMLERD_ROUTE_OFFER_UNPROBED=1`: offer as before, whatever
+    /// setup did.
+    pub(crate) fn new(probed: RouteOffer, state_v6: bool, force: bool) -> Self {
+        let exit_serves_v6 = (state_v6 && offers_exit(&probed.routes)).then_some(false);
+        OfferTracker {
+            serve_routes: probed.routes.clone(),
+            offer: probed,
+            exit_serves_v6,
+            failed_step: None,
+            attempt: 0,
+            retry_at: None,
+            state_v6,
+            force,
+        }
+    }
+
+    /// What the node offers now (into the join, the view and its own NAT
+    /// scope).
+    pub(crate) fn offer(&self) -> &RouteOffer {
+        &self.offer
+    }
+
+    /// What the node states about IPv6 now.
+    pub(crate) fn exit_serves_v6(&self) -> Option<bool> {
+        self.exit_serves_v6
+    }
+
+    /// The routes a setup serves: the probe's, whatever the offer is now.
+    pub(crate) fn serve_routes(&self) -> &[String] {
+        &self.serve_routes
+    }
+
+    /// Withdrawn because a setup failed (not because the probe withheld).
+    pub(crate) fn withdrawn(&self) -> bool {
+        self.failed_step.is_some()
+    }
+
+    /// Is a retry of the failed setup due?
+    pub(crate) fn retry_due(&self, now: std::time::Instant) -> bool {
+        self.retry_at.is_some_and(|t| now >= t)
+    }
+
+    /// A setup ran (at start or as a retry). `true` = the offer the server
+    /// holds is stale: re-join. A failure (not forced) withdraws and
+    /// schedules the next retry; a success restores and stops retrying. The
+    /// key is (routes, the failed step, the IPv6 statement): a failure's text
+    /// alone never re-joins, so a host where the same step keeps failing
+    /// re-joins once, when it withdraws.
+    pub(crate) fn on_setup(
+        &mut self,
+        outcome: &SetupOutcome,
+        now: std::time::Instant,
+        jitter: f64,
+    ) -> bool {
+        let forced;
+        let outcome = if self.force {
+            forced = SetupOutcome {
+                v4: Ok(()),
+                v6: outcome.v6,
+            };
+            &forced
+        } else {
+            outcome
+        };
+        let Some(next) = offer_after_setup(&self.serve_routes, outcome, self.state_v6) else {
+            return false;
+        };
+        if next.failed_step.is_some() {
+            self.retry_at = Some(now + nat_retry_delay(self.attempt, jitter));
+            self.attempt = self.attempt.saturating_add(1);
+        } else {
+            self.retry_at = None;
+            self.attempt = 0;
+        }
+        let changed = (&next.offer.routes, next.failed_step, next.exit_serves_v6)
+            != (&self.offer.routes, self.failed_step, self.exit_serves_v6);
+        if changed {
+            self.offer = next.offer;
+            self.failed_step = next.failed_step;
+            self.exit_serves_v6 = next.exit_serves_v6;
+        }
+        changed
+    }
+}
+
+/// WinNAT has no IPv6 API: a Windows exit never serves IPv6 (FR-97 D1).
+#[cfg(any(test, target_os = "windows"))]
+const WINNAT_SERVES_V6: bool = false;
+
+/// #3562 — a Windows setup's outcome, steps judged in the order they run:
+/// forwarding (the script), then the NAT. Pure.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_outcome(fwd: Result<(), String>, nat: Result<(), String>) -> SetupOutcome {
+    let v4 = match (fwd, nat) {
+        (Err(detail), _) => Err(SetupFailure {
+            step: SetupStep::Forwarding,
+            detail,
+        }),
+        (Ok(()), Err(detail)) => Err(SetupFailure {
+            step: SetupStep::Nat,
+            detail,
+        }),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    SetupOutcome {
+        v4,
+        v6: WINNAT_SERVES_V6,
+    }
+}
+
+/// #3562 — did a forwarding script that exited non-zero leave the exit's
+/// IPv4 dead? `Some(why)` when the overlay adapter does not forward, when a
+/// default route's egress adapter does not, or when no route's egress does.
+/// `None` when only some subnet's egress refused (a VPN miniport that will
+/// not forward, say): those routes are degraded as before, and a working
+/// exit is never withdrawn for them. Reads the script's `OVERLAY`, `ROUTE`
+/// and `AFTER` lines. Pure.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_forwarding_dead(report: &str, routes: &[String]) -> Option<String> {
+    let mut overlay: Option<&str> = None;
+    let mut route_if: Vec<(&str, &str)> = Vec::new();
+    let mut after: Vec<(&str, &str)> = Vec::new();
+    for line in report.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        match f.as_slice() {
+            ["OVERLAY", i] => overlay = Some(*i),
+            ["ROUTE", c, i] => route_if.push((*c, *i)),
+            ["AFTER", i, state] => after.push((*i, *state)),
+            _ => {}
+        }
+    }
+    let forwards = |i: &str| after.iter().any(|&(j, s)| j == i && s == "Enabled");
+    let Some(overlay) = overlay else {
+        return Some("the overlay adapter was not found".into());
+    };
+    if !forwards(overlay) {
+        return Some("forwarding is off on the overlay adapter".into());
+    }
+    let egress_forwards = |r: &str| {
+        route_if
+            .iter()
+            .find(|&&(c, _)| c == r)
+            .is_some_and(|&(_, i)| forwards(i))
+    };
+    let is_default = |r: &str| super::router::Cidr::parse(r).is_some_and(|c| c.is_default_route());
+    if let Some(r) = routes
+        .iter()
+        .find(|r| is_default(r.as_str()) && !egress_forwards(r.as_str()))
+    {
+        return Some(format!("forwarding is off on the egress adapter of {r}"));
+    }
+    if !routes.iter().any(|r| egress_forwards(r.as_str())) {
+        return Some("forwarding is off on every advertised route's egress adapter".into());
+    }
+    None
+}
+
+/// #3562 — the first `New-NetNat` failure that leaves a block un-NATed.
+/// WinNAT refuses a prefix that overlaps another instance's, and the setup
+/// already skips an IDENTICAL one; a block that another ACTIVE instance's
+/// prefix CONTAINS is translated by that instance, so its refusal kills
+/// nothing. `active_nats` holds `<name> <prefix>` lines. Pure.
+#[cfg(any(test, target_os = "windows"))]
+fn winnat_uncovered(failures: Vec<(String, String)>, active_nats: &str) -> Result<(), String> {
+    let covering: Vec<ipnet::Ipv4Net> = active_nats
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    for (block, err) in failures {
+        let covered = block
+            .parse::<ipnet::Ipv4Net>()
+            .is_ok_and(|b| covering.iter().any(|c| c.contains(&b)));
+        if covered {
+            warn!(%block, %err, "overlay: WinNAT refused our instance, but another active WinNAT's prefix contains this block and translates it — the exit keeps its offer");
+        } else {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// `/proc/sys` flags: `"1\n"` → on. `None` when it cannot be read. Pure.
+#[cfg(any(test, target_os = "linux"))]
+fn sysctl_flag(text: &str) -> Option<bool> {
+    text.trim().parse::<i64>().ok().map(|v| v != 0)
+}
+
+/// The FORWARD chain's policy from `iptables -S FORWARD`: `Some(true)` for
+/// ACCEPT, `Some(false)` for DROP, `None` when it cannot be read. Pure.
+#[cfg(any(test, target_os = "linux"))]
+fn forward_policy_accepts(iptables_s: &str) -> Option<bool> {
+    iptables_s
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("-P FORWARD "))
+        .and_then(|p| match p.trim() {
+            "ACCEPT" => Some(true),
+            "DROP" => Some(false),
+            _ => None,
+        })
+}
+
+/// #3562 — a Linux exit's IPv4 outcome, steps judged in the order setup runs
+/// them. `ip_forward` reading 0 is dead, whatever `sysctl -w` returned (and a
+/// read-only `/proc/sys` on a host that already forwards is fine). A
+/// MASQUERADE that failed is dead. A FORWARD rule that did not append is dead
+/// only where the chain's policy drops; with an ACCEPT policy, or one that
+/// cannot be read, the exit keeps its offer: never withdraw on a guess. Pure.
+#[cfg(any(test, target_os = "linux"))]
+fn linux_v4_outcome(
+    ip_forward: Option<bool>,
+    nat: Result<(), String>,
+    fwd_rules: Result<(), String>,
+    forward_policy: Option<bool>,
+) -> Result<(), SetupFailure> {
+    if ip_forward == Some(false) {
+        return Err(SetupFailure {
+            step: SetupStep::Forwarding,
+            detail: "net.ipv4.ip_forward reads 0 after sysctl -w net.ipv4.ip_forward=1".into(),
+        });
+    }
+    nat.map_err(|detail| SetupFailure {
+        step: SetupStep::Nat,
+        detail,
+    })?;
+    match fwd_rules {
+        Err(detail) if forward_policy == Some(false) => Err(SetupFailure {
+            step: SetupStep::ForwardChain,
+            detail,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// #3562 — does this host have an IPv6 uplink? A usable `::/0` in
+/// `/proc/net/ipv6_route` (up, not a reject route, not on `lo` or the
+/// overlay adapter) on a device that holds a global address in
+/// `/proc/net/if_inet6` (scope 0, neither tentative nor failed DAD).
+/// ip6tables applies its rules on a v4-only host too, so the rules alone
+/// would make "this exit serves IPv6" a lie there. Pure.
+#[cfg(any(test, target_os = "linux"))]
+fn has_v6_uplink(ipv6_route: &str, if_inet6: &str, overlay_if: &str) -> bool {
+    const RTF_UP: u32 = 0x0001;
+    const RTF_REJECT: u32 = 0x0200;
+    const IFA_F_DADFAILED: u32 = 0x08;
+    const IFA_F_TENTATIVE: u32 = 0x40;
+    let global_on = |dev: &str| {
+        if_inet6.lines().any(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() >= 6
+                && f[5] == dev
+                && u32::from_str_radix(f[3], 16) == Ok(0)
+                && u32::from_str_radix(f[4], 16)
+                    .is_ok_and(|fl| fl & (IFA_F_DADFAILED | IFA_F_TENTATIVE) == 0)
+        })
+    };
+    ipv6_route.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 10 {
+            return false;
+        }
+        let default = f[0].len() == 32 && f[0].bytes().all(|b| b == b'0') && f[1] == "00";
+        let usable =
+            u32::from_str_radix(f[8], 16).is_ok_and(|fl| fl & RTF_UP != 0 && fl & RTF_REJECT == 0);
+        let dev = f[9];
+        default && usable && dev != "lo" && dev != overlay_if && global_on(dev)
+    })
+}
+
+/// #3562 — a Linux exit serves IPv6 only when its ip6tables NAT and FORWARD
+/// rules applied, IPv6 forwarding reads on, and it has an IPv6 uplink. Pure.
+#[cfg(any(test, target_os = "linux"))]
+fn linux_v6_outcome(rules_ok: bool, forwarding: Option<bool>, uplink: bool) -> bool {
+    rules_ok && forwarding == Some(true) && uplink
+}
+
+/// A `/proc` file's text, empty when it cannot be read.
+#[cfg(target_os = "linux")]
+fn read_proc(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 /// Can this host forward and NAT for the overlay? `Err` says why not.
@@ -302,7 +777,11 @@ async fn probe_cmd(args: &[&str]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-async fn setup(if_name: &str, overlay_cidrs: &[String], _advertised_routes: &[String]) -> bool {
+async fn setup(
+    if_name: &str,
+    overlay_cidrs: &[String],
+    _advertised_routes: &[String],
+) -> SetupOutcome {
     // Global forwarding (leave it on at teardown — another service may rely on
     // it; we only remove our own rules).
     let _ = run(vec![
@@ -311,6 +790,10 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], _advertised_routes: &[St
         "net.ipv4.ip_forward=1".into(),
     ])
     .await;
+    // #3562 — what the kernel says, not what `sysctl` returned: a container
+    // with a read-only `/proc/sys` refuses the write on a host that already
+    // forwards, and that exit works.
+    let ip_forward = sysctl_flag(&read_proc("/proc/sys/net/ipv4/ip_forward"));
     // NAT: masquerade overlay-sourced traffic out the host's uplink so the far
     // side replies to the router itself (zero peer-side config).
     //
@@ -318,9 +801,9 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], _advertised_routes: &[St
     // command this used to, so the live subnet-router path is unchanged; a
     // grown org gets a rule for each of its ranges, because a peer in block 1
     // is just as overlay-sourced as one in block 0.
-    let mut nat_ok = true;
+    let mut nat: Result<(), String> = Ok(());
     for cidr in overlay_cidrs {
-        nat_ok &= run(vec![
+        let r = run_step(vec![
             "iptables".into(),
             "-t".into(),
             "nat".into(),
@@ -332,6 +815,10 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], _advertised_routes: &[St
             "MASQUERADE".into(),
         ])
         .await;
+        // Every block's rule still runs; the first failure is the reason.
+        if nat.is_ok() {
+            nat = r;
+        }
     }
     // filter/FORWARD ACCEPT (P5/A4): container hosts (Docker/containerd — the
     // k8s fleet buildhost/fleet-host-1/fleet-host-2) default the FORWARD chain policy to DROP, so
@@ -339,7 +826,7 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], _advertised_routes: &[St
     // accept overlay→uplink and the established return path. Needed by BOTH
     // subnet-routers and exit nodes; the subnet-router path only ever "worked"
     // on LANs whose upstream router had a permissive FORWARD policy.
-    let fwd_out_ok = run(vec![
+    let fwd_out = run_step(vec![
         "iptables".into(),
         "-A".into(),
         "FORWARD".into(),
@@ -349,7 +836,7 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], _advertised_routes: &[St
         "ACCEPT".into(),
     ])
     .await;
-    let fwd_ret_ok = run(vec![
+    let fwd_ret = run_step(vec![
         "iptables".into(),
         "-A".into(),
         "FORWARD".into(),
@@ -363,18 +850,40 @@ async fn setup(if_name: &str, overlay_cidrs: &[String], _advertised_routes: &[St
         "ACCEPT".into(),
     ])
     .await;
-    // P5/S3b — IPv6 exit egress (best-effort; independent of the v4 result so a
-    // v4-only-uplink exit still reports v4 success). Clients keep v6 fail-closed
-    // until this succeeds on the exit.
-    setup_v6(if_name).await;
-    nat_ok && fwd_out_ok && fwd_ret_ok
+    let fwd_rules = fwd_out.and(fwd_ret);
+    // #3562 — a FORWARD rule that did not append kills the exit only where
+    // the chain drops: read its policy (read-only) to tell.
+    let forward_policy = if fwd_rules.is_err() {
+        let (_, text) = run_capture(vec!["iptables".into(), "-S".into(), "FORWARD".into()]).await;
+        forward_policy_accepts(&text)
+    } else {
+        None
+    };
+    // P5/S3b — IPv6 exit egress, independent of the v4 result: a v4-only
+    // uplink never costs the v4 offer. #3562 — its outcome is what the exit
+    // states, so clients turn IPv6 on only through an exit that serves it.
+    let v6 = setup_v6(if_name).await;
+    let v4 = linux_v4_outcome(ip_forward, nat, fwd_rules.clone(), forward_policy);
+    if v4.is_ok() {
+        if let Err(e) = &fwd_rules {
+            warn!(err = %e, policy_accepts = ?forward_policy,
+                "overlay: a FORWARD rule did not append, and the chain's policy does not drop (or could not be read) — the exit keeps its offer");
+        }
+        if ip_forward.is_none() {
+            warn!(
+                "overlay: /proc/sys/net/ipv4/ip_forward could not be read after enabling it — the exit keeps its offer"
+            );
+        }
+    }
+    SetupOutcome { v4, v6 }
 }
 
 /// P5/S3b — enable IPv6 forwarding + MASQUERADE on an exit node (Linux). Best-
 /// effort + logged independently of v4: a v4-only uplink (no v6, no `ip6tables`)
-/// simply leaves v6 egress unavailable, and clients then stay v6-fail-closed.
+/// simply leaves v6 egress unavailable. #3562 — `true` only when this exit
+/// serves IPv6 ([`linux_v6_outcome`]), which is what it states to its clients.
 #[cfg(target_os = "linux")]
-async fn setup_v6(if_name: &str) {
+async fn setup_v6(if_name: &str) -> bool {
     // Enable v6 forwarding. `accept_ra=2` so a host that forwards STILL accepts
     // Router Advertisements — otherwise `forwarding=1` downgrades RA acceptance
     // and a SLAAC/RA-configured uplink loses its OWN v6 default on the next RA,
@@ -432,14 +941,28 @@ async fn setup_v6(if_name: &str) {
         "ACCEPT".into(),
     ])
     .await;
-    if nat6_ok && fwd6_out_ok && fwd6_ret_ok {
-        info!("overlay: exit-node IPv6 forwarding + NAT enabled");
+    let rules_ok = nat6_ok && fwd6_out_ok && fwd6_ret_ok;
+    let forwarding = sysctl_flag(&read_proc("/proc/sys/net/ipv6/conf/all/forwarding"));
+    let uplink = has_v6_uplink(
+        &read_proc("/proc/net/ipv6_route"),
+        &read_proc("/proc/net/if_inet6"),
+        if_name,
+    );
+    let served = linux_v6_outcome(rules_ok, forwarding, uplink);
+    if served {
+        info!(
+            "overlay: exit-node IPv6 forwarding + NAT enabled; this exit states that it serves IPv6"
+        );
     } else {
         info!(
-            "overlay: IPv6 exit NAT not fully enabled (v4-only uplink / no ip6tables?) — \
-             clients routing through this exit stay v6-fail-closed"
+            rules_ok,
+            forwarding = ?forwarding,
+            v6_uplink = uplink,
+            "overlay: this exit does not serve IPv6 and says so — \
+             clients routing through it keep v6 fail-closed"
         );
     }
+    served
 }
 
 #[cfg(target_os = "windows")]
@@ -447,13 +970,13 @@ async fn setup(
     if_name: &str,
     overlay_cidrs: &[String],
     advertised_routes: &[String],
-) -> (bool, Vec<super::host_ledger::FwdTarget>) {
+) -> (SetupOutcome, Vec<super::host_ledger::FwdTarget>) {
     // P5/S3b — WinNAT (`New-NetNat`) has NO IPv6 API, so a Windows exit node
-    // cannot NAT v6. Clients routing through a Windows exit stay v6-fail-closed
-    // (their global v6 is encapsulated but dropped here — never leaked). v6 exit
-    // egress is Linux's (ip6tables) and macOS's (pf NAT66, FR-97 P1b).
+    // cannot NAT v6. #3562 — it says so (`exit_serves_v6: false`), and its
+    // clients keep IPv6 fail-closed instead of sending it here to be dropped.
+    // v6 exit egress is Linux's (ip6tables) and macOS's (pf NAT66, FR-97 P1b).
     info!(
-        "overlay: IPv6 exit NAT unavailable on Windows (WinNAT is v4-only); v6 stays fail-closed"
+        "overlay: IPv6 exit NAT unavailable on Windows (WinNAT is v4-only); this exit says so, and its clients keep v6 fail-closed"
     );
     // Forwarding on the overlay NIC **and on the EGRESS NIC for each advertised
     // route**.
@@ -486,6 +1009,12 @@ async fn setup(
     // forwarding state it FOUND (`FWD <guid> <ifIndex> <before>`), so the
     // revert can switch off exactly what this turned on (#2077, defect 2: it
     // used to leave every interface forwarding after the router stopped).
+    //
+    // #3562 — and, read-only, which adapter is the overlay's (`OVERLAY
+    // <ifIndex>`), which carries each route (`ROUTE <cidr> <ifIndex>`) and
+    // what each adapter's forwarding reads after the set (`AFTER <ifIndex>
+    // <state>`), so a failed script withdraws the offer only when the exit's
+    // IPv4 is dead ([`windows_forwarding_dead`]).
     let targets = advertised_routes
         .iter()
         .map(|c| format!("'{}'", c.trim().replace('\'', "")))
@@ -503,12 +1032,14 @@ async fn setup(
             "$fail = 0; $idx = @(); \
              $o = Get-NetIPInterface -InterfaceAlias '{alias}' -AddressFamily IPv4 \
                -ErrorAction SilentlyContinue | Select-Object -First 1; \
-             if ($o) {{ $idx += $o.ifIndex }} else {{ $fail = 1 }}; \
+             if ($o) {{ $idx += $o.ifIndex; Write-Output ('OVERLAY ' + $o.ifIndex) }} \
+               else {{ $fail = 1 }}; \
              foreach ($c in @({targets})) {{ \
                $ip = ($c -split '/')[0]; \
                $r = Find-NetRoute -RemoteIPAddress $ip -ErrorAction SilentlyContinue | \
                  Select-Object -First 1; \
-               if ($r) {{ $idx += $r.InterfaceIndex }} \
+               if ($r) {{ $idx += $r.InterfaceIndex; \
+                 Write-Output ('ROUTE ' + $c + ' ' + $r.InterfaceIndex) }} \
              }}; \
              foreach ($i in ($idx | Select-Object -Unique)) {{ \
                $before = (Get-NetIPInterface -ifIndex $i -AddressFamily IPv4 \
@@ -518,10 +1049,11 @@ async fn setup(
                if (-not $g) {{ $g = '-' }}; \
                Set-NetIPInterface -ifIndex $i -AddressFamily IPv4 \
                  -Forwarding Enabled -ErrorAction SilentlyContinue; \
-               if ((Get-NetIPInterface -ifIndex $i -AddressFamily IPv4 \
-                 -ErrorAction SilentlyContinue | Select-Object -First 1).Forwarding \
-                 -ne 'Enabled') {{ $fail = 1 }}; \
-               Write-Output ('FWD ' + $g + ' ' + $i + ' ' + $before) \
+               $after = (Get-NetIPInterface -ifIndex $i -AddressFamily IPv4 \
+                 -ErrorAction SilentlyContinue | Select-Object -First 1).Forwarding; \
+               if ($after -ne 'Enabled') {{ $fail = 1 }}; \
+               Write-Output ('FWD ' + $g + ' ' + $i + ' ' + $before); \
+               Write-Output ('AFTER ' + $i + ' ' + $after) \
              }}; \
              exit $fail"
         ),
@@ -544,6 +1076,12 @@ async fn setup(
              drop them. Check `Get-NetIPInterface | ft ifIndex,InterfaceAlias,Forwarding`."
         );
     }
+    // #3562 — withdraw only when the exit's IPv4 is dead; a subnet whose
+    // egress alone refused stays degraded, as before.
+    let fwd = match (fwd_ok, windows_forwarding_dead(&report, advertised_routes)) {
+        (true, _) | (false, None) => Ok(()),
+        (false, Some(dead)) => Err(dead),
+    };
     // Create the NAT only if no existing WinNAT covers this prefix (Docker
     // Desktop / WSL2 also use WinNAT and overlapping prefixes are rejected).
     //
@@ -552,13 +1090,14 @@ async fn setup(
     // unsuffixed name, so a single-block org creates the identical instance it
     // always did (and an upgrade finds its own NAT rather than orphaning one);
     // later blocks are suffixed by index.
-    let mut ok = true;
+    let mut failures: Vec<(String, String)> = Vec::new();
     let names = nat_names(overlay_cidrs.len());
     for (cidr, name) in overlay_cidrs.iter().zip(&names) {
         // FR-97 P0b-2b — `-ErrorAction Stop` and the message on stderr, so
         // `run` logs WHY WinNAT refused (an overlapping prefix from Docker
-        // or WSL, a missing class) rather than a bare failure.
-        ok &= run(vec![
+        // or WSL, a missing class) rather than a bare failure. #3562 — and
+        // that message is the withdrawal's reason.
+        let r = run_step(vec![
             "powershell".into(),
             "-NoProfile".into(),
             "-Command".into(),
@@ -572,13 +1111,32 @@ async fn setup(
             ),
         ])
         .await;
+        if let Err(e) = r {
+            failures.push((cidr.clone(), e));
+        }
     }
     // FR-97 P0b-2c — recorded, so the boot purge removes them after a crash.
     // Every name of ours, created now or found from an earlier run: only an
     // instance with OUR name is ever removed, never the one Docker or WSL
     // made for the same prefix.
     super::host_ledger::record_nat(&names);
-    (ok, forwarding)
+    // #3562 — a refused block that another ACTIVE WinNAT already translates
+    // is served; read them (read-only) only when something was refused.
+    let nat = if failures.is_empty() {
+        Ok(())
+    } else {
+        let (_, active) = run_capture(vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            "Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Active } | \
+             ForEach-Object { $_.Name + ' ' + $_.InternalIPInterfaceAddressPrefix }"
+                .into(),
+        ])
+        .await;
+        winnat_uncovered(failures, &active)
+    };
+    (windows_outcome(fwd, nat), forwarding)
 }
 
 /// The WinNAT instance names for `blocks` overlay blocks: the historical
@@ -698,8 +1256,18 @@ pub(crate) fn restore_forwarding_guids(guids: &[String]) {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-async fn setup(_if_name: &str, _overlay_cidrs: &[String], _advertised_routes: &[String]) -> bool {
-    false
+async fn setup(
+    _if_name: &str,
+    _overlay_cidrs: &[String],
+    _advertised_routes: &[String],
+) -> SetupOutcome {
+    SetupOutcome {
+        v4: Err(SetupFailure {
+            step: SetupStep::Nat,
+            detail: "this platform has no NAT arm".into(),
+        }),
+        v6: false,
+    }
 }
 
 impl Drop for SubnetRouterGuard {
@@ -830,31 +1398,47 @@ impl Drop for SubnetRouterGuard {
 
 /// Run an OS command off the async reactor (`std::process` in a blocking task —
 /// avoids tokio's `process` feature). `true` on exit 0, else logs stderr.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// #3562 — Linux only now: Windows keeps each step's reason ([`run_step`]).
+#[cfg(target_os = "linux")]
 async fn run(args: Vec<String>) -> bool {
+    run_step(args).await.is_ok()
+}
+
+/// #3562 — run an OS command off the async reactor, keeping why it failed:
+/// the first non-empty line of its stderr, bounded as a probe's is
+/// (`probe_cmd`), so a withdrawal names the failing command's own words.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn run_step(args: Vec<String>) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let prog = args[0].clone();
         match std::process::Command::new(&prog).args(&args[1..]).output() {
-            Ok(o) if o.status.success() => true,
+            Ok(o) if o.status.success() => Ok(()),
             Ok(o) => {
-                warn!(%prog, stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                warn!(%prog, stderr = %stderr.trim(),
                     "overlay: subnet-router command failed");
-                false
+                Err(stderr
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .map(|l| l.chars().take(REASON_MAX).collect())
+                    .unwrap_or_else(|| format!("{prog} exited with {}", o.status)))
             }
             Err(e) => {
                 warn!(%prog, %e, "overlay: subnet-router command spawn failed");
-                false
+                Err(format!("{prog} could not start: {e}"))
             }
         }
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or_else(|e| Err(format!("the setup task failed: {e}")))
 }
 
-/// FR-97 P0b-2b — [`run`], keeping stdout: `(exit 0, stdout)`. The forwarding
+/// FR-97 P0b-2b — [`run_step`]'s command run, keeping stdout: `(exit 0, stdout)`. The forwarding
 /// setup reports what it found on stdout, and a failed run still reports the
-/// interfaces it touched, which the revert needs.
-#[cfg(target_os = "windows")]
+/// interfaces it touched, which the revert needs. #3562 — Linux reads the
+/// FORWARD chain's policy with it.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn run_capture(args: Vec<String>) -> (bool, String) {
     tokio::task::spawn_blocking(move || {
         let prog = args[0].clone();

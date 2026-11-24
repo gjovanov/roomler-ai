@@ -106,6 +106,7 @@ pub async fn relay_overlay_msg_from_node(
             relay_port,
             advertised_routes,
             route_offer_withheld,
+            exit_serves_v6,
             ..
         } => {
             handle_overlay_join(
@@ -127,6 +128,7 @@ pub async fn relay_overlay_msg_from_node(
                 relay_port,
                 advertised_routes,
                 route_offer_withheld,
+                exit_serves_v6,
             )
             .await;
             None
@@ -262,6 +264,7 @@ async fn handle_overlay_join(
     relay_port: Option<u16>,
     advertised_routes: Vec<String>,
     route_offer_withheld: Option<String>,
+    exit_serves_v6: Option<bool>,
 ) {
     let node_ref = ident.node_ref();
     // FR-97 P0b — the device's own words, shown to admins: bounded and kept to
@@ -468,6 +471,7 @@ async fn handle_overlay_join(
                     supports_org_relay,
                     &advertised_routes,
                     route_offer_withheld.as_deref(),
+                    exit_serves_v6,
                     retire.as_ref(),
                 )
                 .await
@@ -575,6 +579,7 @@ async fn handle_overlay_join(
                         supports_org_relay,
                         advertised_routes: advertised_routes.clone(),
                         route_offer_withheld: route_offer_withheld.clone(),
+                        exit_serves_v6,
                     })
                     .await
                 {
@@ -3055,6 +3060,7 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // Dialer honesty — surface the node's raw-dial verdict VERBATIM
         // (`None` = pre-honesty agent; peers then keep legacy role inputs).
         udp_dialer_ok: node.udp_dialer_ok,
+        exit_serves_v6: node.exit_serves_v6,
         relay_home: node.relay_home.clone(),
         // C4 stage 2 (PR-B) — surface the node's standing warm-leg address
         // (heartbeat-mirrored) so a single-relay dialer can dial this anchor
@@ -3447,6 +3453,7 @@ mod tests {
             approved_routes: vec![],
             is_exit_node: false,
             route_offer_withheld: None,
+            exit_serves_v6: None,
             status: AgentStatus::Online,
             last_seen_at: now,
             created_at: now,

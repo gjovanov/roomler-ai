@@ -1704,9 +1704,16 @@ pub enum ClientMsg {
         /// overlay (a Mac; Windows Home, #2077). The server can show it beside
         /// the route approval, so an admin sees "cannot serve" rather than
         /// nothing at all. Additive both ways: an older agent never sends it,
-        /// an older server ignores it.
+        /// an older server ignores it. #3562 — also the reason a setup that
+        /// failed withdrew the offer, re-sent at once by a re-join.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route_offer_withheld: Option<String>,
+        /// #3562 — whether this exit serves IPv6. Absent = an agent from before
+        /// #3562 (its clients keep the old rule), `false` = IPv4 only, `true` =
+        /// its own IPv6 NAT came up. Stated only by a node that offers a
+        /// default route. Absent stays absent on the wire, never `null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_serves_v6: Option<bool>,
     },
 
     /// Node trickles updated connectivity candidates; the server fans a
@@ -4073,6 +4080,12 @@ pub struct NetmapPeer {
     /// capability signal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udp_dialer_ok: Option<bool>,
+    /// #3562 — whether this exit serves IPv6, as its last join stated it:
+    /// absent = an exit (or a server) from before #3562, and a client then
+    /// keeps the old rule; `false` = IPv4 only, so a client keeps its IPv6
+    /// fail-closed and says why; `true` = its own IPv6 NAT came up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_serves_v6: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
     /// C4 stage 2 — this peer's STANDING warm TURN allocation's relayed
@@ -7456,6 +7469,7 @@ mod tests {
             supports_derp_floor: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
             route_offer_withheld: Some("WinNAT is not available".into()),
+            exit_serves_v6: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.join""#));
@@ -8284,6 +8298,7 @@ mod tests {
                 srflx_nat: Some("cone".into()),
                 caps: None,
                 udp_dialer_ok: None,
+                exit_serves_v6: None,
                 relay_home: None,
                 warm_relay_endpoint: None,
                 reachable: true,
