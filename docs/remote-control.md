@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3911`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:4956`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:5001`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -3398,7 +3398,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3681`](../crates/localapi/src/lib.rs#L3681), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:109`](../crates/modules/remote/src/session_policy.rs#L109)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3681`](../crates/localapi/src/lib.rs#L3681), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:523`](../crates/remote_control/src/models.rs#L523)) and re-announced on the heartbeat when it changes |
 
@@ -7146,6 +7146,18 @@ after `kill -9`. Only `run` gates on the lock — `enroll`,
 `service install/uninstall`, `caps`, `displays`, `encoder-smoke`,
 `self-update` stay runnable alongside a live agent.
 
+**Machine guard** (`agents/roomlerd/src/machine_guard.rs`, #4280): one
+daemon per machine, whatever config a `run` loads. `run` takes it before
+anything host-global, and a run that finds it held leaves with 8 (0 on
+macOS). Only a privileged daemon (SYSTEM or an elevated administrator on
+Windows, root on Linux and macOS) can hold it; an unprivileged start can
+check for it but never creates it. It is keyed by the overlay
+interface's name and held only while its owner lives, so a holder that
+ends leaves it free. On Windows only SYSTEM and Administrators, at high
+integrity, can take it or change it, and any other signed-in account can
+only read whether it is held. The rule, and how each supervisor reads the
+code: [multi-org.md §2](multi-org.md#the-machines-guard-one-daemon-per-machine-enforced-4280).
+
 **Internal liveness watchdog** (`agents/roomlerd/src/watchdog.
 rs`): process-singleton via `OnceLock<Arc<Watchdog>>`; pumps tick
 via global `watchdog::tick("name")` free helpers (no parameter
@@ -7825,7 +7837,7 @@ the crash *reports* because the watchdog wrote its own.
 **A worker with no enrollment counts nowhere** (#4028). The SCM host's
 worker for an account with no config, and no last good copy of one that
 holds an enrollment (#4157), exits `NO_ENROLLMENT_EXIT_CODE`
-(78, [`daemon_error.rs:153`](../agents/roomlerd/src/daemon_error.rs#L153)).
+(78, [`daemon_error.rs:210`](../agents/roomlerd/src/daemon_error.rs#L210)).
 `should_record_supervisor_crash` leaves it out of the reports, and the host
 backs it off exactly as an exit 1. Since #4324 it does not count toward the
 host's crash-loop alarm and never raises it: the host names the way forward in
@@ -7877,10 +7889,10 @@ Each one now marks its run clean before it ends, through
 [`agents/roomlerd/src/run_end.rs`](../agents/roomlerd/src/run_end.rs):
 
 - `run_cmd` opens the run's book once the start's mark is saved
-  ([`app.rs:4406`](../agents/roomlerd/src/app.rs#L4406)), and never on the
+  ([`app.rs:4451`](../agents/roomlerd/src/app.rs#L4451)), and never on the
   read-only view an unenrolled GUI worker runs on (FR-43 P3a). It shares the
   P6 write lock with the book
-  ([`app.rs:4866`](../agents/roomlerd/src/app.rs#L4866)).
+  ([`app.rs:4911`](../agents/roomlerd/src/app.rs#L4911)).
 - The mark takes that lock, reads the file again, calls
   `mark_clean_shutdown` and saves, on a thread of its own. The end waits for
   it at most `MARK_BUDGET` (2 s) and then exits anyway. A mark that comes too
@@ -7907,7 +7919,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4378`](../agents/roomlerd/src/app.rs#L4378),
+([`agents/roomlerd/src/app.rs:4423`](../agents/roomlerd/src/app.rs#L4423),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 
@@ -8355,7 +8367,7 @@ flowchart LR
   | The supervisor returned an error | `ServiceSpecific(2)` | restarts it |
   | The supervisor panicked | `ServiceSpecific(3)` | restarts it |
   | No supervisor at all (the worker path or the startup sequence failed) | `ServiceSpecific(4)` | restarts it |
-  | The worker found the single-instance lock held, and the orphan check read every roomlerd process without finding an earlier host's worker: a second installed flavour (#2465, §19.8.9) | `0` | leaves the service stopped |
+  | The worker found the single-instance lock or the machine's guard held (#4280), and the orphan check read every roomlerd process without finding an earlier host's worker: a second installed flavour, or a console `run` that holds the machine (#2465, §19.8.9) | `0` | leaves the service stopped |
   | The same refusal, but some roomlerd process could not be read, so an orphan cannot be ruled out (#2465) | `ServiceSpecific(5)` | restarts it |
 
   ⚠️ A requested stop must stay `0`. With non-crash failure actions on, any other

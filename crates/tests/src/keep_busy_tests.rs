@@ -764,3 +764,70 @@ async fn the_default_pattern_is_validated_and_any_member_may_read() {
         403
     );
 }
+
+/// #4254 — the org's keep-busy settings decide `MANAGE_TENANT` before they
+/// read their body at all: a member without the bit gets the one 403
+/// `forbidden` naming it for a body that does not even parse, the answer a
+/// body the route reads gets, and someone outside the org the one
+/// `not_a_member`. While the route took `Json<T>` as an extractor, axum
+/// answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone.
+#[tokio::test]
+async fn the_keep_busy_settings_decide_manage_tenant_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("kb-unparsed").await;
+    let other = app.seed_tenant("kb-unparsed-b").await;
+    let write = GatedWrite {
+        method: "PUT",
+        path: format!("/api/tenant/{}/keep-busy-settings", seeded.tenant_id),
+        reads: json!({ "keep_busy_denied": false }),
+        refused_field: r#"{"keep_busy_denied": "x"}"#,
+    };
+
+    let mut wrong = gate_problems(
+        &app,
+        "a member without the bit",
+        &seeded.member.access_token,
+        Gate::Bit("MANAGE_TENANT"),
+        &write,
+    )
+    .await;
+    wrong.extend(
+        gate_problems(
+            &app,
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+            &write,
+        )
+        .await,
+    );
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4254's control. The org's owner is answered a keep-busy body that does
+/// not parse exactly as axum's `Json` extractor answers it, the status and
+/// the plain-text words: the body is read before the handler judges what it
+/// sets, as the extractor read it before the handler ran.
+#[tokio::test]
+async fn a_holder_is_answered_a_keep_busy_body_that_does_not_parse_as_the_json_extractor_answers_it()
+ {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_fleet::keep_busy::OrgKeepBusySettingsUpdate;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("kb-unparsed-holder").await;
+    let wrong = holder_problems::<OrgKeepBusySettingsUpdate>(
+        &app,
+        &seeded.admin.access_token,
+        "PUT",
+        &format!("/api/tenant/{}/keep-busy-settings", seeded.tenant_id),
+        r#"{"keep_busy_denied": "x"}"#,
+    )
+    .await;
+    assert_no_problems("the org's owner", &wrong);
+}

@@ -19,7 +19,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{State, rejection::JsonRejection},
+};
 use bson::{Document, doc, oid::ObjectId};
 use roomler_core::{ApiError, MembershipLifecycle, extractors::auth::AuthUser};
 use serde::{Deserialize, Serialize};
@@ -130,13 +133,19 @@ pub struct PruneResponse {
 /// rows), re-checked first, so a person who is a member again by now is left
 /// alone, and a second call finds nothing left.
 ///
+/// Decides its gate before it reads its body (#4254): anyone but a platform
+/// operator gets the 404 whatever the body is, so the route stays unseen; an
+/// operator is answered a body that does not parse as the `Json` extractor
+/// answers it.
+///
 /// [`HookRegistry::org_member_removed`]: roomler_core::HookRegistry::org_member_removed
 pub async fn prune(
     State(state): State<ChatState>,
     auth: AuthUser,
-    Json(body): Json<PruneRequest>,
+    body: Result<Json<PruneRequest>, JsonRejection>,
 ) -> Result<Json<PruneResponse>, ApiError> {
     roomler_core::guards::require_platform_admin(&state, &auth)?;
+    let Json(body) = body?;
     let limit = body
         .limit
         .unwrap_or(DEFAULT_PRUNE_LIMIT)

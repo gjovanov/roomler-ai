@@ -392,6 +392,23 @@ mod tests {
         assert!(is_scm_worker_cmdline(&built), "{built}");
     }
 
+    /// Cell 6 (#4280) — the Stop arm's second cover of a worker hand-off. A worker
+    /// that refused because the machine's guard was held (exit 8) leaves the host
+    /// supervising none, and the reaper then runs with `supervised` empty. Its rule
+    /// matches any other `run --supervisor scm`, so it ends this host's own
+    /// predecessor that outlived the bounded wait as well as an earlier host's
+    /// worker, and the host respawns (`reaped > 0`). The host itself never matches.
+    #[test]
+    fn a_predecessor_that_outlived_the_wait_is_an_orphan_to_end() {
+        let built = format!("\"{EXE}\" {}", super::super::worker_args().join(" "));
+        let host_pid = 4100;
+        let predecessor = cand(4242, "roomlerd.exe", &built);
+        assert!(is_orphaned_worker(&predecessor, host_pid, &[]));
+        let host = cand(host_pid, "roomlerd.exe", &built);
+        assert!(!is_orphaned_worker(&host, host_pid, &[]));
+        assert!(!is_orphaned_worker(&predecessor, host_pid, &[4242]));
+    }
+
     /// Everything else this binary runs as is never a worker to end.
     #[test]
     fn nothing_else_is_an_scm_worker() {

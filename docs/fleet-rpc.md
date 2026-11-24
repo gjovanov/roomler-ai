@@ -531,7 +531,7 @@ run the command as root:
 
 | Where | What is checked | Source |
 |---|---|---|
-| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:975`](../crates/modules/fleet/src/agent_exec.rs#L975) |
+| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:981`](../crates/modules/fleet/src/agent_exec.rs#L981) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:371`](../crates/modules/fleet/src/agent_exec.rs#L371) |
 | The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3206`](../crates/modules/fleet/src/hub.rs#L3206) |
 | The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5815`](../agents/roomlerd/src/signaling.rs#L5815) |
