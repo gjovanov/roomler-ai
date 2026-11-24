@@ -76,7 +76,7 @@ graph TB
 
 | Direction | Message | Purpose |
 |---|---|---|
-| node → server | `rc:overlay.join` | pubkey, LAN endpoints, MTU, capability flags |
+| node → server | `rc:overlay.join` | pubkey, LAN endpoints, MTU, capability flags; the routes it offers and, when it withholds them, why (FR-97 P0b, #3562); whether an exit serves IPv6 (`exit_serves_v6`, #3562) |
 | node → server | `rc:overlay.endpoints` | trickle current relay candidates |
 | node → server | `rc:overlay.srflx` | trickle STUN-learned public mapping + NAT type |
 | node → server | `rc:overlay.relay_request` | ask for coturn credentials for a peer |
@@ -103,7 +103,16 @@ monotonic `next_host` cursor, and `free_hosts`, a pool of **recycled** host
 numbers. On `rc:overlay.join` the server looks the machine up by
 `(tenant_id, machine_id)`:
 
-- **a live node** → rehydrate it; the lease is unchanged.
+- **a live node** → rehydrate it; the lease is unchanged. The rehydrate
+  refreshes the row from the join (the offered routes and their withheld
+  reason, an exit's IPv6 statement, the LAN endpoints) and empties what the
+  join does not carry: srflx and its NAT type, the dialer bit, the measured
+  capability vector, the warm relay. So a node that joins again mid-session
+  (a control-WS Reattach, or an exit whose setup changed its offer, #3562)
+  follows the join with what it wiped (`rejoin_plan`,
+  `crates/tunnel-core/src/overlay/runtime.rs:4679`), and an exit's re-offer
+  reaches the admin row and every peer at once
+  ([`overlay-exit-nodes.md`](./overlay-exit-nodes.md#the-offer-follows-the-setup-3562)).
 - **no live node** → `allocate_host` pops the head of `free_hosts` (FIFO, so an
   address gets the longest possible cool-down before reuse) and falls back to
   bumping `next_host` when the pool is empty. Both branches are single atomic
