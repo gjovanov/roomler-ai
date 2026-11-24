@@ -323,11 +323,11 @@ collects its row.
 
 The daemon keeps the row it started as: its primary's server, org, `agent_id`
 and `ephemeral` (`updater::RunRow`, taken at
-`agents/roomlerd/src/app.rs:4658`). On an OS stop the gate
+`agents/roomlerd/src/app.rs:4703`). On an OS stop the gate
 (`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
 unchanged) reads the run's own `ephemeral`, and the removal targets the run's
 own row (`updater::stop_removal`, `:5085-5114`, at
-`agents/roomlerd/src/app.rs:5895-5923`):
+`agents/roomlerd/src/app.rs:5940-5968`):
 
 | The file at the stop | The stop removes |
 |---|---|
