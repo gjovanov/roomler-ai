@@ -1073,12 +1073,12 @@ sequenceDiagram
   `agents/roomlerd/src/files.rs:3276`): the copy is one step that cannot stop, and its staging is
   what it reads, so the cancel neither stops it nor removes the staging; the end answers once. The
   channel logs `files: cancel requested` with `ending=true`. Today's viewer sends no cancel for an
-  upload (`cancelUpload`, `ui/src/composables/useRemoteControl.ts:14112`, settles the row locally),
+  upload (`cancelUpload`, `ui/src/composables/useRemoteControl.ts:14131`, settles the row locally),
   so a row cancelled at 100% still lands its file. A download's cancel acts at once.
 - **A begin during a placement is taken at once.** Its chunks are written as they come, and its own
   end waits in the lane for the earlier placement. The viewer sends its next begin as soon as a row
   settles, which a local cancel of a row at 100% does at once (`cancelUpload`,
-  `ui/src/composables/useRemoteControl.ts:14112`; the queue's next turn, `:13795`), so the viewer
+  `ui/src/composables/useRemoteControl.ts:14131`; the queue's next turn, `:13814`), so the viewer
   reaches this case. A begin into the same folder makes its `<id>` there twice at most: a placement
   beside it removes the empty `.roomler-partial` folder, and can do so between the begin's make of
   that folder and its make of the `<id>`. `staging::stage` already did so on Linux, and the other
@@ -1087,7 +1087,7 @@ sequenceDiagram
   the mark is process-wide: "files:resume `<id>` but its end is placing the file now"
   (`resume_upload`, `agents/roomlerd/src/files.rs:3421`). It is refused before anything is looked
   up, so it never truncates the staging the copy reads. Today's viewer sends none: `files:end` is the
-  last thing its upload sends (`ui/src/composables/useRemoteControl.ts:13423`).
+  last thing its upload sends (`ui/src/composables/useRemoteControl.ts:13442`).
 - **A channel that closes, or a session that ends, during a placement** leaves the placement to run
   on: its file lands whole, and its staging and registry entry go, as when the read loop ran it.
   Only its answer is dropped, with one debug line ("files: the end's answer is not sent: its channel
