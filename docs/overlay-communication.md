@@ -1218,8 +1218,13 @@ match this node`), and an org-relay grant that needs them is refused.
     prefix back would flip it with the sibling org's guard on every wave, and
     each flip is a route change that arms the next wave in both runtimes. So a
     sibling org's adapter, another product or the host's own LAN keeps a
-    prefix it holds. Install is unchanged: the last carrier install still
-    takes the prefix (Linux `replace`, macOS delete-then-add), and which org's
+    prefix it holds. Holding means holding the entry the guard would write:
+    where the OS keys our route apart from the holder's (Windows always,
+    Linux at another metric, such as a LAN route at metric 100), ours goes
+    back beside it, where install put it, and the OS picks between the two by
+    metric, as it did before the deletion. Install is unchanged: the last
+    carrier install still takes the prefix (Linux `replace`, macOS
+    delete-then-add), and which org's
     route should win there is an open decision of FR-68's C3
     ([FR-68](fr/FR-68-stress-cells-multi-org-and-ipam.md)).
   - **Logs.** A restore is a DEBUG line, `overlay: route guard restored a
@@ -1245,7 +1250,7 @@ match this node`), and an org-relay grant that needs them is refused.
 
   | OS | The guard reads | It writes | A route that already holds the prefix |
   |---|---|---|---|
-  | Linux | `ip [-6] route show exact <cidr> dev <if>`, our device only (`linux_subnet_show_args`, `tun.rs:626`; `linux_route_shown`, `tun.rs:8091`) | install's argv with `replace` → `add`, only when ours is not listed (`linux_subnet_restore_writes`, `tun.rs:610`) | refuses the `add` with EEXIST (`File exists`), the quiet held answer. A refused netlink write is answered to the writer alone, so no route monitor sees it |
+  | Linux | `ip [-6] route show exact <cidr> dev <if>`, our device only (`linux_subnet_show_args`, `tun.rs:626`; `linux_route_shown`, `tun.rs:8091`) | install's argv with `replace` → `add`, only when ours is not listed (`linux_subnet_restore_writes`, `tun.rs:610`) | holds install's exact key (the prefix at metric 0 in the main table), so it refuses the `add` with EEXIST (`File exists`), the quiet held answer. A refused netlink write is answered to the writer alone, so no route monitor sees it |
   | macOS | install's exact `route -n get`, read three ways as #4117 reads the utun's block: ours, another interface's, absent (`utun_block_held`, `tun.rs:1188`) | install's `add` alone, never its `delete`, and only when nothing holds the prefix (`bsd_subnet_restore_writes`, `tun.rs:724`; `bsd_subnet_restore`, `tun.rs:8469`) | is never added over. `route` exits 0 when the kernel refuses a write, and the refused add still reaches every routing-socket listener as `RTM_ADD … errno 17`, which the route monitor counts (`classify_bsd_monitor_line`, below), so an add over a holder would arm the next wave, be refused, and arm the one after |
   | Windows | `winroute::ensure` on our adapter's LUID: the row install makes, on-link at metric 1 (`SystemTun::defend_subnet_route`, `tun.rs:6627`; `ensure`, `tun.rs:3122`) | that row, only when it is missing | is another interface's row, which Windows keys apart from ours, so nothing touches it |
 
