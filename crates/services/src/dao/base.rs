@@ -4,7 +4,7 @@ use bson::{Document, doc, oid::ObjectId};
 use mongodb::{Collection, Database};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::debug;
+use tracing::trace;
 
 #[derive(Debug, Error)]
 pub enum DaoError {
@@ -357,7 +357,9 @@ where
             .inserted_id
             .as_object_id()
             .expect("inserted_id should be ObjectId");
-        debug!(?id, "Inserted document");
+        // #4402 — TRACE: one line per insert, with no collection, was 13 % of
+        // the busier pod's log; the row itself is the record.
+        trace!(?id, "Inserted document");
         Ok(id)
     }
 

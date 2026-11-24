@@ -420,7 +420,7 @@ flowchart TD
 ```
 
 - **The same code decides both.** `shape_full_netmap`
-  (`crates/modules/network/src/overlay.rs:2912`) was extracted from the overlay join and is
+  (`crates/modules/network/src/overlay.rs:3091`) was extracted from the overlay join and is
   what the join itself now calls, so the list can never show a peer the netmap withholds:
   ACL `off` / `warn` list every live node, `enforce` only the shaped set.
 - ⚠️ **The device's node is found before any ACL read.** Loading the ACL can create the
