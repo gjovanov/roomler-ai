@@ -429,7 +429,7 @@ extractor answers a body that does not parse there: 400, 413, 415 or 422. A writ
 takes `Json<T>` and decides its gate in its body therefore answers such a body before
 the gate. A caller the gate refuses is told about the body instead of being refused,
 and a platform-operator route, which answers anyone else 404 so that it stays unseen,
-is seen (#4187, #4218).
+is seen (#4187, #4218, #4254).
 
 - **The order.** A write gated on a permission bit or on the platform-operator
   allowlist takes `Result<Json<T>, JsonRejection>` and unwraps it with
@@ -439,30 +439,59 @@ is seen (#4187, #4218).
   is. A caller it lets through gets what the extractor answered, the status and the
   plain-text words (`ApiError::JsonBody`, `crates/core/src/error.rs:55`), whatever the
   id is, as before.
-- **Where it holds.** Every gated write of the network module: the overlay ACL and
-  tunnel-policy writes (#4187), the route and exit-node approvals, `PUT …/magic-dns`,
-  the retired-key switch, the peer-relay mode, a device's SSH policy, the org's SSH
-  settings, a tunnel client's update and the block renumber, and the four
-  platform-operator routes: block reclaim, host reconcile, orphans and the
-  tunnel-client prune (#4218). The fleet module's `rc-resume-scope` and the remote
-  module's `close-dead` read theirs after the platform-operator check too, and answer
-  an operator's malformed body a 400 JSON. #4254 tracks the gated writes of the other
-  modules that still take `Json<T>`.
+- **Where it holds.** Every gated write of the api crate and of every module:
+  - `network` (#4187, #4218): the overlay ACL and tunnel-policy writes, the route and
+    exit-node approvals, `PUT …/magic-dns`, the retired-key switch, the peer-relay
+    mode, a device's SSH policy, the org's SSH settings, a tunnel client's update and
+    the block renumber, and the four platform-operator routes: block reclaim, host
+    reconcile, orphans and the tunnel-client prune.
+  - the api crate (#4254): an invite, a batch of invites and an added member
+    (`INVITE_MEMBERS`), a role's create and update (`MANAGE_ROLES`), and the growth
+    exclusions (platform operator).
+  - `chat` (#4254): a room's update (`MANAGE_CHANNELS`, after the room guard) and the
+    room-membership prune (platform operator). A message's edit answers its author
+    check before its body too, where the guard cannot see it (below).
+  - `fleet` (#4254): a device's settings, the forced self-update of one device and of
+    the fleet, a device's exec policy and an ephemeral enrollment key's mint
+    (`MANAGE_AGENTS`), and the org's exec switch, ephemeral-key settings, external
+    access and keep-busy settings (`MANAGE_TENANT`). Adding a device to a second org
+    is below.
+  - `remote` (#4254): the org's remote-session policy and limits (`MANAGE_TENANT`).
+  - `saas` (#4254): the newsletter's create, edit, test send and send (platform
+    operator). The send takes `Result<Option<Json<T>>, JsonRejection>`, so a request
+    with no content type still reaches it with no body.
+
+  The fleet module's `rc-resume-scope` and the remote module's `close-dead` read theirs
+  after the platform-operator check too, and answer an operator's malformed body a 400
+  JSON.
+- **A gate that needs the body comes after it.** Two such gates sit among these
+  writes:
+  - the billing writes, `POST /api/stripe/checkout`, `/change-plan` and `/portal`:
+    their gate asks about the org the body's `tenant_id` names, and their routes carry
+    no org in their path. They are on the guard's `BY_DESIGN` list.
+  - adding a device to a second org (`POST …/agent/{agent_id}/join-org`) asks
+    `MANAGE_AGENTS` of two orgs: of the path's org before the body, and of the org the
+    body names after it, since only the body names that org. A holder on the path's
+    org who sends a body that does not parse gets the extractor's answer, as no org
+    was named. The scan sees the first gate before the body, and no list holds it.
 - **The guard.** `gate_before_body` (`crates/api/src/gate_before_body.rs`), a unit
   test of the api crate, reads the server's source: the api crate, `roomler-core` and
   every module. It fails when a function takes its body as `Json<T>` or
-  `Option<Json<T>>` and calls a gate, or takes the `Result` and uses it before its
-  gate. A gate is a function, other than a handler, that checks a permission bit
-  (`permissions::has`) or the allowlist (`platform_admins.contains`), or that calls a
-  gate, so a new helper built on `require_permission` is one without being named.
-  Its `DEFERRED` list holds #4254's handlers and its `BY_DESIGN` list the checks
-  that need the body, each with why. Both may only shrink: an entry the scan no
-  longer flags fails the test until it is removed.
-- ⚠️ **What it cannot see** is written in its header: an ownership or author check
-  (`chat::message::update`, #4254), a check called as a method or through a macro, a
-  handler a macro writes, and the other extractors that answer before the handler
-  runs (`Query<T>`, a typed `Path<T>`, `Form<T>`, `Multipart`, a `Bytes` or `String`
-  body's 413). Those stay the reviewer's.
+  `Option<Json<T>>` and calls a gate, or takes the `Result` of either and uses it
+  before its gate. A gate is a function, other than a handler, that checks a
+  permission bit (`permissions::has`) or the allowlist (`platform_admins.contains`),
+  or that calls a gate, so a new helper built on `require_permission` is one without
+  being named. Its `BY_DESIGN` list holds the checks that need the body, each with
+  why. It may only shrink: an entry the scan no longer flags fails the test until it
+  is removed.
+- ⚠️ **What it cannot see** is written in its header: an ownership or author check, a
+  check called as a method or through a macro, a handler a macro writes, and the other
+  extractors that answer before the handler runs (`Query<T>`, a typed `Path<T>`,
+  `Form<T>`, `Multipart`, a `Bytes` or `String` body's 413). Those stay the reviewer's.
+  A message's edit (`chat::message::update`) is one: since #4254 its author check is
+  answered before its body, so someone who is not the author gets the answer a missing
+  message gets, whatever the body holds. Only its integration test
+  (`crates/tests/src/room_access_tests.rs`) shows that order.
 
 The routes are pinned by the integration tests that cover them: each file has a test
 that a caller the gate refuses gets its answer for `{`, a field of the wrong type and

@@ -755,3 +755,104 @@ async fn long_output_is_capped_and_flagged() {
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// #4254 — a device's exec policy (gate 3, `MANAGE_AGENTS`) and the org's
+/// exec switch (gate 1, `MANAGE_TENANT`) decide their bit before they read
+/// their body at all: a member without the bit gets the one 403 `forbidden`
+/// naming it for a body that does not even parse, the answer a body the route
+/// reads gets, and someone outside the org the one `not_a_member`. While they
+/// took `Json<T>` as an extractor, axum answered such a body before the
+/// handler ran, with a 400, 415 or 422 decided by the body alone.
+#[tokio::test]
+async fn the_exec_policy_and_the_exec_switch_decide_their_bit_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("exec-unparsed").await;
+    let other = app.seed_tenant("exec-unparsed-b").await;
+    let org = format!("/api/tenant/{}", seeded.tenant_id);
+    let fresh = bson::oid::ObjectId::new().to_hex();
+    let writes = [
+        (
+            "MANAGE_AGENTS",
+            GatedWrite {
+                method: "PUT",
+                path: format!("{org}/agent/{fresh}/exec-policy"),
+                reads: json!({}),
+                refused_field: r#"{"can_originate": "x"}"#,
+            },
+        ),
+        (
+            "MANAGE_TENANT",
+            GatedWrite {
+                method: "PUT",
+                path: format!("{org}/exec-settings"),
+                reads: json!({ "remote_exec_enabled": false }),
+                refused_field: r#"{"remote_exec_enabled": "x"}"#,
+            },
+        ),
+    ];
+
+    let mut wrong = Vec::new();
+    for (bit, write) in &writes {
+        wrong.extend(
+            gate_problems(
+                &app,
+                "a member without the bit",
+                &seeded.member.access_token,
+                Gate::Bit(bit),
+                write,
+            )
+            .await,
+        );
+        wrong.extend(
+            gate_problems(
+                &app,
+                "another org's owner",
+                &other.admin.access_token,
+                Gate::NotAMember,
+                write,
+            )
+            .await,
+        );
+    }
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4254's control. The org's owner is answered an exec policy or an exec
+/// switch that does not parse exactly as axum's `Json` extractor answers it,
+/// the status and the plain-text words: the policy's body is read before the
+/// device is looked up, as the extractor read it before the handler ran.
+#[tokio::test]
+async fn a_holder_is_answered_an_exec_write_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_fleet::agent_exec::{ExecPolicyBody, OrgExecSettings};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("exec-unparsed-holder").await;
+    let owner = &seeded.admin.access_token;
+    let org = format!("/api/tenant/{}", seeded.tenant_id);
+    let fresh = bson::oid::ObjectId::new().to_hex();
+
+    let mut wrong = holder_problems::<ExecPolicyBody>(
+        &app,
+        owner,
+        "PUT",
+        &format!("{org}/agent/{fresh}/exec-policy"),
+        r#"{"can_originate": "x"}"#,
+    )
+    .await;
+    wrong.extend(
+        holder_problems::<OrgExecSettings>(
+            &app,
+            owner,
+            "PUT",
+            &format!("{org}/exec-settings"),
+            r#"{"remote_exec_enabled": "x"}"#,
+        )
+        .await,
+    );
+    assert_no_problems("the org's owner", &wrong);
+}
