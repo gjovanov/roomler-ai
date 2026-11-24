@@ -612,15 +612,15 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2170`](../crates/tunnel-core/src/overlay/runtime.rs#L2170),
+  ([`runtime.rs:2221`](../crates/tunnel-core/src/overlay/runtime.rs#L2221),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
-  ([`lib.rs:124`](../crates/localapi/src/lib.rs#L124)), parsed from
+  ([`lib.rs:130`](../crates/localapi/src/lib.rs#L130)), parsed from
   `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
   or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
 - `roomler status` prints it only when the firewall limits what a mesh peer
-  reaches ([`localclient.rs:3210`](../agents/roomler-cli/src/localclient.rs#L3210)):
+  reaches ([`localclient.rs:3212`](../agents/roomler-cli/src/localclient.rs#L3212)):
 
   ```text
     host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
@@ -914,7 +914,7 @@ needs the relay's log of the same minutes.
 
 ⚠️ **Since rc.400 the always-on floor opens `/derp` on every node at startup**
 (`ROOMLERD_OVERLAY_DERP_FLOOR`, default on;
-`crates/tunnel-core/src/overlay/runtime.rs:2632`), so that DERP can carry every
+`crates/tunnel-core/src/overlay/runtime.rs:2710`), so that DERP can carry every
 fresh pair from birth while better tiers upgrade over it. A DERP verdict from the
 server opens it mid-run too (below). The lazy rule below is what a node does with
 the floor switched off.
@@ -1110,7 +1110,7 @@ them when the rule is compiled
 ([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)).
 Each compile (a node's netmap, a delta fan, the DERP allow table, an org-relay
 decision) reads the org's role ids once and reuses them for every node it resolves
-(`CompileRoles`, `crates/modules/network/src/overlay.rs:2541`), so a role the org
+(`CompileRoles`, `crates/modules/network/src/overlay.rs:2546`), so a role the org
 has deleted, or one of another org, never matches.
 
 When someone is given a role or loses one, or a role is deleted, the org's nodes are
@@ -1200,8 +1200,8 @@ match this node`), and an org-relay grant that needs them is refused.
   while the router read online. A wave now also restores them:
   - **What is defended.** Per installed peer, the subnets its crypto-router
     entry holds (what install routed, `WgDevice::peer_subnets`, read on the
-    select loop at `crates/tunnel-core/src/overlay/runtime.rs:3441` and
-    `crates/tunnel-core/src/overlay/runtime.rs:3641`) that the network map
+    select loop at `crates/tunnel-core/src/overlay/runtime.rs:3597` and
+    `crates/tunnel-core/src/overlay/runtime.rs:3797`) that the network map
     still approves (`defended_subnets_of`,
     `crates/tunnel-core/src/overlay/runtime/route_guard.rs:138`). An approved
     subnet that no install has routed yet is not defended: an OS route with
@@ -1210,7 +1210,7 @@ match this node`), and an org-relay grant that needs them is refused.
     route either: the next carrier install does, as before.
   - **Never a default route.** The set goes through install's own P5/A1
     filter (`installable_subnets`, `route_guard.rs:114`, which install applies
-    at `route_guard.rs:668`), so no prefix of length 0 or 1 enters it. An exit
+    at `route_guard.rs:703`), so no prefix of length 0 or 1 enters it. An exit
     node's `0.0.0.0/0` approval and the `/1` halves an exit client's
     crypto-router holds stay with the exit path, which re-asserts them inline.
   - **Once per CIDR**, however many routers claim it (`defended_routes`,
@@ -1626,8 +1626,8 @@ packet the Mac sends to its own overlay address goes into the utun, and the
 daemon reads it. No peer holds that address, so on #4117's code `ping <self>`
 on the Mac got no answer, and neither did the Mac's own lookups of overlay
 names: MagicDNS listens on `<self>:53`
-(`crates/tunnel-core/src/overlay/runtime.rs:2451`), and macOS sends the overlay
-zone there (`runtime.rs:2491`, then
+(`crates/tunnel-core/src/overlay/runtime.rs:2529`), and macOS sends the overlay
+zone there (`runtime.rs:2569`, then
 `crates/tunnel-core/src/overlay/dns.rs:566`). Linux and Windows deliver such a
 packet through their kernel's local route for the address, and the daemon
 never sees it.
@@ -1664,7 +1664,7 @@ flowchart TD
 * **The utun's own address** is the one it was brought up with, read once, at
   the bring-up (`SelfDelivery`, `tun.rs:8233`, from `up_with` at
   `tun.rs:6176`). It does not change while the utun lives: a runtime whose
-  netmap names another address exits for a rebuild (`runtime.rs:4041`), and
+  netmap names another address exits for a rebuild (`runtime.rs:4185`), and
   the daemon reuses a utun only for the same address. Each utun hands back only
   its own address; a sibling org's utun hands back its own.
 * **IPv6.** macOS routes the derived IPv6 as a local address, and still, on

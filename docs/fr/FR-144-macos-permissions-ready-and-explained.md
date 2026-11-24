@@ -129,7 +129,7 @@ per permission `roomlerd` needs:
 
 | Row, as the person reads it | Without it | Live state from | Button |
 |---|---|---|---|
-| **See the screen** — Screen & System Audio Recording | "The remote screen is blank." | a fresh `roomlerd` child probe, because the running process's read stays false until a restart (`crates/localapi/src/lib.rs:545-557`); that macOS attributes the child to `roomlerd.app` is to verify in the field | "Open Screen & System Audio Recording" |
+| **See the screen** — Screen & System Audio Recording | "The remote screen is blank." | a fresh `roomlerd` child probe, because the running process's read stays false until a restart (`crates/localapi/src/lib.rs:551-563`); that macOS attributes the child to `roomlerd.app` is to verify in the field | "Open Screen & System Audio Recording" |
 | **Control the mouse and keyboard** — Device Control and Data Access (macOS 27), Accessibility (earlier) | "Clicks and keys from the controller do nothing." | `AXIsProcessTrusted`, live (`tcc.rs:69-71`) | "Open Device Control and Data Access" |
 | **Reach this network** — Local Network | "A controller on the same network connects through the internet or a relay instead of directly." | the agent's own sends: the last result of a multicast or local-address send | "Ask now", then "Open Local Network" once answered |
 | **Show the screen without a monthly question** — the screen-capture reminder | "macOS asks again about every 30 days, and the question covers the screen until someone answers it." | the agent's own record of when it last saw the reminder answered (replayd's own record, if a process of ours may read it: to verify in the field) | "Ask now" (one capture) |

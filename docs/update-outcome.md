@@ -160,7 +160,7 @@ read the watcher's verdict at its start and settled nothing at its clean-run mar
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
-(`crates/localapi/src/lib.rs:484`), a `LastInstallStatus` (`:581`) whose
+(`crates/localapi/src/lib.rs:490`), a `LastInstallStatus` (`:587`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` stdout line spell them so
 one grep finds all three surfaces (locked by

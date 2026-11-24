@@ -706,9 +706,9 @@ sequenceDiagram
 | Capture the uplink per family, re-read before every pin | `tun.rs:6127`, `current_uplink` `tun.rs:8622`, `bsd_default_uplink` `tun.rs:359` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
 | Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:405`, `bsd_pin_row` `tun.rs:441`, `bsd_pin_holds` `tun.rs:454`, `bsd_table` `tun.rs:8107` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
 | Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:7117` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
-| Re-check the pins | `stale_host_exemptions` `tun.rs:7205`, the gate `route_guard.rs:731` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
-| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:731` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
-| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:527`, `exemption_withheld_reason` `route_guard.rs:539` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
+| Re-check the pins | `stale_host_exemptions` `tun.rs:7205`, the gate `route_guard.rs:766` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
+| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:766` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
+| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:558`, `exemption_withheld_reason` `route_guard.rs:570` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
 
 > ⚠️ **A lookup does not show a pin.** A destination a connection has used
 > keeps an interface-scoped clone of the default route (`WASCLONED,IFSCOPE`).
@@ -831,7 +831,7 @@ A node in netstack mode (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`, or
 mesh lives in a userspace stack inside the daemon, reached through a SOCKS5
 front on `127.0.0.1`. Selecting an exit there installs the split-default in
 that userspace router only
-([`route_guard.rs:827`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L827)),
+([`route_guard.rs:862`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L862)),
 so the exit carries exactly what the front dials and nothing else.
 
 ```mermaid
@@ -853,7 +853,7 @@ flowchart LR
 | DNS | never steered | below |
 
 `roomler status` says so, from `ExitNodeStatus.socks5_port`
-([`lib.rs:111`](../crates/localapi/src/lib.rs#L111)):
+([`lib.rs:117`](../crates/localapi/src/lib.rs#L117)):
 
 ```text
   exit node   <exit> (active for SOCKS5 clients of 127.0.0.1:1080 only — IPv4 destinations; nothing else on this host uses it)
@@ -863,7 +863,7 @@ Before P0c-3 it printed `active, v6 on, DNS NOT steered`, as if every app on
 the host left through the exit (field, 2026-10-17; FR-97 §8).
 
 ⚠️ **A netstack node never steers the host's DNS**
-([`dns_steer_allowed`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L496)).
+([`dns_steer_allowed`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L527)).
 The steer is host-wide on Windows (an NRPT catch-all) and macOS (a resolver
 entry). On a node whose OS routes nothing through the exit it would only move
 every app to the public upstream over the uplink, and on a managed laptop cut
@@ -942,7 +942,7 @@ client of it would have black-holed.
 - **Approval reaches clients at once; the OFFER needs a re-join.** The approve
   and exit-node toggles re-fan the node to its peers immediately
   (`crates/modules/network/src/routes/overlay_route.rs:356`, `:433`, through
-  `overlay::refan_node`, `crates/modules/network/src/overlay.rs:1579`), so no
+  `overlay::refan_node`, `crates/modules/network/src/overlay.rs:1584`), so no
   client re-joins. What does is the exit node itself: the server refuses to
   approve `/0` on a node that has not advertised it, so set
   `overlay_exit_node_enabled` in its config and let it re-join first.
