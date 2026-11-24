@@ -47,10 +47,10 @@ pub struct AgentConfig {
     /// the daemon de-enrolls itself on SIGTERM/SIGINT so a clean stop removes
     /// the device in seconds instead of on the deadline.
     ///
-    /// Recorded FROM THE SERVER'S ENROLL RESPONSE, never from a local flag
-    /// alone — the credential decides what was minted, and the config must
-    /// not disagree with the row. Absent (every pre-FR-51 config) = a normal
-    /// permanent device, byte-for-byte today's behaviour.
+    /// Recorded FROM THE SERVER'S ENROLL RESPONSE on every enrollment, a fold
+    /// into an existing file too (#4331), never from a local flag or the old
+    /// file: the answer is the row's, and the config must not disagree with it.
+    /// Absent (every pre-FR-51 config) = a permanent device, today's behaviour.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
     /// Encoder preference: `auto` (default), `hardware`, or `software`.
@@ -3625,8 +3625,12 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     // not parse, is "unreadable", as before. Both lines are ERROR: either way
     // the host now runs on an older config.
     let prev = prev_path(path);
-    match load_prev(path, &prev) {
-        Ok(mut cfg) => {
+    match load_copy(path, &prev, &err) {
+        Ok((mut cfg, checked)) => {
+            #[cfg(all(windows, test))]
+            if let Some(f) = AFTER_THE_COPY_IS_READ.with(|it| it.borrow_mut().take()) {
+                f();
+            }
             if not_found(&err) {
                 tracing::error!(
                     path = %path.display(),
@@ -3651,7 +3655,18 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
             // Reinstate it as the live file so the next save has a base. The
             // keys this build does not know are the copy's to keep (#2078):
             // the live file, which a save reads them from, parses as nothing.
-            if let Err(e) = save_with_base(path, &prev, &cfg, Kept::Keep) {
+            // #4176 — a restore of the missing machine config keeps them from
+            // the copy's text the checks judged, and puts its file in place
+            // only where none is: a config written since that read is loaded.
+            let base = match &checked {
+                Some(text) => Base::Checked(text),
+                None => Base::File(&prev),
+            };
+            if let Err(e) = save_with_base(path, base, &cfg, Kept::Keep) {
+                #[cfg(windows)]
+                if checked.is_some() && path.exists() {
+                    return load_written_since(path);
+                }
                 tracing::warn!(error = %format!("{e:#}"), "could not reinstate recovered config");
             }
             note_unknown_keys(path);
@@ -3818,7 +3833,7 @@ fn machine_merge_base(
     merge_base(
         path,
         || crate::machine_tree::may_fold(tree, switches),
-        load_private_prev,
+        |prev| load_private_prev(prev),
     )
 }
 
@@ -4067,6 +4082,16 @@ pub fn parse_text(raw: &str, origin: &str) -> Result<AgentConfig> {
 /// What [`try_load`] does with the text it read, `origin` standing for its
 /// path: every reader parses through here.
 fn parse_raw(raw: &str, origin: &str) -> Result<AgentConfig> {
+    let (cfg, promoted) = parse_quietly(raw, origin)?;
+    say_promoted(origin, &promoted);
+    Ok(cfg)
+}
+
+/// [`parse_raw`] without its lines: the config, and each plaintext server URL
+/// the parse read as TLS (the field, and what it held), for the caller to say
+/// ([`say_promoted`]). #4176 — the copy a waiting host asks about at every tick
+/// is parsed here, and said once, by the restore ([`load_machine_copy`]).
+fn parse_quietly(raw: &str, origin: &str) -> Result<(AgentConfig, Vec<(String, String)>)> {
     // An all-NUL file of the correct length is the signature of a power loss
     // between `rename` and the data reaching disk. `toml` reports it as a
     // parse error at line 1, which reads like a hand-edit typo; name it.
@@ -4082,7 +4107,14 @@ fn parse_raw(raw: &str, origin: &str) -> Result<AgentConfig> {
     // FR-101 P1b — TLS to the server whatever the file says, unless its owner
     // kept plaintext (`allow_plaintext_server`). Here, because every reader
     // parses through this function: the daemon, the probe, the recovery.
-    for (field, was) in cfg.secure_server_urls() {
+    let promoted = cfg.secure_server_urls();
+    Ok((cfg, promoted))
+}
+
+/// FR-101 P1b — say each plaintext server URL a parse read as TLS
+/// ([`parse_quietly`]).
+fn say_promoted(origin: &str, promoted: &[(String, String)]) {
+    for (field, was) in promoted {
         tracing::warn!(
             path = %origin,
             field = %field,
@@ -4091,7 +4123,6 @@ fn parse_raw(raw: &str, origin: &str) -> Result<AgentConfig> {
              allow_plaintext_server = true to keep plaintext (a lab without TLS)"
         );
     }
-    Ok(cfg)
 }
 
 /// One step to a key in the config document, as `serde_ignored` reports where
@@ -4485,7 +4516,7 @@ fn unknown_keys_said(raw: &str) -> Option<String> {
 }
 
 pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
-    save_with_base(path, path, cfg, Kept::Keep)
+    save_with_base(path, Base::File(path), cfg, Kept::Keep)
 }
 
 /// #3666 — [`save`] for an elevated writer that folded nothing into what was
@@ -4498,7 +4529,7 @@ pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
 /// would be sealed by the repair and recovered from after any damage, and a
 /// planted key would ride into the new config. Anywhere else it is [`save`].
 pub fn save_fresh(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
-    save_with_base(path, path, cfg, Kept::Drop)
+    save_with_base(path, Base::File(path), cfg, Kept::Drop)
 }
 
 /// #3666 — what a save keeps of the files it replaces: the outgoing config as
@@ -4596,16 +4627,26 @@ impl StartupWrites {
     }
 }
 
+/// What [`save_with_base`] keeps the keys this build does not know from
+/// (#2078), and how it puts its file in place.
+#[derive(Clone, Copy)]
+enum Base<'a> {
+    /// The file at this path, read by the save: the config being replaced, or
+    /// the `.prev` a recovery loaded. The new file replaces the config.
+    File(&'a std::path::Path),
+    /// #4176 — the text of the copy a restore of the missing machine config
+    /// read through the machine's checks ([`load_machine_copy`]): the keys
+    /// come from these bytes, never from a second read. No outgoing config is
+    /// kept as `.prev`, and the new file takes the config's name only where no
+    /// file has it ([`move_where_none_is`]).
+    Checked(&'a str),
+}
+
 /// [`save`], keeping the keys this build does not know of `base` rather than
 /// of the file at `path` (#2078): [`load`]'s recovery reinstates the `.prev`
 /// copy it loaded over a live file that does not parse, and the keys to keep
 /// are the copy's. `kept`: [`Kept`].
-fn save_with_base(
-    path: &PathBuf,
-    base: &std::path::Path,
-    cfg: &AgentConfig,
-    kept: Kept,
-) -> Result<()> {
+fn save_with_base(path: &PathBuf, base: Base<'_>, cfg: &AgentConfig, kept: Kept) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
@@ -4646,13 +4687,15 @@ fn save_with_base(
         }
     }
     #[cfg(windows)]
-    let serialised = if fresh {
-        toml::to_string_pretty(cfg).context("serialising config")?
-    } else {
-        serialise_for(path, base, cfg, machine.is_some())?
-    };
+    let at_machine = machine.is_some();
     #[cfg(not(windows))]
-    let serialised = serialise_for(path, base, cfg, false)?;
+    let at_machine = false;
+    let restore = matches!(base, Base::Checked(_));
+    let serialised = match base {
+        _ if fresh => toml::to_string_pretty(cfg).context("serialising config")?,
+        Base::File(base) => serialise_for(path, base, cfg, at_machine)?,
+        Base::Checked(text) => serialise_over(cfg, text, &prev_path(path))?.0,
+    };
 
     // ATOMIC (P6 hardening): write a sibling temp file, then rename over
     // the target. The file holds `agent_token` — a torn `fs::write`
@@ -4719,8 +4762,9 @@ fn save_with_base(
     // new file of its own, as the config's own temp, and at the machine
     // location only from a config that passes the machine tree's check.
     // #3666 — and never on a fresh machine save: the outgoing config was not
-    // the machine's, and the repair has just made it pass that check.
-    if !fresh && try_load(path).is_ok() {
+    // the machine's, and the repair has just made it pass that check. #4176 —
+    // nor on a restore, which replaces nothing.
+    if !fresh && !restore && try_load(path).is_ok() {
         #[cfg(windows)]
         let rotated = rotate_prev(path, machine.is_some());
         #[cfg(not(windows))]
@@ -4733,6 +4777,10 @@ fn save_with_base(
         }
     }
 
+    #[cfg(windows)]
+    if restore {
+        return move_where_none_is(&tmp, path);
+    }
     std::fs::rename(&tmp, path).with_context(|| {
         // Best-effort cleanup so failed saves don't accrete temp files.
         let _ = std::fs::remove_file(&tmp);
@@ -4770,6 +4818,18 @@ thread_local! {
     /// own machine tree, which [`machine_tree_of`] then never answers.
     static STAND_IN: std::cell::RefCell<Option<crate::machine_tree::MachineTree>> =
         const { std::cell::RefCell::new(None) };
+    /// Tests only: what runs once on this thread, after [`load`] has read the
+    /// copy it recovers from and before it writes anything: a stand-in for a
+    /// writer at that moment ([`after_the_copy_is_read`]).
+    static AFTER_THE_COPY_IS_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests only: run `f` once on this thread, between [`load`]'s read of the copy
+/// it recovers from and its first write.
+#[cfg(all(windows, test))]
+fn after_the_copy_is_read(f: impl FnOnce() + 'static) {
+    AFTER_THE_COPY_IS_READ.with(|it| *it.borrow_mut() = Some(Box::new(f)));
 }
 
 /// #3666 — what `roomlerd re-enroll` and `roomlerd org` ask before they
@@ -4912,6 +4972,8 @@ fn outgoing_bytes(path: &std::path::Path, machine: bool) -> Result<Option<Vec<u8
 /// check ([`load_private_prev`]). It is not part of the chain the service
 /// checks before it runs the config, so an old copy another account made never
 /// stops a device: the next save replaces it with a new file ([`rotate_prev`]).
+/// #4176 — the copy of a machine config that is not there is read through the
+/// checks the config would pass instead ([`load_copy`]).
 fn load_prev(path: &std::path::Path, prev: &PathBuf) -> Result<AgentConfig> {
     #[cfg(windows)]
     if machine_tree_of(path).is_some() {
@@ -4925,13 +4987,169 @@ fn load_prev(path: &std::path::Path, prev: &PathBuf) -> Result<AgentConfig> {
 /// #3609 — a machine-global `.prev`, only while it is a plain file owned by
 /// SYSTEM or Administrators that no other account may change, checked through
 /// its handle (`machine_tree::read_checked`): what [`load`] and an elevated
-/// writer's merge base ([`read_merge_base`]) recover from.
+/// writer's merge base ([`read_merge_base`]) recover from a config that is
+/// there and does not load. #4176 — the bytes parsed are the bytes checked,
+/// read through that handle, never read again by name.
 #[cfg(windows)]
-fn load_private_prev(prev: &PathBuf) -> Result<AgentConfig> {
-    if let Err(why) = crate::machine_tree::read_checked(prev, 1 << 20) {
-        anyhow::bail!("{why}");
+fn load_private_prev(prev: &std::path::Path) -> Result<AgentConfig> {
+    match crate::machine_tree::read_checked(prev, 1 << 20) {
+        Ok(Some(bytes)) => parse_bytes(bytes, prev),
+        Ok(None) => Err(not_there(prev)),
+        Err(why) => anyhow::bail!("{why}"),
     }
-    try_load(prev)
+}
+
+/// #4176 — the copy [`load`] runs on in place of the config at `path`, whose
+/// read failed with `err`. The machine config that is not there is restored
+/// only from a copy that passes the checks the config itself would, and holds
+/// an enrollment ([`load_machine_copy`]), with the text those checks judged,
+/// which the restore writes from; every other config recovers from its copy
+/// as before ([`load_prev`]), with no text.
+fn load_copy(
+    path: &std::path::Path,
+    prev: &PathBuf,
+    err: &anyhow::Error,
+) -> Result<(AgentConfig, Option<String>)> {
+    #[cfg(windows)]
+    if not_found(err)
+        && let Some(tree) = machine_config_tree(path)
+    {
+        return load_machine_copy(&tree).map(|(cfg, text)| (cfg, Some(text)));
+    }
+    #[cfg(not(windows))]
+    let _ = err;
+    load_prev(path, prev).map(|cfg| (cfg, None))
+}
+
+/// #4176 — the machine tree `path` is the config of, when it is the machine
+/// config itself ([`machine_tree_of`] answers for any path in its folder).
+#[cfg(windows)]
+fn machine_config_tree(path: &std::path::Path) -> Option<crate::machine_tree::MachineTree> {
+    machine_tree_of(path).filter(|tree| tree.config() == path)
+}
+
+/// #4176 — what [`load`] restores the machine config that is not there from:
+/// its copy, read through the checks the config would pass
+/// (`machine_tree::read_machine_copy`: the chain as found, and its check) and
+/// parsed from the bytes that were checked, only when it holds an enrollment.
+/// A copy with none holds nothing the machine could run as SYSTEM, so it is
+/// not written into the machine's place, where the service would then run it.
+/// The service host and the SYSTEM worker's start ask the same question first
+/// ([`machine_previous_copy`]), and restore only an `Enrolled`. The config
+/// comes with the text it was parsed from, and what its parse read as TLS is
+/// said here, once.
+#[cfg(windows)]
+fn load_machine_copy(tree: &crate::machine_tree::MachineTree) -> Result<(AgentConfig, String)> {
+    let copy = machine_copy_config(tree)?;
+    if !copy.cfg.has_primary_enrollment() {
+        anyhow::bail!(
+            "{} holds no enrollment, so the missing machine config is not restored from it",
+            tree.prev().display()
+        );
+    }
+    say_promoted(&tree.prev().display().to_string(), &copy.promoted);
+    Ok((copy.cfg, copy.text))
+}
+
+/// #4176 — a machine config's copy, as [`machine_copy_config`] read it.
+#[cfg(windows)]
+struct MachineCopy {
+    cfg: AgentConfig,
+    /// The bytes the check judged, as text: what a restore writes from.
+    text: String,
+    /// What the parse read as TLS ([`parse_quietly`]), not yet said.
+    promoted: Vec<(String, String)>,
+}
+
+/// #4176 — the copy of the machine config under `tree`, read through
+/// `machine_tree::read_machine_copy` and parsed from those bytes without a
+/// line ([`parse_quietly`]): a host that waits asks at every tick. No copy is
+/// an error [`not_found`] answers yes for.
+#[cfg(windows)]
+fn machine_copy_config(tree: &crate::machine_tree::MachineTree) -> Result<MachineCopy> {
+    let copy = tree.prev();
+    let bytes = match crate::machine_tree::read_machine_copy(tree) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(not_there(&copy)),
+        Err(why) => anyhow::bail!("{why}"),
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("reading config at {}: {e}", copy.display()))?;
+    let (cfg, promoted) = parse_quietly(&text, &copy.display().to_string())?;
+    Ok(MachineCopy {
+        cfg,
+        text,
+        promoted,
+    })
+}
+
+/// #4176 — a config was written at the machine `path` after its restore read
+/// the copy, so the restore did not put its file in place
+/// ([`move_where_none_is`]): the config that was written is loaded instead,
+/// once it passes what the SYSTEM worker's ladder asks of a machine config
+/// (`machine_tree::private_machine_config`).
+#[cfg(windows)]
+fn load_written_since(path: &PathBuf) -> Result<AgentConfig> {
+    tracing::warn!(
+        path = %path.display(),
+        "config: a machine config was written while its copy was being restored; the restore \
+         is dropped, and the config that was written is loaded"
+    );
+    if let Some(tree) = machine_config_tree(path)
+        && let Err(crate::machine_tree::Refusal::NotPrivate(why)) =
+            crate::machine_tree::private_machine_config(
+                &tree,
+                crate::machine_tree::Switches::from_env(),
+            )
+    {
+        anyhow::bail!(
+            "the machine config at {} is not loaded: {why}",
+            path.display()
+        );
+    }
+    let cfg = try_load(path)?;
+    note_unknown_keys(path);
+    Ok(cfg)
+}
+
+/// #4176 — a restore's last step: `tmp` takes the config's name at `path` only
+/// where no file has it (`MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`).
+/// A config written after the copy was read is never replaced: the move fails,
+/// and the temp file is removed.
+#[cfg(windows)]
+fn move_where_none_is(tmp: &std::path::Path, path: &std::path::Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let wide =
+        |p: &std::path::Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (from, to) = (wide(tmp), wide(path));
+    // SAFETY: two NUL-terminated paths that live across the call.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        let e = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(tmp);
+        return Err(anyhow::Error::new(e).context(format!(
+            "putting the restored config in place at {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// A config's bytes, read through a checked handle, parsed by [`try_load`]'s
+/// rules with `path` naming them.
+#[cfg(windows)]
+fn parse_bytes(bytes: Vec<u8>, path: &std::path::Path) -> Result<AgentConfig> {
+    let raw = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("reading config at {}: {e}", path.display()))?;
+    parse_raw(&raw, &path.display().to_string())
+}
+
+/// The error a read of `path` that found nothing gives: [`not_found`] answers
+/// yes for it, as for [`try_load`]'s own.
+#[cfg(windows)]
+fn not_there(path: &std::path::Path) -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+        .context(format!("reading config at {}", path.display()))
 }
 
 /// #4157 — what [`load`] restores the copy without: the marks a run leaves on
@@ -4955,19 +5173,73 @@ pub enum PreviousCopy {
     Missing,
     /// It is there, and does not load or may not be read. At the
     /// machine-global location on Windows, also one that fails the machine
-    /// tree's check.
+    /// tree's check: #4176, the checks the config itself would pass
+    /// ([`machine_previous_copy`]).
     Broken,
 }
 
 /// #4157 — what a start whose config at `path` is missing can run on: its last
 /// good copy ([`prev_path`]), read through the same check as [`load`]'s
-/// restore. It reads the copy and writes nothing.
+/// restore. It reads the copy and writes nothing. #4176 — for the machine
+/// config on Windows, [`machine_previous_copy`].
 pub fn previous_copy(path: &std::path::Path) -> PreviousCopy {
-    match load_prev(path, &prev_path(path)) {
+    #[cfg(windows)]
+    if let Some(tree) = machine_config_tree(path) {
+        return machine_previous_copy(&tree);
+    }
+    what_copy(load_prev(path, &prev_path(path)))
+}
+
+fn what_copy(copy: Result<AgentConfig>) -> PreviousCopy {
+    match copy {
         Ok(cfg) if cfg.has_primary_enrollment() => PreviousCopy::Enrolled,
         Ok(_) => PreviousCopy::NoEnrollment,
         Err(e) if not_found(&e) => PreviousCopy::Missing,
         Err(_) => PreviousCopy::Broken,
+    }
+}
+
+/// #4176 — what the machine config under `tree`, which is not there, can be
+/// restored from: its copy, read through the checks the config itself would
+/// pass (`machine_tree::read_machine_copy`). A copy that fails one is
+/// `Broken`, whatever it holds. The one question the service host
+/// (`roomlerd`'s `win_service::supervisor::config_opens_in`, after the machine
+/// config and the SYSTEM profile's) and the SYSTEM worker's start
+/// ([`previous_copy`]) ask, so they cannot disagree; [`load`] restores only
+/// what it calls `Enrolled`. It reads the copy and writes nothing. Why a copy
+/// is not restored is logged once per reason, and nothing its parse finds is
+/// said: not once per tick of a host that waits.
+#[cfg(windows)]
+pub fn machine_previous_copy(tree: &crate::machine_tree::MachineTree) -> PreviousCopy {
+    let copy = machine_copy_config(tree).map(|copy| copy.cfg);
+    note_machine_copy(tree, &copy);
+    what_copy(copy)
+}
+
+#[cfg(windows)]
+fn note_machine_copy(tree: &crate::machine_tree::MachineTree, copy: &Result<AgentConfig>) {
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let why = match copy {
+        Ok(cfg) if cfg.has_primary_enrollment() => None,
+        Ok(_) => Some("it holds no enrollment".to_string()),
+        Err(e) if not_found(e) => None,
+        // A parse error says where it stopped and nothing of the file
+        // ([`parse_failure`]).
+        Err(e) => Some(format!("{e:#}")),
+    };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if why != *last {
+        if let Some(why) = &why {
+            tracing::warn!(
+                config = %tree.config().display(),
+                copy = %tree.prev().display(),
+                reason = %why,
+                "config: the machine config is missing, and its copy is not restored: it does not \
+                 pass the checks the config would, or holds no enrollment; the device runs as one \
+                 with no machine enrollment"
+            );
+        }
+        *last = why;
     }
 }
 
@@ -7765,6 +8037,217 @@ tenant_id = "tid2"
                 ),
                 other => panic!("{other:?}"),
             }
+        }
+    }
+
+    /// #4176 — a machine config that is missing is restored at a start only
+    /// from a copy that SYSTEM would trust as much as the config itself: the
+    /// machine tree's as-found rule and its check, with the copy in the
+    /// config's place. On trees made by `machine_tree::test_support`, never
+    /// the computer's own. They run on CI's elevated runner.
+    #[cfg(windows)]
+    mod machine_copy {
+        use super::*;
+        use crate::machine_tree::MachineTree;
+        use crate::machine_tree::test_support::*;
+
+        /// `tree` stands in for the computer's own machine tree on this
+        /// test's thread, as in `machine_merge_base`.
+        fn stand_in(tree: &MachineTree) {
+            super::super::STAND_IN.with(|it| *it.borrow_mut() = Some(tree.clone()));
+        }
+
+        /// What a start finds in each case: an enrolled copy only in the trees
+        /// that pass, and in every tree that fails a check, a copy it cannot
+        /// run on.
+        fn want(case: MissingConfig) -> PreviousCopy {
+            match case {
+                MissingConfig::NoCopy => PreviousCopy::Missing,
+                MissingConfig::Restorable | MissingConfig::CopyAnAdministratorMayChange => {
+                    PreviousCopy::Enrolled
+                }
+                MissingConfig::CopyWithNoEnrollment => PreviousCopy::NoEnrollment,
+                MissingConfig::CopyInAnOpenFolder
+                | MissingConfig::CopyUnderAnotherAccountsParent
+                | MissingConfig::ReplaceRightOnTheParent
+                | MissingConfig::CopyAnotherAccountOwns
+                | MissingConfig::KeysAnotherAccountMayChange
+                | MissingConfig::CopyThatDoesNotLoad
+                | MissingConfig::InheritOnlyFullControlOnTheParent
+                | MissingConfig::WriteOnTheParentWithoutReplace
+                | MissingConfig::KeyFileInheritsWrite => PreviousCopy::Broken,
+            }
+        }
+
+        /// One tick of a host that waits, as the service host and the SYSTEM
+        /// worker's ladder run it on the machine config: the repair, then the
+        /// check, which finds no config.
+        fn tick(tree: &MachineTree) {
+            use crate::machine_tree::{Refusal, Switches, private_machine_config};
+            assert_eq!(
+                private_machine_config(tree, Switches::ON),
+                Err(Refusal::Absent)
+            );
+        }
+
+        /// #4176 — the copy a start reads for a missing machine config
+        /// ([`previous_copy`], which `config_at_start` asks) passes the same
+        /// checks as the config would, at the first tick of a host that waits
+        /// and at the next, and asking writes nothing.
+        #[test]
+        fn a_missing_machine_configs_copy_is_read_through_the_machines_checks() {
+            if !elevated_or_skip("a missing machine config's copy") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in MissingConfig::ALL {
+                let root = tempfile::tempdir().unwrap();
+                let tree = missing_config(root.path(), case);
+                stand_in(&tree);
+                for at in 0..2 {
+                    tick(&tree);
+                    let got = previous_copy(&tree.config());
+                    if got != want(case) {
+                        wrong.push(format!(
+                            "{case:?}, tick {at}: {got:?}, want {:?}",
+                            want(case)
+                        ));
+                    }
+                }
+                assert!(!tree.config().exists(), "{case:?}: nothing written");
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// #4176 — [`load`] restores a missing machine config only from a
+        /// copy that passes: the file is written, sealed, and the chain
+        /// passes. From any other copy nothing is written, and the load fails
+        /// on the live file's own read error. Each load follows a tick, as a
+        /// worker's start follows its ladder.
+        #[test]
+        fn a_missing_machine_config_is_restored_only_from_a_copy_that_passes() {
+            if !elevated_or_skip("a missing machine config's restore") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in MissingConfig::ALL {
+                let root = tempfile::tempdir().unwrap();
+                let tree = missing_config(root.path(), case);
+                stand_in(&tree);
+                tick(&tree);
+                let loaded = load(&tree.config());
+                if case.restorable() {
+                    let cfg = loaded.expect("restored");
+                    assert!(cfg.has_primary_enrollment());
+                    assert!(tree.config().exists(), "reinstated");
+                    assert_eq!(crate::machine_tree::check(&tree), Ok(()));
+                    continue;
+                }
+                match loaded {
+                    Ok(_) => wrong.push(format!("{case:?}: restored")),
+                    Err(err) if !not_found(&err) => wrong.push(format!("{case:?}: {err:#}")),
+                    Err(_) => {}
+                }
+                if tree.config().exists() {
+                    wrong.push(format!("{case:?}: a config was written"));
+                }
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// The plaintext-URL line [`parse_raw`] says for a config it reads as
+        /// TLS.
+        const PLAINTEXT_LINE: &str = "a plaintext server URL in the config is read as TLS";
+
+        /// #4176 — a host that waits asks the copy at every tick, and that
+        /// ask says nothing of what the copy holds: a copy whose server URL
+        /// is plaintext is said once, by the restore, never once per tick.
+        #[test]
+        fn a_copy_with_a_plaintext_url_is_said_once_not_once_per_tick() {
+            if !elevated_or_skip("a copy with a plaintext URL") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            let mut cfg = test_fixture();
+            cfg.server_url = "http://example.invalid".into();
+            std::fs::write(tree.prev(), toml::to_string(&cfg).unwrap()).unwrap();
+            stand_in(&tree);
+            let (ticks, guard) = captured();
+            for at in 0..4 {
+                tick(&tree);
+                assert_eq!(
+                    previous_copy(&tree.config()),
+                    PreviousCopy::Enrolled,
+                    "tick {at}"
+                );
+            }
+            let said = ticks.text();
+            drop(guard);
+            assert_eq!(said.matches(PLAINTEXT_LINE).count(), 0, "{said}");
+            let (restore, _guard) = captured();
+            load(&tree.config()).expect("restored");
+            let said = restore.text();
+            assert_eq!(said.matches(PLAINTEXT_LINE).count(), 1, "{said}");
+        }
+
+        /// #4176 — a config written after the restore read the copy, and
+        /// before the restore puts its file in place, is never replaced: the
+        /// restore is dropped, and the config that was written is loaded.
+        #[test]
+        fn a_config_written_while_its_copy_is_restored_is_kept() {
+            if !elevated_or_skip("a config written during a restore") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            stand_in(&tree);
+            let mut newer = test_fixture();
+            newer.machine_name = "written meanwhile".into();
+            let text = toml::to_string_pretty(&newer).unwrap();
+            let (path, written) = (tree.config(), text.clone());
+            super::super::after_the_copy_is_read(move || {
+                // As an elevated save leaves it: sealed.
+                std::fs::write(&path, &written).unwrap();
+                set_dacl(&path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+            });
+            let cfg = load(&tree.config()).expect("loaded");
+            assert_eq!(cfg.machine_name, "written meanwhile");
+            assert_eq!(
+                std::fs::read_to_string(tree.config()).unwrap(),
+                text,
+                "never replaced"
+            );
+            let left: Vec<_> = std::fs::read_dir(tree.folder())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".tmp."))
+                .collect();
+            assert!(left.is_empty(), "no temp file left: {left:?}");
+        }
+
+        /// #4176 — the keys this build does not know, which the restore
+        /// writes, come from the bytes the check judged: a change to the copy
+        /// after that read never reaches the restored config.
+        #[test]
+        fn the_restore_writes_the_unknown_keys_of_the_bytes_it_checked() {
+            if !elevated_or_skip("the restore's unknown keys") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            let enrolled = toml::to_string(&test_fixture()).unwrap();
+            std::fs::write(tree.prev(), format!("future_key = \"checked\"\n{enrolled}")).unwrap();
+            stand_in(&tree);
+            let prev = tree.prev();
+            super::super::after_the_copy_is_read(move || {
+                std::fs::write(&prev, format!("future_key = \"later\"\n{enrolled}")).unwrap();
+            });
+            load(&tree.config()).expect("restored");
+            let text = std::fs::read_to_string(tree.config()).unwrap();
+            assert!(text.contains("future_key = \"checked\""), "{text}");
+            assert!(!text.contains("later"), "{text}");
         }
     }
 

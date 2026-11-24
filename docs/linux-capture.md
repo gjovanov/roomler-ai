@@ -559,7 +559,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3628`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3630`,
 `virtual_desktop.rs:2261`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -736,7 +736,7 @@ takes anything down (§2.4). A `SIGTERM` listener made when the desktop starts
 would answer at once, but tokio installs the process's handler for good at
 the first listener, and one made then would come before the run loop's own:
 a `SIGTERM` landing between the two would be swallowed, and the daemon would
-run on. `terminate_signal` (`agents/roomlerd/src/app.rs:3711`) is the daemon's
+run on. `terminate_signal` (`agents/roomlerd/src/app.rs:3713`) is the daemon's
 only one (`STOP_GRACE`'s comment, `agents/roomlerd/src/virtual_desktop.rs:1087-1093`).
 
 **Xorg's directory is made, never adopted** (`private_dir` `:2985`). It
@@ -985,7 +985,7 @@ stderr), a thread that follows that stderr, and the wait for `ready`, 5 s at
 most. A keeper the daemon gives up on adds up to 1 s, the wait to collect it
 after its SIGKILL. A Remote Apps launch on the desktop waits for the keeper's
 answer at most 4 s, the start's 3 s and 1 s of slack, on the blocking thread
-that serves the request (`peer.rs:11404`) and outside the daemon's state lock;
+that serves the request (`peer.rs:11413`) and outside the daemon's state lock;
 its write never waits.
 
 **What a person notices.** A program started from a terminal that the
@@ -2192,7 +2192,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:7118`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7144`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -3007,7 +3007,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`app.rs:4617-4635`, `watchdog.rs:628`) and it forced
+watchdog's 90 s window (`app.rs:4619-4637`, `watchdog.rs:628`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a
