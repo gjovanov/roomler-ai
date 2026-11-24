@@ -2348,11 +2348,36 @@ pub struct Promotion {
 ///
 /// The exit node a primary USES (`overlay_exit_node`) is org-specific and is
 /// cleared; an exit node it OFFERS travels with its enrollment.
+///
+/// #4370 — refused while the primary enrollment is
+/// [`ephemeral`](AgentConfig::ephemeral): checked FIRST, whatever the labels,
+/// and `cfg` is left as it was. An organization beside the primary is never
+/// ephemeral (#4352), and an `[[orgs]]` entry has no `ephemeral`, so the swap
+/// would move the row where this device no longer knows it is ephemeral (and
+/// the restart that applies it, an OS stop of the run that started as that row,
+/// would remove it on the server while the file still lists it), and mark the
+/// promoted org's permanent row ephemeral. Not seen, so not refused: an
+/// `[[orgs]]` entry whose row the server holds as ephemeral (joined before
+/// #4352), since an entry carries no flag.
 pub fn promote_org_to_primary(
     cfg: &mut AgentConfig,
     label: &str,
     demoted_label: Option<&str>,
 ) -> Result<Promotion> {
+    if cfg.ephemeral {
+        anyhow::bail!(
+            "the primary enrollment (row {}, tenant {} on {}) is ephemeral, and an ephemeral \
+             enrollment never sits beside another organization: `org set-primary` would move it \
+             into [[orgs]], where this device would no longer know it is ephemeral. Remove that \
+             row on the Devices page (an ephemeral row never turns permanent), then enroll this \
+             machine in that organization again with a standard enrollment token: the config \
+             keeps its settings and its other organizations. Then run `org set-primary` again. \
+             Nothing has changed",
+            cfg.agent_id,
+            cfg.tenant_id,
+            cfg.server_url
+        );
+    }
     let Some(idx) = cfg.orgs.iter().position(|o| o.label == label) else {
         anyhow::bail!("no org labelled {label:?} — see `roomlerd org ls`");
     };

@@ -975,12 +975,12 @@ enum OrgAction {
     /// Disable a secondary enrollment without deleting it (no supervised
     /// WS loop for it on the next daemon start).
     Disable { label: String },
-    /// Swap a secondary enrollment into the PRIMARY slot (and the current
-    /// primary into `[[orgs]]`, under `--demoted-label` or else the given
-    /// secondary's old label). The primary drives machine-wide effects:
-    /// self-update source, attention sentinels, and declared tunnel routes.
-    /// Each enrollment keeps its place on the mesh where it maps exactly
-    /// (#2540); the output says what it could not keep.
+    /// Swap a secondary enrollment into the PRIMARY slot (and the current primary into
+    /// `[[orgs]]`, under `--demoted-label` or else the given secondary's old label). The
+    /// primary drives machine-wide effects: self-update source, attention sentinels, and
+    /// declared tunnel routes. Each enrollment keeps its place on the mesh where it maps
+    /// exactly (#2540); the output says what it could not keep. Refused while the primary
+    /// enrollment is ephemeral (#4370): an ephemeral row never sits beside another org.
     SetPrimary {
         label: String,
         /// The label the current primary takes in `[[orgs]]`. Default: the
