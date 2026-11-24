@@ -409,8 +409,8 @@ watch(gridSearch, () => {
 })
 
 // Roles for the chips — cheap and idempotent if the Roles section already
-// loaded them. (The grid itself first fetches from @update:options.)
-void roleStore.fetchRoles(props.tenantId)
+// loaded them — are fetched by the org watch at the end. (The grid itself
+// first fetches from @update:options.)
 
 const sortedRoles = computed(() =>
   [...roleStore.roles].sort((a, b) => a.position - b.position || a.name.localeCompare(b.name)),
@@ -525,6 +525,29 @@ async function toggleRole(role: Role, on: boolean) {
     busyRoleId.value = null
   }
 }
+
+// #4257 — the people and their roles follow the page's org: a watch that runs
+// at once, not a one-shot load (a routed section gets only a new prop when the
+// org changes, and nothing fires the table's @update:options again). A change
+// closes the add, remove and roles dialogs opened under the previous org:
+// their save would go to this one. The grid goes back to a clean first page,
+// as AgentsSection's org watch does.
+watch(
+  () => props.tenantId,
+  (tenantId, previous) => {
+    void roleStore.fetchRoles(tenantId)
+    if (previous === undefined) return
+    addDialog.value = false
+    removeDialog.value = false
+    removeTarget.value = null
+    rolesDialog.value = false
+    dialogMember.value = null
+    gridSearch.value = ''
+    if (gridPage.value !== 1) gridPage.value = 1 // options handler fetches
+    else fetchGrid()
+  },
+  { immediate: true },
+)
 </script>
 
 <style scoped>

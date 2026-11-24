@@ -274,5 +274,9 @@ async function refresh() {
   await store.fetchNodes(props.tenantId)
 }
 
-refresh()
+// #4257 — the nodes follow the page's org: a watch that runs at once, not a
+// one-shot call at setup (a routed section gets only a new prop when the org
+// changes). The store drops another org's nodes and their late answer
+// (#4248), and `draft` is seeded again from this org's.
+watch(() => props.tenantId, () => void refresh(), { immediate: true })
 </script>

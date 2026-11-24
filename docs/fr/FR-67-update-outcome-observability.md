@@ -125,7 +125,7 @@ flowchart LR
 |---|---|
 | The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:581`; `NodeStatus.last_install`, `:484` |
 | The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:2130`), its pure half `summarize` (`:2149`) |
-| The startup line and its level | `log_at_startup` (`:2208`), `startup_level` (`:2192`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4388`) |
+| The startup line and its level | `log_at_startup` (`:1829`), `startup_level` (`:1813`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4408`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:1083`) |
 | The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2955`), printed under `version` (`:2556`) |
 
@@ -189,7 +189,7 @@ sequenceDiagram
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:365`); `UpdateRefusal` and `update_refusal()` (`:585`, `:1270`) |
 | Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5601`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3356`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3327`), else `self` |
 | Stamped at **every** announcement | `stub_caps` (`signaling.rs:7250`, `:7266`) |
-| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1793`): a 409 on one device (`:1840`), a `refused` row with its `refused_code` in a bulk (`:1972`) |
+| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1827`): a 409 on one device (`:1874`), a `refused` row with its `refused_code` in a bulk (`:2006`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 
 > [!WARNING]

@@ -396,7 +396,7 @@ One host on 0.4.48 took 60 s on every roll, the shape of the oldest agents, and 
   offsets between hosts do not enter it.
 - **A host can close in both waves.** A daemon with two enrollments runs one signaling loop for each
   (`agents/roomlerd/src/signaling.rs:632-636`) and uploads both loops' lines under its primary's row
-  (`agents/roomlerd/src/app.rs:4797-4810`). Five such rows closed in both waves, about 12 s apart, because their
+  (`agents/roomlerd/src/app.rs:4820-4833`). Five such rows closed in both waves, about 12 s apart, because their
   two organisations sit on different pods. Each socket is still cut once a roll.
 
 ### The switch-on half (2026-11-22)

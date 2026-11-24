@@ -670,11 +670,11 @@ which the daemon still refuses on the same terms as a local request.
    instead of another daemon's — on a two-half Mac the machine-side rows come
    from the root half and the session rows from the worker
    (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`;
-   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:861`; the table
+   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:869`; the table
    in [desktop-companion.md](desktop-companion.md) §5) — and a daemon older
    than design A, which still refuses the listing, gets the administrator's
    path in place of rows (`root_daemon_only`,
-   `agents/roomler-desktop/src/commands.rs:1279`). Whether the person at the
+   `agents/roomler-desktop/src/commands.rs:1287`). Whether the person at the
    seat may switch gate 4 on a root-mode install — Windows' pipe lets every
    interactive user — is the policy call still open on #2871.
 

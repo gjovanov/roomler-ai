@@ -316,23 +316,23 @@ compile.
   | **session** — the per-user half, which serves the remote-desktop session | Remote desktop · Capture & input · Video encoding · Video rate · Files | the worker's row, edited on the worker as before | `rc_clipboard`, `privacy_mode_allowed`, `lock_on_end`, `display_match`, `peer_auth`, `keep_busy_enabled`, `record_*`, `files_dir`, `encoder_preference` |
   | **machine** — the root half, the device `roomler ssh` / `roomler exec` reach | Access & consent · Private network · Carriers · Routing · Tunnels · Roomler SSH · Device & service | the root half's row, over its person socket: editable where that socket sets the key (`external_*`), otherwise read-only with the administrator's command | `exec_enabled`, `ssh_enabled`, `remote_config_enabled`, `overlay_enabled`, `auto_grant_session`, `auto_update`, `external_access_enabled` |
 
-  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:861`) builds the rows —
+  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:869`) builds the rows —
   machine-side keys from the root half's listing, in the worker's order — and
-  `cmd_config_set` (`:1054`) sends a machine-side key to the root half
-  (`root_half_config_set_beside`, `:979`), whose answer is final: the worker's copy of
+  `cmd_config_set` (`:1062`) sends a machine-side key to the root half
+  (`root_half_config_set_beside`, `:987`), whose answer is final: the worker's copy of
   such a key is a file the Mac's device never reads, so it is not written. The worker's
   own copies of machine keys stay reachable with `roomler config …` in a terminal, and
   the CLI's note says so. ⚠️ Two caveats the split cannot express, both P3's to dissolve:
   the root half forwards its own value of a few session knobs to the worker as a floor
   (FR-43's `WORKER_ENV_FORWARD`), and a delegated session's policies are judged by both
   halves' configs, so the worker's copy — the one this edits — can only tighten the
-  root's. The banner (`cmd_config_target`, `:1413`; `two_halves_note`, `:1233`) names both
+  root's. The banner (`cmd_config_target`, `:1421`; `two_halves_note`, `:1241`) names both
   halves' files and says which rows change here. It is shown only when the reached daemon
   says it runs unprivileged AND a root daemon of another identity answers `Status` over the
-  person socket (`two_halves`, `:1216`) — one daemon behind both sockets, a root daemon's
+  person socket (`two_halves`, `:1224`) — one daemon behind both sockets, a root daemon's
   legacy per-user bind, is not two halves. A root half older than design A still refuses
   the listing; the rows are then the worker's alone and the banner carries the #2879 words
-  (`two_halves_legacy_note`, `:1254`): the root half's switches are
+  (`two_halves_legacy_note`, `:1262`): the root half's switches are
   `sudo roomler config set <key> <value>`.
 - **A Linux system install, and a Mac with a root half alone (#2891, #2871).** There the
   daemon the page reaches runs as root and this app does not: `connect()`'s first candidate
@@ -344,17 +344,17 @@ compile.
   written, a file no daemon reads (#2871's failure, on Linux). #2891 made a root daemon's
   refusal final for `cmd_config_entries`, `cmd_config_set` and `cmd_set_device_name`: none
   falls back to the file (`refused_by_root_daemon`,
-  `agents/roomler-desktop/src/commands.rs:1368`). Since design A the same socket serves the
-  listing, marked: `cmd_config_target` (`:1413`) reports `root_only` (`root_daemon_only`,
-  `:1279`, pure: the reached daemon says it runs as root, this process does not, and the OS
+  `agents/roomler-desktop/src/commands.rs:1376`). Since design A the same socket serves the
+  listing, marked: `cmd_config_target` (`:1421`) reports `root_only` (`root_daemon_only`,
+  `:1287`, pure: the reached daemon says it runs as root, this process does not, and the OS
   is not Windows, whose pipe admits interactive users to those verbs), the person's own keys
   are editable, and the rest — the device-owned gates, the network, SSH, the updater, the
   recordings folder — show the root daemon's value with "administrator's" and
   `sudo roomler config set <key> <value>`
-  (`settings.js`, the `read_only` row; `root_only_note`, `:1306`). From a daemon older than
+  (`settings.js`, the `read_only` row; `root_only_note`, `:1314`). From a daemon older than
   design A the card still shows the daemon, its file (`Status.config_path`:
   `/etc/roomler/config.toml`) and the administrator's commands in place of rows
-  (`root_only_legacy_note`, `:1328`).
+  (`root_only_legacy_note`, `:1336`).
 - **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
   daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
   `roomlerd.service: active, enabled` (`system_answer`, `:3959`) — as
@@ -367,7 +367,7 @@ compile.
   `KeyMeta` entry, the `current_value` / `apply` arms, and a set/echo test.
 - **No config file is a normal state for the companion (#3996).** The companion never runs on
   a config; the device service does. So every read it makes of one goes through
-  `load_if_there` (`agents/roomler-desktop/src/commands.rs:3849`): no file is no config, with
+  `load_if_there` (`agents/roomler-desktop/src/commands.rs:3857`): no file is no config, with
   nothing logged. A file that is there goes through `config::load`, so a broken one is always
   logged at ERROR (`config::read_if_present` would hide it, FR-66). If its `.prev` loads, the
   read returns that copy and puts it back as the live file:
@@ -380,11 +380,11 @@ compile.
 
   | Read | With no file | Where |
   |---|---|---|
-  | the configuration listing, when no service answers it; the Welcome reads it as it opens | "There is no configuration file at … yet, and the device service did not answer." | `entries_from_file`, `agents/roomler-desktop/src/commands.rs:821` |
+  | the configuration listing, when no service answers it; the Welcome reads it as it opens | "There is no configuration file at … yet, and the device service did not answer." | `entries_from_file`, `agents/roomler-desktop/src/commands.rs:829` |
   | a setting's or the device name's direct write, when no service takes it | the same words, and nothing is written | `config_set_blocking`, `set_device_name_blocking` |
-  | Open Roomler and View screen | no enrollment: the daemon's server and tenant, as for a one-row Mac's file (FR-43 P3a) | `server_origin_from`, `agents/roomler-desktop/src/commands.rs:2090`; `cmd_open_remote` |
+  | Open Roomler and View screen | no enrollment: the daemon's server and tenant, as for a one-row Mac's file (FR-43 P3a) | `server_origin_from`, `agents/roomler-desktop/src/commands.rs:2098`; `cmd_open_remote` |
   | a re-enroll | the device service holds the enrollment, and the administrator's command | `enrollment_elsewhere`, `agents/roomler-desktop/src/commands.rs:656` |
-  | the Overview's status | not enrolled by the file, so the daemon is asked (#1701), as before; with no answer that names the device and the service's own config there, the enrollment is not known (§3.2) | `load_optional_config`, `agents/roomler-desktop/src/commands.rs:3830`; `status_report_from`, `:113` |
+  | the Overview's status | not enrolled by the file, so the daemon is asked (#1701), as before; with no answer that names the device and the service's own config there, the enrollment is not known (§3.2) | `load_optional_config`, `agents/roomler-desktop/src/commands.rs:3838`; `status_report_from`, `:113` |
 
   Until #3996 most of these went straight to `config::load`. A start with no service
   answering logged that ERROR about a healthy one-row Mac: each start of its script install,
@@ -615,7 +615,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2304`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2313`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -707,8 +707,8 @@ struck through, and how long the probe took.
   to this device's administrator." (`root_only`). Only an *answer* that refuses reads that way,
   and only from a root daemon that this unprivileged app reached, which one `Status` on the
   same connection confirms (`refused_by_root_daemon`,
-  `agents/roomler-desktop/src/commands.rs:1368`, the test the config verbs use, #2891; the
-  decision is `encoder_caps_view`, `:1584`). No answer at all (a failed write or read, a closed
+  `agents/roomler-desktop/src/commands.rs:1376`, the test the config verbs use, #2891; the
+  decision is `encoder_caps_view`, `:1592`). No answer at all (a failed write or read, a closed
   connection) stays **Error**, with its stage. Windows serves the verb to every interactive
   user (the pipe's `IU` ace), and a Mac's companion asks its per-user half, which answers from
   its own probe.
@@ -2550,7 +2550,7 @@ flowchart TD
 - **A restart, not a loop.** launchd relaunches the net's exit as it does any non-zero exit, one start per 10 s at most
   (the plist's `ThrottleInterval`). The net marks no clean shutdown, so a run that it ends before the run has been
   healthy for 5 minutes counts as a crash at the next start, as any other would, and the crash-loop rollback still
-  counts it (`app.rs:4401`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
+  counts it (`app.rs:4421`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
 - **Why a code of its own.** 9, `RESTART_REQUESTED_EXIT_CODE`, is a requested restart: it says no failure happened, and
   the macOS (FR-43) and Windows supervisors keep it out of their crash records. The net's exit is a failure, so it
   leaves with 32, `APPKIT_ENDED_EXIT_CODE`, which no other exit in the tree uses, which is outside the Linux units'
@@ -2781,10 +2781,10 @@ sequenceDiagram
 
 | Piece | Where | What |
 |---|---|---|
-| the click, in the log | `answer_click`, [`agents/roomler-desktop/src/commands.rs:2894`](../agents/roomler-desktop/src/commands.rs#L2894) | `consent: a click arrived` with the verb and the question's id, then `consent: the device service took the answer`, or a WARN with the reason: `consent: the answer was not taken` (the daemon's own words, `connect: …`, or no such question any more) or `consent: no answer from the device service in time`. A click with no question on the page is logged, and nothing is sent (the commands take `Option<String>`). Since #3987 a click whose question came to the front under 1 s ago is logged as one WARN, `consent: a click arrived too soon after the question came to the front; nothing was sent`, and nothing is sent (§10.9.1) |
-| the bound | `CONSENT_ANSWER_WITHIN`, [`commands.rs:2858`](../agents/roomler-desktop/src/commands.rs#L2858): 10 s | the connect and the daemon's reply. Above the daemon's own bounds on an answer: who is at the seat (1.5 s, #3796) and a Mac's relay (5 s, §10.8, §10.8.1) |
+| the click, in the log | `answer_click`, [`agents/roomler-desktop/src/commands.rs:2902`](../agents/roomler-desktop/src/commands.rs#L2902) | `consent: a click arrived` with the verb and the question's id, then `consent: the device service took the answer`, or a WARN with the reason: `consent: the answer was not taken` (the daemon's own words, `connect: …`, or no such question any more) or `consent: no answer from the device service in time`. A click with no question on the page is logged, and nothing is sent (the commands take `Option<String>`). Since #3987 a click whose question came to the front under 1 s ago is logged as one WARN, `consent: a click arrived too soon after the question came to the front; nothing was sent`, and nothing is sent (§10.9.1) |
+| the bound | `CONSENT_ANSWER_WITHIN`, [`commands.rs:2866`](../agents/roomler-desktop/src/commands.rs#L2866): 10 s | the connect and the daemon's reply. Above the daemon's own bounds on an answer: who is at the seat (1.5 s, #3796) and a Mac's relay (5 s, §10.8, §10.8.1) |
 | the page | `decide`, [`panel-consent.js:138`](../agents/roomler-desktop/src/front/panel-consent.js#L138); `paintButtons`, [`:71`](../agents/roomler-desktop/src/front/panel-consent.js#L71); `PAGE_LIMIT_MS`, [`:54`](../agents/roomler-desktop/src/front/panel-consent.js#L54); the status line, `panel-consent.html:103` | the click is sent before anything else can stop it, with how long its question has been shown (`shown`, #3987). The buttons are off only while no question is shown, an answer is on its way, or this window answered the question, and the status line says which. It is an element of its own (`p-status`), so the countdown never overwrites it, and its words stay until the next click or question. The page's own 15 s limit fires only when the app never replies, and the buttons then come back. Escape acts as the Deny button does |
-| the read | `cmd_get_pending_consents` and `pending_answer`, [`commands.rs:2991`](../agents/roomler-desktop/src/commands.rs#L2991) | a failed read is an error, not an empty list. The page keeps the question it shows and clears it only on an empty list. The failure is in the log through the refresh ledger (`refresh failed surface="consent_pending"`, once a streak; §3); a daemon that is not running is quiet |
+| the read | `cmd_get_pending_consents` and `pending_answer`, [`commands.rs:2999`](../agents/roomler-desktop/src/commands.rs#L2999) | a failed read is an error, not an empty list. The page keeps the question it shows and clears it only on an empty list. The failure is in the log through the refresh ledger (`refresh failed surface="consent_pending"`, once a streak; §3); a daemon that is not running is quiet |
 | the fallback modal | `decide`, [`consent.js:70`](../agents/roomler-desktop/src/front/consent.js#L70) | the same: the click is sent first, the buttons are off while an answer is on its way, the same 15 s limit, and an answered question is not shown again |
 
 - **The WARN at every start** (`refresh failed surface="encoder_caps" … person-at-the-device
@@ -2990,10 +2990,10 @@ flowchart TD
 |---|---|---|
 | the watch | one poll at a time, each list its own answer, and a list that failed keeps the last answer's | `SessionWatch::poll`, [`main.rs:459`](../agents/roomler-desktop/src/main.rs#L459) |
 | the poll's bound | 5 s for the connect and both lists (`WATCH_READ_WITHIN`, `main.rs:361`). A poll past it is a failed one. Until #3998 nothing bounded it, and a read that never ended stopped the watch with whatever it showed | `read_within`, [`main.rs:377`](../agents/roomler-desktop/src/main.rs#L377) |
-| the proof | a connect that failed while the own endpoint is gone comes back as `NotFound`, which the tray reads as no service (`tray::no_service`, unchanged). Since #4020 every connect of the app whose error is read goes through it (§3.1) | `connect_service` and `proven`, [`commands.rs:3076`](../agents/roomler-desktop/src/commands.rs#L3076), [`:3090`](../agents/roomler-desktop/src/commands.rs#L3090) |
+| the proof | a connect that failed while the own endpoint is gone comes back as `NotFound`, which the tray reads as no service (`tray::no_service`, unchanged). Since #4020 every connect of the app whose error is read goes through it (§3.1) | `connect_service` and `proven`, [`commands.rs:3084`](../agents/roomler-desktop/src/commands.rs#L3084), [`:3098`](../agents/roomler-desktop/src/commands.rs#L3098) |
 | the tray's red | the same answer as the banner (`tray_answer`, `main.rs:396`). The recording watch connects through the same proof, so the red comes down with a stopped daemon on every host | `spawn_recording_watch`, `tray.rs:438` |
-| the banner's page | `cmd_rc_sessions` answers an error for a failed read, and the page keeps its words | `sessions_answer`, [`commands.rs:3055`](../agents/roomler-desktop/src/commands.rs#L3055); `poll`, `panel-viewing.js:68` |
-| a click with no service | "Could not reach the device service: it is not running." on the prompt's status line, and `device service not running` in the log | `answer_click`, [`commands.rs:2949`](../agents/roomler-desktop/src/commands.rs#L2949) |
+| the banner's page | `cmd_rc_sessions` answers an error for a failed read, and the page keeps its words | `sessions_answer`, [`commands.rs:3063`](../agents/roomler-desktop/src/commands.rs#L3063); `poll`, `panel-viewing.js:68` |
+| a click with no service | "Could not reach the device service: it is not running." on the prompt's status line, and `device service not running` in the log | `answer_click`, [`commands.rs:2957`](../agents/roomler-desktop/src/commands.rs#L2957) |
 
 - **Logs.** A run of failed reads with something on the screen is logged once, at INFO:
   `session watch: a read of the device service failed; the screen keeps what its last answer said`,
@@ -3430,8 +3430,8 @@ Who calls them, and how each is read:
 
 | Caller | Runs | Taken as |
 |---|---|---|
-| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2809`) and the banner's Disconnect (`cmd_rc_disconnect`, `:3105`) | as the person, in their session | the screen's session |
-| `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2550`; `rc_cmd`, `:2447`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
+| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2817`) and the banner's Disconnect (`cmd_rc_disconnect`, `:3113`) | as the person, in their session | the screen's session |
+| `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2559`; `rc_cmd`, `:2456`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
 | the native consent panel and the Windows badge's Disconnect | in the daemon | never on the pipe |
 
 The tests, in `crates/localapi`: `the_screen_decision_table` (every row above, a per-user daemon
@@ -3724,7 +3724,7 @@ sequenceDiagram
 | a check you can see | `MIN_CHECKING_MS`, `src/front/overview.js:183` | "Checking for updates…" stays up at least 0.7 s, and the answer carries the time it was asked ("Checked at 21:45:25."). On 0.4.177 an answer that came back at once read as no check at all (field, a Mac, 2026-10-26) |
 | into view | `scrollToUpdates`, `src/front/overview.js:224`; `revealUpdates`, `:244` | the Updates card is the last one on Overview, and `#content` is what scrolls. The scroll is INSTANT and repeated: once the page is visible, and when the answer lands. On 0.4.177 a smooth scroll never happened on a Mac: it is driven by animation frames, and the tray runs it while the window is still coming up |
 | the ring | `flashUpdates`, `src/front/overview.js:230`; `.card.flash` in `styles.css` | draws the eye to the card. A static outline instead when the OS asks for reduced motion |
-| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:2343` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
+| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:2351` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
 
 ⚠️ **Installing stays a separate click.** The menu item says "Check for Updates", and on macOS
 **Install update** queues the root update helper (FR-27).

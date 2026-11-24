@@ -91,14 +91,60 @@ export const useRoomStore = defineStore('rooms', () => {
   }
 
   // --- Room CRUD ---
-  async function fetchRooms(tenantId: string) {
+  /** #4257 — which org `rooms` describes: the org of the latest list fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's rooms never show (or fill a picker) under another org's page. */
+  const roomsTenantId = ref<string | null>(null)
+  // Only the latest list fetch writes: the answer for an org asked before it
+  // (the page moved on to another org) is dropped.
+  let listSeq = 0
+  // The latest list fetch failed: `ensureRooms` asks again.
+  let listFailed = false
+  // The latest list fetch. One that a newer fetch superseded settles with it,
+  // not with its own dropped answer: a caller that reads the rooms right
+  // after its await then reads the newest ones. The welcome tour counts them
+  // so (AppLayout), and an empty count could send a new user to the tutorial.
+  let latestFetch: Promise<void> = Promise.resolve()
+
+  function fetchRooms(tenantId: string): Promise<void> {
+    const mySeq = ++listSeq
+    if (roomsTenantId.value !== null && roomsTenantId.value !== tenantId) rooms.value = []
+    roomsTenantId.value = tenantId
+    listFailed = false
     loading.value = true
-    try {
-      rooms.value = await api.get<Room[]>(`/tenant/${tenantId}/room`)
-    } finally {
-      loading.value = false
-    }
+    const run = (async (): Promise<void> => {
+      try {
+        const list = await api.get<Room[]>(`/tenant/${tenantId}/room`)
+        if (mySeq !== listSeq) return latestFetch
+        rooms.value = list
+      } catch (e) {
+        if (mySeq !== listSeq) return latestFetch
+        listFailed = true
+        throw e
+      } finally {
+        if (mySeq === listSeq) loading.value = false
+      }
+    })()
+    latestFetch = run
+    return run
   }
+
+  /** #4257 — the org's rooms for a page that only lists, counts or picks
+   *  them, fetched only when the store does not hold them already: the shell
+   *  loads them on every change of org. A store that holds another org's
+   *  rooms, or whose last fetch failed, fetches. One that holds this org's
+   *  answers with that fetch, as `ensureAgents` does: it settles only once
+   *  the rooms have landed, and fails with it. It replaces a check of an
+   *  empty list, which never reloaded a list holding another org's rooms. */
+  function ensureRooms(tenantId: string): Promise<void> {
+    if (roomsTenantId.value === tenantId && !listFailed) return latestFetch
+    return fetchRooms(tenantId)
+  }
+
+  /** A room created for `tenantId` joins the list only when the list is not
+   *  another org's. */
+  const listIsOf = (tenantId: string) =>
+    roomsTenantId.value === null || roomsTenantId.value === tenantId
 
   /** Server-side sidebar search (`GET /room?q=…&page=…`) — respects
    *  secret-room visibility server-side and returns a bare page of rooms.
@@ -126,7 +172,7 @@ export const useRoomStore = defineStore('rooms', () => {
       delete body.has_media
     }
     const room = await api.post<Room>(`/tenant/${tenantId}/room`, body)
-    rooms.value.push(room)
+    if (listIsOf(tenantId)) rooms.value.push(room)
     return room
   }
 
@@ -303,6 +349,10 @@ export const useRoomStore = defineStore('rooms', () => {
   }
 
   async function fetchAllUnreadCounts(tenantId: string) {
+    // #4257 — over this org's rooms only: a fetch that a newer one superseded
+    // settles with it, and the shell's count after it would ask for the new
+    // org's rooms under the previous org.
+    if (!listIsOf(tenantId)) return
     for (const room of rooms.value) {
       fetchUnreadCount(tenantId, room.id)
     }
@@ -339,6 +389,7 @@ export const useRoomStore = defineStore('rooms', () => {
   return {
     // State
     rooms,
+    roomsTenantId,
     current,
     participants,
     loading,
@@ -349,6 +400,7 @@ export const useRoomStore = defineStore('rooms', () => {
     // Room operations
     childrenOf,
     fetchRooms,
+    ensureRooms,
     searchRooms,
     createRoom,
     deleteRoom,

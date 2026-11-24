@@ -80,6 +80,7 @@ function agentStore() {
     fetchOrgExecEnabled: vi.fn(),
     fetchOrgSshEnabled: vi.fn(),
     fetchTenantMembers: vi.fn(),
+    ensureTenantMembers: vi.fn(),
     fetchExternalAccess: vi.fn(),
     fetchConnectCode: vi.fn().mockResolvedValue(null),
     rotateConnectCode: vi.fn(),
@@ -196,7 +197,7 @@ describe('ExecPolicyDialog on its first open (#3156)', () => {
     expect(chosen('Consent')).toEqual(['Unattended — run immediately'])
     expect(chosen('Allowed shells (empty = any the host supports)')).toEqual(['bash'])
     // It reads what every later open reads, and writes nothing.
-    expect(store.fetchTenantMembers).toHaveBeenCalledWith(TID)
+    expect(store.ensureTenantMembers).toHaveBeenCalledWith(TID)
     expect(store.fetchOrgExecEnabled).toHaveBeenCalledWith(TID)
     expect(store.updateExecPolicy).not.toHaveBeenCalled()
     expect(w.emitted('update:modelValue')).toBeUndefined()
@@ -233,7 +234,7 @@ describe('SshPolicyDialog on its first open (#3156)', () => {
     expect(chosen('Sessions run as')).toEqual(['The daemon account (SYSTEM)'])
     expect(chosen('Consent')).toEqual(['Unattended — open immediately'])
     // It reads what every later open reads, and writes nothing.
-    expect(store.fetchTenantMembers).toHaveBeenCalledWith(TID)
+    expect(store.ensureTenantMembers).toHaveBeenCalledWith(TID)
     expect(store.fetchOrgSshEnabled).toHaveBeenCalledWith(TID)
     expect(store.updateSshPolicy).not.toHaveBeenCalled()
     expect(w.emitted('update:modelValue')).toBeUndefined()

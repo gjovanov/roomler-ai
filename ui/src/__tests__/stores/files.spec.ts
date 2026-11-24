@@ -226,3 +226,89 @@ describe('useFileStore FR-11 grid params', () => {
     expect(store.files.map((f) => f.id)).toEqual(['fresh'])
   })
 })
+
+// ─── #4257: the org its list is of ───────────────────────────────────────
+// The Files page is reused when its org changes in place (a link, back or
+// forward). The store records which org its list is of: a fetch for another
+// org drops the previous org's files at once, so none show while the new
+// org's list loads or after that load failed, and an upload answered for an
+// org the page has left stays out of the list. A room's files are the same
+// org's list: moving between all files and a room's never drops it.
+
+describe('useFileStore: the org its list is of (#4257)', () => {
+  const ORG_A = 'a'.repeat(24)
+  const ORG_B = 'b'.repeat(24)
+  const aFile = makeFile({ id: 'fa', tenant_id: ORG_A, filename: 'org-a.txt' })
+  const bFile = makeFile({ id: 'fb', tenant_id: ORG_B, filename: 'org-b.txt' })
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    mockApi.get.mockReset()
+    mockApi.upload.mockReset()
+  })
+
+  function envelope(items: unknown[]) {
+    return { items, total: items.length, page: 1, per_page: 25, total_pages: 1 }
+  }
+
+  it("a fetch for org B drops org A's files at once, before it answers", async () => {
+    const store = useFileStore()
+    mockApi.get.mockResolvedValueOnce(envelope([aFile]))
+    await store.fetchTenantFiles(ORG_A)
+    expect(store.files.map((f) => f.id)).toEqual(['fa'])
+
+    let answerB: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => { answerB = r }))
+    const fetching = store.fetchTenantFiles(ORG_B)
+    expect(store.files).toEqual([])
+    expect(store.total).toBe(0)
+    answerB!(envelope([bFile]))
+    await fetching
+    expect(store.files.map((f) => f.id)).toEqual(['fb'])
+  })
+
+  it("a failed fetch for org B leaves none of org A's files", async () => {
+    const store = useFileStore()
+    mockApi.get.mockResolvedValueOnce(envelope([aFile]))
+    await store.fetchTenantFiles(ORG_A)
+
+    mockApi.get.mockRejectedValueOnce(new Error('unavailable'))
+    await expect(store.fetchTenantFiles(ORG_B)).rejects.toThrow('unavailable')
+    expect(store.files).toEqual([])
+  })
+
+  it("an upload for org A that answers after a fetch for org B stays out of org B's list, and still answers its file", async () => {
+    const store = useFileStore()
+    mockApi.get.mockResolvedValueOnce(envelope([aFile]))
+    await store.fetchTenantFiles(ORG_A)
+    let uploaded: (v: unknown) => void
+    mockApi.upload.mockReturnValueOnce(new Promise((r) => { uploaded = r }))
+    const uploading = store.uploadFile(ORG_A, 'room-a', new File(['x'], 'late.txt'))
+
+    mockApi.get.mockResolvedValueOnce(envelope([bFile]))
+    await store.fetchTenantFiles(ORG_B)
+    const late = makeFile({ id: 'f-late', tenant_id: ORG_A, filename: 'late.txt' })
+    uploaded!(late)
+    await expect(uploading).resolves.toEqual(late)
+    expect(store.files.map((f) => f.id)).toEqual(['fb'])
+  })
+
+  it("the same org's room files and uploads keep the list: nothing drops while a room's files load", async () => {
+    const store = useFileStore()
+    mockApi.get.mockResolvedValueOnce(envelope([aFile]))
+    await store.fetchTenantFiles(ORG_A)
+
+    let answerRoom: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => { answerRoom = r }))
+    const fetching = store.fetchFiles(ORG_A, 'room-a')
+    expect(store.files.map((f) => f.id)).toEqual(['fa'])
+    answerRoom!(envelope([makeFile({ id: 'fr', tenant_id: ORG_A, filename: 'room.txt' })]))
+    await fetching
+    expect(store.files.map((f) => f.id)).toEqual(['fr'])
+
+    mockApi.upload.mockResolvedValueOnce(makeFile({ id: 'fu', tenant_id: ORG_A, filename: 'up.txt' }))
+    await store.uploadFile(ORG_A, 'room-a', new File(['x'], 'up.txt'))
+    expect(store.files.map((f) => f.id)).toEqual(['fr', 'fu'])
+  })
+})
