@@ -1133,7 +1133,7 @@ flowchart TD
   folder, and a task registered from it would name a launcher in `%TEMP%`. The launcher is
   spawned with no handle of the watcher's (`:984`).
 - **The record says it in three places.** The field sits in `last-install.json`, in
-  `NodeStatus.last_install` (`InstallDaemon`, `crates/localapi/src/lib.rs:620`, additive both
+  `NodeStatus.last_install` (`InstallDaemon`, `crates/localapi/src/lib.rs:626`, additive both
   ways), and in the next daemon's `last install:` line, a WARN when the watcher left no daemon
   running (`post_install.rs:2267`).
 - **The first update onto P1b runs the old release's watcher**, so P1b protects the hops after
@@ -2662,7 +2662,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3596`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3602`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2770,8 +2770,8 @@ two privacy grants below remain the person's; the Done page says so.
 **A Mac that is one row already gets nothing from the wizard (FR-141 P3).** Before
 it offers the device install, the wizard asks the root daemon over the person
 socket it serves the console user (`/var/run/roomler-person/<uid>.sock`), which
-answers `status` (`crates/localapi/src/lib.rs:3782-3784`) with
-`gui_worker.one_row` in it (`:530-543`). When the root daemon says one row, the
+answers `status` (`crates/localapi/src/lib.rs:3788-3790`) with
+`gui_worker.one_row` in it (`:536-549`). When the root daemon says one row, the
 Welcome page says "This Mac is one device already", Continue stays off for every
 device card, and pairing start and the install's preflight refuse with the same
 words, so no token is asked for (`agents/roomler-setup/src/reinstall_guard.rs`).
@@ -3543,7 +3543,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5793`).
+(`crates/localapi/src/lib.rs:5799`).
 
 On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
 the console user's `roomler …` is the screen worker the root daemon starts for
@@ -3572,9 +3572,9 @@ The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3596`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3602`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
-read-only and refuses to set by name (`localapi::person_may`, `:3782`). Whether
+read-only and refuses to set by name (`localapi::person_may`, `:3788`). Whether
 the console user should flip those from the app is the decision left open on
 #2871; until it is taken, they stay with `sudo`.
 
@@ -3865,8 +3865,11 @@ flowchart TD
   `agents/roomlerd/src/ssh_service.rs:914`). A Fleet RPC command for as long as
   it runs, 5 min at most, counted by the exec engine for each run
   (`agents/roomlerd/src/exec.rs:2347`); a command an SSH session runs
-  belongs to that connection and is not counted twice. A transfer or a
-  recording, as since rc.19 and FR-85 ([recording.md](recording.md)).
+  belongs to that connection and is not counted twice. On a Windows device
+  anchored for SYSTEM exec (FR-94), a command the `Roomler` service runs for
+  the worker, from its claim until its result is posted, which the worker asks
+  the service for at each decision ([below](#a-command-the-system-service-runs-4244)).
+  A transfer or a recording, as since rc.19 and FR-85 ([recording.md](recording.md)).
 - **Only an operator's push installs at once.** `POST …/agent/update`
   (`rc:agent.update`) skips the gate and keeps only the 5-min install-storm
   cooldown. It says what it cuts, in the daemon's log:
@@ -3891,7 +3894,7 @@ flowchart TD
 | Install | Who decides to install | What it waits for |
 |---|---|---|
 | Windows, per-user (the Scheduled Task) | the daemon | all of it |
-| Windows, machine: attended or SystemContext (the `Roomler` service) | the worker the service runs | all of it, the SSH sessions it carries to the service included. ⚠️ Not a Fleet RPC command the service runs itself for an anchored device (FR-94): the update stops the service under it |
+| Windows, machine: attended or SystemContext (the `Roomler` service) | the worker the service runs | all of it: the SSH sessions it carries to the service, and since #4244 the Fleet RPC commands the service runs itself for an anchored device (FR-94), which the worker asks the service for at each decision ([below](#a-command-the-system-service-runs-4244)) |
 | Linux, system (`roomlerd.service`, root) | the daemon | all of it |
 | Linux, per-user, with the root update helper | the helper, which asks nothing | nothing has to: the install replaces the binary under a daemon that runs on, and the daemon restarts onto it once `Busy` reads idle, or at its 24 h ceiling |
 | Linux, per-user, without the helper | the daemon, where it can install at all | all of it |
@@ -3928,6 +3931,81 @@ LocalAPI verb (`helper_gate`, `agents/roomlerd/src/helper_gate.rs`;
   switch)`. A recheck inside the cooldown logs `auto-updater:
   recheck suppressed by recent-install cooldown; the timer checks next
   cycle=outage_recheck`.
+
+#### A command the SYSTEM service runs (#4244)
+
+On a Windows device anchored for SYSTEM exec (FR-94), the worker hands a Fleet
+RPC command to the `Roomler` service by its request id and never hears its
+end: the service claims the command from the server, runs it in session 0 and
+posts the result there itself ([fleet-rpc.md](fleet-rpc.md#the-system-path)).
+The worker's own `Busy` holds no such run, so until #4244 a periodic update
+could stop the service under a running command, and its caller got no answer.
+The gate now asks the service, on the doorbell's health exchange, and counts
+what it holds as exec runs.
+
+```mermaid
+sequenceDiagram
+  participant G as update gate (the worker)
+  participant V as service (session 0, SYSTEM)
+  participant S as server
+  Note over V: a ring: the run is held from its claim
+  V->>S: claim the command, run it, post its result
+  Note over V: held until its result is posted, 8 min at most
+  G->>V: doorbell: health
+  V-->>G: health {…, exec_runs: 1}
+  G->>G: its own Busy plus 1 exec run: defer, check again in 1 h
+```
+
+| The service's health answer | What the gate counts for the service | Where |
+|---|---|---|
+| a count, `exec_runs` (a service with #4244) | that count: each run from its claim until its result is posted, and never past 8 min after its claim | `HeldRuns`, `agents/roomlerd/src/exec_service.rs:637`; `HELD_AT_MOST`, `agents/roomlerd/src/exec_service.rs:626` |
+| no count: a service older than #4244 (`older`) | the runs this worker handed the service in the last 8 min, each a ring the service answered `claimed: true` | `ServiceRuns::of`, `agents/roomlerd/src/exec_service.rs:751` |
+| no answer within 5 s: no service on the machine, a busy or refused doorbell, a lost pipe (`no_answer`) | the same | `service_runs`, `agents/roomlerd/src/exec_service.rs:798` |
+
+- **Read at the decision.** The gate reads it once a cycle, with the rest of
+  `Busy` (`busy::gate_now`, `agents/roomlerd/src/busy.rs:125`, read at
+  `agents/roomlerd/src/updater.rs:3642`): one health exchange, bounded at 5 s
+  (`RUNS_ASK_TIMEOUT`, `agents/roomlerd/src/exec_service.rs:793`). The
+  service's answer stands over the worker's record: a service started again
+  since a run was handed to it holds nothing and says 0, and nothing is
+  counted twice.
+- **Held from the claim until the result is posted.** The service takes the
+  hold before it claims (`agents/roomlerd/src/exec_service.rs:1964`) and lets
+  it go once the result is posted, or given up on
+  (`agents/roomlerd/src/exec_service.rs:2084`): an update between the
+  command's end and the post would leave the caller without its answer too. A
+  ring for a command the server never queued is counted only while its claim
+  is in flight, and the server refuses it there.
+- **Never past 8 min a run.** `HELD_AT_MOST` is the claim (20 s), a command at
+  the Fleet RPC ceiling (5 min) and its tree kill, and three tries to post the
+  result (30 s each, 7 s apart), with about a minute to spare
+  (`held_at_most_covers_a_whole_run`). It ends the count of a run whose end
+  never comes, such as a command whose output a process it started still
+  holds. The counts live in memory: a service that crashes or restarts holds
+  none, and a worker that restarts has handed none.
+- **The same budget.** The service's runs are exec runs: they defer the check
+  by the hour, the seventh defer installs anyway, and an operator's push
+  installs at once and names them (`forced update proceeding despite: 1 exec
+  run(s)`). A service that does not say counts only what the worker handed it,
+  never a unit of its own as an unread half of a Mac does (FR-151): the worker
+  knows what it handed, and a service that cannot answer is what the update
+  replaces.
+- **Mixed versions.** The worker and the service are one `roomlerd.exe`, but an
+  update can leave them apart for a while: a service host that outlives the
+  installer's stop keeps running the old code, and starts the new worker. A
+  newer worker reads that service as `older`. An older worker reads no count
+  and waits only for its own work, as before #4244.
+- **Work that starts after the decision.** As for every other kind of work
+  since #3429, the gate reads once, and nothing refuses or reads again work
+  that starts after it: a command rung between the decision and the install's
+  stop of the service is cut, as a session opened in that gap is.
+- **Nothing more on the pipe.** The count rides the health answer the pipe
+  already gives every caller it admits (SYSTEM, Administrators and interactive
+  users): a number, never which commands or whose.
+- **What the log says.** When the service did not say and the worker handed it
+  a run: `exec-service: the SYSTEM service did not say what it runs; the update
+  gate counts the runs this worker handed it read=older handed=1`. The defer
+  line is the usual one, with `busy=1 exec run(s)`.
 
 ### macOS: an update with nobody signed in (#3783)
 

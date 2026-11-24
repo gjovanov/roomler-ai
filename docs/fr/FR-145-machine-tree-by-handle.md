@@ -246,7 +246,7 @@ meets a link or is refused, naming the path. `remove_tree` takes `dry_run`: its 
 ### P1: #3743's readers (D6)
 
 `PrivateFolder::open` (`machine_tree.rs:1532-1546`) becomes `HeldPath::base(&machine_program_data())` and `walk`,
-plus its verdict, and the earlier anchor files' deletes (`exec_service.rs:1279-1292`) the same, so their way down
+plus its verdict, and the earlier anchor files' deletes (`exec_service.rs:1501-1514`) the same, so their way down
 is by handle too. #3743's elevated tests already cover both.
 
 ### P2: service logs
@@ -464,7 +464,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   its own. **Default: a design pass of its own**, outside this FR: staging has a pipeline of its own, and its
   layout is that pass's to decide.
 - **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1532-1546`; the earlier anchor
-  files' deletes, `exec_service.rs:1279-1292`). Options: the helper's PR; the next one. **Default: the helper's
+  files' deletes, `exec_service.rs:1501-1514`). Options: the helper's PR; the next one. **Default: the helper's
   PR.** A few lines, and #3743's elevated tests already cover both.
 - **D7. The one-time segment move** (`appdirs.rs:673`, `:933`, `:956`, `:1061`, `:1179`). Options: onto a rename by
   handle in P3; retire it. **Default: read first** how many Windows devices still keep only the older segment;

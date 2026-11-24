@@ -31,7 +31,7 @@ distinguish "default" from explicit `sort=name`. Change: keep the param as
 unchanged. `cmp_rows` (`:377-401`) gains the compound arm; the id tiebreak
 (`:219-223`) stays. UI needs **zero change**: an untouched grid emits
 `sortBy: []` → no `sort` param (`AgentsSection.vue:1594-1604`,
-`stores/devices.ts:82-83`). `device_list_tests.rs:280`'s comment updates
+`stores/devices.ts:82-83`). `device_list_tests.rs:281`'s comment updates
 (order itself survives — the three fixture agents share one presence bucket).
 
 ### 2. Mesh names — server-side, deliberately

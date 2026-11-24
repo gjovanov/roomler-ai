@@ -208,6 +208,15 @@ to a local pipe. What each attempt to get around that meets:
 | Read SYSTEM's output | it is posted from the service to the server over HTTPS |
 | An http origin, to rewrite the claim on the path | the anchor accepts https only (loopback excepted, for tests) |
 
+**An update waits for the command (#4244).** The worker's periodic update
+cannot see a command the service runs, so the service counts each one it
+holds, from its claim until its result is posted, and never past 8 min
+(`HeldRuns`, `agents/roomlerd/src/exec_service.rs:637`). Its health answer
+carries that count (`exec_runs`): a number, never which command or whose, to
+the callers the pipe already admits. The worker asks for it at each decision,
+and defers on it as on a command of its own
+([installation.md](installation.md#a-command-the-system-service-runs-4244)).
+
 ### Anchoring a device
 
 From an **elevated** prompt on the device:

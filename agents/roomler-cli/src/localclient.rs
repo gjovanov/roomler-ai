@@ -3190,10 +3190,12 @@ fn exit_node_state(ex: &tunnel_core::localapi::ExitNodeStatus) -> String {
              nothing else on this host uses it"
         );
     }
-    let v6 = if ex.v6_active {
-        "v6 on"
-    } else {
-        "v6 fail-closed"
+    // #3562 — a fail-closed v6 says why when the daemon knows: the exit
+    // serves IPv4 only, or this host cannot exempt its server over v6.
+    let v6 = match (ex.v6_active, ex.v6_withheld_reason.as_deref()) {
+        (true, _) => "v6 on".to_string(),
+        (false, Some(why)) => format!("v6 fail-closed: {why}"),
+        (false, None) => "v6 fail-closed".to_string(),
     };
     let dns = if ex.dns_steered {
         "DNS steered"
@@ -3920,6 +3922,7 @@ mod tests {
             active: true,
             withheld_reason: None,
             v6_active: true,
+            v6_withheld_reason: None,
             dns_steered: false,
             socks5_port: None,
         };
@@ -3942,6 +3945,34 @@ mod tests {
         assert_eq!(
             exit_node_state(&withheld),
             "withheld — exit node has no live carrier yet"
+        );
+    }
+
+    /// #3562 — a client whose exit serves IPv4 only says why its IPv6 is
+    /// fail-closed; a daemon from before #3562 sends no reason, and its line
+    /// reads as before.
+    #[test]
+    fn a_fail_closed_v6_says_why() {
+        let v4_only = tunnel_core::localapi::ExitNodeStatus {
+            selector: "exit".into(),
+            active: true,
+            withheld_reason: None,
+            v6_active: false,
+            v6_withheld_reason: Some("the exit serves IPv4 only".into()),
+            dns_steered: false,
+            socks5_port: None,
+        };
+        assert_eq!(
+            exit_node_state(&v4_only),
+            "active, v6 fail-closed: the exit serves IPv4 only, DNS NOT steered"
+        );
+        let older = tunnel_core::localapi::ExitNodeStatus {
+            v6_withheld_reason: None,
+            ..v4_only
+        };
+        assert_eq!(
+            exit_node_state(&older),
+            "active, v6 fail-closed, DNS NOT steered"
         );
     }
 

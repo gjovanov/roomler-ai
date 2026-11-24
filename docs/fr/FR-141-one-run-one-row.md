@@ -229,14 +229,14 @@ P0 decides its shape. What the code already gives: the root half's hardware id a
 (`orchestrator_unix.rs:973-1003`). What it lacks on a Mac: any look at the root daemon before the enroll
 (`root_identity.rs:67-79`). The privileged half runs as root and can read the root's config as
 `root_config_says` does (`install.sh:1019-1023`), and the root daemon's `Status` already reports `gui_worker.one_row`
-(`crates/localapi/src/lib.rs:490`, `:530-542`). So a one-row or supervised Mac is told apart, and the wizard enrolls no
+(`crates/localapi/src/lib.rs:496`, `:536-548`). So a one-row or supervised Mac is told apart, and the wizard enrolls no
 person's half on it and says why.
 
 - **2026-11-20, narrowed and built first (decision D2-A, the operator's 2A on #971's part 2):** a Mac whose root daemon
   says it is one row gets no install and no pairing at all, not a package-only road (which waits for a field need).
   The wizard runs as the person and cannot read root's config, so it asks the root daemon itself over the person
   socket root serves the console user (`/var/run/roomler-person/<uid>.sock`), which admits `status`
-  (`crates/localapi/src/lib.rs:3782-3784`) and passes it through whole (`:3911-3933`). The read is bounded to 3 s and
+  (`crates/localapi/src/lib.rs:3788-3790`) and passes it through whole (`:3917-3939`). The read is bounded to 3 s and
   believed only from a socket root serves; unknown is never one row. The stop is one decision
   (`agents/roomler-setup/src/reinstall_guard.rs`, `stop`) asked on the Welcome page, at pairing start and in the
   install's preflight. It sits behind `wizard_reinstall_guard`, default on, NOT behind P2's switch: the terminal makes
@@ -254,7 +254,7 @@ person's half on it and says why.
     writes it, a finished revert removes it (`:3102-3107`), and with no copy the revert says only "nothing to revert"
     (`:3176-3181`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
     is not named: it keeps the config. The words are `stop_text`'s (`agents/roomler-setup/src/reinstall_guard.rs`).
-  - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5825-5829`), so
+  - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5831-5835`), so
     it asks the system socket (`:4939-4943`), the root daemon's own, through the same root-only connect
     (`:6162-6165`): `status` alone, under the same 3 s bound, believed only through `one_row_from`. A person's road is
     unchanged, and a person with no person socket asks nothing, never the system socket (`socket_to_ask`). The only

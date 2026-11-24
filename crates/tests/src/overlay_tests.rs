@@ -109,6 +109,7 @@ impl Ipam {
                 supports_org_relay: false,
                 advertised_routes: vec![],
                 route_offer_withheld: None,
+                exit_serves_v6: None,
             })
             .await
     }
@@ -830,6 +831,7 @@ async fn agent_delete_releases_the_overlay_node() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
@@ -918,6 +920,7 @@ async fn a_re_enrolled_removed_machine_gets_a_fresh_overlay_node() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
@@ -1039,6 +1042,7 @@ async fn tunnel_client_delete_releases_the_overlay_node() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
@@ -1380,6 +1384,7 @@ async fn agent_delete_does_not_release_a_tunnel_clients_node() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
@@ -1705,6 +1710,7 @@ async fn renumber_refuses_a_fleet_below_the_version_floor() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
