@@ -6,6 +6,8 @@
 [#1035](https://github.com/gjovanov/roomler-ai/issues/1035) (a route port held by a companion the daemon spawned) ·
 FR-11 (server-side grids) · FR-27 (consent surfaces) · FR-61 (vmtest)
 
+**Anchors:** master `1d1b2b2c4` (closed 2026-09-26): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 **Installing Roomler ends with the companion open in front of the person who installed it,
@@ -58,7 +60,7 @@ curl -sI https://roomler.ai/api/setup/macos   → 404
 ```
 
 The agent lane is at `agent-v0.4.102`. The resolver is correct — it serves the newest
-`setup-v*` that exists (`crates/modules/fleet/src/setup_release.rs:474-493`); nothing has
+`setup-v*` that exists (`crates/modules/fleet/src/setup_release.rs:377-398`); nothing has
 cut one since 0.4.48, which shipped without macOS (`skip_macos`, before Apple signing).
 
 ## The mechanism, in the code (master `31cb9510e`)
@@ -216,7 +218,7 @@ which can create a folder) and Use default.
 - **Server** — `GET /api/agent/self/devices` and `/api/agent/self/mesh`, host-owned (the
   network module is optional), agent-token authenticated through the fleet extractor's
   shared `authenticate()`. The visible set is **self ∪ the join-time netmap shaping**,
-  extracted as `shape_full_netmap` from `crates/modules/network/src/overlay.rs:629-652` and
+  extracted as `shape_full_netmap` from `crates/modules/network/src/overlay.rs:527-550` and
   reused by `handle_overlay_join`, so the list can never show a peer the netmap withholds:
   `off`/`warn` list every live node, `enforce` only the shaped set. The device's own live node
   is found **before** any ACL read (`try_load_acl` creates the network on miss and must never

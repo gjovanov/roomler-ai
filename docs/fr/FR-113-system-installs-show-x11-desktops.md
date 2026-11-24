@@ -10,6 +10,8 @@ there on the released bytes (§8) · **Owner:** remote desktop (agent) · **Anch
 [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-93](FR-93-wayland-out-of-the-box.md) (the idle skip P3d, the desktop
 brief P2b), FR-80 (the reason codes)
 
+**Anchors:** master `545898507` (closed 2026-10-19): this spec is the record of the work, and its line anchors read at that commit.
+
 ## 1. Goal
 
 A **system** (root) install on an **X11** desktop shows the viewer that desktop, with input, with no capture key set,
@@ -59,7 +61,7 @@ flowchart LR
   scanout would otherwise show whatever is on screen. **It sees a lock only through `LockedHint`**, so the X11 half
   switches on only for a desktop that sets it: GNOME Shell or KDE's `ksmserver` running as the person (D4).
 - **DRM's idle skip on X11 seats.** FR-93 P3d skips unchanged frames on Wayland seats only
-  (`capture/drm_backend.rs:1061`; the X11 cell logged "every frame is read (not a Wayland seat …)"). An idle X11
+  (`capture/drm_backend.rs:1044`; the X11 cell logged "every frame is read (not a Wayland seat …)"). An idle X11
   desktop through DRM would read every frame, so P1 extends the skip, or AC6 fails. **Why P3d was Wayland-only**
   (`drm_idle.rs`): a Wayland compositor flips buffers, so the buffer's identity tells a change; an X server draws
   into the buffer on screen in place, so only the sampled rows can, and 32 rows would leave a typed character up to

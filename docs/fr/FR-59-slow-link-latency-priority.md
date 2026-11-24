@@ -4,6 +4,8 @@
 **Parent/siblings:** FR-1 (drag smoothness), FR-14 (direct jitter), FR-15 (age feedback),
 FR-17 (partial-reliability video), FR-35 (relay ceiling learns the pair)
 
+**Anchors:** master `1c584fb7e` (closed 2026-11-16): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 A remote-desktop session over a genuinely slow link (mobile hotspot, congested hotel/airport
@@ -40,14 +42,14 @@ therefore **increased**.
 ### The six mechanisms
 
 1. **A hard 1.5 Mbps bitrate floor.** `MIN_BITRATE_BPS = 1_500_000`
-   (`agents/roomlerd/src/encode/mod.rs:234`); on a constrained path `area_min_bitrate_bps()`
-   (`:215`) returns exactly it, and `governor.rs:365` passes it as the AIMD's `floor_bps`.
+   (`agents/roomlerd/src/encode/mod.rs:229`); on a constrained path `area_min_bitrate_bps()`
+   (`:215`) returns exactly it, and `governor.rs:327` passes it as the AIMD's `floor_bps`.
    **The encoder cannot be told to emit less than 1.5 Mbps, ever** — 3.8× the measured pipe at
    best, 23× in the worst window. Every other lever is downstream of a target the encoder is
    not allowed to reach.
 
 2. **The measured-goodput clamp is off on exactly the path that needs it.**
-   `governor.rs:336` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
+   `governor.rs:309` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
    for relay on 2026-08-27 because lumpy TURN-TCP samples crashed the down-fast EWMA. So the
    relay path has **no rate anchor at all**. And `derived_ceiling_bps` is itself
    `.max(1_000_000)` (`goodput.rs:107`), so even re-enabled it could not describe a 395 kbps
@@ -61,7 +63,7 @@ therefore **increased**.
 
 4. **The queue budget is denominated in the nominal ceiling.**
    `constrained_queue_budget_bytes(relay_max_bps())` (`rate_profile.rs:360`, called once at
-   `peer.rs:5070`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
+   `peer.rs:5056`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
    budget is **3.4 seconds** of standing queue. The gate never fired.
 
 5. **The only true latency signal is silent, rejected, or toothless.** `viewer_age_ms=None` in
@@ -71,7 +73,7 @@ therefore **increased**.
    `age_over` cuts **fps** and issues an AIMD MD — which stops at the 1.5 Mbps floor.
 
 6. **Video rides a reliable + ordered DataChannel.** FR-17 stage B exists but is behind a
-   viewer `localStorage` opt-in (`useRemoteControl.ts:3363`). On a lossy mobile link every lost
+   viewer `localStorage` opt-in (`useRemoteControl.ts:3362`). On a lossy mobile link every lost
    chunk head-of-line-blocks the stream *and* burns scarce capacity retransmitting a frame that
    is already stale. `peer.rs:2989` still records "a gap cannot occur".
 

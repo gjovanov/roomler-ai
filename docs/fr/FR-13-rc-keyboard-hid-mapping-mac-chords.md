@@ -2,6 +2,8 @@
 
 > **CLOSED 2026-08-27** — issue #789 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
+**Anchors:** master `251abf817` (closed 2026-09-01): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#789](https://github.com/gjovanov/roomler-ai/issues/789)
 **Status:** closed 2026-08-27 before its field check (#789). Both halves landed and shipped: the agent half (hid_to_key arms + fallback removed) in 0.4.6, the viewer half (Ctrl→Cmd translate + toggle) in web `v20260827-e765335c2c25`. The interactive field reads were never recorded, so the criteria stay open (`scripts/fr-ac-debt-baseline.txt` A.4)
 
@@ -15,12 +17,12 @@
 ## Bug A — the `Key::Other` fallback reinterprets HID usages as native keycodes
 
 The viewer maps `KeyboardEvent.code` → USB-HID usage
-(`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:14862` —
+(`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:9648` —
 `CapsLock → 0x39` is **correct**, locked by
 `useRemoteControl.spec.ts:329`). The agent maps HID → enigo `Key` in
-`hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:537-618`) —
+`hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:457-538`) —
 which has **no arm for 0x39**, so the caller falls through
-(`enigo_backend.rs:228-236`) to:
+(`enigo_backend.rs:174-182`) to:
 
 ```rust
 enigo.key(Key::Other(code), direction)
@@ -42,7 +44,7 @@ enigo 0.6.1 + core-graphics 0.25): `Pause` → **changes host volume** (mac),
 `Numpad3`/`Numpad5` → **opens the Start menu** (`VK_LWIN`/`VK_RWIN`, Windows),
 `Numpad7` → **VK_SLEEP sleeps the host** (Windows), NumLock/ScrollLock/
 PrintScreen and the whole numpad type wrong letters/digits on both.
-The composable's comment at `useRemoteControl.ts:11344-11346` ("works enough")
+The composable's comment at `useRemoteControl.ts:9710-9712` ("works enough")
 encodes the wrong assumption.
 
 ### Fix A (agent — one release)
@@ -51,11 +53,11 @@ encodes the wrong assumption.
    enigo, correct on all three OSes), numpad digits/operators
    (0x54–0x63), `IntlBackslash`, `ContextMenu`; platform-gate
    PrintScreen/Pause/NumLock/ScrollLock with the existing `0x49` cfg
-   precedent (`enigo_backend.rs:589-594`).
+   precedent (`enigo_backend.rs:509-514`).
 2. **Kill the unsound fallback**: unmapped HID → `tracing::debug!` + drop,
    never `Key::Other` (a HID usage is never a valid VK/CGKeyCode/keysym).
 3. Regression lock: extend `hid_table_covers_navigation_keys`
-   (`enigo_backend.rs:759-766`) and add a `BROWSER_EMITTED_HID` table test
+   (`enigo_backend.rs:679-686`) and add a `BROWSER_EMITTED_HID` table test
    asserting **every code `kbdCodeToHid` can emit maps to `Some(_)`** — the
    contract that silently broke.
 
@@ -67,7 +69,7 @@ SIGINT in a terminal and `pageDown:` in Cocoa text views, not copy/paste.
 There is no Ctrl→Cmd translation anywhere in the path.
 
 Key finding that shrinks the fix: **the hard half already works.** The
-deferred Ctrl+V flow (`useRemoteControl.ts:9183-9224`) pushes the browser
+deferred Ctrl+V flow (`useRemoteControl.ts:7822-7863`) pushes the browser
 clipboard to the host over the clipboard DC (arboard → NSPasteboard on mac,
 ack-gated) *before* replaying the chord — only the final replayed chord is
 wrong. Ctrl+C's only mechanism is the keystroke itself, so the host clipboard

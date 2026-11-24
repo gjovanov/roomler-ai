@@ -1,5 +1,7 @@
 # FR-5: macOS unattended update chain — the update half, pinned-GPG artifact trust, and a stable code-signing identity (retrospective)
 
+**Anchors:** master `85b9ebd54` (closed 2026-08-27): this spec is the record of the work, and its line anchors read at that commit.
+
 **Status:** SHIPPED and field-closed 2026-08-26 at agent rc.482. Tracking issue: `FR-5` (#774)
 in gjovanov/roomler-ai/issues. Retrospective FR — the arc completed before this document;
 every claim below carries its field receipt.

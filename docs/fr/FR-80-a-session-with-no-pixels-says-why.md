@@ -2,6 +2,8 @@
 
 **Issue:** [#1532](https://github.com/gjovanov/roomler-ai/issues/1532) · **Status:** **closed 2026-09-08** — shipped `agent-v0.4.94` + `hosted-20260908-aa36044`; both halves field-verified, with the failure cell created deliberately · **Glossary:** [`CONTEXT.md`](../../CONTEXT.md) · **Related:** [FR-27](FR-27-host-consent-prompt-surfaces.md) · [FR-77](FR-77-encoder-chroma-matrix.md) · [`docs/remote-control.md`](../remote-control.md)
 
+**Anchors:** master `da587fad3` (closed 2026-09-08): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 When a session produces no pixels, the operator learns **why, in the viewer**,
@@ -53,9 +55,9 @@ operator's to restore; the product's job is to say so.
 ## Key design
 
 1. **The reason survives the fallback.** `capture::open_default`
-   (`agents/roomlerd/src/capture/mod.rs:2837`) currently drops the backend's
+   (`agents/roomlerd/src/capture/mod.rs:490`) currently drops the backend's
    error on the floor and returns `Box::new(NoopCapture)`
-   (`mod.rs:3461`). `NoopCapture` carries a `CaptureUnavailable { code, detail }`
+   (`mod.rs:683`). `NoopCapture` carries a `CaptureUnavailable { code, detail }`
    instead, exposed through one new `ScreenCapture` trait method defaulting to
    `None`, so no call site changes shape and every pump can ask.
 2. **The code is derived, never guessed.** `code` is a small closed set —
@@ -90,7 +92,7 @@ operator's to restore; the product's job is to say so.
    turned out to have a GUI session and to capture fine. The ordering is right;
    the evidence for it was wrong, and no fleet host currently exercises it.
 3. **One new control-DC message**, `rc:media-unavailable`, built by a sibling of
-   `video_info_payload` (`peer.rs:5607`) and sent with the same
+   `video_info_payload` (`peer.rs:4475`) and sent with the same
    retry-until-delivered discipline both pumps already use for `rc:video-info`
    (rc.87: a once-only send races the control-DC open and is silently lost).
    It is peer-to-peer JSON on the control channel, **not** a `ClientMsg` /
@@ -136,7 +138,7 @@ operator's to restore; the product's job is to say so.
 - Restoring the permission itself. A remote agent must not be able to grant
   itself screen capture, and nothing here tries.
 - Making `has_input_permission` track the OS rather than the build
-  (`encode/caps.rs:4763` records that gap). Same class, separate change.
+  (`encode/caps.rs:1654` records that gap). Same class, separate change.
 - Re-signing or pinning the macOS identity so TCC grants survive a
   certificate change. That is FR-7's ground, and the answer there is that a
   Developer ID move is a one-time cost.

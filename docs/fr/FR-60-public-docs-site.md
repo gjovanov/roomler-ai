@@ -1,5 +1,7 @@
 # FR-60: Public documentation site at roomler.ai/docs
 
+**Anchors:** master `b9c3747f4` (closed 2026-09-29): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1165](https://github.com/gjovanov/roomler-ai/issues/1165) ·
 **Status:** proposed · **Owner:** web/docs
 

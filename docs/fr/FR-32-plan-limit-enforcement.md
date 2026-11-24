@@ -1,6 +1,8 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 # FR-32 — Eleven of fourteen plan limits are advertised and enforced nowhere
 
+**Anchors:** master `5c2549b4c` (closed 2026-08-30): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#898](https://github.com/gjovanov/roomler-ai/issues/898) ·
 **Status:** P0–P1c + integration tests shipped; **P2 complete for existing tenants** (all 65 on `Enforce`); default stays `Warn` by standing decision · field-verified on `v20260830-eaba9f4b0554` ·
 **Parent arc:** pricing (P1 of the sequence agreed under [FR-24](FR-24-licensing-split.md))

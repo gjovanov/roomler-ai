@@ -2,6 +2,8 @@
 
 **Issue:** [#864](https://github.com/gjovanov/roomler-ai/issues/864) · **Status:** CLOSED — P1 shipped (0.4.17), P2 merged, P3 ruled out by measurement · **Owner:** agent / capture
 
+**Anchors:** master `0a2d9c539` (closed 2026-08-29): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Break the ~20 ms-per-frame X11 capture floor that pins every Linux
@@ -40,18 +42,18 @@ DXGI Desktop Duplication, which returns `WouldBlock` when the desktop is
 unchanged. Two consequences in
 [`capture/scrap_backend.rs`](../../agents/roomlerd/src/capture/scrap_backend.rs):
 
-- `scrap_backend.rs:409` — the `WouldBlock` arm is the "no new frame" path.
+- `scrap_backend.rs:375` — the `WouldBlock` arm is the "no new frame" path.
   **On Linux it is unreachable**: XShm always yields a full buffer.
-- `scrap_backend.rs:400` — every delivered frame is stamped
+- `scrap_backend.rs:366` — every delivered frame is stamped
   `damage: Damage::Unknown`, so the encoder must treat all pixels as dirty and
-  `peer.rs:3374`'s `set_roi_hints` receives an empty rect list.
+  `peer.rs:2376`'s `set_roi_hints` receives an empty rect list.
 
-The pump already has the fast path this needs. `peer.rs:2946` logs
+The pump already has the fast path this needs. `peer.rs:2052` logs
 `"capture produced no frame (idle screen)"` on a `None` from `next_frame` and
 counts `frames_empty`. **That path exists, is named, and is simply
 unreachable on Linux.** P1 is about making it reachable, not about inventing it.
 
-`Damage` (`capture/mod.rs:86`) likewise already distinguishes the two empty
+`Damage` (`capture/mod.rs:76`) likewise already distinguishes the two empty
 states — `Unknown` ("no information, assume all dirty") vs `Tracked(vec![])`
 ("provably nothing changed"). Only the producer is missing.
 

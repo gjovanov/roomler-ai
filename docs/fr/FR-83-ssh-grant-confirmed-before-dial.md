@@ -4,6 +4,8 @@
 **Field report:** [#1597](https://github.com/gjovanov/roomler-ai/issues/1597), found by the
 FR-81 stress lane ([#1546](https://github.com/gjovanov/roomler-ai/issues/1546))
 
+**Anchors:** master `bd441c3c7` (closed 2026-09-24): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 **A caller that has been told where to dial can rely on the target holding its grant.**
@@ -131,14 +133,14 @@ REFUSAL (`other`), and only an absent or `null` field means recorded.
 ### 2. The capability — `ssh-grant-ack`, read from the LIVE connection
 
 `RpcCap::SshGrantAck` = `ssh-grant-ack`, advertised only by `ssh-server` builds, next to
-`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:4371`).
+`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:1413`).
 
 ⚠️ **Equality-matched**, like every verb: `ssh` is a prefix of `ssh-grant-ack` exactly as it
 is of `ssh-consent`, and `starts_with` would mark every `ssh` agent ack-capable — the
 server would then wait 10 s on every grant to an agent that never answers.
 
 ⚠️ The server reads it from the **Hub entry** (distilled at registration,
-`crates/modules/fleet/src/socket.rs:188`, like `supports_ssh`), never from the stored
+`crates/modules/fleet/src/socket.rs:143`, like `supports_ssh`), never from the stored
 agent row. The row reflects the last hello, which after a rollback promises an ack the
 running agent never sends — every grant to that device would wait out the bound and then
 be refused.
@@ -166,20 +168,20 @@ The waiter table lives in `NetworkState` — `network` owns SSH; the Hub only ow
 socket. A guard deregisters on every exit path, as `ExecWaiterGuard` does for exec.
 
 **The 10 s bound**: 2× the worst lag observed (4.4 s); inside the originating device's own
-30 s wait for `rc:ssh.response` (`agents/roomlerd/src/localapi_state.rs:2171`), so the
+30 s wait for `rc:ssh.response` (`agents/roomlerd/src/localapi_state.rs:1057`), so the
 caller hears the server's reason rather than its own timeout; and it leaves ≥ 50 s of the
 60 s grant TTL (`ssh_limits::GRANT_TTL_SECS`) to dial in.
 
 ### 4. The agent — acknowledge after recording, and every refusal
 
-The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:6085`) acknowledges **after**
+The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:3532`) acknowledges **after**
 `record_grant` returns: the grant is in `GRANTS` — the table the auth path reads — before
 the frame leaves, so "confirmed" means "redeemable". `record_grant`'s `Result<(), String>`
 becomes a typed rejection so the arm can say *which* refusal it was; the log text is
 unchanged.
 
 The ack is sent unconditionally by an ack-capable build. An older server cannot parse the
-frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:776`) — harmless, and
+frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:618`) — harmless, and
 one small frame per grant.
 
 ### Compatibility, both directions

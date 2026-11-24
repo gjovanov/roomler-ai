@@ -2,6 +2,8 @@
 
 Status: **CLOSED — all three causes fixed and field-verified (agent-v0.4.31 / 0.4.32 / 0.4.33, 2026-08-30).** Tracking issue: `FR-44` (#1024). Retroactive: written after the arc shipped, per the FR standing rule ("retroactive FRs for already-shipped arcs are welcome").
 
+**Anchors:** master `3b094b749` (closed 2026-08-30): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Two people viewing the **same** remote screen at once must both see it, and neither may disrupt the other. Roomler already shares ONE encoder across same-profile viewers (`crates`… `agents/roomlerd/src/media_share.rs` — the P5 shared pipeline: a LEADER runs the capture/encode pump, later same-profile sessions register as FOLLOWERS and receive every encoded packet via their own DataChannel). The sharing existed; its correctness under a real second viewer did not.
@@ -19,16 +21,16 @@ Investigation found **three distinct causes**, each fixed in sequence.
 
 ### P1 — join-IDR dropped before the follower's video DC opened (keyframe race) — #1015, 0.4.31
 A follower registers during `AgentPeer::new` (before any DataChannel exists) and `try_join` sets `kf_needed`; the leader forces a pipeline IDR ~33 ms later and `Pipeline::fan_out` flips the follower to `synced` the instant it QUEUES that IDR. But the follower's `video-bytes` DC finishes negotiating hundreds of ms later (field: 819 ms), and `spawn_follower_chunker` drops anything arriving while the DC is `None`/`!Open` — so the join-IDR is lost yet the follower is `synced`: only undecodable deltas follow → black until the next natural keyframe. The **control** DC already had an on-open resync hook (`replay_video_info`); the **video** DC had none.
-- Fix: `media_share::resync_follower` (`agents/roomlerd/src/media_share.rs:911`), called from the `video-bytes` on-open arm in `peer.rs` — reset `synced=false` + `kf_needed=true` so the follower re-syncs onto a fresh IDR the now-live chunker delivers. No-op for a leader.
+- Fix: `media_share::resync_follower` (`agents/roomlerd/src/media_share.rs:714`), called from the `video-bytes` on-open arm in `peer.rs` — reset `synced=false` + `kf_needed=true` so the follower re-syncs onto a fresh IDR the now-live chunker delivers. No-op for a leader.
 
 ### P2 — follower received RAW un-chunk-framed bytes (the real black-screen cause) — #1018, 0.4.32
 The leader's send task wraps each 16 KiB chunk in the FR-17 header (`frame_seq`/`chunk_idx`/`chunk_count`) when the session negotiated chunk-framing, but `spawn_follower_chunker` sent `wire.slice()` RAW, ALWAYS. The browser (same one as the working leader) parsed a chunk header out of AV1 payload and could never reassemble a frame → structurally undecodable → black, consistently. Every chunk-framing follower was broken; only non-chunk-framing clients happened to work.
-- Fix: `FollowerSink.chunk_framing` (`agents/roomlerd/src/media_share.rs:134`, a per-SESSION property — a follower may disagree with the owner) + `spawn_follower_chunker` (`:938`) now mirrors the owner's send task exactly (FR-17 header per chunk with its own `frame_seq`, else raw).
+- Fix: `FollowerSink.chunk_framing` (`agents/roomlerd/src/media_share.rs:130`, a per-SESSION property — a follower may disagree with the owner) + `spawn_follower_chunker` (`:741`) now mirrors the owner's send task exactly (FR-17 header per chunk with its own `frame_seq`, else raw).
 - Verified at the byte level: follower messages `len=16392, seq=1, chunk_idx=0..14, size=232438, flags=1` (a valid chunk-framed keyframe) vs the pre-fix garbage `len=16384, seq=121544, chunk_idx=52993`.
 
 ### P3 — shared egress not viewer-count-aware → 2nd viewer oversubscribed the relay and dropped the 1st — #1020, 0.4.33
 A shared encoder sends every viewer its OWN ciphertext copy over its OWN DataChannel, but the bitrate ceiling did not account for the viewer count. On a CONSTRAINED (relay) transport all copies leave the host over the SAME uplink, so N viewers = N× egress while the encoder still targeted the full relay bandwidth. A 2nd viewer's motion put ~2× the relay's capacity on the wire → the leader's ICE went `Disconnected` under the congestion → the pipeline collapsed and re-dispatched (the leader is a single point of failure). `followers_congested` only trims AFTER the queue fills.
-- Fix: `encode::shared_split_ceiling_bps` (`agents/roomlerd/src/encode/mod.rs:569`, gated by `shared_rate_split_enabled` `:553`) — on a constrained transport divide the ceiling by the live viewer count (`1 + pipeline.follower_count()`), floored at `area_min_bitrate_bps` so no copy drops below usable quality; the reactive AIMD path trims residual. Applied in both DC pumps (`peer.rs:5037` vp9, `:8962` ffmpeg), recomputed each iteration so it tracks joins/leaves. Single viewer and direct transports untouched. Kill switch `ROOMLERD_SHARED_RATE_SPLIT=0`.
+- Fix: `encode::shared_split_ceiling_bps` (`agents/roomlerd/src/encode/mod.rs:493`, gated by `shared_rate_split_enabled` `:478`) — on a constrained transport divide the ceiling by the live viewer count (`1 + pipeline.follower_count()`), floored at `area_min_bitrate_bps` so no copy drops below usable quality; the reactive AIMD path trims residual. Applied in both DC pumps (`peer.rs:3842` vp9, `:5621` ffmpeg), recomputed each iteration so it tracks joins/leaves. Single viewer and direct transports untouched. Kill switch `ROOMLERD_SHARED_RATE_SPLIT=0`.
 - Verified: leader `target_bps` **2,550,000 (1 viewer) → 1,500,000 (2 viewers, floored)** on CORPLAP-3 — total relay egress ~5.1 M → ~3 M.
 
 ## Acceptance criteria

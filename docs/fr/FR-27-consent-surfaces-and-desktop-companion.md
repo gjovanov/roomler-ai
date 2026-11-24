@@ -3,6 +3,8 @@
 **Issue:** [#854](https://github.com/gjovanov/roomler-ai/issues/854)
 **Status:** ✅ **closed 2026-10-26**. Every acceptance criterion is field-verified; the last was macOS "Apply update" from the companion (0.4.172 → 0.4.174, see the 10-26 log entry).
 
+**Anchors:** master `42328ffff` (closed 2026-10-26): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Selecting `Prompt on host (attended)` on a device must put a panel on that
@@ -85,7 +87,7 @@ was rewritten on 2026-11-07 (#3531), and its anchors follow the code.
    Tauri 2.11 auto-creates a tray from `app.trayIcon` (id `main`, icon, no menu);
    `tray::install` then builds a *second* one and never calls `.icon()`. The
    blank one carries the menu — which is exactly what the operator described.
-   — `tauri-2.11.2/src/app.rs:2412`, `agents/roomler-desktop/src/tray.rs:54`
+   — `tauri-2.11.2/src/app.rs:2412`, `agents/roomler-desktop/src/tray.rs:53`
 7. **One bug breaks most pages on macOS and Linux: `agent_exe_path()`.** It
    probes for a *sibling* `roomlerd`, then falls back to a bare name on `PATH`.
    On macOS the companion is `/Applications/Roomler.app/Contents/MacOS/`, the
@@ -93,13 +95,13 @@ was rewritten on 2026-11-07 (#3531), and its anchors follow the code.
    `/usr/local/bin` — hence the reported
    `Spawning self-update: No such file or directory (os error 2)`. The same
    failure kills apply-update, `probe_service_state`, service install/uninstall
-   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1943`
+   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1494`
 8. ~~**macOS "Check for updates" targets the wrong mechanism.**~~ **Wrong —
    corrected during implementation.** The reported
    `Spawning self-update: No such file or directory (os error 2)` made this
    look like a second, independent macOS defect. It is not: `self_update_cmd`
    has queued the root `com.roomler.update` helper for a non-root macOS caller
-   since FR-5 (`app.rs:6594`), so the mechanism was already correct and
+   since FR-5 (`app.rs:3418`), so the mechanism was already correct and (2026-10-27)
    finding 7 alone accounts for the error. What WAS wrong is that
    `cmd_apply_update` spawned detached and discarded stdout, so the daemon's
    <!-- RETIRED-NAME-ANCHOR: quoting the daemon's OWN output; that log path is
@@ -111,7 +113,7 @@ was rewritten on 2026-11-07 (#3531), and its anchors follow the code.
    and exits, so there is nothing to wait for).
 9. **`companion::refresh_if_stale` is Windows-only** and nothing reports the
    companion's version to the server, so "Update all" cannot tell anyone the
-   desktop stayed behind. — `agents/roomlerd/src/companion.rs:730`
+   desktop stayed behind. — `agents/roomlerd/src/companion.rs:115`
 10. **`roomler-desktop` is not shipped for Linux at all** (`scripts/install.sh:530`, at master `5c5a70767`),
     although it already *compiles* there — `cargo clippy --workspace` installs
     webkit2gtk and walks the crate. This is packaging, not porting.
@@ -122,7 +124,7 @@ was rewritten on 2026-11-07 (#3531), and its anchors follow the code.
 11. **"Being viewed by X + Disconnect" is Windows-only**, gated on
     `all(target_os = "windows", feature = "viewer-indicator")`, with a no-op
     `Inner` on every other OS — and `viewer-indicator` is only in the `full-hw`
-    set, so the Linux and macOS release lines (`release-agent.yml:400, 621, 1919`)
+    set, so the Linux and macOS release lines (`release-agent.yml:391, 621, 1922`)
     build plain `full`. There is also no LocalAPI verb for live RC sessions, so
     no thin client can render a banner or offer a Disconnect.
 
@@ -168,10 +170,10 @@ Two things make the native backends much cheaper than they look, both verified
 against `Cargo.lock`: **`x11rb 0.13.2`, `objc2 0.6.4` and `objc2-app-kit 0.3.2`
 are already locked** (via enigo/arboard and tauri), so neither adds a new
 dependency tree; and the macOS daemon **already ships as an `.app` with
-`LSUIElement=true`** (`release-agent.yml:2648`), the bundle identity AppKit
+`LSUIElement=true`** (`release-agent.yml:2457`), the bundle identity AppKit
 windows require.
 
-⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:781`
+⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:697` (2026-10-27)
 is `#[tokio::main]`, so the main thread is parked in `block_on` for the daemon's
 whole life — the main dispatch queue never drains and AppKit can never deliver a
 click to an Approve button. The macOS arm has to build the runtime explicitly, run

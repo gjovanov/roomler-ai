@@ -1,5 +1,7 @@
 # FR-86: Tunnel routes return to the best transport — make-before-break re-upgrade, never cutting a connection
 
+**Anchors:** master `9883dbc7f` (closed 2026-09-29): this spec is the record of the work, and its line anchors read at that commit.
+
 Issue: [#1769](https://github.com/gjovanov/roomler-ai/issues/1769) · supersedes [#1768](https://github.com/gjovanov/roomler-ai/issues/1768) ·
 related [#1761](https://github.com/gjovanov/roomler-ai/issues/1761) (the churn cause, fixed in 0.4.113) and
 [#1754](https://github.com/gjovanov/roomler-ai/issues/1754) (the terminate guard and the exit-side reap).
@@ -25,7 +27,7 @@ The operator's decision (2026-09-28, on #1768): *"they should switch to the bett
 
 The ladder runs **only when a session opens**, and nothing ever re-opens a healthy session, so a route keeps the
 transport it happened to land on. The flow supervisor even remembers that QUIC-over-TURN failed
-(`quic_over_turn_failing`, `agents/roomlerd/src/tunnel/client_mgr.rs:747`) — but only uses it to choose the
+(`quic_over_turn_failing`, `agents/roomlerd/src/tunnel/client_mgr.rs:743`) — but only uses it to choose the
 NEXT session's first rung, and a healthy fallen-back session never ends on its own.
 
 ## The mechanism, in the code (master `f089d9992`)
@@ -62,7 +64,7 @@ the exit side are untouched. Its visible effect is that a route no longer refuse
 ### P2 — make-before-break re-upgrade
 
 The flow supervisor gains a **re-upgrade probe**. The order is `quic-v1` > `quic-derp-v1` > `webrtc-dc-v1`
-(`quic-derp-v1` only where `TUNNEL_DERP_FALLBACK` is on, `client_mgr.rs:865`), restricted to what the route's
+(`quic-derp-v1` only where `TUNNEL_DERP_FALLBACK` is on, `client_mgr.rs:861`), restricted to what the route's
 `--transport` preference allows (`auto` only; a pinned transport never re-upgrades).
 
 ```mermaid
