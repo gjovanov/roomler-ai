@@ -45,6 +45,18 @@
 //! the session's key frame asks over the line by who asked, the refusals by
 //! the 500 ms gap and by the rule, the owed asks granted, and the rule's gap
 //! at the line.
+//!
+//! FR-148 P4b-5a — the key frame ledger closes that line, from the pump's
+//! start, under `shadow` and `on`: the key frames written whole by channel
+//! (the send task tells the lane, [`Lane::written`]), the key frames the lane
+//! dropped by D and by a switch, and the viewer's newest count of the key
+//! frames it completed whole (`rc:decodestat`'s `kf`, kept in
+//! [`ViewerRelayReport`]); O20 reads the two against each other. And the
+//! first write after a still stretch, a second or more with no lane write
+//! from the end of the last write's sends, writes [`WAKE_LINE`] with the
+//! gauges a look reads then, and the first key frame
+//! after a wake on a delta [`WAKE_KEY_LINE`] (D60). Nothing they count or read
+//! changes a pick, a drop, an ask or a write.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -57,6 +69,7 @@ use tracing::{info, warn};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 use webrtc::sctp_transport::RTCSctpTransport;
 
 use crate::session_carrier::{OverlayPath, PairView, RelayTransport, SessionCarrier};
@@ -115,6 +128,14 @@ impl Channel {
         match self {
             Channel::Bytes => BYTES_LABEL,
             Channel::Deadline => DEADLINE_LABEL,
+        }
+    }
+
+    /// FR-148 P4b-5a — its place in a pair of counts: `video-bytes` first.
+    fn index(self) -> usize {
+        match self {
+            Channel::Bytes => 0,
+            Channel::Deadline => 1,
         }
     }
 }
@@ -808,16 +829,28 @@ impl Session {
 /// the control channel cannot flip the pick back. It keeps nothing until a
 /// pump under `shadow` or `on` serves the session ([`Pump::start`]), so under
 /// `off` nothing is kept.
+///
+/// FR-148 P4b-5a — beside it, the newest `kf` a report carried: the key
+/// frames the viewer completed whole on `video-bytes` and on
+/// `video-deadline`, from its session's start ([`Self::kf`]). A report
+/// without the key, or with one that is not two counts, leaves the last, so a
+/// line reads the newest count the viewer sent; kept under the same rule.
 #[derive(Debug, Default)]
 pub struct ViewerRelayReport {
     kept: AtomicBool,
     newest: Mutex<Option<(ViewerRelay, Instant)>>,
+    kf: Mutex<Option<(u64, u64)>>,
 }
 
 impl ViewerRelayReport {
     /// One `rc:decodestat`, as the control channel received it.
     pub fn note(&self, val: &serde_json::Value) {
         self.note_at(ViewerRelay::of_decodestat(val), Instant::now());
+        if let Some(kf) = viewer_kf_of(val)
+            && self.kept.load(Relaxed)
+        {
+            *self.kf.lock().unwrap_or_else(PoisonError::into_inner) = Some(kf);
+        }
     }
 
     fn note_at(&self, report: Option<ViewerRelay>, at: Instant) {
@@ -837,11 +870,71 @@ impl ViewerRelayReport {
     fn keep(&self) {
         self.kept.store(true, Relaxed);
     }
+
+    /// FR-148 P4b-5a — the viewer's newest count of the key frames it
+    /// completed whole, `(video-bytes, video-deadline)`; `None` until a
+    /// report carried one.
+    pub fn kf(&self) -> Option<(u64, u64)> {
+        *self.kf.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// FR-148 P4b-5a — `kf` on one `rc:decodestat`: exactly two counts, each a
+/// JSON integer from 0 to `u64::MAX`. Anything else, an absent key included,
+/// is no report.
+fn viewer_kf_of(val: &serde_json::Value) -> Option<(u64, u64)> {
+    match val.get("kf")?.as_array()?.as_slice() {
+        [bytes, deadline] => Some((bytes.as_u64()?, deadline.as_u64()?)),
+        _ => None,
+    }
+}
+
+/// FR-148 P4b-5a — two counts from a pump's start, one a [`Channel`] or one a
+/// cause; a line reads them and never takes them.
+#[derive(Debug, Default)]
+struct Ledger([AtomicU64; 2]);
+
+impl Ledger {
+    fn add(&self, at: usize) {
+        self.0[at].fetch_add(1, Relaxed);
+    }
+
+    fn read(&self) -> (u64, u64) {
+        (self.0[0].load(Relaxed), self.0[1].load(Relaxed))
+    }
+}
+
+/// FR-148 P4b-5a — a count pair as a line writes it, `(<a>, <b>)`, or `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairOrNone(pub Option<(u64, u64)>);
+
+impl std::fmt::Display for PairOrNone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some((a, b)) => write!(f, "({a}, {b})"),
+            None => f.write_str("None"),
+        }
+    }
+}
+
+/// FR-148 P4b-5a — a count as a line writes it, or `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NumOrNone(Option<u64>);
+
+impl std::fmt::Display for NumOrNone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(n) => write!(f, "{n}"),
+            None => f.write_str("None"),
+        }
+    }
 }
 
 /// A pump's counts for the `path delivery` line: the frames D dropped, the
 /// frames switches dropped, the switches, and the channel in use. Under
-/// `shadow`, what `on` would have done.
+/// `shadow`, what `on` would have done. FR-148 P4b-5a — and the key frame
+/// ledger, which is what the pump really did: the key frames written whole
+/// and the key frames dropped, from the pump's start.
 #[derive(Debug)]
 pub struct Counters {
     mode: Mode,
@@ -853,16 +946,23 @@ pub struct Counters {
     /// FR-148 P4b-4 — under `shadow` and `on`, from the pump's start: the
     /// session's gate and its key frame asks.
     asks: Mutex<Option<Asks>>,
+    /// FR-148 P4b-5a — key frames whose every chunk the send task sent
+    /// without error, by the channel they went on ([`Channel::index`]).
+    kf_written: Ledger,
+    /// FR-148 P4b-5a — key frames the lane dropped before the socket: by D
+    /// (0), and while a switch drained or waited (1). Only `on` drops.
+    kf_dropped: Ledger,
 }
 
 /// FR-148 P4b-4 — what a pump's line reads of its session's key frame asks:
 /// the gate the pump feeds the rate, and N12's split as the last line took
-/// it.
+/// it. FR-148 P4b-5a — and the session's report of the viewer's key frames.
 #[derive(Debug)]
 struct Asks {
     gate: Arc<KeyframeGate>,
     n12: Arc<SessionCounters>,
     taken: KeyframeSplit,
+    viewer: Arc<ViewerRelayReport>,
 }
 
 impl Counters {
@@ -874,6 +974,8 @@ impl Counters {
             switches: AtomicU64::new(0),
             channel: AtomicU8::new(0),
             asks: Mutex::new(None),
+            kf_written: Ledger::default(),
+            kf_dropped: Ledger::default(),
         }
     }
 
@@ -884,11 +986,13 @@ impl Counters {
 
     /// The line's part, its counts since the last take; `None` under `off`.
     /// `forward_tsns`: the association's FORWARD TSN count, from its gauges.
+    /// FR-148 P4b-5a — the key frame ledger is read, never taken: its counts
+    /// run from the pump's start.
     pub fn take(&self, forward_tsns: Option<u64>) -> Option<DeadlineLine> {
         if self.mode == Mode::Off {
             return None;
         }
-        let (asks, kf_gap) = self.take_asks();
+        let (asks, kf_gap, viewer_kf) = self.take_asks();
         Some(DeadlineLine {
             forward_tsns,
             late: self.late.swap(0, Relaxed),
@@ -901,15 +1005,29 @@ impl Counters {
             },
             asks,
             kf_gap_ms: kf_gap.map(|gap| u64::try_from(gap.as_millis()).unwrap_or(u64::MAX)),
+            kf_written: self.kf_written.read(),
+            kf_dropped: self.kf_dropped.read(),
+            viewer_kf,
         })
     }
 
     /// FR-148 P4b-4 — at the pump's start, under `shadow` and `on`: the
     /// session's gate, which [`Self::note_rate`] feeds, and N12's counts,
-    /// whose split each line takes from here on.
-    fn follow(&self, gate: Arc<KeyframeGate>, n12: Arc<SessionCounters>) {
+    /// whose split each line takes from here on. FR-148 P4b-5a — and the
+    /// session's report of the viewer's key frames, which each line reads.
+    fn follow(
+        &self,
+        gate: Arc<KeyframeGate>,
+        n12: Arc<SessionCounters>,
+        viewer: Arc<ViewerRelayReport>,
+    ) {
         let taken = n12.keyframe_split();
-        *self.asks.lock().unwrap_or_else(PoisonError::into_inner) = Some(Asks { gate, n12, taken });
+        *self.asks.lock().unwrap_or_else(PoisonError::into_inner) = Some(Asks {
+            gate,
+            n12,
+            taken,
+            viewer,
+        });
     }
 
     /// FR-148 P4b-4 (D59) — the rate the session's key frame rule divides by,
@@ -927,15 +1045,25 @@ impl Counters {
     /// refusals by what refused them, and the owed asks granted (under
     /// `shadow`, what `on` would have refused, owed and granted); and the
     /// rule's gap at the line ([`KeyframeGate::gap`]), `None` with no session.
-    fn take_asks(&self) -> (KeyframeSplit, Option<Duration>) {
+    /// FR-148 P4b-5a — and the viewer's newest count of its key frames,
+    /// `None` with no session or before a report carried one.
+    fn take_asks(&self) -> (KeyframeSplit, Option<Duration>, Option<(u64, u64)>) {
         let mut asks = self.asks.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(asks) = asks.as_mut() else {
-            return (KeyframeSplit::default(), None);
+            return (KeyframeSplit::default(), None, None);
         };
         let now = asks.n12.keyframe_split();
         let over = now.since(asks.taken);
         asks.taken = now;
-        (over, Some(asks.gate.gap()))
+        (over, Some(asks.gate.gap()), asks.viewer.kf())
+    }
+
+    /// FR-148 P4b-5a — a key frame whose every chunk went, on `channel`.
+    /// Under `off`, nothing.
+    fn wrote_key(&self, channel: Channel) {
+        if self.mode != Mode::Off {
+            self.kf_written.add(channel.index());
+        }
     }
 
     fn set_channel(&self, channel: Channel) {
@@ -969,6 +1097,19 @@ pub struct DeadlineLine {
     /// the last key frame written and the pump's rate; `None` for a pump that
     /// serves no session's gate.
     pub kf_gap_ms: Option<u64>,
+    /// FR-148 P4b-5a — key frames written whole from the pump's start, on
+    /// `video-bytes` and on `video-deadline`: every chunk sent without error.
+    /// Under `shadow` every write is on `video-bytes`.
+    pub kf_written: (u64, u64),
+    /// FR-148 P4b-5a — key frames the lane dropped before the socket from
+    /// the pump's start: by D, and while a switch drained or waited. Under
+    /// `shadow` the lane drops nothing, so both stay 0.
+    pub kf_dropped: (u64, u64),
+    /// FR-148 P4b-5a — the viewer's newest count of the key frames it
+    /// completed whole, on `video-bytes` and on `video-deadline`, from its
+    /// session's start (`rc:decodestat`'s `kf`); `None` until a report
+    /// carried one.
+    pub viewer_kf: Option<(u64, u64)>,
 }
 
 impl DeadlineLine {
@@ -1014,6 +1155,7 @@ impl Pump {
             counters.follow(
                 session.gate(),
                 crate::session_telemetry::counters(session_id),
+                session.viewer_relay(),
             );
             session.viewer_relay.keep();
         }
@@ -1077,6 +1219,7 @@ impl Pump {
             session: self.session.clone(),
             sctp: pc.sctp(),
             session_id: self.session_id,
+            gauges: None,
         };
         Lane::new(
             wire,
@@ -1121,6 +1264,12 @@ pub trait Wire: Send + Sync {
     /// FR-148 P4b-4 — a frame's road was decided at `now`, the lane in `scope`
     /// after it: `key_written`, the size of the key frame it wrote.
     fn frame_done(&self, now: Instant, scope: Scope, key_written: Option<u64>);
+
+    /// FR-148 P4b-5a (D60) — the association's gauges now, as a look reads
+    /// them (`GaugeReader::peek`: it resets nothing the `path delivery`
+    /// line's take owns); `None` with no association, or while its
+    /// transport's slot is held. Never waits.
+    fn gauges(&mut self) -> Option<Gauges>;
 }
 
 /// A lane's wire in a live session.
@@ -1129,6 +1278,10 @@ pub struct SessionWire {
     session: Option<Arc<Session>>,
     sctp: Arc<RTCSctpTransport>,
     session_id: ObjectId,
+    /// FR-148 P4b-5a — the association's gauges once a look found them: one
+    /// association serves a transport for its life, so the reader is asked
+    /// for until it comes, and then only read.
+    gauges: Option<GaugeReader>,
 }
 
 impl Wire for SessionWire {
@@ -1169,6 +1322,13 @@ impl Wire for SessionWire {
             s.gate.on_frame(self.session_id, now, scope, key_written);
         }
     }
+
+    fn gauges(&mut self) -> Option<Gauges> {
+        if self.gauges.is_none() {
+            self.gauges = self.sctp.gauges();
+        }
+        self.gauges.as_ref().map(GaugeReader::peek)
+    }
 }
 
 /// A frame the lane let through: write it on `dc`, numbered `frame_seq`,
@@ -1177,6 +1337,10 @@ pub struct Routed<W: Wire> {
     pub dc: W::Dc,
     pub frame_seq: u32,
     _held: W::Held,
+    /// FR-148 P4b-5a — the channel `dc` is, and whether the frame is a key
+    /// frame: what [`Lane::written`] counts.
+    channel: Channel,
+    key: bool,
 }
 
 /// A switch under way.
@@ -1208,6 +1372,183 @@ enum Phase {
     Keying(Switch),
 }
 
+/// FR-148 P4b-5a (D60) — a still stretch: this long or longer with no lane
+/// write, from the end of the last write's sends to the next frame the lane
+/// lets through. A constant, never a knob.
+const STILL: Duration = Duration::from_secs(1);
+
+/// FR-148 P4b-5a (D60) — at most one [`WAKE_LINE`] a pump in any this long;
+/// and how long a wake on a delta waits for its [`WAKE_KEY_LINE`].
+const WAKE_EVERY: Duration = Duration::from_secs(10);
+
+/// FR-148 P4b-5a (D60) — the first write after a still stretch, which a field
+/// read greps for.
+pub const WAKE_LINE: &str = "path wake (FR-148 P4b-5a, D60)";
+
+/// FR-148 P4b-5a (D60) — the first key frame written after a wake on a delta;
+/// `grep 'path wake'` finds it beside [`WAKE_LINE`].
+pub const WAKE_KEY_LINE: &str = "path wake key (FR-148 P4b-5a, D60)";
+
+/// A write, as the wake lines name it.
+#[derive(Clone, Copy, Debug)]
+struct Wrote {
+    key: bool,
+    bytes: u64,
+    channel: Channel,
+}
+
+/// FR-148 P4b-5a (D60) — a lane's still stretches: what the path held at the
+/// first write after a second or more with none, and at the first key frame
+/// after it. A tail loss before a still screen is found only by a T3, which
+/// cuts the window to one MTU; these lines read the window there. On the
+/// data-channel pumps a still screen still writes the 60 ms keepalive, so a
+/// stretch is most often a pump that held its frames or a lane that dropped
+/// them.
+#[derive(Clone, Copy, Debug, Default)]
+struct Wake {
+    /// The end of the last write, and the association's fast retransmissions
+    /// and T3-rtx expiries since it began, read then (`None` without gauges):
+    /// when the send task said its sends ended ([`Lane::written`]), else when
+    /// the lane let it through.
+    last: Option<(Instant, Option<(u64, u64)>)>,
+    /// The last [`WAKE_LINE`].
+    said: Option<Instant>,
+    /// The stretches since it that wrote none.
+    skipped: u64,
+    /// A wake on a delta, until its key frame or [`WAKE_EVERY`]: when, and
+    /// the T3-rtx expiries then.
+    keyless: Option<(Instant, Option<u64>)>,
+}
+
+impl Wake {
+    /// A write at `now`, with the gauges a look read then.
+    fn wrote(&mut self, session_id: ObjectId, now: Instant, wrote: Wrote, gauges: Option<Gauges>) {
+        let loss = gauges.map(|g| (g.fast_retransmits, g.t3_expiries));
+        if let Some((at, t3)) = self.keyless {
+            let delay = now.saturating_duration_since(at);
+            if delay >= WAKE_EVERY {
+                self.keyless = None;
+            } else if wrote.key {
+                self.keyless = None;
+                let since = t3
+                    .zip(gauges)
+                    .map(|(t3, g)| g.t3_expiries.saturating_sub(t3));
+                emit_wake_key(session_id, ms(delay), wrote, gauges.as_ref(), since);
+            }
+        }
+        if let Some((last, last_loss)) = self.last {
+            let still = now.saturating_duration_since(last);
+            let quiet = self
+                .said
+                .is_some_and(|said| now.saturating_duration_since(said) < WAKE_EVERY);
+            if still >= STILL && quiet {
+                self.skipped = self.skipped.saturating_add(1);
+            } else if still >= STILL {
+                let over = last_loss.zip(loss).map(|((fast, t3), (fast_now, t3_now))| {
+                    (fast_now.saturating_sub(fast), t3_now.saturating_sub(t3))
+                });
+                emit_wake(
+                    session_id,
+                    ms(still),
+                    gauges.as_ref(),
+                    over,
+                    wrote,
+                    self.skipped,
+                );
+                self.said = Some(now);
+                self.skipped = 0;
+                self.keyless = (!wrote.key).then_some((now, gauges.map(|g| g.t3_expiries)));
+            }
+        }
+        self.last = Some((now, loss));
+    }
+
+    /// The last write's sends ended at `now`, with the gauges a look read
+    /// then: the next stretch, and the counts over it, start here.
+    fn sent(&mut self, now: Instant, gauges: Option<Gauges>) {
+        let loss = gauges.map(|g| (g.fast_retransmits, g.t3_expiries));
+        self.last = Some((now, loss));
+    }
+}
+
+/// [`WAKE_LINE`]: the stretch, the gauges at its first write, the fast
+/// retransmissions and T3-rtx expiries over it (`over`, `None` when the write
+/// before it read no gauges), the frame, and the stretches skipped since the
+/// last line. Without gauges, the stretch and the frame alone.
+fn emit_wake(
+    session_id: ObjectId,
+    still_ms: u64,
+    gauges: Option<&Gauges>,
+    over: Option<(u64, u64)>,
+    wrote: Wrote,
+    skipped: u64,
+) {
+    let kind = if wrote.key { "key" } else { "delta" };
+    match gauges {
+        Some(g) => info!(
+            session = %session_id,
+            still_ms,
+            cwnd = g.cwnd,
+            ssthresh = g.ssthresh,
+            inflight_bytes = g.inflight_bytes,
+            pending_bytes = g.pending_bytes,
+            ack_delay_ms = %NumOrNone(g.ack_delay.map(ms)),
+            max_payload = g.max_payload,
+            t3_in_stretch = %NumOrNone(over.map(|(_, t3)| t3)),
+            fast_in_stretch = %NumOrNone(over.map(|(fast, _)| fast)),
+            frame = %kind,
+            bytes = wrote.bytes,
+            channel = %wrote.channel.label(),
+            skipped,
+            "{WAKE_LINE}"
+        ),
+        None => info!(
+            session = %session_id,
+            still_ms,
+            frame = %kind,
+            bytes = wrote.bytes,
+            channel = %wrote.channel.label(),
+            skipped,
+            "{WAKE_LINE}"
+        ),
+    }
+}
+
+/// [`WAKE_KEY_LINE`]: the key frame's delay from the wake, its size and
+/// channel, the gauges at its write, and the T3-rtx expiries since the wake
+/// (`None` when the wake read no gauges). Without gauges, the first three.
+fn emit_wake_key(
+    session_id: ObjectId,
+    delay_ms: u64,
+    wrote: Wrote,
+    gauges: Option<&Gauges>,
+    t3_since_wake: Option<u64>,
+) {
+    match gauges {
+        Some(g) => info!(
+            session = %session_id,
+            delay_ms,
+            bytes = wrote.bytes,
+            channel = %wrote.channel.label(),
+            cwnd = g.cwnd,
+            ssthresh = g.ssthresh,
+            inflight_bytes = g.inflight_bytes,
+            pending_bytes = g.pending_bytes,
+            ack_delay_ms = %NumOrNone(g.ack_delay.map(ms)),
+            max_payload = g.max_payload,
+            t3_since_wake = %NumOrNone(t3_since_wake),
+            "{WAKE_KEY_LINE}"
+        ),
+        None => info!(
+            session = %session_id,
+            delay_ms,
+            bytes = wrote.bytes,
+            channel = %wrote.channel.label(),
+            "{WAKE_KEY_LINE}"
+        ),
+    }
+}
+
 /// A send task's road onto the session's video channels, with its one
 /// `frame_seq` space.
 pub struct Lane<W: Wire> {
@@ -1227,6 +1568,8 @@ pub struct Lane<W: Wire> {
     mark_refused: bool,
     said_refused: bool,
     said_none_open: bool,
+    /// FR-148 P4b-5a (D60) — its still stretches, under `shadow` and `on`.
+    wake: Wake,
 }
 
 impl<W: Wire> Lane<W> {
@@ -1250,6 +1593,7 @@ impl<W: Wire> Lane<W> {
             mark_refused: false,
             said_refused: false,
             said_none_open: false,
+            wake: Wake::default(),
         }
     }
 
@@ -1264,10 +1608,39 @@ impl<W: Wire> Lane<W> {
             .await
     }
 
+    /// FR-148 P4b-5a — the send task's word on a frame the lane let through,
+    /// once its chunk loop ended: `ok`, every chunk sent without error. A key
+    /// frame written whole counts on the channel it went on; a failed send
+    /// counts on neither side, and is no drop. The write ends here, so a still
+    /// stretch starts here (D60): a frame whose chunks took a second to hand
+    /// over is no stretch. Returns `ok`: the condition of the send task's arm
+    /// for a frame on the wire. Under `off`, nothing is counted and neither
+    /// the clock nor the gauges are read.
+    pub fn written(&mut self, out: &Routed<W>, ok: bool) -> bool {
+        if self.counters.mode == Mode::Off {
+            return ok;
+        }
+        self.written_at(out, ok, Instant::now())
+    }
+
+    /// [`Self::written`], the frame's sends ended at `now`.
+    fn written_at(&mut self, out: &Routed<W>, ok: bool, now: Instant) -> bool {
+        if self.counters.mode != Mode::Off {
+            if ok && out.key {
+                self.counters.wrote_key(out.channel);
+            }
+            let gauges = self.wire.gauges();
+            self.wake.sent(now, gauges);
+        }
+        ok
+    }
+
     /// The road of a frame `len` bytes long; then, under `shadow` and `on`,
     /// the session's gate hears of it (FR-148 P4b-4): the key frame rule's
     /// clock restarts at a key frame written, and any other frame grants an
-    /// owed ask once the rule's gap has opened.
+    /// owed ask once the rule's gap has opened. FR-148 P4b-5a (D60) — and a
+    /// frame written is the lane's write for its still stretches, read with
+    /// the association's gauges as they stand.
     async fn route_at(
         &mut self,
         keyframe: bool,
@@ -1279,6 +1652,15 @@ impl<W: Wire> Lane<W> {
         if self.counters.mode != Mode::Off {
             let written = (keyframe && out.is_some()).then_some(len as u64);
             self.wire.frame_done(now, self.scope(), written);
+            if let Some(out) = &out {
+                let wrote = Wrote {
+                    key: keyframe,
+                    bytes: len as u64,
+                    channel: out.channel,
+                };
+                let gauges = self.wire.gauges();
+                self.wake.wrote(self.session_id, now, wrote, gauges);
+            }
         }
         out
     }
@@ -1294,21 +1676,24 @@ impl<W: Wire> Lane<W> {
         let bytes = bytes?;
         let age = now.saturating_duration_since(enqueued_at);
         match self.counters.mode {
-            Mode::Off => Some(self.write(bytes, held)),
+            Mode::Off => Some(self.write(Channel::Bytes, keyframe, bytes, held)),
             Mode::Shadow => {
                 self.shadow(keyframe, age, now).await;
-                Some(self.write(bytes, held))
+                Some(self.write(Channel::Bytes, keyframe, bytes, held))
             }
             Mode::On => self.on(keyframe, age, now, bytes, held).await,
         }
     }
 
-    fn write(&mut self, dc: W::Dc, held: W::Held) -> Routed<W> {
+    /// A frame let through on `dc`, which is `channel`.
+    fn write(&mut self, channel: Channel, keyframe: bool, dc: W::Dc, held: W::Held) -> Routed<W> {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         Routed {
             dc,
             frame_seq: self.frame_seq,
             _held: held,
+            channel,
+            key: keyframe,
         }
     }
 
@@ -1386,13 +1771,13 @@ impl<W: Wire> Lane<W> {
             Phase::Steady => match (self.on, deadline) {
                 (Some(Channel::Deadline), Some(dc)) => {
                     if age > DEADLINE {
-                        self.drop_late();
+                        self.drop_late(keyframe);
                         let _ = self.ask(now, LaneAsk::Late);
                         return None;
                     }
-                    Some(self.write(dc, held))
+                    Some(self.write(Channel::Deadline, keyframe, dc, held))
                 }
-                _ => Some(self.write(bytes, held)),
+                _ => Some(self.write(Channel::Bytes, keyframe, bytes, held)),
             },
             Phase::Draining(mut s) => {
                 let old = match s.from {
@@ -1405,7 +1790,7 @@ impl<W: Wire> Lane<W> {
                     None => true,
                 };
                 if !drained {
-                    return self.drop_switching();
+                    return self.drop_switching(keyframe);
                 }
                 s.drained_ms = ms(now.saturating_duration_since(s.since));
                 self.phase = Phase::Keying(s);
@@ -1437,7 +1822,7 @@ impl<W: Wire> Lane<W> {
                 s.asked = self.ask(now, LaneAsk::Switch);
                 self.phase = Phase::Keying(s);
             }
-            return self.drop_switching();
+            return self.drop_switching(keyframe);
         }
         let (to, dc) = match (s.to, deadline) {
             (Channel::Deadline, Some(dc)) => (Channel::Deadline, dc),
@@ -1446,12 +1831,12 @@ impl<W: Wire> Lane<W> {
         if to == Channel::Deadline && age > DEADLINE {
             // Too old for the new channel: dropped, and another asked, still
             // the switch's own.
-            self.drop_late();
+            self.drop_late(keyframe);
             s.asked = self.ask(now, LaneAsk::Switch);
             self.phase = Phase::Keying(s);
             return None;
         }
-        let out = self.write(dc, held);
+        let out = self.write(to, keyframe, dc, held);
         self.phase = Phase::Steady;
         self.on = Some(to);
         self.counters.set_channel(to);
@@ -1551,20 +1936,28 @@ impl<W: Wire> Lane<W> {
         false
     }
 
-    /// A frame dropped for a switch: it consumes its number.
-    fn drop_switching(&mut self) -> Option<Routed<W>> {
+    /// A frame dropped for a switch: it consumes its number. FR-148 P4b-5a —
+    /// a key frame is counted as one (`kf_dropped.1`).
+    fn drop_switching(&mut self, keyframe: bool) -> Option<Routed<W>> {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         if let Phase::Draining(s) | Phase::Keying(s) = &mut self.phase {
             s.dropped = s.dropped.saturating_add(1);
         }
         self.counters.drained.fetch_add(1, Relaxed);
+        if keyframe {
+            self.counters.kf_dropped.add(1);
+        }
         None
     }
 
-    /// A frame D dropped: it consumes its number.
-    fn drop_late(&mut self) {
+    /// A frame D dropped: it consumes its number. FR-148 P4b-5a — a key frame
+    /// is counted as one (`kf_dropped.0`).
+    fn drop_late(&mut self, keyframe: bool) {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         self.counters.late.fetch_add(1, Relaxed);
+        if keyframe {
+            self.counters.kf_dropped.add(0);
+        }
     }
 
     fn tag(&self) -> &'static str {
@@ -1632,6 +2025,11 @@ mod tests {
         /// FR-148 P4b-4: a session's gate the lane's asks and frames reach,
         /// in place of `ask_ok`.
         gate: Option<(Arc<KeyframeGate>, ObjectId)>,
+        /// FR-148 P4b-5a: what the association's gauges read, as a look
+        /// gives them; `None`, no association or its slot held.
+        gauges: Option<Gauges>,
+        /// FR-148 P4b-5a: the lane's looks at them.
+        gauge_reads: u32,
     }
 
     /// A session's wire, scripted: its channels are their stream ids.
@@ -1700,6 +2098,12 @@ mod tests {
             if let Some((gate, id)) = gate {
                 gate.on_frame(id, now, scope, key_written);
             }
+        }
+
+        fn gauges(&mut self) -> Option<Gauges> {
+            let mut s = self.st();
+            s.gauge_reads += 1;
+            s.gauges
         }
     }
 
@@ -1817,6 +2221,30 @@ mod tests {
 
         fn delta(&mut self) -> Option<(u16, u32)> {
             self.frame(false, 0)
+        }
+
+        /// FR-148 P4b-5a — [`Self::frame`] as the send task takes it: routed,
+        /// then its chunks sent, every one without error (`ok`) or not, and
+        /// the lane told in the arm's condition.
+        fn sent(&mut self, keyframe: bool, age_ms: u64, ok: bool) -> Option<(u16, u32)> {
+            self.t += Duration::from_millis(10);
+            let enqueued = self.t - Duration::from_millis(age_ms);
+            let out =
+                futures::executor::block_on(self.lane.route_at(keyframe, 1_000, enqueued, self.t))?;
+            assert_eq!(
+                self.lane.written_at(&out, ok, self.t),
+                ok,
+                "the arm's condition"
+            );
+            Some((out.dc, out.frame_seq))
+        }
+
+        /// FR-148 P4b-5a — a frame `len` bytes long, on time, its turn at
+        /// `at`.
+        fn wrote_at(&mut self, at: Instant, keyframe: bool, len: usize) -> Option<(u16, u32)> {
+            self.t = at;
+            futures::executor::block_on(self.lane.route_at(keyframe, len, at, at))
+                .map(|r| (r.dc, r.frame_seq))
         }
     }
 
@@ -2582,8 +3010,13 @@ mod tests {
                 let (today, today_log) = run(mode, seed, false);
                 assert_eq!(wrote, today, "{mode:?} seed {seed}: the picks");
                 // Each line from its message on: the fmt layer's timestamp
-                // differs between the two runs.
-                let message = |l: &str| l[l.find("video channel").expect(l)..].to_owned();
+                // differs between the two runs. FR-148 P4b-5a — the lane's
+                // wake lines are its lines too: a second of frames that a
+                // switch or D dropped is a still stretch.
+                let message = |l: &str| {
+                    let at = l.find("video channel").or_else(|| l.find("path wake"));
+                    l[at.expect(l)..].to_owned()
+                };
                 let (class_lines, lane): (Vec<&str>, Vec<&str>) = log
                     .lines()
                     .partition(|l| l.contains("video channel: carrier class"));
@@ -2994,6 +3427,11 @@ mod tests {
                 channel: Some(Channel::Deadline),
                 asks: KeyframeSplit::default(),
                 kf_gap_ms: None,
+                // FR-148 P4b-5a: frame 7, a key frame the drain dropped. No
+                // send task told the lane of a write.
+                kf_written: (0, 0),
+                kf_dropped: (0, 1),
+                viewer_kf: None,
             })
         );
         let line = "video channel: video-bytes -> video-deadline \
@@ -3788,7 +4226,7 @@ mod tests {
         // The line takes the split over its span, and the rule's gap at it:
         // 80 KB at 2 Mbit/s.
         let counters = Counters::new(Mode::On);
-        counters.follow(Arc::new(gate), Arc::clone(&n12));
+        counters.follow(Arc::new(gate), Arc::clone(&n12), Arc::default());
         let line = counters.take(None).unwrap();
         assert_eq!(line.asks, KeyframeSplit::default());
         assert_eq!(line.kf_gap_ms, Some(1_280));
@@ -4076,6 +4514,390 @@ mod tests {
         pc.close().await.expect("closed");
     }
 
+    /// FR-148 P4b-5a — under `on`, a key frame whose every chunk went counts
+    /// on the channel it went on: `kf_written.0` on `video-bytes`, `.1` on
+    /// `video-deadline`. A delta counts on neither, nor does a frame the
+    /// switch dropped. The counts run from the pump's start: a line's take
+    /// leaves them, unlike the per-line counts beside them.
+    #[test]
+    fn a_key_frame_written_whole_counts_on_the_channel_it_went_on() {
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::Direct);
+        assert_eq!(rig.sent(true, 0, true), Some((BYTES, 1)));
+        assert_eq!(rig.sent(false, 0, true), Some((BYTES, 2)));
+        rig.class(C::TurnTcp);
+        assert_eq!(rig.sent(false, 0, true), None, "the switch waits");
+        assert_eq!(rig.sent(true, 0, true), Some((DL, 4)), "its key frame");
+        assert_eq!(rig.sent(false, 0, true), Some((DL, 5)));
+        assert_eq!(rig.sent(true, 0, true), Some((DL, 6)));
+        let line = rig.counters.take(None).unwrap();
+        assert_eq!(line.kf_written, (1, 2));
+        assert_eq!(line.kf_dropped, (0, 0), "a delta dropped is no key frame");
+        assert_eq!((line.drained, line.switches), (1, 1), "the line's own");
+        let again = rig.counters.take(None).unwrap();
+        assert_eq!((again.kf_written, again.drained), ((1, 2), 0), "not taken");
+        assert_eq!(rig.sent(true, 0, true), Some((DL, 7)));
+        assert_eq!(rig.counters.take(None).unwrap().kf_written, (1, 3));
+    }
+
+    /// FR-148 P4b-5a — the key frames the lane dropped before the socket,
+    /// under `on`: by D (`kf_dropped.0`), on `video-deadline` and at a
+    /// switch's key frame toward it, and while a switch drained or waited
+    /// (`.1`); each also counted where `late` and `drained` count it, and
+    /// never as written.
+    #[test]
+    fn a_key_frame_dropped_counts_by_why_and_never_as_written() {
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::TurnTcp);
+        assert_eq!(rig.sent(true, 0, true), Some((DL, 1)));
+        assert_eq!(rig.sent(true, 301, true), None, "older than D");
+        assert_eq!(rig.sent(false, 301, true), None, "a delta older than D");
+        rig.fake.st().buffered.insert(DL, 9_000);
+        rig.class(C::Direct);
+        assert_eq!(rig.sent(true, 0, true), None, "while video-deadline drains");
+        assert_eq!(rig.sent(false, 0, true), None);
+        rig.fake.st().buffered.insert(DL, 0);
+        assert_eq!(rig.sent(true, 0, true), Some((BYTES, 6)), "the switch's");
+        let line = rig.counters.take(None).unwrap();
+        assert_eq!((line.late, line.drained), (2, 2));
+        assert_eq!(line.kf_dropped, (1, 1));
+        assert_eq!(line.kf_written, (1, 1));
+
+        // A switch's key frame older than D, toward `video-deadline`: D's.
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::Direct);
+        assert_eq!(rig.sent(true, 0, true), Some((BYTES, 1)));
+        rig.class(C::TurnTcp);
+        assert_eq!(rig.sent(true, 400, true), None, "the switch's, too old");
+        assert_eq!(rig.sent(true, 0, true), Some((DL, 3)));
+        let line = rig.counters.take(None).unwrap();
+        assert_eq!((line.late, line.drained), (1, 0));
+        assert_eq!((line.kf_dropped, line.kf_written), ((1, 0), (1, 1)));
+    }
+
+    /// FR-148 P4b-5a — under `shadow` every frame goes on `video-bytes`, so
+    /// its key frames count on `kf_written.0` alone; the lane drops nothing,
+    /// so `kf_dropped` stays (0, 0) while `late` counts what D would drop.
+    #[test]
+    fn shadow_counts_key_frames_on_video_bytes_and_drops_none() {
+        let mut rig = Rig::new(Mode::Shadow);
+        rig.class(C::TurnTcp);
+        assert_eq!(rig.sent(true, 0, true), Some((BYTES, 1)));
+        assert_eq!(rig.sent(true, 400, true), Some((BYTES, 2)));
+        assert_eq!(rig.sent(false, 400, true), Some((BYTES, 3)));
+        rig.fake.st().buffered.insert(BYTES, 9_000);
+        rig.class(C::Direct);
+        assert_eq!(rig.sent(true, 0, true), Some((BYTES, 4)));
+        let line = rig.counters.take(None).unwrap();
+        assert_eq!(line.late, 2, "what on would drop");
+        assert_eq!(line.switches, 1, "what on would make");
+        assert_eq!(line.kf_written, (3, 0));
+        assert_eq!(line.kf_dropped, (0, 0));
+    }
+
+    /// FR-148 P4b-5a — a send that failed counts on neither side, and is no
+    /// drop: the lane routed it. The lane's stand-in cannot fail a send (the
+    /// sends are the send task's, on `out.dc`), so the send task's count is
+    /// held here through `written`'s `ok`, and in `peer.rs` by
+    /// [`both_send_tasks_take_every_frame_s_road_from_their_lane`]: the one
+    /// call is the condition of the arm after the chunk loop.
+    #[test]
+    fn a_failed_send_counts_on_neither_side() {
+        for (mode, want) in [(Mode::Shadow, (1, 0)), (Mode::On, (0, 1))] {
+            let mut rig = Rig::new(mode);
+            rig.class(C::TurnTcp);
+            assert!(rig.sent(true, 0, false).is_some(), "{mode:?}: routed");
+            assert!(rig.sent(true, 0, true).is_some(), "{mode:?}");
+            let line = rig.counters.take(None).unwrap();
+            assert_eq!(line.kf_written, want, "{mode:?}");
+            assert_eq!(line.kf_dropped, (0, 0), "{mode:?}");
+        }
+    }
+
+    /// FR-148 P4b-5a — under `off` nothing is counted, the gauges are never
+    /// read, no wake line is written, and every frame goes as before.
+    #[test]
+    fn off_counts_nothing_and_writes_no_wake_line() {
+        let mut rig = Rig::new(Mode::Off);
+        rig.class(C::TurnTcp);
+        rig.fake.st().gauges = Some(gauges(1, 1));
+        let t0 = rig.t;
+        let (wrote, out) = logged(|| {
+            vec![
+                rig.sent(true, 0, true),
+                rig.sent(true, 400, false),
+                rig.wrote_at(t0 + Duration::from_secs(5), false, 900),
+                rig.wrote_at(t0 + Duration::from_millis(5_300), true, 40_000),
+                rig.sent(true, 0, true),
+            ]
+        });
+        let today: Vec<_> = (1..=5).map(|n| Some((BYTES, n))).collect();
+        assert_eq!(wrote, today);
+        assert_eq!(out, "", "no line under off");
+        assert_eq!(rig.counters.take(None), None);
+        assert_eq!(rig.counters.kf_written.read(), (0, 0));
+        assert_eq!(rig.counters.kf_dropped.read(), (0, 0));
+        assert_eq!(rig.fake.st().gauge_reads, 0, "no gauges read");
+    }
+
+    /// FR-148 P4b-5a — `rc:decodestat`'s `kf`, the viewer's key frames
+    /// completed whole on `video-bytes` and on `video-deadline`: under
+    /// `shadow` and `on` the session keeps the newest, the line carries it,
+    /// and a report without the key, or with one that is not two counts,
+    /// leaves the last. Under `off` nothing is kept.
+    #[test]
+    fn the_viewer_s_key_frame_counts_ride_the_line_under_shadow_and_on() {
+        use serde_json::json;
+        let kf = |v: serde_json::Value| {
+            let mut val = decodestat(None);
+            val["kf"] = v;
+            val
+        };
+        for mode in [Mode::Shadow, Mode::On] {
+            let (session, _pump, rig) = ends(mode);
+            let viewer = || rig.counters.take(None).unwrap().viewer_kf;
+            assert_eq!(viewer(), None, "{mode:?}: before a report");
+            session.viewer_relay().note(&decodestat(None));
+            assert_eq!(viewer(), None, "{mode:?}: a report without the key");
+            session.viewer_relay().note(&kf(json!([3, 5])));
+            assert_eq!(viewer(), Some((3, 5)), "{mode:?}");
+            session.viewer_relay().note(&decodestat(Some(json!("tls"))));
+            assert_eq!(viewer(), Some((3, 5)), "{mode:?}: no key, the last");
+            assert!(session.viewer_relay().newest().is_some(), "the relay's");
+            for bad in [
+                json!([3]),
+                json!([3, 5, 7]),
+                json!([-1, 5]),
+                json!([3.5, 5]),
+                json!([3, null]),
+                json!(["3", "5"]),
+                json!("3,5"),
+                json!({ "bytes": 3, "deadline": 5 }),
+                json!(null),
+            ] {
+                session.viewer_relay().note(&kf(bad.clone()));
+                assert_eq!(viewer(), Some((3, 5)), "{mode:?}: {bad}");
+            }
+            session.viewer_relay().note(&kf(json!([4, 9])));
+            assert_eq!(viewer(), Some((4, 9)), "{mode:?}");
+            assert_eq!(session.viewer_relay().kf(), Some((4, 9)));
+        }
+        let (session, pump, rig) = ends(Mode::Off);
+        assert!(pump.session.is_none());
+        session.viewer_relay().note(&kf(json!([3, 5])));
+        assert_eq!(session.viewer_relay().kf(), None, "nothing kept under off");
+        assert_eq!(rig.counters.take(None), None);
+    }
+
+    /// FR-148 P4b-5a (D60) — a gauge reading, made up: the window one MTU, as
+    /// a T3 leaves it, after `t3` T3-rtx expiries and `fast` fast
+    /// retransmissions since the association began.
+    fn gauges(t3: u64, fast: u64) -> Gauges {
+        Gauges {
+            max_payload: 1_200,
+            cwnd: 1_228,
+            ssthresh: 4_912,
+            rwnd: 1_048_576,
+            inflight_bytes: 2_400,
+            pending_bytes: 0,
+            fast_retransmits: fast,
+            t3_expiries: t3,
+            forward_tsns: 0,
+            ack_delay: Some(Duration::from_millis(37)),
+            ack_delay_min: None,
+        }
+    }
+
+    /// The wake line, as a field read greps for it, with gauges.
+    fn wake_line(
+        still: u64,
+        in_stretch: (&str, &str),
+        frame: (&str, u64, &str),
+        skipped: u64,
+    ) -> String {
+        format!(
+            "path wake (FR-148 P4b-5a, D60) session={} still_ms={still} cwnd=1228 ssthresh=4912 \
+             inflight_bytes=2400 pending_bytes=0 ack_delay_ms=37 max_payload=1200 \
+             t3_in_stretch={} fast_in_stretch={} frame={} bytes={} channel={} skipped={skipped}\n",
+            sid(),
+            in_stretch.0,
+            in_stretch.1,
+            frame.0,
+            frame.1,
+            frame.2,
+        )
+    }
+
+    /// FR-148 P4b-5a (D60) — a second or more with no write is a still
+    /// stretch, and its first write says so in one `path wake` line: how
+    /// long, the gauges as a look reads them then, the T3-rtx expiries and
+    /// fast retransmissions from the last write before it to this one, and
+    /// the frame. When that frame is a delta, the first key frame written
+    /// within 10 s says so in a second line: its delay from the wake, its
+    /// size and channel, the gauges at its write, and the T3s since the wake.
+    /// A stretch under a second writes nothing.
+    #[test]
+    fn a_still_stretch_says_so_at_its_first_write_and_at_its_key_frame() {
+        for (mode, channel) in [(Mode::Shadow, "video-bytes"), (Mode::On, "video-deadline")] {
+            let mut rig = Rig::new(mode);
+            rig.class(C::TurnTcp);
+            let t0 = rig.t;
+            let at = |ms: u64| t0 + Duration::from_millis(ms);
+            let (wrote, out) = logged(|| {
+                rig.fake.st().gauges = Some(gauges(2, 5));
+                let mut wrote = vec![rig.wrote_at(at(0), true, 40_000)];
+                // A T3 before the stretch: not its.
+                rig.fake.st().gauges = Some(gauges(3, 5));
+                wrote.push(rig.wrote_at(at(10), false, 800));
+                rig.fake.st().gauges = Some(gauges(4, 7));
+                wrote.push(rig.wrote_at(at(1_210), false, 900));
+                rig.fake.st().gauges = Some(Gauges {
+                    cwnd: 2_456,
+                    ..gauges(5, 7)
+                });
+                wrote.push(rig.wrote_at(at(1_510), true, 40_000));
+                wrote.push(rig.wrote_at(at(1_520), true, 40_000));
+                wrote
+            });
+            let stream = if mode == Mode::On { DL } else { BYTES };
+            let today: Vec<_> = (1..=5).map(|n| Some((stream, n))).collect();
+            assert_eq!(wrote, today, "{mode:?}: the writes as before");
+            assert_eq!(out.matches("path wake").count(), 2, "{mode:?}: {out}");
+            let wake = wake_line(1_200, ("1", "2"), ("delta", 900, channel), 0);
+            assert_eq!(out.matches(&wake).count(), 1, "{wake}{out}");
+            let key = format!(
+                "path wake key (FR-148 P4b-5a, D60) session={} delay_ms=300 bytes=40000 \
+                 channel={channel} cwnd=2456 ssthresh=4912 inflight_bytes=2400 pending_bytes=0 \
+                 ack_delay_ms=37 max_payload=1200 t3_since_wake=1\n",
+                sid()
+            );
+            assert_eq!(out.matches(&key).count(), 1, "{key}{out}");
+        }
+
+        // 900 ms, and 999 ms: no stretch; 1,000 ms is one.
+        let mut rig = Rig::new(Mode::On);
+        let t0 = rig.t;
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let ((), out) = logged(|| {
+            rig.wrote_at(at(0), true, 1_000);
+            rig.wrote_at(at(900), false, 1_000);
+            rig.wrote_at(at(1_899), false, 1_000);
+        });
+        assert!(!out.contains("path wake"), "{out}");
+        let ((), out) = logged(|| {
+            rig.wrote_at(at(2_899), true, 1_000);
+        });
+        assert_eq!(out.matches("path wake").count(), 1, "{out}");
+        assert!(
+            out.contains("still_ms=1000 frame=key bytes=1000 channel=video-bytes skipped=0"),
+            "{out}"
+        );
+    }
+
+    /// FR-148 P4b-5a (D60) — at most one wake line a pump in any 10 s: a
+    /// stretch inside 10 s of the last line writes nothing, and the next line
+    /// counts it. A wake on a key frame writes one line, and a wake on a delta
+    /// whose key frame comes 10 s or more later writes no second line.
+    #[test]
+    fn a_stretch_inside_ten_seconds_of_a_wake_is_counted_at_the_next() {
+        let mut rig = Rig::new(Mode::On);
+        rig.fake.st().gauges = Some(gauges(0, 0));
+        let t0 = rig.t;
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let ((), out) = logged(|| {
+            rig.wrote_at(at(0), true, 40_000);
+            rig.wrote_at(at(1_200), false, 900);
+            rig.wrote_at(at(1_210), false, 900);
+            rig.wrote_at(at(2_500), false, 900);
+            rig.wrote_at(at(2_510), false, 900);
+            rig.wrote_at(at(4_000), false, 900);
+            rig.wrote_at(at(12_000), true, 40_000);
+            rig.wrote_at(at(12_010), true, 40_000);
+        });
+        assert_eq!(out.matches("path wake").count(), 2, "{out}");
+        assert_eq!(out.matches("path wake key").count(), 0, "{out}");
+        let first = wake_line(1_200, ("0", "0"), ("delta", 900, "video-bytes"), 0);
+        let second = wake_line(8_000, ("0", "0"), ("key", 40_000, "video-bytes"), 2);
+        assert_eq!(out.matches(&first).count(), 1, "{first}{out}");
+        assert_eq!(out.matches(&second).count(), 1, "{second}{out}");
+        assert!(out.find(&first) < out.find(&second));
+    }
+
+    /// FR-148 P4b-5a (D60) — without gauges (no association yet, or its
+    /// slot held) the lines carry the rest; with no gauges at the stretch's
+    /// last write, its counts over the stretch read `None`.
+    #[test]
+    fn a_wake_without_gauges_carries_the_rest() {
+        let mut rig = Rig::new(Mode::Shadow);
+        let t0 = rig.t;
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let ((), out) = logged(|| {
+            rig.wrote_at(at(0), true, 40_000);
+            rig.wrote_at(at(1_200), false, 900);
+            rig.wrote_at(at(1_500), true, 40_000);
+        });
+        let wake = format!(
+            "path wake (FR-148 P4b-5a, D60) session={} still_ms=1200 frame=delta bytes=900 \
+             channel=video-bytes skipped=0\n",
+            sid()
+        );
+        let key = format!(
+            "path wake key (FR-148 P4b-5a, D60) session={} delay_ms=300 bytes=40000 \
+             channel=video-bytes\n",
+            sid()
+        );
+        assert_eq!(out.matches(&wake).count(), 1, "{wake}{out}");
+        assert_eq!(out.matches(&key).count(), 1, "{key}{out}");
+
+        let mut rig = Rig::new(Mode::Shadow);
+        let t0 = rig.t;
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let ((), out) = logged(|| {
+            rig.wrote_at(at(0), true, 40_000);
+            rig.fake.st().gauges = Some(gauges(1, 1));
+            rig.wrote_at(at(1_200), false, 900);
+        });
+        let wake = wake_line(1_200, ("None", "None"), ("delta", 900, "video-bytes"), 0);
+        assert_eq!(out.matches(&wake).count(), 1, "{wake}{out}");
+    }
+
+    /// FR-148 P4b-5a (D60) — a still stretch runs from the end of the last
+    /// frame's sends, the send task's word on it (`written`), not from its
+    /// road: a frame whose chunks take a second or more to hand over (the
+    /// stack's queue full on a slow path) leaves no stretch behind it, and the
+    /// T3-rtx expiries and fast retransmissions over a stretch are counted
+    /// from that end, not from the road.
+    #[test]
+    fn a_frame_s_own_sends_are_no_still_stretch() {
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::TurnTcp);
+        let t0 = rig.t;
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let route = |rig: &mut Rig, ms: u64, keyframe: bool, len: usize| {
+            futures::executor::block_on(rig.lane.route_at(keyframe, len, at(ms), at(ms)))
+                .expect("written")
+        };
+        let ((), out) = logged(|| {
+            rig.fake.st().gauges = Some(gauges(1, 1));
+            // A key frame of 300 KB whose sends take 1.5 s, a T3 and two
+            // fast retransmissions among them; the next frame at once.
+            let key = route(&mut rig, 0, true, 300_000);
+            rig.fake.st().gauges = Some(gauges(2, 3));
+            assert!(rig.lane.written_at(&key, true, at(1_500)));
+            let delta = route(&mut rig, 1_510, false, 900);
+            // A T3 among the delta's own sends: before the stretch.
+            rig.fake.st().gauges = Some(gauges(3, 3));
+            assert!(rig.lane.written_at(&delta, true, at(1_520)));
+            // Then 1.2 s with nothing, and a T3 in it.
+            rig.fake.st().gauges = Some(gauges(4, 3));
+            let next = route(&mut rig, 2_720, false, 900);
+            assert!(rig.lane.written_at(&next, true, at(2_730)));
+        });
+        assert_eq!(out.matches("path wake").count(), 1, "{out}");
+        let wake = wake_line(1_200, ("1", "0"), ("delta", 900, "video-deadline"), 0);
+        assert_eq!(out.matches(&wake).count(), 1, "{wake}{out}");
+    }
+
     /// `peer.rs` as compiled, with `\n` line ends.
     fn peer_rs() -> String {
         include_str!("peer.rs").replace("\r\n", "\n")
@@ -4126,6 +4948,9 @@ mod tests {
     /// own. Each pump starts the lane's class after
     /// `detect_constrained_transport` and reads it again at each re-check,
     /// ahead of the env override's arm, so it is read under every override.
+    /// FR-148 P4b-5a — and tells the lane how the frame's send went, once,
+    /// as the condition of the arm of a frame whose every chunk went: after
+    /// the chunk loop, whose failed send set `ok` false and left it.
     #[test]
     fn both_send_tasks_take_every_frame_s_road_from_their_lane() {
         let src = peer_rs();
@@ -4159,10 +4984,14 @@ mod tests {
             let task = &body[body.find(frame).unwrap()..];
             let chunks = task.find("while off < total {").unwrap();
             assert!(task.find("lane.route(").unwrap() < chunks, "{name}");
-            let sends = &task[chunks..task.find("if ok {").unwrap()];
+            let arm = task.find("if lane.written(&out, ok) {").expect(name);
+            let sends = &task[chunks..arm];
             assert_eq!(sends.matches("out.dc.send(").count(), 2, "{name}");
             assert_eq!(sends.matches("out.frame_seq,").count(), 1, "{name}");
             assert!(!sends.contains("video_bytes_dc"), "{name}");
+            assert_eq!(sends.matches("ok = false;\n").count(), 1, "{name}");
+            assert_eq!(body.matches("lane.written(").count(), 1, "{name}");
+            assert_eq!(body.matches("if ok {").count(), 0, "{name}");
             let recheck = "if last_transport_check.elapsed() >= TRANSPORT_RECHECK_INTERVAL {";
             let recheck = &body[body.find(recheck).unwrap()..];
             let read = recheck.find("lanes.read(&pc).await").unwrap();

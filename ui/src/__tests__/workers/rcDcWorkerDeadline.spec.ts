@@ -419,3 +419,88 @@ describe('FR-148 P4b-2 cell 4 — an old agent: nothing ever arrives on video-de
     expect(beside.posted).toEqual(alone.posted)
   })
 })
+
+// ── FR-148 P4b-5a: the key frames the worker completed whole, by channel ──────
+
+describe.each(MODES)('FR-148 P4b-5a — the key frames completed whole, by channel, %s', (mode) => {
+  /** The newest `stats`' count, read at a message 1.2 s on: a delta's lone
+   *  chunk on `video-bytes`, which counts nothing. */
+  const counted = (s: Session, seq: number) => {
+    clock += 1_200
+    s.bytes(agentChunks(seq, wireFrame(false, seq * 1_000, 900))[0]!)
+    return ofType('stats').at(-1)!.kf
+  }
+
+  it('counts a key frame whole on the channel it came on, and a delta on neither', async () => {
+    const s = await session(mode)
+    const frames: [boolean, number, Channel][] = [
+      [true, 40_000, 'video-bytes'],
+      [false, 900, 'video-bytes'],
+      [true, 40_000, 'video-deadline'],
+      [false, 20_000, 'video-deadline'],
+      [true, 900, 'video-deadline'],
+      [false, 900, 'video-deadline'],
+    ]
+    frames.forEach(([key, size, ch], i) => {
+      for (const m of agentChunks(i + 1, wireFrame(key, (i + 1) * 1_000, size))) on(s, ch)(m)
+    })
+    expect(counted(s, 7)).toEqual([1, 2])
+    // Cumulative from the session's start: the next window keeps them.
+    for (const m of agentChunks(8, wireFrame(true, 8_000, 900))) s.bytes(m)
+    expect(counted(s, 9)).toEqual([2, 2])
+  })
+
+  it('counts no key frame the assembler never completed: evicted while partial, or straggling after', async () => {
+    const s = await session(mode)
+    const c = (seq: number, key: boolean, size: number) => agentChunks(seq, wireFrame(key, seq * 1_000, size))
+    for (const m of c(1, true, 900)) s.bytes(m)
+    // Key frame 2: two of its three chunks; then the first chunks of deltas 3
+    // and 4, and key frame 5, whole in one chunk, which evicts key frame 2 and
+    // takes 3 and 4 as stragglers.
+    const two = c(2, true, 40_000)
+    s.deadline(two[0]!)
+    s.deadline(two[1]!)
+    for (let seq = 3; seq <= 4; seq++) s.deadline(c(seq, false, 20_000)[0]!)
+    for (const m of c(5, true, 900)) s.deadline(m)
+    // Key frame 2's last chunk, and frame 3's, late: stragglers.
+    s.deadline(two[2]!)
+    s.deadline(c(3, false, 20_000)[1]!)
+    expect(counted(s, 6)).toEqual([1, 1])
+    const stats = ofType('stats').at(-1)!
+    expect(stats.chunkGaps).toBe(1)
+    expect(stats.chunkStragglers).toBe(4)
+  })
+})
+
+describe('FR-148 P4b-5a — the count rides every stats of a framed session, and none of an unframed one', () => {
+  it('framed: every stats carries both counts, from [0, 0]', async () => {
+    const send = await boot({ chunkFraming: true, decodeRecover: true })
+    const chunk = (buf: ArrayBuffer, deadline: boolean) =>
+      send({ type: 'chunk', bytes: buf, sentAt: performance.timeOrigin + clock, ...(deadline ? { deadline } : {}) })
+    for (let seq = 1; seq <= 12; seq++) {
+      clock += 400
+      const key = seq % 4 === 1
+      for (const m of agentChunks(seq, wireFrame(key, seq * 1_000, 900))) chunk(m, seq > 6)
+      paintAll()
+    }
+    const stats = ofType('stats')
+    expect(stats.length).toBeGreaterThan(2)
+    for (const st of stats) {
+      expect(Array.isArray(st.kf) && (st.kf as unknown[]).length === 2, JSON.stringify(st.kf)).toBe(true)
+    }
+    // Key frames 1 and 5 on video-bytes, 9 on video-deadline.
+    expect(stats.at(-1)!.kf).toEqual([2, 1])
+  })
+
+  it('unframed: no stats carries the key', async () => {
+    const send = await boot({ chunkFraming: false, decodeRecover: true })
+    for (let seq = 1; seq <= 12; seq++) {
+      clock += 400
+      send({ type: 'chunk', bytes: wireFrame(seq % 4 === 1, seq * 1_000, 900).buffer, sentAt: performance.timeOrigin + clock })
+      paintAll()
+    }
+    const stats = ofType('stats')
+    expect(stats.length).toBeGreaterThan(2)
+    for (const st of stats) expect(st).not.toHaveProperty('kf')
+  })
+})
