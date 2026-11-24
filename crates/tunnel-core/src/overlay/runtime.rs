@@ -8967,6 +8967,194 @@ mod tests {
         assert!(st.split_default_installed);
     }
 
+    /// #3562 AC U3 — the exit's IPv6 statement × the client's own v6 pins.
+    /// An exit that says nothing is an older exit: today's rule holds. One
+    /// that says no leaves v6 fail-closed and its reason wins, since it is
+    /// the stable one an operator can act on.
+    #[test]
+    fn the_exit_s_v6_statement_decides_with_the_client_s_pins() {
+        assert_eq!(v6_egress(None, true), Ok(()));
+        assert_eq!(v6_egress(None, false), Err(NO_V6_EXEMPTION));
+        assert_eq!(v6_egress(Some(false), true), Err(EXIT_SERVES_V4_ONLY));
+        assert_eq!(v6_egress(Some(false), false), Err(EXIT_SERVES_V4_ONLY));
+        assert_eq!(v6_egress(Some(true), true), Ok(()));
+        assert_eq!(v6_egress(Some(true), false), Err(NO_V6_EXEMPTION));
+        assert_eq!(EXIT_SERVES_V4_ONLY, "the exit serves IPv4 only");
+    }
+
+    /// #3562 AC U3 — end to end through the reconcile: the client's v6
+    /// exemptions pin (its server has an A and an AAAA), so the exit's
+    /// statement alone decides. Says nothing ⇒ v6 through the exit (today's
+    /// rule); yes ⇒ on; no ⇒ fail-closed with the reason in the status, while
+    /// IPv4 routes through the exit in every case. A statement that changes
+    /// under a live client is followed, both ways.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_follows_its_exit_s_ipv6_statement() {
+        let kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun = ExemptionTun::new();
+        let tf: TunFactory = {
+            let m = tun.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let id = exit_oid(0x34);
+        let servers: Vec<IpAddr> = vec![
+            "203.0.113.7".parse().unwrap(),
+            "2001:db8::7".parse().unwrap(),
+        ];
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280)
+            .with_exit_node(Some(id.to_hex()), servers);
+        let dev: Arc<dyn TunIo> = tun.clone();
+        let pk = [7u8; 32];
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            id,
+            Installed::base(
+                pk,
+                Ipv4Addr::new(100, 64, 0, 1),
+                DirectTier::Lan,
+                Instant::now(),
+            ),
+        );
+        let peers_saying = |stmt: Option<bool>| {
+            let mut np = exit_np(id, "exit-a", vec!["0.0.0.0/0".into()]);
+            np.exit_serves_v6 = stmt;
+            HashMap::from([(id, np)])
+        };
+
+        for (stmt, want) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+            let mut st = ExitRoutingState::default();
+            rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers_saying(stmt), &mut st)
+                .await;
+            assert!(st.split_default_installed, "{stmt:?}: v4 never waits on v6");
+            assert_eq!(st.v6_active, Some(want), "{stmt:?}");
+            assert_eq!(wg.v6_exit(), want.then_some(pk), "{stmt:?}");
+            let status = exit_node_status(Some("exit-a"), &st).unwrap();
+            assert!(status.active, "{stmt:?}");
+            assert_eq!(status.v6_active, want, "{stmt:?}");
+            assert_eq!(
+                status.v6_withheld_reason.as_deref(),
+                (!want).then_some(EXIT_SERVES_V4_ONLY),
+                "{stmt:?}"
+            );
+        }
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let mut st = ExitRoutingState::default();
+        for (stmt, want) in [
+            (Some(true), true),
+            (Some(false), false),
+            (Some(true), true),
+            (None, true),
+        ] {
+            rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers_saying(stmt), &mut st)
+                .await;
+            assert_eq!(st.v6_active, Some(want), "follows {stmt:?}");
+            assert_eq!(wg.v6_exit(), want.then_some(pk), "follows {stmt:?}");
+            assert!(st.split_default_installed, "follows {stmt:?}");
+        }
+    }
+
+    /// #3562 — a re-join on a live socket (a Reattach, or an exit re-sending
+    /// its offer) is followed, in order, by what the server's rehydrate
+    /// wiped: srflx (the keepalive's evolving advert, else the startup
+    /// snapshot), the relayed endpoints, and, for a re-offer only, a fresh
+    /// capability measurement. A Reattach never forces one: it keeps the
+    /// frames it sent before #3562.
+    #[test]
+    fn a_rejoin_restores_what_the_rehydrate_wiped() {
+        let kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun = ExemptionTun::new();
+        let tf: TunFactory = {
+            let m = tun.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp, out_tx, tf, 1280);
+        let join = rt.make_join(vec!["192.168.1.5:41641".into()]);
+        let j = serde_json::to_value(&join).unwrap();
+        let signal = serde_json::json!("signal the srflx keepalive");
+        let measure = serde_json::json!("force a netcheck");
+        let shape = |plan: Vec<RejoinStep>| -> Vec<serde_json::Value> {
+            plan.into_iter()
+                .map(|s| match s {
+                    RejoinStep::Send(m) => serde_json::to_value(&m).unwrap(),
+                    RejoinStep::SignalSrflxKeepalive => signal.clone(),
+                    RejoinStep::ForceNetcheck => measure.clone(),
+                })
+                .collect()
+        };
+        let relayed = vec!["198.51.100.9:3478".to_string()];
+        let endpoints = serde_json::to_value(ClientMsg::OverlayEndpoints {
+            candidates: relayed.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            shape(rejoin_plan(
+                join.clone(),
+                true,
+                &[],
+                None,
+                true,
+                Some(relayed.clone()),
+                true
+            )),
+            vec![
+                j.clone(),
+                signal.clone(),
+                endpoints.clone(),
+                measure.clone()
+            ]
+        );
+        assert_eq!(
+            shape(rejoin_plan(
+                join.clone(),
+                false,
+                &["1.2.3.4:5".to_string()],
+                Some("cone".into()),
+                true,
+                None,
+                false
+            )),
+            vec![
+                j.clone(),
+                serde_json::to_value(ClientMsg::OverlaySrflx {
+                    candidates: vec!["1.2.3.4:5".into()],
+                    nat: Some("cone".into()),
+                    udp_dialer_ok: Some(true),
+                })
+                .unwrap()
+            ]
+        );
+        assert_eq!(
+            shape(rejoin_plan(
+                join.clone(),
+                false,
+                &[],
+                None,
+                false,
+                None,
+                false
+            )),
+            vec![j.clone()]
+        );
+        assert_eq!(
+            shape(rejoin_plan(
+                join,
+                true,
+                &[],
+                None,
+                true,
+                Some(relayed),
+                false
+            )),
+            vec![j, signal, endpoints],
+            "a Reattach's frames, as before"
+        );
+    }
+
     /// #4279 — the defended set read from the crypto-router the select loop
     /// owns and the netmap it holds, exactly as both guard arms call it
     /// (`&current_peers`, `|pk| wg.peer_subnets(pk)`): it carries what

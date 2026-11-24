@@ -8701,6 +8701,72 @@ mod tests {
         }
     }
 
+    /// #3562 AC W4 — an exit's IPv6 statement has three states on every hop,
+    /// and absent stays ABSENT on the wire, never `null`: an older exit sends
+    /// no key, an older server stores none, and every peer then reads `None`
+    /// and keeps the pre-#3562 rule.
+    #[test]
+    fn exit_serves_v6_round_trips_and_is_absent_when_unset() {
+        let json = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert_eq!(p.exit_serves_v6, None, "an older server's peer");
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(
+            !s.contains("exit_serves_v6"),
+            "absent is omitted, never null: {s}"
+        );
+        for v in [false, true] {
+            let mut p2 = p.clone();
+            p2.exit_serves_v6 = Some(v);
+            let s2 = serde_json::to_string(&p2).unwrap();
+            assert!(s2.contains(&format!(r#""exit_serves_v6":{v}"#)), "{s2}");
+            assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
+        }
+
+        let join = |exit_serves_v6: Option<bool>| ClientMsg::OverlayJoin {
+            network_hint: None,
+            wg_public_key: "cHVia2V5".into(),
+            key_epoch: 0,
+            supported: vec!["wireguard-v1".into()],
+            mtu: 1280,
+            endpoints: vec![],
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            supports_forced_derp: false,
+            supports_overlay_echo: false,
+            supports_org_relay: false,
+            supports_join_refusal: true,
+            org_primary: None,
+            relay_port: None,
+            supports_server_relay_strategy: false,
+            supports_derp_floor: false,
+            advertised_routes: vec!["0.0.0.0/0".into()],
+            route_offer_withheld: None,
+            exit_serves_v6,
+        };
+        let stated = |wire: &str| match serde_json::from_str::<ClientMsg>(wire).unwrap() {
+            ClientMsg::OverlayJoin { exit_serves_v6, .. } => exit_serves_v6,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        let older = serde_json::to_string(&join(None)).unwrap();
+        assert!(
+            !older.contains("exit_serves_v6"),
+            "absent is omitted, never null: {older}"
+        );
+        assert_eq!(stated(&older), None);
+        for v in [false, true] {
+            let wire = serde_json::to_string(&join(Some(v))).unwrap();
+            assert!(wire.contains(&format!(r#""exit_serves_v6":{v}"#)), "{wire}");
+            assert_eq!(stated(&wire), Some(v));
+        }
+    }
+
     /// Phase C — `srflx_nat` back-compat: a pre-Phase-C server/peer omits it →
     /// defaults `None` (unknown ⇒ punch attempted, never skipped); `None` is
     /// OMITTED on the wire; populated round-trips.

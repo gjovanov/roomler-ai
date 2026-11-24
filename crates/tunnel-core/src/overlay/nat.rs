@@ -881,7 +881,12 @@ async fn run_capture(args: Vec<String>) -> (bool, String) {
 
 #[cfg(test)]
 mod offer_tests {
-    use super::{NETSTACK_FORWARDS_NOTHING, RouteOffer, gate_offer_with, netstack_offer};
+    use super::{
+        NETSTACK_FORWARDS_NOTHING, OfferTracker, RouteOffer, SetupFailure, SetupOutcome, SetupStep,
+        forward_policy_accepts, gate_offer_with, has_v6_uplink, linux_v4_outcome, linux_v6_outcome,
+        nat_retry_delay, netstack_offer, offer_after_setup, sysctl_flag, windows_outcome,
+    };
+    use std::time::{Duration, Instant};
 
     /// FR-97 P0c-3 — a netstack node offers nothing it was configured to, and
     /// says why, before any probe; with nothing to offer it says nothing.
@@ -957,5 +962,277 @@ mod offer_tests {
     #[tokio::test]
     async fn a_platform_without_a_nat_arm_withholds() {
         assert!(super::probe().await.is_err());
+    }
+
+    fn nat_failure(detail: &str) -> SetupOutcome {
+        SetupOutcome {
+            v4: Err(SetupFailure {
+                step: SetupStep::Nat,
+                detail: detail.to_string(),
+            }),
+            v6: false,
+        }
+    }
+
+    fn served(v6: bool) -> SetupOutcome {
+        SetupOutcome { v4: Ok(()), v6 }
+    }
+
+    /// #3562 AC U1 — the probe is not the outcome. A setup that failed
+    /// withdraws everything the probe offered, with the setup's own error as
+    /// the reason, and schedules a retry; the same failure again changes
+    /// nothing the server holds (no re-join); a later success restores the
+    /// configured offer and stops retrying.
+    #[test]
+    fn a_failed_setup_withdraws_the_offer_and_a_later_success_restores_it() {
+        let configured = routes(&["0.0.0.0/0", "192.168.7.0/24"]);
+        let t0 = Instant::now();
+        let mut t = OfferTracker::new(
+            RouteOffer {
+                routes: configured.clone(),
+                withheld: None,
+            },
+            true,
+            false,
+        );
+        assert_eq!(
+            t.exit_serves_v6(),
+            Some(false),
+            "an exit that has not set up yet states no IPv6, never nothing"
+        );
+        assert!(!t.withdrawn());
+
+        let detail = "New-NetNat roomler-overlay: The object already exists.";
+        assert!(t.on_setup(&nat_failure(detail), t0, 0.5), "re-join");
+        assert!(t.offer().routes.is_empty(), "nothing it cannot serve");
+        let reason = t.offer().withheld.clone().expect("a withdrawal says why");
+        assert!(reason.contains(detail), "the setup's own error: {reason}");
+        assert_eq!(t.exit_serves_v6(), None, "a node that offers nothing");
+        assert!(t.withdrawn());
+        assert!(!t.retry_due(t0));
+        assert!(t.retry_due(t0 + Duration::from_secs(30)));
+
+        assert!(
+            !t.on_setup(&nat_failure(detail), t0 + Duration::from_secs(30), 0.5),
+            "the same failure again is not news to the server"
+        );
+        assert!(t.withdrawn());
+        assert_eq!(t.offer().withheld.as_deref(), Some(reason.as_str()));
+
+        let t2 = t0 + Duration::from_secs(120);
+        assert!(t.on_setup(&served(false), t2, 0.5), "re-join: restored");
+        assert_eq!(
+            t.offer(),
+            &RouteOffer {
+                routes: configured,
+                withheld: None
+            }
+        );
+        assert_eq!(t.exit_serves_v6(), Some(false));
+        assert!(!t.withdrawn());
+        assert!(!t.retry_due(t2 + Duration::from_secs(24 * 3600)));
+    }
+
+    /// #3562 — a re-offer goes out only when the offer changes: the step that
+    /// failed is part of it, the text of the error never is (a host where
+    /// New-NetNat keeps failing must not re-join on every retry).
+    #[test]
+    fn a_failure_at_another_step_re_offers_once_and_the_reason_text_never_does() {
+        let t0 = Instant::now();
+        let mut t = OfferTracker::new(
+            RouteOffer {
+                routes: routes(&["0.0.0.0/0"]),
+                withheld: None,
+            },
+            true,
+            false,
+        );
+        assert!(t.on_setup(&nat_failure("first text"), t0, 0.0));
+        assert!(!t.on_setup(&nat_failure("another text"), t0, 0.0));
+        let chain = SetupOutcome {
+            v4: Err(SetupFailure {
+                step: SetupStep::ForwardChain,
+                detail: "iptables: No chain/target/match by that name.".into(),
+            }),
+            v6: false,
+        };
+        assert!(t.on_setup(&chain, t0, 0.0), "another step is news");
+        assert!(
+            t.offer()
+                .withheld
+                .as_deref()
+                .is_some_and(|r| r.contains("No chain/target/match")),
+            "{:?}",
+            t.offer().withheld
+        );
+    }
+
+    /// #3562 — a failed setup is tried again, backing off: 30 s doubling to a
+    /// 30-minute cap, each delay jittered down by at most a fifth.
+    #[test]
+    fn setup_retries_back_off_with_jitter_and_never_pass_30_minutes() {
+        let s = Duration::from_secs;
+        assert_eq!(nat_retry_delay(0, 0.0), s(24));
+        assert_eq!(nat_retry_delay(0, 1.0), s(30));
+        assert_eq!(nat_retry_delay(1, 1.0), s(60));
+        assert_eq!(nat_retry_delay(5, 1.0), s(16 * 60));
+        assert_eq!(nat_retry_delay(6, 1.0), s(30 * 60));
+        assert_eq!(nat_retry_delay(40, 1.0), s(30 * 60));
+        assert_eq!(nat_retry_delay(40, 0.0), s(24 * 60));
+        assert_eq!(nat_retry_delay(0, 7.0), s(30), "jitter is clamped");
+        assert_eq!(nat_retry_delay(u32::MAX, 1.0), s(30 * 60));
+    }
+
+    /// #3562 — `ROOMLERD_ROUTE_OFFER_UNPROBED=1` offers as before: whatever
+    /// setup did, the offer stays, nothing is withdrawn and nothing retried.
+    #[test]
+    fn a_forced_offer_keeps_its_routes_whatever_setup_did() {
+        let configured = routes(&["0.0.0.0/0"]);
+        let t0 = Instant::now();
+        let mut t = OfferTracker::new(
+            RouteOffer {
+                routes: configured.clone(),
+                withheld: None,
+            },
+            true,
+            true,
+        );
+        t.on_setup(&nat_failure("x"), t0, 0.5);
+        assert_eq!(t.offer().routes, configured);
+        assert_eq!(t.offer().withheld, None);
+        assert!(!t.withdrawn());
+        assert!(!t.retry_due(t0 + Duration::from_secs(24 * 3600)));
+    }
+
+    /// #3562 — a probe that withheld left nothing to set up: its reason stands
+    /// and the node states nothing about IPv6.
+    #[test]
+    fn a_probe_that_withheld_has_nothing_to_set_up() {
+        let probed = RouteOffer {
+            routes: Vec::new(),
+            withheld: Some("WinNAT is not available".into()),
+        };
+        let mut t = OfferTracker::new(probed.clone(), true, false);
+        assert_eq!(t.exit_serves_v6(), None);
+        assert!(!t.on_setup(&served(false), Instant::now(), 0.5));
+        assert_eq!(t.offer(), &probed);
+        assert_eq!(t.exit_serves_v6(), None);
+        assert!(!t.withdrawn());
+    }
+
+    /// #3562 — a Linux FORWARD rule that would not append kills the exit's
+    /// IPv4 only where the chain's policy drops; ip_forward reading 0 always
+    /// does. Steps are judged in the order setup runs them.
+    #[test]
+    fn linux_withdraws_for_a_forward_rule_only_on_a_drop_policy() {
+        let step = |r: Result<(), SetupFailure>| r.err().map(|f| f.step);
+        let x = || Err::<(), String>("x".into());
+        assert_eq!(
+            step(linux_v4_outcome(Some(true), Ok(()), x(), Some(false))),
+            Some(SetupStep::ForwardChain)
+        );
+        assert_eq!(
+            step(linux_v4_outcome(Some(true), Ok(()), x(), Some(true))),
+            None
+        );
+        assert_eq!(step(linux_v4_outcome(Some(true), Ok(()), x(), None)), None);
+        assert_eq!(
+            step(linux_v4_outcome(Some(false), Ok(()), Ok(()), None)),
+            Some(SetupStep::Forwarding)
+        );
+        assert_eq!(step(linux_v4_outcome(None, Ok(()), Ok(()), None)), None);
+        assert_eq!(
+            step(linux_v4_outcome(
+                Some(true),
+                Err("nat".into()),
+                x(),
+                Some(false)
+            )),
+            Some(SetupStep::Nat)
+        );
+    }
+
+    #[test]
+    fn linux_reads_forwarding_and_the_forward_policy() {
+        assert_eq!(sysctl_flag("1\n"), Some(true));
+        assert_eq!(sysctl_flag("0"), Some(false));
+        assert_eq!(sysctl_flag(""), None);
+        assert_eq!(
+            forward_policy_accepts("-P FORWARD DROP\n-A FORWARD -j DOCKER-USER\n"),
+            Some(false)
+        );
+        assert_eq!(forward_policy_accepts("-P FORWARD ACCEPT\n"), Some(true));
+        assert_eq!(forward_policy_accepts(""), None);
+    }
+
+    /// The reason lands on the admin row and in `roomler status`: bounded on
+    /// the device as the probe's is.
+    #[test]
+    fn a_setup_reason_is_bounded() {
+        let f = SetupFailure {
+            step: SetupStep::Nat,
+            detail: "e".repeat(1000),
+        };
+        assert!(f.reason().chars().count() <= 200, "{}", f.reason());
+    }
+
+    /// #3562 AC U2 — an exit states IPv6 only from its own IPv6 NAT outcome.
+    #[test]
+    fn an_exit_whose_v6_nat_did_not_come_up_states_no_ipv6() {
+        let configured = routes(&["0.0.0.0/0"]);
+        let stated = |o: SetupOutcome, state: bool| {
+            offer_after_setup(&configured, &o, state)
+                .expect("something to serve")
+                .exit_serves_v6
+        };
+        assert_eq!(stated(served(false), true), Some(false));
+        assert_eq!(stated(served(true), true), Some(true));
+        assert_eq!(
+            stated(served(true), false),
+            None,
+            "ROOMLERD_EXIT_V6_STATEMENT=0"
+        );
+        assert!(offer_after_setup(&[], &served(true), true).is_none());
+        assert!(
+            !windows_outcome(Ok(()), Ok(())).v6,
+            "WinNAT is IPv4-only: a Windows exit always says no"
+        );
+        assert!(!linux_v6_outcome(false, Some(true), true));
+        assert!(!linux_v6_outcome(true, Some(false), true));
+        assert!(!linux_v6_outcome(true, None, true));
+        assert!(!linux_v6_outcome(true, Some(true), false));
+        assert!(linux_v6_outcome(true, Some(true), true));
+    }
+
+    /// #3562 — ip6tables applies its rules on a host with no IPv6 uplink, so
+    /// the rules alone would make "yes" a lie on exactly the v4-only exit the
+    /// issue names. A v6 uplink is a usable `::/0` on a device that holds a
+    /// global address.
+    #[test]
+    fn a_v4_only_linux_uplink_is_no_v6_uplink() {
+        let lo_reject = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n";
+        let eth0_default = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00450003     eth0\n";
+        let global = "20010db8000000000000000000000002 02 40 00 80     eth0\n";
+        let link_local = "fe800000000000000000000000000002 02 40 20 80     eth0\n";
+        assert!(!has_v6_uplink(lo_reject, global, "roomler0"));
+        assert!(has_v6_uplink(
+            &format!("{lo_reject}{eth0_default}"),
+            global,
+            "roomler0"
+        ));
+        assert!(!has_v6_uplink(eth0_default, link_local, "roomler0"));
+        assert!(!has_v6_uplink(eth0_default, global, "eth0"), "the overlay");
+        assert!(!has_v6_uplink("", "", "roomler0"));
+    }
+
+    #[test]
+    fn windows_judges_forwarding_before_its_nat() {
+        let o = windows_outcome(Err("fwd".into()), Err("New-NetNat x: y".into()));
+        assert_eq!(o.v4.map_err(|f| f.step), Err(SetupStep::Forwarding));
+        let o = windows_outcome(Ok(()), Err("New-NetNat x: y".into()));
+        let f = o.v4.expect_err("a refused NAT is a dead exit");
+        assert_eq!(f.step, SetupStep::Nat);
+        assert!(f.reason().contains("New-NetNat x: y"), "{}", f.reason());
+        assert_eq!(windows_outcome(Ok(()), Ok(())).v4, Ok(()));
     }
 }

@@ -1095,6 +1095,27 @@ mod tests {
             "pass quick on utun4 all keep state\n"
         );
     }
+
+    /// #3562 AC U2 — a Mac exit says it serves IPv6 only when its NAT66 came
+    /// up: v6 was to be served, v6 forwarding took, the anchor it loaded
+    /// carries an `inet6` translation, and its IPv4 serve came up at all.
+    #[test]
+    fn a_mac_exit_states_ipv6_only_when_its_nat66_came_up() {
+        let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let egress = [("en0".to_string(), Some(v6))];
+        let blocks = ["100.65.20.0/24".to_string()];
+        let with = render("utun4", &egress, &blocks, true);
+        let without = render("utun4", &[("en0".to_string(), None)], &blocks, true);
+        assert!(with.contains(" inet6 from "), "{with}");
+        assert!(served_v6(true, true, &with, true));
+        assert!(
+            !served_v6(false, true, &with, true),
+            "no unscoped v6 default"
+        );
+        assert!(!served_v6(true, false, &with, true), "v6 forwarding failed");
+        assert!(!served_v6(true, true, &without, true), "no stable v6");
+        assert!(!served_v6(true, true, &with, false), "IPv4 did not come up");
+    }
 }
 
 /// FR-97 P1b — on a real Mac, as root: CI's `macos_kernel_tests` step runs

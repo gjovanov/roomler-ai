@@ -3569,6 +3569,28 @@ mod tests {
         assert!(!to_netmap_peer(&n, false).reachable);
     }
 
+    /// #3562 AC W4 — the exit's IPv6 statement on the stored row and on the
+    /// netmap peer built from it: absent stays ABSENT in the BSON document
+    /// (an older agent's row, never `null`), and a statement round-trips
+    /// through the row into every peer's netmap as it was sent.
+    #[test]
+    fn the_exit_s_v6_statement_is_stored_as_sent_and_absent_when_unset() {
+        let older = node("exit-a", "100.64.0.15");
+        assert_eq!(older.exit_serves_v6, None);
+        let doc = bson::to_document(&older).unwrap();
+        assert!(!doc.contains_key("exit_serves_v6"), "{doc:?}");
+        assert_eq!(to_netmap_peer(&older, true).exit_serves_v6, None);
+        for v in [false, true] {
+            let mut n = node("exit-a", "100.64.0.15");
+            n.exit_serves_v6 = Some(v);
+            let doc = bson::to_document(&n).unwrap();
+            assert_eq!(doc.get_bool("exit_serves_v6"), Ok(v), "{doc:?}");
+            let back: OverlayNode = bson::from_document(doc).unwrap();
+            assert_eq!(back.exit_serves_v6, Some(v));
+            assert_eq!(to_netmap_peer(&back, true).exit_serves_v6, Some(v));
+        }
+    }
+
     #[test]
     fn pair_key_is_symmetric() {
         let a = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();

@@ -3945,6 +3945,34 @@ mod tests {
         );
     }
 
+    /// #3562 — a client whose exit serves IPv4 only says why its IPv6 is
+    /// fail-closed; a daemon from before #3562 sends no reason, and its line
+    /// reads as before.
+    #[test]
+    fn a_fail_closed_v6_says_why() {
+        let v4_only = tunnel_core::localapi::ExitNodeStatus {
+            selector: "exit".into(),
+            active: true,
+            withheld_reason: None,
+            v6_active: false,
+            v6_withheld_reason: Some("the exit serves IPv4 only".into()),
+            dns_steered: false,
+            socks5_port: None,
+        };
+        assert_eq!(
+            exit_node_state(&v4_only),
+            "active, v6 fail-closed: the exit serves IPv4 only, DNS NOT steered"
+        );
+        let older = tunnel_core::localapi::ExitNodeStatus {
+            v6_withheld_reason: None,
+            ..v4_only
+        };
+        assert_eq!(
+            exit_node_state(&older),
+            "active, v6 fail-closed, DNS NOT steered"
+        );
+    }
+
     /// FR-97 P3i — the `host fw` line names what governs the adapter and what
     /// it admits, and says nothing when the firewall admits everything there.
     #[test]
