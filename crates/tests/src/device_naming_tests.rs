@@ -551,6 +551,23 @@ async fn a_holder_is_answered_a_tunnel_client_update_that_does_not_parse_as_the_
     );
 }
 
+/// Stamp the version a device's daemon would have reported in its hello onto
+/// its row: a device enrolled over HTTP never says hello, and since #3565 an
+/// enrollment writes no version, because a row's version is its daemon's own.
+async fn set_reported_version(app: &TestApp, agent_id: &str, version: &str) {
+    let aid = ObjectId::parse_str(agent_id).unwrap();
+    let res = app
+        .db
+        .collection::<bson::Document>("agents")
+        .update_one(
+            bson::doc! { "_id": aid },
+            bson::doc! { "$set": { "agent_version": version } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.matched_count, 1, "no agent row {agent_id}");
+}
+
 // ─── FR-2: pin-update downgrade guard (2026-08-27) ─────────────
 
 /// The incident this guards: a stale operator script pinned rc.484 at a
@@ -570,6 +587,7 @@ async fn stale_pin_is_refused_unless_forced() {
         "0.4.1",
     )
     .await;
+    set_reported_version(&app, &aid, "0.4.1").await;
 
     // Strictly older pin → 409 naming both versions.
     let resp = app
@@ -645,6 +663,8 @@ async fn bulk_stale_pin_skips_per_agent() {
         "0.4.2",
     )
     .await;
+    set_reported_version(&app, &old, "0.3.0-rc.400").await;
+    set_reported_version(&app, &new, "0.4.2").await;
 
     let resp: Value = app
         .auth_post(
@@ -712,6 +732,7 @@ async fn an_update_the_device_said_it_will_not_act_on_is_refused_with_why() {
         ("mach-p7-self", "Updating Box", Some("self")),
     ] {
         let aid = enroll(&app, &t.tenant_id, admin, mach, name, "0.4.146").await;
+        set_reported_version(&app, &aid, "0.4.146").await;
         set_update_mode(&app, &aid, mode).await;
         ids.push(aid);
     }
