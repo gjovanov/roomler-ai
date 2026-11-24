@@ -665,7 +665,7 @@ question; two moved to `read_if_present`.
 start, clean stop and end of its own choosing (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2656`, `:2678`), at the clean-run promotion
 (`record_clean_run_at`, `:2665`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4518`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4543`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -925,7 +925,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4882`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4907`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
@@ -3654,7 +3654,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3733`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2716`).
+back to the version that is running (`crates/agent-core/src/config.rs:2741`).
 
 ### No pipe can stall the supervisor (#3080)
 

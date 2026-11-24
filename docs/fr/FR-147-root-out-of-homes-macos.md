@@ -735,7 +735,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - The running two-row worker saving the person's config during the conversion, as today.
 - Repairing a `~/Library/LaunchAgents` that an earlier package made (#3763).
 - The person's `config.toml.prev` after a conversion held the enrollment that moved to root, and a load of the
-  person's config (`config.rs:3627-3674`) could bring it back. #4184 fixed that for every conversion from its release
+  person's config (`config.rs:3652-3699`) could bring it back. #4184 fixed that for every conversion from its release
   on: `convert` keeps the new config as its `.prev` too ("Refusals at convert"). Left out of #4184, each named: a
   Mac converted before it keeps the enrolled `.prev` until that person's next save rotates the new file in, which
   for the console person is the screen worker's clean-run save five minutes in (`app.rs:5677`), while a person not
