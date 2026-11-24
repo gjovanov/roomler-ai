@@ -68,6 +68,11 @@ export interface FileEntry {
 export const useRoomStore = defineStore('rooms', () => {
   const rooms = ref<Room[]>([])
   const current = ref<Room | null>(null)
+  /** #4332 — which org `current` is of: the org `fetchRoom` asked, or the one
+   *  `setCurrent` was given; null when nobody said. The API's room carries no
+   *  org, and nothing clears `current` on a change of org, so a page that names
+   *  the current room under an org asks this, never `current.tenant_id`. */
+  const currentTenantId = ref<string | null>(null)
   const participants = ref<Participant[]>([])
   const loading = ref(false)
   const roomFiles = ref<FileEntry[]>([])
@@ -181,6 +186,7 @@ export const useRoomStore = defineStore('rooms', () => {
     rooms.value = rooms.value.filter((r) => r.id !== roomId)
     if (current.value?.id === roomId) {
       current.value = null
+      currentTenantId.value = null
     }
     delete unreadCounts.value[roomId]
   }
@@ -195,7 +201,10 @@ export const useRoomStore = defineStore('rooms', () => {
 
   async function fetchRoom(tenantId: string, roomId: string) {
     const room = await api.get<Room>(`/tenant/${tenantId}/room/${roomId}`)
+    // The room and its org land together: until the answer, the previous room
+    // keeps its own org.
     current.value = room
+    currentTenantId.value = tenantId
     return room
   }
 
@@ -205,8 +214,11 @@ export const useRoomStore = defineStore('rooms', () => {
     )
   }
 
-  function setCurrent(room: Room | null) {
+  /** `tenantId` is the org the room is of. Without it the room's org is
+   *  unknown, and a page that names a room of its org does not use it. */
+  function setCurrent(room: Room | null, tenantId?: string) {
     current.value = room
+    currentTenantId.value = room ? (tenantId ?? null) : null
   }
 
   // --- Call operations ---
@@ -391,6 +403,7 @@ export const useRoomStore = defineStore('rooms', () => {
     rooms,
     roomsTenantId,
     current,
+    currentTenantId,
     participants,
     loading,
     rootRooms,

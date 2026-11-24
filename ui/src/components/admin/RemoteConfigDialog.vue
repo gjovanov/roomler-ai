@@ -608,8 +608,10 @@ watch(
       rc_media_legacy: d?.rc_media_legacy,
     }
     original.value = JSON.stringify(draft.value)
-    if (agentStore.orgExecEnabled === null) void agentStore.fetchOrgExecEnabled(props.tenantId)
-    if (agentStore.orgSshEnabled === null) void agentStore.fetchOrgSshEnabled(props.tenantId)
+    // #4332 — this org's switches, not any: a switch that holds another org's
+    // value is not unset.
+    void agentStore.ensureOrgExecEnabled(props.tenantId)
+    void agentStore.ensureOrgSshEnabled(props.tenantId)
   },
   { immediate: true },
 )

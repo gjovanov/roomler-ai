@@ -269,9 +269,9 @@ watch(
     error.value = ''
     draft.value = { ...emptyPolicy(), ...(agent.value?.external_access_policy ?? {}) }
     void readCode()
-    if (agentStore.orgExternalAccessEnabled === null) {
-      void agentStore.fetchExternalAccess(props.tenantId)
-    }
+    // #4332 — this org's switch, not any: a switch that holds another org's
+    // value is not unset.
+    void agentStore.ensureExternalAccess(props.tenantId)
   },
   { immediate: true },
 )

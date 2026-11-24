@@ -214,7 +214,18 @@ const { xs } = useDisplay()
 const { isOpen, toggle } = useOpenRows<string>()
 
 const tenantId = computed(() => route.params.tenantId as string)
-const currentRoomId = computed(() => roomStore.current?.id || roomStore.rooms[0]?.id || '')
+// #4332 — the room the page names is one of ITS org's: Room Files asks this
+// org for it, and an upload names it. The current room (the last one opened in
+// a chat) stays current across a change of org and the API's room carries no
+// org, so it counts only while the store records it as this org's; else this
+// org's first room, once the list is this org's; else none, and Room Files and
+// Upload wait for the org's rooms.
+const currentRoomId = computed(() => {
+  const tid = tenantId.value
+  if (roomStore.current && roomStore.currentTenantId === tid) return roomStore.current.id
+  if (roomStore.roomsTenantId === tid) return roomStore.rooms[0]?.id || ''
+  return ''
+})
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const uploading = ref(false)
 const viewMode = ref<'all' | 'room'>('all')
