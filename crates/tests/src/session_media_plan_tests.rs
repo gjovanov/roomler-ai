@@ -99,6 +99,48 @@ impl Logged {
     }
 }
 
+/// #4351 — the capture sees every line its own thread logs, even one another
+/// thread with no subscriber reached first. CI lost both lines of
+/// `redis_bound_tests::timeouts_within_a_second_write_one_line_and_every_one_is_counted`
+/// that way, while a test beside it timed out on the same `warn!`.
+#[test]
+fn logged_sees_a_line_another_thread_reached_first() {
+    fn reach() {
+        tracing::warn!("logged probe: a line two threads reach");
+    }
+    let logged = Logged::default();
+    let _log = logged.install();
+    std::thread::spawn(reach).join().unwrap();
+    reach();
+    assert!(
+        logged
+            .text()
+            .contains("logged probe: a line two threads reach"),
+        "the capture missed a line this thread logged: {:?}",
+        logged.text()
+    );
+}
+
+/// #4351 — as [`logged_sees_a_line_another_thread_reached_first`], for
+/// [`Logged::install_debug`].
+#[test]
+fn logged_debug_sees_a_line_another_thread_reached_first() {
+    fn reach() {
+        tracing::warn!("logged debug probe: a line two threads reach");
+    }
+    let logged = Logged::default();
+    let _log = logged.install_debug();
+    std::thread::spawn(reach).join().unwrap();
+    reach();
+    assert!(
+        logged
+            .text()
+            .contains("logged debug probe: a line two threads reach"),
+        "the capture missed a line this thread logged: {:?}",
+        logged.text()
+    );
+}
+
 /// A viewer on a real session: the page's control channel, and each JSON message
 /// that came in on it. `_ctl` stays open, or the server ends the session.
 struct Viewer {
