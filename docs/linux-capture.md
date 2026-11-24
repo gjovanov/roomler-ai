@@ -1201,7 +1201,7 @@ connection makes arboard log three lines; the follow holds back exactly those
 three and lets every other line through (`quietly_drop`, `:859`). The follow
 rests on how arboard 3.6.1 counts its handles before it closes the
 process-wide connection, so the workspace pins it to exactly that version
-(the `arboard = "=3.6.1"` entry in the workspace's root `Cargo.toml`). An upgrade has to read that version's `Drop for Clipboard`
+(the `arboard` entry in the workspace's root `Cargo.toml`). An upgrade has to read that version's `Drop for Clipboard`
 again, and the CI test
 `clipboard::x11_follow_tests::x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server`
 turns red when the rule changed.
