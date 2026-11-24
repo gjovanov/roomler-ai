@@ -106,6 +106,20 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use boringtun::x25519::{PublicKey, StaticSecret};
 
+/// #4380 — the target of the route guard's two INFO lines: the off switch's
+/// (`ROOMLERD_OVERLAY_SUBNET_GUARD=0`, once per process) and the one that names
+/// another route holding a subnet's prefix (once per hold). The daemon's log
+/// filter appends `<this>=info` under any `RUST_LOG`
+/// (`roomler_node_core::logging::filter_for`), as it does for FR-110's
+/// [`sockbuf`]: the packaged Linux units set `RUST_LOG=roomlerd=info,warn`,
+/// which drops every other `tunnel_core` INFO, and dropped these two as well.
+///
+/// No module has this path, so no other line lands on it by default; a module
+/// placed at this path would put all of its INFO lines in the packaged log.
+/// Only INFO lines use it, because the appended `=info` caps a DEBUG line on
+/// it under every spec, `RUST_LOG=debug` included.
+pub(crate) const ROUTE_GUARD_LOG: &str = "tunnel_core::overlay::route_guard";
+
 /// A node's WireGuard static identity. The secret stays in the node's
 /// secure storage; only [`WgKeypair::public_base64`] is published.
 #[derive(Clone)]
@@ -177,5 +191,119 @@ mod tests {
         assert_eq!(decode_public(&b64), Some(kp.public.to_bytes()));
         assert!(decode_public("not-base64!!").is_none());
         assert!(decode_public("c2hvcnQ=").is_none()); // valid b64, wrong len
+    }
+}
+
+/// #4380 — what a cell's own thread says while a [`said::Lines`] guard lives,
+/// each event with its target and level. The daemon's log filter keeps or
+/// drops a line by its target, so a cell reads the target a line is said on.
+#[cfg(test)]
+pub(crate) mod said {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// One event: its target, its level, and its message with its fields.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Said {
+        pub target: String,
+        pub level: tracing::Level,
+        pub text: String,
+    }
+
+    /// Every event this thread says while the guard from [`Lines::start`]
+    /// lives, at every level. Thread-scoped, so a parallel cell's events
+    /// never land in it.
+    #[derive(Clone, Default)]
+    pub(crate) struct Lines(Arc<Mutex<Vec<Said>>>);
+
+    /// What [`Lines::start`] hands back: this thread's scoped subscriber and a
+    /// second registered dispatcher. Two dispatchers, never one: with one,
+    /// tracing-core takes a line's interest from the default of whichever
+    /// thread reaches it first and keeps it for every thread, so a parallel
+    /// cell with no subscriber would hide the line from this one (#4375).
+    /// The scope ends first, then the second.
+    pub(crate) struct Guard {
+        _scoped: tracing::subscriber::DefaultGuard,
+        _second: tracing::Dispatch,
+    }
+
+    impl Lines {
+        pub(crate) fn start() -> (Self, Guard) {
+            let lines = Self::default();
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let subscriber = tracing_subscriber::registry().with(Record(lines.clone()));
+            let guard = Guard {
+                _scoped: tracing::subscriber::set_default(subscriber),
+                _second: second,
+            };
+            (lines, guard)
+        }
+
+        /// The events whose text carries `words`.
+        pub(crate) fn with(&self, words: &str) -> Vec<Said> {
+            let Lines(all) = self;
+            all.lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.text.contains(words))
+                .cloned()
+                .collect()
+        }
+    }
+
+    struct Record(Lines);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Record {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut text = Text(String::new());
+            event.record(&mut text);
+            let meta = event.metadata();
+            let Record(Lines(all)) = self;
+            all.lock().unwrap().push(Said {
+                target: meta.target().to_string(),
+                level: *meta.level(),
+                text: text.0,
+            });
+        }
+    }
+
+    /// An event's message, then each field as `name=value`.
+    struct Text(String);
+
+    impl tracing::field::Visit for Text {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            if field.name() == "message" {
+                let _ = write!(self.0, "{value:?}");
+            } else {
+                let _ = write!(self.0, "{}={value:?}", field.name());
+            }
+        }
+    }
+
+    /// A line this thread says is recorded even when another thread with no
+    /// subscriber of its own reached that line first, as a parallel cell does
+    /// with the route guard's lines (#4375's race).
+    #[test]
+    fn a_line_another_thread_reached_first_is_still_recorded() {
+        fn reach() {
+            tracing::info!("said probe: a line two threads reach");
+        }
+        let (lines, _guard) = Lines::start();
+        std::thread::spawn(reach).join().unwrap();
+        reach();
+        assert_eq!(
+            lines.with("said probe: a line two threads reach").len(),
+            1,
+            "the capture missed a line this thread said"
+        );
     }
 }

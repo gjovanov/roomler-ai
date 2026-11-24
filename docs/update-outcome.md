@@ -64,7 +64,7 @@ control handler writes from a thread of its own (§3). A daemon's settle runs in
 process and stays outside that lock, as before.
 
 `<log_dir>` is `logging::resolve_log_dir`'s
-(`crates/agent-core/src/logging.rs:1028`): the process's per-user data dir plus
+(`crates/agent-core/src/logging.rs:1040`): the process's per-user data dir plus
 `logs`, except a Windows process with a service role, which logs under
 `%PROGRAMDATA%\Roomler\roomler\service-logs`: the SCM host, the SystemContext
 worker, `netd` and the per-Machine MSI's own steps (`ServiceLogRole`;
