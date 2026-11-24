@@ -4458,6 +4458,42 @@ pub(crate) mod tests {
         assert_eq!(st.peers()[0].rtt_ms, None);
     }
 
+    /// #4367 — the control socket is down, and the mesh still holds this
+    /// device's peers: `peers` lists them. In the field read behind the issue,
+    /// two devices lost only their control socket for an hour, an SSH session
+    /// to each ran over the direct WireGuard path the whole time, and
+    /// `roomler peers` on each said `(no peers)`.
+    #[test]
+    fn peers_the_data_plane_holds_are_listed_while_the_control_socket_is_down() {
+        let mut held = view();
+        let mut direct = held.peers[0].clone();
+        direct.node_id = "n3".into();
+        direct.name = "peer-b".into();
+        direct.overlay_ip = Some("100.64.0.3".into());
+        direct.overlay_ip6 = Some("fd72:6f6f:6d6c::6440:3".into());
+        direct.connection = ConnectionType::Direct;
+        held.peers.push(direct);
+        let (_tx, rx) = watch::channel(held);
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            Some("tid".into()),
+            // The control socket is down.
+            Arc::new(AtomicBool::new(false)),
+            rx,
+            consent_broker("kept"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        );
+
+        let peers = st.peers();
+        assert_eq!(peers.len(), 2, "the mesh still holds both peers: {peers:?}");
+        assert_eq!(peers[0].connection, ConnectionType::Relay);
+        assert_eq!(peers[1].connection, ConnectionType::Direct);
+    }
+
     #[test]
     fn tunnel_override_only_fills_carrier_gaps_and_respects_precedence() {
         fn peer(agent: Option<&str>, conn: ConnectionType) -> PeerInfo {
