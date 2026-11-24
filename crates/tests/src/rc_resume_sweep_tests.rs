@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 use crate::fixtures::test_app::TestApp;
 use crate::rc_resume_claim_tests::{
     QUIET, RESUME, WINDOW, WITHIN, ended, enroll, go_live, hello, hello_with, insert, leftover,
-    next_of, now_ms, oid, one, open, row, scope, scope_all, tenant_of, wait_row,
+    next_of, now_ms, oid, one, open, registered, row, scope, scope_all, tenant_of, wait_row,
 };
 
 /// The presence sweep's cadence, the shortest it takes: the resume sweep runs
@@ -480,16 +480,6 @@ async fn with_operator(
         tweak(s);
     })
     .await
-}
-
-/// Once `agent` is registered on `app`'s hub (a hello with no window has no
-/// frame to wait for).
-async fn registered(app: &TestApp, agent: ObjectId) {
-    let deadline = Instant::now() + WITHIN;
-    while !app.state.fleet().rc_hub.is_agent_online(agent) {
-        assert!(Instant::now() < deadline, "the device never registered");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 /// The `kept` rows of a close's answer: `(session_id, why)`.
