@@ -127,6 +127,11 @@ The **four-trap ladder** to make self-signed signing work in CI, each field-hit 
   pinned.
 - Windows/Linux keep their existing paths (Authenticode + name check; dpkg) — the update
   half is macOS-only by design.
+- Note (2026-11-22, [FR-151](FR-151-mac-update-waits-for-live-work.md)): the update half
+  no longer installs as soon as it runs. It reads both halves' live work first, defers on
+  #3429's budget and waits in place for the recheck, and an operator's push or the console
+  person's own ask skips the wait, each within what it may cut. The wake file stays a pure
+  wake, and the install itself (`installer -pkg … -target /`) is unchanged.
 
 ## Related
 

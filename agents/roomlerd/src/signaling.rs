@@ -5800,7 +5800,7 @@ async fn handle_server_msg(
                         duration_ms: 0,
                         error: Some(
                             "this device cannot run commands through its SYSTEM service \
-                             (update the agent)"
+                             (update roomlerd)"
                                 .to_string(),
                         ),
                     })

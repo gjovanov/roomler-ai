@@ -235,7 +235,7 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:399`);
 - every self-update, and the daemon's own refresh of its companion (`download_asset`,
-  `agents/roomlerd/src/updater.rs:1400`).
+  `agents/roomlerd/src/updater.rs:1402`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:4073`, `crates/agent-core/src/config.rs:4566`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:4075`, `crates/agent-core/src/config.rs:4566`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:996`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -523,7 +523,7 @@ Approved in the browser.
   Organization: Acme Corp  (slug: acme)
   Approved by:  Dana Smith  (username: dana)
 Join «Acme Corp» (acme) as approved by «Dana Smith» (@dana)? [y/N] y
-Enrollment successful. Agent id: …
+Enrollment successful. Device id: …
 ```
 
 - The page's address never carries the code: you type it there, signed in (or
@@ -582,9 +582,9 @@ file is a *normal* answer for that caller.
 A start restores a missing file too (#4157). An enrolled device's start whose `config.toml` is missing but whose `config.toml.prev`
 loads and holds an enrollment takes the single-instance lock, then `load` restores the copy with the *"config missing — RESTORED"*
 line and without its run marks, so the next start counts no crash (`agents/roomlerd/src/app/config_at_start.rs:44`,
-`agents/roomlerd/src/app.rs:3954-3959`). With no copy, or one that does not load or holds no enrollment, it stops with
+`agents/roomlerd/src/app.rs:3956-3961`). With no copy, or one that does not load or holds no enrollment, it stops with
 *"no config found"* before the lock, as before. An unenrolled one-row Mac's screen worker never restores at its start: it writes the
-person a new file with no enrollment (`agents/roomlerd/src/app.rs:4054-4066`). Nor does the macOS supervisor's enrolled worker
+person a new file with no enrollment (`agents/roomlerd/src/app.rs:4056-4068`). Nor does the macOS supervisor's enrolled worker
 (`run --supervised` without `--unenrolled`): it ends as before, with exit 78, because a converted one-row Mac's person `config.toml.prev` can still hold the enrollment that moved to root (#4184).
 So removing `config.toml` alone does not make a device forget its enrollment: remove `config.toml.prev` too. A Windows SystemContext install
 restores its missing machine config the same way (#4176), with one rule more: only from a copy that passes every check the config itself
@@ -645,7 +645,7 @@ enrolled where `roomlerd org ls` ran, was told its config was unreadable.
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
 supervisor's `netd_enabled()` flag probe
-(`agents/roomlerd/src/win_service/supervisor.rs:1290`), on **every service
+(`agents/roomlerd/src/win_service/supervisor.rs:1386`), on **every service
 start** of every user-context install; and enrollment itself, reusing an
 existing `machine_id` — during the very operation that enrolls the machine.
 The noise also buried the genuine case, which prints the identical line.
@@ -781,7 +781,7 @@ serving its zip. One wizard, four roles:
 |---|---|---|
 | **Daemon — system** | perMachine MSI + SystemContext enabled | SCM service `Roomler` (LocalSystem) — controls lock screen, UAC, pre-logon |
 | **Daemon — per user** | perUser MSI | the account's own Scheduled Task, `Roomler-<SID>` ([one per account](#two-accounts-on-one-machine-a-task-each-3801)), at logon (limited), with no window: [what the task runs](#what-the-per-user-scheduled-task-runs-3292) |
-| **Daemon — machine (attended)** | perMachine MSI | SCM service, no SystemContext. Its worker runs only as the person signed in at the **console**: an RDP session never gets one, and while nobody is signed in there the service runs with no worker and the device shows offline (`agents/roomlerd/src/win_service/supervisor.rs:826` spawns in the console session, `:1989` idles without a user token). A server reached only over RDP wants **Daemon — system** |
+| **Daemon — machine (attended)** | perMachine MSI | SCM service, no SystemContext. Its worker runs only as the person signed in at the **console**: an RDP session never gets one, and while nobody is signed in there the service runs with no worker and the device shows offline (`agents/roomlerd/src/win_service/supervisor.rs:826` spawns in the console session, `:2110` idles without a user token). A server reached only over RDP wants **Daemon — system** |
 | **Tunnel client** | CLI archive + PATH entry | on demand |
 
 Details worth knowing:
@@ -1546,9 +1546,9 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1928`) launches `msiexec /i … /qn` elevated
-(`:2051`, `:2451`) while the service runs; the worker that launched it exits 0,
-and its host stays up (`:409`). Measured on a vmtest Win11 cell, released code,
+(`agents/roomlerd/src/updater.rs:1973`) launches `msiexec /i … /qn` elevated
+(`:2096`, `:2496`) while the service runs; the worker that launched it exits 0,
+and its host stays up (`:411`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
 
 | Run | The first Stop came from | Released code |
@@ -1607,13 +1607,13 @@ Windows compares environment names, and is added where there is none. The
 exceptions are `ROOMLERD_ENABLE_SYSTEM_SWAP` and `ROOMLER_NODE_ENABLE_SYSTEM_SWAP`,
 both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 `carry.rs:37`). The installer decides the switch: the updater passes
-`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:2189`;
+`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:2234`;
 it reads the service's environment for a per-Machine install only, so a per-user
 install's update, which has no service, logs nothing about the switch, #3889),
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6313`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6315`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1682,7 +1682,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6180`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6182`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1925,13 +1925,13 @@ What a step writes, in order. Its own lines have the target `roomler_node_core::
 file writer's guard, which writes every queued line before the process exits. The guard lives
 in a static, and no exit drops a static: without the flush, one run in six of the test below
 lost the last 1,101 of its 20,000 lines, and the answer and the end line with them. A restart
-exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2322`).
+exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2324`).
 
 One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1441`). It gives the role to `service install` and
 `service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
 and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
-(`agents/roomlerd/src/app.rs:7886`) reads every custom action with an `ExeCommand` in both WiX
+(`agents/roomlerd/src/app.rs:7912`) reads every custom action with an `ExeCommand` in both WiX
 files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
 installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
 
@@ -1947,7 +1947,7 @@ whole stack with no level, which tracing reads as TRACE in every daemon that kee
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
 `service uninstall --as-service` logs `Companion login start removed.` rather than printing it
-(`agents/roomlerd/src/app.rs:6121`), and its answer stays `Service deregistered`.
+(`agents/roomlerd/src/app.rs:6123`), and its answer stays `Service deregistered`.
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
@@ -1966,9 +1966,9 @@ error chain in the file (`crates/agent-core/src/logging.rs:1989`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:2019`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2062`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1956`). In `roomlerd`,
-`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7980`) and
-`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8013`)
+beside `stderr_capture` (`.github/workflows/ci.yml:1958`). In `roomlerd`,
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8006`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8039`)
 pin the role per command and the end line of a failure.
 
 ### Where a step on the service account finds its folders (#3702)
@@ -2060,7 +2060,7 @@ profile, or the machine's data folder) or is reached through a link below it (`k
   daemon, which runs unelevated, merges at its next start, so the merge never runs above the
   integrity level of the folder owner's own processes. When the token cannot be read, the merge
   is left too (`DataMerge`, `crates/agent-core/src/appdirs.rs:1343`;
-  `agents/roomlerd/src/app.rs:7604`). A data folder whose NEW folder is not there still moves by
+  `agents/roomlerd/src/app.rs:7630`). A data folder whose NEW folder is not there still moves by
   one rename.
 - Every run writes a note that names what it moved, what it kept beside, and what it left for
   the next start (`crates/agent-core/src/appdirs.rs:1456`).
@@ -2301,7 +2301,7 @@ neither line: its CLI names itself after an install (`installed: roomler <v>`, `
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
 feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
-records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3138-3149`).
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3140-3151`).
 Since #3931 it also runs every mode with every stand-in reading its stdin on every call, under dash
 with the script padded so that one of dash's 8 KiB reads ends inside the main block (from the
 `# ─── main ─` line to the end), and with the script cut short at sampled lines above the main block,
@@ -2389,7 +2389,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2374-2376`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2419-2421`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -2582,11 +2582,11 @@ sequenceDiagram
     | a config that does not load, with no usable `.prev` | *"written fresh: the config here could not be read and had no usable last good copy (kept as …`.unreadable`)"* | `:58-65` |
     | a config that does not load, whose `.prev` loads and holds no enrollment | *"written into the config's last good copy, which held no enrollment (its settings kept); the config here could not be read (kept as …`.unreadable`)"* | `:66-73` |
     | Windows, the machine-global config, not private to its administrators (#3609) | *"written fresh: the config here was not private to this computer's administrators, so nothing of it was carried over"* | `:74-76` |
-    | an enrolled config | the words it always had: refreshed, replaced, refreshed org, appended | `agents/roomlerd/src/app.rs:3267-3274` |
+    | an enrolled config | the words it always had: refreshed, replaced, refreshed org, appended | `agents/roomlerd/src/app.rs:3269-3276` |
 
     The record is made where the read is matched
-    (`agents/roomlerd/src/app.rs:3195-3220`) and the words are chosen at
-    `:3231`. A copy that could not be kept says why instead of where, and the
+    (`agents/roomlerd/src/app.rs:3197-3222`) and the words are chosen at
+    `:3233`. A copy that could not be kept says why instead of where, and the
     WARNING above it is unchanged.
   - A system scope's machine id is **derived from the host name** (the person
     cannot read the one in root's config). On a renamed host, or a VM cloned
@@ -2662,7 +2662,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3536`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3596`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2770,7 +2770,7 @@ two privacy grants below remain the person's; the Done page says so.
 **A Mac that is one row already gets nothing from the wizard (FR-141 P3).** Before
 it offers the device install, the wizard asks the root daemon over the person
 socket it serves the console user (`/var/run/roomler-person/<uid>.sock`), which
-answers `status` (`crates/localapi/src/lib.rs:3722-3724`) with
+answers `status` (`crates/localapi/src/lib.rs:3782-3784`) with
 `gui_worker.one_row` in it (`:530-543`). When the root daemon says one row, the
 Welcome page says "This Mac is one device already", Continue stays off for every
 device card, and pairing start and the install's preflight refuse with the same
@@ -3017,7 +3017,7 @@ that person's own process: `roomlerd one-row-home <verb>`, the package's binary
 person's uid, primary gid and no other group, an empty environment and `/` as its folder,
 one per account in uid order, 30 s each, and which checks its own identity before it
 touches anything (`agents/roomlerd/src/one_row.rs:3458`,
-`agents/roomlerd/src/one_row_home.rs:3-60`). Root keeps its own copies and records in
+`agents/roomlerd/src/one_row_home.rs:3-61`). Root keeps its own copies and records in
 its own tree: `/etc/roomler/config.toml.pre-one-row` and `/etc/roomler/one-row/`
 (root:wheel 700, files 600: `root.json` and one folder per uid, its `record.json`
 written last), each a temporary file, `fsync`, `rename`; they go only after a restart
@@ -3279,7 +3279,7 @@ console user are skipped and every root row runs as on any install
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:157` |
 | Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:627-630`, `:635`, `:735-738`, `:756`, `:764`, `:777`, `:656`, `:791` |
 | The enrollment `install.sh --one-row` runs under `sudo`, and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
-| `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:3458`, `agents/roomlerd/src/one_row_home.rs:3-60` |
+| `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:3458`, `agents/roomlerd/src/one_row_home.rs:3-61` |
 | `sudo roomlerd one-row`: root's copy of its config, its records and its log | root | `/etc/roomler/config.toml.pre-one-row`, `/etc/roomler/one-row/`, `/var/log/roomler/one-row.log` | `agents/roomlerd/src/one_row.rs:145` |
 
 - **`sudo roomlerd one-row` writes nothing in a home as root (FR-147).** A home whose
@@ -3293,7 +3293,7 @@ console user are skipped and every root row runs as on any install
   (`crates/agent-core/src/appdirs.rs:152`). The person's `live.roomler.roomler`
   is made by the person's own processes. On a Mac where an earlier root step made
   it, the screen worker's config write fails with an error that names the folder,
-  its owner and its mode (`agents/roomlerd/src/app.rs:3913`, `:4061`). The
+  its owner and its mode (`agents/roomlerd/src/app.rs:3915`, `:4063`). The
   macOS release build (`viewer-indicator-macos`,
   `.github/workflows/release-agent.yml:2915`) runs the AppKit `main`
   (`agents/roomlerd/src/app.rs:1293`), which cannot return the error for std
@@ -3355,7 +3355,7 @@ console user are skipped and every root row runs as on any install
     worker makes the folder again, as the person, at its next start.
   - When it holds `com.roomler.agent.plist.pre-one-row` or
     `config.toml.pre-one-row`, which the revert reads there and nowhere else
-    (the person's own `put-back-legacy`, `agents/roomlerd/src/one_row_home.rs:1152-1194`,
+    (the person's own `put-back-legacy`, `agents/roomlerd/src/one_row_home.rs:1284-1326`,
     started by `--revert` where that person's `read` reports them,
     `agents/roomlerd/src/one_row.rs:2653`), the command stages first and
     moves last: `<test> && sudo -u '#<uid>' mkdir '<folder>.new-<stamp>' &&
@@ -3531,7 +3531,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5688`).
+(`crates/localapi/src/lib.rs:5793`).
 
 On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
 the console user's `roomler …` is the screen worker the root daemon starts for
@@ -3560,9 +3560,9 @@ The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3536`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3596`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
-read-only and refuses to set by name (`localapi::person_may`, `:3722`). Whether
+read-only and refuses to set by name (`localapi::person_may`, `:3782`). Whether
 the console user should flip those from the app is the decision left open on
 #2871; until it is taken, they stay with `sudo`.
 
@@ -3642,7 +3642,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3711`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3713`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -3824,7 +3824,7 @@ remote-control session, an SSH connection, a Fleet RPC `exec` run, a file
 transfer, a recording. So the periodic check defers while any of them is live,
 on the budget transfers always had, and so does the check a daemon runs early
 when its control socket comes back after an hour or more down (#4245). It
-reads one model, `Busy` (`agents/roomlerd/src/busy.rs:30`), the same one the
+reads one model, `Busy` (`agents/roomlerd/src/busy.rs:32`), the same one the
 per-user Linux daemon's restart onto a replaced binary reads
 ([linux-self-update.md](linux-self-update.md#the-per-user-daemon-onto-the-new-binary-p2b)).
 
@@ -3843,7 +3843,7 @@ flowchart TD
 
 | What is live | What the periodic check does | Where |
 |---|---|---|
-| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3666` |
+| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3770` |
 | a remote-control session, an SSH connection, a Fleet RPC run, a transfer or a recording | defers, and checks again in 1 h | `TRANSFER_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:77` |
 | only a network transition in the last 10 min | defers, and checks again in 2 min (R5b) | `NET_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:98` |
 | either, after 7 defers in a row | installs anyway, and warns what it cuts: a device that is never idle still takes a release about 7 h after it was due | `MAX_CONSECUTIVE_DEFERS`, `agents/roomlerd/src/updater.rs:84` |
@@ -3870,9 +3870,9 @@ flowchart TD
   outlives an hour without its socket (FR-138 keeps one for 120 s at most), but
   an SSH session on the mesh does, and so does a session another enrollment of
   the daemon serves; and a long outage often ends on a network that just moved.
-  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3199`),
+  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3244`),
   and one function picks the cycle's way (`cycle_arm`,
-  `agents/roomlerd/src/updater.rs:3735`).
+  `agents/roomlerd/src/updater.rs:3839`).
 - **Only the process that installs is asked**, and it counts only what it
   serves itself:
 
@@ -3883,7 +3883,19 @@ flowchart TD
 | Linux, system (`roomlerd.service`, root) | the daemon | all of it |
 | Linux, per-user, with the root update helper | the helper, which asks nothing | nothing has to: the install replaces the binary under a daemon that runs on, and the daemon restarts onto it once `Busy` reads idle, or at its 24 h ceiling |
 | Linux, per-user, without the helper | the daemon, where it can install at all | all of it |
-| macOS, both halves | the root update helper (`com.roomler.update`), which asks nothing | ⚠️ nothing: the package's post-install reloads both halves, whatever they serve |
+| macOS, either half or both (FR-151) | the root update helper (`com.roomler.update`), which reads both halves the package's post-install restarts: the root daemon over its system socket, and the console person's daemon through a child it starts as that person | all of it, in both halves, on the same budget. A half it cannot read counts as live work; a half that is not running, or nobody at the console, as none. R5b reads the root half's network alone |
+
+On a Mac the helper decides between two readings of `live_work`, a read-only
+LocalAPI verb (`helper_gate`, `agents/roomlerd/src/helper_gate.rs`;
+[FR-151](fr/FR-151-mac-update-waits-for-live-work.md)):
+
+| | The helper on a Mac |
+|---|---|
+| reads | the root half over `/var/run/roomler/roomler.sock`, kept only when root serves it; the console person's half through `roomlerd one-row-home live-work`, started as that person (FR-147's child: its check of itself first, no file read or written, one bounded line back) |
+| keeps | the budget in `update-defers.json` beside `update-attempt` in root's log folder (`{"v":1,"defers":3,"next_due":…}`, 0600, read strictly), so a reboot keeps the count. Only a due cycle counts: a wake inside a chain never does |
+| waits | in place after a defer: it reads again when `next_due` comes, or at a wake at most once a minute, and exits on the opt-out, a manual install, SIGTERM, or after 8 h awake. SIGTERM also ends a check or a download in progress, without installing |
+| skips the wait | an operator's push to the root half's row: over everything. A push to the person's row, or their "Apply update" (a `roomlerd self-update` as that person, which records the ask in the daemon behind their own socket): over their own sessions and the root half's remote-control sessions, never over its SSH connections, runs, transfers or recording, or its network transition |
+| kill switch | `sudo touch /etc/roomler/install-over-live-work`: it installs with no reading, as before FR-151 |
 
 - **What the log says.** Each defer: `auto-updater: deferring — live work a
   restart would cut, or the network just moved busy=1 remote-control session(s)
@@ -3892,7 +3904,16 @@ flowchart TD
   spent: `auto-updater: forcing update after 7 consecutive defers`, with the
   same `busy=` and `cycle=`. The recheck starts with `control WS recovered
   after a long outage — requesting the update recheck down_mins=61
-  update_check_fired=true`, and one inside the cooldown logs `auto-updater:
+  update_check_fired=true`. On a Mac, in `/var/log/roomler/update.log`:
+  `update-helper: deferring the install: busy=1 remote-control session(s)
+  consecutive_defers=1 next_check_secs=3600 cycle=due root=not_running
+  person=answered` (`cycle=wake` for an uncounted wake; each half reads
+  `answered`, `not_running`, `older` or `no_answer`), `… after the download:`
+  when the second reading finds work, `update-helper: the install goes ahead`,
+  `update-helper: forced update proceeding despite: …` for a push, the
+  person's ask or the cap, `update-helper: stops waiting without installing`,
+  and `update-helper: installing over live work with no reading (the kill
+  switch)`. A recheck inside the cooldown logs `auto-updater:
   recheck suppressed by recent-install cooldown; the timer checks next
   cycle=outage_recheck`.
 
@@ -3960,7 +3981,7 @@ SIGPIPE, and the failed pipe read as "idle", as did a print that failed.
 container: a case for each reading, one where launchctl writes its answer in
 pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
-macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3136-3137`), and "macOS overlay
+macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3138-3139`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
 `:1437-1442`).
 
@@ -3969,7 +3990,7 @@ session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
 daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
-agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3788`,
+agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3892`,
 `WatchPaths` in `com.roomler.update.plist:61`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way.
@@ -4107,7 +4128,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2284`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2286`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

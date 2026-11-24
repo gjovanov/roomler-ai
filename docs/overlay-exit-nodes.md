@@ -231,7 +231,7 @@ shows in `roomler status` (`… DNS steered` / `DNS NOT steered`).
 `process::exit` bypasses Rust's `Drop`, so the paths that hard-exit (watchdog
 stall, a fatal goodbye, a duplicate-instance loser, `roomlerd self-update` run
 by hand) never run RAII teardown. An auto-update is not one of them: it shuts
-the daemon down gracefully (`agents/roomlerd/src/updater.rs:3367`). Three sync,
+the daemon down gracefully (`agents/roomlerd/src/updater.rs:3471`). Three sync,
 context-free purges — `overlay::tun::purge_split_default()`,
 `overlay::tun::purge_stale_peer_routes()` and `overlay::dns::purge_exit_dns()`
 — are folded, with the host ledger's ([below](#exit-client-pins-fr-97-p0e)),
@@ -246,7 +246,7 @@ into `roomlerd::purge_exit_routes()` and called:
   their replacement: [below](#a-stall-exit-hands-a-slow-dns-purge-to-its-replacement-3440),
   and
 - (FR-97 P0e) **after every exit of the daemon**, clean ones included, once the
-  runtime is dropped (`purge_after_daemon`, `agents/roomlerd/src/app.rs:2284`):
+  runtime is dropped (`purge_after_daemon`, `agents/roomlerd/src/app.rs:2286`):
   see [exit-client pins](#exit-client-pins-fr-97-p0e) below.
 
 The stale-route purge drops the peer and subnet routes it finds on the overlay's
@@ -262,7 +262,7 @@ reads like a stale-route find.
 
 On Linux it finds prefix routes only. It lists `ip route show dev <tun>` and
 keeps the first fields that carry a length
-(`crates/tunnel-core/src/overlay/tun.rs:7082`), and iproute2 prints a host route
+(`crates/tunnel-core/src/overlay/tun.rs:7859`), and iproute2 prints a host route
 without its `/32`. The per-peer routes need no purge there, because the TUN is
 not persistent (`persist off`): the kernel removes it, and every route on it,
 when its last descriptor closes. So a Linux exit logs the exit line only when
@@ -295,7 +295,7 @@ purge finishes on a thread of its own.
 The last two rows say any Normal-priority child waits this way, so the bound
 alone does not get such a start to its probe. The next children on that path
 were the four `icacls` steps of the config save every start makes for its crash
-bookkeeping (`agents/roomlerd/src/app.rs:4400`). A save now reads the
+bookkeeping (`agents/roomlerd/src/app.rs:4402`). A save now reads the
 directory's owner and DACL in-process and runs the steps only when they would
 change something
 ([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
@@ -334,7 +334,7 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:408`, `:424`, called at `agents/roomlerd/src/app.rs:4308` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
+| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:408`, `:424`, called at `agents/roomlerd/src/app.rs:4310` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
 | Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:889` (`purge_exit_dns_within`), `:1272` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
 | Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:625` (`run_cmd`), `:1314` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
 | A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:1256` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
@@ -591,12 +591,12 @@ sequenceDiagram
 
 | Step | Where | What it guards against |
 |---|---|---|
-| Capture the uplink per family, re-read before every pin | `tun.rs:5425`, `current_uplink` `tun.rs:7772`, `bsd_default_uplink` `tun.rs:322` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
-| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:368`, `bsd_pin_row` `tun.rs:404`, `bsd_pin_holds` `tun.rs:417`, `bsd_table` `tun.rs:7295` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
-| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:6340` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
-| Re-check the pins | `stale_host_exemptions` `tun.rs:6428`, the gate `route_guard.rs:600` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
-| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:600` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
-| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:394`, `exemption_withheld_reason` `route_guard.rs:406` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
+| Capture the uplink per family, re-read before every pin | `tun.rs:6127`, `current_uplink` `tun.rs:8622`, `bsd_default_uplink` `tun.rs:359` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
+| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:405`, `bsd_pin_row` `tun.rs:441`, `bsd_pin_holds` `tun.rs:454`, `bsd_table` `tun.rs:8107` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
+| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:7117` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
+| Re-check the pins | `stale_host_exemptions` `tun.rs:7205`, the gate `route_guard.rs:731` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
+| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:731` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
+| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:527`, `exemption_withheld_reason` `route_guard.rs:539` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
 
 > ⚠️ **A lookup does not show a pin.** A destination a connection has used
 > keeps an interface-scoped clone of the default route (`WASCLONED,IFSCOPE`).
@@ -719,7 +719,7 @@ A node in netstack mode (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`, or
 mesh lives in a userspace stack inside the daemon, reached through a SOCKS5
 front on `127.0.0.1`. Selecting an exit there installs the split-default in
 that userspace router only
-([`route_guard.rs:696`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L695)),
+([`route_guard.rs:827`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L827)),
 so the exit carries exactly what the front dials and nothing else.
 
 ```mermaid
@@ -751,7 +751,7 @@ Before P0c-3 it printed `active, v6 on, DNS NOT steered`, as if every app on
 the host left through the exit (field, 2026-10-17; FR-97 §8).
 
 ⚠️ **A netstack node never steers the host's DNS**
-([`dns_steer_allowed`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L363)).
+([`dns_steer_allowed`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L496)).
 The steer is host-wide on Windows (an NRPT catch-all) and macOS (a resolver
 entry). On a node whose OS routes nothing through the exit it would only move
 every app to the public upstream over the uplink, and on a managed laptop cut

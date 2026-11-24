@@ -389,7 +389,7 @@ can do.
 ### 3.2 P0a — fail toward withhold (#2081)
 
 `SystemTun` refuses an exemption wherever it has no arm: a `cfg(not(any(linux, windows)))` `add_host_exemption`
-returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:574-585` withholds and `roomler status`
+returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:705-716` withholds and `roomler status`
 says why. The trait default stays `Ok(())`, now documented as safe only for a device that installs no OS routes
 (the in-memory mocks, netstack); changing it would move every mock and netstack for no safety gain. Netstack's untrue
 `active` belongs to P0c. The test that fails on master is
@@ -483,7 +483,7 @@ beside the words.
   - `ExitNodeStatus.socks5_port` (`crates/localapi/src/lib.rs:111`): `roomler status` says "active for SOCKS5
     clients of 127.0.0.1:1080 only", and never `v6 on`.
   - The host's DNS is never steered from a netstack node
-    (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:363`): on Windows and macOS the steer is host-wide and
+    (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:496`): on Windows and macOS the steer is host-wide and
     would route nothing through the exit.
   - A netstack node withholds every route offer (`crates/tunnel-core/src/overlay/nat.rs:179`): its stack forwards
     nothing. On 0.4.141, a netstack node on a host where iptables worked offered `/0`.
@@ -502,34 +502,34 @@ reach a viewer from agents on the release after P0c-1.
 Mirror the Linux arm with the BSD tools the macOS code already drives, and close two gaps the Linux arm has (N12):
 
 1. **The uplink, per family.** At bring-up, `route -n get [-inet6] default` gives the next hop and the interface
-   (`tun.rs:5421`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
-   every pin (`current_uplink`, `tun.rs:7772`): a Mac that booted without a network still pins once it has one, and
-   one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:323`) refuses a route on our
+   (`tun.rs:6123`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
+   every pin (`current_uplink`, `tun.rs:8622`): a Mac that booted without a network still pins once it has one, and
+   one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:360`) refuses a route on our
    own utun, one narrower than `/0` (a `/1` also prints `destination: default`; only the mask tells), and one with no
    next-hop address (another VPN's interface route). A family with no usable default keeps what it had, so a network
    in transit does not move the pins.
-2. **A pin is read from the routing TABLE** (`netstat -rnW -f inet[6]`, `bsd_table` `tun.rs:7295`), never from a
+2. **A pin is read from the routing TABLE** (`netstat -rnW -f inet[6]`, `bsd_table` `tun.rs:8107`), never from a
    lookup. A destination a connection has used keeps an interface-scoped clone of the default route
    (`WASCLONED,IFSCOPE`), and an unscoped `route -n get` answers with that clone even after the pin is in (field,
    §8: the first P1a read back by lookup and refused every pin for the server). The pin is the UNSCOPED static host
-   route for exactly the address (`bsd_pin_row`, `tun.rs:405`: flags `H` and `S`, never `W` or `I`), and it holds
-   when it is flagged `G` through the uplink's next hop on its interface (`bsd_pin_holds`, `tun.rs:418`).
-3. **`add_host_exemption`** (`tun.rs:6312`) looks first, because BSD `route` has no idempotent write (#1856): a pin
+   route for exactly the address (`bsd_pin_row`, `tun.rs:442`: flags `H` and `S`, never `W` or `I`), and it holds
+   when it is flagged `G` through the uplink's next hop on its interface (`bsd_pin_holds`, `tun.rs:455`).
+3. **`add_host_exemption`** (`tun.rs:7089`) looks first, because BSD `route` has no idempotent write (#1856): a pin
    that holds is left alone; one that does not (the old uplink, a crashed run's, an interface route) is deleted, then
    added; anything else gets `route add -host <ip> <gw>` (`-inet6` and a zoned `fe80::1%en0` for v6). Never `route
    change`: it resolves its target the way the lookup does, and on the field Mac it left the pin untouched. The table
    then decides; a pin that does not hold comes out again and the call errs.
-4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:6424` on macOS, an empty default
-   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:612`)
+4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:7201` on macOS, an empty default
+   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:743`)
    asks at most every 3 s, re-pins each, and DELETES one it cannot re-pin before forgetting it, so an untracked
    route never outlives the exit. Then the usual rule applies: a v4 pin missing means WITHHOLD.
 5. **`del_host_exemption`** removes only the pin the table shows, never a route on our utun (a peer route): with no
    unscoped pin left, `route -n delete -host` removed something else on the field Mac. The boot purge already
-   removes the `/1`s (`tun.rs:4603-4646` at the time of writing); pins an unclean exit leaves behind are N13, all
+   removes the `/1`s (`tun.rs:5305-5348` at the time of writing); pins an unclean exit leaves behind are N13, all
    three OSes.
 6. **The two 0.4.132 follow-ups.** The pin WARN fires once per (endpoint, cause) (`note_exemption_failure`,
-   `route_guard.rs:406`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
-   (`exemption_withheld_reason`, `route_guard.rs:418`) instead of `no original default route?`.
+   `route_guard.rs:539`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
+   (`exemption_withheld_reason`, `route_guard.rs:551`) instead of `no original default route?`.
 
 Kill switch: `ROOMLERD_EXIT_CLIENT_MACOS=0` refuses every exemption, as 0.4.132 did. DNS is not steered yet (P1c):
 `roomler status` says `DNS NOT steered`.
@@ -729,7 +729,7 @@ test of the SIGKILL property itself.
   answer with the window, as Linux's title convention does.
 - **P2d, the small ones.** *P2d-1, the lock hint (built):* the session dictionary's lock flag
   (`CGSessionCopyCurrentDictionary`), read as keep busy reads it (`keep_busy/host_mac.rs:187`), reaches the viewer at
-  two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1479-1545`): whether
+  two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1477-1543`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
   `signaling.rs:4515`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
@@ -796,10 +796,10 @@ test of the SIGKILL property itself.
   lists a device with no node by itself (`overlay: "no_node"`, `crates/api/src/routes/agent_self.rs`). The fix keeps
   the server and the companion as they are:
   - the root half serves the console user a person socket (FR-27 P11's mechanism) at
-    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:5133`). The directory is root's and writable by
-    nobody else (`root_only_dir`, `:5402`), so root binds and then hands the socket over (`bind_root_owned`,
-    `:5415`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
-  - `person_may` (`:3722`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
+    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:5238`). The directory is root's and writable by
+    nobody else (`root_only_dir`, `:5507`), so root binds and then hands the socket over (`bind_root_owned`,
+    `:5520`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
+  - `person_may` (`:3782`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
     socket the same way, and its companion's Devices page was refused there before;
   - the per-user half asks the root half only when its own answer is `no_node` and it is not root
     (`agents/roomlerd/src/person_socket.rs:180`). It shows the root half's answer only when that is `ok` (`:188`),
@@ -814,17 +814,17 @@ test of the SIGKILL property itself.
 
   Built:
   - **One async hook at the dispatch of each request**, `LocalApiState::status_view` and `peers_view`
-    (`crates/localapi/src/lib.rs:2988`, `:2993`, dispatched at `:4003`). They default to the sync reads, so the
+    (`crates/localapi/src/lib.rs:3036`, `:3041`, dispatched at `:4071`). They default to the sync reads, so the
     tests' fakes are untouched. #3864 later put two more beside them, `consent_pending_view` and
-    `consent_decide_view` (`:3114`, `:3122`), which default to the daemon's own consent questions and answers. A
+    `consent_decide_view` (`:3162`, `:3170`), which default to the daemon's own consent questions and answers. A
     one-row Mac's GUI worker (FR-43 P3) overrides them to list the root half's questions beside its own and to
     send the root half the answers to them.
-  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2157`, `:2170`), with P2g's
+  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2212`, `:2225`), with P2g's
     rule turned to the live view: no overlay address of its own and not root (`person_socket.rs:282`). Then
     `Peers` is the root half's, and `Status` is its own with the root half's overlay addresses, exit status,
     MagicDNS and, since FR-128 D8, netcheck (`with_machine_network`, `:289`). On a one-row Mac's GUI worker
     (FR-43 P3a), `Status` also takes the root half's identity and link (`with_machine_identity`, `:313`).
-  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3729`). That drops
+  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3789`). That drops
     the endpoints of either end and of a relay, the carrier snapshot, the path decision and the probes, which
     name other devices' public and LAN addresses.
   - **A root half slow to answer** (1.5 s) leaves the half's own answer for that poll.
@@ -1115,7 +1115,7 @@ model on Windows, so the three agree on what the mode means.
 ### 3.11 P6 — install, update, ops
 
 - **P6a, the artifact's own version (built).** Each format states its version inside the bytes its `.asc` signs, and
-  `download_asset` refuses when that disagrees with the tag `is_newer` read (`updater.rs:1539`), as it always has for
+  `download_asset` refuses when that disagrees with the tag `is_newer` read (`updater.rs:1541`), as it always has for
   the MSI:
   - the `.deb`: its control `Version` through `dpkg-deb --field` (`artifact_version.rs:288`), from the dpkg the
     updater requires before it picks a `.deb`; cargo-deb's revision (`0.4.142-1`) and any epoch are dropped;
@@ -1243,7 +1243,7 @@ model on Windows, so the three agree on what the mode means.
     - It is off with the FR-43 supervisor (`macos_supervise_gui_worker`, default off).
 - **P6f, a fresh private staging directory per download** on Windows and macOS, as Linux has had since FR-96's
   security review. **Settled without a build.**
-  - *Windows* got exactly that with GHSA-r3xj-4wh9-xh2v, released in 0.4.142 (`updater.rs:1234`).
+  - *Windows* got exactly that with GHSA-r3xj-4wh9-xh2v, released in 0.4.142 (`updater.rs:1236`).
   - *macOS* keeps its one fixed `roomlerd-update` directory, because the hazard is not there, measured on a Mac
     (§8). The root update helper's launchd job sets no `TMPDIR`. With `TMPDIR` unset, `std::env::temp_dir()` on
     Apple is `confstr(_CS_DARWIN_USER_TEMP_DIR)`: for root that is `/var/folders/zz/…/T/`, `drwx------ root`.
@@ -1288,7 +1288,7 @@ model on Windows, so the three agree on what the mode means.
 
 - Unit tests wherever the logic can run on every OS (FR-43's practice: keep `decide()` out of `cfg(macos)`), and a
   macOS `cargo test` lane for `tunnel-core` with `overlay-l3`. Today macOS only compiles, plus the real-utun kernel
-  test (`ci.yml:1830-1846`).
+  test (`ci.yml:1832-1848`).
 - Extend `macos_kernel_tests` on the runner's real utun: an exemption pinned and read back, the pf anchor loaded and
   flushed, the resolver keys installed and purged.
 - Field: the `vmtest` macOS, Win11 (Home and Pro) and Ubuntu cells; one exit cell per (client OS × exit OS) pair;

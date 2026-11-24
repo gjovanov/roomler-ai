@@ -185,7 +185,7 @@ impl Reason {
             Reason::Locked => "Paused: the screen is locked.",
             Reason::NoSession => "Waiting: nobody is signed in at this computer.",
             Reason::CalibrationFailed => {
-                "Unavailable: the pointer did not go where it was sent, so the agent cannot tell a person from itself."
+                "Unavailable: the pointer did not go where it was sent, so roomlerd cannot tell a person from itself."
             }
             Reason::NotLanding => {
                 "Unavailable: the system does not register the moves (a protected window or another desktop is in front)."
@@ -201,7 +201,7 @@ impl Reason {
                 "Unavailable: this desktop does not report when it was last used, so a person could not take over."
             }
             Reason::NoPermission => {
-                "Unavailable: the agent is not allowed to control the pointer here (macOS: Accessibility)."
+                "Unavailable: roomlerd is not allowed to control the pointer here (macOS: Accessibility)."
             }
             Reason::DeviceDisabled => "Turned off on this computer (keep_busy_enabled = false).",
             Reason::OrgDenied => "Disabled by your organization.",
