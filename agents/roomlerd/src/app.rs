@@ -3971,7 +3971,8 @@ fn owner_of_folder(file: &Path) -> String {
 /// this config's lock and the platform leaves with a clean end (macOS; Linux and
 /// Windows exit 8 here). `hold` is the machine's guard,
 /// `roomlerd::machine_guard::hold_here`, and a stand-in in the run-order test, so
-/// that no test takes the machine's own.
+/// that no test takes the machine's own. What it did decides how this config's
+/// lock is taken ([`config_lock`], #4403).
 async fn start_gate<F, Fut>(
     config_path: &Path,
     unenrolled: bool,
@@ -3981,7 +3982,9 @@ async fn start_gate<F, Fut>(
 ) -> Result<Option<instance_lock::InstanceLock>>
 where
     F: FnOnce(roomlerd::supervision::Supervision) -> Fut,
-    Fut: std::future::Future<Output = Result<(), roomlerd::daemon_error::MachineHeld>>,
+    Fut: std::future::Future<
+            Output = Result<roomlerd::machine_guard::Hold, roomlerd::daemon_error::MachineHeld>,
+        >,
 {
     let at_start = config_at_start::of(config_path, unenrolled, supervision);
     if at_start == config_at_start::AtStart::NoConfig {
@@ -3996,27 +3999,30 @@ where
     // connection are the machine's. Another daemon of this machine holds it: leave with the
     // lock's code (`daemon_error::MachineHeld`). A supervised start waits for it a bounded while
     // first, for a predecessor that is still exiting and holds both.
-    hold(supervision).await?;
+    let held = hold(supervision).await?;
     // Take the single-instance lock before doing anything else. If another agent is already
     // attached to this config (typically the Scheduled Task / systemd unit launched at logon),
     // exit cleanly instead of fighting it for the WS connection. Only `run` gates on the lock —
     // `enroll`, `service install`, `caps`, `displays`, `encoder-smoke`, `self-update` are
-    // intentionally runnable alongside an active agent.
-    let instance_lock =
-        match instance_lock::acquire(config_path).context("acquiring single-instance lock")? {
-            instance_lock::AcquireOutcome::Acquired(g) => g,
-            instance_lock::AcquireOutcome::AlreadyRunning => {
-                // FR-97 P6e (#1538) — never `eprintln!`: on a failing stderr it
-                // panics, and this benign exit became a crash on a Mac.
-                logging::say_on_stderr(
-                    "Another roomlerd is already running for this config; exiting.\n\
+    // intentionally runnable alongside an active agent. #4403 — for the Windows service's own
+    // SYSTEM worker that holds the machine's guard, the guard decides, and that worker still
+    // takes the lock (`config_lock`).
+    let instance_lock = match config_lock(config_path, supervision, held)
+        .context("acquiring single-instance lock")?
+    {
+        instance_lock::AcquireOutcome::Acquired(g) => g,
+        instance_lock::AcquireOutcome::AlreadyRunning => {
+            // FR-97 P6e (#1538) — never `eprintln!`: on a failing stderr it
+            // panics, and this benign exit became a crash on a Mac.
+            logging::say_on_stderr(
+                "Another roomlerd is already running for this config; exiting.\n\
                  (use `roomlerd service status` to check the auto-start hook,\n\
                  or stop the running instance before starting a new one.)",
-                );
-                tracing::warn!("single-instance lock held by another process; exiting");
-                return already_running_exit().map(|()| None);
-            }
-        };
+            );
+            tracing::warn!("single-instance lock held by another process; exiting");
+            return already_running_exit().map(|()| None);
+        }
+    };
     // FR-97 P0e — from here this process IS the daemon, so what it leaves in
     // the host is its own to purge once the runtime is gone
     // (`purge_after_daemon`). Never before the lock: on macOS a second
@@ -4024,6 +4030,53 @@ where
     // otherwise purge the RUNNING daemon's exit routes and pins.
     DAEMON_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(Some(instance_lock))
+}
+
+/// #4403 — this config's single-instance lock, as the machine's guard decides
+/// (`machine_guard::relaxes_config_lock`). The Windows service's own SYSTEM
+/// worker that holds the guard takes each part of the lock that is free and goes
+/// on ([`lock_beside_the_guard`]). Every other run takes the lock as before, and
+/// `AlreadyRunning` = it leaves.
+fn config_lock(
+    config_path: &Path,
+    supervision: roomlerd::supervision::Supervision,
+    held: roomlerd::machine_guard::Hold,
+) -> Result<instance_lock::AcquireOutcome> {
+    if roomlerd::machine_guard::relaxes_config_lock(
+        roomlerd::machine_guard::PLATFORM,
+        supervision,
+        held,
+    ) && let Some(lock) = lock_beside_the_guard(config_path)
+    {
+        return Ok(instance_lock::AcquireOutcome::Acquired(lock));
+    }
+    instance_lock::acquire(config_path)
+}
+
+/// #4403 — [`config_lock`]'s Windows half: the lock beside the machine's guard,
+/// with one line that says what it took. `None` off Windows, where the
+/// predicate never holds.
+fn lock_beside_the_guard(config_path: &Path) -> Option<instance_lock::InstanceLock> {
+    #[cfg(windows)]
+    {
+        let taken = instance_lock::acquire_beside_guard(config_path);
+        if taken.not_taken.is_empty() {
+            tracing::info!("single-instance lock taken beside the machine's guard");
+        } else {
+            let not_taken: Vec<String> = taken.not_taken.iter().map(ToString::to_string).collect();
+            tracing::warn!(
+                not_taken = %not_taken.join("; "),
+                "single-instance lock not fully taken; the service's SYSTEM worker goes on, \
+                 because it holds the machine's guard"
+            );
+        }
+        Some(taken.lock)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config_path;
+        None
+    }
 }
 
 /// The daemon. `Ok(Some(code))` = it ended through the graceful path a
@@ -9306,6 +9359,16 @@ mod smoke_ffmpeg_tests {
 mod machine_gate_tests {
     use super::*;
 
+    /// The gate's cells share `DAEMON_RAN`, which a start that goes on sets: one
+    /// cell at a time.
+    static GATE_CELLS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn one_gate_cell() -> std::sync::MutexGuard<'static, ()> {
+        GATE_CELLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Cell 2 — an unsupervised start on an enrolled config, on a machine whose guard
     /// another daemon holds, is refused at the gate with the typed error (8 off macOS,
     /// 0 on macOS). `DAEMON_RAN` stays false, so no exit purge runs; this config's lock
@@ -9314,6 +9377,7 @@ mod machine_gate_tests {
     fn a_held_machine_leaves_at_the_gate_before_the_lock_and_writes_nothing() {
         use roomlerd::daemon_error::{MachineHeld, exit_code};
         use roomlerd::supervision::Supervision;
+        let _cell = one_gate_cell();
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = dir.path().join("config.toml");
         std::fs::write(&cfg, "agent_token = \"t\"\n").expect("a config");
@@ -9353,6 +9417,104 @@ mod machine_gate_tests {
             .map(|e| e.expect("an entry").file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("config.toml")]);
+    }
+
+    /// #4403 — the lock step of the run order, for what the machine's guard said:
+    /// with this config's lock already held (here by this test), only the Windows
+    /// service's own SYSTEM worker that holds the guard goes on. Every other run
+    /// leaves, as before, on every platform; off Windows that worker leaves too.
+    #[test]
+    fn only_the_service_system_worker_holding_the_guard_goes_on_past_a_held_lock() {
+        use roomlerd::machine_guard::{Hold, Privilege};
+        use roomlerd::supervision::Supervision;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("config.toml");
+        let instance_lock::AcquireOutcome::Acquired(_held) =
+            instance_lock::acquire(&cfg).expect("the lock")
+        else {
+            panic!("this test takes the lock first");
+        };
+        let goes_on = |supervision, held| {
+            matches!(
+                config_lock(&cfg, supervision, held).expect("the lock step"),
+                instance_lock::AcquireOutcome::Acquired(_)
+            )
+        };
+        assert_eq!(
+            goes_on(Supervision::WindowsScm, Hold::Taken(Privilege::System)),
+            cfg!(windows),
+            "the service's SYSTEM worker that holds the guard goes on, on Windows only"
+        );
+        for (supervision, held) in [
+            (Supervision::WindowsScm, Hold::Taken(Privilege::Elevated)),
+            (Supervision::WindowsScm, Hold::Unavailable),
+            (Supervision::WindowsScm, Hold::Free),
+            (Supervision::WindowsScm, Hold::Skipped),
+            (Supervision::WindowsTask, Hold::Taken(Privilege::System)),
+            (Supervision::None, Hold::Taken(Privilege::System)),
+            (Supervision::None, Hold::Taken(Privilege::Elevated)),
+            (Supervision::None, Hold::Taken(Privilege::Root)),
+        ] {
+            assert!(
+                !goes_on(supervision, held),
+                "{supervision:?} {held:?} leaves, as before"
+            );
+        }
+    }
+
+    /// #4403 — the gate itself, on Windows: the service's SYSTEM worker that holds
+    /// the machine's guard (a stand-in here) goes on past this config's lock held
+    /// by this test, and from the gate's end it is the daemon (`DAEMON_RAN`). The
+    /// gate writes nothing. (Off Windows the same start leaves through
+    /// `process::exit`, which a test cannot run; the lock step's cell covers it.)
+    #[cfg(windows)]
+    #[test]
+    fn the_service_system_worker_holding_the_guard_runs_past_a_held_lock() {
+        use roomlerd::machine_guard::{Hold, Privilege};
+        use roomlerd::supervision::Supervision;
+        /// `DAEMON_RAN` back to false when the cell ends, however it ends.
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                DAEMON_RAN.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _cell = one_gate_cell();
+        let _unset = Unset;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "agent_token = \"t\"\n").expect("a config");
+        let before = std::fs::read(&cfg).expect("the config");
+        let instance_lock::AcquireOutcome::Acquired(_held) =
+            instance_lock::acquire(&cfg).expect("the lock")
+        else {
+            panic!("this test takes the lock first");
+        };
+        let asked = std::cell::Cell::new(None);
+        let res = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(start_gate(
+                &cfg,
+                false,
+                Supervision::WindowsScm,
+                None,
+                |s| {
+                    asked.set(Some(s));
+                    async { Ok(Hold::Taken(Privilege::System)) }
+                },
+            ));
+        let lock = res
+            .expect("the gate")
+            .expect("the worker goes on past a held lock");
+        assert_eq!(asked.get(), Some(Supervision::WindowsScm));
+        assert!(
+            DAEMON_RAN.load(std::sync::atomic::Ordering::SeqCst),
+            "from the gate's end this process is the daemon"
+        );
+        drop(lock);
+        assert_eq!(std::fs::read(&cfg).expect("the config"), before);
     }
 }
 
