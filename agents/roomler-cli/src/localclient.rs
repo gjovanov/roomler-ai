@@ -288,7 +288,13 @@ pub async fn peers(args: PeersArgs) -> Result<()> {
         println!("{}", peers_json(&named, display_name)?);
         return Ok(());
     }
-    print_peers(&named, display_name, now_ms());
+    let now = now_ms();
+    print_peers(&named, display_name, now);
+    // #4367: rows kept through a control-socket outage are said to be, after
+    // the table, so the rows stay what older readers parse.
+    for line in control_down_lines(named.iter().map(|n| n.peer), now) {
+        println!("{line}");
+    }
     // An org with no rows is only worth explaining when nothing was asked
     // for by name — a filter narrows the screen to what was named.
     if names.is_empty() {
@@ -3320,6 +3326,15 @@ fn dark_orgs<'a>(
 /// and cut at 34 like the `devices` table; otherwise it is the mesh name in
 /// its fixed cell — byte for byte the table it has always been.
 fn print_peers(named: &[NamedPeer<'_>], display: bool, now_ms: u64) {
+    for line in peers_table(named, display, now_ms) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_peers`] prints, pure so a test reads them: the header,
+/// then `(no peers)` or the rows, grouped by org with a blank line between
+/// groups.
+fn peers_table(named: &[NamedPeer<'_>], display: bool, now_ms: u64) -> Vec<String> {
     let labels: Vec<String> = named.iter().map(|n| peer_label(n, display)).collect();
     let name_w = if display {
         labels
@@ -3331,13 +3346,13 @@ fn print_peers(named: &[NamedPeer<'_>], display: bool, now_ms: u64) {
     } else {
         PEER_NAME_W
     };
-    println!(
+    let mut out = vec![format!(
         "  {:<name_w$} {:<16} {:<26} {:<15} {:>7} LAST SEEN",
         "NAME", "OVERLAY IP", "OVERLAY IP6", "CONN", "RTT"
-    );
+    )];
     if named.is_empty() {
-        println!("(no peers)");
-        return;
+        out.push("(no peers)".to_string());
+        return out;
     }
     let rows: Vec<(&NamedPeer<'_>, &str)> = named
         .iter()
@@ -3347,15 +3362,64 @@ fn print_peers(named: &[NamedPeer<'_>], display: bool, now_ms: u64) {
     for (i, (org, group)) in grouped.into_iter().enumerate() {
         if let Some(org) = org {
             if i > 0 {
-                println!();
+                out.push(String::new());
             }
-            println!("  ── org: {org} ──");
+            out.push(format!("  ── org: {org} ──"));
         }
         for (n, label) in group {
             let cell = fit_label(label, name_w, display);
-            println!("{}", fmt_peer_row_as(n.peer, &cell, name_w, now_ms));
+            out.push(fmt_peer_row_as(n.peer, &cell, name_w, now_ms));
         }
     }
+    out
+}
+
+/// #4367 — the note under the `peers` table for the orgs whose peers are
+/// listed while this device's control socket for that org is down. The daemon
+/// then keeps listing the peers its mesh still holds, each marked
+/// `control_down`: CONN, RTT and LAST SEEN are the data plane's and live, the
+/// ●/○ is the server's last word from before the loss. The rows stay byte for
+/// byte what they always were (older readers parse them), so the mark is said
+/// here, once per org, after the table, as the overlay-off note is.
+///
+/// Empty when no listed peer is marked: a connected daemon, and a daemon older
+/// than the mark, which listed no peer at all while its socket was down.
+fn control_down_lines<'a>(
+    peers: impl IntoIterator<Item = &'a PeerInfo>,
+    now_ms: u64,
+) -> Vec<String> {
+    // Each org once, in the order its first marked peer is listed.
+    let mut down: Vec<(&'a str, Option<u64>)> = Vec::new();
+    for p in peers {
+        let Some(mark) = p.control_down else {
+            continue;
+        };
+        if !down.iter().any(|(org, _)| *org == p.org) {
+            down.push((p.org.as_str(), mark.since_ms));
+        }
+    }
+    if down.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![String::new()];
+    for (org, since) in down {
+        let who = if org.is_empty() {
+            String::new()
+        } else {
+            format!("org {org}: ")
+        };
+        let lost = since.map_or_else(String::new, |ms| {
+            format!(" (lost {})", fmt_last_seen(Some(ms), now_ms))
+        });
+        out.push(format!(
+            "  {who}control plane unreachable{lost}: peers listed from what this device's mesh still holds."
+        ));
+    }
+    out.push(
+        "  CONN, RTT and LAST SEEN are live; ●/○ is the server's last word from before the loss."
+            .to_string(),
+    );
+    out
 }
 
 /// FR-84 D5b — the `devices` table, one row per listed device, then the page
@@ -5051,5 +5115,132 @@ mod display_name_tests {
         assert!(with[1]["display_name"].is_null());
         assert_eq!(with[0]["name"], "laptop", "the mesh name stays alongside");
         assert_eq!(with.as_array().unwrap().len(), 2);
+    }
+}
+
+/// #4367 — a peer list kept through a control-socket outage, as `peers`
+/// prints it, and an older daemon's answer, which carries no mark.
+#[cfg(test)]
+mod control_down_tests {
+    use super::*;
+    use tunnel_core::localapi::ControlDown;
+
+    const NOW: u64 = 1_764_000_000_000;
+
+    /// A peer as the daemon sends it, its carrier measured 3 s ago.
+    fn peer(node: &str, name: &str, org: &str, lost_at: Option<u64>) -> PeerInfo {
+        let mut p: PeerInfo = serde_json::from_str(
+            r#"{"node_id":"x","name":"x","online":true,"connection":"direct","overlay_ip":"100.64.0.5","rtt_ms":12}"#,
+        )
+        .unwrap();
+        p.node_id = node.into();
+        p.name = name.into();
+        p.org = org.into();
+        p.last_seen_ms = Some(NOW - 3_000);
+        p.control_down = lost_at.map(|ms| ControlDown { since_ms: Some(ms) });
+        p
+    }
+
+    fn named(peers: &[PeerInfo]) -> Vec<NamedPeer<'_>> {
+        peers
+            .iter()
+            .map(|p| NamedPeer {
+                peer: p,
+                display_name: None,
+            })
+            .collect()
+    }
+
+    /// The kept rows print exactly as the same rows unmarked; the note after
+    /// them names each org whose socket is down once, with when it was lost;
+    /// `--json` carries the mark as the wire does.
+    #[test]
+    fn a_kept_list_prints_its_rows_unchanged_and_says_so_once_per_org() {
+        let lost = NOW - 12 * 60_000;
+        let kept = [
+            peer("n1", "laptop", "", Some(lost)),
+            peer("n2", "build-box", "", Some(lost)),
+        ];
+        let live = [
+            peer("n1", "laptop", "", None),
+            peer("n2", "build-box", "", None),
+        ];
+        assert_eq!(
+            peers_table(&named(&kept), false, NOW),
+            peers_table(&named(&live), false, NOW),
+            "the mark changes no row"
+        );
+        assert_eq!(
+            control_down_lines(&kept, NOW),
+            vec![
+                String::new(),
+                "  control plane unreachable (lost 12m ago): peers listed from what this device's mesh still holds.".to_string(),
+                "  CONN, RTT and LAST SEEN are live; ●/○ is the server's last word from before the loss.".to_string(),
+            ]
+        );
+        assert!(
+            control_down_lines(&live, NOW).is_empty(),
+            "a live list has no note"
+        );
+
+        // Two orgs, only the second one's socket down: the note names it alone.
+        let mixed = [
+            peer("n1", "laptop", "primary", None),
+            peer("n3", "lab-a", "acme", Some(NOW - 3 * 60_000)),
+            peer("n4", "lab-b", "acme", Some(NOW - 3 * 60_000)),
+        ];
+        let lines = control_down_lines(&mixed, NOW);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "  org acme: control plane unreachable (lost 3m ago): peers listed from what this device's mesh still holds."
+        );
+
+        // `--json` is the wire: each kept peer carries its mark.
+        let json: serde_json::Value =
+            serde_json::from_str(&peers_json(&named(&kept), false).unwrap()).unwrap();
+        assert_eq!(json[0]["control_down"]["since_ms"], lost);
+        assert_eq!(json[1]["control_down"]["since_ms"], lost);
+        assert!(
+            !peers_json(&named(&live), false)
+                .unwrap()
+                .contains("control_down"),
+            "an unmarked peer's JSON is what it was"
+        );
+    }
+
+    /// An older daemon's answer has no mark: the table is the one `peers`
+    /// always printed (the header, then each row as `fmt_peer_row` pins it,
+    /// or `(no peers)`, which is what such a daemon sends while its control
+    /// socket is down), and no note follows it.
+    #[test]
+    fn an_older_daemons_answer_prints_the_table_it_always_did() {
+        let header = format!(
+            "  NAME{}OVERLAY IP{}OVERLAY IP6{}CONN{}RTT LAST SEEN",
+            " ".repeat(17),
+            " ".repeat(7),
+            " ".repeat(16),
+            " ".repeat(16)
+        );
+        let older: Vec<PeerInfo> = serde_json::from_str(
+            r#"[{"node_id":"n1","name":"laptop","online":true,"connection":"direct","overlay_ip":"100.64.0.5","rtt_ms":12,"last_seen_ms":1763999997000},
+                {"node_id":"n2","name":"nas","online":false,"connection":"offline","overlay_ip":"100.64.0.6"}]"#,
+        )
+        .unwrap();
+        assert!(older.iter().all(|p| p.control_down.is_none()));
+        assert_eq!(
+            peers_table(&named(&older), false, NOW),
+            vec![
+                header.clone(),
+                fmt_peer_row(&older[0], NOW),
+                fmt_peer_row(&older[1], NOW)
+            ]
+        );
+        assert!(control_down_lines(&older, NOW).is_empty());
+        assert_eq!(
+            peers_table(&[], false, NOW),
+            vec![header, "(no peers)".to_string()],
+            "an older daemon's answer while its socket is down"
+        );
     }
 }

@@ -127,10 +127,15 @@
       (dns.answer_aaaa ? '' : ' · AAAA off');
   }
 
+  // #4367: while a control socket is down the daemon keeps listing the
+  // peers its mesh still holds, each marked `control_down`; their `online`
+  // is the server's word from before the outage, so the count says so.
   function paintCounts(dv) {
     const peers = (dv && dv.peers) || [];
     const online = peers.filter((p) => p.online).length;
+    const kept = peers.filter((p) => p.control_down).length;
     let text = online + ' of ' + peers.length + ' devices online';
+    if (kept) text += kept === peers.length ? ' (last known)' : ' (' + kept + ' last known)';
     if (routesActive !== null) text += ' · ' + routesActive + ' routes active';
     setText('ov-counts', peers.length ? text : '—');
   }

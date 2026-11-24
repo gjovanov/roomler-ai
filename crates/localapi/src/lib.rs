@@ -7777,6 +7777,48 @@ mod tests {
         assert!(serde_json::from_str::<PeerInfo>(&s).unwrap().stalled);
     }
 
+    /// #4367 — `PeerInfo.control_down` is additive in both directions: an
+    /// older daemon's payload (no key) reads as no mark, an unset mark stays
+    /// off the wire, a set one round-trips with its time, a mark without a
+    /// time is still a mark, and an older reader parses a payload carrying it.
+    #[test]
+    fn peer_info_control_down_wire_compat() {
+        // Absent → None (an older daemon talking to a newer CLI).
+        let old = r#"{"node_id":"n1","name":"pc","online":true,"connection":"direct"}"#;
+        let p: PeerInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(p.control_down, None);
+        // Unset → off the wire: a connected daemon's `peers --json` is unchanged.
+        assert!(!serde_json::to_string(&p).unwrap().contains("control_down"));
+        // Set → round-trips with its time.
+        let mut kept = p.clone();
+        kept.control_down = Some(ControlDown {
+            since_ms: Some(1_764_000_000_000),
+        });
+        let s = serde_json::to_string(&kept).unwrap();
+        assert!(
+            s.contains(r#""control_down":{"since_ms":1764000000000}"#),
+            "{s}"
+        );
+        assert_eq!(serde_json::from_str::<PeerInfo>(&s).unwrap(), kept);
+        // A mark the daemon cannot time is still a mark.
+        let bare: PeerInfo = serde_json::from_str(
+            r#"{"node_id":"n1","name":"pc","online":true,"connection":"direct","control_down":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(bare.control_down, Some(ControlDown { since_ms: None }));
+        // An OLDER reader (no such field) still parses the newer payload.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OldPeerInfo {
+            node_id: String,
+            name: String,
+            online: bool,
+        }
+        let as_old: OldPeerInfo =
+            serde_json::from_str(&s).expect("a newer payload must not choke an older reader");
+        assert_eq!((as_old.node_id.as_str(), as_old.online), ("n1", true));
+    }
+
     #[tokio::test]
     async fn set_device_name_wire_shape_and_default_unsupported() {
         // Wire lock: adjacently tagged, snake_case.
@@ -11978,6 +12020,10 @@ mod tests {
             rx_denied: 0,
             rx_denied_noroute: 0,
         });
+        // #4367 — a peer kept through the root half's control-socket outage.
+        p.control_down = Some(ControlDown {
+            since_ms: Some(1_764_000_000_000),
+        });
         let Response::Peers(out) = person_view(Response::Peers(vec![p.clone()])) else {
             panic!("a Peers answer stays a Peers answer");
         };
@@ -11996,6 +12042,10 @@ mod tests {
         assert_eq!(q.rtt_ms, p.rtt_ms);
         assert_eq!(q.relay_kind.as_deref(), Some("derp"));
         assert_eq!(q.relay_transport.as_deref(), Some("tcp"));
+        assert_eq!(
+            q.control_down, p.control_down,
+            "the mark crosses the person socket: it says how old the list is"
+        );
         let status = Response::Status(Box::new(Mock.status()));
         assert_eq!(person_view(status.clone()), status);
     }
