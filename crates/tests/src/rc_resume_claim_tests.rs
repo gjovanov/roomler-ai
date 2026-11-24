@@ -143,7 +143,7 @@ pub(crate) async fn hello_with(
 }
 
 /// The device's `rc:agent.hello`, advertising `rpc` and claiming back `kept`.
-fn hello_frame(rpc: &[&str], kept: &[ObjectId], max_sessions: u8) -> Value {
+pub(crate) fn hello_frame(rpc: &[&str], kept: &[ObjectId], max_sessions: u8) -> Value {
     let mut hello = json!({
         "t": "rc:agent.hello",
         "machine_name": "fr138 test box",
