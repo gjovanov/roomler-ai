@@ -121,7 +121,7 @@ working two-row.
 | Keep | writes root's records, in root's tree only | nothing: no `.pre-one-row` in a home |
 | LaunchAgent | `launchctl bootout gui/<uid>/com.roomler.agent`, by label, as before (`bootout_agent`, `:3733`) | the plist is removed by `convert` |
 | Root's file | `config::save` of `/etc/roomler/config.toml`, as today | nothing |
-| People's files | nothing | `convert`: removes `<P>` and writes its config with the enrollments taken out (`without_enrollments`, `:556`), each only over the bytes root kept. The new config is made from the bytes it checked (`config::serialise_over`, which keeps the keys this build does not know), and those bytes are kept as the config's `.prev`, 0600, as a save keeps the outgoing file; it reads no file again by path. The files are born the person's |
+| People's files | nothing | `convert`: removes `<P>` and writes its config with the enrollments taken out (`without_enrollments`, `:556`), each only over the bytes root kept. The new config is made from the bytes it checked (`config::serialise_over`, which keeps the keys this build does not know), and it is written as the config's `.prev` too, 0600, before the config: the outgoing bytes are kept in root's records alone, since a load restores a `.prev` (#4184, "Refusals at convert"); it reads no file again by path. The files are born the person's |
 | Restart, verify, report | as before (`wait_for_new_daemon`, `:2368`; `verify`, `:2507`; `report`, `:2525`) | nothing |
 | Undo | its file back from its kept copy; its records removed after the restart answers | `put-back` of both files from root's records, then, once the restart has answered, the bootstrap (D6) |
 | `--revert` | its file back from its kept copy; its records removed after the restart answers | `put-back`, or `put-back-legacy` on a Mac converted by any release before root's side |
@@ -138,7 +138,7 @@ sequenceDiagram
     R->>D: bootout gui/uid/com.roomler.agent
     R->>R: root's file - both switches, the moved enrollments
     R->>C: convert --expect-config --expect-plist
-    C-->>R: the new config's sha256, the plist removed
+    C-->>R: the new config's sha256 (kept as its .prev too), the plist removed
     R->>R: restart and verify
     alt a step or the verify fails
         R->>R: root's file back
@@ -230,7 +230,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:3257`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:3269`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:999`) and `folder_words` (`:1132`), with `r5_words` (`:1178`); `refusals` (`:1520`) says them.
 
 ### Refusals at Plan
@@ -272,6 +272,26 @@ the root half holds is refused too.
 | A person, not held | `<name>'s enrollment (<server>, tenant <tenant>) is ephemeral, and the root half does not hold that org: an ephemeral row lives only with the half that enrolled it, so it cannot move to the root half. Remove it on the Devices page (an ephemeral row never turns permanent) and enroll <name>'s half again with a key that is not ephemeral: that half's config keeps its settings. Then run this again. Nothing has changed` |
 | `--revert`, root's kept copy | `--revert is refused: the root half's enrollment (<server>, tenant <tenant>) in /etc/roomler/config.toml.pre-one-row, which --revert puts back first, is ephemeral: --revert restarts the daemon onto that file, and on that stop an ephemeral row deletes itself, so the root half would come back on a dead token. Remove it on the Devices page (an ephemeral row never turns permanent), remove /etc/roomler/config.toml.pre-one-row, whose enrollment cannot come back, and enroll the root half again with a key that is not ephemeral: /etc/roomler/config.toml keeps its settings. Then run this again. Nothing has changed` |
 | `--revert`, no kept copy | the same, naming `/etc/roomler/config.toml` and with nothing to remove |
+
+### Refusals at convert
+
+One stop comes after the plan was said, from the person's own process (#4184). `convert` writes the new config as
+its `.prev` before it writes it as the config, both the way every write of the child goes (`RealFs::write`,
+`agents/roomlerd/src/one_row_home.rs:1657-1681`; `write_temp`, `:1531-1544`): a new temporary file in the folder,
+`fsync`, then a `rename` over the name. A rename asks only for write on the folder, which `convert` checks before it
+changes anything, so a `.prev` the person may not write, one another account owns among them, is replaced. Where the
+name still cannot be replaced (a folder there, a file locked by a flag, a full disk), what is there may be an older
+`.prev` that holds the enrollments this conversion takes out, and a load of the config restores it
+(`crates/agent-core/src/config.rs:3627-3674`). So `convert` stops with exit 1, after the plist went and before the
+config, and the undo puts both files back (C in "Order, failure and undo"). Before #4184 a `.prev` that could not be
+written was a note on stderr, and the conversion went on.
+
+| Case | That process's line, quoted after `stderr` in the command's output and in `/var/log/roomler/one-row.log` |
+|---|---|
+| A `.prev` it cannot replace | ``<F>/config.toml.prev could not be replaced (<the error>), so <F>/config.toml was not converted: what is at that name may hold the enrollments this conversion takes out, and a load of the config restores it. Remove what is there or free disk space, then run `sudo roomlerd one-row` again`` |
+
+The command then says `stopped: <name>'s files: it failed (exit 1)`, the undo's lines and `the Mac is as it was`,
+and fails with `one row did not take, and the Mac is as it was` (`one_row.rs:1859-1864`).
 
 ### Root's records
 
@@ -321,7 +341,7 @@ verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
 | Verb | stdin | Reply | Exit |
 |---|---|---|---|
 | `read` | none | `home`: kind, uid and mode of `pw_dir`, whether it is an absolute path (it starts with `/` and does not end with one), and its device and inode; `library`, `agents_dir`, `folder`: kind (`dir`, `file`, `link`, `other`, `absent`), uid, mode, and, for each of the three, whether the person can write it; `segment`; `config`, `plist`: absent, or the bytes with uid and mode, or an error (`eacces`, `too_large`, `not_regular`, `other`) with uid and mode, where anything but a regular file (a link, a socket, a device) reads as `not_regular`; `legacy`: each name an old copy is kept under, reported as a folder is: kind, uid, mode and whether the person can write it (`other` with no uid and no mode when it could not be looked at) | 0 |
-| `convert --expect-config <hex\|none> --expect-plist <hex\|none>` | none | the sha256 of the config it wrote; whether the plist was removed | 0; 3 when either live file is not the expected bytes, or is no longer a regular file (it checks both before it changes either) |
+| `convert --expect-config <hex\|none> --expect-plist <hex\|none>` | none | the sha256 of the config it wrote; whether the plist was removed | 0; 3 when either live file is not the expected bytes, or is no longer a regular file (it checks both before it changes either); 1 when the config's `.prev` cannot be replaced, after the plist went and before the config (#4184) |
 | `put-back` | the kept bytes and modes of both files | the sha256 of each file written | 0; 4 when `<L>` is not writable |
 | `put-back-legacy` | none | which old copies it moved | 0; 3 when anything but a file is at an old copy's name (a folder, a link, a socket); 4, naming `<F>`, when an old copy's name could not be looked at (`<F>` does not let the person through); either way before anything is renamed; 4 as in `--revert` below |
 | all | | | 2: usage, a failed identity check or another version; 4: not writable (stderr: path, owner, mode); 1: any other error |
@@ -592,6 +612,7 @@ exists only as an argument list, built by `bootstrap_argv`.
 | `an_entry_that_is_not_its_owners_home_is_left_alone`, `two_entries_of_one_uid_are_one_person`, `a_home_with_no_account_is_left_alone` | which homes are people |
 | `read_reports_bytes_owners_and_legacy_names`, `convert_refuses_bytes_it_was_not_shown`, `a_fifo_or_an_oversize_file_is_an_error_not_a_wait`, `the_child_ignores_the_home_it_was_given` | the child, on a temporary home |
 | `an_ephemeral_root_half_stops_the_plan_and_changes_nothing`, `a_held_ephemeral_person_stops_the_plan_for_the_row_it_would_lose`, `an_unheld_ephemeral_person_is_refused_in_words_true_for_it`, `an_ephemeral_half_the_root_does_not_hold_stops_the_plan`, `a_mixed_mac_stops_on_its_ephemeral_person_and_writes_nothing`, `revert_refuses_an_ephemeral_root_half_before_any_change`, `an_ephemeral_mac_that_is_one_row_already_is_left_alone` | #4312, "Refusals at Plan": an ephemeral row is refused with the fake host's files as they were, no write and no `launchctl` call. The root half's, a dry run's included; a person's, held or not, and on a Mac with a permanent person beside it; `--revert`'s, from root's kept copy and, on a Mac an older release converted, from root's own file. A Mac that is one row already is left alone as before. The first six read failing on master's code first |
+| `convert_keeps_the_new_config_as_its_prev_0600`, `after_convert_no_load_of_the_config_brings_the_enrollment_back`, `a_prev_it_cannot_replace_stops_convert_before_the_config`, `a_failed_verb_keeps_its_notes`, `on_disk::convert_replaces_a_prev_it_may_not_write_and_keeps_the_unknown_key`, `after_a_conversion_roots_records_are_the_only_copy_of_the_enrollment`, `a_conversion_stopped_at_any_step_leaves_the_person_a_config_that_loads`, `a_prev_the_person_cannot_replace_stops_the_conversion_and_says_what_to_do` | #4184, "Refusals at convert": the new config is kept as its `.prev`, 0600, over an older `.prev` that holds the enrollment, and on disk over one its owner may not write; the person's files, loaded through `config::load` with the config as it is, removed, all NUL and not TOML, give no enrollment and leave none at the config's path. The same through the whole conversion on the fake Mac, whose `convert` and `put-back` are `one_row_home`'s own (`with_real_child`): root's records hold the outgoing bytes, stay as the conversion left them, and `--revert` gives them back. A conversion stopped at each of its steps, and at each step of its undo that can fail, leaves the person a config that loads: put back as it was, or converted with no enrollment to restore. A `.prev` it cannot replace is exit 1 before the config, its line says what to do, and the undo puts the config and the plist back. The seven that run on every lane read failing on master's `convert` first; of the stops, only the `.prev` one did, as the others pin the undo as it was. The on-disk one runs on the Unix lanes only |
 
 No unit test shows the child's group list: a child started as another uid needs root, and Linux empties the list
 where macOS does not. Cell C8 reads it.
@@ -600,7 +621,7 @@ where macOS does not. Cell C8 reads it.
 
 | Cell | Pass line |
 |---|---|
-| C1 two-row, one person at the console, then `one-row --yes` | `<F>`, `config.toml` and `config.toml.prev` are the person's; `find /Users -name '*.pre-one-row'` is empty; `/etc/roomler/one-row/<uid>` is root's 700 with files 600; `gui_worker attached: true` and `screen-capture` |
+| C1 two-row, one person at the console, then `one-row --yes` | `<F>`, `config.toml` and `config.toml.prev` are the person's, and `config.toml.prev` holds no enrollment (#4184: count the key names, print no value); `find /Users -name '*.pre-one-row'` is empty; `/etc/roomler/one-row/<uid>` is root's 700 with files 600; `gui_worker attached: true` and `screen-capture` |
 | C2 then `--revert` | config and plist sha256 as before C1; owners the person's; plist mode 644; `launchctl print gui/<uid>/com.roomler.agent` loaded where the kept root file had supervision off; the records gone; two rows online. Since #4092, twice: both rows online within 60 s with no login, the person's agent running with no `single-instance lock held` line in its log, and `bootstrapped:` after the restart's line in `one-row.log` |
 | C3 a second person, enrolled, not signed in | their file blanked and still theirs after C1, restored by C2; no bootstrap for them |
 | C4 a failed conversion (no Screen Recording grant) | the undo: `config.toml` and the plist byte-identical and owned as before; no record left. Since #4092 (a failed conversion after its restart): the person's agent running after the undo, with no `single-instance lock held` line |
@@ -640,7 +661,7 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2998`, its sequence at `:3026`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2998`, its sequence at `:3038`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:3196`): one-row's row, and
@@ -713,10 +734,17 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - Screen Recording and Accessibility grants (FR-144).
 - The running two-row worker saving the person's config during the conversion, as today.
 - Repairing a `~/Library/LaunchAgents` that an earlier package made (#3763).
-- The person's `config.toml.prev` after a conversion still holds the enrollment that moved to root (a save keeps the
-  previous file), and the person's agent's `.prev` repair (`config.rs:3627-3674`) could bring it back: its own issue
-  (#4184). The worker root's supervisor starts never restores it at its start (#4157): with `--unenrolled` it writes
-  a blank file, and without it (`macos_one_row` turned off by hand, with no `--revert`) it ends with 78 as before.
+- The person's `config.toml.prev` after a conversion held the enrollment that moved to root, and a load of the
+  person's config (`config.rs:3627-3674`) could bring it back. #4184 fixed that for every conversion from its release
+  on: `convert` keeps the new config as its `.prev` too ("Refusals at convert"). Left out of #4184, each named: a
+  Mac converted before it keeps the enrolled `.prev` until that person's next save rotates the new file in, which
+  for the console person is the screen worker's clean-run save five minutes in (`app.rs:5677`), while a person not
+  at the console has no writer; on such a Mac, with `macos_one_row` turned off by hand, the supervisor's enrolled
+  worker that finds a config there that does not load restores that `.prev` through `app.rs:4044` and runs the
+  copy, since `may_restore` (`config_at_start.rs:74-85`, #4157) covers only a missing config; and a
+  `.prev` beside a person config that is missing, which Read never sees and `convert` leaves. The worker root's
+  supervisor starts never restores a missing config at its start (#4157): with `--unenrolled` it writes a blank
+  file, and without it (`macos_one_row` turned off by hand, with no `--revert`) it ends with 78 as before.
 - Linux and Windows: their root steps take their folders from the system already (#3702). On Linux that holds for
   the daemons systemd starts; a root command typed through a `sudo` that keeps the caller's `HOME` is #3866's (the
   source gate's Linux rows). The uninstall's Linux arm
@@ -731,3 +759,4 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 | 2026-11-21 | #4122, a gap #4113 (#4097) opened: a stop inside L2's Keep again (a crash, a kill, a power loss) leaves the person's folder without its `record.json` and their agent booted out, and `--revert` removed the folder as a Keep that never finished without loading that agent again, so the console person's row stayed offline until their next login. The fix decides it in `revert_plan`: that folder's person, where they are the console user, root's file put back leaves that half to its LaunchAgent, their own `read` finds their plist in their home and their job is not loaded. The plan says it in the words a person given back gets, its digest holds it, and the bootstrap comes once the restart has answered, through `start_agent` as for a person given back, after `launchctl print` is read again | RED on master's code in the fake's tests: no bootstrap after the restart, the plan's line without it, and no line for a restart that does not answer, a failed bootstrap or a job loaded since the plan; a Keep that stopped before the bootout, and the cells the rule does not name, loaded nothing there and still load nothing. GREEN with the fix. No lab cell: a lab cannot stop the command inside that Keep on purpose |
 | 2026-11-21 | #4227, found by #4122's worker: a run that stops after a person's Keep has written their `record.json` and before L boots their agent out leaves a whole record and a loaded job. `--revert` gave that person back and bootstrapped the loaded job anyway: launchd refused it, the Mac host tried five times, and the command's last line said the agent did not start while it ran. The fix: `start_agent` reads the job right before its bootstrap, for both of `--revert`'s paths and the undo; a loaded job is not bootstrapped again, one line says so, and the kickstart without `-k` still follows, after the worker's wait where there is one. The plan says it for a person given back (their LaunchAgent, already loaded, is started after the restart if it is not running), and its digest holds that read. `-k`, read in the code first: no path of one-row's own, and no login, loads the job while an agent runs on a config the run changed (L comes before any change, `convert` removes the plist before the config, a put-back writes the config before the plist); only a package install or update whose postinstall runs between root's file put back and that person's files can, and nothing is built for it | RED on master's code in the fake's tests, which now refuse a bootstrap of a loaded job as launchd does: the bootstrap of a person given back after that stop, the plan's "bootstrapped" for them, the undo's bootstrap of a job a login loaded again, and #4224's job loaded since the plan, left without a kickstart. GREEN with the fix; a job not loaded is bootstrapped and kickstarted as before. No lab cell: a lab cannot stop the command between the Keep and the bootout on purpose |
 | 2026-11-22 | #4287, left by #4227: when the restart onto the files put back does not answer, `--revert` and the undo said of every agent they did not start that launchd loads it at the next login. Since #4227 the job can be loaded by then (a run that stopped after the Keep and before the bootout, or a login since), and for it that line was wrong twice: nothing loads a loaded job at the next login, and an agent that exited while the one-row screen worker held its lock is started only by a kickstart. The fix reads the job as the line is said (`not_bootstrapped`): not loaded, the line as before; loaded, that it was not started here, as the daemon did not restart, and that `sudo launchctl kickstart gui/<uid>/com.roomler.agent` starts it if it is not running. The restart, the order, the records, the plan and its digest, and the bootstrap once a restart has answered are unchanged | RED on master's code in the fake's tests for both callers: the loaded cells (a login as the revert or the undo restarts) got the next-login line. GREEN with the fix; the cells not loaded keep their line. No lab cell: a real Mac cannot be made to miss the restart's answer on purpose |
+| 2026-11-23 | #4184, found in a code read while #4157 was built: `convert` kept the person's outgoing config, which holds the enrollments that move to root, as `config.toml.prev`, and `config::load` restores a `.prev` when the config is missing or does not load. On a converted Mac the screen worker's start (a config that does not load), its clean-run save, its graceful stop, its LocalAPI `config_entries`, `config_set` and `restart_daemon`, the recording manager and child, the desktop app (a config that does not load), and `roomlerd org` and `re-enroll` typed by hand all load the person's config that way. The fix keeps the new config as the `.prev` too, written first, and a `.prev` that cannot be replaced is exit 1 before the config. No path back reads the person's `.prev`: the undo and `--revert` give back root's records, and `put-back-legacy` renames an older release's copies | RED on master's code: the `.prev` was the outgoing file, a load with the config removed made the enrollment live, and a `.prev` that could not be written let the conversion go on. GREEN with the fix. No lab read in this PR: C1's pass line reads it on the next candidate |

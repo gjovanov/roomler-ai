@@ -532,7 +532,7 @@ marks (#4157), and logs *RESTORED* or *RECOVERED from the previous good copy* at
 When no usable copy exists, it logs that the host must be enrolled (again) or re-enrolled,
 at ERROR, and fails. A diagnostic must never write the device's config as a side effect of being run.
 Since #4157 a start restores a missing file the same way, except the macOS supervisor's enrolled worker, which
-ends with 78 as before: on a converted one-row Mac the person's `.prev` can hold the enrollment that moved to root (#4184).
+ends with 78 as before: on a one-row Mac an earlier release converted, the person's `.prev` can hold the enrollment that moved to root (#4184).
 
 ## 9. Code map
 

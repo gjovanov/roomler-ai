@@ -50,8 +50,8 @@
 //! `rename`, as the daemon saves its config. `convert` writes only from the
 //! bytes it checked, and reads no file again by path: the new config is the
 //! text a save would write over them (`config::serialise_over`, which keeps
-//! the keys this build does not know), and they are kept as the config's
-//! `.prev` (0600), as a save keeps the outgoing file. `put-back` gives the
+//! the keys this build does not know), kept first as its `.prev` too (0600):
+//! root's records alone keep the outgoing bytes (#4184). `put-back` gives the
 //! plist its recorded mode less group and other write (0644 when none was
 //! recorded: launchd ignores a plist others can write) and the config its
 //! recorded owner bits (0600 when none), and makes a missing
@@ -1112,10 +1112,10 @@ fn not_writable(fs: &impl Fs, path: &Path) -> Fail {
 /// `convert`: both live files checked against what root named, both folders
 /// it changes checked writable, and the new config made from the bytes it
 /// checked and held to its bound, before anything changes; then the plist
-/// goes, those bytes are kept as the config's `.prev` and the new config is
-/// written. The reply's sha256 is of the bytes it wrote: no file is read
-/// again by path. The keys of the outgoing config it could not keep, and a
-/// `.prev` it could not write, go in `said`.
+/// goes, and the new config is written as the config's `.prev` (#4184), then
+/// as the config. The reply's sha256 is of the bytes it wrote: no file is
+/// read again by path. The keys of the outgoing config it could not keep go
+/// in `said`; a `.prev` it could not write is exit 1, before the config.
 fn convert(
     at: &Places,
     want_config: Expect,
@@ -1156,7 +1156,7 @@ fn convert(
                     lost.join(", ")
                 ));
             }
-            Some((bytes, blank))
+            Some(blank)
         }
         None => None,
     };
@@ -1169,16 +1169,20 @@ fn convert(
         None => false,
     };
     let config_sha256 = match blank {
-        Some((outgoing, blank)) => {
-            // Kept as a save keeps the outgoing file: it parsed, and a copy
-            // that cannot be made costs its recovery, not the verb.
+        Some(blank) => {
+            // #4184 — the new file is the `.prev` too, written first: a load
+            // restores the `.prev` of a config that is missing or does not
+            // load, and one left as it was may hold the enrollments.
             let prev = crate::config::prev_path(&at.config);
-            if let Err(e) = fs.write(&prev, outgoing, 0o600) {
-                said.push(format!(
-                    "the outgoing config was not kept as {}: {e}",
+            fs.write(&prev, blank.as_bytes(), 0o600).map_err(|e| {
+                Fail::Error(format!(
+                    "{} could not be replaced ({e}), so {origin} was not converted: what is at \
+                     that name may hold the enrollments this conversion takes out, and a load of \
+                     the config restores it. Remove what is there or free disk space, then run \
+                     `sudo roomlerd one-row` again",
                     prev.display()
-                ));
-            }
+                ))
+            })?;
             fs.write(&at.config, blank.as_bytes(), 0o600)
                 .map_err(|e| Fail::Error(format!("saving {origin}: {e}")))?;
             Some(sha256_hex(blank.as_bytes()))
@@ -1691,6 +1695,11 @@ impl Fs for RealFs {
     }
 }
 
+/// #4184 — for `one_row`'s fake Mac, whose people's `convert` and `put-back`
+/// are this module's own.
+#[cfg(test)]
+pub(crate) use tests::{ChildHome, assert_no_load_brings_an_enrollment_back};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1792,6 +1801,8 @@ mod tests {
         calls: RefCell<Vec<String>>,
         /// Every `write` fails, as on a full disk.
         writes_fail: bool,
+        /// #4184 — a `write` of this one path fails.
+        fails_at: Option<PathBuf>,
     }
 
     /// #3802, moved from `macos_supervisor`'s tests (FR-147): the names the
@@ -1811,6 +1822,7 @@ mod tests {
                 nodes: BTreeMap::new(),
                 calls: RefCell::new(Vec::new()),
                 writes_fail: false,
+                fails_at: None,
             }
         }
 
@@ -1917,7 +1929,7 @@ mod tests {
         }
         fn write(&mut self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
             self.log(format!("write {} {mode:o}", path.display()));
-            if self.writes_fail {
+            if self.writes_fail || self.fails_at.as_deref() == Some(path) {
                 return Err(io::Error::other("no space left"));
             }
             self.put(path, Kind::File, UID, mode, bytes.to_vec(), true);
@@ -2437,16 +2449,210 @@ mod tests {
         );
     }
 
-    /// The outgoing config is kept as its `.prev`, 0600, as a save keeps it.
+    /// #4184 — the new config is kept as its `.prev` too, 0600: the outgoing
+    /// one holds the enrollments that move to root, and `config::load`
+    /// restores the `.prev` of a config that is missing or does not load.
+    /// Root's records keep the outgoing bytes.
     #[test]
-    fn convert_keeps_the_outgoing_config_as_prev_0600() {
+    fn convert_keeps_the_new_config_as_its_prev_0600() {
         let (mut fs, at) = a_home();
         let verb = shown(&at, &fs);
         let out = answer(verb, &at.home, &creds(), &[], &mut fs);
         assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
         let prev = &fs.nodes[&crate::config::prev_path(&at.config)];
-        assert_eq!(prev.bytes, ENROLLED.as_bytes());
+        assert_eq!(prev.bytes, fs.nodes[&at.config].bytes);
         assert_eq!(prev.mode, 0o600);
+        let text = std::str::from_utf8(&prev.bytes).unwrap();
+        assert!(!enrolled(&crate::config::parse_text(text, "prev").unwrap()));
+    }
+
+    /// #4184 — the person's files as `convert` leaves them, over an older
+    /// `.prev` that holds the enrollment, loaded the way every reader of the
+    /// person's config loads them: no load makes that enrollment live again.
+    #[test]
+    fn after_convert_no_load_of_the_config_brings_the_enrollment_back() {
+        let (mut fs, at) = a_home();
+        let prev = crate::config::prev_path(&at.config);
+        fs.file(&prev, ENROLLED.as_bytes(), 0o600);
+        let verb = shown(&at, &fs);
+        let out = answer(verb, &at.home, &creds(), &[], &mut fs);
+        assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG);
+        std::fs::write(&path, &fs.nodes[&at.config].bytes).unwrap();
+        std::fs::write(crate::config::prev_path(&path), &fs.nodes[&prev].bytes).unwrap();
+        assert_no_load_brings_an_enrollment_back(&path);
+    }
+
+    /// #4184 — a `.prev` it cannot replace stops `convert` before the config,
+    /// exit 1: what stays there may hold the enrollment. The plist is gone by
+    /// then, so root's undo puts both files back. The line names the file and
+    /// says what to do.
+    #[test]
+    fn a_prev_it_cannot_replace_stops_convert_before_the_config() {
+        let (mut fs, at) = a_home();
+        let prev = crate::config::prev_path(&at.config);
+        fs.file(&prev, ENROLLED.as_bytes(), 0o600);
+        fs.fails_at = Some(prev.clone());
+        let verb = shown(&at, &fs);
+        let out = answer(verb, &at.home, &creds(), &[], &mut fs);
+        assert_eq!(out.exit, Exit::Error, "{}", out.stderr);
+        assert!(out.stdout.is_empty());
+        assert!(
+            out.stderr.contains(&prev.display().to_string())
+                && out.stderr.contains("run `sudo roomlerd one-row` again"),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(fs.nodes[&at.config].bytes, ENROLLED.as_bytes());
+        assert_eq!(
+            fs.changes(),
+            [
+                format!("remove {}", at.plist.display()),
+                format!("write {} 600", prev.display()),
+            ]
+        );
+    }
+
+    /// Any enrollment at all: the primary's identity, an `[[orgs]]` entry, or
+    /// the WireGuard key that goes with them (`one_row::without_enrollments`).
+    pub(crate) fn enrolled(cfg: &crate::config::AgentConfig) -> bool {
+        !cfg.agent_token.is_empty()
+            || !cfg.agent_id.is_empty()
+            || !cfg.orgs.is_empty()
+            || cfg.overlay_wg_secret_key.is_some()
+    }
+
+    /// #4184 — the config at `path` and its `.prev`, as a conversion left
+    /// them, loaded through `config::load` as every reader of the person's
+    /// config loads it: as it is, removed, all NUL (an unclean shutdown's
+    /// file) and not TOML, each time with the `.prev` as it was left. Each
+    /// load gives a config with no enrollment in it, and leaves one at `path`.
+    pub(crate) fn assert_no_load_brings_an_enrollment_back(path: &Path) {
+        let path = path.to_path_buf();
+        let prev = crate::config::prev_path(&path);
+        let config = std::fs::read(&path).expect("the converted config");
+        let kept = std::fs::read(&prev).ok();
+        let put = |at: &Path, bytes: Option<&[u8]>| match bytes {
+            Some(bytes) => std::fs::write(at, bytes).unwrap(),
+            None => match std::fs::remove_file(at) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => panic!("removing {}: {e}", at.display()),
+            },
+        };
+        let cases: [(&str, Option<Vec<u8>>); 4] = [
+            ("as it is", Some(config.clone())),
+            ("removed", None),
+            ("all NUL", Some(vec![0; config.len()])),
+            ("not TOML", Some(b"not = [toml".to_vec())),
+        ];
+        for (case, live) in cases {
+            put(&path, live.as_deref());
+            put(&prev, kept.as_deref());
+            let cfg = crate::config::load(&path)
+                .unwrap_or_else(|e| panic!("{case}: the person's config does not load: {e:#}"));
+            assert!(!enrolled(&cfg), "{case}: a load made the enrollment live");
+            let left = crate::config::read_if_present(&path)
+                .unwrap_or_else(|| panic!("{case}: no config that loads at {}", path.display()));
+            assert!(
+                !enrolled(&left),
+                "{case}: an enrolled file at {}",
+                path.display()
+            );
+        }
+    }
+
+    /// #4184 — a person's home for `one_row`'s fake Mac, whose `convert` and
+    /// `put-back` that Mac has done as this module does them ([`answer`]), on
+    /// [`FakeFs`]: a test through the whole conversion then reads what the
+    /// person's own process leaves, the `.prev` included.
+    pub(crate) struct ChildHome {
+        fs: FakeFs,
+        home: PathBuf,
+    }
+
+    impl ChildHome {
+        /// A home as [`a_home`] makes one, holding `config` and `plist`
+        /// (`(bytes, mode)` each) where they are given.
+        pub(crate) fn with(
+            config: Option<&(Vec<u8>, u32)>,
+            plist: Option<&(Vec<u8>, u32)>,
+        ) -> ChildHome {
+            let (fs, at) = a_home();
+            let mut home = ChildHome { fs, home: at.home };
+            home.hold(config, plist);
+            home
+        }
+
+        /// The config and the plist made `config` and `plist`, and taken
+        /// away where they are not given; the `.prev` stays as it is.
+        pub(crate) fn hold(
+            &mut self,
+            config: Option<&(Vec<u8>, u32)>,
+            plist: Option<&(Vec<u8>, u32)>,
+        ) {
+            let at = self.at();
+            for (path, file) in [(&at.config, config), (&at.plist, plist)] {
+                self.fs.nodes.remove(path);
+                if let Some((bytes, mode)) = file {
+                    self.fs.file(path, bytes, *mode);
+                }
+            }
+        }
+
+        /// `verb`, as the person's own process answers it, for `uid`, `gid`.
+        pub(crate) fn answer(&mut self, verb: Verb, uid: u32, gid: u32, stdin: &[u8]) -> Outcome {
+            let me = Creds {
+                uid,
+                euid: uid,
+                gid,
+                egid: gid,
+                groups: vec![gid],
+            };
+            answer(verb, &self.home, &me, stdin, &mut self.fs)
+        }
+
+        fn at(&self) -> Places {
+            Places::of(&self.home, &self.fs)
+        }
+
+        fn held(&self, path: &Path) -> Option<(Vec<u8>, u32)> {
+            let node = self.fs.nodes.get(path)?;
+            (node.kind == Kind::File).then(|| (node.bytes.clone(), node.mode))
+        }
+
+        pub(crate) fn config(&self) -> Option<(Vec<u8>, u32)> {
+            self.held(&self.at().config)
+        }
+
+        pub(crate) fn prev(&self) -> Option<(Vec<u8>, u32)> {
+            self.held(&crate::config::prev_path(&self.at().config))
+        }
+
+        pub(crate) fn plist(&self) -> Option<(Vec<u8>, u32)> {
+            self.held(&self.at().plist)
+        }
+
+        /// From now on a write of the config's `.prev` fails.
+        pub(crate) fn prev_cannot_be_replaced(&mut self) {
+            self.fs.fails_at = Some(crate::config::prev_path(&self.at().config));
+        }
+
+        /// The config and its `.prev` written into `dir`, as `config.toml`
+        /// and its `.prev`; the config's path.
+        pub(crate) fn on_disk(&self, dir: &Path) -> PathBuf {
+            let path = dir.join(CONFIG);
+            for (to, file) in [
+                (path.clone(), self.config()),
+                (crate::config::prev_path(&path), self.prev()),
+            ] {
+                if let Some((bytes, _)) = file {
+                    std::fs::write(to, bytes).unwrap();
+                }
+            }
+            path
+        }
     }
 
     /// Exit 3 for each way a live file can differ from what root was shown,
@@ -2837,21 +3043,35 @@ mod tests {
         }
     }
 
-    /// A verb that fails still says what it noted before: here the outgoing
-    /// config that could not be kept, then the save that failed.
+    /// A verb that fails still says what it noted before: here a key of the
+    /// outgoing config it could not keep, then (#4184) the `.prev` it could
+    /// not replace, which stops it before the config.
     #[test]
     fn a_failed_verb_keeps_its_notes() {
         let (mut fs, at) = a_home();
         fs.nodes.remove(&at.plist);
+        let outgoing = format!(
+            "{ENROLLED}\n[[orgs]]\nlabel = \"other\"\nserver_url = \"https://roomler.example\"\n\
+             agent_token = \"tok-other\"\nagent_id = \"a-2\"\ntenant_id = \"t-2\"\n\
+             an_org_key_from_a_newer_build = 2\n"
+        );
+        fs.file(&at.config, outgoing.as_bytes(), 0o600);
         fs.writes_fail = true;
-        let verb = Verb::Convert {
-            config: Expect::of(Some(ENROLLED.as_bytes())),
-            plist: Expect::Absent,
-        };
+        let verb = shown(&at, &fs);
         let out = answer(verb, &at.home, &creds(), &[], &mut fs);
         assert_eq!(out.exit, Exit::Error, "{}", out.stderr);
-        assert!(out.stderr.contains("was not kept as"), "{}", out.stderr);
-        assert!(out.stderr.contains("saving"), "{}", out.stderr);
+        assert!(
+            out.stderr.contains("orgs.0.an_org_key_from_a_newer_build"),
+            "{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("could not be replaced"),
+            "{}",
+            out.stderr
+        );
+        assert!(!out.stderr.contains("saving"), "{}", out.stderr);
+        assert_eq!(fs.nodes[&at.config].bytes, outgoing.as_bytes());
     }
 
     #[test]
@@ -3192,40 +3412,40 @@ mod tests {
             assert_eq!(mode(&at.config), 0o600);
         }
 
-        /// `convert` on disk: the new config and the outgoing one, kept as its
-        /// `.prev`, are both 0600; the `.prev` holds the bytes it checked; a
-        /// key this build does not know is still in the config; and no
-        /// temporary file is left.
+        /// #4184 — `convert` on disk, over an older `.prev` that holds the
+        /// enrollment and that its owner may not write (0400, as a copy
+        /// another account left would be to the person): the new config is
+        /// kept as its `.prev` too, both 0600, each a temporary file renamed
+        /// in the folder, so that `.prev` is replaced; a key this build does
+        /// not know is still in the config; no temporary file is left; and no
+        /// load of the config brings the enrollment back.
         #[test]
-        fn convert_keeps_the_outgoing_bytes_as_prev_and_the_unknown_key() {
+        fn convert_replaces_a_prev_it_may_not_write_and_keeps_the_unknown_key() {
             let (dir, at) = a_home();
             let outgoing = format!("{ENROLLED}a_key_from_a_newer_build = 1\n");
             std::fs::write(&at.config, &outgoing).unwrap();
             chmod(&at.config, 0o600);
+            let prev = crate::config::prev_path(&at.config);
+            std::fs::write(&prev, ENROLLED).unwrap();
+            chmod(&prev, 0o400);
             let verb = Verb::Convert {
                 config: Expect::of(Some(outgoing.as_bytes())),
                 plist: Expect::of(Some(PLIST)),
             };
             let out = answer(verb, dir.path(), &creds(), &[], &mut RealFs);
             assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
-            let prev = crate::config::prev_path(&at.config);
             assert_eq!(mode(&at.config), 0o600);
             assert_eq!(mode(&prev), 0o600);
-            assert_eq!(std::fs::read(&prev).unwrap(), outgoing.as_bytes());
             let saved = std::fs::read_to_string(&at.config).unwrap();
             assert!(saved.contains("a_key_from_a_newer_build = 1"), "{saved}");
-            assert!(
-                crate::config::load(&at.config)
-                    .unwrap()
-                    .agent_token
-                    .is_empty()
-            );
+            assert_eq!(std::fs::read(&prev).unwrap(), saved.as_bytes());
             let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
             assert_eq!(
                 listing(&at.folder),
                 [name(&at.config), name(&prev)],
                 "no temporary file left"
             );
+            assert_no_load_brings_an_enrollment_back(&at.config);
         }
 
         #[test]

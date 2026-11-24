@@ -6454,7 +6454,7 @@ to-activate, so the browser never sees a bait-and-switch.
   hello still announces copied images as its first probe found them
   ([#3927](https://github.com/gjovanov/roomler-ai/issues/3927)). The follow
   rests on how arboard 3.6.1's `Drop` counts its handles before it closes the
-  connection, so the workspace pins `arboard` to `=3.6.1` (`Cargo.toml:326`).
+  connection, so the workspace pins `arboard` to `=3.6.1` (the `arboard` entry in the workspace's root `Cargo.toml`).
   An upgrade has to read that `Drop` again; the CI control
   `x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server`
   turns red when its rule changes. Kill switch
@@ -7839,8 +7839,8 @@ its reports. Since FR-150 P2 so does the per-user task's daemon, whose
 launcher leaves on it. Only those three workers exit 78: every other `run`
 with no config still exits 1. The macOS supervisor's worker exits 78 even
 beside an enrolled copy, because it never restores at its start (#4157): on a
-converted one-row Mac the person's `config.toml.prev` can still hold the
-enrollment that moved to root (#4184). The other two restore a missing config
+one-row Mac an earlier release converted, the person's `config.toml.prev` can
+hold the enrollment that moved to root (#4184). The other two restore a missing config
 from such a copy, and exit 78 only without one. The service's SYSTEM worker
 restores its machine config only from a copy that passes every check the
 config itself would, and the service starts that worker for such a copy
