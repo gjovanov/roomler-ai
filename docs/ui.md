@@ -405,7 +405,7 @@ org's rows at a time and record which. A fetch for another org drops the rows at
 once, only the latest fetch writes, and a save answered for another org leaves the
 list alone (`stores/tunnelPolicies.ts:159-165`, `stores/overlayAcl.ts:78-84`). A
 page that only names or picks devices asks with `ensureAgents` or
-`ensureTunnelClients` (`stores/agents.ts:1091`, `stores/tunnelClients.ts:117`),
+`ensureTunnelClients` (`stores/agents.ts:1141`, `stores/tunnelClients.ts:117`),
 which fetch unless the store already holds, or is loading, that org's rows. Never
 gate a fetch on an empty list: a list that holds another org's rows is not empty.
 Every page that shows one org's data keeps the same rules ([Conventions](#conventions),
@@ -615,15 +615,30 @@ by their own subject. So every such page, and each dialog it owns, keeps four ru
 | It watches its org from the start | A `watch` with `{ immediate: true }` replaces a one-shot load on mount. A routed view watches its `tenantId` computed, never a `ref` of the route param, which setup reads once (`views/invite/InviteManageView.vue:266` held one). A section watches `() => props.tenantId` | `views/rooms/RoomList.vue:197`, `components/admin/RolesSection.vue:471` |
 | A change closes what was opened under the previous org | An editor, a prompt or a dialog closes, because its save would go to the new org, and a secret minted there goes with its dialog. What names the previous org's rows resets: a device filter, a grid's search and its page. A paging grid fetches again, because nothing fires its `@update:options` on a change of org | `components/admin/EnrollKeysSection.vue:351`, `components/admin/MembersSection.vue:535` |
 | A late answer for the previous org is dropped | A store guards its own rows (next row). A page that keeps rows in its own state notes the org it asked for: its latest load writes its rows, its error and its spinner only while that is still the page's org | `components/admin/ExecAuditSection.vue:228-248` |
-| A store records its org, and a page asks it with an ensure | The store names that ref for its rows (`roomsTenantId`), never `tenantId`: a `${tenantId}` in one of its URLs would read the ref once a parameter is renamed. A fetch for another org drops the rows at once, only the latest fetch writes, and a create or a save answered for another org leaves the list alone (`listIsOf`). A page that only lists, names or picks the rows asks with `ensureRooms`, `ensureAgents`, `ensureTenantMembers`, `ensureRoles` or `ensureTunnelClients`, which fetch unless the store holds this org's rows or is loading them, and fetch again after a failed fetch. `ensureRooms` and `ensureAgents` answer with the fetch in flight, and a fetch that a newer one superseded settles with the newest, so a caller that reads the rows after its await reads this org's newest: the welcome tour counts the devices and the rooms so (`components/layout/AppLayout.vue:1093-1096`), and the remote viewer takes the store's own row of its device (`views/remote/RemoteControl.vue:5365`) | `stores/rooms.ts:97`, `:139`, `:146`; `stores/agents.ts:1091`, `:1278`; `stores/role.ts:62`; `stores/tunnelClients.ts:117` |
+| A store records its org, and a page asks it with an ensure | The store names that ref for its rows (`roomsTenantId`), never `tenantId`: a `${tenantId}` in one of its URLs would read the ref once a parameter is renamed. A fetch for another org drops the rows at once, only the latest fetch writes, and a create or a save answered for another org leaves the list alone (`listIsOf`). A page that only lists, names or picks the rows asks with `ensureRooms`, `ensureAgents`, `ensureTenantMembers`, `ensureRoles` or `ensureTunnelClients`, which fetch unless the store holds this org's rows or is loading them, and fetch again after a failed fetch. `ensureRooms` and `ensureAgents` answer with the fetch in flight, and a fetch that a newer one superseded settles with the newest, so a caller that reads the rows after its await reads this org's newest: the welcome tour counts the devices and the rooms so (`components/layout/AppLayout.vue:1093-1096`), and the remote viewer takes the store's own row of its device (`views/remote/RemoteControl.vue:5365`). A dialog that shows an org switch asks with `ensureOrgExecEnabled`, `ensureOrgSshEnabled` or `ensureExternalAccess` (a single value, below) | `stores/rooms.ts:102`, `:144`, `:151`; `stores/agents.ts:1141`, `:1328`, `:1522`, `:1600`, `:1855`; `stores/role.ts:62`; `stores/tunnelClients.ts:117` |
 
 Never gate a fetch on an empty list: a list that holds another org's rows is not empty. The
-stores that record their org: the devices and the org's people (`stores/agents.ts:1035`,
-`:1248`), rooms (`stores/rooms.ts:97`), roles (`stores/role.ts:29`), members
+stores that record their org: the devices and the org's people (`stores/agents.ts:1085`,
+`:1298`), rooms (`stores/rooms.ts:102`), roles (`stores/role.ts:29`), members
 (`stores/members.ts:49`), tunnel clients (`stores/tunnelClients.ts:59`), overlay nodes
 (`stores/overlayRoutes.ts:86`), the two policy lists (`stores/tunnelPolicies.ts:159`,
 `stores/overlayAcl.ts:78`), files (`stores/files.ts:49`), invites (`stores/invite.ts:95`), and
 the dashboard's overview and mesh (`stores/stats.ts:344-345`).
+
+**A single value a store holds for an org is that org's too (#4332).** The store records the
+org as it does for a list, and a page asks whether the store holds THIS org's value, never
+whether the value is unset: a switch that holds another org's value is not unset, and nothing
+clears the current room on a change of org.
+
+| Value | Its org is recorded by | A page asks |
+|---|---|---|
+| An org setting: the exec, SSH and external-access switches, and four more | `orgSettingTracker` (`stores/agents.ts:63`): a fetch for another org drops the value at once, and only the latest fetch writes | `ensureOrgExecEnabled`, `ensureOrgSshEnabled` or `ensureExternalAccess` (`stores/agents.ts:1503`, `:1581`, `:1836`): this org's fetch, in flight or landed with an answer; else a fetch, again after one that ended unknown (refused, failed, or a caller who may not read org settings). The five device dialogs do not wait for it: each shows the store's value, unknown until this org's answer lands |
+| The current room, the one last opened in a chat | `currentTenantId` (`stores/rooms.ts:75`): `fetchRoom` writes it with the room once the answer has landed; `setCurrent` writes the org it is given, else none | The Files page names the current room only while it is the URL's org; else the org's first room, once the list is the org's; else none (`views/files/FilesBrowser.vue:223-228`) |
+
+Never read the org, or whether a value is known, off the value itself. The API's room carries
+no org: `Room.tenant_id` (`stores/rooms.ts:11`) is declared and never sent
+(`crates/modules/chat/src/room.rs:29-50`). A switch's answer can hold `null`
+(`orgExecRequireSystem` from an older server).
 
 **What the shell reloads on a change of org.** `AppLayout` keeps the tenant store on the
 URL's org (`useRouteTenantSync`, `components/layout/AppLayout.vue:997`). On a change it
@@ -642,7 +657,8 @@ The tests change the org under a mounted page and release org A's held answer af
 change: `orgChangeTenantPages.spec.ts` (the routed views, through a memory router built from
 the app's own route records, under a stand-in for the shell's reloads),
 `orgChangeAdminSections.spec.ts` and `orgChangeShape2.spec.ts` (a section's `tenantId` prop),
-and each store's spec.
+`orgChangeDeviceDialogs.spec.ts` (a device dialog opened for org B on a store that holds org
+A's switch), and each store's spec.
 
 **The call page remounts by room, and asks before it leaves a call (#1637).** The app
 bar's Active Calls menu and the "Call started in …" snackbar push another room's call

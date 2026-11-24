@@ -54,22 +54,72 @@ async function mayReadDeviceDiagnostics(tenantId: string): Promise<boolean> {
  *  another org drops the value at once, back to unknown, and only the latest
  *  fetch writes. A save writes its answer only while the value is its org's,
  *  so a save answered after the page moved on to another org is dropped.
- *  Made once per store instance, inside the store. */
+ *  Made once per store instance, inside the store.
+ *
+ *  #4332 — a fetch made through `run` is also recorded for an ensure: its
+ *  promise, and whether it ended with an answer. A page asks the ensure
+ *  whether the store holds THIS org's value, never whether the value is
+ *  unset: a value that is another org's is not unset. */
 function orgSettingTracker(drop: () => void) {
   let seq = 0
   let valueTenantId: string | null = null
+  // #4332 — the latest fetch `run` made (`null`: none, or a newer `begin`),
+  // and how it ended: `null` while in flight, `true` with an answer, `false`
+  // unknown (refused, failed, or a caller who may not read org settings).
+  // Never read off the value: an answer can hold `null` (`orgExecRequireSystem`
+  // from an older server).
+  let latestRun: Promise<void> | null = null
+  let latestAnswered: boolean | null = null
+
+  /** A fetch for `tenantId` starts; the check it returns holds while that
+   *  fetch is the latest. */
+  function begin(tenantId: string): () => boolean {
+    const mine = ++seq
+    if (valueTenantId !== null && valueTenantId !== tenantId) drop()
+    valueTenantId = tenantId
+    latestRun = null
+    return () => mine === seq
+  }
+
   return {
-    /** A fetch for `tenantId` starts; the check it returns holds while that
-     *  fetch is the latest. */
-    begin(tenantId: string): () => boolean {
-      const mine = ++seq
-      if (valueTenantId !== null && valueTenantId !== tenantId) drop()
-      valueTenantId = tenantId
-      return () => mine === seq
-    },
+    begin,
     /** Whether the value held is `tenantId`'s (or no org's yet). */
     holds(tenantId: string): boolean {
       return valueTenantId === null || valueTenantId === tenantId
+    },
+    /** #4332 — a fetch for `tenantId`, begun at once (no `await` before the
+     *  drop). `fetch` writes only while its check holds, and answers whether
+     *  it ended with an answer. A fetch that a newer one superseded settles
+     *  with the newest, as `fetchAgents` does: a caller that awaits it then
+     *  reads the newest value. */
+    run(tenantId: string, fetch: (latest: () => boolean) => Promise<boolean>): Promise<void> {
+      const latest = begin(tenantId)
+      const settled: Promise<void> = fetch(latest).then(
+        (answered) => {
+          if (!latest()) return latestRun ?? undefined
+          latestAnswered = answered
+          return undefined
+        },
+        (e: unknown) => {
+          if (!latest()) return latestRun ?? undefined
+          latestAnswered = false
+          throw e
+        },
+      )
+      latestRun = settled
+      latestAnswered = null
+      return settled
+    },
+    /** #4332 — this org's value, or `fetch` for it: the latest fetch's
+     *  promise while that fetch is `tenantId`'s and is in flight or landed
+     *  with an answer. Otherwise it fetches: no fetch yet, a value no fetch
+     *  recorded (a test's seed), another org's value, or this org's latest
+     *  fetch ended unknown. */
+    ensure(tenantId: string, fetch: () => Promise<void>): Promise<void> {
+      if (valueTenantId === tenantId && latestRun !== null && latestAnswered !== false) {
+        return latestRun
+      }
+      return fetch()
     },
   }
 }
@@ -1442,24 +1492,35 @@ export const useAgentStore = defineStore('agents', () => {
     orgExecRequireSystem.value = null
   })
 
-  async function fetchOrgExecEnabled(tenantId: string) {
-    const latest = execSettings.begin(tenantId)
-    if (!(await mayReadOrgSettings(tenantId))) {
-      if (!latest()) return
-      orgExecEnabled.value = null
-      orgExecRequireSystem.value = null
-      return
-    }
-    try {
-      const resp = await api.get<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`)
-      if (latest()) applyOrgExecSettings(resp)
-    } catch {
-      if (!latest()) return
-      // A 403 here means "not an admin", not "disabled" — leave it unknown
-      // rather than claiming the org is off.
-      orgExecEnabled.value = null
-      orgExecRequireSystem.value = null
-    }
+  function fetchOrgExecEnabled(tenantId: string): Promise<void> {
+    return execSettings.run(tenantId, async (latest) => {
+      if (!(await mayReadOrgSettings(tenantId))) {
+        if (!latest()) return false
+        orgExecEnabled.value = null
+        orgExecRequireSystem.value = null
+        return false
+      }
+      try {
+        const resp = await api.get<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`)
+        if (latest()) applyOrgExecSettings(resp)
+        return true
+      } catch {
+        if (!latest()) return false
+        // A 403 here means "not an admin", not "disabled" — leave it unknown
+        // rather than claiming the org is off.
+        orgExecEnabled.value = null
+        orgExecRequireSystem.value = null
+        return false
+      }
+    })
+  }
+
+  /** #4332 — the org's exec switch for a dialog that shows it: fetched
+   *  unless the store holds this org's or is fetching it, and again after a
+   *  fetch that ended unknown. It replaces a check of `null`, which never
+   *  fetched while the switch held another org's value. */
+  function ensureOrgExecEnabled(tenantId: string): Promise<void> {
+    return execSettings.ensure(tenantId, () => fetchOrgExecEnabled(tenantId))
   }
 
   /** Flip gate 1. MANAGE_TENANT server-side. Names only the kill-switch: the
@@ -1515,20 +1576,29 @@ export const useAgentStore = defineStore('agents', () => {
 
   const sshSettings = orgSettingTracker(() => (orgSshEnabled.value = null))
 
-  async function fetchOrgSshEnabled(tenantId: string) {
-    const latest = sshSettings.begin(tenantId)
-    if (!(await mayReadOrgSettings(tenantId))) {
-      if (latest()) orgSshEnabled.value = null
-      return
-    }
-    try {
-      const resp = await api.get<{ remote_ssh_enabled: boolean }>(
-        `/tenant/${tenantId}/ssh-settings`,
-      )
-      if (latest()) orgSshEnabled.value = resp.remote_ssh_enabled
-    } catch {
-      if (latest()) orgSshEnabled.value = null
-    }
+  function fetchOrgSshEnabled(tenantId: string): Promise<void> {
+    return sshSettings.run(tenantId, async (latest) => {
+      if (!(await mayReadOrgSettings(tenantId))) {
+        if (latest()) orgSshEnabled.value = null
+        return false
+      }
+      try {
+        const resp = await api.get<{ remote_ssh_enabled: boolean }>(
+          `/tenant/${tenantId}/ssh-settings`,
+        )
+        if (latest()) orgSshEnabled.value = resp.remote_ssh_enabled
+        return true
+      } catch {
+        if (latest()) orgSshEnabled.value = null
+        return false
+      }
+    })
+  }
+
+  /** #4332 — the org's SSH switch for a dialog that shows it, as
+   *  `ensureOrgExecEnabled` asks for the exec switch. */
+  function ensureOrgSshEnabled(tenantId: string): Promise<void> {
+    return sshSettings.ensure(tenantId, () => fetchOrgSshEnabled(tenantId))
   }
 
   /** Flip gate 1. MANAGE_TENANT server-side. */
@@ -1762,18 +1832,28 @@ export const useAgentStore = defineStore('agents', () => {
     externalDevices.value = []
   })
 
-  async function fetchExternalAccess(tenantId: string) {
-    const latest = externalAccess.begin(tenantId)
-    try {
-      const resp = await api.get<ExternalAccessSettings>(`/tenant/${tenantId}/external-access`)
-      if (!latest()) return
-      orgExternalAccessEnabled.value = resp.enabled
-      externalDevices.value = resp.devices
-    } catch {
-      if (!latest()) return
-      orgExternalAccessEnabled.value = null
-      externalDevices.value = []
-    }
+  function fetchExternalAccess(tenantId: string): Promise<void> {
+    return externalAccess.run(tenantId, async (latest) => {
+      try {
+        const resp = await api.get<ExternalAccessSettings>(`/tenant/${tenantId}/external-access`)
+        if (!latest()) return true
+        orgExternalAccessEnabled.value = resp.enabled
+        externalDevices.value = resp.devices
+        return true
+      } catch {
+        if (!latest()) return false
+        orgExternalAccessEnabled.value = null
+        externalDevices.value = []
+        return false
+      }
+    })
+  }
+
+  /** #4332 — the org's external-access switch, and its approved devices, for
+   *  a dialog that shows the switch, as `ensureOrgExecEnabled` asks for the
+   *  exec switch. */
+  function ensureExternalAccess(tenantId: string): Promise<void> {
+    return externalAccess.ensure(tenantId, () => fetchExternalAccess(tenantId))
   }
 
   /** Flip gate 1. MANAGE_TENANT server-side. */
@@ -2157,6 +2237,7 @@ export const useAgentStore = defineStore('agents', () => {
     fetchLogs,
     orgExecEnabled,
     fetchOrgExecEnabled,
+    ensureOrgExecEnabled,
     setOrgExecEnabled,
     orgExecRequireSystem,
     setOrgExecRequireSystem,
@@ -2164,6 +2245,7 @@ export const useAgentStore = defineStore('agents', () => {
     unanchorDevice,
     orgSshEnabled,
     fetchOrgSshEnabled,
+    ensureOrgSshEnabled,
     setOrgSshEnabled,
     orgKeepBusyDenied,
     orgKeepBusyDefaultPattern,
@@ -2183,6 +2265,7 @@ export const useAgentStore = defineStore('agents', () => {
     orgExternalAccessEnabled,
     externalDevices,
     fetchExternalAccess,
+    ensureExternalAccess,
     setOrgExternalAccessEnabled,
     updateExternalAccessPolicy,
     fetchConnectCode,

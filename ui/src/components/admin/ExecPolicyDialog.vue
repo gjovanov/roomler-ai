@@ -334,9 +334,9 @@ watch(
     // #4257 — this org's people, not any: a list that holds another org's
     // members is not empty.
     void agentStore.ensureTenantMembers(props.tenantId)
-    if (agentStore.orgExecEnabled === null) {
-      void agentStore.fetchOrgExecEnabled(props.tenantId)
-    }
+    // #4332 — this org's switch, not any: a switch that holds another org's
+    // value is not unset.
+    void agentStore.ensureOrgExecEnabled(props.tenantId)
   },
   { immediate: true },
 )

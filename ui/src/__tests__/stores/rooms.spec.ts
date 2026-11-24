@@ -503,3 +503,86 @@ describe('useRoomStore: one org at a time (#4257)', () => {
     expect(s.unreadCounts.rb).toBe(3)
   })
 })
+
+// #4332 — the current room is one org's too, and the store records which. The
+// API's room carries no org (`Room.tenant_id` is declared, never sent), so a
+// page that names the current room under an org (the Files page) asks
+// `currentTenantId`, never the room. Nothing clears `current` on a change of
+// org: a room opened in org A's chat is still current under org B.
+describe('useRoomStore: the current room records its org (#4332)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  /** Let every answer already handed over land. */
+  const settle = () => new Promise((r) => setTimeout(r, 0))
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    mockApi.get.mockReset()
+  })
+
+  it('fetchRoom records the org it asked with the room, once the answer has landed: until then the previous room keeps its own', async () => {
+    const s = useRoomStore()
+    // The answer's own `tenant_id` ('t1') is not the org: the store records the org it asked.
+    mockApi.get.mockResolvedValueOnce(makeRoom({ id: 'ra' }))
+    await s.fetchRoom(ORG_A, 'ra')
+    expect.soft(s.current?.id).toBe('ra')
+    expect.soft(s.currentTenantId).toBe(ORG_A)
+
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)) as never)
+    const loadB = s.fetchRoom(ORG_B, 'rb')
+    await settle()
+    expect.soft(s.current?.id, 'the previous room until the answer lands').toBe('ra')
+    expect.soft(s.currentTenantId, "the previous room's org until the answer lands").toBe(ORG_A)
+
+    answerB(makeRoom({ id: 'rb' }))
+    await loadB
+    expect.soft(s.current?.id).toBe('rb')
+    expect.soft(s.currentTenantId).toBe(ORG_B)
+  })
+
+  it('a fetchRoom that fails leaves the current room and its org', async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce(makeRoom({ id: 'ra' }))
+    await s.fetchRoom(ORG_A, 'ra')
+    mockApi.get.mockRejectedValueOnce(new Error('Not found'))
+    await expect(s.fetchRoom(ORG_B, 'rb')).rejects.toThrow('Not found')
+    expect.soft(s.current?.id).toBe('ra')
+    expect.soft(s.currentTenantId).toBe(ORG_A)
+  })
+
+  it('setCurrent records the org it is given, and none without one', () => {
+    const s = useRoomStore()
+    s.setCurrent(makeRoom({ id: 'ra' }), ORG_A)
+    expect.soft(s.current?.id).toBe('ra')
+    expect.soft(s.currentTenantId).toBe(ORG_A)
+
+    s.setCurrent(makeRoom({ id: 'rb' }))
+    expect.soft(s.current?.id).toBe('rb')
+    expect.soft(s.currentTenantId, 'a room set with no org is no org').toBeNull()
+  })
+
+  it('setCurrent(null) clears the room and its org', () => {
+    const s = useRoomStore()
+    s.setCurrent(makeRoom({ id: 'ra' }), ORG_A)
+    s.setCurrent(null)
+    expect.soft(s.current).toBeNull()
+    expect.soft(s.currentTenantId).toBeNull()
+  })
+
+  it('deleteRoom of the current room clears the room and its org; of another room, neither', async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce(makeRoom({ id: 'ra' }))
+    await s.fetchRoom(ORG_A, 'ra')
+    mockApi.delete.mockResolvedValue(undefined as never)
+
+    await s.deleteRoom(ORG_A, 'other')
+    expect.soft(s.current?.id).toBe('ra')
+    expect.soft(s.currentTenantId).toBe(ORG_A)
+
+    await s.deleteRoom(ORG_A, 'ra')
+    expect.soft(s.current).toBeNull()
+    expect.soft(s.currentTenantId).toBeNull()
+  })
+})
