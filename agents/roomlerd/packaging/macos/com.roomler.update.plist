@@ -15,8 +15,8 @@
 
   It also removes the whole exit-to-update failure class on two-half Macs:
   no agent process is ever the installer's parent and none exits for an
-  update — the pkg's postinstall re-bootstraps both halves, and the helper
-  is not long-running, so there is nothing to race.
+  update — the pkg's postinstall re-bootstraps both halves, and no agent
+  waits on the helper, so there is nothing to race.
 
   Wake sources, all three deliberate:
     RunAtLoad      — catch up right after boot / first install.
@@ -32,6 +32,12 @@
 
   Not KeepAlive: the helper runs, decides, exits. launchd relaunches it on
   the next wake source. ThrottleInterval guards a crash-looping helper.
+  FR-151: before it installs it reads both halves' live work, and when it
+  defers it stays up to read again at the recheck (an hour, R5b's two
+  minutes) or at a wake, at most once a minute; it exits on the opt-out, a
+  manual install, SIGTERM, or after 8 h awake. While it waits, launchd
+  starts no second copy, and the wake file it watches still reaches it.
+  /etc/roomler/install-over-live-work makes it install with no reading.
 
   ⚠️ postinstall must NEVER bootout a LOADED com.roomler.update — during an
   update the postinstall is a grandchild of this very job, and booting the

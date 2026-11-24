@@ -346,7 +346,7 @@ that updates across the first tunnel release carrying it, on today's spelling.
 ## Acceptance criteria
 
 - [~] `name-audit.sh` reports **`anchors = 0`** — the counter is the LIVE class — and CI blocks on it.
-      **Half met 2026-10-26**: CI blocks (the `name-audit` job runs `--check --strict`, `ci.yml:2848`,
+      **Half met 2026-10-26**: CI blocks (the `name-audit` job runs `--check --strict`, `ci.yml:2850`,
       green on master); **open**: `anchors = 651`, the classes and the condition each waits on are in
       the endgame table below and in `docs/retired-names.md`
 - [ ] no runtime path, service name, scheduled task, env var, log filename, wire value or
