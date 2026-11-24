@@ -173,6 +173,37 @@ then cost a two-org host its mesh path, measured on 2026-10-19.
 The command prints the outcome for each enrollment, with the way back on where
 it could not keep one.
 
+⚠️ **An ephemeral primary is never swapped out** (#4370). While the primary
+enrollment is ephemeral, `set-primary` refuses, whatever label it is given:
+`promote_org_to_primary` checks it before anything else
+(`crates/agent-core/src/config.rs:2367-2380`), and the file stays as it was,
+since `org_cmd` saves only after its arm succeeds
+(`agents/roomlerd/src/app.rs:3602`). The swap would put the ephemeral row
+beside another org, which #4352 rules out. An `[[orgs]]` entry has no
+`ephemeral`, so the swap would leave:
+- **the moved row** in `[[orgs]]`, where the device no longer knows it is
+  ephemeral. The restart that applies the swap stops the run that started as
+  that row, and when it is an OS stop it removes that row on the server
+  ([#4352](ephemeral-nodes.md#a-stop-removes-only-the-row-its-run-started-as-4352))
+  while the file still lists it;
+- **the promoted org**, a permanent row, marked ephemeral: every later stop
+  asks the server to remove it and is refused (403).
+
+The way on is the order the server's 409 gives
+([ephemeral-nodes.md](ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)):
+remove the ephemeral row on its Devices page, enroll the machine in that org
+again with a standard enrollment token (the config keeps its settings and its
+`[[orgs]]`), then run `set-primary` again.
+
+**Known limit: the reverse case is swapped as before.** A permanent primary can
+sit beside an `[[orgs]]` entry whose row the server holds as ephemeral: a join
+could add one before #4352 refused it. The device cannot tell, since an
+`OrgEntry` carries no flag, so `set-primary` promotes that entry and marks the
+new primary permanent. No stop removes its row, and the server's reaper, where
+it runs, removes it once the device is silent past its deadline. To make it
+permanent, remove it on its Devices page and enroll again with a standard
+enrollment token.
+
 **Per-org supervisors.** `run_cmd` starts one supervised loop per enabled org.
 `OrgCtx` threads the per-enrollment identity through `run` / `connect_once` /
 `handle_server_msg`, which buys:

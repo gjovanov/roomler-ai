@@ -317,7 +317,10 @@ administrator step) and the companion's re-enroll. The primary is unchanged: a
 first enrollment, `--replace`, and the same server and org again take
 `ephemeral` from the answer. A secondary made ephemeral before #4352 stays as it
 is: the device does not know it as ephemeral, and the reaper, where it runs,
-collects its row.
+collects its row. `org set-primary` promotes such a secondary as any other,
+since the device cannot tell it, but refuses while the primary is ephemeral
+(#4370, [multi-org.md](multi-org.md#3-p1--the-foundation-orgs-shipped-313)):
+that swap would put an ephemeral row beside another org.
 
 ### A stop removes only the row its run started as (#4352)
 
@@ -331,7 +334,7 @@ own row (`updater::stop_removal`, `:5085-5114`, at
 
 | The file at the stop | The stop removes |
 |---|---|
-| still names the run's row, as the primary or an `[[orgs]]` entry (a renewed token, a re-enrollment of the same row, `org set-primary`) | the run's row, with the file's token, the newest |
+| still names the run's row, as the primary (a renewed token, a re-enrollment of the same row) or as an `[[orgs]]` entry (an `org set-primary` that moved it: since #4370 that command refuses while the primary is ephemeral, so only a file an older agent wrote holds the run's row there) | the run's row, with the file's token, the newest |
 | names another row: a re-enrollment written while the daemon ran, in this org or another | the run's row, with the run's own token; never the file's row |
 | does not load | the run's row, with the run's own token |
 | anything, on a run that started permanent | nothing |

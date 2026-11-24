@@ -521,33 +521,116 @@ fn exclude_from_capture<R: Runtime>(win: &tauri::WebviewWindow<R>) {
 #[cfg(not(any(windows, target_os = "macos")))]
 fn exclude_from_capture<R: Runtime>(_win: &tauri::WebviewWindow<R>) {}
 
+/// FR-27 P9 — the red frame's thickness, in points: the native Windows
+/// border's 2 px.
+#[cfg(any(target_os = "macos", test))]
+const FRAME_BORDER: f64 = 2.0;
+
+/// FR-27 P9, #4376 — the red frame's four strips round a screen: top, bottom,
+/// left and right, each `thickness` thick and flush with its own edge, the
+/// top and bottom ones as wide as the screen and the sides as tall as it.
+/// `screen` is the screen's frame in AppKit's global coordinates
+/// (`NSScreen::frame`: its bottom-left corner, y up), and each strip comes
+/// back as its window's frame in the same coordinates. A second display has
+/// an origin of its own, and the strips start from it.
+#[cfg(any(target_os = "macos", test))]
+fn frame_strips(
+    screen: roomler_node_core::consent_screen::Frame,
+    thickness: f64,
+) -> [roomler_node_core::consent_screen::Frame; 4] {
+    use roomler_node_core::consent_screen::Frame;
+    let Frame { x, y, w, h } = screen;
+    [
+        // y counts up from the bottom: the top strip ends at the top edge.
+        Frame {
+            x,
+            y: y + h - thickness,
+            w,
+            h: thickness,
+        },
+        Frame {
+            x,
+            y,
+            w,
+            h: thickness,
+        },
+        Frame {
+            x,
+            y,
+            w: thickness,
+            h,
+        },
+        Frame {
+            x: x + w - thickness,
+            y,
+            w: thickness,
+            h,
+        },
+    ]
+}
+
 /// FR-27 P9 — the red frame round the screen while a session is up: the
 /// native Windows border's 2 px, as four click-through strips (no layer, no
 /// transparency: an opaque strip needs nothing beyond what `indicator/mac.rs`
 /// already uses). ⚠️ It WILL appear in the captured stream, like the banner:
 /// our macOS capture is `CGDisplayStream`, which ignores
 /// `NSWindowSharingNone` (the operator's call, 2026-10-06: ship it anyway).
+///
+/// #4376 — it runs round the main screen as that screen is now. Each show
+/// lays the strips out from it, and while the frame is up an observer lays
+/// them out again at each change of a display's mode, the arrangement or the
+/// set of displays. display-match (FR-108) switches the mode at a session's
+/// start and hands it back later. Until #4376 the strips were laid out once a
+/// process, at the frame's first show: one first shown during display-match
+/// stayed at 400 × 300 pt in a corner after the hand-back, and for every
+/// later session, until the companion restarted.
 #[cfg(target_os = "macos")]
 mod frame {
     use std::cell::RefCell;
 
     use objc2::rc::Retained;
-    // `MainThreadOnly` provides `NSWindow::alloc` — load-bearing import.
-    use objc2::{MainThreadMarker, MainThreadOnly};
+    use objc2::runtime::NSObject;
+    // `MainThreadOnly` provides `NSWindow::alloc` and `ScreenObserver::alloc`
+    // — load-bearing import.
+    use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+    // `NSApplicationDidChangeScreenParametersNotification` is behind
+    // objc2-app-kit's `NSApplication` feature, which tauri's window layer
+    // (tao) turns on in this build; the Foundation half (the notification
+    // centre) comes with this crate's own `NSScreen` and `NSWindow` features.
     use objc2_app_kit::{
-        NSBackingStoreType, NSColor, NSScreen, NSScreenSaverWindowLevel, NSWindow,
-        NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask,
+        NSApplicationDidChangeScreenParametersNotification, NSBackingStoreType, NSColor, NSScreen,
+        NSScreenSaverWindowLevel, NSWindow, NSWindowCollectionBehavior, NSWindowSharingType,
+        NSWindowStyleMask,
     };
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use objc2_foundation::{NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize};
+    use roomler_node_core::consent_screen::Frame;
     use tauri::{AppHandle, Runtime};
 
-    /// Frame thickness in points.
-    const BORDER: f64 = 2.0;
+    use super::{FRAME_BORDER, frame_strips};
+
+    /// The frame's state. Only the main thread touches it, so it lives in
+    /// that thread's thread-local, for the companion process's whole life.
+    struct State {
+        /// The four strips: built at the first show that finds a screen,
+        /// then kept and moved.
+        strips: Vec<Retained<NSWindow>>,
+        /// From a `show` to the next `hide`. The screen-change observer acts
+        /// only while it is set.
+        shown: bool,
+        /// #4376 — the screen-change observer, registered at the first show
+        /// and never let go. The notification centre does not retain its
+        /// observers: this is the one strong reference.
+        observer: Option<Retained<ScreenObserver>>,
+    }
 
     thread_local! {
-        /// The four strips, created once and kept: only the main thread
-        /// touches them, so they live in its thread-local.
-        static STRIPS: RefCell<Vec<Retained<NSWindow>>> = const { RefCell::new(Vec::new()) };
+        static STATE: RefCell<State> = const {
+            RefCell::new(State {
+                strips: Vec::new(),
+                shown: false,
+                observer: None,
+            })
+        };
     }
 
     pub fn show<R: Runtime>(app: &AppHandle<R>) {
@@ -555,44 +638,118 @@ mod frame {
             let Some(mtm) = MainThreadMarker::new() else {
                 return;
             };
-            STRIPS.with(|strips| {
-                let mut strips = strips.borrow_mut();
-                if strips.is_empty() {
-                    *strips = build(mtm);
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.shown = true;
+                if state.observer.is_none() {
+                    state.observer = Some(observe_screen_changes(mtm));
                 }
-                for s in strips.iter() {
-                    s.orderFrontRegardless();
-                }
+                put_up(mtm, &mut state.strips);
             });
         });
     }
 
     pub fn hide<R: Runtime>(app: &AppHandle<R>) {
         let _ = app.run_on_main_thread(|| {
-            STRIPS.with(|strips| {
-                for s in strips.borrow().iter() {
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                // Before the strips go: from here the observer leaves them be.
+                state.shown = false;
+                for s in state.strips.iter() {
                     s.orderOut(None);
                 }
             });
         });
     }
 
-    fn build(mtm: MainThreadMarker) -> Vec<Retained<NSWindow>> {
-        let Some(screen) = NSScreen::mainScreen(mtm) else {
-            return Vec::new();
+    /// #4376 — the strips round the main screen as it is now, ordered front:
+    /// built the first time, moved every later time. With no screen to read
+    /// they keep their last place, and the next screen change lays them out.
+    fn put_up(mtm: MainThreadMarker, strips: &mut Vec<Retained<NSWindow>>) {
+        if let Some(screen) = NSScreen::mainScreen(mtm) {
+            let f = screen.frame();
+            let screen = Frame {
+                x: f.origin.x,
+                y: f.origin.y,
+                w: f.size.width,
+                h: f.size.height,
+            };
+            let rects = frame_strips(screen, FRAME_BORDER)
+                .map(|r| NSRect::new(NSPoint::new(r.x, r.y), NSSize::new(r.w, r.h)));
+            if strips.is_empty() {
+                *strips = rects.into_iter().map(|r| strip(mtm, r)).collect();
+            } else {
+                for (s, r) in strips.iter().zip(rects) {
+                    s.setFrame_display(r, true);
+                }
+            }
+        }
+        // With no screen, strips built before come up where they were, as before #4376.
+        for s in strips.iter() {
+            s.orderFrontRegardless();
+        }
+    }
+
+    define_class!(
+        // SAFETY: `NSObject` has no subclassing requirements, and this class
+        // has no `Drop`.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        struct ScreenObserver;
+
+        impl ScreenObserver {
+            // SAFETY: the notification centre sends this selector with one
+            // argument, the notification, and wants nothing back.
+            #[unsafe(method(screenParametersChanged:))]
+            fn screen_parameters_changed(&self, _notification: &NSNotification) {
+                on_screen_change();
+            }
+        }
+    );
+
+    /// #4376 — registers the screen-change observer with the default
+    /// notification centre. Called once a process, by the first show, on the
+    /// main thread (`mtm`); `State::observer` keeps what it returns.
+    fn observe_screen_changes(mtm: MainThreadMarker) -> Retained<ScreenObserver> {
+        let this = ScreenObserver::alloc(mtm).set_ivars(());
+        // SAFETY: `NSObject`'s `init`, on an instance just allocated.
+        let observer: Retained<ScreenObserver> = unsafe { msg_send![super(this), init] };
+        // SAFETY: `observer` answers `screenParametersChanged:` with the one
+        // argument the centre sends (`define_class!` above). The centre holds
+        // it without retaining it, and `State` keeps it alive for the
+        // process's life. The name is AppKit's own constant, posted on the
+        // main thread when a display's mode, the arrangement or the set of
+        // displays changes.
+        unsafe {
+            NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+                &observer,
+                sel!(screenParametersChanged:),
+                Some(NSApplicationDidChangeScreenParametersNotification),
+                None,
+            );
+        }
+        observer
+    }
+
+    /// #4376 — a screen changed: while the frame is up, lay it out again
+    /// round the main screen as it is now. Nothing here may panic, because
+    /// it runs inside AppKit's call: the state is tried, never taken. Off the
+    /// main thread (AppKit posts this on it) it does nothing, and the next
+    /// show lays the frame out.
+    fn on_screen_change() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
         };
-        let f = screen.frame();
-        let (x, y, w, h) = (f.origin.x, f.origin.y, f.size.width, f.size.height);
-        // AppKit's origin is bottom-left.
-        [
-            (x, y + h - BORDER, w, BORDER),
-            (x, y, w, BORDER),
-            (x, y, BORDER, h),
-            (x + w - BORDER, y, BORDER, h),
-        ]
-        .into_iter()
-        .map(|(x, y, w, h)| strip(mtm, NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))))
-        .collect()
+        let _ = STATE.try_with(|state| {
+            // Held only by a show or a hide on this thread while they call
+            // AppKit, and those lay the frame out, or take it down, themselves.
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return;
+            };
+            if state.shown {
+                put_up(mtm, &mut state.strips);
+            }
+        });
     }
 
     fn strip(mtm: MainThreadMarker, rect: NSRect) -> Retained<NSWindow> {
@@ -1285,5 +1442,117 @@ mod tests {
             !mac.contains("NSScreen::mainScreen"),
             "the daemon's panel: the focused window's screen"
         );
+    }
+
+    /// #4376 — a frame in AppKit's global coordinates, written short.
+    fn at(x: f64, y: f64, w: f64, h: f64) -> roomler_node_core::consent_screen::Frame {
+        roomler_node_core::consent_screen::Frame { x, y, w, h }
+    }
+
+    /// #4376 — the lab Mac's screen, 1024 × 768 pt at the origin, and the
+    /// 400 × 300 pt screen display-match's 800 × 600 px mode makes of it at
+    /// 2×: on each, the frame runs round the whole screen, 2 pt thick. In
+    /// order: top, bottom, left, right; y counts up from the bottom edge.
+    #[test]
+    fn the_frame_runs_round_the_whole_of_a_screen_at_the_origin() {
+        assert_eq!(FRAME_BORDER, 2.0, "the native Windows border's 2 px");
+        assert_eq!(
+            frame_strips(at(0.0, 0.0, 1024.0, 768.0), FRAME_BORDER),
+            [
+                at(0.0, 766.0, 1024.0, 2.0),
+                at(0.0, 0.0, 1024.0, 2.0),
+                at(0.0, 0.0, 2.0, 768.0),
+                at(1022.0, 0.0, 2.0, 768.0),
+            ]
+        );
+        assert_eq!(
+            frame_strips(at(0.0, 0.0, 400.0, 300.0), FRAME_BORDER),
+            [
+                at(0.0, 298.0, 400.0, 2.0),
+                at(0.0, 0.0, 400.0, 2.0),
+                at(0.0, 0.0, 2.0, 300.0),
+                at(398.0, 0.0, 2.0, 300.0),
+            ]
+        );
+    }
+
+    /// #4376 — a second display's frame has an origin of its own: right of
+    /// the primary and lower, or left of it and higher. The frame runs round
+    /// that screen from its own corner, not from the primary's.
+    #[test]
+    fn on_a_second_display_the_frame_runs_round_it_from_its_own_corner() {
+        assert_eq!(
+            frame_strips(at(1440.0, -200.0, 1920.0, 1080.0), FRAME_BORDER),
+            [
+                at(1440.0, 878.0, 1920.0, 2.0),
+                at(1440.0, -200.0, 1920.0, 2.0),
+                at(1440.0, -200.0, 2.0, 1080.0),
+                at(3358.0, -200.0, 2.0, 1080.0),
+            ]
+        );
+        assert_eq!(
+            frame_strips(at(-1024.0, 300.0, 1024.0, 768.0), FRAME_BORDER),
+            [
+                at(-1024.0, 1066.0, 1024.0, 2.0),
+                at(-1024.0, 300.0, 1024.0, 2.0),
+                at(-1024.0, 300.0, 2.0, 768.0),
+                at(-2.0, 300.0, 2.0, 768.0),
+            ]
+        );
+    }
+
+    /// #4376 — on every screen, at the origin or not, each strip is 2 pt
+    /// thick, lies on the screen, sits flush with its own edge and runs that
+    /// edge's whole length.
+    #[test]
+    fn every_strip_is_2_pt_thick_flush_with_its_edge_and_as_long_as_it() {
+        for (ox, oy) in [
+            (0.0, 0.0),
+            (1440.0, -200.0),
+            (-1024.0, 300.0),
+            (-240.0, 900.0),
+        ] {
+            for w in (320..=3840).step_by(160) {
+                for h in (240..=2160).step_by(120) {
+                    let s = at(ox, oy, f64::from(w), f64::from(h));
+                    let strips = frame_strips(s, FRAME_BORDER);
+                    for r in strips {
+                        assert!(r.x >= s.x && r.x + r.w <= s.x + s.w, "{s:?}: {r:?}");
+                        assert!(r.y >= s.y && r.y + r.h <= s.y + s.h, "{s:?}: {r:?}");
+                    }
+                    let [top_strip, bottom_strip, left_strip, right_strip] = strips;
+                    // Top and bottom: as wide as the screen, 2 pt tall.
+                    assert_eq!(
+                        (top_strip.x, top_strip.w, top_strip.h),
+                        (s.x, s.w, FRAME_BORDER),
+                        "{s:?}"
+                    );
+                    assert_eq!(top_strip.y + top_strip.h, s.y + s.h, "{s:?}: the top edge");
+                    assert_eq!(
+                        (bottom_strip.x, bottom_strip.w, bottom_strip.h),
+                        (s.x, s.w, FRAME_BORDER),
+                        "{s:?}"
+                    );
+                    assert_eq!(bottom_strip.y, s.y, "{s:?}: the bottom edge");
+                    // Left and right: as tall as the screen, 2 pt wide.
+                    assert_eq!(
+                        (left_strip.y, left_strip.h, left_strip.w),
+                        (s.y, s.h, FRAME_BORDER),
+                        "{s:?}"
+                    );
+                    assert_eq!(left_strip.x, s.x, "{s:?}: the left edge");
+                    assert_eq!(
+                        (right_strip.y, right_strip.h, right_strip.w),
+                        (s.y, s.h, FRAME_BORDER),
+                        "{s:?}"
+                    );
+                    assert_eq!(
+                        right_strip.x + right_strip.w,
+                        s.x + s.w,
+                        "{s:?}: the right edge"
+                    );
+                }
+            }
+        }
     }
 }
