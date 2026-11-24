@@ -1,6 +1,6 @@
 # FR-151: On a Mac, an update waits for live work
 
-**Issue:** [#4288](https://github.com/gjovanov/roomler-ai/issues/4288) · **Status:** claimed 2026-11-22; P0 done (#4243's design, its ruling and the operator's answers); P1–P3 not built
+**Issue:** [#4288](https://github.com/gjovanov/roomler-ai/issues/4288) · **Status:** claimed 2026-11-22; P0 done (#4243's design, its ruling and the operator's answers); P2 merged 2026-11-22 (#4299, `04ea2d1bf`) and served from 2026-11-23; P1 merged 2026-11-24 (#4297, `93a9ec85f`), released in 0.4.235 and field-read on twelve lab Macs the same day; P3 not built, by D1; the docs with AC11
 **From:** [#4243](https://github.com/gjovanov/roomler-ai/issues/4243): its [design](https://github.com/gjovanov/roomler-ai/issues/4243#issuecomment-7078923220), the coordinator's [ruling](https://github.com/gjovanov/roomler-ai/issues/4243#issuecomment-7079182419) and the operator's [answers](https://github.com/gjovanov/roomler-ai/issues/4243#issuecomment-7079545326). Where they differ, the latest wins.
 **Builds on:** #3429's slice 1 (#4225: `busy.rs`, `updater::periodic_gate`, `decide_defer`), #4245 and #4253 (`UpdateAsk`, `cycle_arm`, `CycleArm::defers_after`), [FR-147](FR-147-root-out-of-homes-macos.md) (the person's child and its envelope), [FR-5](FR-5-macos-unattended-update-chain.md) (the macOS update half)
 **Related:** #4244 (the Windows gap, FR-94), FR-43 and FR-141 (the Mac's shapes)
@@ -336,35 +336,72 @@ each box ticked only with its log line.
 | Phase | What | Kill switch, or back-out | Status |
 |---|---|---|---|
 | P0 | the design and its ruling (#4243), the operator's answers | none | done 2026-11-22 |
-| P1 | the gate: `live_work` and the person's ask in the LocalAPI; the daemon's answer and record; the forwarder's record; the helper's readings, budget, waiting loop and second reading; the child's verb; `self-update`'s ask; the cells; the docs | `/etc/roomler/install-over-live-work` | not built |
-| P2 | `install.sh`'s uninstall stops a waiting helper at once and waits only for one that has an `installer` child (`scripts/install.sh:1997-2011`). A promote serves the script, so it is served before the agent release that carries P1 | the previous script, served again | not built |
-| P3 | postinstall, for a manual install during a chain (D1) | none | not built |
-| Docs | each phase's docs in its own pull request | none | P1's with P1 |
+| P1 | the gate: `live_work` and the person's ask in the LocalAPI; the daemon's answer and record; the forwarder's record; the helper's readings, budget, waiting loop and second reading; the child's verb; `self-update`'s ask; the cells; the docs | `/etc/roomler/install-over-live-work` | done: merged 2026-11-24 (#4297, `93a9ec85f`) and released in 0.4.235. F0 RED on 0.4.231, and F1, F1b and F2 GREEN on a candidate, before the merge (2026-11-23); the rest field-verified on 0.4.235 by two lab lanes on 2026-11-24 (field log) |
+| P2 | `install.sh`'s uninstall stops a waiting helper at once and waits only for one that has an `installer` child (`scripts/install.sh:1997-2011`). A promote serves the script, so it is served before the agent release that carries P1 | the previous script, served again | done: merged 2026-11-22 (#4299, `04ea2d1bf`), carried by setup-v0.4.233 and served from 2026-11-23, before 0.4.235; U1 and U1b GREEN with 0.4.235 (field log) |
+| P3 | postinstall, for a manual install during a chain (D1) | none | not built, and not needed: D1 (Decisions, 2026-11-24) |
+| Docs | each phase's docs in its own pull request | none | P1's merged in #4297; the Mac's gate in `installation.md`, the helper plist's header, FR-5's note, the LocalAPI verbs, this field log and `docs/README.md`'s row with AC11 |
 
 ## Acceptance criteria
 
-- [ ] **AC1** (RED first): on the release before P1, a lab Mac's helper install cuts a live remote-control session (F0).
-- [ ] **AC2** (per-user Mac): a live session makes the helper defer, with `person=answered` in its log line. The
+- [x] **AC1** (RED first): on the release before P1, a lab Mac's helper install cuts a live remote-control session (F0).
+  Read 2026-11-23 on the published 0.4.231: a wake with a session live, and the helper installed at once with no
+  defer line; the viewer lost the session
+  ([step log](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7085357140),
+  [lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)).
+- [x] **AC2** (per-user Mac): a live session makes the helper defer, with `person=answered` in its log line. The
   session holds, and the install comes within the hour after it ends (F1, F2).
-- [ ] **AC3** (one-row Mac): the same, with both halves answered (F1b).
-- [ ] **AC4** (wakes never count): ten minutes of wakes leave the defer count unchanged, with at most one cycle a
+  Read 2026-11-24 on 0.4.235: F1 on four per-user Macs, each `… cycle=due root=not_running person=answered` with the
+  session held ([lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)); after the
+  session ended, the helper's own recheck installed 3606 s after the defer, with no wake
+  ([lane 2](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7144609181)).
+- [x] **AC3** (one-row Mac): the same, with both halves answered (F1b).
+  Read 2026-11-24 on 0.4.235: the defer with `root=answered person=answered`, the session held
+  ([lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)), and the helper's own
+  recheck installed 3603 s after the defer, with no wake
+  ([lane 2](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7144609181)).
+- [x] **AC4** (wakes never count): ten minutes of wakes leave the defer count unchanged, with at most one cycle a
   minute (F3).
-- [ ] **AC5** (two halves): an SSH connection to the root half defers; a push recorded by the root half installs over a
+  Read 2026-11-24 on 0.4.235: 11 wake cycles 60 to 62 s apart, each `consecutive_defers=1 … cycle=wake`, and the due
+  time did not move ([lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)).
+- [x] **AC5** (two halves): an SSH connection to the root half defers; a push recorded by the root half installs over a
   person's session; neither a person's push nor their click cuts the root half's SSH connection (F4, F5).
-- [ ] **AC6** ("Apply update"): the person's click installs at once over a session on their own desktop, on a
+  Read 2026-11-24 on 0.4.235, on two-row Macs: `busy=1 SSH connection(s)` deferred; a push to the root half's row
+  installed over a person's session with `forced update proceeding despite: 1 remote-control session(s)`; a push to
+  the person's row and the person's click each deferred with no force, and the SSH connection ran until its client
+  ended it ([lane 2](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7144609181)).
+- [x] **AC6** ("Apply update"): the person's click installs at once over a session on their own desktop, on a
   per-user Mac and on a one-row Mac (F6).
-- [ ] **AC7** (reboot and cap): a reboot in the middle of a chain keeps the count, and the cap forces the install, with
+  Read 2026-11-24 on 0.4.235, by the command the button runs: `forced update proceeding despite: 1 remote-control
+  session(s)`, then the install, on a per-user Mac and on a one-row Mac
+  ([lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)).
+- [x] **AC7** (reboot and cap): a reboot in the middle of a chain keeps the count, and the cap forces the install, with
   the warning naming the work (F7, F8).
-- [ ] **AC8** (kill switch and the empty Mac): the kill switch installs over live work. With nobody at the console and
+  Read 2026-11-24 on 0.4.235: the budget came through a reboot with `defers` 1, and the next due cycle read
+  `consecutive_defers=2`; a budget written with `defers` 7 and a past due time forced the install with the warning
+  ([lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)).
+- [x] **AC8** (kill switch and the empty Mac): the kill switch installs over live work. With nobody at the console and
   no root half, the install goes ahead as today (F9, F10).
-- [ ] **AC9** (`install.sh`): its uninstall stops a waiting helper at once, and waits only for one that is installing.
+  Read 2026-11-24 on 0.4.235: the switch, touched with no wake, installed over a live session; with nobody at the
+  console and no root half, `the install goes ahead root="not_running" person="not_running"`
+  ([lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)).
+- [x] **AC9** (`install.sh`): its uninstall stops a waiting helper at once, and waits only for one that is installing.
   The server serves this before the agent release that carries P1.
+  Read 2026-11-24 with the served script and 0.4.235: a waiting helper stopped at once (`why=Stopped`), and an
+  installing one was waited for until `installer(8)` exited. The script has carried #4299 since 2026-11-23, a day
+  before 0.4.235 ([lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)).
 - [ ] **AC10** (tests): the cells above pass in CI on the lanes that build them, the behaviour cells shown RED on P1's
   seam first.
-- [ ] **AC11** — Docs updated in house style (tables, the helper's cycle as a mermaid flow, `file:line` anchors):
+  Open (2026-11-24): on #4297's last head (`e20cc8bfb`) every cell passes in CI, across four lanes with no failure.
+  #4297's description records its seam (`49dc7086d`), where 31 of the 33 FR-151 tests failed, and lists them. H6
+  (`mac_the_childs_socket_is_the_daemons`), a macOS-only behaviour cell, is not among them: it runs only in CI's macOS
+  lane, and no CI ran on the seam.
+- [x] **AC11** — Docs updated in house style (tables, the helper's cycle as a mermaid flow, `file:line` anchors):
   `docs/installation.md`'s "An update waits for live work (#3429)" with the macOS rows and the helper's log lines; the
   helper plist's header; FR-5's note; wherever the docs list the LocalAPI verbs; this spec's field log; and a row in
   `docs/README.md`'s index that names the Mac's gate.
+  Done 2026-11-24: `installation.md`'s "macOS: the root update helper's gate (FR-151)", with the cycle, the Macs, the
+  log lines and the fixes in #3783's section; the plist's header; FR-5's note of 2026-11-24; `tunnels.md`'s LocalAPI
+  table; this spec's phases, boxes, D1 and field log; `docs/README.md`'s `installation.md` row.
 
 ## Decisions
 
@@ -383,12 +420,26 @@ Taken in the ruling and the operator's answers on #4243 (2026-11-22):
   without installing; an error reply is unread; the child stays inside FR-147's envelope; F0, F1 and F1b before P1's
   merge.
 
+Decided by the coordinator after P1's field read (2026-11-24; anchors on master `d651fa94e`, where `postinstall` is as
+it was at `11c2308b0`):
+
+- **D1, P3's shape: no P3.** It was open as: "A manual install during a chain leaves a waiting helper running, and
+  postinstall reads it as `running` and leaves it alone (`postinstall:751-753`); it exits when it sees its program
+  replaced, so the cost is bounded. postinstall could instead boot out a waiting helper that is not its own ancestor."
+  postinstall stays as it is (`agents/roomlerd/packaging/macos/postinstall:750-753`). The waiting helper takes its
+  program's device and inode when it starts (`program_id`, `agents/roomlerd/src/updater.rs:4855-4858`, taken at
+  `:4512-4513`) and compares them at every look (`program_replaced`, `:4527-4528`). Once an install has replaced the
+  program, `next_step` returns `Step::Exit(ExitWhy::Replaced)` (`agents/roomlerd/src/helper_gate.rs:430-431`), and the
+  helper exits without installing, the budget kept for the next run (`updater.rs:4534-4542`). A look comes every 5 s
+  (`TICK`, `helper_gate.rs:52`; `updater.rs:4553`), so leaving a waiting helper alone costs a few seconds, and the
+  next run is the new program's. Booting it out instead would have postinstall tell a waiting helper from one whose
+  `installer` child runs the script, to save those seconds. The unit cell C16
+  (`next_wake_spaces_wakes_and_exits_on_markers`, `helper_gate.rs:737`) holds the exit. No field cell ran a manual
+  install during a chain: the decision rests on the code.
+
 ## Open decisions
 
-- **D1, P3's shape.** A manual install during a chain leaves a waiting helper running, and postinstall reads it as
-  `running` and leaves it alone (`postinstall:751-753`); it exits when it sees its program replaced, so the cost is
-  bounded. postinstall could instead boot out a waiting helper that is not its own ancestor. Decided after P1's field
-  read.
+None: D1 was decided on 2026-11-24 (Decisions).
 
 ## Out of scope
 
@@ -404,3 +455,7 @@ Taken in the ruling and the operator's answers on #4243 (2026-11-22):
 
 | date | what | result |
 |---|---|---|
+| 2026-11-23 | P1's field gate before its merge, on lab Macs, 08:06Z to 08:40Z: F0 on the published 0.4.231, the release before P1; F1, F1b and F2 on a candidate build of the branch (`d4e665301`) with 0.4.233 on its feed ([step log](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7085357140)) | **F0 RED** (AC1): a wake with a session live, and the helper installed at once with no defer line; the viewer lost the session, and its redial came back on 0.4.233. **F1 GREEN** on a per-user Mac: `deferring the install: busy=1 remote-control session(s) … root=not_running person=answered`, and the session held. **F1b GREEN** on a one-row Mac: the same line with `root=answered person=answered`. **F2 GREEN**: once the session ended, a wake reached the waiting helper, which logged `the install goes ahead` 4 s later and installed |
+| 2026-11-24 | lane 1, after publication: eight lab Macs (seven per-user, one one-row; macOS 15.7.7, Apple Silicon), each a fresh clone that installed the published 0.4.235 and had 0.4.236 on its feed, 12:46Z to 15:41Z ([lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)) | AC1 (F0 above), AC4 and AC6 to AC9 GREEN. F1 on four per-user Macs and F1b deferred, and the sessions held; F2 installed at a wake 87 s after the session ended. F3: 11 wake cycles 60 to 62 s apart, the count at 1 and the due time unmoved. F6: the person's `roomlerd self-update` installed at once over a session on their own desktop, on a per-user and on a one-row Mac. F7: the count came through a reboot (the boot's run held by the opt-out marker), and the next due cycle read `consecutive_defers=2`. F8: a budget at 7 forced the install, with the warning. F9: the kill switch, touched with no wake, installed over a live session. F10: nobody at the console and no root half, `root="not_running" person="not_running"`, installed. `install.sh --uninstall`: a waiting helper stopped at once (`why=Stopped`), and an installing one was waited for until `installer(8)` exited. Owed after it: the install at the helper's own recheck (AC2, AC3) and F4, F5 (AC5) |
+| 2026-11-24 | lane 2, after publication: four lab Macs (one one-row, one per-user, two two-row), each a fresh clone that installed the published 0.4.235 and had 0.4.236 on its feed, 17:30Z to 20:11Z ([lane 2](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7144609181)) | AC2, AC3 and AC5 GREEN. With no wake, the helper's own recheck installed 3606 s after the defer on the per-user Mac and 3603 s after it on the one-row Mac, and the run that deferred is the run that installed. F4: an SSH connection to the root half deferred (`busy=1 SSH connection(s)`). F5: a push to the person's row and the person's click each deferred with no force, `consecutive_defers` stayed 1 while `next_check_secs` counted down, and the SSH connection ran until its client ended it. On a second two-row Mac, a push to the root half's row installed over a person's session with `forced update proceeding despite: 1 remote-control session(s)`, and the viewer's redial restored the session on 0.4.236 |
+| 2026-11-24 | lane 2's reading of the code, not a cell: a failed feed probe at a waiting helper's due minute (anchors at `agent-v0.4.235`, the same lines on master `d651fa94e`) | the helper logs `update-helper: check skipped`, and the run ends with the budget kept (`agents/roomlerd/src/updater.rs:4601-4603`). The next run is the plist's `StartInterval` of 21600 s (`agents/roomlerd/packaging/macos/com.roomler.update.plist:64-65`), unless a push, the person's ask, a boot or a daemon's outage recheck wakes it first: a daemon on a Mac forwards only pushes and the outage recheck (`updater.rs:3513-3514`, `forward_triggers`). So a server roll or a network drop at that minute can move the next counted cycle from an hour to as much as 6 h. The count is kept, and nothing installs over live work. The lane kept server rolls away from its due minutes. `installation.md`'s log-line table says what the line means |
