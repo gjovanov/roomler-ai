@@ -1207,9 +1207,9 @@ mod macos_kernel_tests {
         super::probe().expect("this runner's pf evaluates com.apple/* (the stock pf.conf)");
         let (status0, fwd0) = (pf_status(), fwd4());
         let anchor = super::anchor_for("utun199");
-        let (ok, serve) = super::serve("utun199", &["100.64.0.0/10".to_string()]).await;
+        let (outcome, serve) = super::serve("utun199", &["100.64.0.0/10".to_string()]).await;
         let serve = serve.expect("a serve to stop");
-        assert!(ok, "the serve set up fully");
+        assert!(outcome.v4.is_ok(), "the serve set up fully: {outcome:?}");
         assert_eq!(pf_status(), "Enabled", "pf enabled by our token");
         assert!(
             anchor_nat(&anchor).contains("nat on "),
