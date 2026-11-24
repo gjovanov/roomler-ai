@@ -777,7 +777,7 @@ describe('The Files page follows its org (#4257)', () => {
 
   it("the room view under org A goes back to all files: org B's files, never org A's room asked under org B", async () => {
     // The person had opened org A's eng room: the room view lists its files.
-    useRoomStore().setCurrent(ORGS[ORG_A]!.rooms[1] as never)
+    useRoomStore().setCurrent(ORGS[ORG_A]!.rooms[1] as never, ORG_A)
     await open(`/tenant/${ORG_A}/files`)
     await clickButton('Room Files')
     expect(pageText()).toContain('Org A eng diagram.txt')
@@ -791,7 +791,7 @@ describe('The Files page follows its org (#4257)', () => {
   })
 
   it('an upload started under org A sends every file of its batch to org A', async () => {
-    useRoomStore().setCurrent(ORGS[ORG_A]!.rooms[1] as never)
+    useRoomStore().setCurrent(ORGS[ORG_A]!.rooms[1] as never, ORG_A)
     const sent: string[] = []
     let firstAnswers!: () => void
     mockApi.upload.mockImplementation(async (path: string) => {
