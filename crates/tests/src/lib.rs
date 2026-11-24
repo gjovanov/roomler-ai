@@ -367,6 +367,10 @@ mod relay_region_tests;
 mod remote_control_tests;
 #[cfg(test)]
 mod remote_recording_tests;
+/// #4402 — a request writes a line at production's level only when its
+/// answer is worth reading: a refusal, an error, or a slow answer.
+#[cfg(test)]
+mod request_log_tests;
 /// FR-40 P2 — a key a device rotated away from cannot be used to rejoin:
 /// refused `key_retired` at join and DERP under the org's `enforce`, the
 /// device with the verb ordered to rotate (once), `warn` and `off` admit.
