@@ -379,7 +379,7 @@ roles do not.
   The rest of the network module's gated writes followed in #4218, and a guard now
   holds the order in every module ([below](#a-gated-write-decides-its-gate-before-it-reads-its-body)).
 - ⚠️ **The forward itself reads no permission bit, and must not.**
-  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
+  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1035`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
   people who hold no management bit reach what a holder named them for, so a bit on
   the forward would either defeat it or repeat it. When a policy names a role, the
@@ -1012,7 +1012,7 @@ mint asked, whether that person holds `MANAGE_AGENTS` in the credential's org
 `require_permission`, which nobody outside the org passes):
 
 - **Both doors ask it**: `POST /api/agent/enroll`, for a token and a key alike
-  (`crates/modules/fleet/src/agent.rs:354`), and `POST /api/agent/anchor`
+  (`crates/modules/fleet/src/agent.rs:379`), and `POST /api/agent/anchor`
   (`crates/modules/fleet/src/exec_service.rs:151`). They ask after the archived-org
   gate and before the token's spend or the key's claim
   ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)). A token a

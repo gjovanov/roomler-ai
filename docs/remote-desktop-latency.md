@@ -159,7 +159,7 @@ built **without a wire-format change**: the 13-byte video header already carried
 - **Measured at paint.** The decode worker computes
   `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:220` `frameAgeMs`). The
   pill is the window average, `~${Math.round(age.avgMs)} ms`
-  (`RemoteControl.vue:4863` `statsAgeLabel`, rendered at `:289`).
+  (`RemoteControl.vue:4864` `statsAgeLabel`, rendered at `:289`).
 - **On one clock.** The probe runs on the page, so the offset maps the agent's
   clock onto the page's, and a decode worker's `epochNow` is not the page's:
   each context fixes its epoch from the wall clock when it starts, and a worker
@@ -279,7 +279,7 @@ heartbeats with a `viewer_age_ms`.
 
 So the wire carries the number the person reads. Each window's `age` goes to the
 pill and to `sendDecodeStat` from one worker `stats` message
-(`useRemoteControl.ts:7809`, `:8465`, `RemoteControl.vue:4898`). A once-a-second
+(`useRemoteControl.ts:7809`, `:8465`, `RemoteControl.vue:4899`). A once-a-second
 read can skip a window, which fits the three misses, though this read can't prove it.
 
 That is all this read shows. The session was VP9 software on a loaded host, under
@@ -296,7 +296,7 @@ day: the worker now reads the offset through a skew the page measures when it st
 the worker (`workerAgentOffsetUs`, `rc-dc-worker.ts:889`). Production runs the old
 arithmetic until a promote. The read above started each session right after loading
 its page, so it stands, and the pill and the wire still take one worker `stats`
-message (`useRemoteControl.ts:7982`, `:8638`, `RemoteControl.vue:4864`). The fleet
+message (`useRemoteControl.ts:7982`, `:8638`, `RemoteControl.vue:4865`). The fleet
 tables above carry the error, and a window whose ages all read negative sent none,
 since `HopStats` drops a negative sample (`rc-hop-stats.ts:54`). AC8 ticks once #3568
 is on production and its owed GREEN read is in.

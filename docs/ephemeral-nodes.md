@@ -167,10 +167,10 @@ exec roomlerd run
   ([`wix-perMachine/main.wxs:698-700`](../agents/roomlerd/wix-perMachine/main.wxs#L698-L700),
   [`win_service/lifecycle.rs:293`](../agents/roomlerd/src/win_service/lifecycle.rs#L293)).
   The worker takes either stop as an OS-initiated stop
-  ([`app.rs:5801-5807`](../agents/roomlerd/src/app.rs#L5801-L5807)), finds no
+  ([`app.rs:5811-5817`](../agents/roomlerd/src/app.rs#L5811-L5817)), finds no
   update in flight, and an ephemeral device deletes its own row, the one its
   run started as
-  ([`app.rs:5895-5904`](../agents/roomlerd/src/app.rs#L5895-L5904)).
+  ([`app.rs:5905-5914`](../agents/roomlerd/src/app.rs#L5905-L5914)).
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
@@ -254,7 +254,7 @@ A device's `ephemeral` (`crates/agent-core/src/config.rs:45-55`) is what the
 server answered the enrollment that wrote the file, on every enrollment. One
 that folds into a file already there keeps that file's settings and takes the
 rest from the fresh enrollment: the identity fields, and `ephemeral`
-(`preserve_operator_config`, `crates/agent-core/src/enrollment.rs:1022-1035`).
+(`preserve_operator_config`, `crates/agent-core/src/enrollment.rs:1049-1062`).
 That covers the three folds of `apply_enrollment` into the primary: onto a file
 with no enrollment in it (a one-row Mac person's), a `--replace`, and a
 re-enrollment into the same server and org. Before #4331 a fold kept the old
@@ -263,15 +263,15 @@ with its row. A fold into a second organization never takes an ephemeral
 answer ([below](#a-second-organization-is-never-ephemeral-4352)).
 
 The answer is the row's nature (`EnrollResponse::ephemeral`,
-`crates/modules/fleet/src/agent.rs:308-312`, answered at `:468`), and a row's
+`crates/modules/fleet/src/agent.rs:333-337`, answered at `:493`), and a row's
 nature is fixed when the row is made:
 
 | The enrollment | The row it gets | The answer, and so the file |
 |---|---|---|
 | An ephemeral key | a new row, always: the key path is create-only, and a known machine id is a 409 | ephemeral |
 | A standard token, and the machine id has no live row | a new device: a new row, or a removed permanent row brought back as one (`revive`). A removed ephemeral row left nothing | permanent |
-| A standard token, and the machine id's row is live and permanent | that row, refreshed (`rehydrate`, `crates/services/src/dao/agent.rs:254-294`) | permanent |
-| A standard token, and the machine id's row is live and **ephemeral** | none: **409**, decided before the single-use token is spent, as the plan cap is (#4352: `refuse_live_ephemeral`, `crates/modules/fleet/src/agent.rs:616-630`, at `:379-381`, and again in every later round of `enroll_row`, `:536`) | nothing; the file is not written |
+| A standard token, and the machine id's row is live and permanent | that row, refreshed (`rehydrate`, `crates/services/src/dao/agent.rs:267-307`) | permanent |
+| A standard token, and the machine id's row is live and **ephemeral** | none: **409**, decided before the single-use token is spent, as the plan cap is (#4352: `refuse_live_ephemeral`, `crates/modules/fleet/src/agent.rs:638-652`, at `:404-406`, and again in every later round of `enroll_row`, `:564`) | nothing; the file is not written |
 
 A re-enrollment keeps the config's machine id
 (`agents/roomlerd/src/app.rs:2925-2932`), so the live row is the one it finds.
@@ -297,8 +297,8 @@ A secondary org (`[[orgs]]`) has no `ephemeral` (`OrgEntry`,
 its run started as ([below](#a-stop-removes-only-the-row-its-run-started-as-4352)),
 so nothing would ever remove an ephemeral secondary's row. An enrollment whose
 answer is ephemeral, and which would add an `[[orgs]]` entry or refresh one, is
-refused (`refuse_ephemeral_org`, `crates/agent-core/src/enrollment.rs:769-790`,
-decided in `apply_enrollment` at `:912-918`):
+refused (`refuse_ephemeral_org`, `crates/agent-core/src/enrollment.rs:796-817`,
+decided in `apply_enrollment` at `:939-945`):
 
 | The answer | The config file | The row |
 |---|---|---|
@@ -323,11 +323,11 @@ collects its row.
 
 The daemon keeps the row it started as: its primary's server, org, `agent_id`
 and `ephemeral` (`updater::RunRow`, taken at
-`agents/roomlerd/src/app.rs:4658`). On an OS stop the gate
+`agents/roomlerd/src/app.rs:4668`). On an OS stop the gate
 (`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
 unchanged) reads the run's own `ephemeral`, and the removal targets the run's
 own row (`updater::stop_removal`, `:5085-5114`, at
-`agents/roomlerd/src/app.rs:5895-5923`):
+`agents/roomlerd/src/app.rs:5905-5933`):
 
 | The file at the stop | The stop removes |
 |---|---|
