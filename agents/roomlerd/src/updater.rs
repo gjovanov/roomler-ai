@@ -3639,7 +3639,7 @@ pub async fn run_periodic(
         // push skips the live-work gate. The cooldown marker is read for an
         // ask only: the timer's carve-out is the skipped first check above.
         let in_cooldown = ask.is_some() && recent_update_attempt(STARTUP_UPDATE_COOLDOWN);
-        let busy = crate::busy::now(&rc_sessions);
+        let busy = crate::busy::gate_now(&rc_sessions).await;
         let cycle = cycle_name(ask.as_ref());
         let arm = cycle_arm(ask.as_ref(), &busy, consecutive_defers, in_cooldown);
         let defers_before = consecutive_defers;
