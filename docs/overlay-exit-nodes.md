@@ -256,7 +256,7 @@ is stored on the node's row as sent (`crates/remote_control/src/models.rs:7310`;
 the rehydrate `$unset`s it for a join that states nothing,
 `crates/services/src/dao/overlay_node.rs:362`), and reaches every client in its
 netmap peer (`signaling.rs:4088`, `to_netmap_peer`
-`crates/modules/network/src/overlay.rs:3063`). Absent stays absent on every
+`crates/modules/network/src/overlay.rs:3223`). Absent stays absent on every
 hop: never `null`, never read as `false`.
 
 A client decides with `v6_egress` (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:448`):
@@ -942,7 +942,7 @@ client of it would have black-holed.
 - **Approval reaches clients at once; the OFFER needs a re-join.** The approve
   and exit-node toggles re-fan the node to its peers immediately
   (`crates/modules/network/src/routes/overlay_route.rs:356`, `:433`, through
-  `overlay::refan_node`, `crates/modules/network/src/overlay.rs:1584`), so no
+  `overlay::refan_node`, `crates/modules/network/src/overlay.rs:1601`), so no
   client re-joins. What does is the exit node itself: the server refuses to
   approve `/0` on a node that has not advertised it, so set
   `overlay_exit_node_enabled` in its config and let it re-join first.
