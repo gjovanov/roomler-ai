@@ -977,19 +977,19 @@ been lost.
 
 - `Shadow::swap_spawn` (`plan.rs:552`) captures the plan's rate and dims when a
   replacement spawns, and the pump carries it beside the handle: `pending_swap`
-  is now `(handle, spawn)` (`peer.rs:7735`), and `PendingDimsOpen` gains a fifth
-  field (`peer.rs:6852`).
+  is now `(handle, spawn)` (`peer.rs:7736`), and `PendingDimsOpen` gains a fifth
+  field (`peer.rs:6853`).
 - At adoption, `judge_swap` (`plan.rs:601`, through `note_rate_swap_adopted`
-  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7686` and
-  `:7590`) asks one question: **did the plan move while it opened?**
+  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7687` and
+  `:7591`) asks one question: **did the plan move while it opened?**
   - **It held** — the common case; opens are milliseconds on most backends: the
     replacement is judged exactly as an inline open is, against the
     controller's first target after adoption (`after_tick`, `plan.rs:527`).
     Re-rated there although the plan did not move is a divergence — the `zeus`
     finding above.
   - **It moved**: a **stale adoption**, counted apart — `plan_stale_swaps` on
-    the heartbeat (`peer.rs:10293`), and the session's first logs once at INFO
-    with its three rates (`log_plan_stale_swap`, `peer.rs:10430`): *`FR-70 M3a: a
+    the heartbeat (`peer.rs:10294`), and the session's first logs once at INFO
+    with its three rates (`log_plan_stale_swap`, `peer.rs:10431`): *`FR-70 M3a: a
     replacement was adopted after the plan moved while it opened (built at the
     plan of its spawn; first time this session)`*. Not judged at the tick. That
     is the lag M4 will trade against an IDR per adoption.
