@@ -230,7 +230,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:3269`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:3273`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:999`) and `folder_words` (`:1132`), with `r5_words` (`:1178`); `refusals` (`:1520`) says them.
 
 ### Refusals at Plan
@@ -661,7 +661,7 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2998`, its sequence at `:3038`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3002`, its sequence at `:3042`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:3196`): one-row's row, and
@@ -738,9 +738,9 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
   person's config (`config.rs:3627-3674`) could bring it back. #4184 fixed that for every conversion from its release
   on: `convert` keeps the new config as its `.prev` too ("Refusals at convert"). Left out of #4184, each named: a
   Mac converted before it keeps the enrolled `.prev` until that person's next save rotates the new file in, which
-  for the console person is the screen worker's clean-run save five minutes in (`app.rs:5677`), while a person not
+  for the console person is the screen worker's clean-run save five minutes in (`app.rs:5722`), while a person not
   at the console has no writer; on such a Mac, with `macos_one_row` turned off by hand, the supervisor's enrolled
-  worker that finds a config there that does not load restores that `.prev` through `app.rs:4044` and runs the
+  worker that finds a config there that does not load restores that `.prev` through `app.rs:4089` and runs the
   copy, since `may_restore` (`config_at_start.rs:74-85`, #4157) covers only a missing config; and a
   `.prev` beside a person config that is missing, which Read never sees and `convert` leaves. The worker root's
   supervisor starts never restores a missing config at its start (#4157): with `--unenrolled` it writes a blank
