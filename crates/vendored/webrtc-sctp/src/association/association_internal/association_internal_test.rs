@@ -1384,3 +1384,110 @@ async fn test_assoc_close_ends_a_read_between_its_check_and_its_wait() -> Result
     }
     Ok(())
 }
+
+// roomler (FR-148 P0, D43): the pacer in the association. It holds only new
+// data, only while a writer has it on, and only once a SACK gave it a round
+// trip; a retransmission never waits for it. Where a test needs the tokens
+// to hold, the round trip is 1,000 s and the rate 12 bytes a second: a held
+// chunk waits longer than any test runs, so the counts do not depend on how
+// long a test takes.
+
+/// An established association in slow start whose window holds ten
+/// messages, with `pending` messages of 1,200 bytes waiting; chunk 10 is the
+/// next to go.
+async fn pacer_association(pending: usize) -> AssociationInternal {
+    let mut a = delivery_association(10);
+    a.use_forward_tsn = false;
+    a.cwnd = 12_000;
+    a.ssthresh = u32::MAX;
+    a.rwnd = 1 << 20;
+    for _ in 0..pending {
+        let c = ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            stream_identifier: 1,
+            user_data: Bytes::from(vec![0u8; 1200]),
+            ..Default::default()
+        };
+        assert!(a.pending_queue.push(c).await);
+    }
+    a
+}
+
+/// How many new chunks one send moves into flight.
+async fn new_chunks_sent(a: &mut AssociationInternal) -> usize {
+    a.pop_pending_data_chunks_to_send().await.0.len()
+}
+
+#[tokio::test]
+async fn test_pacer_off_or_with_no_round_trip_holds_nothing() {
+    let mut a = pacer_association(12).await;
+    // Off, a round trip is kept nowhere, and the window alone decides.
+    a.pacer.on_rtt(Duration::from_secs(1_000));
+    assert_eq!(new_chunks_sent(&mut a).await, 10);
+    assert_eq!(a.take_pace_wake(), None);
+
+    // On, with no round trip yet: the first flight leaves as it would.
+    let mut a = pacer_association(12).await;
+    a.pace_switch().set(true);
+    assert_eq!(new_chunks_sent(&mut a).await, 10);
+    assert_eq!(a.take_pace_wake(), None);
+}
+
+#[tokio::test]
+async fn test_pacer_takes_its_round_trip_from_a_sack_and_holds_new_data() -> Result<()> {
+    // Chunk 10 in flight, sent 1,000 s ago, then twelve messages waiting.
+    let mut a = ack_delay_association(&[(10, 1, Duration::from_secs(1_000))]);
+    let switch = a.pace_switch();
+    switch.set(true);
+    a.handle_sack(&sack(10, &[])).await?;
+    for _ in 0..12 {
+        let c = ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            stream_identifier: 1,
+            user_data: Bytes::from(vec![0u8; 1200]),
+            ..Default::default()
+        };
+        assert!(a.pending_queue.push(c).await);
+    }
+    (a.cwnd, a.ssthresh, a.rwnd) = (12_000, u32::MAX, 1 << 20);
+
+    // 12 bytes a second: the first send's tokens let one chunk out, the
+    // write loop gets a wake for the next, and a send before it moves none.
+    assert_eq!(new_chunks_sent(&mut a).await, 1);
+    assert!(a.take_pace_wake().is_some());
+    assert_eq!(new_chunks_sent(&mut a).await, 0);
+    assert!(a.take_pace_wake().is_some());
+
+    // Turned off, it holds nothing: the window decides again.
+    switch.set(false);
+    assert_eq!(new_chunks_sent(&mut a).await, 9);
+    assert_eq!(a.take_pace_wake(), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_pacer_the_cap_holds_new_data_and_a_retransmission_never_waits() {
+    let mut a = pacer_association(12).await;
+    let switch = a.pace_switch();
+    switch.set(true);
+    switch.steer(crate::association::pacer::WHOLE, Some(3_600));
+    // A round trip of a microsecond: the tokens hold nothing, the cap does.
+    a.pacer.on_rtt(Duration::from_micros(1));
+    assert_eq!(new_chunks_sent(&mut a).await, 3);
+    assert_eq!(new_chunks_sent(&mut a).await, 0);
+    assert_eq!(a.take_pace_wake(), None, "a SACK wakes it, not a timer");
+
+    // T3-rtx expires with the cap reached: the first chunk goes again, within
+    // the window of one packet the expiry leaves.
+    a.on_retransmission_timeout(RtxTimerId::T3RTX, 1).await;
+    let (packets, _) = a.gather_outbound().await;
+    let resent: Vec<(u32, u32)> = packets
+        .iter()
+        .flat_map(|p| p.chunks.iter())
+        .filter_map(|c| c.as_any().downcast_ref::<ChunkPayloadData>())
+        .map(|c| (c.tsn, c.nsent))
+        .collect();
+    assert_eq!(resent, [(10, 2)]);
+}
