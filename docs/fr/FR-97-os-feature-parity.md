@@ -389,7 +389,7 @@ can do.
 ### 3.2 P0a — fail toward withhold (#2081)
 
 `SystemTun` refuses an exemption wherever it has no arm: a `cfg(not(any(linux, windows)))` `add_host_exemption`
-returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:740-751` withholds and `roomler status`
+returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:746-757` withholds and `roomler status`
 says why. The trait default stays `Ok(())`, now documented as safe only for a device that installs no OS routes
 (the in-memory mocks, netstack); changing it would move every mock and netstack for no safety gain. Netstack's untrue
 `active` belongs to P0c. The test that fails on master is
@@ -483,7 +483,7 @@ beside the words.
   - `ExitNodeStatus.socks5_port` (`crates/localapi/src/lib.rs:117`): `roomler status` says "active for SOCKS5
     clients of 127.0.0.1:1080 only", and never `v6 on`.
   - The host's DNS is never steered from a netstack node
-    (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:527`): on Windows and macOS the steer is host-wide and
+    (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:533`): on Windows and macOS the steer is host-wide and
     would route nothing through the exit.
   - A netstack node withholds every route offer (`crates/tunnel-core/src/overlay/nat.rs:209`): its stack forwards
     nothing. On 0.4.141, a netstack node on a host where iptables worked offered `/0`.
@@ -503,24 +503,24 @@ Mirror the Linux arm with the BSD tools the macOS code already drives, and close
 
 1. **The uplink, per family.** At bring-up, `route -n get [-inet6] default` gives the next hop and the interface
    (`tun.rs:6123`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
-   every pin (`current_uplink`, `tun.rs:8622`): a Mac that booted without a network still pins once it has one, and
+   every pin (`current_uplink`, `tun.rs:8630`): a Mac that booted without a network still pins once it has one, and
    one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:360`) refuses a route on our
    own utun, one narrower than `/0` (a `/1` also prints `destination: default`; only the mask tells), and one with no
    next-hop address (another VPN's interface route). A family with no usable default keeps what it had, so a network
    in transit does not move the pins.
-2. **A pin is read from the routing TABLE** (`netstat -rnW -f inet[6]`, `bsd_table` `tun.rs:8107`), never from a
+2. **A pin is read from the routing TABLE** (`netstat -rnW -f inet[6]`, `bsd_table` `tun.rs:8115`), never from a
    lookup. A destination a connection has used keeps an interface-scoped clone of the default route
    (`WASCLONED,IFSCOPE`), and an unscoped `route -n get` answers with that clone even after the pin is in (field,
    §8: the first P1a read back by lookup and refused every pin for the server). The pin is the UNSCOPED static host
    route for exactly the address (`bsd_pin_row`, `tun.rs:442`: flags `H` and `S`, never `W` or `I`), and it holds
    when it is flagged `G` through the uplink's next hop on its interface (`bsd_pin_holds`, `tun.rs:455`).
-3. **`add_host_exemption`** (`tun.rs:7089`) looks first, because BSD `route` has no idempotent write (#1856): a pin
+3. **`add_host_exemption`** (`tun.rs:7097`) looks first, because BSD `route` has no idempotent write (#1856): a pin
    that holds is left alone; one that does not (the old uplink, a crashed run's, an interface route) is deleted, then
    added; anything else gets `route add -host <ip> <gw>` (`-inet6` and a zoned `fe80::1%en0` for v6). Never `route
    change`: it resolves its target the way the lookup does, and on the field Mac it left the pin untouched. The table
    then decides; a pin that does not hold comes out again and the call errs.
-4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:7201` on macOS, an empty default
-   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:778`)
+4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:7209` on macOS, an empty default
+   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:784`)
    asks at most every 3 s, re-pins each, and DELETES one it cannot re-pin before forgetting it, so an untracked
    route never outlives the exit. Then the usual rule applies: a v4 pin missing means WITHHOLD.
 5. **`del_host_exemption`** removes only the pin the table shows, never a route on our utun (a peer route): with no
@@ -528,8 +528,8 @@ Mirror the Linux arm with the BSD tools the macOS code already drives, and close
    removes the `/1`s (`tun.rs:5305-5348` at the time of writing); pins an unclean exit leaves behind are N13, all
    three OSes.
 6. **The two 0.4.132 follow-ups.** The pin WARN fires once per (endpoint, cause) (`note_exemption_failure`,
-   `route_guard.rs:570`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
-   (`exemption_withheld_reason`, `route_guard.rs:582`) instead of `no original default route?`.
+   `route_guard.rs:576`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
+   (`exemption_withheld_reason`, `route_guard.rs:588`) instead of `no original default route?`.
 
 Kill switch: `ROOMLERD_EXIT_CLIENT_MACOS=0` refuses every exemption, as 0.4.132 did. DNS is not steered yet (P1c):
 `roomler status` says `DNS NOT steered`.
