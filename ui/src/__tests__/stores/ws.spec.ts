@@ -302,13 +302,16 @@ describe('useWsStore', () => {
       expect(spy).toHaveBeenNthCalledWith(2, unpin)
     })
 
-    it('should increment unread for message:create in a non-current room', () => {
+    // #4395 — "a page shows this room" is `showRoom`, which the chat and call
+    // pages claim while mounted; `setCurrent` alone (the last opened room,
+    // kept after its page is left) no longer stops a count.
+    it('should increment unread for message:create in a room no page shows', () => {
       const store = useWsStore()
       store.connect()
       mockWsInstance.simulateOpen()
 
       const roomStore = useRoomStore()
-      roomStore.setCurrent({ id: 'current-room' } as never)
+      roomStore.showRoom('current-room')
       const spy = vi.spyOn(roomStore, 'incrementUnread')
 
       mockWsInstance.simulateMessage({
@@ -319,13 +322,13 @@ describe('useWsStore', () => {
       expect(spy).toHaveBeenCalledWith('other-room')
     })
 
-    it('should NOT increment unread for message:create in the current room', () => {
+    it('should NOT increment unread for message:create in the room a page shows', () => {
       const store = useWsStore()
       store.connect()
       mockWsInstance.simulateOpen()
 
       const roomStore = useRoomStore()
-      roomStore.setCurrent({ id: 'current-room' } as never)
+      roomStore.showRoom('current-room')
       const spy = vi.spyOn(roomStore, 'incrementUnread')
 
       mockWsInstance.simulateMessage({
@@ -334,6 +337,25 @@ describe('useWsStore', () => {
       })
 
       expect(spy).not.toHaveBeenCalled()
+    })
+
+    it('should increment unread for the last opened room once its page released it', () => {
+      const store = useWsStore()
+      store.connect()
+      mockWsInstance.simulateOpen()
+
+      const roomStore = useRoomStore()
+      roomStore.setCurrent({ id: 'current-room' } as never, 'T')
+      const release = roomStore.showRoom('current-room')
+      release()
+      const spy = vi.spyOn(roomStore, 'incrementUnread')
+
+      mockWsInstance.simulateMessage({
+        type: 'message:create',
+        data: { id: 'm1', room_id: 'current-room', content: 'hi', author_id: 'other' },
+      })
+
+      expect(spy).toHaveBeenCalledWith('current-room')
     })
 
     it('should route room:call_started to roomStore.updateRoomCallStatus', () => {
