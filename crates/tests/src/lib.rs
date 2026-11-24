@@ -249,6 +249,10 @@ mod oauth_tests;
 /// start with the holder named, per seat on Pro, carried across pods.
 #[cfg(test)]
 mod org_session_cap_tests;
+/// #4402 — a fan-out pass writes one line for the peers it could not reach,
+/// not one line a peer.
+#[cfg(test)]
+mod overlay_fan_log_tests;
 #[cfg(test)]
 mod overlay_growth_tests;
 #[cfg(test)]
