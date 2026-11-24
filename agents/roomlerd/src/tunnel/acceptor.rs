@@ -65,7 +65,7 @@ pub async fn decide_forward(
             session_id,
             flow_id,
             kind: RejectKind::AclDenied,
-            reason: format!("agent: {reason}"),
+            reason: format!("roomlerd: {reason}"),
         });
     }
     match dial_dst(dst_host, dst_port, dial_timeout).await {
@@ -132,7 +132,7 @@ pub async fn handle_forward_request(
                 session_id,
                 flow_id,
                 kind: RejectKind::AgentError,
-                reason: "DC pool not ready on agent".into(),
+                reason: "roomlerd: DC pool not ready".into(),
             })
             .await;
         return;
@@ -145,7 +145,7 @@ pub async fn handle_forward_request(
                 session_id,
                 flow_id,
                 kind: RejectKind::AgentError,
-                reason: "empty DC pool on agent".into(),
+                reason: "roomlerd: empty DC pool".into(),
             })
             .await;
         return;
@@ -317,7 +317,7 @@ pub async fn decide_forward_udp(
             session_id,
             flow_id,
             kind: RejectKind::AclDenied,
-            reason: format!("agent: {reason}"),
+            reason: format!("roomlerd: {reason}"),
         });
     }
     match dial_udp(dst_host, dst_port, dial_timeout).await {
@@ -378,7 +378,7 @@ pub async fn handle_udp_forward_request(
                 session_id,
                 flow_id,
                 kind: RejectKind::AgentError,
-                reason: "DC pool not ready on agent".into(),
+                reason: "roomlerd: DC pool not ready".into(),
             })
             .await;
         return;
@@ -390,7 +390,7 @@ pub async fn handle_udp_forward_request(
                 session_id,
                 flow_id,
                 kind: RejectKind::AgentError,
-                reason: "empty DC pool on agent".into(),
+                reason: "roomlerd: empty DC pool".into(),
             })
             .await;
         return;

@@ -61,7 +61,7 @@ impl CliTransport {
 
 #[derive(Debug, Parser)]
 #[command(name = "roomler", version, about, long_about = None)]
-struct Cli {
+pub struct Cli {
     // RETIRED-NAME-ANCHOR(4): the config segment is frozen — it holds the
     // ENROLLED credential on tunnel-only hosts, and renaming it strands
     // every one of them. agents/roomler-cli/src/config.rs
@@ -93,29 +93,29 @@ enum Command {
         name: String,
     },
     /// Open one TCP forward: listen on `--local`, accept TCP connections,
-    /// dial `--remote` from the named agent's host. Stays in the
+    /// dial `--remote` from the named device. Stays in the
     /// foreground; Ctrl-C tears down.
     Forward {
-        /// Hex `agent_id` of the target agent (visible in the admin UI).
+        /// Hex `agent_id` of the target device (visible in the admin UI).
         #[arg(long)]
         agent: String,
         /// Local TCP port to listen on (bound to 127.0.0.1).
         #[arg(long)]
         local: u16,
-        /// Remote destination `host:port` that the agent dials. Subject
-        /// to the agent's allowlist + the tenant's tunnel_policies.
+        /// Remote destination `host:port` that the device dials. Subject
+        /// to the device's allowlist + the tenant's tunnel_policies.
         #[arg(long)]
         remote: String,
         /// Data-plane transport. `auto` (default) prefers QUIC and
         /// transparently falls back to WebRTC if QUIC setup fails;
         /// `quic` forces QUIC (no fallback); `webrtc` forces the proven
         /// WebRTC DataChannel path. Server-side QUIC negotiation is
-        /// deployed and gates on the agent's reported version, so `auto`
-        /// only attempts QUIC against agents that actually support it.
+        /// deployed and gates on the daemon's reported version, so `auto`
+        /// only attempts QUIC against daemons that actually support it.
         #[arg(long, value_enum, default_value = "auto")]
         transport: CliTransport,
         /// Hand the forward to the LOCAL daemon over the LocalAPI instead of
-        /// running it in this process: the daemon opens it over its own agent
+        /// running it in this process: the daemon opens it over its own control
         /// WS (no tunnel-client token needed) + supervises it, and this command
         /// returns immediately. The flow survives this CLI's exit — manage it
         /// with `flows` / `kill`. (Becomes the default at the P3d rename.)
@@ -131,14 +131,14 @@ enum Command {
     },
     /// Run a local SOCKS5 proxy ("userspace mode"): apps point at
     /// `127.0.0.1:<local>` and each connection's SOCKS5 CONNECT target is dialed
-    /// by the named agent over the tunnel. Needs NO OS routing, so it works on
+    /// by the named device over the tunnel. Needs NO OS routing, so it works on
     /// strict full-tunnel corporate VPNs (Check Point, etc.) where the L3 overlay
-    /// can't win the routing table. Same server policy + agent allowlist as
+    /// can't win the routing table. Same server policy + device allowlist as
     /// `forward`. Stays in the foreground; Ctrl-C tears down. TCP CONNECT only.
     Socks5 {
-        /// Hex `agent_id` of the target agent. OMIT for **mesh mode**: one proxy
-        /// reaches the whole tenant, addressing an agent by its 24-hex id as the
-        /// SOCKS hostname (`--socks5-hostname <agent-id>:<port>`).
+        /// Hex `agent_id` of the target device. OMIT for **mesh mode**: one proxy
+        /// reaches the whole tenant, addressing a device by its 24-hex id as the
+        /// SOCKS hostname (`--socks5-hostname <device-id>:<port>`).
         #[arg(long)]
         agent: Option<String>,
         /// Local TCP port for the SOCKS5 listener (bound to 127.0.0.1).
@@ -173,7 +173,7 @@ enum Command {
     /// routes — use `route add` instead; never wired.
     Run {},
     /// Probe path-MTU, ICE candidate reachability, and TURN-relay status
-    /// against the named agent. Prints a structured diagnostic dump.
+    /// against the named device. Prints a structured diagnostic dump.
     /// T3 implementation.
     Diagnose {
         #[arg(long)]
@@ -417,7 +417,7 @@ enum Command {
     /// `roomler exec "Office PC" -- hostname`.
     Exec {
         /// Target device — a device name (e.g. `build-box`), a dashboard
-        /// display name, or a hex agent id. A display name is resolved from
+        /// display name, or a hex device id. A display name is resolved from
         /// the org's device list only when no device NAME matches it, and
         /// refused when two devices share it — the server then resolves and
         /// gates whatever is sent, exactly as before.
@@ -452,7 +452,7 @@ enum Command {
     /// A dashboard display name works too: `roomler ssh "Office PC"`.
     Ssh {
         /// Target device — a device name (e.g. `build-box`), a dashboard
-        /// display name, or a hex agent id. Resolved like `exec`'s: a display
+        /// display name, or a hex device id. Resolved like `exec`'s: a display
         /// name counts only when no device NAME matches it, and one that two
         /// devices share is refused rather than guessed.
         device: String,
@@ -715,13 +715,13 @@ enum RouteAction {
     /// Declare a supervised route. With `--remote` it's a static forward;
     /// without, a SOCKS5 listener toward the node.
     Add {
-        /// Target agent id (24-hex) to reach.
+        /// Target device id (24-hex) to reach.
         #[arg(long)]
         agent: String,
         /// Local loopback port to listen on.
         #[arg(long)]
         local: u16,
-        /// Forward target `host:port` (as reachable FROM the agent).
+        /// Forward target `host:port` (as reachable FROM the device).
         /// Omit for a SOCKS5 route.
         #[arg(long)]
         remote: Option<String>,
@@ -764,7 +764,7 @@ enum RouteAction {
     Edit {
         /// Route id (from `route ls`).
         id: String,
-        /// New target agent id (24-hex).
+        /// New target device id (24-hex).
         #[arg(long)]
         agent: Option<String>,
         /// New local loopback port.
@@ -983,7 +983,7 @@ where
              (persisted in the daemon config, restarts with the daemon)"
         ),
         Command::Diagnose { agent } => {
-            bail!("T3: diagnose not yet wired (agent={:?})", agent);
+            bail!("T3: diagnose not yet wired (--agent {:?})", agent);
         }
         Command::SelfUpdate { check } => {
             // "One updater per role" (see CLAUDE.md, P4c-2): tunnel-ONLY hosts

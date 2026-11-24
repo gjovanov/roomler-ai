@@ -437,7 +437,7 @@ pub fn down_detail() -> Option<String> {
 
 fn down_detail_of(why: &str) -> String {
     format!(
-        "this device's virtual desktop is down: {why}. The agent starts it again by itself; \
+        "this device's virtual desktop is down: {why}. The daemon starts it again by itself; \
          reconnect in a moment"
     )
 }
@@ -2046,7 +2046,7 @@ impl Desktop {
             // die at once, or land on the next server, outside any tree.
             if st.up.is_none() {
                 return XStart::Refused(format!(
-                    "this device's virtual desktop is down: {}. The agent starts it again by \
+                    "this device's virtual desktop is down: {}. The daemon starts it again by \
                      itself; launch it again in a moment",
                     st.why_down
                 ));
@@ -3623,7 +3623,7 @@ mod tests {
         assert_eq!(
             down_detail_of("its X server (Xvfb) exited: signal 6 (aborted), core dumped"),
             "this device's virtual desktop is down: its X server (Xvfb) exited: signal 6 \
-             (aborted), core dumped. The agent starts it again by itself; reconnect in a moment"
+             (aborted), core dumped. The daemon starts it again by itself; reconnect in a moment"
         );
     }
 
@@ -8171,7 +8171,7 @@ mod supervise_tests {
         assert_eq!(
             reason.detail,
             "this device's virtual desktop is down: its X server (Xvfb) exited: signal 9 \
-             (killed). The agent starts it again by itself; reconnect in a moment"
+             (killed). The daemon starts it again by itself; reconnect in a moment"
         );
         // Not before the grace: a stop that comes within it is the daemon's
         // own, and its sessions are told nothing.

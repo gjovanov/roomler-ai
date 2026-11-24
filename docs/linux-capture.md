@@ -711,7 +711,7 @@ brief's refresher (`refresh_soon`, `desktop_brief.rs:53`), so the hello's
 minute later. A session opened meanwhile is refused with `backend_error` and
 the agent's own words (`capture/mod.rs:3614`), for example: *this device's
 virtual desktop is down: its X server (Xvfb) exited: signal 6 (aborted), core
-dumped. The agent starts it again by itself; reconnect in a moment.* Display
+dumped. The daemon starts it again by itself; reconnect in a moment.* Display
 match treats the desktop as the daemon's own all the while
 (`virtual_desktop::active`), so a server that restarts is never read as a
 person coming back to the screen.
