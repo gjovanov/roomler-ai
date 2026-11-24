@@ -101,6 +101,45 @@ impl std::fmt::Display for NoConfig {
 
 impl std::error::Error for NoConfig {}
 
+/// #4379 — the enrolled worker FR-43's macOS supervisor starts found its config
+/// there, and it does not load. That worker does not restore the file's last
+/// good copy (`config::load_without_restore`): on a Mac converted to one row the
+/// copy can hold an enrollment that moved to the root daemon. Like [`NoConfig`]
+/// it ends with [`NO_ENROLLMENT_EXIT_CODE`], which that supervisor reads: nothing
+/// runs, no crash is recorded, and its give-up names both ends
+/// (`macos_supervisor::gave_up_reason`). Its line names the file and why it does
+/// not load; the parse error says where, never what is there (#3086).
+#[derive(Debug)]
+pub struct ConfigDoesNotLoad {
+    path: PathBuf,
+    why: String,
+}
+
+impl ConfigDoesNotLoad {
+    /// The config at `path` did not load, with `error`.
+    pub fn at(path: &Path, error: &anyhow::Error) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            why: format!("{error:#}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigDoesNotLoad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the config at {} does not load ({}), and this worker does not restore its last \
+             good copy: on a Mac converted to one row that copy can hold an enrollment the root \
+             daemon runs now. The file is left as it is",
+            self.path.display(),
+            self.why
+        )
+    }
+}
+
+impl std::error::Error for ConfigDoesNotLoad {}
+
 /// #4023 — a worker's crash record for the error its `run` ended with. `record`
 /// writes it, with the summary it always had (`worker exit: ` and the whole
 /// chain), for every error but [`NoConfig`], even under a context. That one is
@@ -184,10 +223,10 @@ pub fn machine_held_exit_code() -> i32 {
 ///
 /// #4071 — and the code of the GUI worker FR-43's macOS supervisor started (`run
 /// --supervised`, without `--unenrolled`) whose console user has no enrollment on
-/// this Mac. That supervisor reaps `sudo`, which passes the code through as its
-/// own, and writes no crash record for it either (`macos_supervisor::crash_summary`).
-/// It counts the exit towards giving up as an exit 1, then says for certain why
-/// (`macos_supervisor::gave_up_reason`).
+/// this Mac, or (#4379) whose config does not load ([`ConfigDoesNotLoad`]). That
+/// supervisor reaps `sudo`, which passes the code through as its own, and records
+/// no crash for it either (`macos_supervisor::crash_summary`). It counts the exit
+/// towards giving up as an exit 1, then says why (`macos_supervisor::gave_up_reason`).
 ///
 /// FR-150 P2 — and the code of the per-user Scheduled Task's daemon (`run
 /// --supervisor task`), whose launcher (`agents/roomlerdw`) leaves on this code
@@ -224,6 +263,10 @@ pub fn exit_code(error: &anyhow::Error) -> Option<i32> {
     // #4280 — a machine whose guard another daemon holds.
     if error.downcast_ref::<MachineHeld>().is_some() {
         return Some(machine_held_exit_code());
+    }
+    // #4379 — only that worker's start ever ends with it.
+    if error.downcast_ref::<ConfigDoesNotLoad>().is_some() {
+        return Some(NO_ENROLLMENT_EXIT_CODE);
     }
     error
         .downcast_ref::<NoConfig>()

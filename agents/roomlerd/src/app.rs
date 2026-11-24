@@ -4149,7 +4149,7 @@ async fn run_cmd(
             )
         })?;
     }
-    let mut cfg = config::load(config_path).context("loading config")?;
+    let mut cfg = config_at_start::load(config_path, unenrolled, supervision)?;
     // #3116 — every save below, up to the LocalAPI coming up, writes THIS
     // copy, so each goes through `startup_writes`: it refuses to write over a
     // file another process wrote after this load (the setup wizard's folded
@@ -5398,6 +5398,11 @@ async fn run_cmd(
         delegate_host.clone(),
         shutdown_rx.clone(),
     ));
+    // #4379 — beside it, the root daemon's sweep of people's `.prev` after a
+    // conversion to one row; never in a worker. Aborted below as well.
+    #[cfg(target_os = "macos")]
+    let one_row_sweep_task = (euid_is_root() && !supervised)
+        .then(|| tokio::spawn(roomlerd::one_row::sweep_at_start(shutdown_rx.clone())));
 
     // FR-43 P2a — the WORKER half. Inert unless `--supervised` says the root
     // daemon started us and put an attach secret on our stdin, so a
@@ -5948,6 +5953,10 @@ async fn run_cmd(
     }
     #[cfg(target_os = "linux")]
     if let Some(t) = replaced_task {
+        t.abort();
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(t) = one_row_sweep_task {
         t.abort();
     }
     // #1684 — take our own virtual desktop down BEFORE we leave. Under systemd
@@ -9647,6 +9656,81 @@ mod no_enrollment_exit_tests {
                 missing.display()
             ))
         );
+    }
+
+    /// #4379, cell 24 — the enrolled worker FR-43's macOS supervisor starts
+    /// (`run --supervised`, on a Mac), on a config that is there and does not
+    /// load, beside a last good copy that holds an enrollment: the load its
+    /// start makes after the lock (`config_at_start::load`, `run_cmd`'s only
+    /// load) ends with `ConfigDoesNotLoad`, 78, a line that names the file,
+    /// and both files byte for byte as they were, alone in their folder. The
+    /// same files under any other run are restored, as before. At the load,
+    /// not through `run_cmd`: past the gate a start takes host-global state
+    /// (`machine_gate_tests`), and a load that restored would start a daemon.
+    #[test]
+    fn a_supervised_worker_whose_config_does_not_load_leaves_with_78() {
+        use roomlerd::daemon_error::{ConfigDoesNotLoad, NO_ENROLLMENT_EXIT_CODE, exit_code};
+        use roomlerd::supervision::Supervision;
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            roomlerd::supervision::detect_here(None, true),
+            Supervision::MacosSupervisor
+        );
+        let copy = toml::to_string(&config::test_fixture()).unwrap();
+        let files = |live: &[u8]| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, live).unwrap();
+            std::fs::write(config::prev_path(&path), &copy).unwrap();
+            (dir, path)
+        };
+        let names = |dir: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        for live in [b"agent_token = \"broken\n".to_vec(), vec![0u8; 64]] {
+            let (dir, path) = files(&live);
+            let before = names(dir.path());
+            let res = super::config_at_start::load(&path, false, Supervision::MacosSupervisor)
+                .map(|_| ());
+            let (words, code) = step_outcome(&res);
+            assert_eq!(code, NO_ENROLLMENT_EXIT_CODE);
+            let said = words.unwrap_or_default();
+            assert!(
+                said.contains(&path.display().to_string())
+                    && said.contains("does not load")
+                    && said.contains("this worker does not restore its last good copy"),
+                "{said}"
+            );
+            let err = res.expect_err("the config does not load, and nothing is restored");
+            assert!(err.downcast_ref::<ConfigDoesNotLoad>().is_some(), "{err:#}");
+            assert_eq!(exit_code(&err), Some(NO_ENROLLMENT_EXIT_CODE));
+            assert_eq!(std::fs::read(&path).unwrap(), live, "the config as it was");
+            assert_eq!(
+                std::fs::read_to_string(config::prev_path(&path)).unwrap(),
+                copy,
+                "its copy as it was"
+            );
+            assert_eq!(names(dir.path()), before);
+        }
+        for (supervision, unenrolled) in [
+            (Supervision::MacosSupervisor, true),
+            (Supervision::Launchd, false),
+            (Supervision::None, false),
+        ] {
+            let (_dir, path) = files(b"agent_token = \"broken\n");
+            let cfg = super::config_at_start::load(&path, unenrolled, supervision)
+                .unwrap_or_else(|e| panic!("{supervision:?} {unenrolled}: {e:#}"));
+            assert_eq!(
+                cfg.agent_token,
+                config::test_fixture().agent_token,
+                "{supervision:?} {unenrolled}: restored, as before"
+            );
+        }
     }
 }
 
