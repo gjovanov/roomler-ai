@@ -1582,3 +1582,284 @@ describe('useAgentStore: an ensure answers with the fetch in flight (#4257)', ()
     expect(s.agents.map((a) => a.id)).toEqual([DEVICE, 'dev_2'])
   })
 })
+
+// #4332 — a device dialog asks whether the store holds THIS org's switch,
+// never whether the switch is unset: a switch that holds another org's value
+// is not unset. Each switch has an ensure beside its fetcher, in the shape of
+// `ensureAgents`: it answers with this org's fetch, in flight or landed, and
+// starts one otherwise. One test per state of the ensure, for each switch:
+//   1. no fetch yet, or a value no fetch recorded (a test's seed): it fetches;
+//   2. the value is another org's: it fetches, and that value is gone at once;
+//   3. this org's fetch is in flight: no second GET, and it settles only once
+//      the answer has landed;
+//   4. this org's latest fetch landed with an answer: no GET;
+//   5. this org's latest fetch ended unknown (refused, failed, or a caller who
+//      may not read org settings): it asks again, and for exec and SSH
+//      `mayReadOrgSettings` still decides whether a GET goes out.
+describe("useAgentStore: an org switch's ensure asks for THIS org's value (#4332)", () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+
+  type Store = ReturnType<typeof useAgentStore>
+  interface Switch {
+    name: string
+    route: string
+    fetch: (s: Store, tenantId: string) => Promise<void>
+    ensure: (s: Store, tenantId: string) => Promise<void>
+    /** The server's answer: org A's switch is on, org B's off. */
+    answer: (on: boolean) => unknown
+    held: (s: Store) => unknown
+    /** What the store holds after the org's answer, and while unknown. */
+    of: (on: boolean) => unknown
+    unknown: unknown
+    /** A value set with no fetch, as a test seeds one. */
+    seed: (s: Store) => void
+    /** Its fetch asks `mayReadOrgSettings` first. */
+    gated: boolean
+  }
+  const SWITCHES: Switch[] = [
+    {
+      name: 'exec',
+      route: 'exec-settings',
+      fetch: (s, t) => s.fetchOrgExecEnabled(t),
+      ensure: (s, t) => s.ensureOrgExecEnabled(t),
+      answer: (on) => ({ remote_exec_enabled: on, exec_require_system: on }),
+      held: (s) => [s.orgExecEnabled, s.orgExecRequireSystem],
+      of: (on) => [on, on],
+      unknown: [null, null],
+      seed: (s) => {
+        s.orgExecEnabled = true
+      },
+      gated: true,
+    },
+    {
+      name: 'SSH',
+      route: 'ssh-settings',
+      fetch: (s, t) => s.fetchOrgSshEnabled(t),
+      ensure: (s, t) => s.ensureOrgSshEnabled(t),
+      answer: (on) => ({ remote_ssh_enabled: on }),
+      held: (s) => s.orgSshEnabled,
+      of: (on) => on,
+      unknown: null,
+      seed: (s) => {
+        s.orgSshEnabled = true
+      },
+      gated: true,
+    },
+    {
+      name: 'external access',
+      route: 'external-access',
+      fetch: (s, t) => s.fetchExternalAccess(t),
+      ensure: (s, t) => s.ensureExternalAccess(t),
+      answer: (on) => ({ enabled: on, devices: on ? [{ id: 'dev_a' }] : [] }),
+      held: (s) => [s.orgExternalAccessEnabled, s.externalDevices.map((d) => d.id)],
+      of: (on) => [on, on ? ['dev_a'] : []],
+      unknown: [null, []],
+      seed: (s) => {
+        s.orgExternalAccessEnabled = true
+      },
+      gated: false,
+    },
+  ]
+
+  /** The server's answer to a GET: the caller owns both orgs. */
+  function answerFor(path: string): unknown {
+    const m = /^\/tenant\/([^/]+)\/(.+)$/.exec(path)
+    if (m?.[2] === 'member/me') return { permissions: 0, is_owner: true }
+    const x = SWITCHES.find((y) => y.route === m?.[2])
+    if (!m || !x) throw new Error(`unexpected GET ${path}`)
+    return x.answer(m[1] === ORG_A)
+  }
+
+  /** A GET whose answer (or failure) the test hands over later. */
+  interface Held {
+    path: string
+    taken: boolean
+    release: () => void
+    fail: (e: unknown) => void
+  }
+  let held: Held[] = []
+  function hold(tenant: string, route: string): Held {
+    const never = () => {
+      throw new Error(`the held GET of ${route} was never sent`)
+    }
+    const h: Held = { path: `/tenant/${tenant}/${route}`, taken: false, release: never, fail: never }
+    held.push(h)
+    return h
+  }
+  /** Every pending promise has settled. */
+  const settle = () => new Promise((r) => setTimeout(r, 0))
+  /** How many GETs of the switch were sent for `tenant`. */
+  const gets = (x: Switch, tenant: string) =>
+    mockApi.get.mock.calls.filter((c) => c[0] === `/tenant/${tenant}/${x.route}`).length
+  const refusal = () => Object.assign(new Error('Forbidden'), { status: 403 })
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    // A test that stops before its held GET is sent must not hand it to the next.
+    mockApi.get.mockReset()
+    mockApi.put.mockReset()
+    held = []
+    mockApi.get.mockImplementation(async (path: string) => {
+      const h = held.find((x) => !x.taken && x.path === path)
+      if (!h) return answerFor(path) as never
+      h.taken = true
+      return new Promise((resolve, reject) => {
+        h.release = () => resolve(answerFor(path) as never)
+        h.fail = reject
+      }) as never
+    })
+    const t = useTenantStore()
+    t.isOwner = true
+    t.myPermissions = 0
+    t.myPermissionsTenantId = ORG_A
+  })
+
+  for (const x of SWITCHES) {
+    it(`${x.name}, state 1: with no fetch yet, it fetches`, async () => {
+      const s = useAgentStore()
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 1: a value no fetch recorded (a test's seed) is no org's, so it fetches`, async () => {
+      const s = useAgentStore()
+      x.seed(s)
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 2: holding org A's value, it fetches org B's, and org A's is gone at once, before any answer`, async () => {
+      const s = useAgentStore()
+      await x.fetch(s, ORG_A)
+      expect(x.held(s)).toEqual(x.of(true))
+      const answerB = hold(ORG_B, x.route)
+      const ensured = x.ensure(s, ORG_B)
+      expect(x.held(s)).toEqual(x.unknown)
+      await settle()
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.unknown)
+
+      answerB.release()
+      await ensured
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 3: with this org's fetch in flight, it sends no second GET, and settles only once the answer has landed`, async () => {
+      const s = useAgentStore()
+      const answerB = hold(ORG_B, x.route)
+      void x.fetch(s, ORG_B)
+      // Asked at once, before the fetch's GET is sent, and again after it is.
+      let settled = 0
+      const first = x.ensure(s, ORG_B).then(() => settled++)
+      await settle()
+      const second = x.ensure(s, ORG_B).then(() => settled++)
+      await settle()
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(settled).toBe(0)
+      expect(x.held(s)).toEqual(x.unknown)
+
+      answerB.release()
+      await Promise.all([first, second])
+      expect(settled).toBe(2)
+      expect(x.held(s)).toEqual(x.of(false))
+      expect(gets(x, ORG_B)).toBe(1)
+    })
+
+    it(`${x.name}, state 3: a fetch that a newer one superseded settles with the newest, so the ensure settles once the newest answer has landed`, async () => {
+      const s = useAgentStore()
+      const firstB = hold(ORG_B, x.route)
+      const newestB = hold(ORG_B, x.route)
+      void x.fetch(s, ORG_B)
+      await settle()
+      let settled = false
+      const ensured = x.ensure(s, ORG_B).then(() => (settled = true))
+      // A page's refresh for the same org (Settings' org watch) supersedes it.
+      void x.fetch(s, ORG_B)
+      await settle()
+      expect(gets(x, ORG_B)).toBe(2)
+
+      firstB.release()
+      await settle()
+      expect(settled).toBe(false)
+      expect(x.held(s)).toEqual(x.unknown)
+      newestB.release()
+      await ensured
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 4: with this org's answer landed, it sends no GET`, async () => {
+      const s = useAgentStore()
+      await x.fetch(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      await x.ensure(s, ORG_B)
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 5: after this org's fetch was refused, it asks again`, async () => {
+      const s = useAgentStore()
+      const refused = hold(ORG_B, x.route)
+      const first = x.ensure(s, ORG_B)
+      await settle()
+      refused.fail(refusal())
+      await first
+      expect(x.held(s)).toEqual(x.unknown)
+
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(2)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 5: after this org's fetch failed, it asks again`, async () => {
+      const s = useAgentStore()
+      const failed = hold(ORG_B, x.route)
+      const first = x.ensure(s, ORG_B)
+      await settle()
+      failed.fail(new Error('network'))
+      await first
+      expect(x.held(s)).toEqual(x.unknown)
+
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(2)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+  }
+
+  for (const x of SWITCHES.filter((y) => y.gated)) {
+    it(`${x.name}, state 5: for a caller who may not read org settings no GET goes out at all, and once they may, it asks`, async () => {
+      // MANAGE_AGENTS | REMOTE_CONTROL: the Devices page, but not MANAGE_TENANT.
+      const t = useTenantStore()
+      t.isOwner = false
+      t.myPermissions = (1 << 24) | (1 << 25)
+      t.myPermissionsTenantId = ORG_B
+      const s = useAgentStore()
+      await x.ensure(s, ORG_B)
+      await x.ensure(s, ORG_B)
+      expect(mockApi.get).not.toHaveBeenCalled()
+      expect(x.held(s)).toEqual(x.unknown)
+
+      t.isOwner = true
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+  }
+
+  it("exec, state 4: an older server's answer, which names no exec_require_system, is an answer: no GET again", async () => {
+    // Never read "known" off a ref: `orgExecRequireSystem` stays null in it.
+    mockApi.get.mockImplementation(async (path: string) => {
+      if (path === `/tenant/${ORG_B}/exec-settings`) return { remote_exec_enabled: false } as never
+      return answerFor(path) as never
+    })
+    const s = useAgentStore()
+    await s.ensureOrgExecEnabled(ORG_B)
+    expect([s.orgExecEnabled, s.orgExecRequireSystem]).toEqual([false, null])
+    await s.ensureOrgExecEnabled(ORG_B)
+    expect(gets(SWITCHES[0]!, ORG_B)).toBe(1)
+  })
+})
