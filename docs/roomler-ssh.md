@@ -1150,7 +1150,7 @@ the claim landing on the other prod pod:
 | 1 — org kill-switch (`remote_ssh_enabled`) | server | **live.** Default off, and a *separate* switch from `remote_exec_enabled`: allowing bounded diagnostic commands is not the same decision as allowing interactive sessions |
 | 2 — caller permission (`SSH_DEVICE`, `1 << 29`) | server | **live.** A *separate* bit from `EXEC_DEVICE` and, like it, deliberately **not** in `DEFAULT_ADMIN` |
 | 3 — `SshPolicy` | server | **live.** `SshMode::Off` default, `can_originate` on the *originating* device, user/role allowlists, `account_mode`, consent |
-| 4 — `ssh_enabled` + `ssh_authorized_keys` | the device | **live.** The refusal that survives a compromised control plane |
+| 4 — `ssh_enabled` | the device | **live.** The refusal that survives a compromised control plane. A grant needs no entry in `ssh_authorized_keys`: that list is the separate break-glass route, empty by default (#4325) |
 
 All four are default-deny, and each is owned by a different party, so no single
 compromise is sufficient.

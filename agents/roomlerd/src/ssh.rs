@@ -552,9 +552,9 @@ mod sshd {
     /// built rather than per connection.
     pub struct Ctx {
         pub config: Arc<russh::server::Config>,
-        /// Keys allowed to authenticate. Empty is a valid, safe state: the
-        /// transport answers, every authentication attempt fails, and the
-        /// operator sees exactly why in the log.
+        /// The break-glass keys, read only when no server grant matches. Empty
+        /// is the default and a safe state: a grant still signs in, a key-list
+        /// session is refused, and the start-up log says so (#4325).
         pub authorized: Vec<PublicKey>,
         /// What a key-list session runs as, resolved once from
         /// `ssh_account_mode`.
@@ -651,11 +651,11 @@ mod sshd {
                     ),
                 }
             }
-            if authorized.is_empty() {
-                warn!(
-                    "ssh: no usable entries in ssh_authorized_keys — the port will answer \
-                     but every authentication attempt will be refused"
-                );
+            // #4325 — what the list as a whole leaves able to sign in.
+            match super::key_list_line(cfg.ssh_authorized_keys.len(), authorized.len()) {
+                Some(super::KeyListLine::Info(line)) => info!("{line}"),
+                Some(super::KeyListLine::Warn(line)) => warn!("{line}"),
+                None => {}
             }
 
             let config = russh::server::Config {
@@ -3844,9 +3844,9 @@ mod tests {
         );
     }
 
-    /// An empty list is the default, and it must deny rather than allow.
+    /// An empty list is the default, and with no grant to redeem it must deny.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_empty_authorized_list_denies_everyone() {
+    async fn an_empty_authorized_list_denies_a_key_with_no_grant() {
         let (key, _) = client_key(3);
         let addr = serve_one(&cfg_with(Vec::new())).await;
 
@@ -7401,4 +7401,186 @@ mod tests {
             assert!(!ran.exists(), "a command asked for on the forward ran");
         }
     }
+
+    // ── #4325: the start-up line about the key list as a whole ────────────
+    //
+    // A server grant is tried before the list and needs no entry in it
+    // (`a_grant_admits_its_key_exactly_once` signs in with the list EMPTY),
+    // so the line says which sign-ins remain, never that every attempt is
+    // refused. Each case reads the line `Ctx::build` writes, level first.
+
+    /// What `f` logs, as the daemon's log file writes it.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// What the worker's server logs as it is built for `cfg`.
+    fn build_log(cfg: &crate::config::AgentConfig) -> String {
+        logged(|| {
+            super::sshd::Ctx::build(cfg, test_services()).expect("a usable host key");
+        })
+    }
+
+    /// The lines of `log` at `level` that name `ssh_authorized_keys`, trimmed,
+    /// so each reads `LEVEL message fields`.
+    fn key_list_lines<'a>(log: &'a str, level: &str) -> Vec<&'a str> {
+        log.lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with(level) && l.contains("ssh_authorized_keys"))
+            .collect()
+    }
+
+    /// The default: no break-glass key. A server grant still signs in, so the
+    /// line says that at INFO, and nothing about the list is a WARN.
+    #[test]
+    fn an_empty_key_list_says_only_server_grants_sign_in_at_info() {
+        let log = build_log(&cfg_with(Vec::new()));
+        assert_eq!(
+            key_list_lines(&log, "INFO"),
+            [
+                "INFO ssh: no break-glass key is set (ssh_authorized_keys is empty), so only \
+                 server grants (roomler ssh) can sign in"
+            ],
+            "the start line, at INFO:\n{log}"
+        );
+        assert_eq!(
+            key_list_lines(&log, "WARN"),
+            Vec::<&str>::new(),
+            "no WARN about the list:\n{log}"
+        );
+    }
+
+    /// Entries, and none parses: the operator meant to set a break-glass key
+    /// and none works. Each entry is still warned about by its index alone,
+    /// and the summary is a WARN that counts them.
+    #[test]
+    fn a_key_list_where_no_entry_parses_warns_with_the_count() {
+        // Shaped like a key, so the parse fails on the key data. Its comment
+        // must not reach the log: a malformed entry is still key material.
+        let bad = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL4325notakey i4325-entry-comment";
+        let cases = [
+            (
+                vec![bad.to_string()],
+                "WARN ssh: ssh_authorized_keys has 1 entry and it does not parse, so no \
+                 break-glass key works: only server grants (roomler ssh) can sign in",
+            ),
+            (
+                vec![bad.to_string(), "not a key".to_string()],
+                "WARN ssh: ssh_authorized_keys has 2 entries and none parses, so no \
+                 break-glass key works: only server grants (roomler ssh) can sign in",
+            ),
+        ];
+        for (entries, summary) in cases {
+            let n = entries.len();
+            let log = build_log(&cfg_with(entries));
+            let warns = key_list_lines(&log, "WARN");
+            assert_eq!(
+                warns
+                    .iter()
+                    .filter(|l| l.contains("ignoring an unparseable ssh_authorized_keys entry"))
+                    .count(),
+                n,
+                "one WARN per entry, as before:\n{log}"
+            );
+            assert!(
+                warns.contains(&summary),
+                "the summary WARN, counting {n}:\n{log}"
+            );
+            assert_eq!(key_list_lines(&log, "INFO"), Vec::<&str>::new(), "{log}");
+            assert!(
+                !log.contains("i4325-entry-comment"),
+                "an entry's text reached the log:\n{log}"
+            );
+        }
+    }
+
+    /// One key that parses: the list works as the fallback, so no summary is
+    /// added (`ssh: server ready` counts the keys), whatever else it holds.
+    #[test]
+    fn a_key_list_with_one_good_key_adds_no_summary_line() {
+        let (_, good) = client_key(43);
+        let log = build_log(&cfg_with_mode(vec![good.clone()], Some("console_user")));
+        assert_eq!(key_list_lines(&log, "WARN"), Vec::<&str>::new(), "{log}");
+        assert_eq!(key_list_lines(&log, "INFO"), Vec::<&str>::new(), "{log}");
+        assert!(log.contains("authorized_keys=1"), "{log}");
+
+        // Beside an entry that does not parse: that entry's own WARN only.
+        let log = build_log(&cfg_with_mode(
+            vec!["not a key".to_string(), good],
+            Some("console_user"),
+        ));
+        let warns = key_list_lines(&log, "WARN");
+        assert_eq!(warns.len(), 1, "{log}");
+        assert!(
+            warns[0].contains("ignoring an unparseable ssh_authorized_keys entry"),
+            "{log}"
+        );
+        assert!(log.contains("authorized_keys=1"), "{log}");
+    }
+}
+
+// ===========================================================================
+// #4325 — the start-up line about `ssh_authorized_keys` as a whole.
+// ===========================================================================
+
+/// The line `sshd::Ctx::build` logs about `ssh_authorized_keys` as a whole,
+/// at the level it is logged at.
+#[cfg(feature = "ssh-server")]
+enum KeyListLine {
+    Info(String),
+    Warn(String),
+}
+
+/// What `listed` entries, `usable` of which parse, leave able to sign in.
+/// A server grant is tried before the list and needs no entry in it
+/// (`auth_publickey`), so whatever the list holds, a grant still signs in.
+/// `None` adds no line: `ssh: server ready` counts the usable keys.
+#[cfg(feature = "ssh-server")]
+fn key_list_line(listed: usize, usable: usize) -> Option<KeyListLine> {
+    const ONLY_GRANTS: &str = "only server grants (roomler ssh) can sign in";
+    if usable > 0 {
+        return None;
+    }
+    Some(match listed {
+        // The default. Nobody asked for a break-glass key, so this is no
+        // warning.
+        0 => KeyListLine::Info(format!(
+            "ssh: no break-glass key is set (ssh_authorized_keys is empty), so {ONLY_GRANTS}"
+        )),
+        // Someone wrote these entries to have a break-glass key, and none
+        // works: they would find out when the server cannot mint grants, the
+        // one time that route is for. Each entry has its own WARN, from
+        // `Ctx::build`.
+        1 => KeyListLine::Warn(format!(
+            "ssh: ssh_authorized_keys has 1 entry and it does not parse, so no break-glass key \
+             works: {ONLY_GRANTS}"
+        )),
+        n => KeyListLine::Warn(format!(
+            "ssh: ssh_authorized_keys has {n} entries and none parses, so no break-glass key \
+             works: {ONLY_GRANTS}"
+        )),
+    })
 }
