@@ -217,16 +217,19 @@ static SUBNET_GUARD_OFF_SAID: std::sync::atomic::AtomicBool =
 /// delete-then-add on the same prefix, and awaiting it inline would stall
 /// the outbound TUN arm).
 pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
-    run_defense_wave_with(tun, set, subnet_guard_enabled()).await;
+    run_defense_wave_with(tun, set, subnet_guard_enabled(), &SUBNET_GUARD_OFF_SAID).await;
 }
 
 /// [`run_defense_wave`] with the subnet switch passed in
 /// ([`subnet_guard_enabled`]), so a cell sets it without touching the process
-/// environment, which the cells share while they run in parallel.
+/// environment, which the cells share while they run in parallel. The flag
+/// that says the switch's INFO once ([`SUBNET_GUARD_OFF_SAID`]) is passed in
+/// too, so a cell reads that line whatever the cells before it said.
 pub(super) async fn run_defense_wave_with(
     tun: Arc<dyn TunIo>,
     set: Vec<Defend>,
     subnet_guard: bool,
+    off_said: &std::sync::atomic::AtomicBool,
 ) {
     // FR-68 — the wave is the unit of work a route war multiplies: every
     // eviction is a FIB change, which feeds our own route-change subscription,
@@ -249,8 +252,11 @@ pub(super) async fn run_defense_wave_with(
             Defend::AssertSubnet(cidr) => {
                 if subnet_guard {
                     tun.defend_subnet_route(&cidr.to_string()).await.ok();
-                } else if !SUBNET_GUARD_OFF_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                } else if !off_said.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    // #4380 — on the route guard's own target, which the
+                    // daemon keeps at INFO under every `RUST_LOG`.
                     info!(
+                        target: crate::overlay::ROUTE_GUARD_LOG,
                         %cidr,
                         "overlay: the route guard leaves subnet routes alone on this host \
                          (ROOMLERD_OVERLAY_SUBNET_GUARD is off): a router peer's subnet route \

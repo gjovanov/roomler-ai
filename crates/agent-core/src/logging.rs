@@ -461,6 +461,18 @@ fn filter_for(rust_log: Option<&str>) -> EnvFilter {
                 .parse()
                 .expect("static EnvFilter directive is valid"),
         )
+        // #4380 — the route guard's two INFO lines, on a target of their own
+        // (tunnel-core's `overlay::ROUTE_GUARD_LOG`): the off switch's
+        // (`ROOMLERD_OVERLAY_SUBNET_GUARD=0`), once per process, and the one
+        // that names another route holding a subnet's prefix, once per hold.
+        // The packaged Linux units' `RUST_LOG` dropped both, so this is
+        // appended UNCONDITIONALLY too. No other line uses the target, so no
+        // other `tunnel_core` INFO comes with them.
+        .add_directive(
+            "tunnel_core::overlay::route_guard=info"
+                .parse()
+                .expect("static EnvFilter directive is valid"),
+        )
 }
 
 /// #1928, #3506 — targets whose INFO lines the daemon keeps under any spec that
@@ -484,7 +496,7 @@ const KEPT_AT_INFO: [&str; 2] = ["roomler_localapi", "roomler_node_core::logging
 /// of INFO or finer already keeps the lines, and a directive added there would
 /// cap them, since a directive with a target outranks a bare level: under
 /// `debug,roomler_localapi=info` the crate logs at INFO. That is also why this
-/// edits the spec, where [`filter_for`]'s two fixed directives use
+/// edits the spec, where [`filter_for`]'s fixed directives use
 /// `add_directive`: that replaces any directive for the same target, at whatever
 /// level the operator gave it.
 ///
@@ -1520,6 +1532,64 @@ mod tests {
                 "{rust_log:?}"
             );
         }
+    }
+
+    /// #4380 — the route guard's two INFO lines, the off switch's and the one
+    /// that names a subnet's other holder, share one target (tunnel-core's
+    /// `overlay::ROUTE_GUARD_LOG`, whose cells pin the same string), and every
+    /// shipped spec keeps it: a Windows service sets none, the packaged Linux
+    /// units and the macOS per-user agent set `roomlerd=info,warn` (a unit from
+    /// before the FR-21 rename too), and the macOS root daemon sets `info`.
+    /// The packaged spec still drops the target's DEBUG and every other
+    /// `tunnel_core` INFO but FR-110's `sockbuf`, the modules the two lines
+    /// were said from before included.
+    #[test]
+    fn the_route_guards_lines_show_under_every_shipped_spec_and_no_other_tunnel_core_info() {
+        use tracing::Level;
+        for rust_log in [
+            None,
+            Some("roomlerd=info,warn"),
+            Some(LEGACY_UNIT),
+            Some("info"),
+            Some("roomlerd=info,tunnel_core=info,warn"),
+        ] {
+            assert!(
+                kept(rust_log, || tracing::enabled!(
+                    target: "tunnel_core::overlay::route_guard",
+                    Level::INFO
+                )),
+                "{rust_log:?}"
+            );
+        }
+        let packaged = |check: fn() -> bool| kept(Some("roomlerd=info,warn"), check);
+        assert!(!packaged(|| tracing::enabled!(
+            target: "tunnel_core::overlay::route_guard",
+            Level::DEBUG
+        )));
+        assert!(!packaged(|| tracing::enabled!(
+            target: "tunnel_core::overlay::runtime::route_guard",
+            Level::INFO
+        )));
+        assert!(!packaged(|| tracing::enabled!(
+            target: "tunnel_core::overlay::tun",
+            Level::INFO
+        )));
+        assert!(!packaged(|| tracing::enabled!(
+            target: "tunnel_core::overlay::runtime",
+            Level::INFO
+        )));
+        assert!(!packaged(|| tracing::enabled!(
+            target: "tunnel_core::overlay::router",
+            Level::INFO
+        )));
+        assert!(!packaged(|| tracing::enabled!(
+            target: "tunnel_core::overlay",
+            Level::INFO
+        )));
+        assert!(!packaged(|| tracing::enabled!(
+            target: "tunnel_core",
+            Level::INFO
+        )));
     }
 
     #[test]
