@@ -18,7 +18,7 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::{Bson, Document, doc, oid::ObjectId};
 use futures::{SinkExt, StreamExt};
-use roomler_ai_remote_control::models::{NodeRef, OsKind};
+use roomler_ai_remote_control::models::{EnrollingProgram, EnrollingProgramName, NodeRef, OsKind};
 use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
 use roomler_ai_services::dao::overlay_node::{NewOverlayNode, OverlayNodeDao};
 use serde_json::{Value, json};
@@ -473,7 +473,7 @@ async fn a_members_tunnel_clients_end_with_their_membership() {
             "member's device".to_string(),
             "mach-tcend-device".to_string(),
             OsKind::Linux,
-            "0.4.0-test".to_string(),
+            EnrollingProgram::new(EnrollingProgramName::Roomlerd, "0.4.0-test"),
             String::new(),
             None,
         )
