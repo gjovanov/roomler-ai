@@ -5,6 +5,8 @@
 // unordered with no retransmits, beside `video-bytes` whenever chunk framing is
 // negotiated, and hands both to the one data-channel worker. `video-bytes` is
 // always reliable and ordered: the per-browser unordered opt-in is retired.
+// FR-148 P4b-3b (D58) — and each `rc:decodestat` carries the stats poll's
+// newest read of the page's own relay, which the agent's pick reads.
 //
 // Through the real composable: the peer is a fake `RTCPeerConnection` that
 // records every channel it is asked for, the decode worker a fake `Worker` that
@@ -55,11 +57,15 @@ class FakeChannel {
   onopen: (() => void) | null = null
   onclose: (() => void) | null = null
   onmessage: ((ev: { data: unknown }) => void) | null = null
+  /** FR-148 P4b-3b — what the page sent on it. */
+  readonly sent: unknown[] = []
   constructor(
     readonly label: string,
     readonly init: RTCDataChannelInit | undefined,
   ) {}
-  send() {}
+  send(data: unknown) {
+    this.sent.push(data)
+  }
   close() {
     this.readyState = 'closed'
   }
@@ -69,6 +75,8 @@ class FakeChannel {
 
 class FakePc {
   static last: FakePc | null = null
+  /** FR-148 P4b-3b — what `getStats()` answers. */
+  static stats: Map<string, Record<string, unknown>> = new Map()
   readonly made: FakeChannel[] = []
   connectionState = 'new'
   onconnectionstatechange: (() => void) | null = null
@@ -92,7 +100,7 @@ class FakePc {
     this.config = c
   }
   async getStats() {
-    return new Map()
+    return FakePc.stats
   }
   async createOffer() {
     return { type: 'offer', sdp: 'v=0\r\n' }
@@ -184,6 +192,7 @@ beforeEach(() => {
   vi.stubGlobal('RTCPeerConnection', FakePc)
   vi.stubGlobal('Worker', FakeWorker)
   vi.stubGlobal('OffscreenCanvas', FakeOffscreenCanvas)
+  FakePc.stats = new Map()
 })
 afterEach(() => {
   vi.useRealTimers()
@@ -278,5 +287,48 @@ describe('FR-148 P4b-2 — both channels reach the one worker', () => {
     expect(moves).toHaveLength(1)
     expect(moves[0]!.msg).toEqual({ type: 'video-channel', channel: bytes })
     expect(moves[0]!.transfer).toEqual([bytes])
+  })
+})
+
+/** A Chromium-shaped stats report whose selected pair's local candidate is
+ *  `local`. */
+function selectedLocal(local: Record<string, unknown>) {
+  return new Map<string, Record<string, unknown>>([
+    ['T01', { id: 'T01', type: 'transport', selectedCandidatePairId: 'CP1' }],
+    ['CP1', { id: 'CP1', type: 'candidate-pair', localCandidateId: 'IL1', remoteCandidateId: 'IR1' }],
+    ['IL1', { id: 'IL1', type: 'local-candidate', ...local }],
+    ['IR1', { id: 'IR1', type: 'remote-candidate', candidateType: 'srflx' }],
+  ])
+}
+
+describe('FR-148 P4b-3b — the page reports its relay on each rc:decodestat', () => {
+  it('puts the newest stats poll’s read on the next rc:decodestat, and no key once its pair is no relay', async () => {
+    FakePc.stats = selectedLocal({ candidateType: 'relay', relayProtocol: 'tls' })
+    const { pc, worker } = await connect(['chunk-framing'])
+    const control = pc.made.find((c) => c.label === 'control')
+    expect(control).toBeDefined()
+    control!.readyState = 'open'
+    const decodestats = () =>
+      control!.sent
+        .map((s) => JSON.parse(s as string) as Record<string, unknown>)
+        .filter((m) => m.t === 'rc:decodestat')
+    const window = () => worker.onmessage!({ data: { type: 'stats', fps: 30 } } as MessageEvent)
+
+    // Before the first poll the page has read nothing: no key.
+    window()
+    expect(decodestats()).toHaveLength(1)
+    expect(decodestats()[0]).not.toHaveProperty('relay')
+
+    await vi.advanceTimersByTimeAsync(500)
+    window()
+    expect(decodestats().at(-1)).toMatchObject({ t: 'rc:decodestat', fps: 30, relay: 'tls', de: 1 })
+    // Kept between polls: every window carries the newest read.
+    window()
+    expect(decodestats().at(-1)!.relay).toBe('tls')
+
+    FakePc.stats = selectedLocal({ candidateType: 'prflx' })
+    await vi.advanceTimersByTimeAsync(500)
+    window()
+    expect(decodestats().at(-1)).not.toHaveProperty('relay')
   })
 })

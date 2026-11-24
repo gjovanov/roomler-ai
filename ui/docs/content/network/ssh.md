@@ -56,7 +56,7 @@ true. Each is owned by a different party, and any one of them refuses:
 1. **The organization** enables remote SSH. It is a separate switch from remote command execution.
 2. **The user** has the SSH permission. Also separate — and not included in the default administrator role.
 3. **The device** has an SSH policy allowing it.
-4. **The machine itself** has SSH enabled in its own configuration, with an authorised key list. Enabling SSH without listing a key grants nobody anything.
+4. **The machine itself** has SSH enabled in its own configuration. A session the server grants (`roomler ssh`) needs no key list there: a list of authorised keys is a separate, break-glass route for when the server cannot be reached, and it is empty by default.
 :::
 
 :::danger The machine's own setting is the one that survives a compromised server
@@ -67,8 +67,8 @@ holds. That is what makes the whole chain worth having.
 
 ## Which account a session runs as
 
-A session runs as **what was actually asked for, never more**. The device
-decides which accounts are permitted, and an unset value means *authenticate,
+A session runs as **what was actually asked for, never more**. A session the server
+grants runs as the account its policy names, and the device refuses one above its own ceiling. For the device's own break-glass keys, an unset account mode means *authenticate,
 then run nothing* — rather than quietly handing over a root shell.
 
 An unparseable setting is a refusal, not a fallback.

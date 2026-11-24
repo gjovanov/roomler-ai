@@ -615,12 +615,16 @@ which the daemon still refuses on the same terms as a local request.
      wire has three states and a switch has two — `undefined` means the device
      keeps what it has, and an operator toggling exec must not silently assert
      a value for every other key.
-   - **Combination warnings.** `ssh_enabled` alone grants nothing: without
-     `ssh_authorized_keys` nobody can connect, and with an unset
-     `ssh_account_mode` a key-list session authenticates and then runs nothing.
-     Both produce a device that is "on" and unreachable — the same
-     silent-nothing this whole feature exists to remove, so the dialog says so
-     before you save rather than leaving you to find out by `ssh`ing at it.
+   - **Combination warnings.** An empty `ssh_authorized_keys` is not one. A
+     server grant (`roomler ssh`) is tried before the list and needs no key in
+     it and no `ssh_account_mode`: it runs as the device's SSH policy says. So
+     the empty default still reaches every caller the server grants, and it
+     refuses only a key-list session, the break-glass route (#4325). The dialog
+     warns where a key-list session would authenticate and then run nothing:
+     keys with an unset `ssh_account_mode`. That is a device "on" for that
+     route and doing nothing — the same silent-nothing this whole feature
+     exists to remove, so the dialog says so before you save rather than
+     leaving you to find out by `ssh`ing at it.
    - **Grant bits mirrored** (`canGrantDeviceExec` / `canGrantDeviceSsh`), so a
      caller without `EXEC_DEVICE` sees a disabled control and the reason,
      rather than a 403 they cannot attribute to themselves or to the device.

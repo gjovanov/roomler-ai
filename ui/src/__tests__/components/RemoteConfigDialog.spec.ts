@@ -193,3 +193,67 @@ describe('RemoteConfigDialog fills its draft from the device (#3156)', () => {
     })
   })
 })
+
+// #4325 — a server grant (`roomler ssh`) is tried before the key list and
+// needs no key and no account mode on the device, so an SSH device with an
+// empty list is reached by every grant: the list is the break-glass route.
+// The account mode still decides whether a KEY-LIST session runs anything.
+
+/** A device whose request manages exactly `desired`. */
+function sshAgent(desired: Record<string, unknown>): Agent {
+  return {
+    id: AGENT_ID,
+    name: 'build-01',
+    agent_version: '0.4.188',
+    remote_config: { desired: { revision: 3, ...desired }, state: 'applied' },
+  } as Agent
+}
+
+function mountOpen(agent: Agent) {
+  const w = mount(RemoteConfigDialog, {
+    props: { modelValue: true, tenantId: TID, agent },
+    global: { plugins: [vuetify] },
+    attachTo: document.body,
+  })
+  wrapper = w
+  return w
+}
+
+/** The text of every alert the dialog shows, whitespace collapsed. */
+function alerts(): string[] {
+  return [...document.body.querySelectorAll('.v-alert')].map(
+    (a) => a.textContent?.replace(/\s+/g, ' ').trim() ?? '',
+  )
+}
+
+describe('RemoteConfigDialog says what an SSH key list does (#4325)', () => {
+  it('raises no warning for SSH on with an empty key list, which server grants still reach', async () => {
+    mountOpen(sshAgent({ ssh_enabled: true, ssh_authorized_keys: [] }))
+    await flushPromises()
+    expect(alerts().filter((t) => /nobody|key list|authorized keys/i.test(t))).toEqual([])
+    // The caption under the box says what an empty list leaves.
+    const page = document.body.textContent?.replace(/\s+/g, ' ') ?? ''
+    expect(page).toContain('only server grants (roomler ssh) can sign in')
+    expect(page).not.toMatch(/empty list means nobody/i)
+  })
+
+  it('does not say SSH needs authorized keys when the list is left to the device', async () => {
+    mountOpen(sshAgent({ ssh_enabled: true }))
+    await flushPromises()
+    const text = alerts().join('\n')
+    expect(text).not.toMatch(/needs authorized keys/i)
+    // What stays true: keys of the device's own run only with an account mode.
+    expect(text).toContain('a key-list session authenticates and then runs nothing')
+    expect(text).toContain('Server grants (roomler ssh) need neither')
+  })
+
+  it('keeps the account-mode warning when keys are sent without one', async () => {
+    mountOpen(sshAgent({ ssh_enabled: true, ssh_authorized_keys: ['ssh-ed25519 AAAAC3Nza test@host'] }))
+    await flushPromises()
+    expect(
+      alerts().some((t) =>
+        t.includes('You are sending keys but not an account mode. A key-list session on a device whose account mode is unset authenticates and then runs nothing.'),
+      ),
+    ).toBe(true)
+  })
+})
