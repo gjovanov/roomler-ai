@@ -411,7 +411,7 @@ whatever its cause, and what heals a write applied behind a lost reply, or one t
 
 | Redis user | Commands | On an error | A write applied behind the lost reply |
 |---|---|---|---|
-| Fan-out on `roomler:ws` (`crates/core/src/ws/dispatcher.rs:57`, `:85`, `:139`) | PUBLISH | logged; users on other pods miss that one event (at-most-once, never retried); the request that sent it still answers (a chat post: 200 in 3.0 s) | delivered: nothing to heal |
+| Fan-out on `roomler:ws` (`crates/core/src/ws/dispatcher.rs:59`, `:87`, `:141`) | PUBLISH | logged; users on other pods miss that one event (at-most-once, never retried); the request that sent it still answers (a chat post: 200 in 3.0 s) | delivered: nothing to heal |
 | Online registry (`crates/core/src/ws/redis_pubsub.rs:110`, `:129`) | SADD + EXPIRE, SREM | logged; the 30 s heartbeat (`crates/api/src/state.rs:449`) writes it again | the 90 s TTL |
 | Push gate (`crates/core/src/notify.rs:39`) | EXISTS | read as offline: the web push (and a mention's email) is sent | — |
 | Agent presence (`crates/modules/fleet/src/socket.rs:436`, `:977`, `:1050`, `:1054`; `presence.rs:281`) | SET EX 90, compare-DEL, EXISTS, MGET | logged; a teardown announces the device offline and the next sweep (≤ 30 s) corrects it; the sweep skips a cycle | the next heartbeat, or the 90 s TTL |
@@ -498,7 +498,7 @@ Why a Redis that answers, however slowly, does not trip it:
 3. It takes two misses in a row: one late arrival, or one stall of the pod's own runtime, costs at
    most one.
 4. While the command connection is down every probe is unknown, and readiness already fails on its
-   PING (`crates/api/src/lib.rs:487`).
+   PING (`crates/api/src/lib.rs:495`).
 
 | Subscriber | A subscribe that gets no answer | A subscription gone deaf |
 |---|---|---|
@@ -531,7 +531,7 @@ connected 3 times in 10 s, and the relay's gave up after 3.0 s.
   and every post, ping and total arrives once.
 - **TURN usage.** Totals published in the gap are not booked; the per-leg dedupe books none twice.
 - **Readiness.** `/health/ready` answers 503 with `redis_subscriber: false`
-  (`crates/api/src/lib.rs:493-495`, `:514`) only from the verdict to the new subscription, about
+  (`crates/api/src/lib.rs:501-503`, `:522`) only from the verdict to the new subscription, about
   1 s, usually shorter than the readiness probe's failure threshold; before the verdict it reads
   true. Liveness is `/health`, so a deaf subscriber never restarts a pod.
 

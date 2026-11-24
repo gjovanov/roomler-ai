@@ -317,7 +317,7 @@ refused join holds no lease.
 **The refusal** is `rc:overlay.join_refused { reason: key_retired, detail }`
 (`crates/remote_control/src/signaling.rs:463`). It is not retryable: the same key is
 refused again, and the way out is a new key. The detail says when and why the key retired
-and names no key (`overlay.rs:791`). A ledger read that fails refuses `store_unavailable`
+and names no key (`overlay.rs:813`). A ledger read that fails refuses `store_unavailable`
 under `enforce`, failing closed like the uniqueness check above it.
 
 ⚠️ **Old agents survive the new reason.** Agents from 0.4.41 run a decoder whose unknown
@@ -330,7 +330,7 @@ server's log and audit carry the reason.
 
 **The self-heal** is the route's own order path. `place_order`
 (`crates/modules/network/src/routes/overlay_key.rs:156`) is what the route calls and what
-the join calls for a refused agent (`overlay.rs:861`): the shared one-a-minute ceiling,
+the join calls for a refused agent (`overlay.rs:878`): the shared one-a-minute ceiling,
 `decide()`'s cells, the order on the row as desired state, the push, and ONE audit row.
 The server places it as nobody — `OrderedBy::Server`, the zero `user_id`, and
 `trigger: key_retired` on both the order and its audit row (`overlay_key.rs:114`) — and
@@ -448,7 +448,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2100-2201`; `ui/src/stores/agents.ts:1327-1341` |
 | P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3224`, `:3242`, `:3964`, `:3212`, `:10565`, `:10847`; the node and network fields `:7027`, `:7274` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7434` |
-| P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:381-423`, `:444-475`, `:796`, `:817`, `:866` |
+| P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:381-423`, `:444-475`, `:813`, `:834`, `:883` |
 | P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:383`; nest `crates/modules/network/src/lib.rs:555`, `:613` |
 | P2 DERP | `crates/modules/network/src/derp.rs:440`, `:512-548` |
 | P2 DAO: the check · the CAS write · the switch | `crates/services/src/dao/overlay_node.rs:148`, `:365-391`; `crates/services/src/dao/overlay_network.rs:326` |

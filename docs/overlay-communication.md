@@ -1110,7 +1110,7 @@ them when the rule is compiled
 ([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)).
 Each compile (a node's netmap, a delta fan, the DERP allow table, an org-relay
 decision) reads the org's role ids once and reuses them for every node it resolves
-(`CompileRoles`, `crates/modules/network/src/overlay.rs:2546`), so a role the org
+(`CompileRoles`, `crates/modules/network/src/overlay.rs:2706`), so a role the org
 has deleted, or one of another org, never matches.
 
 When someone is given a role or loses one, or a role is deleted, the org's nodes are
