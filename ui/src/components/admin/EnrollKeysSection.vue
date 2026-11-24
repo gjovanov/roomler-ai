@@ -214,7 +214,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref, watch } from 'vue'
+import { reactive, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { useAgentStore, type EnrollmentKeyRow } from '@/stores/agents'
 import { useOpenRows } from '@/composables/useOpenRows'
@@ -262,16 +262,29 @@ function keyState(k: EnrollmentKeyRow): { text: string; color?: string } {
   return { text: 'active', color: 'success' }
 }
 
+// #4257 — only the latest list request writes, and only while the page still
+// shows the org it asked for: an answer for an org the page has left is dropped.
+let keysSeq = 0
+
 async function refresh() {
+  const tenantId = props.tenantId
+  const mine = ++keysSeq
   error.value = null
   try {
-    keys.value = await agentStore.listEnrollKeys(props.tenantId)
+    const rows = await agentStore.listEnrollKeys(tenantId)
+    if (mine === keysSeq && tenantId === props.tenantId) keys.value = rows
   } catch (e) {
-    error.value = (e as Error).message
+    if (mine === keysSeq && tenantId === props.tenantId) error.value = (e as Error).message
   }
 }
 
+// #4257 — each opening of the mint dialog; closing it ends that opening. A
+// mint answered after its dialog closed (a change of org and back, or Cancel)
+// writes no secret: the key is in the list, to revoke.
+let mintOpening = 0
+
 function openMint() {
+  mintOpening++
   mintedKey.value = null
   mintError.value = null
   copied.value = false
@@ -279,19 +292,24 @@ function openMint() {
 }
 
 async function mint() {
+  const tenantId = props.tenantId
+  const opening = mintOpening
   minting.value = true
   mintError.value = null
   try {
-    const resp = await agentStore.mintEnrollKey(props.tenantId, {
+    const resp = await agentStore.mintEnrollKey(tenantId, {
       label: form.label || undefined,
       max_uses: form.max_uses || undefined,
       expires_in_secs: form.expires_in_days ? form.expires_in_days * 86_400 : undefined,
       ephemeral_ttl_secs: form.ephemeral_ttl_secs || undefined,
     })
-    mintedKey.value = resp.key
+    // #4257 — minted for an org the page has left: its secret never shows
+    // under this one (the key is in that org's list, to revoke).
+    if (tenantId !== props.tenantId) return
+    if (opening === mintOpening && mintOpen.value) mintedKey.value = resp.key
     void refresh()
   } catch (e) {
-    mintError.value = (e as Error).message
+    if (tenantId === props.tenantId) mintError.value = (e as Error).message
   } finally {
     minting.value = false
   }
@@ -309,6 +327,7 @@ async function copyKey() {
 }
 
 function closeMint() {
+  mintOpening++
   mintOpen.value = false
   // The reveal is over: never keep the secret in component state.
   mintedKey.value = null
@@ -324,11 +343,26 @@ async function revoke(k: EnrollmentKeyRow) {
   }
 }
 
-onMounted(async () => {
-  // The switch answer decides whether this card exists at all.
-  await agentStore.fetchOrgEphemeralKeysEnabled(props.tenantId)
-  if (agentStore.orgEphemeralKeysEnabled === true) void refresh()
-})
+// #4257 — the keys follow the page's org: a watch that runs at once, not a
+// one-shot mount (a routed section gets only a new prop when the org changes).
+// A change closes the mint dialog through closeMint(), so a secret minted
+// under the previous org goes with it, and empties the list until this org's
+// lands.
+watch(
+  () => props.tenantId,
+  async (tenantId, previous) => {
+    if (previous !== undefined) {
+      closeMint()
+      keys.value = []
+      error.value = null
+    }
+    // The switch answer decides whether this card exists at all.
+    await agentStore.fetchOrgEphemeralKeysEnabled(tenantId)
+    if (tenantId !== props.tenantId) return
+    if (agentStore.orgEphemeralKeysEnabled === true) void refresh()
+  },
+  { immediate: true },
+)
 
 // The org switch can flip while this page is open (SettingsSection).
 watch(

@@ -405,9 +405,11 @@ org's rows at a time and record which. A fetch for another org drops the rows at
 once, only the latest fetch writes, and a save answered for another org leaves the
 list alone (`stores/tunnelPolicies.ts:159-165`, `stores/overlayAcl.ts:78-84`). A
 page that only names or picks devices asks with `ensureAgents` or
-`ensureTunnelClients` (`stores/agents.ts:1036`, `stores/tunnelClients.ts:117`),
+`ensureTunnelClients` (`stores/agents.ts:1074`, `stores/tunnelClients.ts:117`),
 which fetch unless the store already holds, or is loading, that org's rows. Never
 gate a fetch on an empty list: a list that holds another org's rows is not empty.
+Every page that shows one org's data keeps the same rules ([Conventions](#conventions),
+#4257).
 
 ### The devices list's "needs a person" chips
 
@@ -595,6 +597,52 @@ The fix is route meta, not per-view watchers: `meta.remountOn: '<param>'`
 (`plugins/router.ts`), read by `components/layout/KeyedRouterView.vue`, keys the view by
 that one param. Every other route stays unkeyed on purpose — several views rewrite
 `route.query` in place and must not remount — so never key by `fullPath`.
+
+**A page that shows one org's data follows the org in place (#4257).** The org is the
+exception to the rule above. No route is keyed by it (`remountOn` names only `userId`,
+`roomId` and `agentId`: `plugins/router.ts:197`, `:242`, `:374`), so a link, back or forward
+to another org's page, and the app bar's org switcher, reuse the mounted page, and a routed
+section (`props: true`) gets only a new `tenantId` prop. A key would not be enough: a
+remounted page's old instance still finishes its load when its fetch answers and, since its
+prop never changes, cannot tell that the org moved on. It can ask for the previous org's rows
+after the new instance asked for this org's, and a store that keeps the latest answer then
+holds the previous org's (#4250). A key on the org at the tenant level would also key the
+live views under it, the call and the remote viewer (`meta.liveSession`), which remount only
+by their own subject. So every such page, and each dialog it owns, keeps four rules:
+
+| Rule | How | Read it in |
+|---|---|---|
+| It watches its org from the start | A `watch` with `{ immediate: true }` replaces a one-shot load on mount. A routed view watches its `tenantId` computed, never a `ref` of the route param, which setup reads once (`views/invite/InviteManageView.vue:266` held one). A section watches `() => props.tenantId` | `views/rooms/RoomList.vue:197`, `components/admin/RolesSection.vue:471` |
+| A change closes what was opened under the previous org | An editor, a prompt or a dialog closes, because its save would go to the new org, and a secret minted there goes with its dialog. What names the previous org's rows resets: a device filter, a grid's search and its page. A paging grid fetches again, because nothing fires its `@update:options` on a change of org | `components/admin/EnrollKeysSection.vue:351`, `components/admin/MembersSection.vue:535` |
+| A late answer for the previous org is dropped | A store guards its own rows (next row). A page that keeps rows in its own state notes the org it asked for: its latest load writes its rows, its error and its spinner only while that is still the page's org | `components/admin/ExecAuditSection.vue:228-248` |
+| A store records its org, and a page asks it with an ensure | The store names that ref for its rows (`roomsTenantId`), never `tenantId`: a `${tenantId}` in one of its URLs would read the ref once a parameter is renamed. A fetch for another org drops the rows at once, only the latest fetch writes, and a create or a save answered for another org leaves the list alone (`listIsOf`). A page that only lists, names or picks the rows asks with `ensureRooms`, `ensureAgents`, `ensureTenantMembers`, `ensureRoles` or `ensureTunnelClients`, which fetch unless the store holds this org's rows or is loading them, and fetch again after a failed fetch. `ensureRooms` and `ensureAgents` answer with the fetch in flight, and a fetch that a newer one superseded settles with the newest, so a caller that reads the rows after its await reads this org's newest: the welcome tour counts the devices and the rooms so (`components/layout/AppLayout.vue:1093-1096`), and the remote viewer takes the store's own row of its device (`views/remote/RemoteControl.vue:5364`) | `stores/rooms.ts:97`, `:139`, `:146`; `stores/agents.ts:1074`, `:1261`; `stores/role.ts:62`; `stores/tunnelClients.ts:117` |
+
+Never gate a fetch on an empty list: a list that holds another org's rows is not empty. The
+stores that record their org: the devices and the org's people (`stores/agents.ts:1018`,
+`:1231`), rooms (`stores/rooms.ts:97`), roles (`stores/role.ts:29`), members
+(`stores/members.ts:49`), tunnel clients (`stores/tunnelClients.ts:59`), overlay nodes
+(`stores/overlayRoutes.ts:86`), the two policy lists (`stores/tunnelPolicies.ts:159`,
+`stores/overlayAcl.ts:78`), files (`stores/files.ts:49`), invites (`stores/invite.ts:95`), and
+the dashboard's overview and mesh (`stores/stats.ts:344-345`).
+
+**What the shell reloads on a change of org.** `AppLayout` keeps the tenant store on the
+URL's org (`useRouteTenantSync`, `components/layout/AppLayout.vue:997`). On a change it
+reloads the rooms and their unread counts when the `chat` module is on (`:1016-1023`), and the
+devices when the fleet nav shows (`:1056-1067`). Nothing else: tunnel clients, roles, members,
+settings and each section's own rows are the page's to load. The shell's watches run before a
+page's, so a page that asks for the rooms or the devices with an ensure on a change finds the
+shell's fetch in flight and sends no second GET. Its first run still fetches, as the mount
+did (`views/dashboard/TenantDashboard.vue:358-380`). The org switcher (`selectTenant`,
+`components/layout/AppLayout.vue:1142-1150`) sets the tenant store, then pushes
+`/tenant/<id>`. From the org dashboard it reuses the dashboard. From any other page it mounts
+the dashboard fresh, on stores that may still hold the previous org's rows: the reason a page
+asks a store with an ensure.
+
+The tests change the org under a mounted page and release org A's held answer after the
+change: `orgChangeTenantPages.spec.ts` (the routed views, through a memory router built from
+the app's own route records, under a stand-in for the shell's reloads),
+`orgChangeAdminSections.spec.ts` and `orgChangeShape2.spec.ts` (a section's `tenantId` prop),
+and each store's spec.
 
 **The call page remounts by room, and asks before it leaves a call (#1637).** The app
 bar's Active Calls menu and the "Call started in …" snackbar push another room's call

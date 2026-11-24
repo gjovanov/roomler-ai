@@ -75,7 +75,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useRoomStore, type Room } from '@/stores/rooms'
 
@@ -95,13 +95,21 @@ function debounceSearch() {
   searchTimeout = setTimeout(() => doSearch(), 300)
 }
 
+// #4257 — only the latest search writes: one asked for an older query, or for
+// the org the page has since left, is dropped, and only the latest clears the
+// spinner.
+let searchSeq = 0
+
 async function doSearch() {
+  const mySeq = ++searchSeq
+  const tid = tenantId.value
   loading.value = true
   searched.value = true
   try {
-    results.value = await roomStore.explore(tenantId.value, query.value || '')
+    const rooms = await roomStore.explore(tid, query.value || '')
+    if (mySeq === searchSeq && tid === tenantId.value) results.value = rooms
   } finally {
-    loading.value = false
+    if (mySeq === searchSeq) loading.value = false
   }
 }
 
@@ -110,7 +118,17 @@ async function join(roomId: string) {
   router.push({ name: 'room-chat', params: { tenantId: tenantId.value, roomId } })
 }
 
-onMounted(() => {
-  doSearch()
-})
+// #4257 — the search follows the org in the URL. No route remounts on the
+// org, so a link, back or forward to another org's Explore reuses this page:
+// a watch that runs at once replaces the one-shot mount search. On a change
+// the previous org's rooms leave the page at once, and the search runs again
+// for the new org.
+watch(
+  tenantId,
+  (_tid, previous) => {
+    if (previous !== undefined) results.value = []
+    void doSearch()
+  },
+  { immediate: true },
+)
 </script>
