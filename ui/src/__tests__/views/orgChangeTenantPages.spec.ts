@@ -176,7 +176,10 @@ const GRIDS: Record<
   [ORG_A]: {
     files: [fileRow(hex(0xa031), 'Org A plan.txt')],
     fileTotal: 60,
-    roomFiles: { [A_ENG_ROOM]: [fileRow(hex(0xa032), 'Org A eng diagram.txt')] },
+    roomFiles: {
+      [hex(0xa011)]: [fileRow(hex(0xa033), 'Org A general minutes.txt')],
+      [A_ENG_ROOM]: [fileRow(hex(0xa032), 'Org A eng diagram.txt')],
+    },
     invites: [inviteRow(hex(0xa041), ORG_A, 'guest@org-a.example')],
     inviteTotal: 60,
     roles: [roleRow(hex(0xa002), ORG_A, 'Org A operators')],
@@ -184,7 +187,7 @@ const GRIDS: Record<
   [ORG_B]: {
     files: [fileRow(hex(0xb031), 'Org B notes.txt')],
     fileTotal: 1,
-    roomFiles: {},
+    roomFiles: { [hex(0xb011)]: [fileRow(hex(0xb032), 'Org B general minutes.txt')] },
     invites: [inviteRow(hex(0xb041), ORG_B, 'guest@org-b.example')],
     inviteTotal: 1,
     roles: [roleRow(hex(0xb002), ORG_B, 'Org B operators')],
@@ -227,6 +230,15 @@ function answer(path: string): unknown {
     // A room of another org, asked under this one.
     unexpected.push(path)
     return pageOf([], 0, q)
+  }
+  // One room, as the chat view asks for it (`fetchRoom`). Like the API's, it
+  // carries no org.
+  const oneRoom = /^room\/([0-9a-f]{24})$/.exec(m[2]!)
+  if (oneRoom) {
+    const found = org.rooms.find((r) => r.id === oneRoom[1])
+    if (found) return found
+    unexpected.push(path)
+    return {}
   }
   switch (m[2]) {
     case 'file':
@@ -801,6 +813,101 @@ describe('The Files page follows its org (#4257)', () => {
     firstAnswers()
     await settle()
     expect(sent).toEqual([`/tenant/${ORG_A}/file/upload`, `/tenant/${ORG_A}/file/upload`])
+    expectNothingRaised()
+  })
+
+  // #4332 — the page names a room of ITS org. The room the person last opened
+  // in a chat (the chat view's `fetchRoom`) stays `current` across a change of
+  // org, and the API's room carries no org: org B's files named org A's room,
+  // so Room Files asked org B for org A's room's files, and an upload went to
+  // org B naming org A's room.
+  const A_GENERAL_ROOM = hex(0xa011)
+  const B_ROOM = hex(0xb011)
+  /** The room-files GETs sent since `since`, without their query. */
+  const roomFilesAsked = (since = 0) =>
+    asked()
+      .slice(since)
+      .map((p) => p.split('?')[0]!)
+      .filter((p) => /\/room\/[0-9a-f]{24}\/file$/.test(p))
+  /** Each upload: its path, and the room its form names. */
+  function recordUploads() {
+    const sent: Array<[string, FormDataEntryValue | null]> = []
+    mockApi.upload.mockImplementation(async (path: string, form: FormData) => {
+      sent.push([path, form.get('room_id')])
+      return fileRow(hex(0xb0f0 + sent.length), `upload ${sent.length}.txt`) as never
+    })
+    return sent
+  }
+  /** One file through the page's file input, as a pick in the browser's dialog. */
+  async function uploadOne() {
+    const input = document.body.querySelector<HTMLInputElement>('input[type="file"]')!
+    Object.defineProperty(input, 'files', { configurable: true, value: [new File(['1'], 'one.txt')] })
+    input.dispatchEvent(new Event('change'))
+    await settle()
+  }
+  const buttonNamed = (text: string) =>
+    [...document.body.querySelectorAll<HTMLButtonElement>('button')].find((x) => x.textContent?.trim() === text)
+
+  it("org B's files opened fresh after a chat in org A name org B's room, for Room Files and an upload (#4332)", async () => {
+    const rooms = useRoomStore()
+    // The chat view opened org A's eng room; then the org switcher, then Files.
+    await rooms.fetchRoom(ORG_A, A_ENG_ROOM)
+    // The shell's mount loads org B's rooms (the stand-in loads them on a change only).
+    await rooms.fetchRooms(ORG_B)
+    const sent = recordUploads()
+    await open(`/tenant/${ORG_B}/files`)
+
+    await clickButton('Room Files')
+    expect
+      .soft(roomFilesAsked(), "org B's room, never org A's asked under org B")
+      .toEqual([`/tenant/${ORG_B}/room/${B_ROOM}/file`])
+    expect.soft(pageText()).toContain('Org B general minutes.txt')
+    expect.soft(pageText()).not.toContain('Org A eng diagram.txt')
+
+    await uploadOne()
+    expect.soft(sent, "the upload names org B's room").toEqual([[`/tenant/${ORG_B}/file/upload`, B_ROOM]])
+    expectNothingRaised()
+  })
+
+  it("a link from org A's files to org B's: Room Files and Upload wait for org B's rooms, then name org B's room (#4332)", async () => {
+    const rooms = useRoomStore()
+    await rooms.fetchRoom(ORG_A, A_ENG_ROOM)
+    const sent = recordUploads()
+    await open(`/tenant/${ORG_A}/files`)
+    expect(buttonNamed('Room Files')?.disabled, "org A's eng room, under org A").toBe(false)
+    const roomsB = gate(getOf(ORG_B, 'room'))
+    const since = asked().length
+
+    await go(`/tenant/${ORG_B}/files`)
+    expect(roomsB.sent, "the shell asked for org B's rooms").toBe(1)
+    expect.soft(buttonNamed('Room Files')?.disabled, "Room Files waits for org B's rooms").toBe(true)
+    expect.soft(buttonNamed('Upload')?.disabled, "Upload waits for org B's rooms").toBe(true)
+
+    roomsB.open()
+    await settle()
+    await clickButton('Room Files')
+    expect
+      .soft(roomFilesAsked(since), "org B's room, never org A's asked under org B")
+      .toEqual([`/tenant/${ORG_B}/room/${B_ROOM}/file`])
+    expect.soft(pageText()).toContain('Org B general minutes.txt')
+
+    await uploadOne()
+    expect.soft(sent, "the upload names org B's room").toEqual([[`/tenant/${ORG_B}/file/upload`, B_ROOM]])
+    expectNothingRaised()
+  })
+
+  it("a current room no one recorded an org for is not used: the page names its own org's first room (#4332)", async () => {
+    const rooms = useRoomStore()
+    // Org B's room, set with no org: whose room it is, nobody said.
+    rooms.setCurrent(ORGS[ORG_B]!.rooms[0] as never)
+    await rooms.fetchRooms(ORG_A)
+    await open(`/tenant/${ORG_A}/files`)
+
+    await clickButton('Room Files')
+    expect
+      .soft(roomFilesAsked(), "org A's first room, never a room of unknown org")
+      .toEqual([`/tenant/${ORG_A}/room/${A_GENERAL_ROOM}/file`])
+    expect.soft(pageText()).toContain('Org A general minutes.txt')
     expectNothingRaised()
   })
 })
