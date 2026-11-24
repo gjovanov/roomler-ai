@@ -1831,6 +1831,50 @@ pub enum Request {
     /// socket serves it too (#3831, [`person_may`]); a daemon older than that
     /// refuses it there.
     EncoderCaps,
+    /// FR-151 — what live work this daemon serves now, which an install
+    /// that restarts it would cut, and the age of the newest ask for an
+    /// update it recorded. The root update helper on a Mac asks it before it
+    /// installs. READ-ONLY, sync and cheap: counts the daemon already holds.
+    /// Returns [`Response::LiveWork`]. A daemon older than FR-151 answers an
+    /// unknown verb ([`is_unknown_verb`]), which the helper counts as live
+    /// work. Never on the person socket ([`person_may`]).
+    LiveWork,
+    /// FR-151 — the person asks for an update now ("Apply update", a
+    /// `roomlerd self-update` run as the person). The daemon behind the
+    /// person's OWN socket records when, and [`Request::LiveWork`] answers
+    /// its age, which lets the root update helper skip the wait over that
+    /// person's own work only. A daemon that runs as root refuses it, so a
+    /// root daemon's record is only ever an operator's push. Returns
+    /// [`Response::UpdateAskRecorded`]. Never on the person socket.
+    AskForUpdate,
+}
+
+/// FR-151 — [`Request::LiveWork`]'s answer: what an install that restarts
+/// this daemon would cut or wedge now, as the daemon's own busy state counts
+/// it, and the age of the newest ask for an update it recorded. Every field
+/// defaults, so a field added later reads as nothing from an older daemon.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LiveWorkInfo {
+    /// Live remote-control sessions.
+    #[serde(default)]
+    pub rc_sessions: u32,
+    /// Open roomler SSH connections.
+    #[serde(default)]
+    pub ssh_connections: u32,
+    /// Fleet RPC `exec` runs in flight.
+    #[serde(default)]
+    pub exec_runs: u32,
+    /// File transfers and recordings in progress.
+    #[serde(default)]
+    pub work: u32,
+    /// A network transition in the last 10 minutes (R5b).
+    #[serde(default)]
+    pub net_transition: bool,
+    /// Seconds since the newest ask for an update this daemon recorded: an
+    /// operator's push to its row, or its person's own ask. `None` when it
+    /// recorded none since it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_age_secs: Option<u64>,
 }
 
 /// FR-84 D4 — what this device can encode, as [`Request::EncoderCaps`]
@@ -2101,6 +2145,10 @@ pub enum Response {
     },
     /// FR-84 D4 — answer to [`Request::EncoderCaps`].
     EncoderCaps(EncoderCapsSummary),
+    /// FR-151 — answer to [`Request::LiveWork`].
+    LiveWork(LiveWorkInfo),
+    /// FR-151 — answer to [`Request::AskForUpdate`]: the ask is recorded.
+    UpdateAskRecorded,
     /// FR-85 — the recorder's state, answering [`Request::RecordStart`],
     /// [`Request::RecordStop`] and [`Request::RecordStatus`].
     Recording(RecordingState),
@@ -3403,6 +3451,18 @@ pub trait LocalApiState: Send + Sync {
     fn encoder_caps(&self) -> Option<EncoderCapsSummary> {
         None
     }
+    /// FR-151 — what live work this node serves ([`Request::LiveWork`]).
+    /// `None` = not reported here (mocks, non-daemon impls), answered as an
+    /// `Error`, which the update helper counts as live work.
+    fn live_work(&self) -> Option<LiveWorkInfo> {
+        None
+    }
+    /// FR-151 — record the person's own ask for an update
+    /// ([`Request::AskForUpdate`]). `Err` carries the refusal. Default: not
+    /// served here.
+    fn ask_for_update(&self) -> Result<(), String> {
+        Err("asking for an update is not served on this node".into())
+    }
 }
 
 /// FR-85 — a recording verb's refusal, which names the screen's person (#3907).
@@ -3822,6 +3882,14 @@ pub fn person_may(req: &Request) -> bool {
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
+        // FR-151 — the root update helper's read of live work, and the record
+        // of a person's own ask for an update. The first lists the root
+        // half's SSH connections and runs, which this socket lists nowhere
+        // else. The second must never reach a root daemon from a person: a
+        // root daemon's record lets an update install over everything. The
+        // helper asks the system socket, and a person asks their own daemon.
+        | Request::LiveWork
+        | Request::AskForUpdate
         | Request::RestartDaemon { .. } => false,
     }
 }
@@ -4011,6 +4079,17 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
             None => Response::Error {
                 message: "encoder capabilities are not reported on this node".into(),
             },
+        },
+        // FR-151 — sync by contract: counts the daemon already holds.
+        Request::LiveWork => match state.live_work() {
+            Some(info) => Response::LiveWork(info),
+            None => Response::Error {
+                message: "live work is not reported on this node".into(),
+            },
+        },
+        Request::AskForUpdate => match state.ask_for_update() {
+            Ok(()) => Response::UpdateAskRecorded,
+            Err(message) => Response::Error { message },
         },
         // `Ping` / `Create*` / the mutating `Route*` verbs are async —
         // intercepted in `serve_connection` before this sync dispatch runs.
@@ -4829,6 +4908,32 @@ pub(crate) fn per_user_socket_path() -> Option<std::path::PathBuf> {
         std::env::temp_dir(),
         &dir_facts,
     )
+}
+
+/// FR-151 — this account's OWN per-user endpoint, never the system one:
+/// where `roomlerd self-update`, run as a person, records that person's ask
+/// for an update, so the ask can never land in a root daemon. `None` when
+/// this account has no private directory for one, and always for root on
+/// macOS.
+#[cfg(unix)]
+pub fn own_socket_path() -> Option<std::path::PathBuf> {
+    per_user_socket_path()
+}
+
+/// FR-151 — [`own_socket_path`] for a process that reads no environment:
+/// the root update helper's child (`roomlerd one-row-home live-work`). The
+/// caller names the folder: on macOS `temp_dir`, which the child resolves
+/// with `confstr(_CS_DARWIN_USER_TEMP_DIR)`, the folder launchd gives the
+/// person's daemon as `TMPDIR`; elsewhere `runtime_dir`. The same rule as
+/// the daemon's own ([`per_user_socket_path_for`]).
+#[cfg(unix)]
+pub fn own_socket_path_in(
+    temp_dir: std::path::PathBuf,
+    runtime_dir: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    per_user_socket_path_for(euid, runtime_dir, temp_dir, &dir_facts)
 }
 
 /// The SYSTEM socket path, used by a daemon privileged enough to bind it.
@@ -6557,6 +6662,25 @@ impl Client {
     pub async fn encoder_caps(&mut self) -> std::io::Result<EncoderCapsSummary> {
         match self.request(&Request::EncoderCaps).await? {
             Response::EncoderCaps(summary) => Ok(summary),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-151 — what live work the daemon serves. A daemon older than FR-151
+    /// answers a bad-request [`Response::Error`], surfaced as `Err` with its
+    /// message kept, which [`is_unknown_verb`] recognises.
+    pub async fn live_work(&mut self) -> std::io::Result<LiveWorkInfo> {
+        match self.request(&Request::LiveWork).await? {
+            Response::LiveWork(info) => Ok(info),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-151 — record this person's own ask for an update in their daemon.
+    /// A refusal, or an older daemon, is `Err`.
+    pub async fn ask_for_update(&mut self) -> std::io::Result<()> {
+        match self.request(&Request::AskForUpdate).await? {
+            Response::UpdateAskRecorded => Ok(()),
             other => Err(unexpected_response(other)),
         }
     }
@@ -10154,9 +10278,78 @@ mod tests {
             Request::KillFlow { id: "f".into() },
             Request::RouteRemove { id: "r".into() },
             Request::SetDeviceName { name: "x".into() },
+            // FR-151 — the root update helper's read, and a person's own ask,
+            // which must never reach a root daemon from a person.
+            Request::LiveWork,
+            Request::AskForUpdate,
         ];
         for req in refused {
             assert!(!person_may(&req), "the person socket must refuse {req:?}");
+        }
+    }
+
+    /// FR-151 L1 — `live_work` and `ask_for_update` on the wire, their
+    /// answers, and a node that serves neither says so as an error, which
+    /// the update helper counts as live work.
+    #[tokio::test]
+    async fn live_work_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&Request::LiveWork).unwrap(),
+            r#"{"t":"live_work"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::AskForUpdate).unwrap(),
+            r#"{"t":"ask_for_update"}"#
+        );
+        let info = LiveWorkInfo {
+            rc_sessions: 1,
+            ssh_connections: 2,
+            exec_runs: 3,
+            work: 4,
+            net_transition: true,
+            ask_age_secs: Some(5),
+        };
+        let j = serde_json::to_string(&Response::LiveWork(info)).unwrap();
+        assert_eq!(
+            j,
+            r#"{"t":"live_work","d":{"rc_sessions":1,"ssh_connections":2,"exec_runs":3,"work":4,"net_transition":true,"ask_age_secs":5}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&j).unwrap(),
+            Response::LiveWork(info)
+        );
+        // No ask recorded: the field is absent, and an absent field reads as none.
+        let idle = serde_json::to_string(&Response::LiveWork(LiveWorkInfo::default())).unwrap();
+        assert!(!idle.contains("ask_age_secs"), "{idle}");
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"t":"live_work","d":{}}"#).unwrap(),
+            Response::LiveWork(LiveWorkInfo::default())
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::UpdateAskRecorded).unwrap(),
+            r#"{"t":"update_ask_recorded"}"#
+        );
+        // The trait's defaults: neither is served by a node that does not say so.
+        match ask_scoped(Scope::Full, r#"{"t":"live_work"}"#).await {
+            Response::Error { message } => assert!(message.contains("not reported"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        match ask_scoped(Scope::Full, r#"{"t":"ask_for_update"}"#).await {
+            Response::Error { message } => assert!(message.contains("not served"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    /// FR-151 L2 — neither verb is served on the person socket: the read
+    /// lists the root half's SSH connections and runs, and a person's ask
+    /// recorded by a root daemon would let an update install over everything.
+    #[tokio::test]
+    async fn live_work_and_the_ask_are_not_on_the_person_socket() {
+        assert!(!person_may(&Request::LiveWork));
+        assert!(!person_may(&Request::AskForUpdate));
+        for j in [r#"{"t":"live_work"}"#, r#"{"t":"ask_for_update"}"#] {
+            let r = ask_scoped(SEAT, j).await;
+            assert!(is_person_refusal(&r), "{j}: {r:?}");
         }
     }
 
