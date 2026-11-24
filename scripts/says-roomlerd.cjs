@@ -912,7 +912,8 @@ function scanText(file, text, kind) {
 
 function gitFiles() {
   const out = execFileSync('git', ['ls-files', '-z'], { cwd: ROOT, maxBuffer: 256 * 1024 * 1024 })
-  return out.toString('utf8').split('\0').filter(Boolean)
+  // Mid-merge, ls-files lists a conflicted file once per stage (up to 3): read it once.
+  return [...new Set(out.toString('utf8').split('\0').filter(Boolean))]
 }
 
 function surfaceOf(file) {
