@@ -366,7 +366,8 @@ async fn handle_client_message(
     let msg_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let data = parsed.get("data");
 
-    debug!(?user_id, %connection_id, msg_type, "WS message received");
+    // #4402 — TRACE, as its sibling "WS message sent": one line per message.
+    tracing::trace!(?user_id, %connection_id, msg_type, "WS message received");
 
     match msg_type {
         "ping" => {
