@@ -195,7 +195,7 @@ the `next_host: {$gt: host}` sanity filter, the `$addToSet` dedup and the
 pool's size cap. On a carved `/22` (1 022 addresses, not the `/10`'s 4.19 M)
 the holes are no longer cosmetic, so FR-47 P3 recovers them the guarded way.
 `POST /api/tenant/{tid}/overlay-block/reconcile-hosts`
-([`overlay_block.rs:1157`](../crates/modules/network/src/routes/overlay_block.rs#L1157))
+([`overlay_block.rs:1158`](../crates/modules/network/src/routes/overlay_block.rs#L1158))
 computes `(1..next_host) − live − pooled` server-side and returns each number
 through `release_host`, so every guard still applies. It is platform-operator
 only, and anyone else gets a 404. It is a dry run unless the body says
@@ -1299,8 +1299,8 @@ match this node`), and an org-relay grant that needs them is refused.
   So the child usually exits before the daemon's run loop has heard the stop,
   and #1867's WARN used to go out on every restart. The daemon now marks its
   stop as the first thing each arm of `run`'s shutdown `select!` does
-  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5801`, `:5837`,
-  `:5849`). After the child exits, the supervisor waits out the first part of
+  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5811`, `:5847`,
+  `:5859`). After the child exits, the supervisor waits out the first part of
   the backoff, at most 1 s (`STOP_GRACE`,
   `crates/tunnel-core/src/overlay/netstate.rs:1241`), before it says anything:
 

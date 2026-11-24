@@ -93,6 +93,10 @@ pub(crate) async fn enrol(app: &TestApp, seeded: &SeededTenant, machine_id: &str
         machine_id,
         machine_name: machine_id,
         install: None,
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .expect("agent enrollment")

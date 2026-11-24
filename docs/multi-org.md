@@ -54,7 +54,7 @@ So: **one daemon, many orgs**. Everything below follows from that.
 
 A `roomlerd run` takes a guard that belongs to the machine, not to its config, before anything
 above: before the start's purge of the overlay's routes, the LocalAPI pipe and the first connect
-(`start_gate`, `agents/roomlerd/src/app.rs:3965`; the guard is
+(`start_gate`, `agents/roomlerd/src/app.rs:3975`; the guard is
 `agents/roomlerd/src/machine_guard.rs`). A run that finds it held leaves there, whatever config it
 loaded and elevated or not, and marks, saves and counts nothing.
 
@@ -178,7 +178,7 @@ enrollment is ephemeral, `set-primary` refuses, whatever label it is given:
 `promote_org_to_primary` checks it before anything else
 (`crates/agent-core/src/config.rs:2367-2380`), and the file stays as it was,
 since `org_cmd` saves only after its arm succeeds
-(`agents/roomlerd/src/app.rs:3602`). The swap would put the ephemeral row
+(`agents/roomlerd/src/app.rs:3612`). The swap would put the ephemeral row
 beside another org, which #4352 rules out. An `[[orgs]]` entry has no
 `ephemeral`, so the swap would leave:
 - **the moved row** in `[[orgs]]`, where the device no longer knows it is

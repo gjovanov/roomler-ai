@@ -64,7 +64,7 @@ sequenceDiagram
     A->>S: POST /api/tenant/{tid}/agent/enroll-token
     S-->>A: {enrollment_token, expires_in: 600, jti}
     A-->>D: token handed to installer / wizard
-    D->>S: POST /api/agent/enroll {enrollment_token, machine_id, machine_name, os, agent_version}
+    D->>S: POST /api/agent/enroll {enrollment_token, machine_id, machine_name, os, agent_version, enrolling_program}
     S-->>D: {agent_id, tenant_id, agent_token}
     D->>S: GET /ws?role=agent&tid=<tenant_id>, Authorization: Bearer <agent_token>  (always-on control link)
 ```
@@ -81,6 +81,24 @@ the same moment). The tunnel-client flow is identical
 in shape (`…/tunnel-client/enroll-token` → `POST /api/tunnel-client/enroll` →
 `{tunnel_client_token}`), with a distinct audience so a leaked agent token can't
 impersonate a client or vice-versa.
+
+**A device row's version is its daemon's own** (#3565). Three programs enroll a
+device (the daemon's own `roomlerd enroll`, the setup wizard and the companion), and
+they are released apart. Each one names itself in the request:
+`enrolling_program: {name, version}`, where `name` is `roomlerd`, `roomler-setup` or
+`roomler-desktop` and `version` is the version that program was built as. It still
+sends `agent_version`, the same version, because every server from before #3565
+requires that field.
+
+| What | Written by | When the daemon has not connected yet |
+|---|---|---|
+| The row's `agent_version` | the daemon's hello alone (`AgentDao::update_hello`). An enrollment never writes it, and a re-enrollment of a live row leaves it as it was | absent on the row; `""` on the API, shown as "not reported yet" |
+| The row's `enrolling_program` | every enrollment, clamped and never refused: a name the server does not know is stored as `other`, and a version that is not a short version string as `""` | the program the latest enrollment named |
+| A request without `enrolling_program` (an older enroller) | stored as `{name: "unknown", version: <its agent_version>}`, never as the device's version | the same |
+
+An older server ignores `enrolling_program`, because the enroll body accepts unknown
+fields. `enrolling_program` says how the device was enrolled; `enrolled_by` is the
+person who did.
 
 **An enrollment token enrolls once** (#3328). Every door that redeems one — the
 daemon's `POST /api/agent/enroll`, `POST /api/tunnel-client/enroll`, and the anchor
@@ -201,7 +219,7 @@ capability URLs, webhook signatures).
 | POST | `/api/sendgrid/webhook` | FR-102 P5 (`saas`): SendGrid's Event Webhook — ECDSA P-256 signed, verified **before the body is parsed** (401), the empty 404 without `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`; records `delivered` · `bounce` · `dropped` · `spamreport` of newsletter messages on their ledger rows (never opens or clicks); un-governed ([growth-observability.md](growth-observability.md#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5)) |
 | POST | `/api/pair/start` | FR-129 A1: an installer starts a **device pairing** instead of asking for a pasted token — `{machine_name, os, arch, role: daemon\|tunnel, halves?, client, client_version}` → `{device_code, user_code: "BCDF-GHJK", verification_uri, expires_in, interval}`. The `device_code` is the installer's secret (stored only as a hash, in no other response); the `user_code` is what the person types on `/pair`. Per-address ceiling (429 `rate_limited`); 415 unless the body declares `application/json` (every `/api/pair/*` route — a cross-site `text/plain` form cannot reach the cookie-authenticated routes without a preflight); 400 `network_unmounted` for a tunnel role on a server without the network module; the **empty 404** while `ROOMLER__PAIRING__ENABLED=false` ([the spec](fr/FR-129-guided-cross-platform-installer.md#the-pairing-api)) |
 | POST | `/api/pair/poll` | FR-129 A1: `{device_code}` → `{status: authorization_pending \| slow_down (+interval) \| access_denied \| expired_token \| approved (+tokens[], org_name, org_slug, approver_name, approver_username)}` — the installer shows the two unique handles beside the display names before it installs. The device code **is** the auth; an unknown, delivered or expired code answers `expired_token` alike. The first poll after an approval mints the ordinary single-use enrollment token(s) behind the approver's gate, re-checked — delivery is once |
-| POST | `/api/agent/enroll` | Exchange enrollment token (or an FR-51 ephemeral key) → agent credential. 403 for an archived org, or for a credential whose admin may no longer enroll devices in it, before anything is spent (above). The answer's `ephemeral` is the row's nature, which the daemon records. #4352: a standard token over a **live ephemeral** row is a **409** `conflict` that says to remove the device on the Devices page first, decided before the token is spent (the same token works once the row is removed); a live permanent row is refreshed, and a removed one comes back as a new device ([ephemeral-nodes.md](ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)) |
+| POST | `/api/agent/enroll` | Exchange enrollment token (or an FR-51 ephemeral key) → agent credential. 403 for an archived org, or for a credential whose admin may no longer enroll devices in it, before anything is spent (above). The answer's `ephemeral` is the row's nature, which the daemon records. #4352: a standard token over a **live ephemeral** row is a **409** `conflict` that says to remove the device on the Devices page first, decided before the token is spent (the same token works once the row is removed); a live permanent row is refreshed, and a removed one comes back as a new device ([ephemeral-nodes.md](ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)). The body's `enrolling_program` is stored as how the device was enrolled; the row's version comes only from the daemon's hello (#3565, above) |
 | GET | `/api/agent/latest-release` | Agent release manifest (cached GitHub proxy). Readers: the daemon's update check; the Windows tray refresh and the Linux companion's sync, which look up their own `agent-v<own>` here and nowhere else; a rollback or an operator's pin, which looks here first (#3818). So every asset of a listed release stays in the answer, the companion's included |
 | GET | `/api/agent/installer/{flavour}` (+`/health`) | Stream the MSI/installer through roomler.ai (`peruser` \| `permachine`) |
 | POST | `/api/agent/crash` | Crash-report ingest (agent JWT in-handler). Every string of the report is scrubbed again on the way in, as a log line's is ([security-baseline.md](security-baseline.md#device-diagnostics-manage_agents-and-a-second-scrub)) |
@@ -425,7 +443,7 @@ Both exports take `{room_id}`: a room of the path org that the caller may read. 
 | GET | `…/agent` | List enrolled devices (status, caps, overlay info). FR-55 P4: `power {policy, on_ac?, held}`, the posture the device last reported (absent from an agent that predates it: unknown, never `never`), and, on a device that is not online, `sleep {since, power}` when it announced a sleep ([power.md](power.md) §3) |
 | GET | `…/device` | The unified devices grid (agents and tunnel clients), searched, sorted and paged on the server. FR-55 P4: an agent that is not online and announced a sleep carries `sleep {since, power}`, which the dashboard reads as **asleep** ([power.md](power.md) §3.4) |
 | POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use). 403 for an **archived** org |
-| POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device), `{pin?, force?}` (+ `agent_ids?` for the fleet). A push that would not be acted on is refused, never sent: FR-2's downgrade guard (`pin_downgrade`, unless `force`), and since FR-67 P7 a device whose caps say it ignores the push (`primary_org`, a secondary enrollment) or drops it (`auto_update_off`). `force` lifts only the first. One device answers **409** with the reason; the fleet route skips the device with a `refused` reason and its `refused_code`, and counts it in `refused` |
+| POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device), `{pin?, force?}` (+ `agent_ids?` for the fleet). A push that would not be acted on is refused, never sent: FR-2's downgrade guard (`pin_downgrade`, unless `force`); since #3565 a pin to a row with no reported version, which is refused unless it is forced (`version_unreported`); and since FR-67 P7 a device whose caps say it ignores the push (`primary_org`, a secondary enrollment) or drops it (`auto_update_off`). `force` lifts only the two pin checks. One device answers **409** with the reason; the fleet route skips the device with a `refused` reason and its `refused_code`, and counts it in `refused` |
 | POST | `…/agent/{aid}/join-org` · GET `…/join-targets` | Add an enrolled device to a second org (multi-org) |
 | GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release). The detail's `access_policy` names its `allowed_role_ids` and `allowed_user_ids` as 24-hex strings; a PUT may also name one as bson's `{"$oid": "<hex>"}`, and both are stored as the same ObjectId (#4189). Removal is final: from then on the device is a **404 on every per-device route** — this GET and PUT, the policies, `desired-config`, `update`, `exec`, `ssh`, `join-org` — and a repeat DELETE is a 404 too, like the listing that no longer shows it. Only the audit views (`…/agent/{aid}/crash`, `…/agent/{aid}/logs`, `…/recording-activity/{aid}`, `…/transfer-activity/{aid}`, `…/privacy-activity/{aid}`) still resolve a removed device |
 | GET | `…/agent/{aid}/crash` | The device's last 50 crash reports, newest first. `MANAGE_AGENTS`, decided before the device is looked up, so a caller without it gets one 403 `forbidden` whatever the id names. For a holder, another org's device or an id that names nothing is a 404, and a removed device still reads (an audit view) — see [security-baseline.md](security-baseline.md#device-diagnostics-manage_agents-and-a-second-scrub) |

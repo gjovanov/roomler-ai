@@ -30,9 +30,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::{DateTime, doc, oid::ObjectId};
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentStatus, ConsentMode, DesiredConfig, ExecMode, ExecPolicy,
-    ExternalAccessPolicy, KeyRotationRequest, OsKind, PeerRelayPolicy, PolicySubject, PolicyTarget,
-    SshMode, SshPolicy,
+    AccessPolicy, Agent, AgentStatus, ConsentMode, DesiredConfig, EnrollingProgram,
+    EnrollingProgramName, ExecMode, ExecPolicy, ExternalAccessPolicy, KeyRotationRequest, OsKind,
+    PeerRelayPolicy, PolicySubject, PolicyTarget, SshMode, SshPolicy,
 };
 use roomler_ai_services::dao::base::DaoError;
 use serde_json::{Value, json};
@@ -731,7 +731,13 @@ async fn a_live_re_enrollment_does_not_undo_a_removal_that_landed_after_its_read
     // The route read the row live, then the removal landed: the write it was
     // about to make must match nothing.
     let refreshed = agents
-        .rehydrate(aid, "race box", OsKind::Linux, "0.4.207", None)
+        .rehydrate(
+            aid,
+            "race box",
+            OsKind::Linux,
+            &EnrollingProgram::new(EnrollingProgramName::Roomlerd, "0.4.207"),
+            None,
+        )
         .await;
     assert!(
         matches!(refreshed, Err(DaoError::NotFound)),
@@ -770,7 +776,7 @@ async fn a_revive_that_read_an_earlier_removal_writes_nothing() {
                 admin,
                 "stale box".into(),
                 OsKind::Linux,
-                "0.4.207".into(),
+                EnrollingProgram::new(EnrollingProgramName::Roomlerd, "0.4.207"),
                 None,
             )
             .await
