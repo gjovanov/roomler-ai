@@ -1468,7 +1468,8 @@ mod offer_tests {
     use super::{
         NETSTACK_FORWARDS_NOTHING, OfferTracker, RouteOffer, SetupFailure, SetupOutcome, SetupStep,
         forward_policy_accepts, gate_offer_with, has_v6_uplink, linux_v4_outcome, linux_v6_outcome,
-        nat_retry_delay, netstack_offer, offer_after_setup, sysctl_flag, windows_outcome,
+        nat_retry_delay, netstack_offer, offer_after_setup, sysctl_flag, windows_forwarding_dead,
+        windows_outcome, winnat_uncovered,
     };
     use std::time::{Duration, Instant};
 
@@ -1818,5 +1819,105 @@ mod offer_tests {
         assert_eq!(f.step, SetupStep::Nat);
         assert!(f.reason().contains("New-NetNat x: y"), "{}", f.reason());
         assert_eq!(windows_outcome(Ok(()), Ok(())).v4, Ok(()));
+    }
+
+    /// #3562 — a Windows forwarding script that exited non-zero kills the
+    /// exit only when the overlay adapter, a default route's egress, or every
+    /// route's egress does not forward. One subnet's egress refusing (a VPN
+    /// miniport, say) degrades that route as before, and the exit keeps its
+    /// offer.
+    #[test]
+    fn windows_withdraws_only_for_forwarding_that_kills_the_exit() {
+        let routes = |rs: &[&str]| rs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        let report = "OVERLAY 7\nROUTE 0.0.0.0/0 3\nROUTE 10.9.0.0/16 12\n\
+                      AFTER 7 Enabled\nAFTER 3 Enabled\nAFTER 12 Disabled\n";
+        let exit = routes(&["0.0.0.0/0", "10.9.0.0/16"]);
+        assert_eq!(
+            windows_forwarding_dead(report, &exit),
+            None,
+            "one subnet's egress"
+        );
+
+        let no_overlay = report.replace("AFTER 7 Enabled", "AFTER 7 Disabled");
+        assert_eq!(
+            windows_forwarding_dead(&no_overlay, &exit).as_deref(),
+            Some("forwarding is off on the overlay adapter")
+        );
+        assert_eq!(
+            windows_forwarding_dead("ROUTE 0.0.0.0/0 3\nAFTER 3 Enabled\n", &exit).as_deref(),
+            Some("the overlay adapter was not found")
+        );
+
+        let dead_default = report
+            .replace("AFTER 3 Enabled", "AFTER 3 Disabled")
+            .replace("AFTER 12 Disabled", "AFTER 12 Enabled");
+        assert_eq!(
+            windows_forwarding_dead(&dead_default, &exit).as_deref(),
+            Some("forwarding is off on the egress adapter of 0.0.0.0/0"),
+            "a live subnet does not make a dead default an exit"
+        );
+        assert_eq!(
+            windows_forwarding_dead("OVERLAY 7\nAFTER 7 Enabled\n", &routes(&["0.0.0.0/0"]))
+                .as_deref(),
+            Some("forwarding is off on the egress adapter of 0.0.0.0/0"),
+            "an egress the script never found does not forward"
+        );
+
+        // A subnet router (no default route): dead only when no egress forwards.
+        assert_eq!(
+            windows_forwarding_dead(report, &routes(&["10.9.0.0/16"])).as_deref(),
+            Some("forwarding is off on every advertised route's egress adapter")
+        );
+        assert_eq!(
+            windows_forwarding_dead(&dead_default, &routes(&["10.9.0.0/16"])),
+            None
+        );
+        // IPv6 routes are not WinNAT's: they never count as a default route.
+        assert_eq!(
+            windows_forwarding_dead(report, &routes(&["0.0.0.0/0", "::/0"])),
+            None
+        );
+    }
+
+    /// #3562 — a WinNAT refusal kills the exit only when no other ACTIVE
+    /// instance's prefix contains the refused block: one that does translates
+    /// it, and the exit keeps its offer. A prefix that only overlaps (the
+    /// field cell: another instance inside the org's range) translates
+    /// nothing. The first block left un-NATed names the failure.
+    #[test]
+    fn winnat_withdraws_only_for_a_block_nothing_translates() {
+        let refused = |blocks: &[&str]| -> Vec<(String, String)> {
+            blocks
+                .iter()
+                .map(|b| (b.to_string(), format!("New-NetNat {b}: overlaps")))
+                .collect()
+        };
+        let covering = "roomler-old 100.64.0.0/10\n";
+        assert_eq!(
+            winnat_uncovered(refused(&["100.64.0.0/16"]), covering),
+            Ok(())
+        );
+        assert_eq!(
+            winnat_uncovered(refused(&["100.64.0.0/16"]), "other 100.64.200.0/24\n"),
+            Err("New-NetNat 100.64.0.0/16: overlaps".to_string())
+        );
+        assert_eq!(
+            winnat_uncovered(refused(&["100.64.0.0/16"]), ""),
+            Err("New-NetNat 100.64.0.0/16: overlaps".to_string())
+        );
+        assert_eq!(
+            winnat_uncovered(
+                refused(&["100.64.0.0/16", "100.128.0.0/16", "100.129.0.0/16"]),
+                covering
+            ),
+            Err("New-NetNat 100.128.0.0/16: overlaps".to_string()),
+            "the first block nothing translates"
+        );
+        assert_eq!(
+            winnat_uncovered(refused(&["100.64.0.0/16"]), "garbage\nname not-a-prefix\n"),
+            Err("New-NetNat 100.64.0.0/16: overlaps".to_string()),
+            "an unreadable line covers nothing"
+        );
+        assert_eq!(winnat_uncovered(Vec::new(), ""), Ok(()));
     }
 }
