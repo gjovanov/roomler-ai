@@ -131,9 +131,10 @@ impl Busy {
     /// `self`, with the runs the device's SYSTEM service holds counted as
     /// exec runs (#4244).
     pub fn with_service_runs(self, service: &crate::exec_service::ServiceRuns) -> Busy {
-        // The seam: master's gate reads this process's `Busy` alone.
-        let _ = service;
-        self
+        Busy {
+            exec_runs: self.exec_runs.saturating_add(service.counted()),
+            ..self
+        }
     }
 }
 
