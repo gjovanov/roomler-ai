@@ -92,6 +92,148 @@ async fn every_admin_newsletter_route_is_404_without_authority() {
     );
 }
 
+/// The four newsletter writes, each with a body the route reads and a body
+/// with a field the route's own body type refuses. One issue path serves
+/// them all: no issue is looked up before the gate, nor before a body that
+/// does not parse is answered.
+fn newsletter_writes() -> [crate::tunnel_policy_permission_tests::GatedWrite; 4] {
+    use crate::tunnel_policy_permission_tests::GatedWrite;
+    let issue = "/api/admin/newsletter/issues/gate-first";
+    [
+        GatedWrite {
+            method: "POST",
+            path: "/api/admin/newsletter/issues".to_owned(),
+            reads: issue_json("gate-first"),
+            refused_field: r#"{"slug": 7}"#,
+        },
+        GatedWrite {
+            method: "PUT",
+            path: issue.to_owned(),
+            reads: serde_json::json!({
+                "subject": "s",
+                "preheader": "p",
+                "body_md": "b",
+            }),
+            refused_field: r#"{"subject": 7}"#,
+        },
+        GatedWrite {
+            method: "POST",
+            path: format!("{issue}/test-send"),
+            reads: serde_json::json!({ "email": "operator@test.io" }),
+            refused_field: r#"{"email": 7}"#,
+        },
+        GatedWrite {
+            method: "POST",
+            path: format!("{issue}/send"),
+            reads: serde_json::json!({ "retry_stale": false }),
+            refused_field: r#"{"retry_stale": "x"}"#,
+        },
+    ]
+}
+
+/// #4254 — the four newsletter writes decide their gate before they read
+/// their body at all: anyone but a platform operator, an org's owner
+/// included, gets the one 404 for a body that does not even parse, the
+/// answer a body the route reads gets, so the routes stay unseen. While they
+/// took `Json<T>` (`send`: `Option<Json<T>>`) as an extractor, axum answered
+/// such a body before the handler ran, with a 400, 415 or 422 decided by the
+/// body alone.
+#[tokio::test]
+async fn the_newsletter_writes_decide_their_gate_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{Gate, assert_no_problems, gate_problems};
+
+    let operator = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+        // 32 requests besides the seeding: the limiter must not answer first.
+        s.app.rate_limit_per_sec = 1_000;
+        s.app.rate_limit_burst = 10_000;
+    })
+    .await;
+    let org = app.seed_tenant("newsletter-unparsed").await;
+
+    let mut wrong = Vec::new();
+    for write in &newsletter_writes() {
+        for (who, token) in [
+            ("an org's owner", &org.admin.access_token),
+            ("a member", &org.member.access_token),
+        ] {
+            wrong.extend(gate_problems(&app, who, token, Gate::Unseen, write).await);
+        }
+    }
+    assert_no_problems("answered before the gate", &wrong);
+}
+
+/// #4254's control. A platform operator is answered a newsletter body that
+/// does not parse exactly as axum's `Json` extractor answers it, the status
+/// and the plain-text words. And `send` with no body and no `Content-Type`
+/// still reaches the handler, as it did while it took `Option<Json<T>>`: on
+/// a server with no mailer, that is the handler's own 400, never a 415.
+/// Nothing is written.
+#[tokio::test]
+async fn an_operator_is_answered_a_newsletter_body_that_does_not_parse_as_the_json_extractor_answers_it()
+ {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, call, holder_problems};
+    use roomler_ai_mod_saas::newsletter::{CreateIssue, IssueBody, SendRequest, TestSend};
+
+    let operator = ObjectId::new();
+    // Default test settings leave email unconfigured ⇒ state.email = None.
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+    })
+    .await;
+    let op = token_for(&app, operator);
+
+    let [create, update, test_send, send] = newsletter_writes();
+    let mut wrong = Vec::new();
+    wrong.extend(
+        holder_problems::<CreateIssue>(
+            &app,
+            &op,
+            create.method,
+            &create.path,
+            create.refused_field,
+        )
+        .await,
+    );
+    wrong.extend(
+        holder_problems::<IssueBody>(&app, &op, update.method, &update.path, update.refused_field)
+            .await,
+    );
+    wrong.extend(
+        holder_problems::<TestSend>(
+            &app,
+            &op,
+            test_send.method,
+            &test_send.path,
+            test_send.refused_field,
+        )
+        .await,
+    );
+    wrong.extend(
+        holder_problems::<SendRequest>(&app, &op, send.method, &send.path, send.refused_field)
+            .await,
+    );
+    assert_no_problems("a platform operator", &wrong);
+
+    let (status, body) = call(&app, send.method, &send.path, &op, None).await;
+    assert!(
+        status == 400
+            && body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("no mailer configured")),
+        "send with no body: answered {status} {body}, want the handler's own 400"
+    );
+
+    let issues = app
+        .db
+        .collection::<bson::Document>("newsletter_issues")
+        .count_documents(doc! {})
+        .await
+        .unwrap();
+    assert_eq!(issues, 0, "nothing is written");
+}
+
 #[tokio::test]
 async fn draft_crud_roundtrip_slug_conflict_and_edit_lock() {
     let admin_id = ObjectId::new();

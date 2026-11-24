@@ -271,8 +271,12 @@ pub fn restricted_medium_copy() -> Result<Owned, String> {
     // SAFETY: a TOKEN_USER whose SID lives in `user_buf`, alive for both
     // calls below.
     let user_sid = unsafe { (*(user_buf.as_ptr() as *const TOKEN_USER)).User.Sid };
-    // An elevated token's objects are owned by Administrators by default,
-    // which is deny-only now and so can own nothing.
+    // The copy's objects are owned by its user. An elevated token's default
+    // owner is Administrators or its user, as the policy "System objects:
+    // Default owner for objects created by members of the Administrators
+    // group" says (Administrators on a server edition, the user on a client
+    // one), and Administrators is deny-only in this copy and so can own
+    // nothing.
     let owner = TOKEN_OWNER { Owner: user_sid };
     // SAFETY: `owner` and the SID it names outlive the call.
     if unsafe {

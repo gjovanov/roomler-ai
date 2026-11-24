@@ -18,8 +18,8 @@
 //!
 //! 1. a function takes its body as `Json<T>` or `Option<Json<T>>` (both
 //!    extractors answer before the handler runs) and calls a gate, or
-//! 2. a function takes `Result<Json<T>, _>` and uses it in, or before, the
-//!    first statement that calls a gate.
+//! 2. a function takes `Result<Json<T>, _>` or `Result<Option<Json<T>>, _>`
+//!    and uses it in, or before, the first statement that calls a gate.
 //!
 //! A **gate** is a function other than a handler that checks a permission
 //! bit (`permissions::has`) or the platform-operator allowlist
@@ -27,19 +27,19 @@
 //! counts for that handler. So `require_permission`, `require_platform_admin`
 //! and every helper built on them are gates without being named here.
 //!
-//! What it flags today is listed, each entry with its reason, and both lists
-//! may only shrink: an entry the scan no longer flags fails the test until it
-//! is removed.
-//! - [`DEFERRED`]: gated writes outside the network module, fixed by #4254.
-//! - [`BY_DESIGN`]: handlers whose check needs the body, or that read the
-//!   allowlist to shape their answer rather than to refuse.
+//! What it flags today is listed in [`BY_DESIGN`], each entry with its
+//! reason: handlers whose check needs the body, or that read the allowlist to
+//! shape their answer rather than to refuse. The list may only shrink: an
+//! entry the scan no longer flags fails the test until it is removed.
 //!
 //! What it cannot see:
-//! - A check it does not recognise as a gate: an ownership or author check
-//!   (`chat::message::update` is one, #4254), a bit read some other way, a
-//!   gate called as a method, through a closure or a function pointer, inside
-//!   a macro's arguments (`syn` leaves those unparsed), or defined outside the
-//!   scanned crates.
+//! - A check it does not recognise as a gate: an ownership or author check, a
+//!   bit read some other way, a gate called as a method, through a closure or
+//!   a function pointer, inside a macro's arguments (`syn` leaves those
+//!   unparsed), or defined outside the scanned crates. `chat::message::update`
+//!   unwraps its body after its author check since #4254; the scan does not
+//!   see that check, and only its integration test in `room_access_tests.rs`
+//!   shows the order.
 //! - A call it cannot resolve. A call resolves by name: to the function of the
 //!   calling file, else to the one file that defines the name, else to the
 //!   file the path's module segment names (`agent_exec::authorize`). A name
@@ -58,99 +58,6 @@ use std::path::{Path, PathBuf};
 
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-
-/// #4254 — gated writes outside the network module that still take their body
-/// as `Json<T>`: `(file, function, issue)`. Fix one the #4218 way and remove
-/// its entry; the test fails while a fixed one is still listed.
-const DEFERRED: &[(&str, &str, &str)] = &[
-    (
-        "crates/api/src/growth/exclusions.rs",
-        "put_exclusions",
-        "#4254",
-    ),
-    ("crates/api/src/routes/invite.rs", "add_member", "#4254"),
-    (
-        "crates/api/src/routes/invite.rs",
-        "batch_create_invite",
-        "#4254",
-    ),
-    ("crates/api/src/routes/invite.rs", "create_invite", "#4254"),
-    ("crates/api/src/routes/role.rs", "create", "#4254"),
-    ("crates/api/src/routes/role.rs", "update", "#4254"),
-    ("crates/modules/chat/src/membership.rs", "prune", "#4254"),
-    ("crates/modules/chat/src/room.rs", "update", "#4254"),
-    (
-        "crates/modules/fleet/src/agent.rs",
-        "trigger_agent_update",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/agent.rs",
-        "trigger_agents_update",
-        "#4254",
-    ),
-    ("crates/modules/fleet/src/agent.rs", "update_agent", "#4254"),
-    (
-        "crates/modules/fleet/src/agent_exec.rs",
-        "set_org_settings",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/agent_exec.rs",
-        "set_policy",
-        "#4254",
-    ),
-    ("crates/modules/fleet/src/agent_org.rs", "join_org", "#4254"),
-    (
-        "crates/modules/fleet/src/enroll_key.rs",
-        "mint_key",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/enroll_key.rs",
-        "set_org_settings",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/external_access.rs",
-        "set_enabled",
-        "#4254",
-    ),
-    (
-        "crates/modules/fleet/src/keep_busy.rs",
-        "set_org_settings",
-        "#4254",
-    ),
-    (
-        "crates/modules/remote/src/session_policy.rs",
-        "set_limits",
-        "#4254",
-    ),
-    (
-        "crates/modules/remote/src/session_policy.rs",
-        "set_policy",
-        "#4254",
-    ),
-    ("crates/modules/saas/src/newsletter.rs", "create", "#4254"),
-    ("crates/modules/saas/src/newsletter.rs", "send", "#4254"),
-    (
-        "crates/modules/saas/src/newsletter.rs",
-        "test_send",
-        "#4254",
-    ),
-    ("crates/modules/saas/src/newsletter.rs", "update", "#4254"),
-    ("crates/modules/saas/src/stripe.rs", "change_plan", "#4254"),
-    (
-        "crates/modules/saas/src/stripe.rs",
-        "create_checkout",
-        "#4254",
-    ),
-    (
-        "crates/modules/saas/src/stripe.rs",
-        "create_portal",
-        "#4254",
-    ),
-];
 
 /// Handlers that read their body before a gate on purpose:
 /// `(file, function, why)`.
@@ -229,6 +136,24 @@ const BY_DESIGN: &[(&str, &str, &str)] = &[
         "enroll_tunnel_client",
         "the enrollment credential and the machine id are the body: whether a bit is asked \
          depends on the machine it names (`revive_scope`)",
+    ),
+    (
+        "crates/modules/saas/src/stripe.rs",
+        "change_plan",
+        "its gate asks about the org the body's `tenant_id` names, and the route carries no \
+         org in its path",
+    ),
+    (
+        "crates/modules/saas/src/stripe.rs",
+        "create_checkout",
+        "its gate asks about the org the body's `tenant_id` names, and the route carries no \
+         org in its path",
+    ),
+    (
+        "crates/modules/saas/src/stripe.rs",
+        "create_portal",
+        "its gate asks about the org the body's `tenant_id` names, and the route carries no \
+         org in its path",
     ),
 ];
 
@@ -344,8 +269,9 @@ enum Body {
     /// `Json<T>` or `Option<Json<T>>`: read by the extractor, before the
     /// handler's first line.
     Extracted,
-    /// `Result<Json<T>, _>` bound to this name (`None`: to a pattern the scan
-    /// cannot follow): read where the handler unwraps it.
+    /// `Result<Json<T>, _>` or `Result<Option<Json<T>>, _>` bound to this
+    /// name (`None`: to a pattern the scan cannot follow): read where the
+    /// handler unwraps it.
     Deferred(Option<String>),
 }
 
@@ -372,6 +298,13 @@ fn is_json(ty: &syn::Type) -> bool {
     last_segment(ty).is_some_and(|segment| segment.ident == "Json")
 }
 
+/// `Option<Json<T>>`.
+fn is_optional_json(ty: &syn::Type) -> bool {
+    last_segment(ty).is_some_and(|segment| {
+        segment.ident == "Option" && first_type_argument(segment).is_some_and(is_json)
+    })
+}
+
 fn body(argument: &syn::FnArg) -> Option<Body> {
     let syn::FnArg::Typed(typed) = argument else {
         return None;
@@ -384,7 +317,7 @@ fn body(argument: &syn::FnArg) -> Option<Body> {
     if segment.ident == "Option" && is_json(inner) {
         return Some(Body::Extracted);
     }
-    if segment.ident == "Result" && is_json(inner) {
+    if segment.ident == "Result" && (is_json(inner) || is_optional_json(inner)) {
         let name = match &*typed.pat {
             syn::Pat::Ident(binding) => Some(binding.ident.to_string()),
             _ => None,
@@ -760,16 +693,11 @@ fn every_gated_write_decides_its_gate_before_it_reads_its_body() {
     );
     let found = scan(&files).findings;
 
-    let listed: BTreeSet<(&str, &str)> = DEFERRED
+    let listed: BTreeSet<(&str, &str)> = BY_DESIGN
         .iter()
-        .chain(BY_DESIGN)
         .map(|(file, name, _)| (*file, *name))
         .collect();
-    assert_eq!(
-        listed.len(),
-        DEFERRED.len() + BY_DESIGN.len(),
-        "a handler is listed twice"
-    );
+    assert_eq!(listed.len(), BY_DESIGN.len(), "a handler is listed twice");
     let flagged: BTreeSet<(&str, &str)> = found
         .iter()
         .map(|f| (f.file.as_str(), f.name.as_str()))
@@ -799,8 +727,8 @@ fn every_gated_write_decides_its_gate_before_it_reads_its_body() {
     }
     if !stale.is_empty() {
         problems.push_str(&format!(
-            "listed in DEFERRED or BY_DESIGN, but the scan no longer flags them (fixed, \
-             renamed or gone): remove each entry:\n{}\n",
+            "listed in BY_DESIGN, but the scan no longer flags them (fixed, renamed or \
+             gone): remove each entry:\n{}\n",
             stale.join("\n")
         ));
     }
@@ -892,6 +820,50 @@ fn an_optional_json_body_is_read_before_the_handler_too() {
     ]);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].1.contains("platform_admins.contains"), "{found:?}");
+}
+
+/// A body that may be absent, `Result<Option<Json<T>>, _>`, is checked for
+/// order like `Result<Json<T>, _>`: unwrapped after its gate, it passes.
+#[test]
+fn an_optional_body_unwrapped_after_its_gate_passes() {
+    let found = flagged(&[
+        CORE,
+        (
+            "h.rs",
+            r#"
+            pub async fn send(State(state): State<Core>, auth: AuthUser, body: Result<Option<Json<Req>>, JsonRejection>) -> Result<(), ApiError> {
+                require_platform_admin(&state, &auth)?;
+                let req = body?.map(|Json(b)| b).unwrap_or_default();
+                Ok(())
+            }
+            "#,
+        ),
+    ]);
+    assert!(found.is_empty(), "{found:?}");
+}
+
+/// A body that may be absent, `Result<Option<Json<T>>, _>`, used before its
+/// gate is flagged.
+#[test]
+fn an_optional_body_unwrapped_before_its_gate_is_flagged() {
+    let found = flagged(&[
+        CORE,
+        (
+            "h.rs",
+            r#"
+            pub async fn send(State(state): State<Core>, auth: AuthUser, body: Result<Option<Json<Req>>, JsonRejection>) -> Result<(), ApiError> {
+                let req = body?.map(|Json(b)| b).unwrap_or_default();
+                require_platform_admin(&state, &auth)?;
+                Ok(())
+            }
+            "#,
+        ),
+    ]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].1.contains("uses `body` in statement 1"),
+        "{found:?}"
+    );
 }
 
 #[test]
