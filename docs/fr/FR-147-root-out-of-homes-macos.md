@@ -738,9 +738,9 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
   person's config (`config.rs:3627-3674`) could bring it back. #4184 fixed that for every conversion from its release
   on: `convert` keeps the new config as its `.prev` too ("Refusals at convert"). Left out of #4184, each named: a
   Mac converted before it keeps the enrolled `.prev` until that person's next save rotates the new file in, which
-  for the console person is the screen worker's clean-run save five minutes in (`app.rs:5677`), while a person not
+  for the console person is the screen worker's clean-run save five minutes in (`app.rs:5687`), while a person not
   at the console has no writer; on such a Mac, with `macos_one_row` turned off by hand, the supervisor's enrolled
-  worker that finds a config there that does not load restores that `.prev` through `app.rs:4044` and runs the
+  worker that finds a config there that does not load restores that `.prev` through `app.rs:4054` and runs the
   copy, since `may_restore` (`config_at_start.rs:74-85`, #4157) covers only a missing config; and a
   `.prev` beside a person config that is missing, which Read never sees and `convert` leaves. The worker root's
   supervisor starts never restores a missing config at its start (#4157): with `--unenrolled` it writes a blank
