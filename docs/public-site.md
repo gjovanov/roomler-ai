@@ -45,7 +45,7 @@ flowchart LR
 
 `bun run build` is `vue-tsc && vite build && bun docs/build.ts`. **The generator must run
 after `vite build`**, which empties `dist/`. CI runs the three separately so each failure gets
-its own annotation ([`ci.yml:2933`](../.github/workflows/ci.yml)).
+its own annotation ([`ci.yml:2935`](../.github/workflows/ci.yml)).
 
 | Collection | Source | URL | Dated from |
 |---|---|---|---|
@@ -273,6 +273,7 @@ is the natural target, because there the edge sends one URL to each server.
 | every `/docs/assets/` file `/`, `/docs/` and a leaf name is hashed and loads; every `<img>` has a size | stale caches; layout shift |
 | given a full-history repo, every docs `<lastmod>` equals git's | dates from the build clock |
 | given the repo, `/<key>.txt` serves the IndexNow key exactly as committed (§8) | a key file that stopped shipping: `location /` would answer with the SPA shell, and every engine would reject every submission |
+| given the repo, `/ads.txt` serves `ui/public/ads.txt` exactly as committed, as `text/plain` (§8) | the same for AdSense, which reads the SPA shell as no ads.txt, so the site fails its check |
 
 Each check was shown failing before it passed. Against production before FR-87 it failed on
 all of them, and an image built with no manifest fails the `lastmod` check. Production before
@@ -398,6 +399,14 @@ property from it. Review the coverage at +3, +14 and +28 days after a launch (FR
 > ⚠️ **Not used, on purpose:** the sitemap "ping" endpoints (retired by Google in 2023), the
 > Indexing API (Google limits it to job postings and livestreams), and a `SoftwareApplication`
 > rich result, which requires ratings.
+
+**AdSense** verifies the site by fetching `https://roomler.ai/ads.txt`. That file is
+[`ui/public/ads.txt`](../ui/public/ads.txt): the one line AdSense shows for the site, naming its
+publisher account. It ships in the image, so a change to it goes live with the next promote,
+and the smoke (§6) checks that it is served as committed. No AdSense script or meta tag is on
+any page, and the CSP allows no AdSense origin, so showing ads would take a change to
+[`files/security-headers.conf`](../files/security-headers.conf). The AdSense account, its
+*Verify* button and its site review are the operator's.
 
 ## 9. What a campaign link carries
 
@@ -681,3 +690,4 @@ flowchart TD
 | [`files/nginx-pod.conf`](../files/nginx-pod.conf) · [`files/nginx-blog.conf`](../files/nginx-blog.conf) | how it is served: the pod, and the blog lane (§11) |
 | [`scripts/public-site-smoke.sh`](../scripts/public-site-smoke.sh) | how it is proven |
 | [`scripts/indexnow.sh`](../scripts/indexnow.sh) · `ui/public/<key>.txt` · [`promote.yml`](../.github/workflows/promote.yml) | telling search engines what a roll changed |
+| [`ui/public/ads.txt`](../ui/public/ads.txt) | AdSense's check of the site (§8) |

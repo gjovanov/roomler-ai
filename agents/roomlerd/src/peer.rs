@@ -1308,6 +1308,7 @@ impl AgentPeer {
                             quality_for_dc,
                             target_res_for_dc,
                             keyframe_for_dc,
+                            deadline_stash.viewer_relay(),
                             viewer_report_for_dc,
                             priority_for_dc,
                             stats_now_for_dc,
@@ -10858,6 +10859,9 @@ fn attach_control_handler(
     // rc.130 — the session's key frame gate (FR-148 P4b-3: shared with the
     // send tasks' own asks), over the atomic the media pumps poll.
     keyframe_gate: Arc<crate::media_deadline::KeyframeGate>,
+    // FR-148 P4b-3b (D58) — the session's slot for `rc:decodestat`'s `relay`,
+    // the viewer's own relay's transport, which the pumps' pick reads.
+    viewer_relay: Arc<crate::media_deadline::ViewerRelayReport>,
     // rc.188 — written on every `rc:decodestat` (packed decoded fps + a
     // struggling bit via `viewer_rate::pack_report`); the DC video pumps swap+
     // decode it to drive the viewer-rate fps cap.
@@ -10907,6 +10911,7 @@ fn attach_control_handler(
         let quality_state = quality_state.clone();
         let target_resolution = target_resolution.clone();
         let keyframe_gate = keyframe_gate.clone();
+        let viewer_relay = viewer_relay.clone();
         let viewer_report = viewer_report.clone();
         let priority = priority.clone();
         let dc_for_reply = dc_for_reply.clone();
@@ -11264,6 +11269,9 @@ fn attach_control_handler(
                     // kept for the heartbeat and the session's reading. Record
                     // only: nothing above reads it.
                     note_viewer_decodestat(session_id, &val, stats_new);
+                    // FR-148 P4b-3b (D58) — `relay`: what carries the viewer's
+                    // own relay. The newest overwrites, an absent key clears.
+                    viewer_relay.note(&val);
                 }
                 "rc:display-match" => {
                     // rc.191 — viewer asked the host to switch its display to
@@ -11349,15 +11357,24 @@ fn attach_control_handler(
                 }
                 "rc:keyframe" => {
                     // Browser's decode queue backed up → it dropped deltas and
-                    // needs a fresh IDR to resync. Force one (min-gap clamped).
+                    // needs a fresh IDR to resync. Ask the session's gate for
+                    // one (`media_deadline::KeyframeGate`): it passes once
+                    // 500 ms have passed since the gate's last grant
+                    // (`media_deadline::MIN_KF_GAP`). Under
+                    // `ROOMLERD_VIDEO_DEADLINE=on`, while the session's lane is
+                    // on `video-deadline` or switching to it, FR-148 P4b-4's
+                    // cost rule spaces it instead (`media_deadline::kf_gap`),
+                    // and an ask the rule refuses is owed: the lane's first
+                    // frame after the rule's gap opens forces it, and a key
+                    // frame written first answers it.
                     // rc.217 — 200 ms → 500 ms: with the #166 worker retrying
                     // at ~4 req/s while gated AND runtime forces now actually
                     // producing IDRs (qsv forced_idr), the old gap allowed up
                     // to 5 big IDRs/s onto a struggling viewer — feeding the
                     // very backlog the resync was meant to clear. 2 IDRs/s is
                     // plenty for resync and halves the burst load. The gap is
-                    // the session's gate's (`media_deadline::MIN_KF_GAP`),
-                    // which FR-148 P4b-3's send tasks ask through too.
+                    // the session's gate's, which FR-148 P4b-3's send tasks
+                    // ask through too.
                     // FR-135 R0 (N12) — the gate counts every ask, and whether
                     // the gap dropped it: R1's slow recoveries pointed here
                     // with no counter.
