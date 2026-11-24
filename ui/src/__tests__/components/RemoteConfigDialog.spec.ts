@@ -58,8 +58,8 @@ function agentStore() {
   return {
     orgExecEnabled: null as boolean | null,
     orgSshEnabled: null as boolean | null,
-    fetchOrgExecEnabled: vi.fn(),
-    fetchOrgSshEnabled: vi.fn(),
+    ensureOrgExecEnabled: vi.fn(),
+    ensureOrgSshEnabled: vi.fn(),
     updateDesiredConfig: vi.fn().mockResolvedValue({ revision: 4 }),
   }
 }
@@ -155,16 +155,16 @@ describe('RemoteConfigDialog fills its draft from the device (#3156)', () => {
     await flushPromises()
     expectRecordedDraft()
     // And reads the org gates, as every later open does.
-    expect(store.fetchOrgExecEnabled).toHaveBeenCalledWith(TID)
-    expect(store.fetchOrgSshEnabled).toHaveBeenCalledWith(TID)
+    expect(store.ensureOrgExecEnabled).toHaveBeenCalledWith(TID)
+    expect(store.ensureOrgSshEnabled).toHaveBeenCalledWith(TID)
   })
 
   it('when a mounted, closed dialog opens', async () => {
     const w = mountDialog(false)
     await flushPromises()
     // Mounted closed, it asks for nothing and emits nothing.
-    expect(store.fetchOrgExecEnabled).not.toHaveBeenCalled()
-    expect(store.fetchOrgSshEnabled).not.toHaveBeenCalled()
+    expect(store.ensureOrgExecEnabled).not.toHaveBeenCalled()
+    expect(store.ensureOrgSshEnabled).not.toHaveBeenCalled()
     expect(w.emitted('update:modelValue')).toBeUndefined()
     // Cast, as VideoTileFr124.spec.ts does: the hosted image type-checks
     // `.vue` through env.d.ts's shim (oven/bun has no `node`), where a REAL

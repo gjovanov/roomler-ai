@@ -77,10 +77,11 @@ function agentStore() {
     orgExternalAccessEnabled: null as boolean | null,
     tenantMembers: [] as { user_id: string; display_name: string; nickname: string | null }[],
     externalDevices: [] as { id: string; connect_code: string | null }[],
-    fetchOrgExecEnabled: vi.fn(),
-    fetchOrgSshEnabled: vi.fn(),
+    ensureOrgExecEnabled: vi.fn(),
+    ensureOrgSshEnabled: vi.fn(),
     fetchTenantMembers: vi.fn(),
     ensureTenantMembers: vi.fn(),
+    ensureExternalAccess: vi.fn(),
     fetchExternalAccess: vi.fn(),
     fetchConnectCode: vi.fn().mockResolvedValue(null),
     rotateConnectCode: vi.fn(),
@@ -198,7 +199,7 @@ describe('ExecPolicyDialog on its first open (#3156)', () => {
     expect(chosen('Allowed shells (empty = any the host supports)')).toEqual(['bash'])
     // It reads what every later open reads, and writes nothing.
     expect(store.ensureTenantMembers).toHaveBeenCalledWith(TID)
-    expect(store.fetchOrgExecEnabled).toHaveBeenCalledWith(TID)
+    expect(store.ensureOrgExecEnabled).toHaveBeenCalledWith(TID)
     expect(store.updateExecPolicy).not.toHaveBeenCalled()
     expect(w.emitted('update:modelValue')).toBeUndefined()
   })
@@ -235,7 +236,7 @@ describe('SshPolicyDialog on its first open (#3156)', () => {
     expect(chosen('Consent')).toEqual(['Unattended — open immediately'])
     // It reads what every later open reads, and writes nothing.
     expect(store.ensureTenantMembers).toHaveBeenCalledWith(TID)
-    expect(store.fetchOrgSshEnabled).toHaveBeenCalledWith(TID)
+    expect(store.ensureOrgSshEnabled).toHaveBeenCalledWith(TID)
     expect(store.updateSshPolicy).not.toHaveBeenCalled()
     expect(w.emitted('update:modelValue')).toBeUndefined()
   })
@@ -290,7 +291,7 @@ describe('ExternalAccessDialog on its first open (#3156)', () => {
     expect(chosen('An outside session may at most')).toEqual(['View only — no keyboard or mouse'])
     expect(document.body.querySelector('code.text-h6')?.textContent?.trim()).toBe('K7QX-2M9P-4HTD')
     // It reads what every later open reads, and writes nothing.
-    expect(store.fetchExternalAccess).toHaveBeenCalledWith(TID)
+    expect(store.ensureExternalAccess).toHaveBeenCalledWith(TID)
     expect(store.fetchConnectCode).toHaveBeenCalledWith(TID, AGENT_ID)
     expect(store.updateExternalAccessPolicy).not.toHaveBeenCalled()
     expect(w.emitted('update:modelValue')).toBeUndefined()
@@ -472,8 +473,8 @@ describe("ExternalAccessDialog reads the device's own connect code (#3182, #3197
 
 describe('DeviceConsoleDialog on its first open (#3156)', () => {
   it('reads the org exec switch, so a closed org gate is explained before a command is refused', async () => {
-    // What the real fetch does for an org with remote execution off.
-    store.fetchOrgExecEnabled.mockImplementation(async () => {
+    // What the real ensure does for an org with remote execution off.
+    store.ensureOrgExecEnabled.mockImplementation(async () => {
       await Promise.resolve()
       store.orgExecEnabled = false
     })
@@ -491,7 +492,7 @@ describe('DeviceConsoleDialog on its first open (#3156)', () => {
     })
     const w = track(mount(DeviceConsoleDialog, opened(ready)))
     await flushPromises()
-    expect(store.fetchOrgExecEnabled).toHaveBeenCalledWith(TID)
+    expect(store.ensureOrgExecEnabled).toHaveBeenCalledWith(TID)
     expect(alertShown('Remote execution is switched off for this organization')).toBe(true)
     expect(store.execOnAgent).not.toHaveBeenCalled()
     expect(w.emitted('update:modelValue')).toBeUndefined()
