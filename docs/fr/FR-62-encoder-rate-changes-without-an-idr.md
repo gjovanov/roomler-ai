@@ -108,7 +108,7 @@
   - 🔑 **The carrier line is not a source.** Each of the three came 1–3 s after an agent line
     `overlay carrier under the nominated pair is not direct`. The code read here is master's,
     and none of these paths has changed since 0.4.199, the build that ran. The line comes from
-    `overlay_remote_is_relay_tier` (`peer.rs:2291`), a LocalAPI read that changes nothing. The
+    `overlay_remote_is_relay_tier` (`peer.rs:2236`), a LocalAPI read that changes nothing. The
     FFmpeg DC pump calls it on its transport recheck, every 5 s (`TRANSPORT_RECHECK_INTERVAL`,
     `peer.rs:2121`; the recheck at `:7753`). The answer goes two places:
     - into `constrained`, which sets the rate ceiling and, on a flip, re-sends `rc:video-info`
@@ -195,7 +195,7 @@
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
-    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7637`), which
+    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7569`), which
     keeps the encoder's counters. A read that cannot see that IDR cannot vouch for the
     absence of the others.
   - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
@@ -220,7 +220,7 @@
     the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
     Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
     An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
-    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9206`)
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9056`)
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
@@ -231,7 +231,7 @@
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
       and move nothing. Δ`rate_moves` marks a real move. The read judges the first
-      complete 2 s heartbeat window (`peer.rs:7144`) after a Δ`rate_moves`, on
+      complete 2 s heartbeat window (`peer.rs:7080`) after a Δ`rate_moves`, on
       Δ`bytes_written` ÷ Δ`frames_encoded`. A window that starts at most 2 s after the
       move and holds the ratio shows the encoder had tracked by then.
     - ≈ 1.0 is a CBR's contract. NVENC is quality-capped VBR and sits under its cap on
