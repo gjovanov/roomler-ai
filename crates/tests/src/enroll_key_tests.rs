@@ -350,6 +350,106 @@ async fn mint_requires_manage_agents() {
     assert_eq!(resp.status(), 403);
 }
 
+/// #4254 — the class switch (`MANAGE_TENANT`) and the key mint
+/// (`MANAGE_AGENTS`) decide their bit before they read their body at all: a
+/// member without the bit gets the one 403 `forbidden` naming it for a body
+/// that does not even parse, the answer a body the route reads gets, and
+/// someone outside the org the one `not_a_member`. While they took `Json<T>`
+/// as an extractor, axum answered such a body before the handler ran, with a
+/// 400, 415 or 422 decided by the body alone.
+#[tokio::test]
+async fn the_key_writes_decide_their_bit_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("ekey-unparsed").await;
+    let other = app.seed_tenant("ekey-unparsed-b").await;
+    let org = format!("/api/tenant/{}", t.tenant_id);
+    let writes = [
+        (
+            "MANAGE_TENANT",
+            GatedWrite {
+                method: "PUT",
+                path: format!("{org}/ephemeral-key-settings"),
+                reads: json!({ "ephemeral_keys_enabled": false }),
+                refused_field: r#"{"ephemeral_keys_enabled": "x"}"#,
+            },
+        ),
+        (
+            "MANAGE_AGENTS",
+            GatedWrite {
+                method: "POST",
+                path: format!("{org}/agent/enroll-key"),
+                reads: json!({}),
+                refused_field: r#"{"max_uses": "x"}"#,
+            },
+        ),
+    ];
+
+    let mut wrong = Vec::new();
+    for (bit, write) in &writes {
+        wrong.extend(
+            gate_problems(
+                &app,
+                "a member without the bit",
+                &t.member.access_token,
+                Gate::Bit(bit),
+                write,
+            )
+            .await,
+        );
+        wrong.extend(
+            gate_problems(
+                &app,
+                "another org's owner",
+                &other.admin.access_token,
+                Gate::NotAMember,
+                write,
+            )
+            .await,
+        );
+    }
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4254's control. The org's owner is answered a key write that does not
+/// parse exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words. The class switch is off, and the mint's body is read
+/// before the switch is asked about, as the extractor read it before the
+/// handler ran.
+#[tokio::test]
+async fn a_holder_is_answered_a_key_write_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_fleet::enroll_key::{MintKeyRequest, OrgEphemeralKeySettings};
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("ekey-unparsed-holder").await;
+    let owner = &t.admin.access_token;
+    let org = format!("/api/tenant/{}", t.tenant_id);
+
+    let mut wrong = holder_problems::<OrgEphemeralKeySettings>(
+        &app,
+        owner,
+        "PUT",
+        &format!("{org}/ephemeral-key-settings"),
+        r#"{"ephemeral_keys_enabled": "x"}"#,
+    )
+    .await;
+    wrong.extend(
+        holder_problems::<MintKeyRequest>(
+            &app,
+            owner,
+            "POST",
+            &format!("{org}/agent/enroll-key"),
+            r#"{"max_uses": "x"}"#,
+        )
+        .await,
+    );
+    assert_no_problems("the org's owner", &wrong);
+}
+
 /// FR-51 P3 — the self-unenroll route: an ephemeral device removes itself
 /// with its own agent JWT; a permanent device is refused; a second call
 /// after success is a 401 (the row is gone, which `AuthAgent` enforces) —

@@ -275,6 +275,71 @@ async fn the_limits_route_reads_for_members_and_writes_for_admins() {
     );
 }
 
+/// #4254 — the limits route decides `MANAGE_TENANT` before it reads its body
+/// at all: a member without the bit gets the one 403 `forbidden` naming it
+/// for a body that does not even parse, the answer a body the route reads
+/// gets, and someone outside the org the one `not_a_member`. While the route
+/// took `Json<T>` as an extractor, axum answered such a body before the
+/// handler ran, with a 400, 415 or 422 decided by the body alone.
+#[tokio::test]
+async fn the_limits_route_decides_manage_tenant_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr101p4bunparsed").await;
+    let other = app.seed_tenant("fr101p4bunparsed-b").await;
+    let write = GatedWrite {
+        method: "PUT",
+        path: format!("/api/tenant/{}/rc-session-limits", seeded.tenant_id),
+        reads: json!({ "max_secs": 3600 }),
+        refused_field: r#"{"max_secs": "x"}"#,
+    };
+
+    let mut wrong = gate_problems(
+        &app,
+        "a member without the bit",
+        &seeded.member.access_token,
+        Gate::Bit("MANAGE_TENANT"),
+        &write,
+    )
+    .await;
+    wrong.extend(
+        gate_problems(
+            &app,
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+            &write,
+        )
+        .await,
+    );
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4254's control. The org's owner is answered a limits body that does not
+/// parse exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words: the body is read before the handler judges the limits
+/// it sets, as the extractor read it before the handler ran.
+#[tokio::test]
+async fn a_holder_is_answered_a_limits_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_remote::session_policy::RcSessionLimitsUpdate;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr101p4bunparsed-holder").await;
+    let wrong = holder_problems::<RcSessionLimitsUpdate>(
+        &app,
+        &seeded.admin.access_token,
+        "PUT",
+        &format!("/api/tenant/{}/rc-session-limits", seeded.tenant_id),
+        r#"{"max_secs": "x"}"#,
+    )
+    .await;
+    assert_no_problems("the org's owner", &wrong);
+}
+
 /// The limit, end to end: the session lives until it, then both ends are
 /// told it ended as `IdleTimeout` because of the org's maximum length, and
 /// the audit row says the same. The control is the same flow in an org with

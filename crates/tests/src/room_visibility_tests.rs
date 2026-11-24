@@ -386,3 +386,90 @@ async fn list_with_q_searches_and_respects_secret_visibility() {
     seen.dedup();
     assert_eq!(seen.len(), 2, "pages overlapped");
 }
+
+/// The room update's body, field for field (`chat::room::UpdateRoomRequest`).
+/// This crate does not link the chat module, and what axum's `Json` extractor
+/// answers a body depends on the body type's shape alone.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct UpdateRoomRequest {
+    name: Option<String>,
+    topic: Option<String>,
+    purpose: Option<String>,
+    is_open: Option<bool>,
+    is_archived: Option<bool>,
+    is_read_only: Option<bool>,
+    visibility: Option<roomler_ai_db::models::RoomVisibility>,
+}
+
+/// #4254 — the room update decides its gates before it reads its body at
+/// all. Someone outside the org gets the room guard's one `not_a_member`, and
+/// a member who may read the room but holds no `MANAGE_CHANNELS` the one 403
+/// `forbidden`, for a body that does not even parse, the answer a body the
+/// route reads gets. While it took `Json<T>` as an extractor, axum answered
+/// such a body before the handler ran, with a 400, 415 or 422 decided by the
+/// body alone.
+#[tokio::test]
+async fn the_room_update_decides_the_bit_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("roomupd-unparsed").await;
+    let other = app.seed_tenant("roomupd-unparsed-b").await;
+    // A Public room, which every member of the org may read: the member is
+    // refused for the bit alone.
+    let write = GatedWrite {
+        method: "PUT",
+        path: format!("/api/tenant/{}/room/{}", t.tenant_id, t.rooms[0].id),
+        reads: json!({ "topic": "a new topic" }),
+        refused_field: r#"{"name": 7}"#,
+    };
+
+    let mut wrong = Vec::new();
+    for (who, token, gate) in [
+        (
+            "a member without the bit",
+            &t.member.access_token,
+            Gate::Bit("MANAGE_CHANNELS"),
+        ),
+        (
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+        ),
+    ] {
+        wrong.extend(gate_problems(&app, who, token, gate, &write).await);
+    }
+    assert_no_problems("answered before the gate", &wrong);
+}
+
+/// #4254's control. The org's owner is answered a room update that does not
+/// parse exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words, and the room is left as it was.
+#[tokio::test]
+async fn a_holder_is_answered_a_room_update_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+
+    async fn read(app: &TestApp, path: &str, token: &str) -> Value {
+        let resp = app.auth_get(path, token).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        resp.json().await.unwrap()
+    }
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("roomupd-unparsed-holder").await;
+    let owner = &t.admin.access_token;
+    let path = format!("/api/tenant/{}/room/{}", t.tenant_id, t.rooms[0].id);
+    let before = read(&app, &path, owner).await;
+
+    let wrong =
+        holder_problems::<UpdateRoomRequest>(&app, owner, "PUT", &path, r#"{"name": 7}"#).await;
+    assert_no_problems("the org's owner", &wrong);
+    assert_eq!(
+        read(&app, &path, owner).await,
+        before,
+        "the room is left as it was"
+    );
+}

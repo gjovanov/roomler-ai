@@ -14,7 +14,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -75,11 +75,15 @@ pub async fn get_org_settings(
 /// `PUT /api/tenant/{tid}/ephemeral-key-settings` — flip the class switch.
 /// Off is an org-wide revocation that burns nothing: the gate is re-checked
 /// on every key USE, ahead of the key's own claim.
+///
+/// `MANAGE_TENANT` is decided before the body is read (#4254): a caller
+/// without it gets the gate's answer whatever the body is, and a holder is
+/// answered one that does not parse as the `Json` extractor answered it.
 pub async fn set_org_settings(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<OrgEphemeralKeySettings>,
+    body: Result<Json<OrgEphemeralKeySettings>, JsonRejection>,
 ) -> Result<Json<OrgEphemeralKeySettings>, ApiError> {
     let tid = tenant_of(&tenant_id)?;
     require_permission(
@@ -90,6 +94,7 @@ pub async fn set_org_settings(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     let tenant = state
         .tenants
         .set_ephemeral_keys_enabled(tid, body.ephemeral_keys_enabled)
@@ -140,11 +145,17 @@ pub struct MintKeyResponse {
 }
 
 /// `POST /api/tenant/{tid}/agent/enroll-key` — mint a reusable ephemeral key.
+///
+/// `MANAGE_AGENTS` is decided before the body is read, and the body before
+/// the org is asked about its class switch (#4254): a caller without the bit
+/// gets the gate's answer whatever the body is, and a holder is answered one
+/// that does not parse as the `Json` extractor answered it, whatever the
+/// switch says.
 pub async fn mint_key(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<MintKeyRequest>,
+    body: Result<Json<MintKeyRequest>, JsonRejection>,
 ) -> Result<Json<MintKeyResponse>, ApiError> {
     let tid = tenant_of(&tenant_id)?;
     require_permission(
@@ -155,6 +166,7 @@ pub async fn mint_key(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
 
     let tenant = state.tenants.base.find_by_id(tid).await?;
     // #3042 — a key minted here could only be refused at the enroll route.

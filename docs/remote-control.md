@@ -3398,7 +3398,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3687`](../crates/localapi/src/lib.rs#L3687), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:109`](../crates/modules/remote/src/session_policy.rs#L109)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3687`](../crates/localapi/src/lib.rs#L3687), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:523`](../crates/remote_control/src/models.rs#L523)) and re-announced on the heartbeat when it changes |
 
@@ -7839,8 +7839,8 @@ its reports. Since FR-150 P2 so does the per-user task's daemon, whose
 launcher leaves on it. Only those three workers exit 78: every other `run`
 with no config still exits 1. The macOS supervisor's worker exits 78 even
 beside an enrolled copy, because it never restores at its start (#4157): on a
-converted one-row Mac the person's `config.toml.prev` can still hold the
-enrollment that moved to root (#4184). The other two restore a missing config
+one-row Mac an earlier release converted, the person's `config.toml.prev` can
+hold the enrollment that moved to root (#4184). The other two restore a missing config
 from such a copy, and exit 78 only without one. The service's SYSTEM worker
 restores its machine config only from a copy that passes every check the
 config itself would, and the service starts that worker for such a copy

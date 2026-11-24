@@ -405,7 +405,7 @@ The docs:
   with a report line; the per-user arm reads the profile the system records for the session's account, and removes
   nothing when none is recorded.
 - `docs/security-baseline.md`: a rule beside "A Windows machine config is the machine's only as found"
-  (`docs/security-baseline.md:642`): a privileged process acts on the machine folder only through
+  (`docs/security-baseline.md:671`): a privileged process acts on the machine folder only through
   `machine_tree::HeldPath`, with the walk as a mermaid flow, the two seals and the leaf policy.
 - `.claude/rules/security.md`: the one-line rule for new code.
 - `docs/operator-systemcontext-smoke.md` (`:302-305`, `:401-402`): the folders are sealed (SYSTEM and

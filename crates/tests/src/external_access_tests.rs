@@ -774,3 +774,69 @@ async fn a_person_is_barred_by_a_device_admin_and_let_back_by_the_pair() {
         "{rows:#?}"
     );
 }
+
+/// #4254 — the org's external-access switch (gate 1) decides `MANAGE_TENANT`
+/// before it reads its body at all: a member without the bit gets the one 403
+/// `forbidden` naming it for a body that does not even parse, the answer a
+/// body the route reads gets, and someone outside the org the one
+/// `not_a_member`. While it took `Json<T>` as an extractor, axum answered
+/// such a body before the handler ran, with a 400, 415 or 422 decided by the
+/// body alone.
+#[tokio::test]
+async fn the_external_access_switch_decides_manage_tenant_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ext-unparsed").await;
+    let other = app.seed_tenant("ext-unparsed-b").await;
+    let write = GatedWrite {
+        method: "PUT",
+        path: format!("/api/tenant/{}/external-access", seeded.tenant_id),
+        reads: json!({ "enabled": false }),
+        refused_field: r#"{"enabled": "x"}"#,
+    };
+
+    let mut wrong = gate_problems(
+        &app,
+        "a member without the bit",
+        &seeded.member.access_token,
+        Gate::Bit("MANAGE_TENANT"),
+        &write,
+    )
+    .await;
+    wrong.extend(
+        gate_problems(
+            &app,
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+            &write,
+        )
+        .await,
+    );
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4254's control. The org's owner is answered an external-access switch
+/// that does not parse exactly as axum's `Json` extractor answers it, the
+/// status and the plain-text words.
+#[tokio::test]
+async fn a_holder_is_answered_an_external_access_switch_that_does_not_parse_as_the_json_extractor_answers_it()
+ {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_fleet::external_access::ExternalAccessEnabledBody;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ext-unparsed-holder").await;
+    let wrong = holder_problems::<ExternalAccessEnabledBody>(
+        &app,
+        &seeded.admin.access_token,
+        "PUT",
+        &format!("/api/tenant/{}/external-access", seeded.tenant_id),
+        r#"{"enabled": "x"}"#,
+    )
+    .await;
+    assert_no_problems("the org's owner", &wrong);
+}
