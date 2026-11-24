@@ -3435,9 +3435,12 @@ impl OverlayRuntime {
                     if let Ok(guard) = route_reassert_lock.clone().try_lock_owned() {
                         let tun2 = tun.clone();
                         // rc.285 — the wave runs the DECLARATIVE defended set
-                        // (every peer /32, then our own /32 + v6 twins —
+                        // (every peer /32, every installed router peer's
+                        // subnets (#4279), then our own /32 + v6 twins —
                         // composed in one place, `route_guard::defended_routes`).
-                        let set = defended_routes(&by_node, self_v4);
+                        let set = defended_routes(&by_node, &current_peers, self_v4, |pk| {
+                            wg.peer_subnets(pk)
+                        });
                         // #1282 — attribute the wave to the TICK arm.
                         crate::evidence::ROUTE_WAVES_TICK
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3635,7 +3638,9 @@ impl OverlayRuntime {
                                     // route storm that re-adds the hijacking
                                     // /32 for our own address; evict it NOW
                                     // rather than waiting for the 2 s tick.
-                                    let set = defended_routes(&by_node, self_v4);
+                                    let set = defended_routes(&by_node, &current_peers, self_v4, |pk| {
+                                        wg.peer_subnets(pk)
+                                    });
                                     // #1282 — attribute the wave to the EVENT arm.
                                     crate::evidence::ROUTE_WAVES_EVENT
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5854,15 +5859,21 @@ mod tests {
     /// unobservable.
     struct RouteRecordingTun {
         routes: std::sync::Mutex<Vec<(&'static str, Ipv4Addr)>>,
+        /// #4279 — every subnet re-assert, as the exact string the device got.
+        subnets: std::sync::Mutex<Vec<String>>,
     }
     impl RouteRecordingTun {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 routes: std::sync::Mutex::new(Vec::new()),
+                subnets: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn calls(&self) -> Vec<(&'static str, Ipv4Addr)> {
             self.routes.lock().unwrap().clone()
+        }
+        fn subnet_calls(&self) -> Vec<String> {
+            self.subnets.lock().unwrap().clone()
         }
     }
     #[async_trait]
@@ -5883,6 +5894,17 @@ mod tests {
         }
         async fn defend_self_route(&self, ip: Ipv4Addr) {
             self.routes.lock().unwrap().push(("defend", ip));
+        }
+        async fn defend_subnet_route(&self, cidr: &str) -> io::Result<()> {
+            // #4279 — in the ordered log under the prefix's network address,
+            // and in full beside it.
+            let net = cidr
+                .split_once('/')
+                .and_then(|(ip, _)| ip.parse().ok())
+                .unwrap_or(Ipv4Addr::UNSPECIFIED);
+            self.routes.lock().unwrap().push(("subnet", net));
+            self.subnets.lock().unwrap().push(cidr.to_string());
+            Ok(())
         }
         async fn defend_block_floor(&self) {
             // Change B — recorded with the unspecified address (the step has
@@ -5922,7 +5944,12 @@ mod tests {
         }
 
         let t: Arc<dyn TunIo> = tun.clone();
-        run_defense_wave(t, defended_routes(&by_node, self_v4)).await;
+        // No router among them: the crypto-router holds no subnet for anyone.
+        run_defense_wave(
+            t,
+            defended_routes(&by_node, &HashMap::new(), self_v4, |_| Vec::new()),
+        )
+        .await;
 
         let got = tun.calls();
         // v3 (#23) — peers asserted, self defended, floor, then the ownership check
@@ -5989,7 +6016,10 @@ mod tests {
             by_node.insert(ObjectId::new(), installed_at([i as u8 + 1; 32], *ip));
         }
 
-        let set = defended_routes(&by_node, self_v4);
+        // #4279 — none of them is a router: a peer with no subnets adds
+        // nothing beyond its `/32`, so this is the set's shape before the
+        // subnet arm existed.
+        let set = defended_routes(&by_node, &HashMap::new(), self_v4, |_| Vec::new());
         assert_eq!(set.len(), ips.len() + 2);
         assert_eq!(set.last(), Some(&Defend::BlockFloor));
         assert_eq!(
@@ -6001,16 +6031,294 @@ mod tests {
             .iter()
             .filter_map(|d| match d {
                 Defend::AssertPeer(ip) => Some(*ip),
-                Defend::EvictSelf(_) | Defend::BlockFloor => None,
+                Defend::AssertSubnet(_) | Defend::EvictSelf(_) | Defend::BlockFloor => None,
             })
             .collect();
         assert_eq!(asserted, ips.iter().copied().collect::<HashSet<_>>());
 
         // An empty mesh still defends our own address + the floor.
         assert_eq!(
-            defended_routes(&HashMap::new(), self_v4),
+            defended_routes(&HashMap::new(), &HashMap::new(), self_v4, |_| Vec::new()),
             vec![Defend::EvictSelf(self_v4), Defend::BlockFloor]
         );
+    }
+
+    /// #4279 — a mesh for the defended-set tests, as the select loop holds
+    /// it: each node's `(public key, overlay IP, the routes its netmap entry
+    /// approves)` becomes a `by_node` entry and a `current_peers` entry under
+    /// one node id.
+    #[allow(clippy::type_complexity)]
+    fn router_mesh(
+        nodes: &[([u8; 32], Ipv4Addr, &[&str])],
+    ) -> (HashMap<ObjectId, Installed>, HashMap<ObjectId, NetmapPeer>) {
+        let mut by_node = HashMap::new();
+        let mut current_peers = HashMap::new();
+        for (pk, ip, approved) in nodes {
+            let id = ObjectId::new();
+            by_node.insert(id, installed_at(*pk, *ip));
+            let routes = approved.iter().map(|r| r.to_string()).collect();
+            current_peers.insert(id, exit_np(id, "peer", routes));
+        }
+        (by_node, current_peers)
+    }
+
+    /// #4279 — a fixed `installed_subnets` for [`defended_routes`]: what the
+    /// crypto-router would hold for each peer public key.
+    fn subnets_held(
+        held: &[([u8; 32], &[&str])],
+    ) -> impl Fn(&[u8; 32]) -> Vec<crate::overlay::router::Cidr> + use<> {
+        let map: HashMap<[u8; 32], Vec<crate::overlay::router::Cidr>> = held
+            .iter()
+            .map(|(pk, cidrs)| {
+                let cidrs = cidrs
+                    .iter()
+                    .map(|c| crate::overlay::router::Cidr::parse(c).unwrap())
+                    .collect();
+                (*pk, cidrs)
+            })
+            .collect();
+        move |pk: &[u8; 32]| map.get(pk).cloned().unwrap_or_default()
+    }
+
+    /// #4279 — the subnet entries of a defended set, in order, as strings.
+    fn defended_subnets(set: &[Defend]) -> Vec<String> {
+        set.iter()
+            .filter_map(|d| match d {
+                Defend::AssertSubnet(c) => Some(c.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #4279 — a router peer's approved subnets are DEFENDED, as its `/32`
+    /// is. On 2026-11-21 something deleted every route on a Windows host's
+    /// overlay adapter: the guard put each peer `/32` back within seconds,
+    /// and a router peer's three subnet routes stayed missing for 35 minutes,
+    /// until the next carrier install for that peer ran `install_subnets`.
+    /// A peer with no subnets still contributes its `/32` and nothing else.
+    #[test]
+    fn defended_set_carries_a_router_peers_subnets() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let router = Ipv4Addr::new(100, 64, 0, 2);
+        let plain = Ipv4Addr::new(100, 64, 0, 4);
+        let two: &[&str] = &["10.1.0.0/16", "192.168.50.0/24"];
+        let (by_node, current_peers) =
+            router_mesh(&[([1; 32], router, two), ([2; 32], plain, &[])]);
+        let held = subnets_held(&[([1; 32], two)]);
+
+        let set = defended_routes(&by_node, &current_peers, self_v4, held);
+
+        assert_eq!(
+            defended_subnets(&set),
+            ["10.1.0.0/16", "192.168.50.0/24"],
+            "both of the router's subnets, once each"
+        );
+        // Every peer `/32` first, then the subnets, then self, the floor LAST.
+        assert_eq!(set.len(), 2 + 2 + 2, "{set:?}");
+        let peers: HashSet<Ipv4Addr> = set[..2]
+            .iter()
+            .map(|d| match d {
+                Defend::AssertPeer(ip) => *ip,
+                other => panic!("a peer /32 first, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(peers, HashSet::from([router, plain]));
+        assert!(matches!(set[2], Defend::AssertSubnet(_)), "{set:?}");
+        assert!(matches!(set[3], Defend::AssertSubnet(_)), "{set:?}");
+        assert_eq!(set[4], Defend::EvictSelf(self_v4));
+        assert_eq!(set[5], Defend::BlockFloor);
+    }
+
+    /// #4279 + P5/A1 — a default route never enters the defended set. An
+    /// exit peer's netmap entry approves `0.0.0.0/0`, and while it carries
+    /// this node's egress its crypto-router entry holds its real subnets AND
+    /// the split-default `/1` halves (`exit_peer_allowed_ips`). The `/1`s are
+    /// re-asserted INLINE on the select loop, never by the detached wave (see
+    /// [`Defend`]), and a `/0` is never routed by the generic path at all.
+    /// The real subnet is still defended.
+    #[test]
+    fn defended_set_never_carries_a_default_route() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let exit = Ipv4Addr::new(100, 64, 0, 7);
+        let (by_node, current_peers) =
+            router_mesh(&[([7; 32], exit, &["10.9.0.0/16", "0.0.0.0/0"])]);
+        let held = subnets_held(&[(
+            [7; 32],
+            &["10.9.0.0/16", "0.0.0.0/1", "128.0.0.0/1", "0.0.0.0/0"],
+        )]);
+
+        let set = defended_routes(&by_node, &current_peers, self_v4, held);
+
+        assert_eq!(
+            set,
+            vec![
+                Defend::AssertPeer(exit),
+                Defend::AssertSubnet(crate::overlay::router::Cidr::parse("10.9.0.0/16").unwrap()),
+                Defend::EvictSelf(self_v4),
+                Defend::BlockFloor,
+            ]
+        );
+    }
+
+    /// #4279 — a subnet is defended only while it is BOTH routed to the peer
+    /// (its crypto-router entry) AND still approved (its netmap entry). A
+    /// route approval reaches an installed peer's crypto-router only at its
+    /// next carrier install, so the two disagree for as long as a carrier
+    /// lives: a newly approved CIDR has no crypto-router entry yet (an OS
+    /// route for it would pull the range into the TUN and drop it there), and
+    /// a revoked one must not be kept alive by the guard. An approval is
+    /// matched as the router parses it, host bits masked; an entry that does
+    /// not parse approves nothing.
+    #[test]
+    fn a_subnet_is_defended_only_while_routed_and_approved() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let (by_node, current_peers) = router_mesh(&[(
+            [1; 32],
+            Ipv4Addr::new(100, 64, 0, 2),
+            &["10.1.2.3/16", "10.3.0.0/16", "not-a-cidr"],
+        )]);
+        let held = subnets_held(&[([1; 32], &["10.1.0.0/16", "10.2.0.0/16"])]);
+
+        let set = defended_routes(&by_node, &current_peers, self_v4, held);
+
+        assert_eq!(
+            defended_subnets(&set),
+            ["10.1.0.0/16"],
+            "10.2/16 was revoked, 10.3/16 is not routed yet"
+        );
+
+        // A peer the netmap no longer lists approves nothing.
+        let held = subnets_held(&[([1; 32], &["10.1.0.0/16"])]);
+        assert!(
+            defended_subnets(&defended_routes(&by_node, &HashMap::new(), self_v4, held)).is_empty()
+        );
+    }
+
+    /// #4279 — one OS route serves a CIDR however many routers claim it (the
+    /// crypto-router's tie-break picks the carrier; `warn_subnet_conflicts`
+    /// names the duplicate), so the wave writes it once.
+    #[test]
+    fn a_subnet_two_routers_claim_is_defended_once() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let one: &[&str] = &["10.1.0.0/16"];
+        let two: &[&str] = &["10.1.0.0/16", "10.2.0.0/16"];
+        let (by_node, current_peers) = router_mesh(&[
+            ([1; 32], Ipv4Addr::new(100, 64, 0, 2), one),
+            ([2; 32], Ipv4Addr::new(100, 64, 0, 3), two),
+        ]);
+        let held = subnets_held(&[([1; 32], one), ([2; 32], two)]);
+
+        let mut subnets =
+            defended_subnets(&defended_routes(&by_node, &current_peers, self_v4, held));
+        subnets.sort();
+
+        assert_eq!(subnets, ["10.1.0.0/16", "10.2.0.0/16"]);
+    }
+
+    /// P5/A1 in one place — `installable_subnets` is the filter both
+    /// `install_subnets` and the defended set apply: every default route out
+    /// (`/0` and both split-default `/1` halves), every real subnet kept, in
+    /// order.
+    #[test]
+    fn installable_subnets_drops_default_routes_only() {
+        let c = |s: &str| crate::overlay::router::Cidr::parse(s).unwrap();
+        assert_eq!(
+            installable_subnets(&[
+                c("0.0.0.0/0"),
+                c("10.1.0.0/16"),
+                c("0.0.0.0/1"),
+                c("128.0.0.0/1"),
+                c("192.168.50.0/24"),
+            ]),
+            vec![c("10.1.0.0/16"), c("192.168.50.0/24")]
+        );
+        assert!(installable_subnets(&[]).is_empty());
+    }
+
+    /// #4279 — the REAL wave (`defended_routes` → `run_defense_wave`, the code
+    /// both select-loop arms spawn) hands each subnet to the device in
+    /// canonical form, after every peer `/32` and before our own address. A
+    /// subnet is no peer: it never reaches `add_peer_route` or the ownership
+    /// check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_wave_reasserts_a_router_peers_subnets() {
+        let tun = RouteRecordingTun::new();
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let router = Ipv4Addr::new(100, 64, 0, 2);
+        let plain = Ipv4Addr::new(100, 64, 0, 4);
+        let two: &[&str] = &["10.1.0.0/16", "192.168.50.0/24"];
+        let (by_node, current_peers) =
+            router_mesh(&[([1; 32], router, two), ([2; 32], plain, &[])]);
+        let held = subnets_held(&[([1; 32], two)]);
+
+        let t: Arc<dyn TunIo> = tun.clone();
+        run_defense_wave(t, defended_routes(&by_node, &current_peers, self_v4, held)).await;
+
+        assert_eq!(tun.subnet_calls(), ["10.1.0.0/16", "192.168.50.0/24"]);
+        let got = tun.calls();
+        // 2 peer adds, 2 subnets, self, the floor, then one verify per peer.
+        assert_eq!(got.len(), 2 + 2 + 1 + 1 + 2, "{got:?}");
+        assert!(got[..2].iter().all(|(op, _)| *op == "add"), "{got:?}");
+        assert_eq!(
+            got[2..4],
+            [
+                ("subnet", Ipv4Addr::new(10, 1, 0, 0)),
+                ("subnet", Ipv4Addr::new(192, 168, 50, 0)),
+            ]
+        );
+        assert_eq!(got[4], ("defend", self_v4));
+        assert_eq!(got[5], ("floor", Ipv4Addr::UNSPECIFIED));
+        let verified: HashSet<Ipv4Addr> = got[6..]
+            .iter()
+            .map(|(op, ip)| {
+                assert_eq!(*op, "verify");
+                *ip
+            })
+            .collect();
+        assert_eq!(verified, HashSet::from([router, plain]), "peers only");
+    }
+
+    /// #4279 — `ROOMLERD_OVERLAY_SUBNET_GUARD=0`: a wave over a router peer's
+    /// missing subnets writes no subnet route, and every other arm runs as
+    /// before (the peer's `/32`, our own address, the floor, the ownership
+    /// check). With the default the same wave puts both back. The switch is
+    /// passed in, never set in the process environment, which the cells share
+    /// while they run in parallel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_subnet_guard_switch_off_writes_no_subnet_route() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let router = Ipv4Addr::new(100, 64, 0, 2);
+        let two: &[&str] = &["10.1.0.0/16", "192.168.50.0/24"];
+        let (by_node, current_peers) = router_mesh(&[([1; 32], router, two)]);
+        let set = || {
+            defended_routes(
+                &by_node,
+                &current_peers,
+                self_v4,
+                subnets_held(&[([1; 32], two)]),
+            )
+        };
+        assert_eq!(defended_subnets(&set()), two, "both subnets are defended");
+
+        let off = RouteRecordingTun::new();
+        let t: Arc<dyn TunIo> = off.clone();
+        run_defense_wave_with(t, set(), false).await;
+        assert!(off.subnet_calls().is_empty(), "{:?}", off.subnet_calls());
+        assert_eq!(
+            off.calls(),
+            [
+                ("add", router),
+                ("defend", self_v4),
+                ("floor", Ipv4Addr::UNSPECIFIED),
+                ("verify", router),
+            ],
+            "every other arm as before"
+        );
+
+        let on = RouteRecordingTun::new();
+        let t: Arc<dyn TunIo> = on.clone();
+        run_defense_wave_with(t, set(), SUBNET_GUARD_DEFAULT).await;
+        assert_eq!(on.subnet_calls(), two, "the default puts both back");
     }
 
     /// The off-loop ALLOCATE queue's test twin (see `test_relay_bq`).
@@ -8657,6 +8965,95 @@ mod tests {
             wg.peer_subnets(&pk)
         );
         assert!(st.split_default_installed);
+    }
+
+    /// #4279 — the defended set read from the crypto-router the select loop
+    /// owns and the netmap it holds, exactly as both guard arms call it
+    /// (`&current_peers`, `|pk| wg.peer_subnets(pk)`): it carries what
+    /// `install_subnets` routed, never the approved `/0`, and while the peer
+    /// carries this node's egress, never the split-default `/1`s the exit
+    /// reconcile adds to its entry (those are re-asserted inline on the loop,
+    /// mutually exclusive with the teardown). A route the admin revokes stops
+    /// being defended at the netmap delta, although the crypto-router keeps
+    /// it until the peer's next carrier install.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_defended_subnets_are_what_install_subnets_routed() {
+        use crate::overlay::router::Cidr;
+        let kp = WgKeypair::generate();
+        let exit_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun = ExemptionTun::new();
+        let tf: TunFactory = {
+            let m = tun.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let id = exit_oid(0x33);
+        let server: IpAddr = "203.0.113.7".parse().unwrap();
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280)
+            .with_exit_node(Some(id.to_hex()), vec![server]);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let dev: Arc<dyn TunIo> = tun.clone();
+        let pk = crate::overlay::decode_public(&exit_kp.public_base64()).unwrap();
+        let routes = vec!["10.9.0.0/16".to_string(), "0.0.0.0/0".to_string()];
+        let mut peers = HashMap::new();
+        peers.insert(
+            id,
+            NetmapPeer {
+                wg_public_key: exit_kp.public_base64(),
+                ..exit_np(id, "exit-a", routes.clone())
+            },
+        );
+        let exit_ip = Ipv4Addr::new(100, 64, 0, 1);
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            id,
+            Installed::base(pk, exit_ip, DirectTier::Lan, Instant::now()),
+        );
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let subnets: Vec<Cidr> = routes.iter().map(|r| Cidr::parse(r).unwrap()).collect();
+
+        // The generic install, as every carrier install runs it.
+        rt.install_subnets(&mut wg, &dev, id, pk, &subnets).await;
+        let set = defended_routes(&by_node, &peers, self_v4, |k| wg.peer_subnets(k));
+        assert_eq!(defended_subnets(&set), ["10.9.0.0/16"], "{set:?}");
+
+        // This node now routes its egress through that peer.
+        let mut st = ExitRoutingState::default();
+        rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers, &mut st)
+            .await;
+        assert!(st.split_default_installed);
+        assert!(
+            !split_default_missing(&wg.peer_subnets(&pk)),
+            "the crypto-router holds the /1s now: {:?}",
+            wg.peer_subnets(&pk)
+        );
+        let set = defended_routes(&by_node, &peers, self_v4, |k| wg.peer_subnets(k));
+        assert_eq!(
+            defended_subnets(&set),
+            ["10.9.0.0/16"],
+            "the /1s stay off the detached wave: {set:?}"
+        );
+
+        // The admin revokes the subnet: the netmap delta drops it from the
+        // peer's routes while its crypto-router entry still holds it.
+        peers.get_mut(&id).unwrap().routes = vec!["0.0.0.0/0".to_string()];
+        assert!(
+            wg.peer_subnets(&pk)
+                .contains(&Cidr::parse("10.9.0.0/16").unwrap()),
+            "the crypto-router keeps it until the next carrier install"
+        );
+        let set = defended_routes(&by_node, &peers, self_v4, |k| wg.peer_subnets(k));
+        assert!(
+            defended_subnets(&set).is_empty(),
+            "a revoked route is not kept alive: {set:?}"
+        );
+
+        // A peer that is no longer installed contributes nothing, even with
+        // its entry still in the crypto-router.
+        assert_eq!(
+            defended_routes(&HashMap::new(), &peers, self_v4, |k| wg.peer_subnets(k)),
+            vec![Defend::EvictSelf(self_v4), Defend::BlockFloor]
+        );
     }
 
     /// FR-97 P1a — the uplink moves under an active exit (Wi-Fi ↔ Ethernet).
