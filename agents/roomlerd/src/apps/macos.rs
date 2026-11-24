@@ -594,7 +594,7 @@ impl WindowManager for MacWm {
         Coverage {
             sources: vec!["quartz"],
             unlisted: (!tcc::screen_recording_granted()).then(|| {
-                "window titles: this agent has no Screen Recording permission, so macOS names \
+                "window titles: roomlerd has no Screen Recording permission, so macOS names \
                  each window's app only (System Settings → Privacy & Security → Screen \
                  Recording)"
                     .to_string()
@@ -614,7 +614,7 @@ impl WindowManager for MacWm {
             super::parse_quartz_window_id(window_id).ok_or_else(|| anyhow!("invalid window id"))?;
         if !tcc::accessibility_trusted() {
             bail!(
-                "this agent has no Accessibility permission, and bringing another app's window \
+                "roomlerd has no Accessibility permission, and bringing another app's window \
                  forward needs it (System Settings → Privacy & Security → Accessibility)"
             );
         }

@@ -523,7 +523,7 @@ Approved in the browser.
   Organization: Acme Corp  (slug: acme)
   Approved by:  Dana Smith  (username: dana)
 Join «Acme Corp» (acme) as approved by «Dana Smith» (@dana)? [y/N] y
-Enrollment successful. Agent id: …
+Enrollment successful. Device id: …
 ```
 
 - The page's address never carries the code: you type it there, signed in (or

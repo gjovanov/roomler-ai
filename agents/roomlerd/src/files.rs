@@ -611,7 +611,7 @@ impl FsAs {
         if self.is_the_daemon() {
             return read.with_context(|| {
                 format!(
-                    "{asked}: {} refused to open it for the account this agent runs as",
+                    "{asked}: {} refused to open it for the account roomlerd runs as",
                     reads::THIS_OS
                 )
             });
@@ -3897,7 +3897,7 @@ fn open_to_send(asked: &str, checks: bool) -> Result<(PathBuf, u64, std::fs::Fil
     let resolved = validate_outgoing_path(asked)?;
     if is_agent_secret(&resolved) {
         return Err(anyhow!(
-            "{} holds the agent's own credentials — file transfer never sends it",
+            "{} holds the daemon's own credentials — file transfer never sends it",
             resolved.display()
         ));
     }
@@ -4051,7 +4051,7 @@ fn resolve_dest_path_here(
     let canonical = validate_outgoing_path(input).context("validating dest_path")?;
     if let Some(run) = agent_state_run(&canonical) {
         return Err(anyhow!(
-            "dest_path {} is inside the agent's own configuration and state (…{run}…) — \
+            "dest_path {} is inside the daemon's own configuration and state (…{run}…) — \
              file transfer never writes there",
             canonical.display()
         ));
@@ -4374,7 +4374,7 @@ async fn list_staging(
     _by: std::time::Instant,
 ) -> Result<DirListing> {
     Err(anyhow!(
-        "this host has no single staging root — non-Windows agents stage \
+        "this host has no single staging root — off Windows, roomlerd stages \
          alongside each destination"
     ))
 }
@@ -7692,7 +7692,7 @@ mod tests {
         assert_eq!(
             format!("{refused}"),
             format!(
-                "{}: {} refused to open it for the account this agent runs as",
+                "{}: {} refused to open it for the account roomlerd runs as",
                 shut.display(),
                 reads::THIS_OS
             ),
@@ -7744,7 +7744,7 @@ mod tests {
         assert_eq!(
             format!("{refused}"),
             format!(
-                "{}: {} refused to open it for the account this agent runs as",
+                "{}: {} refused to open it for the account roomlerd runs as",
                 shut.display(),
                 reads::THIS_OS
             ),

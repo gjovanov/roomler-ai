@@ -39,7 +39,7 @@ const INSTALLS: [Install; 6] = [
 /// So `agent_id` (a config key) is not the word, while `agent-v0.4.1` (a tag)
 /// and `rc:agent.update` (a wire name) are: either one leaking into prose is
 /// caught.
-fn says_agent(text: &str) -> bool {
+pub(crate) fn says_agent(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
     lower.match_indices("agent").any(|(at, _)| {
@@ -153,7 +153,7 @@ fn a_rollback_names_the_release_by_its_version() {
 /// Every string literal in `code` (comments skipped), and whether a log macro
 /// (`trace!` … `error!`) holds it: a log line is engineering text, not this
 /// FR's (FR-133, out of scope).
-fn literals(code: &str) -> Vec<(&str, bool)> {
+pub(crate) fn literals(code: &str) -> Vec<(&str, bool)> {
     const LOG: [&str; 5] = ["trace!", "debug!", "info!", "warn!", "error!"];
     let b = code.as_bytes();
     let (mut out, mut i, mut depth, mut log_at) = (Vec::new(), 0, 0usize, None);

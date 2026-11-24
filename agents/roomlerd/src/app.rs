@@ -40,7 +40,7 @@ use tunnel_core::env::node_env_os;
 
 #[derive(Debug, Parser)]
 #[command(name = "roomlerd", version, about, long_about = None)]
-struct Cli {
+pub(crate) struct Cli {
     /// Override config file location. Defaults to the platform config dir.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -52,7 +52,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Enroll this machine against a Roomler server using an admin-issued
-    /// enrollment token. Writes the resulting agent token to the config file.
+    /// enrollment token. Writes the resulting device credential to the config file.
     Enroll {
         /// Base URL of the Roomler API (e.g. https://roomler.live).
         #[arg(long)]
@@ -82,7 +82,7 @@ enum Command {
         /// explicit).
         #[arg(long, value_name = "SLUG")]
         pair_org: Option<String>,
-        /// Friendly name shown in the admin agents list.
+        /// Friendly name shown in the admin devices list.
         #[arg(long)]
         name: String,
         /// Multi-org: label for the enrollment when it resolves to a NEW
@@ -157,7 +157,7 @@ enum Command {
         #[arg(long, value_name = "SCOPE")]
         install_scope: Option<String>,
     },
-    /// Refresh this machine's agent token using a fresh enrollment JWT.
+    /// Refresh this machine's device credential using a fresh enrollment JWT.
     /// Preserves `server_url` and `machine_name` from the existing
     /// config, so the operator only needs the new token. Used after
     /// an admin revokes the prior token (the `re-enrollment required`
@@ -421,7 +421,7 @@ enum Command {
     /// LaunchDaemon and of the Linux `roomler-update.service` (FR-96): consume
     /// the wake file, then check → download → verify → install as root,
     /// waiting on it (`installer -pkg … -target /` on macOS, whose postinstall
-    /// restarts the agent halves; `apt-get`/`dpkg` or the tarball on Linux).
+    /// restarts the daemon's halves; `apt-get`/`dpkg` or the tarball on Linux).
     /// Root-only and single-shot. Hidden: launchd or systemd is the caller — by
     /// hand it is `sudo roomlerd update-helper`, and running it non-root only
     /// prints the refusal.
@@ -656,12 +656,12 @@ enum Command {
         mode: String,
     },
     /// Run the capability probe that populates `rc:agent.hello` and
-    /// print the result. Useful for verifying what codecs the agent
+    /// print the result. Useful for verifying what codecs roomlerd
     /// will actually advertise on this host (the HEVC + AV1 probes
     /// run real MfEncoder activations, so this exits with roughly
     /// the same logs an operator would see in the first session).
     Caps,
-    /// Enumerate attached displays and print what the agent will
+    /// Enumerate attached displays and print what roomlerd will
     /// report in `rc:agent.hello`. Cross-platform via `scrap`.
     Displays,
     /// (M3 A1) Print the peer-presence marker file's state. The
@@ -744,7 +744,7 @@ enum Command {
     /// (works regardless of which profile the service runs under — incl.
     /// SYSTEM/SCM installs); falls back to a sentinel file under
     /// `<log_dir>/consent/` in THIS profile when no service is listening
-    /// (console-run agent). 30 s from the agent's POV, after which the
+    /// (console-run daemon). 30 s from the daemon's POV, after which the
     /// broker auto-denies.
     ///
     /// `--list` is FR-27: the id was previously obtainable only by grepping
@@ -755,7 +755,7 @@ enum Command {
         #[arg(long, short = 'l', conflicts_with_all = ["approve", "deny"])]
         list: bool,
         /// Hex `session_id` (or exec request id) from `--list` or the
-        /// agent's "operator consent required" log line — a 24-character
+        /// daemon's "operator consent required" log line — a 24-character
         /// MongoDB ObjectId hex string.
         #[arg(long, required_unless_present = "list")]
         session: Option<String>,
@@ -779,7 +779,7 @@ enum Command {
     },
     /// (internal) Entry point invoked by the Windows Service Control
     /// Manager when `Roomler` starts. Hands the process
-    /// over to `windows-service`'s dispatcher; the agent main loop
+    /// over to `windows-service`'s dispatcher; the daemon's main loop
     /// runs inside the SCM thread until Stop is signalled. Hidden
     /// from `--help` because operators never invoke this directly —
     /// `service install --as-service` registers it as the service's
@@ -873,12 +873,12 @@ enum Command {
     /// (internal) Watch a running installer process and record its
     /// exit code + the new binary's version to `last-install.json`.
     /// Spawned automatically by the updater immediately before the
-    /// agent exits to make room for the installer; not intended for
+    /// daemon exits to make room for the installer; not intended for
     /// interactive use. Hidden from `--help` to avoid confusion.
     #[command(hide = true)]
     PostInstallWatch {
         /// PID of the installer (msiexec / dpkg / installer(8))
-        /// the parent agent just spawned.
+        /// the parent daemon just spawned.
         #[arg(long)]
         installer_pid: u32,
         /// Path of the installer artifact (only logged for the
@@ -991,7 +991,7 @@ enum OrgAction {
     /// FR-49 — put a secondary enrollment on (or off) that org's overlay mesh.
     ///
     /// Before this the only way was to hand-edit `config.toml` — the file that
-    /// also holds the agent token and the SSH host private key, is written
+    /// also holds the device credential and the SSH host private key, is written
     /// atomically with a `.prev` sibling, and on Windows lives under a
     /// machine-global ACL-restricted directory. Takes effect on the next daemon
     /// start (the overlay engine is built once, at startup).
@@ -1029,7 +1029,7 @@ enum MediaAction {
 
 #[derive(Debug, Subcommand)]
 enum ServiceAction {
-    /// Register the agent for auto-start on the next login.
+    /// Register the daemon for auto-start on the next login.
     Install {
         /// Register the ROOT daemon with the OS's own service manager instead
         /// of the per-user auto-start: on Windows the `Roomler` SCM service
@@ -2045,7 +2045,7 @@ async fn daemon_main() -> Result<()> {
                 anyhow::bail!(
                     "update-helper is the body of the macOS com.roomler.update LaunchDaemon \
                      and of the Linux roomler-update.service; this platform's updater runs \
-                     inside the agent itself"
+                     inside the daemon itself"
                 )
             }
         }
@@ -2573,7 +2573,7 @@ async fn consent_cmd(session_hex: &str, approve: bool, deny: bool) -> Result<()>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "device service not reachable — falling back to a sentinel file in this \
-                 user's profile (only a console-run agent in the SAME profile will see it)"
+                 user's profile (only a console-run daemon in the SAME profile will see it)"
             );
         }
         Err(e) => {
@@ -3066,27 +3066,27 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         EnrollOutcome::FreshPrimary => {
             if cfg.ephemeral {
                 println!(
-                    "Enrollment successful (EPHEMERAL). Agent id: {enrolled_agent_id}\n\
+                    "Enrollment successful (EPHEMERAL). Device id: {enrolled_agent_id}\n\
                      This device removes itself: on clean shutdown immediately, or after \
                      its inactivity deadline. A restart enrolls a NEW device."
                 );
             } else {
-                println!("Enrollment successful. Agent id: {enrolled_agent_id}");
+                println!("Enrollment successful. Device id: {enrolled_agent_id}");
             }
         }
         EnrollOutcome::RefreshedPrimary => {
             println!(
-                "Primary enrollment refreshed (same server + org). Agent id: {enrolled_agent_id}"
+                "Primary enrollment refreshed (same server + org). Device id: {enrolled_agent_id}"
             );
         }
         EnrollOutcome::ReplacedPrimary => {
-            println!("Primary enrollment REPLACED (--replace). Agent id: {enrolled_agent_id}");
+            println!("Primary enrollment REPLACED (--replace). Device id: {enrolled_agent_id}");
         }
         EnrollOutcome::RefreshedOrg { label } => {
-            println!("Org {label:?} enrollment refreshed. Agent id: {enrolled_agent_id}");
+            println!("Org {label:?} enrollment refreshed. Device id: {enrolled_agent_id}");
         }
         EnrollOutcome::AppendedOrg { label } => {
-            println!("Enrolled into an ADDITIONAL org as {label:?}. Agent id: {enrolled_agent_id}");
+            println!("Enrolled in an ADDITIONAL org as {label:?}. Device id: {enrolled_agent_id}");
             println!(
                 "This machine now serves {} enrollment(s); manage them with \
                  `roomlerd org ls`.",
@@ -3436,7 +3436,7 @@ async fn re_enroll_cmd(
     if is_primary {
         notify::clear_all_attention();
     }
-    println!("Re-enrollment successful for {org_label:?}. Agent id: {refreshed_agent_id}");
+    println!("Re-enrollment successful for {org_label:?}. Device id: {refreshed_agent_id}");
     // #2293 — what actually brings this daemon back depends on its install:
     // systemd never restarts the removal's exit 7, and `roomlerd run` by
     // hand beside a unit is an orphan.
@@ -5902,7 +5902,7 @@ async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()>
         ServiceAction::Install { as_service: false } => {
             service::install(config_path).context("installing auto-start hook")?;
             println!(
-                "Auto-start registered. The agent will launch on next login{}.",
+                "Auto-start registered. The daemon will launch on next login{}.",
                 if cfg!(target_os = "windows") && config_path.exists() {
                     ", and within about a minute"
                 } else {

@@ -876,26 +876,26 @@ impl CaptureUnavailableCode {
                 if cfg!(target_os = "macos") {
                     MAC_PERMISSION_HINT
                 } else {
-                    "The host denied this agent permission to capture the screen. Grant it on \
+                    "The host denied roomlerd permission to capture the screen. Grant it on \
                      the host, then reconnect."
                 }
             }
             Self::NoDisplay => {
                 if cfg!(target_os = "macos") {
-                    "This agent runs as a system daemon, which has no desktop session and \
+                    "This roomlerd runs as a system daemon, which has no desktop session and \
                      therefore no screen to capture. Connect to this machine's user-session \
-                     agent instead. Remote shell works here."
+                     roomlerd instead. Remote shell works here."
                 } else {
                     no_display_hint(crate::files::follows_the_screen())
                 }
             }
             Self::NotBuilt => {
-                "This agent was built without a capture backend — it can signal, but never \
-                 send pixels. Install a full agent build."
+                "This roomlerd was built without a capture backend — it can signal, but never \
+                 send pixels. Install a full roomlerd build."
             }
             Self::BackendError => {
                 "The host's capture backend failed to start. Its own error is in the detail; \
-                 the agent log has the full line."
+                 roomlerd's log has the full line."
             }
             Self::WaylandNotEnabled => wayland_hint(running_as_root()),
             Self::X11NotEnabled => x11_hint(running_as_root()),
@@ -1018,7 +1018,7 @@ fn x11_hint_with(
             "Remote shell and file transfer still work."
         )
     } else {
-        "This computer is showing an X11 desktop, and this agent was started without access to \
+        "This computer is showing an X11 desktop, and roomlerd was started without access to \
          it (no DISPLAY). Restart it from inside the desktop session, with roomler restart in a \
          terminal there, or install the system service. Remote shell and file transfer still \
          work."
