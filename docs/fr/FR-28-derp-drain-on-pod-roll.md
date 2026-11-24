@@ -307,7 +307,7 @@ this size it is a number to measure first. The flip is a staged rollout and the 
   `RUST_LOG=roomlerd=info,warn` (`agents/roomlerd/packaging/linux/roomlerd.service:53`), which replaces the default
   filter whole (`crates/agent-core/src/logging.rs:430-437`). Of `tunnel_core`'s INFO lines it then keeps only the
   socket-buffer line appended for FR-110 (`:453-463`), and the line is `info!` in `tunnel_core`
-  (`crates/tunnel-core/src/overlay/runtime.rs:3977`). So a read on such a host ends at the hello and the agent's
+  (`crates/tunnel-core/src/overlay/runtime.rs:3982`). So a read on such a host ends at the hello and the agent's
   own reattach line, which the `roomlerd` target keeps (`agents/roomlerd/src/overlay.rs:265`). A criterion written
   on `control-WS reattached` has the same gap on every packaged Linux host. The filter sets what every such host
   uploads, so widening it is a change of its own, with its own read of the volume.
@@ -611,7 +611,7 @@ out. AC3 to AC6 keep their words.
 
 ⚠️ What moved with AC1: the reader for it does not exist either. `video DC delivery gap` is console-only and logs
 only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:19`, warned at
-`ui/src/composables/useRemoteControl.ts:8518`).
+`ui/src/composables/useRemoteControl.ts:8530`).
 
 ## Out of scope
 

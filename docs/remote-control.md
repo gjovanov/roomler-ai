@@ -818,7 +818,7 @@ evicts it and opens a capture of its own
 and every session registered at that moment gets, one stop grace (1 s) after
 the exit, the reason a session opened while the desktop is down gets:
 `backend_error`, with *this device's virtual desktop is down: its X server
-(Xvfb) exited: … The agent starts it again by itself; reconnect in a moment.*
+(Xvfb) exited: … The daemon starts it again by itself; reconnect in a moment.*
 (`down_detail_of`, `agents/roomlerd/src/virtual_desktop.rs:438`). The
 supervisor reads who to tell on its own thread and sends one
 `spawn_capture_unavailable_notice` per session on the daemon's runtime
@@ -7827,8 +7827,12 @@ worker for an account with no config, and no last good copy of one that
 holds an enrollment (#4157), exits `NO_ENROLLMENT_EXIT_CODE`
 (78, [`daemon_error.rs:153`](../agents/roomlerd/src/daemon_error.rs#L153)).
 `should_record_supervisor_crash` leaves it out of the reports, and the host
-backs it off exactly as an exit 1. It ends before this bookkeeping, with no
-config to keep a count in, so it needs no `--prior-end` word. Since #4071 the
+backs it off exactly as an exit 1. Since #4324 it does not count toward the
+host's crash-loop alarm and never raises it: the host names the way forward in
+one line instead
+([`ExitTally`](../agents/roomlerd/src/win_service/supervisor.rs#L1269)). It
+ends before this bookkeeping, with no config to keep a count in, so it needs
+no `--prior-end` word. Since #4071 the
 GUI worker FR-43's macOS supervisor starts (`run --supervised` on a two-row
 Mac) exits 78 as well, and that supervisor's `crash_summary` leaves it out of
 its reports. Since FR-150 P2 so does the per-user task's daemon, whose
@@ -8417,8 +8421,8 @@ sequenceDiagram
   wall clock. On the vmtest guest whose clock had been corrected backwards by
   nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
   replaced it, so an "older than this host" rule would have left it running.
-- **When it runs.** Once before the first spawn (`supervisor.rs:1498`). Again in
-  the `Stop` arm (`supervisor.rs:1647`) before it gives up: if that pass ended an
+- **When it runs.** Once before the first spawn (`supervisor.rs:1597`). Again in
+  the `Stop` arm (`supervisor.rs:1753`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
   with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).

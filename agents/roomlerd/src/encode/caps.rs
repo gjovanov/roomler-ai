@@ -2681,7 +2681,7 @@ fn with_learned_word(
             LEARNED_CODE,
             &format!(
                 "These encoder cells ended the capability probe on this host, so neither the \
-                 probe nor a session opens them: {cells}. A driver update, an agent update, a \
+                 probe nor a session opens them: {cells}. A driver update, a roomlerd update, a \
                  settings change or a restart a day later tests them again"
             ),
         ),
@@ -2866,11 +2866,11 @@ fn linux_audio_word(
     match why {
         Some(Why::NoSoundServer) => Unavailable::new(
             "no-sound-server",
-            "This host sends no sound: it has no Pulse client library (libpulse-simple), so the agent cannot reach its sound server",
+            "This host sends no sound: it has no Pulse client library (libpulse-simple), so roomlerd cannot reach its sound server",
         ),
         Some(Why::NoSession) => Unavailable::new(
             "no-session",
-            "This host sends no sound: the agent runs as root without the session helper that records a session's sound",
+            "This host sends no sound: roomlerd runs as root without the session helper that records a session's sound",
         ),
         _ => Unavailable::new(
             "no-monitor",
@@ -3038,7 +3038,7 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
             ),
             OsKind::Linux | OsKind::Windows => Unavailable::new(
                 "unsupported",
-                "This host's display cannot be switched to your window: display match needs an X11 desktop with a per-user install, or the agent's own virtual desktop; a Wayland desktop and a system install keep their screen as it is",
+                "This host's display cannot be switched to your window: display match needs an X11 desktop with a per-user install, or the daemon's own virtual desktop; a Wayland desktop and a system install keep their screen as it is",
             ),
         };
         caps.unavailable.insert("display-match".into(), why);

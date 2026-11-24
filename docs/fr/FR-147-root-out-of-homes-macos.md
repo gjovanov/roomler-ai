@@ -397,7 +397,7 @@ and any error runs `undo` (`:2205`), with `Done` (`:1657`) recording what to put
   made (#4287, `not_bootstrapped`, `:2489-2503`). A job not loaded gets `gui/<uid>/com.roomler.agent: not
   bootstrapped, as the daemon did not restart onto the files put back; launchd loads it at the next login`. A job
   that a login has loaded again by then gets ``gui/<uid>/com.roomler.agent: already loaded, and not started here,
-  as the daemon did not restart onto the files put back; if the agent is not running, `sudo launchctl kickstart
+  as the daemon did not restart onto the files put back; if roomlerd is not running, `sudo launchctl kickstart
   gui/<uid>/com.roomler.agent` starts it``: nothing loads a loaded job at the next login, and its agent may run, or
   may have exited 0 on the one-row screen worker's lock: then only that kickstart starts it. Before #4287 both got
   the first line.
