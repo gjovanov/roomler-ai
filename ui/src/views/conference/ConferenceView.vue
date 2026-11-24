@@ -316,8 +316,9 @@ const { smAndDown } = useDisplay()
 const canScreenShare = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia
 // A closed chat — the phone's default now — still says when someone wrote: a
 // dot on its button. The WS handler never bumps the unread count of the room
-// this page shows (#4395, `shownRoomId`), so arrivals are noticed here (once the first load is in, which
-// is not news); the server's count covers what came before the page opened.
+// this page shows (#4395, `shownRoomId`), so arrivals are noticed here (once
+// the first load is in, which is not news); the server's count covers what
+// came before the page opened.
 const chatUnseen = ref(false)
 let chatPrimed = false
 const chatDot = computed(
