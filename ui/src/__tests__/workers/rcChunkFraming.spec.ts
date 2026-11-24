@@ -456,3 +456,56 @@ describe('rc-chunk-framing across two channels — a key frame supersedes (FR-14
     expect(st.partials.size).toBe(0)
   })
 })
+
+describe('rc-chunk-framing — the key frame a message completes, named (FR-148 P4b-5a)', () => {
+  // The worker counts the key frames it completes whole, by channel, for the
+  // agent's `path delivery` line (`viewer_kf`). A frame is whole here and
+  // nowhere before, so the assembler names a key frame on the message that
+  // completes it, from the record's own header as the supersede rule reads
+  // it, and names nothing on a message that completes no frame.
+  const header = (key: boolean) => [0, 0, 0, 0, key ? 1 : 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+  it('names a key frame on the message that completes it, whichever chunk that is, and a delta as none', () => {
+    const st = createChunkFraming()
+    expect(stripChunkPrefix(st, framed(1, 1, 2, [9])).key).toBeUndefined()
+    const key = stripChunkPrefix(st, framed(1, 0, 2, [...header(true), 1]))
+    expect(bytes(key)).toEqual([...header(true), 1, 9])
+    expect(key.key).toBe(true)
+    const delta = stripChunkPrefix(st, framed(2, 0, 1, [...header(false), 2]))
+    expect(delta.payload).not.toBeNull()
+    expect(delta.key).toBe(false)
+  })
+
+  it('names nothing on a message that completes no frame: a partial, a duplicate, a collision, a straggler, garbage', () => {
+    const st = createChunkFraming()
+    const partial = stripChunkPrefix(st, framed(1, 0, 2, [...header(true), 1]))
+    const duplicate = stripChunkPrefix(st, framed(1, 0, 2, [...header(true), 1]))
+    const collision = stripChunkPrefix(st, framed(1, 1, 3, [2]))
+    const whole = stripChunkPrefix(st, framed(2, 0, 1, [...header(true), 2]))
+    const straggler = stripChunkPrefix(st, framed(1, 1, 2, [3]))
+    const garbage = stripChunkPrefix(st, new Uint8Array([1]))
+    for (const r of [partial, duplicate, collision, straggler, garbage]) {
+      expect(r.payload).toBeNull()
+      expect(r.key).toBeUndefined()
+    }
+    expect(whole.key).toBe(true)
+  })
+
+  it('names the key frame an evicting message completes, and never the key frame it evicted', () => {
+    const st = createChunkFraming()
+    // Key frame 1, partial: the eviction below takes it, and it is never whole.
+    stripChunkPrefix(st, framed(1, 0, 2, [...header(true), 1]))
+    for (let seq = 2; seq <= MAX_PARTIAL_FRAMES; seq++) {
+      stripChunkPrefix(st, framed(seq, 0, 2, [...header(false), seq]))
+    }
+    // A key frame of one chunk evicts frame 1, and is whole on the same message.
+    const r = stripChunkPrefix(st, framed(MAX_PARTIAL_FRAMES + 1, 0, 1, [...header(true), 9]))
+    expect(r.gap).toBe(true)
+    expect(bytes(r)).toEqual([...header(true), 9])
+    expect(r.key).toBe(true)
+    // Frame 1's last chunk, late: a straggler.
+    const late = stripChunkPrefix(st, framed(1, 1, 2, [2]))
+    expect(late.payload).toBeNull()
+    expect(late.key).toBeUndefined()
+  })
+})

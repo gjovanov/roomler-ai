@@ -458,6 +458,10 @@ function maybeEmitStats(): void {
     // acceptance criterion became unmeasurable.
     chunkGaps: framingState.gaps,
     chunkStragglers: framingState.stragglers,
+    // FR-148 P4b-5a — the key frames completed whole, `[video-bytes,
+    // video-deadline]`, from the session's start, for the agent's line
+    // (`rc:decodestat`'s `kf`). A framed session's alone: unframed, no key.
+    ...(chunkFraming ? { kf: [keyFramesWhole[0], keyFramesWhole[1]] } : {}),
     paint: paintStats.snapshotAndReset(),
     // FR-1 P7 — end-to-end frame age; null until the clock probe lands.
     age: clockOffsetUs !== null ? ageStats.snapshotAndReset() : null,
@@ -518,6 +522,11 @@ function resetAssembler(): void {
  *  keeps the pre-FR-17 bare byte stream exactly. */
 let chunkFraming = false
 const framingState = createChunkFraming()
+/** FR-148 P4b-5a — the key frames the assembler completed whole, from the
+ *  session's start: `[video-bytes, video-deadline]`, by the channel of the
+ *  message that completed each. A frame evicted, abandoned or overtaken while
+ *  partial, and a straggling chunk, never complete, so never count. */
+const keyFramesWhole: [number, number] = [0, 0]
 
 workerScope.onmessage = (e) => {
   const msg = e.data
@@ -608,8 +617,9 @@ workerScope.onmessageerror = () => {
  *  the unordered channel, and false off `video-bytes`. Both feed the one
  *  assembler, keyed by frame_seq: the agent is to keep one frame_seq space
  *  across the two and switch between them only at a key frame (P4b-3). The
- *  channel decides one thing here, what a gap does to the gate
- *  (`gapClosesGate`). */
+ *  channel decides two things here: what a gap does to the gate
+ *  (`gapClosesGate`), and (FR-148 P4b-5a) which side of `keyFramesWhole` a
+ *  key frame this message completes counts on. */
 function onChunk(bytes: ArrayBuffer, sentAt: number | undefined, deadline: boolean): void {
   framesReceived++
   if (typeof sentAt === 'number') {
@@ -632,7 +642,9 @@ function onChunk(bytes: ArrayBuffer, sentAt: number | undefined, deadline: boole
   // reports as corruption rather than loss, so the assembler is reset
   // and a fresh IDR requested instead.
   if (chunkFraming) {
-    const { payload, gap } = stripChunkPrefix(framingState, u8)
+    const { payload, gap, key } = stripChunkPrefix(framingState, u8)
+    // FR-148 P4b-5a — a key frame whole, on the channel this message came on.
+    if (payload && key) keyFramesWhole[deadline ? 1 : 0]++
     if (gap) {
       resetAssembler()
       // FR-135 R1 — the deltas behind the gap reference the frame it lost,

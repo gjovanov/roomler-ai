@@ -175,7 +175,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:8122`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:8141`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
@@ -328,7 +328,7 @@ inside a fullscreen viewer too).
 | the person's hands | a plain reload waits until no key, click or wheel for 5 s | `BUSY_MS`, `staleBuildWatch.ts:72` |
 
 **The resume.** A remote session that a cut put on its redial (`scheduleReconnect`) is handed
-over: its pending retry is stopped (`holdRedial`, `useRemoteControl.ts:9947`), the args its
+over: its pending retry is stopped (`holdRedial`, `useRemoteControl.ts:9966`), the args its
 redial would have used (with the held session it replaces, FR-138's `replaces`,
 [remote-control.md §11.17](remote-control.md#1117-a-session-outlives-its-control-socket-the-viewers-half-fr-138-p1c))
 are written to sessionStorage with the time, the path and the
@@ -341,7 +341,7 @@ load takes the record out of storage before any page renders (`installStaleBuild
 it has its device and the person (`resumeAfterNewBuild`, `RemoteControl.vue:5519`): once,
 under a minute old, on the first page that load rendered, for the same person, device,
 organization and path (`resumeArgsFor`, `staleBuildPolicy.ts:318`). It resumes through the
-redial's own ladder (`resumeAfterReload`, `useRemoteControl.ts:9972`), never as a first
+redial's own ladder (`resumeAfterReload`, `useRemoteControl.ts:9991`), never as a first
 connect: a first connect starts the ladder at 0, and `rc:error` retries `agent_offline` only
 past it, so a tab that reloaded while its device restarted for an update would have stopped
 there, where the redial keeps trying. Its record is `after_drop`, out of FR-22's
