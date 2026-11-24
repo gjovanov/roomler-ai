@@ -51,7 +51,7 @@ use roomler_ai_remote_control::{
 use roomler_ai_services::dao::base::DaoError;
 use roomler_ai_services::dao::overlay_node::NewOverlayNode;
 use tokio::net::lookup_host;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 use tunnel_core::policy::{
     OverlayPeerRef, OverlaySource, evaluate_overlay, evaluate_overlay_ingress,
 };
@@ -755,6 +755,7 @@ async fn handle_overlay_join(
     // `reachable: false`) is a no-op against an already-installed peer — only
     // the removes branch tears down the WG peer, its route and its carrier.
     let fan_roles = CompileRoles::new(self_node.tenant_id);
+    let mut fanned = FanCount::default();
     for peer in all.iter().filter(|n| n.id != self_node.id) {
         let peer_src = overlay_source_of(state, peer, &fan_roles).await;
         // The shaped peer here is the JOINER, whose identity we already have.
@@ -769,16 +770,32 @@ async fn handle_overlay_join(
             }
             None => (vec![], vec![self_node.id.unwrap_or_default()]),
         };
-        send_to_node(
-            state,
-            peer,
-            ServerMsg::OverlayNetmapDelta {
-                epoch,
-                upserts,
-                removes,
-            },
-        )
-        .await;
+        fanned.note(
+            push_to_node(
+                state,
+                &peer.node_ref,
+                ServerMsg::OverlayNetmapDelta {
+                    epoch,
+                    upserts,
+                    removes,
+                },
+                true,
+            )
+            .await,
+        );
+    }
+    // #4402 — one line for the pass, with its counts.
+    if fanned.peers() > 0 {
+        debug!(
+            pass = "join",
+            node = %self_node.name,
+            epoch,
+            peers = fanned.peers(),
+            sent = fanned.sent,
+            not_here = fanned.not_here,
+            queue_full = fanned.queue_full,
+            "overlay: delta fanned out"
+        );
     }
 
     // P7 — a node that restarted mid-escalation lost its client-side DERP pin
@@ -1977,6 +1994,7 @@ async fn fan_upsert_shaped(state: &NetworkState, node: &OverlayNode, epoch: u64,
         (None, HashMap::new())
     };
     let mut reverse_rows: Vec<NetmapPeer> = Vec::new();
+    let mut fanned = FanCount::default();
     for peer in peers.iter().filter(|p| p.id != node.id) {
         let src = overlay_source_of(state, peer, &roles).await;
         // U2 — the edge is `recipient=peer → this fanned node`; both full
@@ -1989,16 +2007,19 @@ async fn fan_upsert_shaped(state: &NetworkState, node: &OverlayNode, epoch: u64,
             }
             None => (vec![], vec![node.id.unwrap_or_default()]),
         };
-        send_to_node(
-            state,
-            peer,
-            ServerMsg::OverlayNetmapDelta {
-                epoch,
-                upserts,
-                removes,
-            },
-        )
-        .await;
+        fanned.note(
+            push_to_node(
+                state,
+                &peer.node_ref,
+                ServerMsg::OverlayNetmapDelta {
+                    epoch,
+                    upserts,
+                    removes,
+                },
+                true,
+            )
+            .await,
+        );
         // D0 — the mirror row for the changed node: recipient=node,
         // shaped=peer, verdict for the `node → peer` edge. Same shaping
         // rules as any row toward `node` (ACL from its source; the peer's
@@ -2018,23 +2039,45 @@ async fn fan_upsert_shaped(state: &NetworkState, node: &OverlayNode, epoch: u64,
             }
         }
     }
+    // #4402 — the D0 push's rows and what became of it ride the pass's line.
+    let reverse_count = reverse_rows.len();
+    let mut reverse = None;
     if !reverse_rows.is_empty() {
-        debug!(
+        trace!(
             node = %node.name,
-            rows = reverse_rows.len(),
+            rows = reverse_count,
             epoch,
             "overlay: reverse verdict delta — re-stamping the changed node's outgoing edges (D0)"
         );
-        send_to_node(
-            state,
-            node,
-            ServerMsg::OverlayNetmapDelta {
-                epoch,
-                upserts: reverse_rows,
-                removes: vec![],
-            },
-        )
-        .await;
+        reverse = Some(
+            push_to_node(
+                state,
+                &node.node_ref,
+                ServerMsg::OverlayNetmapDelta {
+                    epoch,
+                    upserts: reverse_rows,
+                    removes: vec![],
+                },
+                true,
+            )
+            .await,
+        );
+    }
+    // #4402 — one line for the pass, with its counts.
+    if fanned.peers() > 0 {
+        debug!(
+            pass = "change",
+            node = %node.name,
+            epoch,
+            reachable,
+            peers = fanned.peers(),
+            sent = fanned.sent,
+            not_here = fanned.not_here,
+            queue_full = fanned.queue_full,
+            reverse_rows = reverse_count,
+            reverse = reverse.map_or("none", Delivery::label),
+            "overlay: delta fanned out"
+        );
     }
 }
 
@@ -2120,31 +2163,147 @@ async fn fan_delta_to(
     upserts: Vec<NetmapPeer>,
     removes: Vec<ObjectId>,
 ) {
+    let mut fanned = FanCount::default();
     for peer in peers.iter().filter(|n| n.id != exclude) {
-        send_to_node(
-            state,
-            peer,
-            ServerMsg::OverlayNetmapDelta {
-                epoch,
-                upserts: upserts.clone(),
-                removes: removes.clone(),
-            },
-        )
-        .await;
+        fanned.note(
+            push_to_node(
+                state,
+                &peer.node_ref,
+                ServerMsg::OverlayNetmapDelta {
+                    epoch,
+                    upserts: upserts.clone(),
+                    removes: removes.clone(),
+                },
+                true,
+            )
+            .await,
+        );
+    }
+    // #4402 — one line for the pass, with its counts.
+    if fanned.peers() > 0 {
+        debug!(
+            pass = "release",
+            node_id = %exclude.map(|id| id.to_hex()).unwrap_or_default(),
+            epoch,
+            peers = fanned.peers(),
+            sent = fanned.sent,
+            not_here = fanned.not_here,
+            queue_full = fanned.queue_full,
+            upserts = upserts.len(),
+            removes = removes.len(),
+            "overlay: delta fanned out"
+        );
     }
 }
 
-/// Deliver a `ServerMsg` to one overlay node, resolving its `node_ref`:
-/// agent nodes go through the Hub, tunnel-client nodes through the
-/// connection-lifetime registry. Best-effort — an offline node is
-/// simply skipped (it re-syncs on its next join).
-pub async fn send_to_node(state: &NetworkState, node: &OverlayNode, msg: ServerMsg) {
-    match &node.node_ref {
-        NodeRef::Agent { agent_id } => {
-            if let Err(e) = state.fleet.rc_hub.send_to_agent(*agent_id, msg) {
-                debug!(agent_id = %agent_id, %e, "overlay: agent node unreachable; skipped");
-            }
+/// #4402 — what one push did. A fan-out pass counts these into one line
+/// ([`FanCount`]); a single send's miss keeps a line of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Queued on the node's socket on this pod.
+    Sent,
+    /// No socket for the node on this pod: the device is offline (its row
+    /// stays in the network, so every fan includes it), or its socket is on
+    /// the other pod. A removal reaches the other pod through
+    /// `overlay_removes` (#1186); an upsert waits for the node's next join or
+    /// that pod's own refresh.
+    NotHere,
+    /// A socket on this pod that did not take the push, its queue full: a
+    /// live node missed this delta.
+    QueueFull,
+}
+
+impl Delivery {
+    /// The name the pass's line gives it.
+    fn label(self) -> &'static str {
+        match self {
+            Delivery::Sent => "sent",
+            Delivery::NotHere => "not_here",
+            Delivery::QueueFull => "queue_full",
         }
+    }
+}
+
+/// #4402 — what an agent's failed push stands for. The Hub fails a push in
+/// two ways (`Hub::send_to_agent`): no socket for the agent on this pod, or
+/// a socket whose queue is full. A failure it does not name yet is counted
+/// with the full queue, so its line stays at DEBUG.
+fn agent_miss(e: &roomler_ai_remote_control::error::Error) -> Delivery {
+    match e {
+        roomler_ai_remote_control::error::Error::AgentOffline(_) => Delivery::NotHere,
+        _ => Delivery::QueueFull,
+    }
+}
+
+/// #4402 — does a missed push write its own line at DEBUG, production's
+/// level for this crate? A single send's does, as it always did, and so does
+/// a fan's push that a live node missed. A fan's push to a node with no
+/// socket here writes at TRACE: its pass's line counts it, and one line a
+/// peer was 40 % of the busier pod's log.
+fn miss_at_debug(in_fan: bool, miss: Delivery) -> bool {
+    !in_fan || miss != Delivery::NotHere
+}
+
+/// #4402 — the counts one fan-out pass writes in its line,
+/// `overlay: delta fanned out`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FanCount {
+    sent: usize,
+    not_here: usize,
+    queue_full: usize,
+}
+
+impl FanCount {
+    fn note(&mut self, delivery: Delivery) {
+        match delivery {
+            Delivery::Sent => self.sent += 1,
+            Delivery::NotHere => self.not_here += 1,
+            Delivery::QueueFull => self.queue_full += 1,
+        }
+    }
+
+    /// The peers the pass pushed to.
+    fn peers(&self) -> usize {
+        self.sent + self.not_here + self.queue_full
+    }
+}
+
+/// #4402 — a missed push's own line, at DEBUG or at TRACE
+/// ([`miss_at_debug`]). `tracing` fixes an event's level where the event is
+/// written, so each wording has a call site at each level.
+macro_rules! miss_line {
+    ($at_debug:expr, $($line:tt)+) => {
+        if $at_debug {
+            tracing::debug!($($line)+);
+        } else {
+            tracing::trace!($($line)+);
+        }
+    };
+}
+
+/// Deliver a `ServerMsg` to one overlay node by its [`NodeRef`]: agent nodes
+/// go through the Hub, tunnel-client nodes through the connection-lifetime
+/// registry. Best-effort — a node with no socket here is simply skipped (it
+/// re-syncs on its next join). `in_fan`: the push is one of a fan-out
+/// pass's, whose own line counts a miss (#4402).
+async fn push_to_node(
+    state: &NetworkState,
+    node_ref: &NodeRef,
+    msg: ServerMsg,
+    in_fan: bool,
+) -> Delivery {
+    match node_ref {
+        NodeRef::Agent { agent_id } => match state.fleet.rc_hub.send_to_agent(*agent_id, msg) {
+            Ok(()) => Delivery::Sent,
+            Err(e) => {
+                let miss = agent_miss(&e);
+                miss_line!(
+                    miss_at_debug(in_fan, miss),
+                    agent_id = %agent_id, %e, "overlay: agent node unreachable; skipped"
+                );
+                miss
+            }
+        },
         NodeRef::TunnelClient { tunnel_client_id } => {
             // Clone the Sender out of the DashMap Ref so the shard guard
             // isn't held across the `.await` (the established pattern in
@@ -2154,41 +2313,42 @@ pub async fn send_to_node(state: &NetworkState, node: &OverlayNode, msg: ServerM
                 .get(tunnel_client_id)
                 .map(|e| e.value().clone());
             match tx {
-                Some(tx) => {
-                    if let Err(e) = tx.send(msg).await {
-                        debug!(%tunnel_client_id, %e, "overlay: client node channel closed; skipped");
+                Some(tx) => match tx.send(msg).await {
+                    Ok(()) => Delivery::Sent,
+                    Err(e) => {
+                        miss_line!(
+                            miss_at_debug(in_fan, Delivery::NotHere),
+                            %tunnel_client_id, %e, "overlay: client node channel closed; skipped"
+                        );
+                        Delivery::NotHere
                     }
+                },
+                None => {
+                    miss_line!(
+                        miss_at_debug(in_fan, Delivery::NotHere),
+                        %tunnel_client_id, "overlay: client node not connected; skipped"
+                    );
+                    Delivery::NotHere
                 }
-                None => debug!(%tunnel_client_id, "overlay: client node not connected; skipped"),
             }
         }
     }
 }
 
+/// Deliver a `ServerMsg` to one overlay node, resolving its `node_ref`:
+/// agent nodes go through the Hub, tunnel-client nodes through the
+/// connection-lifetime registry. Best-effort — an offline node is
+/// simply skipped (it re-syncs on its next join). A miss writes its own
+/// line at DEBUG; a fan-out pass pushes with [`push_to_node`] instead and
+/// counts its misses in one line (#4402).
+pub async fn send_to_node(state: &NetworkState, node: &OverlayNode, msg: ServerMsg) {
+    push_to_node(state, &node.node_ref, msg, false).await;
+}
+
 /// [`send_to_node`] by [`NodeRef`] alone — for callers that hold a session
 /// record rather than a row (FR-19's mint re-push and revoke).
 pub async fn send_to_node_ref(state: &NetworkState, node_ref: &NodeRef, msg: ServerMsg) {
-    match node_ref {
-        NodeRef::Agent { agent_id } => {
-            if let Err(e) = state.fleet.rc_hub.send_to_agent(*agent_id, msg) {
-                debug!(agent_id = %agent_id, %e, "overlay: agent node unreachable; skipped");
-            }
-        }
-        NodeRef::TunnelClient { tunnel_client_id } => {
-            let tx = state
-                .overlay_nodes_by_id
-                .get(tunnel_client_id)
-                .map(|e| e.value().clone());
-            match tx {
-                Some(tx) => {
-                    if let Err(e) = tx.send(msg).await {
-                        debug!(%tunnel_client_id, %e, "overlay: client node channel closed; skipped");
-                    }
-                }
-                None => debug!(%tunnel_client_id, "overlay: client node not connected; skipped"),
-            }
-        }
-    }
+    push_to_node(state, node_ref, msg, false).await;
 }
 
 /// What a node identity's agent or tunnel-client row says about it.
@@ -3415,6 +3575,59 @@ mod tests {
     // `roomler_ai_remote_control::models` (the free pool needs the inverse, and
     // the model crate is shared with `services` and the agent). Their tests —
     // including the round-trip that pins the two together — moved with them.
+
+    /// #4402 — a fan's push to a node with no socket on this pod writes its
+    /// line at TRACE, because the pass's line counts it. A single send's
+    /// miss, and a push a live node missed for a full queue, keep theirs at
+    /// DEBUG.
+    #[test]
+    fn only_a_fans_push_to_a_node_not_here_writes_its_line_at_trace() {
+        assert!(!miss_at_debug(true, Delivery::NotHere));
+        assert!(miss_at_debug(true, Delivery::QueueFull));
+        assert!(miss_at_debug(false, Delivery::NotHere));
+        assert!(miss_at_debug(false, Delivery::QueueFull));
+    }
+
+    /// #4402 — the Hub's two failures: no socket here, or a full queue.
+    #[test]
+    fn an_agents_failed_push_is_read_from_the_hubs_error() {
+        use roomler_ai_remote_control::error::Error;
+        assert_eq!(
+            agent_miss(&Error::AgentOffline("507f1f77bcf86cd799439011".into())),
+            Delivery::NotHere
+        );
+        assert_eq!(agent_miss(&Error::SendFailed), Delivery::QueueFull);
+    }
+
+    /// #4402 — a pass counts each push once, under what it did; its peers are
+    /// every push it made.
+    #[test]
+    fn a_pass_counts_each_push_under_what_it_did() {
+        let mut fanned = FanCount::default();
+        for d in [
+            Delivery::Sent,
+            Delivery::NotHere,
+            Delivery::NotHere,
+            Delivery::QueueFull,
+            Delivery::Sent,
+            Delivery::NotHere,
+        ] {
+            fanned.note(d);
+        }
+        assert_eq!(
+            fanned,
+            FanCount {
+                sent: 2,
+                not_here: 3,
+                queue_full: 1
+            }
+        );
+        assert_eq!(fanned.peers(), 6);
+        assert_eq!(FanCount::default().peers(), 0);
+        assert_eq!(Delivery::Sent.label(), "sent");
+        assert_eq!(Delivery::NotHere.label(), "not_here");
+        assert_eq!(Delivery::QueueFull.label(), "queue_full");
+    }
 
     /// A node row with just enough shape for `to_netmap_peer`.
     fn node(name: &str, ip: &str) -> OverlayNode {
