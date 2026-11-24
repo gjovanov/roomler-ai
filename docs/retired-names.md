@@ -137,6 +137,25 @@ its memory limit — an 80-second read outage, self-healed.
 | a sweep rewrote an anchor's own explanation | the sentence saying a name must not be rewritten had it rewritten; the count went *down*, which reads as progress | no guard can verify a prose claim — read the anchor |
 | a span marker inside a BEGIN/END region | never staleness-checked; four kept claiming the bundle was TCC-frozen a phase after it moved | none, by decision: inside a region an inner marker is decorative |
 
+## The sister guard: the word "agent" (FR-133)
+
+The `name-audit` job runs a second guard as its last step (`.github/workflows/ci.yml:2864`):
+`scripts/says-roomlerd.cjs`, FR-133 P4's. It hunts a retired *word*, not a retired name: nothing a
+person reads calls the daemon an "agent", except the wire and OS identities FR-133 keeps, each
+listed in the script with its reason. It has this page's shape (one script, a committed baseline
+that only `--update-baseline` moves, an inline marker that must carry a reason and fails when it
+covers nothing), with two differences: it counts per file rather than per marker, and a PR that
+only removes hits never fails. It reads the text a person can meet in each kind of file (string
+literals, a page's text, installer output, package metadata), never comments or log lines. How it
+reads and the baseline per surface: [FR-133 § The guard (P4)](fr/FR-133-roomlerd-not-agent.md#the-guard-p4).
+
+| | `scripts/name-audit.sh` | `scripts/says-roomlerd.cjs` |
+|---|---|---|
+| hunts | the retired names (`name-audit.sh:142`) | the word "agent" in text a person reads |
+| reads | every tracked file holding a name or a marker | the person-facing surfaces, a reader per kind of file |
+| marker | `RETIRED-NAME-ANCHOR` / `-RECORD`, colon required | `AGENT-WORD-KEPT`, colon and a reason required |
+| baseline | anchors and records pinned both ways | a count per file; only a rise fails |
+
 ## Reserved after FR-90 was parked (FR-137)
 
 FR-90 (Hive: agent sessions, the vault, knowhow) is parked on

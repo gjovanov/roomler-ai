@@ -1,6 +1,6 @@
 # FR-133: Nothing a person reads calls the daemon an "agent" — it is `roomlerd`
 
-**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 shipped in 0.4.192 (#3209); AC1 to AC4 and AC7 met 2026-11-03; P2a built (#4307), for the next agent release; P2b built (#4314), promoted 2026-11-23 (`hosted-20261123-a238604`); P2c built (#4343), rides an agent release; P3 and P4 proposed (D1–D3 decided 2026-10-30); spec and claim 2026-10-30 ·
+**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 shipped in 0.4.192 (#3209); AC1 to AC4 and AC7 met 2026-11-03; P2a shipped in 0.4.234 (#4307); P2b built (#4314), promoted 2026-11-23 (`hosted-20261123-a238604`); P2c shipped in 0.4.236 (#4343); P4 built, the guard in CI's `name-audit` job ([The guard (P4)](#the-guard-p4)); P3 proposed (D1–D3 decided 2026-10-30); spec and claim 2026-10-30 ·
 **Related:** FR-46 ([#1051](https://github.com/gjovanov/roomler-ai/issues/1051), the retired `roomler-agent` names; its "MSI installer identity — its own program" row is this FR's P1) ·
 FR-21 (the retired-name guard, `scripts/name-audit.sh`) · FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), the wizard; its phase C renames the wizard's own words)
 
@@ -48,9 +48,10 @@ and needs those lookups to accept both names.
 |---|---|---|
 | **person-facing text** | wizard pages and progress lines, the companion, the web app, the docs site, installer and CLI output, the viewer's banners | renamed: `roomlerd`, or "the daemon". A version is shown as a version (`0.4.188`), never as its tag (`agent-v0.4.188`) |
 | **display identity** | the MSI ProductName (Apps & Features), its shortcut and UI title, the Authenticode description, the `.deb`/`.rpm` summary | renamed (D1). `install.ps1` and the verify script match the old and the new name. The old one is kept as a `RETIRED-NAME-ANCHOR` for the machines installed before |
-| **wire names** | the `agent-v*` release tags every deployed updater polls; `/api/agent/*`; the `agents` collection; `TokenType::Agent`; `/ws?role=agent` | **kept**. Each is a fleet migration with a dual-accept window (FR-46 P4's pattern), and none of them is ever shown to a person once the text above shows versions |
-| **OS identities** | `com.roomler.agent`, the macOS bundle id and launchd label that every Mac's TCC grants key on (FR-46 D1); Apple's own word "LaunchAgent" | **kept** |
-| **engineering prose** | `docs/*.md`, code comments, `tracing` lines | not this FR |
+| **wire names** | the `agent-v*` release tags every deployed updater polls; `/api/agent/*` and every `/agent` path segment; the `agents` collection; `TokenType::Agent`; `/ws?role=agent`; the `rc:agent.*` message types; snake_case fields and codes (`agent_id`, `agent_offline`); the `roomler` CLI's `--agent` flag | **kept**. Each is a fleet migration with a dual-accept window (FR-46 P4's pattern), and none of them is ever shown to a person once the text above shows versions |
+| **OS identities** | `com.roomler.agent`, the macOS bundle id and launchd label that every Mac's TCC grants key on (FR-46 D1); Apple's own word "LaunchAgent"; `Software\Roomler\Agent`, the HKCU key the per-user MSI's components keep their KeyPath under (Windows Installer tracks a component by it, so a rename means new component GUIDs, and no page shows it) | **kept** |
+| **an agent that is not the daemon** | polkit's authentication agent; an EDR or endpoint-security product's agent; the HTTP `User-Agent` header; FR-90's agent sessions (an AI agent at work on a device); in the docs site, another product's agent (MeshCentral's) | **kept**: the word names something else. A spelling that always means it is in P4's list; one that only its sentence tells apart is marked where it stands |
+| **engineering prose** | `docs/*.md`, code comments, `tracing` lines, and the text only a log line carries (P4's `KEPT_PHRASES`) | not this FR |
 
 ## Phases
 
@@ -58,11 +59,11 @@ and needs those lookups to accept both names.
 |---|---|---|---|
 | P0 | spec + ledger row + issue | — | this commit |
 | P1 | the install surfaces: the MSI ProductName, shortcut and title (both flavours), the Authenticode description, the `.deb`/`.rpm` summary; `install.ps1`'s two lookups and the verify script accept both names; `install.sh`/`install.ps1` output. The wizard's own words ride FR-129 phase C, and the macOS grant notices ride #3164. **Where it landed:** `agents/roomlerd/wix/main.wxs:73` (Name), `:339` (shortcut), `:359` (title); `agents/roomlerd/wix-perMachine/main.wxs:71`, `:308`; `.github/workflows/release-agent.yml:2026`; `agents/roomlerd/Cargo.toml:7` (roomlerd ships no `.rpm`: only the companion does, and its summary never said "agent"); `scripts/install.ps1:109` (the exact names, old and new, per flavour), `:294`, `:476`; `agents/roomlerd/scripts/m3-a1-verify-win11.ps1:387`. Proved by `.github/workflows/installer-smoke.yml:1699` | copy: a revert. The lookups match both names, so an older or a newer MSI is always found | shipped: [#3209](https://github.com/gjovanov/roomler-ai/pull/3209) merged 2026-10-31, first released in 0.4.192. Field-verified on the CI MSI on 2026-10-31 and on the released 0.4.197 packages (the log below) |
-| P2a | the daemon's own notifications (the needs-attention notice: a crash loop, a re-enrollment, a server-side close, a duplicate-instance duel) and the updater reasons they carry, which now open `roomlerd:`, say the server's close reason in words and show a release as its version (`notify::versions_not_tags` in `crates/agent-core/src/notify.rs`, at the one writer); the companion's pages, the errors it hands them, and the key descriptions on its Settings page (`crates/agent-core/src/config_surface.rs`). Held by `agents/roomlerd/src/notice_text_tests.rs`, the `says_roomlerd` tests in `agents/roomler-desktop/src/commands.rs`, and four node-core tests (three in `notify.rs`, one in `config_surface.rs`) | a revert | built: [#4307](https://github.com/gjovanov/roomler-ai/pull/4307), rides an agent release |
+| P2a | the daemon's own notifications (the needs-attention notice: a crash loop, a re-enrollment, a server-side close, a duplicate-instance duel) and the updater reasons they carry, which now open `roomlerd:`, say the server's close reason in words and show a release as its version (`notify::versions_not_tags` in `crates/agent-core/src/notify.rs`, at the one writer); the companion's pages, the errors it hands them, and the key descriptions on its Settings page (`crates/agent-core/src/config_surface.rs`). Held by `agents/roomlerd/src/notice_text_tests.rs`, the `says_roomlerd` tests in `agents/roomler-desktop/src/commands.rs`, and four node-core tests (three in `notify.rs`, one in `config_surface.rs`) | a revert | shipped in 0.4.234: [#4307](https://github.com/gjovanov/roomler-ai/pull/4307), read in the released packages' bytes ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7115908297)) |
 | P2b | the web app (`ui/src`) and the server's own words: the server-written half of the viewer's banners (the page's text and the refusal reasons the server sends), and the server text a notice quotes (`crates/modules/fleet/src/hub.rs`, `socket.rs`, `auth_agent.rs`) | a revert | built (#4314), promoted 2026-11-23 (`hosted-20261123-a238604`) |
-| P2c | the daemon-written half of the viewer's banners: 33 sentences in 12 files of `agents/roomlerd/src` (`capture/mod.rs`, `audio_source.rs`, `encode/caps.rs`, `apps/{linux,macos,mod}.rs`, `input/reach.rs`, `keep_busy/engine.rs`, `files.rs`, `virtual_desktop.rs`, `peer.rs`, `display_match.rs`); the CLI and LocalAPI output: 35 sentences of `roomlerd` (`service.rs`'s enroll output, `app.rs`, `tunnel/client_mgr.rs`, `tunnel/acceptor.rs`, `probe_target.rs`, `one_row.rs`, and `signaling.rs`'s exec refusal), 4 of `agents/roomler-cli/src` (`cli.rs`, `mesh.rs`, `sshcmd.rs`) and the two tunnel refusals the acceptor sends from `crates/agent-core/src/acl.rs`; and both binaries' `--help`, 31 doc-comment lines of `agents/roomlerd/src/app.rs` and `agents/roomler-cli/src/cli.rs`. A machine or a row is "device", and the credential "device credential", as P2b words them. Held by `agents/roomlerd/src/daemon_text_tests.rs`, which reads each file with P2a's lexer (so the Linux- and macOS-only files are read on every OS) and walks every subcommand's long help, with the kept spellings listed | a revert | built ([#4343](https://github.com/gjovanov/roomler-ai/pull/4343)), rides an agent release |
+| P2c | the daemon-written half of the viewer's banners: 33 sentences in 12 files of `agents/roomlerd/src` (`capture/mod.rs`, `audio_source.rs`, `encode/caps.rs`, `apps/{linux,macos,mod}.rs`, `input/reach.rs`, `keep_busy/engine.rs`, `files.rs`, `virtual_desktop.rs`, `peer.rs`, `display_match.rs`); the CLI and LocalAPI output: 35 sentences of `roomlerd` (`service.rs`'s enroll output, `app.rs`, `tunnel/client_mgr.rs`, `tunnel/acceptor.rs`, `probe_target.rs`, `one_row.rs`, and `signaling.rs`'s exec refusal), 4 of `agents/roomler-cli/src` (`cli.rs`, `mesh.rs`, `sshcmd.rs`) and the two tunnel refusals the acceptor sends from `crates/agent-core/src/acl.rs`; and both binaries' `--help`, 31 doc-comment lines of `agents/roomlerd/src/app.rs` and `agents/roomler-cli/src/cli.rs`. A machine or a row is "device", and the credential "device credential", as P2b words them. Held by `agents/roomlerd/src/daemon_text_tests.rs`, which reads each file with P2a's lexer (so the Linux- and macOS-only files are read on every OS) and walks every subcommand's long help, with the kept spellings listed | a revert | shipped in 0.4.236 ([#4343](https://github.com/gjovanov/roomler-ai/pull/4343)), read in the released packages' bytes ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7132981129)) |
 | P3 | the docs site (`ui/docs/content`) | a revert | proposed |
-| P4 | a guard in CI: person-facing strings may not say "agent" except the listed identities (an allowlist, in the shape of `name-audit.sh`) | the guard's own baseline | proposed |
+| P4 | a guard in CI: person-facing strings may not say "agent" except the listed identities (an allowlist, in the shape of `name-audit.sh`). **Where it landed:** `scripts/says-roomlerd.cjs` (Node, no dependencies) and its baseline `scripts/says-roomlerd-baseline.txt`, run as the last step of CI's `name-audit` job (`.github/workflows/ci.yml:2862-2864`). How it reads, how a kept word is marked and how the baseline moves: [The guard (P4)](#the-guard-p4) | the guard's own baseline | built |
 | D | docs: `docs/installation.md` (what Windows lists), the `ship-it` skill (the signing description), this spec's log | — | `docs/installation.md` § Windows rides P1's PR, and so does `ship-it` § 2: the MSI's name is display only, and a change to it ships in one order, because `install.ps1` matches exact names and is served by the server image. Neither `ship-it` nor `docs/code-signing.md` ever named the signing description (checked 2026-10-31), so there was nothing to rename. This log, as phases land |
 
 ## Acceptance criteria
@@ -107,6 +108,93 @@ and needs those lookups to accept both names.
 - Wire names and OS identities (the table above).
 - The retired `roomler-agent` names (FR-46).
 - Engineering docs, code comments and log lines.
+
+## The guard (P4)
+
+`scripts/says-roomlerd.cjs` holds every surface in CI: a new "agent" in text a person reads fails
+the PR that adds it, whichever file it lands in. It is Node with no dependencies, so the
+`name-audit` job runs it as its last step (`.github/workflows/ci.yml:2862-2864`) in seconds, with
+no build and no install. Its `if: ${{ !cancelled() }}` lets it report even when the retired-name
+audit before it failed.
+
+```mermaid
+flowchart TD
+    F[a file on a surface] --> R[the reader for its kind keeps the text a person can meet:<br/>no comments, log macros or test code]
+    R --> I[the identities are taken out]
+    I --> W{agent or agents<br/>as a word?}
+    W -- no --> P[passes]
+    W -- yes --> C{prose, or a literal with<br/>a space or a capital?}
+    C -- no, an identifier --> P
+    C -- yes --> K{marked AGENT-WORD-KEPT<br/>or in KEPT_PHRASES?}
+    K -- yes --> P
+    K -- no --> B{the file above its<br/>baseline count?}
+    B -- no --> P
+    B -- yes --> X[fails: file:line, the phrase<br/>and the two fixes]
+```
+
+| command | what it does |
+|---|---|
+| `node scripts/says-roomlerd.cjs --check` | CI's step. The self-test first (each reader, the rule, planted hits that must fail and kept ones that must pass, and the agreement below), then the tree against the baseline |
+| `node scripts/says-roomlerd.cjs` | every hit per surface, as `file:line` and its phrase; `--summary` prints the counts only |
+| `node scripts/says-roomlerd.cjs --identities` | the kept spellings and phrases, each with its reason |
+| `node scripts/says-roomlerd.cjs --update-baseline` | rewrites the baseline from the tree; refused while a marker is at fault |
+
+**What it reads.** A reader per kind of file: Rust string literals outside comments, log macros and
+test code (P2a's lexer); JS strings outside comments and `console.*` calls; a page's text and its
+`placeholder`, `title`, `aria-label` and `alt`; Markdown prose; the quoted strings and heredocs of
+`sh` and `ps1`; a `.wxs`'s attribute values and text; the shown keys of a `Cargo.toml`,
+`tauri.conf.json`, `.desktop` entry or systemd unit; every line of an installed README; and the
+description the release's Windows signing step stamps on the MSI. Once the identities are out, a hit
+is `agent` or `agents` as a word. Prose counts as it stands; in code, a literal with no space and no
+capital (`'agent'`, `"agent-logs"`) is an identifier. The UI spec counts the same way, and the Rust
+tests count only a literal with a space. It cannot see a word built at run time from parts, nor the
+binaries' `--help`, whose text is doc comments: `agents/roomlerd/src/daemon_text_tests.rs` walks
+every subcommand's help instead.
+
+**One list, held in agreement.** The identities are the key-design table above, each in the script
+with its reason. `ui/src` is read by its own spec, `ui/src/__tests__/saysRoomlerd.spec.ts`, and not
+twice. The self-test fails when that spec's `IDENTITIES` are not in the guard's list verbatim, or
+when a spelling `daemon_text_tests.rs` or `notice_text_tests.rs` keeps is not kept by the guard too,
+and its message names the entry to add.
+
+**Keeping one.** Reword it first: `roomlerd`, "the daemon", or "device" as P2b words them. When the
+word must stay, a comment says why, on the line above it or on its own line:
+`AGENT-WORD-KEPT: <the reason>`. It covers its own line and the next line that is neither blank nor
+a comment. A marker with no reason fails, and so does one that covers nothing. A phrase in a file
+that cannot hold a comment, or in one whose comments a person reads (an installed README), or one
+that only a log line carries, goes in the script's `KEPT_PHRASES` with its reason; a listed phrase
+that is gone fails too. A new identity goes in `IDENTITIES` with its reason, and in the key-design
+table.
+
+**The baseline is the kill switch.** `scripts/says-roomlerd-baseline.txt` holds the known hits as a
+count per file, never a line number (so an edit elsewhere in a file never moves it), grouped by
+surface under the owner that removes them. `--check` fails only when a file holds more than its
+count. A PR that only removes hits passes and is told how to lock the gain in. A count moves only
+with `--update-baseline`, committed with its reason, as with `scripts/name-audit.sh`.
+
+The baseline as P4 wrote it, read on master `d3f974e3f`:
+
+| surface | read | hits | owner |
+|---|---|---|---|
+| the web app, `ui/src` | by its spec | — | P2b |
+| the daemon (AC5b): `agents/roomlerd`, `roomler-cli`, `roomlerdw`, `roomler-cli-shim`; `crates/agent-core`, `localapi`, `tunnel-core` | 448 files | 4 | FR-133 follow-up |
+| the companion (AC5): `agents/roomler-desktop/src` | 26 files | 0 | — |
+| the server's own words: `crates/api`, `core`, `remote_control`, `services`, every `crates/modules/*` | 329 files | 60 | FR-133 follow-up |
+| the install scripts' output: `install.sh`, `install.ps1`, the `.deb`'s maintainer scripts, the `.pkg`'s postinstall | 6 files | 3 | FR-133 follow-up |
+| the display identity: both MSIs' `.wxs`, the packages' metadata and installed READMEs, the signing description | 20 files | 1 | FR-133 follow-up |
+| the wizard (AC5): `agents/roomler-setup`, `crates/roomler-setup-core` | 40 files | 0 | FR-129 phase C |
+| the docs site, `ui/docs/content` | 67 files | 242 | P3 |
+
+> ⚠️ **AC5b's surface is not empty.** Its 4 are the tunnel gate's refusal reasons
+> (`crates/tunnel-core/src/policy.rs:212`, `:221`, `:227`, `:236`): the server evaluates the gate
+> and sends the reason to the tunnel client, which logs it or returns it as its error. AC5b stays
+> open until they are reworded. The server's 60 sit in 21 files: refusals a person reads (the
+> device console's, SSH's, the tunnel's, an external login's), the growth pages' "Agent version"
+> labels, the daemon's own handshake errors, and internal 500 text. The install scripts' 3 are the
+> `.pkg`'s postinstall calling the per-user launchd job an "agent"
+> (`agents/roomlerd/packaging/macos/postinstall:394`, `:426`, `:649`), and the display identity's 1
+> is a line of the `.deb`'s README (`agents/roomlerd/packaging/linux/README.Debian:48`). The
+> baseline file lists each with its words.
 
 ## Field-verification log
 
