@@ -3005,7 +3005,7 @@ impl OverlayRuntime {
                         // The guard it replaces is inert (retries run only
                         // while withdrawn); dropped off-loop all the same.
                         let old = std::mem::replace(&mut subnet_router, guard);
-                        let _ = tokio::task::spawn_blocking(move || drop(old));
+                        drop(tokio::task::spawn_blocking(move || drop(old)));
                     }
                     if changed {
                         self.mirror_offer(&offer_tracker);
@@ -4607,10 +4607,10 @@ impl OverlayRuntime {
         // #3562 — a setup retry or a revert still running finishes before the
         // runtime returns: what a retry set up is reverted by its own guard,
         // never left behind unguarded.
-        if let Some(t) = nat_task.take() {
-            if let Ok((guard, _)) = t.await {
-                let _ = tokio::task::spawn_blocking(move || drop(guard)).await;
-            }
+        if let Some(t) = nat_task.take()
+            && let Ok((guard, _)) = t.await
+        {
+            let _ = tokio::task::spawn_blocking(move || drop(guard)).await;
         }
         if let Some(r) = pending_revert.take() {
             let _ = r.await;
