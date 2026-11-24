@@ -191,7 +191,7 @@ duplicate-delivery race below. Any report about a *different* order, and any
 ## The state the dashboard shows
 
 Resolved **once, server-side**, from the order, the claim and the proof
-(`crates/modules/fleet/src/agent.rs:943-1036`); the grid only names the states
+(`crates/modules/fleet/src/agent.rs:1160-1321`); the grid only names the states
 (`AgentsSection.vue:2115-2216`). The device row also carries `overlay_public_key` and
 `overlay_key_epoch` straight from the proof (`agent.rs:2225-2226`), so an operator
 can *see* the key change instead of trusting a chip.

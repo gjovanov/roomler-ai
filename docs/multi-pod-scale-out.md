@@ -281,7 +281,7 @@ next frame is read, and a Connect right after a Disconnect gets a new session. A
 reaches the device within the same-pod time plus `RPC_DEADLINE` (2 s,
 `crates/core/src/cluster/bus.rs:42`), the longest one relayed frame waits on a live bus. The tests
 measure both times in one run and hold the cross-pod one to that bound (`bound_from`,
-`crates/tests/src/rc_cross_pod_hangup_tests.rs:145`).
+`crates/tests/src/rc_cross_pod_hangup_tests.rs:147`).
 
 **The log line.** Each relayed hang-up writes ONE line at info on the viewer's pod:
 `rc relay: hang-up relayed to the socket's owner pods` (`HANGUP_RELAYED_LINE`, `relay.rs:827`). Its
