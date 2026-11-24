@@ -491,12 +491,15 @@ async fn standard_token(app: &TestApp, tenant_id: &str, admin_token: &str) -> St
 }
 
 /// #4331 — the enroll answer's `ephemeral` is what the ROW is, because a
-/// daemon records it into its config. A standard token over a LIVE ephemeral
-/// row with the same machine id refreshes that row, and the row stays
-/// ephemeral (nothing after enrollment flips a device), so the answer says
-/// ephemeral: a config that read `false` would not remove itself on a stop
-/// while the reaper still deletes its row. Once the row is removed, the same
-/// machine id enrolls a NEW permanent device, and the answer says that.
+/// daemon records it into its config.
+///
+/// T11 (#4352) — a standard token over a LIVE ephemeral row with the same
+/// machine id is a 409, decided before the token is spent: the row stays as it
+/// was (ephemeral, the same id), and the person is told to remove the device
+/// first. Once the row is removed, the SAME token enrolls the machine id as a
+/// NEW permanent device, and the answer says that. Before #4352 the token
+/// refreshed the live row, which stayed ephemeral, and the device then removed
+/// it at its next OS stop.
 #[tokio::test]
 async fn the_enroll_answer_is_the_rows_nature_not_the_tokens() {
     let app = TestApp::spawn().await;
@@ -516,28 +519,76 @@ async fn the_enroll_answer_is_the_rows_nature_not_the_tokens() {
     let eph: Value = resp.json().await.unwrap();
     assert_eq!(eph["ephemeral"], json!(true));
     let eph_id = eph["agent_id"].as_str().unwrap().to_string();
+    let before = agent_row(&app, &eph_id).await.unwrap();
 
-    // A standard token, the same machine id, the row still live.
+    // A standard token, the same machine id, the row still live: 409.
     let token = standard_token(&app, &t.tenant_id, admin).await;
     let resp = enroll_raw(&app, &token, "ekey7-mid", json!({})).await;
-    assert!(resp.status().is_success());
-    let refreshed: Value = resp.json().await.unwrap();
-    assert_eq!(
-        refreshed["agent_id"], eph["agent_id"],
-        "the live row is refreshed"
-    );
-    let row = agent_row(&app, &eph_id).await.unwrap();
+    assert_eq!(resp.status(), 409, "a live ephemeral row is not refreshed");
+    let refused: Value = resp.json().await.unwrap();
+    assert_eq!(refused["error"], json!("conflict"));
+    let message = refused["message"].as_str().unwrap_or_default();
     assert!(
-        row.get_bool("ephemeral").unwrap_or(false),
-        "the row stays ephemeral"
+        message.contains("ephemeral") && message.contains("Devices page"),
+        "{message}"
     );
     assert_eq!(
-        refreshed["ephemeral"],
-        json!(true),
-        "the answer says what the row is"
+        agent_row(&app, &eph_id).await.as_ref(),
+        Some(&before),
+        "the row is unchanged: still ephemeral, the same id"
     );
 
-    // Removed (the Devices page), the same machine id is a new permanent device.
+    // Removed (the Devices page), the SAME token makes the machine id a new
+    // permanent device: the 409 did not spend it.
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{}/agent/{eph_id}", t.tenant_id),
+            admin,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let resp = enroll_raw(&app, &token, "ekey7-mid", json!({})).await;
+    assert!(
+        resp.status().is_success(),
+        "the token was not spent: {}",
+        resp.status()
+    );
+    let permanent: Value = resp.json().await.unwrap();
+    assert_ne!(permanent["agent_id"], eph["agent_id"], "a new row");
+    assert_eq!(permanent["ephemeral"], json!(false));
+    let row = agent_row(&app, permanent["agent_id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        !row.get_bool("ephemeral").unwrap_or(true),
+        "a permanent row"
+    );
+}
+
+/// T12 (#4352) — what a standard token did before stays: over a LIVE
+/// PERMANENT row it refreshes that row (the same id, still permanent), and
+/// over a REMOVED ephemeral row it makes a new permanent device.
+#[tokio::test]
+async fn a_standard_token_still_refreshes_a_live_permanent_row() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("ekey9").await;
+    let admin = t.admin.access_token.as_str();
+    enable_keys(&app, &t.tenant_id, admin).await;
+
+    // A removed ephemeral row: hard-deleted, so the machine id is new again.
+    let minted = mint_key(&app, &t.tenant_id, admin, json!({})).await;
+    let resp = enroll_raw(
+        &app,
+        minted["key"].as_str().unwrap(),
+        "ekey9-mid",
+        json!({}),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let eph: Value = resp.json().await.unwrap();
+    let eph_id = eph["agent_id"].as_str().unwrap().to_string();
     let resp = app
         .auth_delete(
             &format!("/api/tenant/{}/agent/{eph_id}", t.tenant_id),
@@ -548,16 +599,100 @@ async fn the_enroll_answer_is_the_rows_nature_not_the_tokens() {
         .unwrap();
     assert!(resp.status().is_success());
     let token = standard_token(&app, &t.tenant_id, admin).await;
-    let resp = enroll_raw(&app, &token, "ekey7-mid", json!({})).await;
-    assert!(resp.status().is_success());
+    let resp = enroll_raw(&app, &token, "ekey9-mid", json!({})).await;
+    assert!(resp.status().is_success(), "{}", resp.status());
     let permanent: Value = resp.json().await.unwrap();
     assert_ne!(permanent["agent_id"], eph["agent_id"], "a new row");
     assert_eq!(permanent["ephemeral"], json!(false));
+
+    // A live permanent row: refreshed, as before.
+    let again = standard_token(&app, &t.tenant_id, admin).await;
+    let resp = enroll_raw(&app, &again, "ekey9-mid", json!({})).await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let refreshed: Value = resp.json().await.unwrap();
+    assert_eq!(
+        refreshed["agent_id"], permanent["agent_id"],
+        "the live row is refreshed"
+    );
+    assert_eq!(refreshed["ephemeral"], json!(false));
     let row = agent_row(&app, permanent["agent_id"].as_str().unwrap())
         .await
         .unwrap();
     assert!(
         !row.get_bool("ephemeral").unwrap_or(true),
-        "a permanent row"
+        "still permanent"
+    );
+}
+
+/// T13 (#4352) — an ephemeral key adding a SECOND organization to an enrolled
+/// device is refused: the row the key made is gone again, and the device's
+/// config file is unchanged. Driven through `org join`, the daemon's own
+/// caller, against the real routes.
+#[tokio::test]
+async fn an_ephemeral_key_cannot_add_a_second_org_to_an_enrolled_device() {
+    let app = TestApp::spawn().await;
+    let home = app.seed_tenant("ekey8a").await;
+    let other = app.seed_tenant("ekey8b").await;
+    enable_keys(&app, &other.tenant_id, &other.admin.access_token).await;
+
+    // The device: enrolled in `home` with a standard token, its config on disk.
+    let cfg =
+        crate::agent_tests::enrol_via_agent_lib(&app, &home, "ekey8-mid", "Two-org box").await;
+    assert!(!cfg.ephemeral);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    roomlerd::config::save(&path, &cfg).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    // An ephemeral key of the OTHER organization, handed to the device.
+    let minted = mint_key(&app, &other.tenant_id, &other.admin.access_token, json!({})).await;
+    let joined = roomlerd::org_join::join_org(
+        &cfg,
+        &path,
+        std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        minted["key"].as_str().unwrap(),
+        None,
+        None,
+    )
+    .await;
+    let error = match joined {
+        Ok(outcome) => panic!("an ephemeral key added an organization: {outcome:?}"),
+        Err(e) => e,
+    };
+    let refused = error
+        .downcast_ref::<roomlerd::enrollment::EphemeralOrgRefused>()
+        .unwrap_or_else(|| panic!("refused for another reason: {error:#}"));
+    assert_eq!(refused.tenant_id, other.tenant_id);
+    assert!(
+        matches!(
+            refused.row,
+            roomlerd::enrollment::RefusedRow::Made {
+                removed: Some(Ok(())),
+                ..
+            }
+        ),
+        "{:?}",
+        refused.row
+    );
+
+    // The row the key made is gone, and the file is as it was.
+    assert!(
+        agent_row(&app, &refused.agent_id).await.is_none(),
+        "the row the key made is removed"
+    );
+    let left = app
+        .db
+        .collection::<bson::Document>("agents")
+        .find_one(bson::doc! {
+            "tenant_id": ObjectId::parse_str(&other.tenant_id).unwrap(),
+            "machine_id": "ekey8-mid",
+        })
+        .await
+        .unwrap();
+    assert!(left.is_none(), "no row of this machine in the other org");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the config is unchanged"
     );
 }

@@ -9,6 +9,9 @@ AC6 was re-read 2026-10-29 on two two-org hosts running the released 0.4.185.
 · **Owner**: overlay/networking ·
 **Issue**: [#1272](https://github.com/gjovanov/roomler-ai/issues/1272)
 
+**Extension C3** (claimed on #1272 2026-11-23, before any of its code): the same
+subnet approved in two orgs, AC12-AC15, all open. Its P8 ships in #4279's PR.
+
 ## Goal
 
 Turn two overlay properties from **promises into properties**:
@@ -38,6 +41,25 @@ Turn two overlay properties from **promises into properties**:
   (`crates/tests/src/overlay_growth_tests.rs`) fakes the scale with a cursor jump and says
   so in its own header; it cannot prove an *old daemon* sizes its netmask and NAT scope
   correctly from the string the server sends.
+
+### C3: the same subnet approved in two orgs (extension, 2026-11-23)
+
+Read on master `c05a5644e` while fixing
+[#4279](https://github.com/gjovanov/roomler-ai/issues/4279). This extends FR-68's second
+goal, catching a #1237-class multi-org route war before the field, from overlay addresses
+to **approved subnet routes**.
+
+- Multi-org gives each org its own TUN adapter on every OS, and each org's runtime runs its
+  own route guard (`docs/multi-org.md`, "Per-org TUN adapters").
+- Nothing stops two tenants from approving the same CIDR, because private ranges overlap
+  across tenants. A host in both orgs then installs that CIDR on both adapters.
+- Install writes the route with `ip route replace` on Linux and delete-then-add on macOS, at
+  every carrier install, so the last carrier install wins and then all is quiet. On Windows
+  the two rows coexist, because each write touches only its own interface's row.
+- #4279's first design would have started a war. It re-asserted subnets every wave with
+  install's write, so on Linux and macOS each org's guard would displace the other's route
+  on every wave: a self-sustaining flip at about #1282's rate (~20 waves/min per runtime),
+  plus #1856's hole on macOS at each flip.
 
 ## Key design (anchors verified against `origin/master` @ `b91a7404`)
 
@@ -148,6 +170,9 @@ the next reader does not assume back-off exists.
 | P5 | The two cells, incl. the `multiorg-control` negative control | the cell tuples |
 | P6 | L3 fleet read-only arm | — |
 | P7 | Handover; decide on `multi_block_enabled` | the flag itself |
+| P8 | **C3(a)** the route guard only restores a MISSING subnet route and never displaces one, on every OS (Linux: a read, then an exclusive `add`; macOS: the three-way read, an `add` only on Absent; Windows: `ensure` on our row, with #1328's stand-down). Install is unchanged. Ships in #4279's PR | `ROOMLERD_OVERLAY_SUBNET_GUARD=0` (the guard's subnet arm) |
+| P9 | **C3(b)** the overlap WARN extended to approved subnets: two orgs on one host that route overlapping CIDRs emit one WARN naming the CIDR and both orgs | WARN-only |
+| P10 | **C3(c)** a two-org stress cell with the same CIDR approved in both orgs, plus a negative control | the cell tuples |
 
 ## Acceptance criteria
 
@@ -197,6 +222,16 @@ the next reader does not assume back-off exists.
       (flowchart, the counters table, the three cells, the overlap WARN); the
       `overlay_blocks` and unique-identity rows in `docs/data-model.md`; the
       `multi-org.md` row in `docs/README.md`'s index — all in the P1-tail PR.
+- [ ] **AC12** (C3) The route guard restores a missing approved subnet route within one
+      wave and never displaces a route that holds the prefix. Unit cells on Windows, Linux
+      and macOS; lab cells on a Windows and a Linux client (#4279).
+- [ ] **AC13** (C3) A host whose two orgs route overlapping subnet CIDRs emits the overlap
+      WARN naming the CIDR and both orgs, and disjoint subnets emit none.
+- [ ] **AC14** (C3) A two-org Linux guest with the same CIDR approved in both orgs shows
+      zero subnet route flips over 10 minutes: the wave counters stay at cadence. The
+      negative control (the guard writing with `replace`) reproduces the flip.
+- [ ] **AC15** (C3) Docs: this spec, and `docs/overlay-communication.md`'s route-guard
+      section, cover subnets.
 
 ## Open decisions
 
@@ -204,6 +239,10 @@ the next reader does not assume back-off exists.
   ceiling. Largest org today is 17 devices against 1 022.
 - Whether the mixed-prefix (`/16` + `/22`) shape should be **refused at grow time** rather
   than merely tested — it is the only shape where a server rollback is catastrophic.
+- (C3) **Which org's subnet route wins at install time.** Today the last carrier install
+  wins. The choices: keep that; make install restore-only too, so the first install wins;
+  or a deterministic rule on the host. This needs the operator's word. Until then, C3(a)
+  only stops the guards from fighting.
 
 ## Out of scope
 
@@ -211,6 +250,9 @@ the next reader does not assume back-off exists.
 - The structural fix for nested blocks (FR-47 reconciler).
 - The pump-loop stall detector and the other items from the blocking-work analysis.
 - Anything that mutates grox / demo / jovanov: the fleet arm is **read-only**.
+- (C3) A revoked subnet's route stays until the next carrier install, and eviction deletes
+  no subnet route. Both are pre-existing, as on master.
+- (C3) Peer `/32`s keep their write. Their cross-org case is AC9's nested-block WARN.
 
 ## Where this stands — 2026-10-29
 
@@ -365,7 +407,7 @@ and can run against prod.
   unknown `--type`, and advertising a cell with no driver breaks a matrix run.
 
 ⚠️ **The guest sequence must resolve two rules that collide.** Flipping
-`overlay_multi_org` requires a daemon restart (`org_join.rs:98-102,208-233`),
+`overlay_multi_org` requires a daemon restart (`org_join.rs:98-102,218-243`),
 while FR-51 says never SIGTERM an ephemeral daemon — it self-unenrolls and its
 row is deleted. Resolution: write the FULL config (both enrollments + the flag)
 *before* the daemon's single clean start. install → stop the auto-started

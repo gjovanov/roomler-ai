@@ -107,7 +107,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAgentStore, type KeepBusyHistoryEntry } from '@/stores/agents'
 import { patternLabel, type KeepBusyPattern } from '@/composables/keepBusy'
@@ -186,36 +186,52 @@ async function fetchPage(before?: string): Promise<KeepBusyHistoryEntry[]> {
   })
 }
 
+// #4257 — only the latest page asked writes, and only while the section is
+// still the org it was asked for: an answer for the previous org (or for an
+// older filter) lands after the change and must not fill, or append to, the
+// new org's list.
+let seq = 0
+
 async function reload() {
+  const mine = ++seq
+  const tenantId = props.tenantId
+  const current = () => mine === seq && tenantId === props.tenantId
   loading.value = true
   error.value = null
   try {
     const page = await fetchPage()
+    if (!current()) return
     entries.value = page
     hasMore.value = page.length >= PAGE
   } catch (e) {
+    if (!current()) return
     // A 403 is an answer (FR-82): it shows here and ends nothing.
     error.value = (e as Error).message
     entries.value = []
     hasMore.value = false
   } finally {
-    loading.value = false
+    if (current()) loading.value = false
   }
 }
 
 async function loadMore() {
   const last = entries.value.at(-1)
   if (!last) return reload()
+  const mine = ++seq
+  const tenantId = props.tenantId
+  const current = () => mine === seq && tenantId === props.tenantId
   loading.value = true
   error.value = null
   try {
     const page = await fetchPage(last.at)
+    if (!current()) return
     entries.value = [...entries.value, ...page]
     hasMore.value = page.length >= PAGE
   } catch (e) {
+    if (!current()) return
     error.value = (e as Error).message
   } finally {
-    loading.value = false
+    if (current()) loading.value = false
   }
 }
 
@@ -224,10 +240,24 @@ function onFilter(v: string | null) {
   void reload()
 }
 
-onMounted(() => {
-  void reload()
-  if (!agentStore.agents.length) void agentStore.fetchAgents(props.tenantId)
-})
+// #4257 — the history follows its org: the Settings page is reused when only
+// the org in the URL changes, so a load on mount alone kept the previous
+// org's rows. A device filter names the previous org's device: it is reset.
+// The devices name the rows and fill the filter: this org's, not any.
+watch(
+  () => props.tenantId,
+  (tenantId, previous) => {
+    if (previous !== undefined) {
+      agentFilter.value = ''
+      entries.value = []
+      hasMore.value = false
+      error.value = null
+    }
+    void reload()
+    void agentStore.ensureAgents(tenantId)
+  },
+  { immediate: true },
+)
 
 defineExpose({ reload })
 </script>

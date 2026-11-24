@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3911`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:4933`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:4956`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -818,7 +818,7 @@ evicts it and opens a capture of its own
 and every session registered at that moment gets, one stop grace (1 s) after
 the exit, the reason a session opened while the desktop is down gets:
 `backend_error`, with *this device's virtual desktop is down: its X server
-(Xvfb) exited: … The agent starts it again by itself; reconnect in a moment.*
+(Xvfb) exited: … The daemon starts it again by itself; reconnect in a moment.*
 (`down_detail_of`, `agents/roomlerd/src/virtual_desktop.rs:438`). The
 supervisor reads who to tell on its own thread and sends one
 `spawn_capture_unavailable_notice` per session on the daemon's runtime
@@ -3219,7 +3219,7 @@ account owns is refused (`:605`). An answer from the tray, from `roomlerd consen
 or from a native panel reaches the broker in process (`record_decision`, `:925`),
 which writes it there. `roomlerd consent` writes the file itself only when it
 cannot reach the device service, and then only a console-run agent in the same
-profile sees it (`consent_cmd`, [`app.rs:2550`](../agents/roomlerd/src/app.rs#L2550)).
+profile sees it (`consent_cmd`, [`app.rs:2559`](../agents/roomlerd/src/app.rs#L2559)).
 
 | The daemon's own folder | the file channel | questions and answers | the log, once at start |
 |---|---|---|---|
@@ -5336,7 +5336,7 @@ session not yet live, and an external one, end as before FR-138.
 | What ends it | What the device does | Proven by |
 |---|---|---|
 | a stop or a restart | the `Shutdown` arm closes every peer | `arm_shutdown_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2381`); `a_terminal_exit_closes_kept_sessions_too` (`:2912`) |
-| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:8447`) |
+| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:8690`) |
 | sleep, a resume from suspend | the `Sleep` and `ResumeFromSuspend` arms close every peer. A pause of at least 120 s, measured at the RX deadline, is read as a resume (M2) | `arm_sleep_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2382`); `arm_resume_from_suspend_closes_every_peer` (`:2383`); `the_rx_deadline_reads_a_long_pause_as_a_resume_from_suspend` (`:3159`) |
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1155`) |
@@ -7827,8 +7827,12 @@ worker for an account with no config, and no last good copy of one that
 holds an enrollment (#4157), exits `NO_ENROLLMENT_EXIT_CODE`
 (78, [`daemon_error.rs:153`](../agents/roomlerd/src/daemon_error.rs#L153)).
 `should_record_supervisor_crash` leaves it out of the reports, and the host
-backs it off exactly as an exit 1. It ends before this bookkeeping, with no
-config to keep a count in, so it needs no `--prior-end` word. Since #4071 the
+backs it off exactly as an exit 1. Since #4324 it does not count toward the
+host's crash-loop alarm and never raises it: the host names the way forward in
+one line instead
+([`ExitTally`](../agents/roomlerd/src/win_service/supervisor.rs#L1269)). It
+ends before this bookkeeping, with no config to keep a count in, so it needs
+no `--prior-end` word. Since #4071 the
 GUI worker FR-43's macOS supervisor starts (`run --supervised` on a two-row
 Mac) exits 78 as well, and that supervisor's `crash_summary` leaves it out of
 its reports. Since FR-150 P2 so does the per-user task's daemon, whose
@@ -7873,10 +7877,10 @@ Each one now marks its run clean before it ends, through
 [`agents/roomlerd/src/run_end.rs`](../agents/roomlerd/src/run_end.rs):
 
 - `run_cmd` opens the run's book once the start's mark is saved
-  ([`app.rs:4386`](../agents/roomlerd/src/app.rs#L4386)), and never on the
+  ([`app.rs:4406`](../agents/roomlerd/src/app.rs#L4406)), and never on the
   read-only view an unenrolled GUI worker runs on (FR-43 P3a). It shares the
   P6 write lock with the book
-  ([`app.rs:4843`](../agents/roomlerd/src/app.rs#L4843)).
+  ([`app.rs:4866`](../agents/roomlerd/src/app.rs#L4866)).
 - The mark takes that lock, reads the file again, calls
   `mark_clean_shutdown` and saves, on a thread of its own. The end waits for
   it at most `MARK_BUDGET` (2 s) and then exits anyway. A mark that comes too
@@ -7903,7 +7907,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4358`](../agents/roomlerd/src/app.rs#L4358),
+([`agents/roomlerd/src/app.rs:4378`](../agents/roomlerd/src/app.rs#L4378),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 
@@ -8417,8 +8421,8 @@ sequenceDiagram
   wall clock. On the vmtest guest whose clock had been corrected backwards by
   nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
   replaced it, so an "older than this host" rule would have left it running.
-- **When it runs.** Once before the first spawn (`supervisor.rs:1498`). Again in
-  the `Stop` arm (`supervisor.rs:1647`) before it gives up: if that pass ended an
+- **When it runs.** Once before the first spawn (`supervisor.rs:1597`). Again in
+  the `Stop` arm (`supervisor.rs:1753`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
   with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).

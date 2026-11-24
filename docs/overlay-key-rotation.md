@@ -191,9 +191,9 @@ duplicate-delivery race below. Any report about a *different* order, and any
 ## The state the dashboard shows
 
 Resolved **once, server-side**, from the order, the claim and the proof
-(`crates/modules/fleet/src/agent.rs:885-970`); the grid only names the states
+(`crates/modules/fleet/src/agent.rs:919-1004`); the grid only names the states
 (`AgentsSection.vue:2102-2203`). The device row also carries `overlay_public_key` and
-`overlay_key_epoch` straight from the proof (`agent.rs:2100-2108`), so an operator
+`overlay_key_epoch` straight from the proof (`agent.rs:2145-2146`), so an operator
 can *see* the key change instead of trusting a chip.
 
 ```mermaid
@@ -221,14 +221,14 @@ flowchart TD
 | `delivered` | pushed to a live socket, no answer for **this** order yet | *rotating key…* | wait a few seconds |
 | `rotating` | the device claims `rotated` (≤ 60 s ago) but its last join still shows the previous key | *rotating key…* | wait — it is re-joining |
 | `rotated` | the join proves it (key ≠ `public_key_before` after the order), **or** the claim's `new_public_key` is what the device joined with | *key rotated · e⟨epoch⟩* | done |
-| `reported_not_joined` | claimed `rotated` > 60 s ago (`KEY_ROTATION_REJOIN_GRACE_SECS`, `agent.rs:1163`), still joined under another key | *key not re-joined* | the re-join failed — read the device log |
+| `reported_not_joined` | claimed `rotated` > 60 s ago (`KEY_ROTATION_REJOIN_GRACE_SECS`, `agent.rs:1197`), still joined under another key | *key not re-joined* | the re-join failed — read the device log |
 | `refused` | the device answered `disabled`, `rate_limited` or `unsupported` | *key rotation refused (⟨outcome⟩)*, tooltip = `report.detail` | fix the stated thing |
 | `failed` | mint or persist failed; identity unchanged | *key rotation failed* | `report.detail` says why |
 | `unsupported` | an order stands, no answer, and the device's hello lacks `key-rotate` | *roomlerd too old for key rotation* | update the device; the order stays queued and runs on the first connect that advertises the verb |
 
 ⚠️ **Compare `request_id`s, never outcomes alone.** A report about an earlier order
 says nothing about this one — the remote-configuration lesson, applied here
-(`agent.rs:1174`).
+(`agent.rs:1208`).
 
 ⚠️ **`unsupported` is a state an *offline* order reaches.** An online pre-feature
 device never gets an order recorded — the route refuses it 409 up front. The state
@@ -440,12 +440,12 @@ The server cannot see the device switch, so a switched-off device is still order
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:649-672`; `crates/services/src/dao/agent.rs:1189` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1154-1184` |
-| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1094-1255`, `:2104-2112` |
+| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1128-1289`, `:2138-2146` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:838-846` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6309-6451`, `:3563-3605`, `:3607-3628`, `:1427-1454` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:1091-1096`, `:1876-1881`, `:2006-2008`; `config_surface.rs:1266-1273` |
-| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2100-2201`; `ui/src/stores/agents.ts:1210-1224` |
+| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2100-2201`; `ui/src/stores/agents.ts:1277-1291` |
 | P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3224`, `:3242`, `:3964`, `:3212`, `:10560`, `:10842`; the node and network fields `:7027`, `:7269` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7421` |
 | P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:378-420`, `:441-471`, `:791`, `:812`, `:861` |

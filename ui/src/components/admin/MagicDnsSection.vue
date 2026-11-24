@@ -78,7 +78,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useOverlayRoutesStore } from '@/stores/overlayRoutes'
 
 const props = defineProps<{ tenantId: string }>()
@@ -98,22 +98,33 @@ function isRefusal(e: unknown): boolean {
   return typeof e === 'object' && e !== null && (e as { status?: unknown }).status === 403
 }
 
+// #4257 — only the latest load writes the form, and only while the page still
+// shows the org it asked for: an answer for an org the page has left is dropped.
+let loadSeq = 0
+
 async function loadSettings() {
+  const tenantId = props.tenantId
+  const mine = ++loadSeq
   try {
-    const s = await store.fetchMagicDns(props.tenantId)
+    const s = await store.fetchMagicDns(tenantId)
+    if (mine !== loadSeq || tenantId !== props.tenantId) return
     domain.value = s.magic_dns_domain ?? ''
     nameserversText.value = s.magic_dns_nameservers.join(', ')
   } catch (e) {
-    error.value = (e as Error).message
+    if (mine === loadSeq && tenantId === props.tenantId) error.value = (e as Error).message
   }
 }
 
 async function load() {
-  canEdit.value = await store.mayEditMagicDns(props.tenantId)
+  const tenantId = props.tenantId
+  const may = await store.mayEditMagicDns(tenantId)
+  if (tenantId !== props.tenantId) return
+  canEdit.value = may
   await loadSettings()
 }
 
 async function save() {
+  const tenantId = props.tenantId
   loading.value = true
   error.value = null
   saved.value = false
@@ -123,14 +134,17 @@ async function save() {
       .map((s) => s.trim())
       .filter((s) => s.length > 0)
     const trimmed = domain.value.trim()
-    const s = await store.saveMagicDns(props.tenantId, {
+    const s = await store.saveMagicDns(tenantId, {
       magic_dns_domain: trimmed.length > 0 ? trimmed : null,
       magic_dns_nameservers: nameservers,
     })
+    // Saved for an org the page has left: the form is this org's now.
+    if (tenantId !== props.tenantId) return
     domain.value = s.magic_dns_domain ?? ''
     nameserversText.value = s.magic_dns_nameservers.join(', ')
     saved.value = true
   } catch (e) {
+    if (tenantId !== props.tenantId) return
     if (isRefusal(e)) {
       // Refused: show what the org has, read-only, rather than an error.
       canEdit.value = false
@@ -143,5 +157,22 @@ async function save() {
   }
 }
 
-load()
+// #4257 — the settings follow the page's org: a watch that runs at once, not
+// a one-shot load at setup (a routed section gets only a new prop when the
+// org changes). A change first clears the form, so what it held for the
+// previous org, an unsaved edit included, is never saved to this one.
+watch(
+  () => props.tenantId,
+  (_tenantId, previous) => {
+    if (previous !== undefined) {
+      domain.value = ''
+      nameserversText.value = ''
+      saved.value = false
+      error.value = null
+      canEdit.value = true
+    }
+    void load()
+  },
+  { immediate: true },
+)
 </script>

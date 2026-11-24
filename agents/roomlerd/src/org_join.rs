@@ -136,7 +136,17 @@ pub async fn join_org(
 
     let existing = crate::config::load(&config_path.to_path_buf()).ok();
     let had_config = existing.is_some();
-    let (mut merged, outcome) = apply_enrollment(existing, fresh, label, false)?;
+    let (mut merged, outcome) = match apply_enrollment(existing, fresh, label, false) {
+        Ok(folded) => folded,
+        Err(e) => {
+            // #4352 — nothing was written. A refusal (an ephemeral answer for
+            // this second org) removes the row the enrollment made, with the
+            // answer's own server and token, off the write lock: the removal
+            // is a network call.
+            drop(_guard);
+            return Err(crate::enrollment::remove_refused_row(e).await);
+        }
+    };
 
     // A REFRESH is not a no-op: the admin may be re-sending the request
     // precisely to change this org's mesh participation on a device that is
@@ -310,6 +320,103 @@ mod tests {
         c.agent_token = format!("tok-{tenant}");
         c.agent_id = format!("aid-{tenant}");
         c
+    }
+
+    /// #4352 (T6 at a caller) — a join the server answers with an EPHEMERAL
+    /// row for another organization, on the device's own server. The file's
+    /// files, as bytes, before and after; every request the server saw; and
+    /// the join's error.
+    async fn join_answered_ephemeral(
+        removal: (&'static str, &'static str),
+    ) -> (
+        Vec<(String, Vec<u8>)>,
+        Vec<(String, Vec<u8>)>,
+        Vec<roomler_node_core::pairing::test_http::Seen>,
+        anyhow::Error,
+    ) {
+        use roomler_node_core::pairing::test_http::scripted_server;
+        let answer = r#"{"agent_id":"aid-new","tenant_id":"tid-acme","agent_token":"ANSWER-TOK","ephemeral":true}"#;
+        let (server, seen) = scripted_server(vec![("200 OK", answer), removal]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = base();
+        cfg.server_url = server;
+        cfg.agent_token = "FILE-TOK".into();
+        crate::config::save(&path, &cfg).unwrap();
+        let files = |dir: &std::path::Path| {
+            let mut all: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .map(|p| {
+                    let name = p.file_name().unwrap().to_string_lossy().to_string();
+                    (name, std::fs::read(&p).unwrap_or_default())
+                })
+                .collect();
+            all.sort();
+            all
+        };
+        let before = files(dir.path());
+        let joined = join_org(
+            &cfg,
+            &path,
+            Arc::new(tokio::sync::Mutex::new(())),
+            "a-pushed-token",
+            None,
+            None,
+        )
+        .await;
+        let after = files(dir.path());
+        let seen = seen.lock().unwrap().clone();
+        match joined {
+            Ok(outcome) => panic!(
+                "the join was not refused: {outcome:?}; the server saw {:?}",
+                seen.iter().map(|s| &s.path).collect::<Vec<_>>()
+            ),
+            Err(e) => (before, after, seen, e),
+        }
+    }
+
+    /// #4352 (T6 at a caller) — the config is left byte for byte, and the row
+    /// the enrollment made is removed with the ANSWER's token, never the
+    /// file's, although both are on the same server.
+    #[tokio::test]
+    async fn t6_a_refused_ephemeral_join_leaves_the_file_and_removes_the_answers_row() {
+        let (before, after, seen, error) = join_answered_ephemeral(("200 OK", "{}")).await;
+        assert_eq!(before, after, "the config's folder is unchanged");
+        let paths: Vec<&str> = seen.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, ["/api/agent/enroll", "/api/agent/self/unenroll"]);
+        let bearer = |head: &str, token: &str| {
+            head.lines()
+                .any(|l| l.eq_ignore_ascii_case(&format!("authorization: Bearer {token}")))
+        };
+        assert!(bearer(&seen[1].head, "ANSWER-TOK"), "{}", seen[1].head);
+        assert!(!seen.iter().any(|s| s.head.contains("FILE-TOK")));
+        let refused = error
+            .downcast_ref::<crate::enrollment::EphemeralOrgRefused>()
+            .unwrap_or_else(|| panic!("refused for another reason: {error:#}"));
+        assert_eq!(refused.agent_id, "aid-new");
+        assert_eq!(
+            refused.row,
+            crate::enrollment::RefusedRow::Made {
+                agent_token: "ANSWER-TOK".into(),
+                removed: Some(Ok(()))
+            }
+        );
+    }
+
+    /// #4352 (T6 at a caller) — a removal that fails is said, and the file is
+    /// still not written.
+    #[tokio::test]
+    async fn t6_a_refused_ephemeral_join_whose_removal_fails_says_so() {
+        let (before, after, seen, error) =
+            join_answered_ephemeral(("500 Internal Server Error", "boom")).await;
+        assert_eq!(before, after, "the config's folder is unchanged");
+        assert_eq!(seen.len(), 2, "the enroll, then the removal");
+        let words = format!("{error:#}");
+        assert!(
+            words.contains("could not be removed") && words.contains("Devices page"),
+            "{words}"
+        );
     }
 
     /// The append path: a new tenant becomes a labelled secondary with its

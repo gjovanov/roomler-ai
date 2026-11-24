@@ -737,7 +737,7 @@ mod a_refusal_names_what_and_why {
         drop(held);
         let why = |asked: &std::path::Path| {
             format!(
-                "{}: {OS} refused to open it for the account this agent runs as",
+                "{}: {OS} refused to open it for the account roomlerd runs as",
                 asked.display()
             )
         };

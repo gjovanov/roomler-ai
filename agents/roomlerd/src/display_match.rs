@@ -1067,7 +1067,7 @@ impl std::fmt::Display for ApplyError {
             Self::SwitchFailed(rc) => write!(f, "xrandr failed rc={rc}"),
             Self::Unsupported => write!(
                 f,
-                "display-match runs on Windows, on Linux on a person's own X11 display or the agent's virtual desktop, and on a Mac with one display"
+                "display-match runs on Windows, on Linux on a person's own X11 display or the daemon's virtual desktop, and on a Mac with one display"
             ),
         }
     }

@@ -292,7 +292,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoleStore, type Role } from '@/stores/role'
 import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 import {
@@ -464,7 +464,23 @@ async function doDelete() {
   }
 }
 
-onMounted(() => roleStore.fetchRoles(props.tenantId))
+// #4257 — the roles follow the page's org: a watch that runs at once, not a
+// one-shot mount (a routed section gets only a new prop when the org changes).
+// A change closes the editor and the delete prompt opened under the previous
+// org: their save would go to this one.
+watch(
+  () => props.tenantId,
+  (tenantId, previous) => {
+    if (previous !== undefined) {
+      editDialog.value = false
+      editingId.value = null
+      deleteDialog.value = false
+      deleteTarget.value = null
+    }
+    void roleStore.fetchRoles(tenantId)
+  },
+  { immediate: true },
+)
 </script>
 
 <style scoped>

@@ -535,6 +535,9 @@ pub mod busy;
 #[cfg(test)]
 mod config_enum_pins;
 pub mod daemon_error;
+/// FR-133 P2c — the viewer's sentences, the CLI and LocalAPI output, `--help`.
+#[cfg(test)]
+mod daemon_text_tests;
 /// FR-151 — the Mac's root update helper waits for live work: the pure
 /// decision its macOS arm (`updater::run_update_helper`) runs.
 pub mod helper_gate;

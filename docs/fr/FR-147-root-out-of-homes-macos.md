@@ -206,7 +206,7 @@ with "nothing has changed" (exit 1).
 | R1 | `<L>` is not writable by the person, and the plan removes `<P>` (#3763) | the administrator's line where it fits (below), else the no-command text |
 | R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3846's administrator's command where the package's rule fits (`move_aside`, `macos_supervisor.rs:638-763`: a `sudo mv` of `<F>` aside, then a restart), built from the child's report (`folder_not_theirs`, `:1061`), else its words without a command. No command the person runs can move `<F>`: macOS lets no account rename a directory another account owns. Whether anything replaces it is D8 |
 | R3 | the config exists and the person cannot read it (a copy of root's, mode 600) | the administrator's line for that file where it fits, else the no-command text |
-| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2: an administrator's command or words, never one for the person. Without R4 the worker's first save (`app.rs:4016`) fails after the restart, and the conversion undoes itself |
+| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2: an administrator's command or words, never one for the person. Without R4 the worker's first save (`app.rs:4036`) fails after the restart, and the conversion undoes itself |
 | R5 | the console person has `com.roomler.agent` loaded but is not a person to convert | no command; it says why that person was left alone (the verify would fail after the restart) |
 
 **A command for an administrator is printed only for the console administrator's own home**, when all of these
@@ -237,7 +237,7 @@ That section is `docs/installation.md:3269`; P1 adds one-row's row to it. The li
 
 An ephemeral row ([FR-51](../ephemeral-nodes.md)) is refused before anything changes (#4312, ruled 2026-11-23).
 One-row stops the half that holds it, the root half at its restart and a person's at the bootout, and on such a
-stop an ephemeral row deletes itself (`agents/roomlerd/src/app.rs:5833-5860`, by
+stop an ephemeral row deletes itself (`agents/roomlerd/src/app.rs:5856-5923`, by
 `updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`). One-row does not mark its own stops,
 as the updater's `update-attempt` marker does (#1683): a retired row stays offline for as long as the Mac stays
 one row, and the server's reaper deletes an offline ephemeral row however it stopped.
@@ -248,7 +248,7 @@ one row, and the server's reaper deletes an offline ephemeral row however it sto
 | A person's primary that the root half does not hold | move it, though it lives only with the half that enrolled it. Refused before #4312 too | the same |
 | The root half's primary | stop the daemon that holds it, at the restart and again at the undo's | `migrate` (`one_row.rs:1770-1772`), with `ephemeral_root` (`:716`), once the plan has something to do. A Mac that is one row already restarts nothing and still reads "nothing to do" (`:1758-1766`) |
 | Root's file that `--revert` restarts onto | stop the daemon at that restart, whose stop reads root's file as it is by then, the one put back | `revert_main` (`one_row.rs:3195-3197`), with `ephemeral_revert` (`:3137`): root's kept copy where there is one, since it goes back first, else root's own file |
-| An `[[orgs]]` entry, a person's or the root's | nothing new | not refused. An entry has no `ephemeral` (`OrgEntry`, `crates/agent-core/src/config.rs:1970-2028`), an enrollment appended as one is built without it (`crates/agent-core/src/enrollment.rs:723-753`), and the stop deletes only the primary's row (`agents/roomlerd/src/app.rs:5856`) |
+| An `[[orgs]]` entry, a person's or the root's | nothing new | not refused. An entry has no `ephemeral` (`OrgEntry`, `crates/agent-core/src/config.rs:1970-2028`), an enrollment appended as one is built without it (`crates/agent-core/src/enrollment.rs:929-959`), and the stop deletes only the primary's row (`agents/roomlerd/src/app.rs:5904`) |
 
 Each comes before Keep, so no file is written and launchd is asked nothing, and `--dry-run` refuses the same way.
 A person's line comes from the pure `plan`, before the plan is said. The root half's comes after it, beside R1 to R5,
@@ -257,12 +257,12 @@ and `--revert`'s after its own plan.
 Each line ends with the way on: remove the row on the Devices page, then enroll that half again with a key that is
 not ephemeral. The same file serves. Since #4331 an enrollment that folds into a file keeps the file's settings and
 takes `ephemeral` from the server's answer, which is the row's (`preserve_operator_config`,
-`crates/agent-core/src/enrollment.rs:816-829`; the answer, `crates/modules/fleet/src/agent.rs:462`). The row goes
+`crates/agent-core/src/enrollment.rs:1022-1035`; the answer, `crates/modules/fleet/src/agent.rs:468`). The row goes
 first because a live ephemeral row stays ephemeral when a standard token enrolls over it (`OVER_EPHEMERAL`,
 `one_row.rs:712`; [`ephemeral-nodes.md`](../ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)). Until
 #4331 the way on was a new config, since a fold kept the old file's flag. The line before #4312 also offered
 "unenroll it first" and "enroll the root half there", and neither gets past it: no command takes an enrollment out
-of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5870-5873`), and an org
+of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5925-5928`), and an org
 the root half holds is refused too.
 
 | Case | The line, after `Error: ` (exit 1) |
@@ -417,7 +417,7 @@ and any error runs `undo` (`:2205`), with `Done` (`:1657`) recording what to put
   made (#4287, `not_bootstrapped`, `:2489-2503`). A job not loaded gets `gui/<uid>/com.roomler.agent: not
   bootstrapped, as the daemon did not restart onto the files put back; launchd loads it at the next login`. A job
   that a login has loaded again by then gets ``gui/<uid>/com.roomler.agent: already loaded, and not started here,
-  as the daemon did not restart onto the files put back; if the agent is not running, `sudo launchctl kickstart
+  as the daemon did not restart onto the files put back; if roomlerd is not running, `sudo launchctl kickstart
   gui/<uid>/com.roomler.agent` starts it``: nothing loads a loaded job at the next login, and its agent may run, or
   may have exited 0 on the one-row screen worker's lock: then only that kickstart starts it. Before #4287 both got
   the first line.
