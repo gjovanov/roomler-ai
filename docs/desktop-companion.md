@@ -493,7 +493,7 @@ sequenceDiagram
   the 0.4.225 lab two "View screen" clicks landed on row padding, and with rows of another
   height a click lands on another device's. They now share one slot two lines tall, there
   whether a line shows or not (`dv-notes`, `src/front/index.html:318`; `.dv-notes`,
-  `src/front/styles.css:489`). `paintNotes` (`src/front/devices.js:751`) shows and hides the
+  `src/front/styles.css:489`). `paintNotes` (`src/front/devices.js:764`) shows and hides the
   lines, never the slot. A longer line is cut with "…" and reads whole on hover; with both up,
   one line each. The slot is reserved in the flow rather than drawn over it: at the narrowest
   window (640 px, a card about 400 px wide) a stale line runs to two or three lines, and a band
@@ -502,6 +502,16 @@ sequenceDiagram
   in the flow: the Routes page's `tn-stale` (`src/front/index.html:380`) and the Recordings
   page's `rec-banner`, `rec-unavailable` and `rec-folder-reason` (`:476`, `:486`, `:522`).
   Pinned by `a_note_above_the_device_list_moves_no_row`, in the two lanes §3.1 names.
+- **A peer kept through a control-socket outage (#4367).** While the daemon's control
+  socket for an org is down, its `Peers` answer keeps the peers that org's mesh still
+  holds, each marked `control_down`
+  ([overlay-communication.md §8](overlay-communication.md#the-peer-list-while-the-control-socket-is-down-4367)).
+  The Connection column is unchanged: the carrier and its round trip are live. The NAME
+  column's dot reads `online`, the server's word from before the loss, so it is amber or
+  off, never green, and its tip says when the device last heard the server
+  (`src/front/devices.js:307`). The fallback table reads such a peer as `stale` (`:632`),
+  and the Overview count says "(last known)" (`paintCounts`, `src/front/overview.js:133`).
+  An older app shows the kept rows with their old dots.
 - **Older sides still work.** A daemon that predates the verbs, or a server without the
   routes, gets the pre-FR-84 peers table with a one-line note to update. `overlay:
   "no_node"` shows this device and the "private network is off" hint; ACL `enforce` with no

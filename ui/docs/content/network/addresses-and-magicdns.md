@@ -85,3 +85,19 @@ than omitted — because a silently-absent organization is indistinguishable fro
 one whose peers are all offline, and that ambiguity has cost real debugging
 time.
 :::
+
+:::note While the machine cannot reach the server
+The mesh keeps running when a machine loses its connection to the server, so
+`roomler peers` keeps listing the peers the mesh still holds, followed by a note:
+
+```
+  control plane unreachable (lost 12m ago): peers listed from what this device's mesh still holds.
+  CONN, RTT and LAST SEEN are live; ●/○ is the server's last word from before the loss.
+```
+
+The connection type, round trip and last-seen columns are measured on the spot.
+The ● / ○ is what the server last said about each peer before the connection
+dropped. Once the server is reachable again the note goes away and the list is
+live. Agents older than this behaviour print `(no peers)` while the server is
+unreachable.
+:::

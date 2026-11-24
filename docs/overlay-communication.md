@@ -212,11 +212,16 @@ blackholing the address's new owner; the paths that exercise them are the delta
 `overlay_exit_node` is pinned to the node it first resolved to — see
 `docs/overlay-exit-nodes.md`.
 
-Note that a **disconnect needs no pruning**: the node runtime is scoped to one
-control-WS session, so losing the WS tears down `by_node`, the WireGuard device
-and the TUN, and the reconnect rebuilds from an empty state. (There is a
-defensive diff-and-prune on the full-netmap arm, but a second full netmap never
-reaches a live runtime today — the server only sends one in reply to a join.)
+A **disconnect is pruned at the re-join**, not at the loss. Since rc.307 the
+node runtime outlives its control WS: losing the WS leaves `by_node`, the
+WireGuard device, the TUN and every carrier running, one runtime per tenant
+(`RUNTIME_SLOTS`, `agents/roomlerd/src/overlay.rs:110`). The next connection
+re-attaches it (`OverlayEvent::Reattach`, `:275`) instead of starting another,
+the runtime joins again, and the full netmap the server answers that join with
+is the reconcile: whatever the runtime still holds that the netmap no longer
+lists is pruned (`crates/tunnel-core/src/overlay/runtime.rs:4221`). What the
+device's own peer list says in between is in
+[§8](#the-peer-list-while-the-control-socket-is-down-4367).
 
 ---
 
@@ -1764,6 +1769,64 @@ The rules are pure and tested on every platform: the hand-back's
 (`utun_self_delivery_tests`, `tun.rs:9471`), and the checksum's, against
 checksums the tests compute another way (`v6_transport_checksum_tests`,
 `tun.rs:9588`).
+
+### The peer list while the control socket is down (#4367)
+
+The mesh keeps carrying sessions through a control-socket outage (§1), so the
+device's own peer list keeps what the mesh still holds. Before #4367 it did not:
+two devices without a control socket for 62 minutes kept a direct WireGuard path
+to a third, with a live SSH session on it, while `roomler peers` on each printed
+`(no peers)`. The LocalAPI's answer returned nothing whenever the primary's
+control socket was down, under a rule written before the runtime outlived it.
+
+Each org's list is now decided by that org's own control socket (`fn peers`,
+`agents/roomlerd/src/localapi_state.rs:1196`, through `Listing`, `:2566`):
+
+| That org's control socket | Its overlay runtime | Listed |
+|---|---|---|
+| up | any | the live list, unmarked |
+| down | running | what its mesh still holds, each peer marked `control_down` |
+| down | gone: never started since the daemon's start, the overlay off, or ended on its own | none |
+| down | the org ended: disabled, or its loop stopped for good | none |
+
+- **The data plane decides, never the last list the server sent.** A runtime's
+  view keeps its last list after the runtime ends, so the probe is
+  `overlay::runtime_alive` (`agents/roomlerd/src/overlay.rs:122`): the tenant's
+  runtime slot exists and its event channel is open. The daemon builds its
+  LocalAPI state only with that probe (`DaemonState::for_daemon`,
+  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5185`); the
+  constructor without one is test-only.
+- **The mark** (`PeerInfo::control_down`, `crates/localapi/src/lib.rs:1026`) is
+  additive. Its `since_ms` is when this device lost that socket, stamped by the
+  connection's guard before its flag drops
+  (`agents/roomlerd/src/signaling.rs:887`); the server's last frame came at most
+  the socket's 80 s receive deadline before. In a kept row `connection`,
+  `stalled`, `rtt_ms` and `last_seen_ms` stay live, and `online` is the server's
+  word from before the loss, never rewritten. A token refused at the upgrade is
+  kept and marked too: any HTTP 401 there refuses it (`signaling.rs:1874`), and a
+  middlebox the machine trusts can answer one while the mesh runs on.
+- **Several orgs.** Each org's rows carry their own mark and time: the primary's
+  outage no longer hides a secondary's live peers, and a secondary's outage no
+  longer lists its peers as live.
+- **What reads it.** `roomler peers` prints the rows as it always did, then one
+  line per org whose socket is down and which columns are live
+  (`control_down_lines`, `agents/roomler-cli/src/localclient.rs:3387`):
+
+  ```
+    control plane unreachable (lost 12m ago): peers listed from what this device's mesh still holds.
+    CONN, RTT and LAST SEEN are live; ●/○ is the server's last word from before the loss.
+  ```
+
+  `--json` carries the mark on each kept peer, and the desktop app draws a kept
+  peer's dot amber ([desktop-companion.md](desktop-companion.md#the-companions-side)).
+  A remote-control session's relay-tier cap (`overlay_remote_is_relay_tier`,
+  `agents/roomlerd/src/peer.rs:2236`) and the carrier readers of FR-128 and
+  FR-148 read the live carrier instead of an unknown peer: a session on a relay
+  stays capped through the outage rather than going uncapped at its next 5 s
+  recheck.
+- **Mixed versions.** An older CLI or desktop app shows the kept rows without the
+  note (it ignores the key). An older daemon sends no mark and lists none during
+  an outage, so a newer CLI prints `(no peers)` as before.
 
 ---
 

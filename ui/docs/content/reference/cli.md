@@ -22,7 +22,7 @@ display name or the hex id — see Remote access below.
 | Command | Does |
 |---|---|
 | `roomler status` | This machine: id, version, mode, mesh address, server connection — **and** the mesh state per organization |
-| `roomler peers` | Every peer the local agent sees, with its live connection type |
+| `roomler peers` | Every peer the local agent sees, with its live connection type. While the agent cannot reach the server, the peers its mesh still holds, with a note under the table that the list is last known |
 | `roomler peers --display-name` | The same table, with the dashboard display name in NAME where one is set (`--json` gains a `display_name` per peer) |
 | `roomler peers <name>…` | Only those peers — each a device name or a display name, in the order given |
 | `roomler why <peer>` | Why **one** peer rides the path it does: the ladder, each tier's eligibility, and any hold-down overriding the ranking |
