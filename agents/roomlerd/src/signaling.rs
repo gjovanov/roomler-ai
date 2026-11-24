@@ -661,6 +661,14 @@ pub struct OrgCtx {
     /// static pre-multi-org: one org's reconnect would have erased another
     /// org's outage stamp (and fired the update recheck off the wrong org).
     down_since_ms: Arc<std::sync::atomic::AtomicI64>,
+    /// #4367 — Unix ms when this org's control socket was last lost; 0 = never
+    /// in this process. [`ConnectedGuard`] stamps it on every exit path, just
+    /// before the connected flag drops, and the LocalAPI's `peers` answer reads
+    /// it (through the org's `OrgRuntime` row) as the time on the mark of a
+    /// peer it lists while the socket is down. Unlike `down_since_ms` (the A5
+    /// update recheck's clock, stamped only on a failed connect), it is
+    /// stamped on the loss itself.
+    pub control_lost_at_ms: Arc<std::sync::atomic::AtomicU64>,
     /// `rc:agent.update` pushes ignored on this org's WS because it is not
     /// the primary. Surfaced in the LocalAPI `OrgStatus`.
     pub updates_ignored: Arc<std::sync::atomic::AtomicU32>,
@@ -688,6 +696,7 @@ impl OrgCtx {
             unenrolled: false,
             pump: "signaling",
             down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            control_lost_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             token,
             renewal: Default::default(),
@@ -705,6 +714,7 @@ impl OrgCtx {
             // wants `&'static str`; one bounded leak per org per process.
             pump: Box::leak(format!("signaling:{label}").into_boxed_str()),
             down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            control_lost_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             token,
             renewal: Default::default(),
@@ -832,12 +842,22 @@ impl Drop for SignalingPumpGuard {
 /// coordination server" for the LocalAPI (`roomler status`) while a WS
 /// connection is live, and clears it on EVERY exit path from `connect_once`
 /// (Ok, `?`-propagated Err, explicit return) — same discipline as
-/// [`SignalingPumpGuard`]. The `DaemonState` reads this flag; while it's false
-/// `peers()` reports none (the overlay carriers are torn down on disconnect).
-struct ConnectedGuard(Arc<AtomicBool>);
+/// [`SignalingPumpGuard`]. The `DaemonState` reads this flag. The overlay
+/// runtime outlives the socket (its carriers keep running through the outage),
+/// so while the flag is false `peers()` still lists what this org's mesh
+/// holds, each peer marked as last known (#4367), with the time the guard
+/// stamped into `lost_at_ms` as it dropped.
+struct ConnectedGuard {
+    flag: Arc<AtomicBool>,
+    lost_at_ms: Arc<std::sync::atomic::AtomicU64>,
+}
 
 impl ConnectedGuard {
-    fn mark(flag: Arc<AtomicBool>, clear_attention: bool) -> Self {
+    fn mark(
+        flag: Arc<AtomicBool>,
+        lost_at_ms: Arc<std::sync::atomic::AtomicU64>,
+        clear_attention: bool,
+    ) -> Self {
         flag.store(true, Ordering::Relaxed);
         // S1b — a healthy authenticated connect resolves (almost) every
         // attention reason by definition: auth works, no goodbye, no live
@@ -860,13 +880,19 @@ impl ConnectedGuard {
         if clear_attention {
             crate::notify::clear_attention_on_healthy_connect_from(env!("CARGO_PKG_VERSION"));
         }
-        Self(flag)
+        Self { flag, lost_at_ms }
     }
 }
 
 impl Drop for ConnectedGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Relaxed);
+        // #4367 — the time first, then the flag (Release): a reader that sees
+        // the flag down (Acquire) reads this loss's time, never an older one.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        self.lost_at_ms.store(now_ms, Ordering::Relaxed);
+        self.flag.store(false, Ordering::Release);
     }
 }
 
@@ -1885,9 +1911,11 @@ async fn connect_once(
     // select loop. Dropped where the loop starts; its arms name their own.
     let setup_stage = watchdog::enter(ctx.pump, "setup");
     // Unification P1 — mark the daemon connected for the LocalAPI; the guard
-    // clears it on every return path (like `_pump_guard`). Sentinel clearing
-    // is primary-only (see `ConnectedGuard::mark`).
-    let _connected_guard = ConnectedGuard::mark(connected, ctx.is_primary);
+    // clears it on every return path (like `_pump_guard`), stamping the loss's
+    // time first (#4367). Sentinel clearing is primary-only (see
+    // `ConnectedGuard::mark`).
+    let _connected_guard =
+        ConnectedGuard::mark(connected, ctx.control_lost_at_ms.clone(), ctx.is_primary);
 
     // Fleet RPC — teach the redactor THIS org's agent token before any exec
     // can run. Registered per-org (the registry is process-wide) so a command
@@ -10751,5 +10779,43 @@ mod announce_tests {
             announcer.beat(&mut hello.last, Some(&host)).is_none(),
             "nothing the row says changed"
         );
+    }
+}
+#[cfg(test)]
+mod connected_guard_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    /// #4367 — the guard marks the socket up, and its drop stamps when the
+    /// socket was lost before the flag goes down, so a reader that sees the
+    /// flag down reads the time of this loss.
+    #[test]
+    fn the_guard_stamps_the_loss_time_before_the_flag_drops() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let lost_at = Arc::new(AtomicU64::new(0));
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let guard = ConnectedGuard::mark(flag.clone(), lost_at.clone(), false);
+        assert!(flag.load(Ordering::Acquire), "marked up");
+        assert_eq!(lost_at.load(Ordering::Relaxed), 0, "nothing was lost yet");
+
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire), "down on drop");
+        let stamped = lost_at.load(Ordering::Relaxed);
+        assert!(
+            stamped >= before,
+            "the loss time is this drop's: {stamped} < {before}"
+        );
+
+        // A reconnect does not clear the time (the reader ignores it while
+        // the flag is up), and the next loss stamps a newer one.
+        let guard = ConnectedGuard::mark(flag.clone(), lost_at.clone(), false);
+        assert_eq!(lost_at.load(Ordering::Relaxed), stamped);
+        drop(guard);
+        assert!(lost_at.load(Ordering::Relaxed) >= stamped);
+        assert!(!flag.load(Ordering::Acquire));
     }
 }

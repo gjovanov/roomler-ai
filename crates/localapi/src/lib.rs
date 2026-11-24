@@ -1013,6 +1013,29 @@ pub struct PeerInfo {
     /// the prober is off, or before it has issued a round.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probes: Vec<PathProbe>,
+    /// #4367 — set while THIS device's control socket for the peer's org is
+    /// down and its mesh still holds the peer. The row is then the data
+    /// plane's last known: `connection`, `stalled`, `rtt_ms` and
+    /// `last_seen_ms` stay live (the WireGuard side keeps measuring), and
+    /// `online` is the control plane's last word from before the loss.
+    ///
+    /// `None` while the socket is up, and from a daemon older than the field,
+    /// which listed no peer at all during an outage. An older CLI ignores the
+    /// key and prints the kept rows as it always printed rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_down: Option<ControlDown>,
+}
+
+/// #4367 — the mark on a peer listed while this device's control socket for
+/// the peer's org is down ([`PeerInfo::control_down`]). Its presence is the
+/// mark; the time is what the daemon knows about it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControlDown {
+    /// Unix ms when this device lost that control socket. The control plane's
+    /// last frame came at most the socket's receive deadline before it.
+    /// `None` when the daemon cannot say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
 }
 
 /// A — the disco prober's measurement of one path to this peer (C2).
@@ -7322,6 +7345,7 @@ mod tests {
                     why: None,
                     probes: Vec::new(),
                     debug: None,
+                    control_down: None,
                 },
                 PeerInfo {
                     node_id: "n3".into(),
@@ -7344,6 +7368,7 @@ mod tests {
                     why: None,
                     probes: Vec::new(),
                     debug: None,
+                    control_down: None,
                 },
             ]
         }

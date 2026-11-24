@@ -465,6 +465,7 @@ mod tests {
                 rx_denied: 0,
                 rx_denied_noroute: 0,
             }),
+            control_down: None,
         }
     }
 

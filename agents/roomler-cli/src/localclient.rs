@@ -3859,6 +3859,7 @@ mod tests {
             why: None,
             probes: Vec::new(),
             debug: None,
+            control_down: None,
         }
     }
 
@@ -4265,6 +4266,7 @@ mod tests {
             why: None,
             probes: Vec::new(),
             debug: None,
+            control_down: None,
         };
         let row = fmt_peer_row(&online, now);
         assert!(row.starts_with('●'));
@@ -4296,6 +4298,7 @@ mod tests {
             why: None,
             probes: Vec::new(),
             debug: None,
+            control_down: None,
         };
         let row = fmt_peer_row(&offline, now);
         assert!(row.starts_with('○'));
@@ -4327,6 +4330,7 @@ mod tests {
             why: None,
             probes: Vec::new(),
             debug: None,
+            control_down: None,
         };
         let row = fmt_peer_row(&p, now);
         assert!(row.contains("0123456789ab…"), "row was: {row}");
@@ -4361,6 +4365,7 @@ mod tests {
             why: None,
             probes: Vec::new(),
             debug: None,
+            control_down: None,
         };
         assert!(fmt_peer_row(&p, now).contains("stalled"));
         p.connection = ConnectionType::Relay;
