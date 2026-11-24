@@ -33,8 +33,8 @@ use crate::fixtures::test_app::TestApp;
 use crate::rc_resume_claim_tests::{
     QUIET, REMOTE_CONTROL, RESUME, WINDOW, WITHIN, Ws, answer_for, attach_seq, detached,
     drop_socket, end_reason, ended, enroll, give_member, hello, hello_frame, hello_with, insert,
-    leftover, next_of, now_ms, oid, one, open, pair, row, scope_all, tenant_of, urlencode,
-    wait_row,
+    leftover, next_of, now_ms, oid, one, open, pair, registered, row, scope_all, tenant_of,
+    urlencode, wait_row,
 };
 
 pub(crate) async fn send(ws: &mut Ws, v: Value) {
@@ -114,7 +114,7 @@ pub(crate) async fn request(ctl: &mut Ws, agent_id: ObjectId, replaces: Option<O
 /// Drive `sid` live the way the two ends do: the device consents (the hub
 /// takes it whether or not the device has read its `rc:request` yet), the
 /// viewer offers, the device answers.
-async fn drive_live(ctl: &mut Ws, agent: &mut Ws, sid: ObjectId) {
+pub(crate) async fn drive_live(ctl: &mut Ws, agent: &mut Ws, sid: ObjectId) {
     let hex = sid.to_hex();
     send(
         agent,
@@ -140,14 +140,15 @@ async fn drive_live(ctl: &mut Ws, agent: &mut Ws, sid: ObjectId) {
         .expect("the viewer's answer: the session is live");
 }
 
-/// A session from a new viewer socket of `token`, created and not yet live:
-/// the socket, the session id and the `rc:session.created` the viewer was
-/// sent.
+/// A session from a new viewer socket of `token`, asked for once `app`'s hub
+/// holds the device ([`registered`]), created and not yet live: the socket,
+/// the session id and the `rc:session.created` the viewer was sent.
 pub(crate) async fn open_session(
     app: &TestApp,
     token: &str,
     agent_id: ObjectId,
 ) -> (Ws, ObjectId, Value) {
+    registered(app, agent_id).await;
     let mut ctl = controller(app, token).await;
     let created = request(&mut ctl, agent_id, None).await;
     assert_eq!(created["t"], "rc:session.created", "{created}");

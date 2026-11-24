@@ -34,9 +34,11 @@ use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
 use crate::rc_resume_claim_tests::{
     QUIET, REMOTE_CONTROL, RESUME, WINDOW, WITHIN, Ws, audit, end_reason, ended, enroll,
-    give_member, hello, kinds, next_of, one, open, pair, row, scope_all, wait_audit, wait_row,
+    give_member, hello, kinds, next_of, oid, one, open, pair, row, scope_all, wait_audit, wait_row,
 };
-use crate::rc_resume_rejoin_tests::{controller, live_session, request, send, wait_bus};
+use crate::rc_resume_rejoin_tests::{
+    controller, drive_live, live_session, request, send, wait_bus,
+};
 
 /// One measured line, written straight to stderr. The harness captures
 /// `println!` and `eprintln!` from a test that passes, and the integration
@@ -187,8 +189,14 @@ async fn relayed(app1: TestApp, app2: TestApp, window: u64, rpc: &[&str]) -> Opt
             .expect("pod 1 announces the window");
     }
     seen_from(&app2, agent_id).await;
-    let (ctl, sid, created) =
-        live_session(&app2, &seeded.admin.access_token, agent_id, &mut agent).await;
+    // Pod 2's hub never holds the device, so the viewer asks there without
+    // the session helpers' wait on the hub: a request on pod 2 needs the
+    // device's presence as pod 2 reads it, which `seen_from` waited for.
+    let mut ctl = controller(&app2, &seeded.admin.access_token).await;
+    let created = request(&mut ctl, agent_id, None).await;
+    assert_eq!(created["t"], "rc:session.created", "{created}");
+    let sid = oid(created["session_id"].as_str().expect("a session id"));
+    drive_live(&mut ctl, &mut agent, sid).await;
     assert!(
         app1.state.fleet().rc_hub.session_snapshot(sid).is_some(),
         "pod 1, the device's, holds the session"
