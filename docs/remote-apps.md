@@ -510,7 +510,7 @@ label    = "Safari"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1211`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:7005`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:7050`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
@@ -525,7 +525,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3725`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3750`),
 not `load`, because `load` self-heals. When the live file is missing or unreadable and
 its `.prev` copy loads, `load` promotes that copy back over it, without the copy's run
 marks (#4157), and logs *RESTORED* or *RECOVERED from the previous good copy* at ERROR.

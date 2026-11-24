@@ -5178,7 +5178,7 @@ encoder is never handed.
 | the sampler and the line | `agents/roomlerd/src/media_delivery.rs:659` (the field), `:1042` (`on_frame`), `:1120` (`on_pair_check`), `:1130` (`note_gate`), `:1282` (`on_handed`), `:1291` (`pump_count`), `:965` (`report`), `:1407` (`emit`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:4324` (the send task's count), `:4338` and `:4366` (each frame taken, each chunk released), `:4421` (the pair), `:4540` (the gate's count), `:4559` (the step), `:5254` (the watermark), `:5289` (`on_handed`), `:5306` (a full channel) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:7344` (the send task's count), `:7365` and `:7420` (each frame taken, each chunk released), `:7755` (the pair), `:8150` (the gate's count, the ledger beside the channel), `:8225` (the step), `:9944` (`on_handed`), `:9970` (a full channel) |
-| the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3513` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2165` (its echo), `:2754` (its check) |
+| the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3538` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2165` (its echo), `:2754` (its check) |
 | the harness's outages and reads | `agents/roomlerd/src/media_delivery.rs:4894` (`Outages`), `:5113` (`out_direction`), `:7590` (`outaged`), `:8740` (`print_releases`), `:8800` (`recoveries`), `:8956` (`stalls_against_today`), `:9185` (`outages_against_today`) |
 | B2's view of the budget | `agents/roomlerd/src/media_inflight.rs:625` (`Over`), `:868` (`over`), `:925` (`held_each`), `:820` (`still_after`), `:833` (`take_mark`), `:738` (the mark in `step`), `:1873` (`Shadow::take_mark`); the opening: `:644` (`Over::opening`), `:897` (its reading in `over`), `:734` (the first measured rate, in `step`), `:1175` (the rate's provenance, in `rate_at`), `:986` (a new association's opening, in `on_new_association`) |
 | B2's push-backs | `agents/roomlerd/src/media_delivery.rs:255` (`SamplePushBack`), `:277` (`Burst`), `:321` (`BURST`), `:331` (`settle`), `:412` (`push_back_of`), `:454` (P3, with the opening's), `:902` (`Budget::over` at a sample's close), `:755` (`heartbeat`, the hand-off), `:788` (`due_read`), `:798` (`on_mark`), `:1042` (`on_frame`, the mark) |
@@ -5428,7 +5428,7 @@ waits a whole gap after it.
 Unlike the in-flight budget's, this switch acts with `ROOMLERD_PATH_MODEL=off`: only its counts ride
 that line, and its own lines are written either way. The config key is built as `inflight_budget`'s: the
 field, its env fallback, the key's metadata, its echo and its check
-(`crates/agent-core/src/config.rs:1236`, `:3516`; `crates/agent-core/src/config_surface.rs:1459`,
+(`crates/agent-core/src/config.rs:1236`, `:3541`; `crates/agent-core/src/config_surface.rs:1459`,
 `:2166`, `:2756`). A set variable wins over the key, any value but `off`, `shadow` or `on` is refused
 at `config set`, and remote config cannot set it ([remote-config.md](remote-config.md)). The read is
 inside the FR-135 ratchet's media path, so the ratchet counts it (ledger `p4:DEADLINE-1`, which

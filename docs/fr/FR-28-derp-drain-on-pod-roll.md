@@ -396,7 +396,7 @@ One host on 0.4.48 took 60 s on every roll, the shape of the oldest agents, and 
   offsets between hosts do not enter it.
 - **A host can close in both waves.** A daemon with two enrollments runs one signaling loop for each
   (`agents/roomlerd/src/signaling.rs:632-636`) and uploads both loops' lines under its primary's row
-  (`agents/roomlerd/src/app.rs:4775-4788`). Five such rows closed in both waves, about 12 s apart, because their
+  (`agents/roomlerd/src/app.rs:4820-4833`). Five such rows closed in both waves, about 12 s apart, because their
   two organisations sit on different pods. Each socket is still cut once a roll.
 
 ### The switch-on half (2026-11-22)
@@ -496,7 +496,7 @@ it in advance, so the sequence is: pod dies → agent keeps handing frames to a 
 socket → a send hard-errors → `DeathReason::HardDead`
 (`crates/tunnel-core/src/overlay/runtime/establish.rs:734-754`) → carrier rebuild →
 `MuxEvent::Recovered` opens the fast-walk window
-(`crates/tunnel-core/src/overlay/runtime.rs:2703-2706`).
+(`crates/tunnel-core/src/overlay/runtime.rs:2781-2784`).
 
 That recovery path has already been optimised once (#28: `DERP_RECOVERY_WALK_WINDOW`
 + `DERP_RECOVERY_RECHECK`, after a field case where "the WS returned in 1.5 s and the

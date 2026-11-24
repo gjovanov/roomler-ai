@@ -31,7 +31,7 @@ distinguish "default" from explicit `sort=name`. Change: keep the param as
 unchanged. `cmp_rows` (`:377-401`) gains the compound arm; the id tiebreak
 (`:219-223`) stays. UI needs **zero change**: an untouched grid emits
 `sortBy: []` → no `sort` param (`AgentsSection.vue:1594-1604`,
-`stores/devices.ts:82-83`). `device_list_tests.rs:280`'s comment updates
+`stores/devices.ts:82-83`). `device_list_tests.rs:281`'s comment updates
 (order itself survives — the three fixture agents share one presence bucket).
 
 ### 2. Mesh names — server-side, deliberately
@@ -59,7 +59,7 @@ decision).
   `users.find_by_email` (`dao/user.rs:105-110` — the address is a *proven
   reservation*, so adding by it is adding a verified account). Unknown
   address → 404 with "no account with that address — use Invites". Gate
-  unchanged: `INVITE_MEMBERS` + `check_grant_roles` (`invite.rs:475`).
+  unchanged: `INVITE_MEMBERS` + `check_grant_roles` (`invite.rs:602`).
 - **Remove** (NEW — no route exists today, verified): `DELETE
   /tenant/{tid}/member/{user_id}` on the member router (2026-08-27, `crates/api/src/lib.rs:167-172` at `1b25e3d8`),
   gated on **`KICK_MEMBERS`** (`role.rs:35` — defined, never consumed until

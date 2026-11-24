@@ -167,10 +167,10 @@ exec roomlerd run
   ([`wix-perMachine/main.wxs:698-700`](../agents/roomlerd/wix-perMachine/main.wxs#L698-L700),
   [`win_service/lifecycle.rs:293`](../agents/roomlerd/src/win_service/lifecycle.rs#L293)).
   The worker takes either stop as an OS-initiated stop
-  ([`app.rs:5801-5807`](../agents/roomlerd/src/app.rs#L5801-L5807)), finds no
+  ([`app.rs:5846-5852`](../agents/roomlerd/src/app.rs#L5846-L5852)), finds no
   update in flight, and an ephemeral device deletes its own row, the one its
   run started as
-  ([`app.rs:5895-5904`](../agents/roomlerd/src/app.rs#L5895-L5904)).
+  ([`app.rs:5940-5949`](../agents/roomlerd/src/app.rs#L5940-L5949)).
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
@@ -317,21 +317,24 @@ administrator step) and the companion's re-enroll. The primary is unchanged: a
 first enrollment, `--replace`, and the same server and org again take
 `ephemeral` from the answer. A secondary made ephemeral before #4352 stays as it
 is: the device does not know it as ephemeral, and the reaper, where it runs,
-collects its row.
+collects its row. `org set-primary` promotes such a secondary as any other,
+since the device cannot tell it, but refuses while the primary is ephemeral
+(#4370, [multi-org.md](multi-org.md#3-p1--the-foundation-orgs-shipped-313)):
+that swap would put an ephemeral row beside another org.
 
 ### A stop removes only the row its run started as (#4352)
 
 The daemon keeps the row it started as: its primary's server, org, `agent_id`
 and `ephemeral` (`updater::RunRow`, taken at
-`agents/roomlerd/src/app.rs:4658`). On an OS stop the gate
+`agents/roomlerd/src/app.rs:4703`). On an OS stop the gate
 (`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
 unchanged) reads the run's own `ephemeral`, and the removal targets the run's
 own row (`updater::stop_removal`, `:5085-5114`, at
-`agents/roomlerd/src/app.rs:5895-5923`):
+`agents/roomlerd/src/app.rs:5940-5968`):
 
 | The file at the stop | The stop removes |
 |---|---|
-| still names the run's row, as the primary or an `[[orgs]]` entry (a renewed token, a re-enrollment of the same row, `org set-primary`) | the run's row, with the file's token, the newest |
+| still names the run's row, as the primary (a renewed token, a re-enrollment of the same row) or as an `[[orgs]]` entry (an `org set-primary` that moved it: since #4370 that command refuses while the primary is ephemeral, so only a file an older agent wrote holds the run's row there) | the run's row, with the file's token, the newest |
 | names another row: a re-enrollment written while the daemon ran, in this org or another | the run's row, with the run's own token; never the file's row |
 | does not load | the run's row, with the run's own token |
 | anything, on a run that started permanent | nothing |

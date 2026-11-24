@@ -229,7 +229,7 @@ before B2: done in #4061).
    (`vendored/webrtc/src/api/setting_engine/mod.rs:198–200`, evaluated per address in
    `webrtc-ice/src/util/mod.rs:129–132`) with the addresses **on our own adapters**, not a CIDR:
    `if_addrs::get_if_addrs()` filtered by `is_overlay_iface(name)` on Windows/Linux, plus LocalAPI
-   `status().overlay_ip/ip6` (`localapi/src/lib.rs:190–194`) for macOS `utunN`. An ISP CGNAT
+   `status().overlay_ip/ip6` (`localapi/src/lib.rs:196–200`) for macOS `utunN`. An ISP CGNAT
    address lives on the physical NIC and is never dropped — this retires the objection at
    `peer.rs:344–347`.
 2. **srflx**: the mapped address bypasses every filter (`agent_gather.rs:828–862`) — a 3-line
@@ -245,7 +245,7 @@ and in the FR-35 memory key (`peer.rs:4819` → `"{ip}|{class}"`, which fixes "a
 onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–34`
 has only `Relay`) so DERP / TURN / org relay are distinguishable. Mitigation for the one path lost
 (proxy-only egress, 443 only): a `turns:` listener on 443 on coturn, or the loopback-TURN opt-in.
-Update `docs/multi-org.md:547–548` (its "ICE never gathers on roomler-*" is true only on Linux) and
+Update `docs/multi-org.md:623–624` (its "ICE never gathers on roomler-*" is true only on Linux) and
 `docs/overlay-nat-traversal.md` with the rule.
 
 **Field verification** (CORPLAP-1 multi-org with the VPN on; CORPLAP-3 LAN): `ICE: gathered local

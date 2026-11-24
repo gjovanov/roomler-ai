@@ -226,6 +226,10 @@ pub enum DoorbellReply {
         /// every one older than FR-105.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ssh: Option<roomler_ai_remote_control::models::SshServiceCeiling>,
+        /// #4244 — the Fleet RPC runs this service holds ([`HeldRuns`]): a
+        /// count, never which. Absent from a service older than #4244.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_runs: Option<u32>,
     },
     /// `claimed: true` = the service holds the command now, and the server
     /// hears the result from it. Anything else names why nothing runs.
@@ -535,7 +539,12 @@ pub async fn ring(request_id: &str) -> Result<(), String> {
         };
         // The service claims over HTTPS before it answers.
         match win::ask(&req, std::time::Duration::from_secs(30)).await? {
-            DoorbellReply::Rang { claimed: true, .. } => Ok(()),
+            DoorbellReply::Rang { claimed: true, .. } => {
+                // #4244 — what the update gate counts when the service
+                // cannot say what it holds ([`service_runs`]).
+                handed().note(std::time::Instant::now());
+                Ok(())
+            }
             DoorbellReply::Rang { error, .. } => {
                 Err(error
                     .unwrap_or_else(|| "the SYSTEM service did not take the command".to_string()))
@@ -597,6 +606,219 @@ pub async fn cancel(request_id: &str) -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// #4244 — the runs the service holds, for the worker's update gate
+// ────────────────────────────────────────────────────────────────────────────
+
+/// #4244 — the longest one Fleet RPC run is counted for the update gate: its
+/// claim (20 s), the command at the Fleet RPC ceiling
+/// (`exec_limits::MAX_TIMEOUT_MS`, 5 min) and its tree kill, and its result's
+/// post with every retry (3 × 30 s, 7 s apart), with a minute to spare.
+/// `held_at_most_covers_a_whole_run` locks it to those parts.
+///
+/// A run is counted until its result is posted. The bound is for a run whose
+/// end never comes: the engine waits on a Fleet RPC command's output for as
+/// long as anything it started holds the pipes (no job ends them,
+/// `exec::session_job::finish`), and a guard alone would count it as long.
+pub const HELD_AT_MOST: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+
+/// Fleet RPC runs counted for the worker's update gate, each until its
+/// [`HeldRun`] drops or [`HELD_AT_MOST`] after it began, whichever comes
+/// first. Two are kept, each in its own process:
+///
+/// - the SYSTEM service's ([`held`]): each run from its ring's claim until
+///   its result is posted, which its health answer reports;
+/// - the worker's ([`handed`]): each run the service said it claimed, which
+///   the gate counts only when the service does not say ([`ServiceRuns`]).
+#[derive(Clone, Default)]
+pub struct HeldRuns(std::sync::Arc<std::sync::Mutex<Book>>);
+
+#[derive(Default)]
+struct Book {
+    next: u64,
+    began: std::collections::HashMap<u64, std::time::Instant>,
+}
+
+impl Book {
+    /// Forget every run [`HELD_AT_MOST`] has ended by `now`.
+    fn prune(&mut self, now: std::time::Instant) {
+        self.began
+            .retain(|_, at| now.saturating_duration_since(*at) < HELD_AT_MOST);
+    }
+}
+
+impl HeldRuns {
+    /// Count a run from `now` until the guard drops.
+    pub fn hold(&self, now: std::time::Instant) -> HeldRun {
+        HeldRun {
+            runs: self.clone(),
+            id: self.begin(now),
+        }
+    }
+
+    /// Count a run from `now` until [`HELD_AT_MOST`]: nothing tells the
+    /// worker when the service's run ends.
+    pub fn note(&self, now: std::time::Instant) {
+        self.begin(now);
+    }
+
+    /// The runs counted at `now`.
+    pub fn count_at(&self, now: std::time::Instant) -> usize {
+        let mut book = self.book();
+        book.prune(now);
+        book.began.len()
+    }
+
+    /// [`count_at`](Self::count_at), as the health answer carries it.
+    pub fn reported_at(&self, now: std::time::Instant) -> u32 {
+        u32::try_from(self.count_at(now)).unwrap_or(u32::MAX)
+    }
+
+    fn begin(&self, now: std::time::Instant) -> u64 {
+        let mut book = self.book();
+        book.prune(now);
+        let id = book.next;
+        book.next += 1;
+        book.began.insert(id, now);
+        id
+    }
+
+    fn book(&self) -> std::sync::MutexGuard<'_, Book> {
+        match self.0.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+/// One run [`HeldRuns::hold`] counts, until it drops.
+pub struct HeldRun {
+    runs: HeldRuns,
+    id: u64,
+}
+
+impl Drop for HeldRun {
+    fn drop(&mut self) {
+        self.runs.book().began.remove(&self.id);
+    }
+}
+
+/// The SYSTEM service's runs: what its health answer reports.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn held() -> &'static HeldRuns {
+    static HELD: std::sync::OnceLock<HeldRuns> = std::sync::OnceLock::new();
+    HELD.get_or_init(HeldRuns::default)
+}
+
+/// The runs this worker handed the service: each one it answered
+/// `claimed: true` for ([`ring`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn handed() -> &'static HeldRuns {
+    static HANDED: std::sync::OnceLock<HeldRuns> = std::sync::OnceLock::new();
+    HANDED.get_or_init(HeldRuns::default)
+}
+
+/// #4244 — the Fleet RPC runs the update gate counts for the device's SYSTEM
+/// service (FR-94), and how it knew them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRuns {
+    /// The service said: the runs it holds now.
+    Answered(usize),
+    /// The service did not say: the runs this worker handed it in the last
+    /// [`HELD_AT_MOST`] count instead.
+    Unread { why: Unread, handed: usize },
+}
+
+/// Why the service did not say what it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// A build older than #4244: its health answer has no count.
+    Older,
+    /// No answer: no pipe SYSTEM serves (no service on this machine, or none
+    /// up), a busy or refused doorbell, a timeout, an error, or a reply that
+    /// is not a health answer.
+    NoAnswer,
+}
+
+impl ServiceRuns {
+    /// From the health exchange's outcome and the runs this worker handed the
+    /// service. The service's word, when it gives one, is the whole truth: a
+    /// run it no longer holds (posted, or a service started since) is not
+    /// counted again from the worker's record.
+    pub fn of(reply: Result<DoorbellReply, String>, handed: usize) -> ServiceRuns {
+        match reply {
+            Ok(DoorbellReply::Health {
+                exec_runs: Some(n), ..
+            }) => ServiceRuns::Answered(n as usize),
+            Ok(DoorbellReply::Health {
+                exec_runs: None, ..
+            }) => ServiceRuns::Unread {
+                why: Unread::Older,
+                handed,
+            },
+            _ => ServiceRuns::Unread {
+                why: Unread::NoAnswer,
+                handed,
+            },
+        }
+    }
+
+    /// What the gate counts as exec runs.
+    pub fn counted(&self) -> usize {
+        match self {
+            ServiceRuns::Answered(n) => *n,
+            ServiceRuns::Unread { handed, .. } => *handed,
+        }
+    }
+
+    /// The word a log line uses.
+    pub fn word(&self) -> &'static str {
+        match self {
+            ServiceRuns::Answered(_) => "answered",
+            ServiceRuns::Unread {
+                why: Unread::Older, ..
+            } => "older",
+            ServiceRuns::Unread {
+                why: Unread::NoAnswer,
+                ..
+            } => "no_answer",
+        }
+    }
+}
+
+/// The bound on the update gate's health exchange with the service.
+pub const RUNS_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #4244 — the service's runs, read now for the update gate: its health
+/// answer over the doorbell on Windows. Off Windows there is no service to
+/// ask, and nothing was handed to one.
+pub async fn service_runs() -> ServiceRuns {
+    #[cfg(windows)]
+    {
+        let reply = win::ask(&DoorbellRequest::Health, RUNS_ASK_TIMEOUT).await;
+        if let Err(e) = &reply {
+            tracing::debug!(%e, "exec-service: no health answer for the update gate");
+        }
+        let runs = ServiceRuns::of(reply, handed().count_at(std::time::Instant::now()));
+        if let ServiceRuns::Unread {
+            handed: n @ 1.., ..
+        } = runs
+        {
+            tracing::info!(
+                read = %runs.word(),
+                handed = n,
+                "exec-service: the SYSTEM service did not say what it runs; the update gate \
+                 counts the runs this worker handed it"
+            );
+        }
+        runs
+    }
+    #[cfg(not(windows))]
+    {
+        ServiceRuns::of(Err("no SYSTEM service off Windows".into()), 0)
     }
 }
 
@@ -1620,6 +1842,9 @@ mod svc {
 
     fn health() -> DoorbellReply {
         let version = env!("CARGO_PKG_VERSION").to_string();
+        // #4244 — whatever the anchor says now: a run claimed before an
+        // un-anchor still runs, and still posts its result.
+        let exec_runs = Some(super::held().reported_at(std::time::Instant::now()));
         match load_anchor() {
             Ok(Some(a)) => DoorbellReply::Health {
                 anchored: true,
@@ -1628,6 +1853,7 @@ mod svc {
                 problem: None,
                 version,
                 ssh: crate::ssh_service::served_ceiling(&a),
+                exec_runs,
             },
             // #3737 — no anchor in the key: when the one-time copy refused
             // the anchor this device had, or did not finish, the worker logs
@@ -1639,6 +1865,7 @@ mod svc {
                 problem: super::store::copy_problem(),
                 version,
                 ssh: None,
+                exec_runs,
             },
             Err(e) => DoorbellReply::Health {
                 anchored: false,
@@ -1647,6 +1874,7 @@ mod svc {
                 problem: Some(e),
                 version,
                 ssh: None,
+                exec_runs,
             },
         }
     }
@@ -1730,6 +1958,10 @@ mod svc {
                  (`roomlerd anchor exec on`, elevated)",
             );
         }
+        // #4244 — live work for the worker's update gate from the claim until
+        // the result is posted: an update stops this service, and a run cut
+        // here leaves its caller with no answer.
+        let held = super::held().hold(std::time::Instant::now());
         let claimed = match claim(&anchor, &request_id).await {
             Ok(c) => c,
             Err(e) => {
@@ -1752,7 +1984,7 @@ mod svc {
             %request_id, caller = ?claimed.caller, run_as = ran_as,
             "exec-service: running a command for the server"
         );
-        tokio::spawn(run_and_post(anchor, claimed, run_as, ran_as));
+        tokio::spawn(run_and_post(anchor, claimed, run_as, ran_as, held));
         DoorbellReply::Rang {
             claimed: true,
             error: None,
@@ -1778,8 +2010,10 @@ mod svc {
             .map_err(|e| format!("building the HTTP client: {e}"))
     }
 
-    const CLAIM_TIMEOUT: Duration = Duration::from_secs(20);
-    const POST_TIMEOUT: Duration = Duration::from_secs(30);
+    pub(super) const CLAIM_TIMEOUT: Duration = Duration::from_secs(20);
+    pub(super) const POST_TIMEOUT: Duration = Duration::from_secs(30);
+    /// The wait after each try to post a result, one entry a try.
+    pub(super) const POST_BACKOFF_SECS: [u64; 3] = [2, 5, 0];
 
     fn url(anchor: &Anchor, path: &str) -> String {
         // `tid` lets the front proxy send the call to the org's pod, where the
@@ -1818,11 +2052,14 @@ mod svc {
         }
     }
 
-    async fn run_and_post(
+    /// `held` counts the run for the worker's update gate (#4244), and goes
+    /// once its result is posted, or given up on.
+    pub(super) async fn run_and_post(
         anchor: Anchor,
         claimed: Claimed,
         run_as: crate::exec::RunAs,
         ran_as: &'static str,
+        held: super::HeldRun,
     ) {
         // Masked out of whatever the command prints, as the agent token is.
         crate::exec::register_secret(&anchor.service_token);
@@ -1844,6 +2081,7 @@ mod svc {
             .run(req, &crate::exec::redactor())
             .await;
         post_result(&anchor, &request_id, &outcome, Some(ran_as)).await;
+        drop(held);
     }
 
     /// Post the outcome, retrying a network failure: the caller waits on it.
@@ -1870,7 +2108,7 @@ mod svc {
                 return;
             }
         };
-        for (attempt, backoff) in [(1, 2u64), (2, 5), (3, 0)] {
+        for (attempt, backoff) in (1u32..).zip(POST_BACKOFF_SECS) {
             let sent = client
                 .post(url(
                     anchor,
@@ -2774,6 +3012,230 @@ mod tests {
 
     fn never(why: &str) -> DoorbellReply {
         panic!("{why}")
+    }
+
+    /// #4244 — the health answer carries the service's runs as a count and
+    /// nothing else, and each mix of versions reads the other: a worker reads
+    /// an older service's answer (no count) as `older`, and an older worker
+    /// reads a newer answer as it always did.
+    #[test]
+    fn the_runs_count_reads_across_versions() {
+        let newer = DoorbellReply::Health {
+            anchored: true,
+            agent_id: Some("6ace07367d06cf41e19e54b0".into()),
+            exec_enabled: true,
+            problem: None,
+            version: "0.4.237".into(),
+            ssh: None,
+            exec_runs: Some(2),
+        };
+        let line = serde_json::to_string(&newer).unwrap();
+        assert_eq!(
+            line,
+            r#"{"t":"health","anchored":true,"agent_id":"6ace07367d06cf41e19e54b0","exec_enabled":true,"version":"0.4.237","exec_runs":2}"#
+        );
+        assert_eq!(
+            ServiceRuns::of(Ok(newer), 5),
+            ServiceRuns::Answered(2),
+            "the service's word stands over the worker's record"
+        );
+
+        // A service older than #4244 answers as 0.4.235 does: no count.
+        let older: DoorbellReply = serde_json::from_str(
+            r#"{"t":"health","anchored":true,"agent_id":"6ace07367d06cf41e19e54b0","exec_enabled":true,"version":"0.4.235"}"#,
+        )
+        .unwrap();
+        let read = ServiceRuns::of(Ok(older), 1);
+        assert_eq!(
+            read,
+            ServiceRuns::Unread {
+                why: Unread::Older,
+                handed: 1
+            }
+        );
+        assert_eq!((read.counted(), read.word()), (1, "older"));
+
+        // An older worker's reply type takes a newer answer as before.
+        #[derive(Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum BeforeTheCount {
+            Health {
+                anchored: bool,
+                #[serde(default)]
+                agent_id: Option<String>,
+                #[serde(default)]
+                exec_enabled: bool,
+                version: String,
+            },
+        }
+        let BeforeTheCount::Health {
+            anchored,
+            agent_id,
+            exec_enabled,
+            version,
+        } = serde_json::from_str(&line).unwrap();
+        assert!(anchored && exec_enabled);
+        assert_eq!(agent_id.as_deref(), Some("6ace07367d06cf41e19e54b0"));
+        assert_eq!(version, "0.4.237");
+
+        // Anything but a health answer is no answer: counted from the record.
+        for reply in [
+            Err("the SYSTEM service did not answer within 5 s".to_string()),
+            Ok(DoorbellReply::Refused {
+                error: "not a doorbell request".into(),
+            }),
+            Ok(DoorbellReply::Rang {
+                claimed: true,
+                error: None,
+            }),
+        ] {
+            let read = ServiceRuns::of(reply, 0);
+            assert_eq!(
+                read,
+                ServiceRuns::Unread {
+                    why: Unread::NoAnswer,
+                    handed: 0
+                }
+            );
+            assert_eq!((read.counted(), read.word()), (0, "no_answer"));
+        }
+    }
+
+    /// #4244 — a run is counted until its guard drops, and never past
+    /// [`HELD_AT_MOST`] after it began, whatever became of its guard: a run
+    /// whose task never ends, or a worker's note of a run it handed over,
+    /// which nothing ends.
+    #[test]
+    fn a_held_run_counts_until_it_ends_and_never_past_its_bound() {
+        let runs = HeldRuns::default();
+        let t0 = std::time::Instant::now();
+        let first = runs.hold(t0);
+        let stuck = runs.hold(t0);
+        assert_eq!(runs.count_at(t0), 2);
+        drop(first);
+        assert_eq!(runs.count_at(t0), 1, "a dropped run is no longer counted");
+        let just_before = t0 + HELD_AT_MOST - std::time::Duration::from_millis(1);
+        assert_eq!(runs.count_at(just_before), 1);
+        assert_eq!(
+            runs.count_at(t0 + HELD_AT_MOST),
+            0,
+            "a run whose end never came is counted past its bound"
+        );
+        drop(stuck);
+        assert_eq!(runs.reported_at(t0), 0, "a guard dropped after its bound");
+
+        let t1 = t0 + HELD_AT_MOST;
+        runs.note(t1);
+        runs.note(t1);
+        assert_eq!(runs.reported_at(t1 + HELD_AT_MOST / 2), 2);
+        assert_eq!(
+            runs.count_at(t1 + HELD_AT_MOST),
+            0,
+            "a note outlived its bound"
+        );
+    }
+
+    /// #4244 — the bound covers a whole run the service holds, with a little
+    /// to spare and not much more: the claim, the command at the Fleet RPC
+    /// ceiling, and every try to post its result.
+    #[cfg(windows)]
+    #[test]
+    fn held_at_most_covers_a_whole_run() {
+        use std::time::Duration;
+        let ceiling =
+            Duration::from_millis(roomler_ai_remote_control::models::exec_limits::MAX_TIMEOUT_MS);
+        let tries = svc::POST_BACKOFF_SECS.len() as u32;
+        let backoff: u64 = svc::POST_BACKOFF_SECS.iter().sum();
+        let whole =
+            svc::CLAIM_TIMEOUT + ceiling + svc::POST_TIMEOUT * tries + Duration::from_secs(backoff);
+        assert!(
+            HELD_AT_MOST >= whole + Duration::from_secs(30),
+            "{HELD_AT_MOST:?} leaves under 30 s for a tree kill past {whole:?}"
+        );
+        assert!(
+            HELD_AT_MOST <= whole + Duration::from_secs(120),
+            "{HELD_AT_MOST:?} is far past a whole run, {whole:?}"
+        );
+    }
+
+    /// #4244 — the service holds a run past its command's end, until its
+    /// result is posted: an update in that gap stops the service with the
+    /// caller's answer unsent. The post goes to a loopback stand-in for the
+    /// server, which takes the result and answers only when told. The engine's
+    /// own count is this thread's, so no other test reads this command.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_run_is_held_until_its_result_is_posted() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let engine_runs = crate::power::new_activity_counter();
+        crate::busy::EXEC_RUNS_HERE.with(|h| *h.borrow_mut() = Some(engine_runs));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (posting_tx, posting_rx) = tokio::sync::oneshot::channel::<()>();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if conn.read(&mut byte).await.unwrap() == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let _ = posting_tx.send(());
+            let _ = answer_rx.await;
+            conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            // Read to the end, so closing never resets what the client sent.
+            let mut rest = Vec::new();
+            let _ = conn.read_to_end(&mut rest).await;
+            String::from_utf8_lossy(&head).into_owned()
+        });
+        let mut anchor = anchor();
+        anchor.server = format!("http://127.0.0.1:{port}");
+        let claimed = Claimed {
+            request_id: "6ace07367d06cf41e19e54b0".into(),
+            shell: "cmd".into(),
+            command: "exit 0".into(),
+            timeout_ms: 60_000,
+            max_output_bytes: 0,
+            cwd: None,
+            caller: "test".into(),
+            run_as: "system".into(),
+        };
+        let runs = HeldRuns::default();
+        let held = runs.hold(std::time::Instant::now());
+        let task = tokio::spawn(svc::run_and_post(
+            anchor,
+            claimed,
+            crate::exec::RunAs::Daemon,
+            "system",
+            held,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(120), posting_rx)
+            .await
+            .expect("the result was never posted")
+            .unwrap();
+        assert_eq!(
+            runs.count_at(std::time::Instant::now()),
+            1,
+            "the run stopped counting before its result was posted"
+        );
+        answer_tx.send(()).unwrap();
+        task.await.unwrap();
+        crate::busy::EXEC_RUNS_HERE.with(|h| *h.borrow_mut() = None);
+        assert_eq!(
+            runs.count_at(std::time::Instant::now()),
+            0,
+            "the run is counted after its result was posted"
+        );
+        let head = server.await.unwrap();
+        assert!(
+            head.starts_with("POST /api/agent/service/rpc/6ace07367d06cf41e19e54b0/result?tid="),
+            "{head}"
+        );
     }
 
     /// The one-time copy reads the anchor's first home through FR-94's

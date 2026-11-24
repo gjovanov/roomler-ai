@@ -176,7 +176,7 @@ sequenceDiagram
 | A miss | `dao/room.rs:960`, the close itself `close_sessions` (`:1028`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
 | Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
 | Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`crates/modules/conference/src/lib.rs:290`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
-| Room deleted | `crates/modules/chat/src/room.rs:364`, `dao/room.rs:348` `cascade_delete` | The room's `room_members` rows go with its document, and their sessions with them. The call ends for everyone in it, on the pod serving it ([below](#a-room-deleted-mid-call-ends-its-call)) |
+| Room deleted | `crates/modules/chat/src/room.rs:373`, `dao/room.rs:348` `cascade_delete` | The room's `room_members` rows go with its document, and their sessions with them. The call ends for everyone in it, on the pod serving it ([below](#a-room-deleted-mid-call-ends-its-call)) |
 
 What a leave naming connection C may close:
 
@@ -295,7 +295,7 @@ sequenceDiagram
 |---|---|---|
 | Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:239`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:251`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
 | Left the room (`POST …/room/{room_id}/leave`) | `crates/modules/chat/src/room.rs:239`, `room_member_removed` | their seats in that room's call (`revoke.rs:223`). The membership row held their call sessions, so the leave itself drops the call's count (`dao/room.rs:526`), and a call they were the last one in ends (`call.rs:331` `settle_call_after_departure`) |
-| The room was deleted (`DELETE …/room/{room_id}`) | `crates/modules/chat/src/room.rs:384`, `room_removed` | the room's call, for everyone in it (`revoke.rs:120` `room_deleted`): every seat, the router, the claim and the call's stats record ([below](#a-room-deleted-mid-call-ends-its-call)) |
+| The room was deleted (`DELETE …/room/{room_id}`) | `crates/modules/chat/src/room.rs:393`, `room_removed` | the room's call, for everyone in it (`revoke.rs:120` `room_deleted`): every seat, the router, the claim and the call's stats record ([below](#a-room-deleted-mid-call-ends-its-call)) |
 
 - The seats close on the pod that holds them (`revoke.rs:355` `withdraw_seats_here`), reached
   over the bus as `media.withdraw_seats` when it is the other pod (`revoke.rs:316`,
@@ -587,7 +587,7 @@ document and its `room_members` rows, and the call sessions those rows held go w
 The call running in the room ends with them, for everyone in it, on whichever pod serves
 it. `chat` tells `conference` through `MembershipLifecycle::room_removed`
 (`crates/core/src/hooks.rs:229`) once the room is gone
-(`crates/modules/chat/src/room.rs:384`).
+(`crates/modules/chat/src/room.rs:393`).
 
 ```mermaid
 sequenceDiagram
@@ -629,7 +629,7 @@ sequenceDiagram
   (`crates/core/src/cluster/bus.rs:42`), a second read and a release when no reply comes,
   and one update of the stats record.
 - **The delete waits a bounded time.** The hook runs in a task of its own, and the delete
-  waits for it at most `ROOM_REMOVED_BOUND`, 5 s (`crates/modules/chat/src/room.rs:342`),
+  waits for it at most `ROOM_REMOVED_BOUND`, 5 s (`crates/modules/chat/src/room.rs:351`),
   well above the slowest healthy teardown. Past the bound (a Redis or Mongo node lost
   without a reset hangs a read without end), or when the client hangs up, the delete
   answers and the teardown goes on: it is never cut off between a router removed and its
@@ -918,7 +918,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
-| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1191`), `RETIRED_RC_TAG_FAMILIES` (`:1220`), `RETIRED_USER_WS_NAMESPACES` (`:1225`) and `RETIRED_MODULE_IDS` (`:1229`), locked by `retired_rpc_verbs_are_never_reused` (`:8329`), `retired_wire_families_and_module_ids_are_never_reused` (`:8398`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5308`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1191`), `RETIRED_RC_TAG_FAMILIES` (`:1220`), `RETIRED_USER_WS_NAMESPACES` (`:1225`) and `RETIRED_MODULE_IDS` (`:1229`), locked by `retired_rpc_verbs_are_never_reused` (`:8334`), `retired_wire_families_and_module_ids_are_never_reused` (`:8403`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5308`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 

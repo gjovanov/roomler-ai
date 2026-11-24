@@ -2348,11 +2348,36 @@ pub struct Promotion {
 ///
 /// The exit node a primary USES (`overlay_exit_node`) is org-specific and is
 /// cleared; an exit node it OFFERS travels with its enrollment.
+///
+/// #4370 — refused while the primary enrollment is
+/// [`ephemeral`](AgentConfig::ephemeral): checked FIRST, whatever the labels,
+/// and `cfg` is left as it was. An organization beside the primary is never
+/// ephemeral (#4352), and an `[[orgs]]` entry has no `ephemeral`, so the swap
+/// would move the row where this device no longer knows it is ephemeral (and
+/// the restart that applies it, an OS stop of the run that started as that row,
+/// would remove it on the server while the file still lists it), and mark the
+/// promoted org's permanent row ephemeral. Not seen, so not refused: an
+/// `[[orgs]]` entry whose row the server holds as ephemeral (joined before
+/// #4352), since an entry carries no flag.
 pub fn promote_org_to_primary(
     cfg: &mut AgentConfig,
     label: &str,
     demoted_label: Option<&str>,
 ) -> Result<Promotion> {
+    if cfg.ephemeral {
+        anyhow::bail!(
+            "the primary enrollment (row {}, tenant {} on {}) is ephemeral, and an ephemeral \
+             enrollment never sits beside another organization: `org set-primary` would move it \
+             into [[orgs]], where this device would no longer know it is ephemeral. Remove that \
+             row on the Devices page (an ephemeral row never turns permanent), then enroll this \
+             machine in that organization again with a standard enrollment token: the config \
+             keeps its settings and its other organizations. Then run `org set-primary` again. \
+             Nothing has changed",
+            cfg.agent_id,
+            cfg.tenant_id,
+            cfg.server_url
+        );
+    }
     let Some(idx) = cfg.orgs.iter().position(|o| o.label == label) else {
         anyhow::bail!("no org labelled {label:?} — see `roomlerd org ls`");
     };
@@ -7044,6 +7069,106 @@ tenant_id = "tid2"
         assert_eq!(cfg.orgs[0].label, "old-home");
         assert_eq!(cfg.orgs[0].tenant_id, "tid");
         assert_eq!(cfg.tenant_id, "tid-a");
+    }
+
+    /// #4370 — the device of the cells below: an EPHEMERAL primary enrollment
+    /// (row `row-eph-a`) beside two permanent `[[orgs]]` entries, `zeta` and
+    /// `acme`.
+    fn ephemeral_primary_beside_two_orgs() -> AgentConfig {
+        let mut cfg = fixture();
+        cfg.ephemeral = true;
+        cfg.agent_id = "row-eph-a".into();
+        let mut acme = org_fixture("acme", "tid-acme");
+        acme.server_url = "https://acme.invalid".into();
+        cfg.orgs = vec![org_fixture("zeta", "tid-z"), acme];
+        cfg
+    }
+
+    /// #4370 — a promotion refused because the primary is ephemeral, told
+    /// apart from every other refusal of `promote_org_to_primary`: it names
+    /// the ephemeral row.
+    fn is_the_ephemeral_refusal(err: &anyhow::Error) -> bool {
+        let said = err.to_string();
+        said.contains("ephemeral") && said.contains("row-eph-a")
+    }
+
+    /// #4370 T1 — an ephemeral primary is never promoted away: `set-primary`
+    /// would move its row into `[[orgs]]`, where the device no longer knows it
+    /// is ephemeral, and leave the promoted org marked ephemeral. Refused, with
+    /// or without `--demoted-label`, and nothing in the config changes: its
+    /// TOML is the same, the `[[orgs]]` order and labels included.
+    #[test]
+    fn promote_refuses_while_the_primary_is_ephemeral_and_changes_nothing() {
+        for demoted_label in [None, Some("old-home")] {
+            let mut cfg = ephemeral_primary_beside_two_orgs();
+            let before = toml::to_string_pretty(&cfg).unwrap();
+
+            let err = promote_org_to_primary(&mut cfg, "acme", demoted_label)
+                .expect_err("an ephemeral primary is never promoted away");
+
+            assert!(is_the_ephemeral_refusal(&err), "{demoted_label:?}: {err:#}");
+            assert_eq!(
+                toml::to_string_pretty(&cfg).unwrap(),
+                before,
+                "{demoted_label:?}: the config is as it was"
+            );
+            let labels: Vec<&str> = cfg.orgs.iter().map(|o| o.label.as_str()).collect();
+            assert_eq!(labels, ["zeta", "acme"], "{demoted_label:?}");
+            assert!(cfg.ephemeral, "{demoted_label:?}");
+            assert_eq!(cfg.agent_id, "row-eph-a", "{demoted_label:?}");
+            assert_eq!(cfg.tenant_id, "tid", "{demoted_label:?}");
+        }
+    }
+
+    /// #4370 T2 — the ephemeral refusal comes first, whatever label is asked
+    /// for: an unknown org, and a `--demoted-label` that is itself refused
+    /// (another org's, the reserved one, an unusable one), are told the
+    /// primary is ephemeral, and nothing in the config changes.
+    #[test]
+    fn promote_refuses_an_ephemeral_primary_before_it_reads_the_labels() {
+        for (label, demoted_label) in [
+            ("ghost", None),
+            ("acme", Some("zeta")),
+            ("acme", Some("Primary")),
+            ("acme", Some("!!")),
+        ] {
+            let mut cfg = ephemeral_primary_beside_two_orgs();
+            let before = toml::to_string_pretty(&cfg).unwrap();
+
+            let err = promote_org_to_primary(&mut cfg, label, demoted_label)
+                .expect_err("an ephemeral primary is never promoted away");
+
+            assert!(
+                is_the_ephemeral_refusal(&err),
+                "({label}, {demoted_label:?}): {err:#}"
+            );
+            assert_eq!(
+                toml::to_string_pretty(&cfg).unwrap(),
+                before,
+                "({label}, {demoted_label:?}): the config is as it was"
+            );
+        }
+    }
+
+    /// #4370 T4 — the same device with a PERMANENT primary is promoted as
+    /// before, and the swap leaves `ephemeral` false.
+    #[test]
+    fn promote_from_a_permanent_primary_swaps_as_before() {
+        let mut cfg = ephemeral_primary_beside_two_orgs();
+        cfg.ephemeral = false;
+
+        let done = promote_org_to_primary(&mut cfg, "acme", None).unwrap();
+
+        assert_eq!(cfg.tenant_id, "tid-acme");
+        assert_eq!(cfg.agent_id, "aid-acme");
+        assert!(
+            !cfg.ephemeral,
+            "a swap never marks the new primary ephemeral"
+        );
+        assert_eq!(done.demoted_label, "acme");
+        assert_eq!(cfg.orgs[1].label, "acme");
+        assert_eq!(cfg.orgs[1].agent_id, "row-eph-a", "the demoted primary");
+        assert_eq!(cfg.orgs[1].tenant_id, "tid");
     }
 
     #[test]

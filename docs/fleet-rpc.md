@@ -208,6 +208,15 @@ to a local pipe. What each attempt to get around that meets:
 | Read SYSTEM's output | it is posted from the service to the server over HTTPS |
 | An http origin, to rewrite the claim on the path | the anchor accepts https only (loopback excepted, for tests) |
 
+**An update waits for the command (#4244).** The worker's periodic update
+cannot see a command the service runs, so the service counts each one it
+holds, from its claim until its result is posted, and never past 8 min
+(`HeldRuns`, `agents/roomlerd/src/exec_service.rs:637`). Its health answer
+carries that count (`exec_runs`): a number, never which command or whose, to
+the callers the pipe already admits. The worker asks for it at each decision,
+and defers on it as on a command of its own
+([installation.md](installation.md#a-command-the-system-service-runs-4244)).
+
 ### Anchoring a device
 
 From an **elevated** prompt on the device:
@@ -531,7 +540,7 @@ run the command as root:
 
 | Where | What is checked | Source |
 |---|---|---|
-| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:975`](../crates/modules/fleet/src/agent_exec.rs#L975) |
+| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:981`](../crates/modules/fleet/src/agent_exec.rs#L981) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:371`](../crates/modules/fleet/src/agent_exec.rs#L371) |
 | The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3206`](../crates/modules/fleet/src/hub.rs#L3206) |
 | The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5815`](../agents/roomlerd/src/signaling.rs#L5815) |

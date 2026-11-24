@@ -3654,6 +3654,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,

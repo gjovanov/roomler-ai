@@ -106,6 +106,7 @@ pub async fn relay_overlay_msg_from_node(
             relay_port,
             advertised_routes,
             route_offer_withheld,
+            exit_serves_v6,
             ..
         } => {
             handle_overlay_join(
@@ -127,6 +128,7 @@ pub async fn relay_overlay_msg_from_node(
                 relay_port,
                 advertised_routes,
                 route_offer_withheld,
+                exit_serves_v6,
             )
             .await;
             None
@@ -262,6 +264,7 @@ async fn handle_overlay_join(
     relay_port: Option<u16>,
     advertised_routes: Vec<String>,
     route_offer_withheld: Option<String>,
+    exit_serves_v6: Option<bool>,
 ) {
     let node_ref = ident.node_ref();
     // FR-97 P0b — the device's own words, shown to admins: bounded and kept to
@@ -468,6 +471,7 @@ async fn handle_overlay_join(
                     supports_org_relay,
                     &advertised_routes,
                     route_offer_withheld.as_deref(),
+                    exit_serves_v6,
                     retire.as_ref(),
                 )
                 .await
@@ -575,6 +579,7 @@ async fn handle_overlay_join(
                         supports_org_relay,
                         advertised_routes: advertised_routes.clone(),
                         route_offer_withheld: route_offer_withheld.clone(),
+                        exit_serves_v6,
                     })
                     .await
                 {
@@ -3055,6 +3060,7 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // Dialer honesty — surface the node's raw-dial verdict VERBATIM
         // (`None` = pre-honesty agent; peers then keep legacy role inputs).
         udp_dialer_ok: node.udp_dialer_ok,
+        exit_serves_v6: node.exit_serves_v6,
         relay_home: node.relay_home.clone(),
         // C4 stage 2 (PR-B) — surface the node's standing warm-leg address
         // (heartbeat-mirrored) so a single-relay dialer can dial this anchor
@@ -3447,6 +3453,7 @@ mod tests {
             approved_routes: vec![],
             is_exit_node: false,
             route_offer_withheld: None,
+            exit_serves_v6: None,
             status: AgentStatus::Online,
             last_seen_at: now,
             created_at: now,
@@ -3567,6 +3574,28 @@ mod tests {
         let n = node("buildhost", "100.64.0.14");
         assert!(to_netmap_peer(&n, true).reachable);
         assert!(!to_netmap_peer(&n, false).reachable);
+    }
+
+    /// #3562 AC W4 — the exit's IPv6 statement on the stored row and on the
+    /// netmap peer built from it: absent stays ABSENT in the BSON document
+    /// (an older agent's row, never `null`), and a statement round-trips
+    /// through the row into every peer's netmap as it was sent.
+    #[test]
+    fn the_exit_s_v6_statement_is_stored_as_sent_and_absent_when_unset() {
+        let older = node("exit-a", "100.64.0.15");
+        assert_eq!(older.exit_serves_v6, None);
+        let doc = bson::to_document(&older).unwrap();
+        assert!(!doc.contains_key("exit_serves_v6"), "{doc:?}");
+        assert_eq!(to_netmap_peer(&older, true).exit_serves_v6, None);
+        for v in [false, true] {
+            let mut n = node("exit-a", "100.64.0.15");
+            n.exit_serves_v6 = Some(v);
+            let doc = bson::to_document(&n).unwrap();
+            assert_eq!(doc.get_bool("exit_serves_v6"), Ok(v), "{doc:?}");
+            let back: OverlayNode = bson::from_document(doc).unwrap();
+            assert_eq!(back.exit_serves_v6, Some(v));
+            assert_eq!(to_netmap_peer(&back, true).exit_serves_v6, Some(v));
+        }
     }
 
     #[test]

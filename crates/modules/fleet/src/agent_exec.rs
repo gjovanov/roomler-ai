@@ -40,7 +40,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -940,11 +940,16 @@ pub async fn cancel(
 /// `MANAGE_AGENTS`, like every other device-policy edit. Note this does NOT
 /// require `EXEC_DEVICE`: deciding a device may be exec'd is a management act,
 /// performing the exec is a separate power.
+///
+/// The bit is decided before the body is read, and the body before the
+/// device is looked up (#4254): a caller without the bit gets the gate's
+/// answer whatever the body is, and a holder is answered one that does not
+/// parse as the `Json` extractor answered it, whatever the device id.
 pub async fn set_policy(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    Json(body): Json<ExecPolicyBody>,
+    body: Result<Json<ExecPolicyBody>, JsonRejection>,
 ) -> Result<Json<ExecPolicyBody>, ApiError> {
     let tid = tenant_of(&tenant_id).await?;
     require_permission(
@@ -955,6 +960,7 @@ pub async fn set_policy(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
     let agent = load_agent(&state, tid, &agent_id).await?;
 
     let parse_ids = |v: &[String], what: &str| -> Result<Vec<ObjectId>, ApiError> {
@@ -1052,12 +1058,15 @@ pub async fn get_org_settings(
 ///
 /// `MANAGE_TENANT`, not `MANAGE_AGENTS`: this one switch decides whether the
 /// org's devices can be shelled into at all, which is an org-owner decision
-/// rather than a fleet-admin one.
+/// rather than a fleet-admin one. It is decided before the body is read
+/// (#4254): a caller without it gets the gate's answer whatever the body is,
+/// and a holder is answered one that does not parse as the `Json` extractor
+/// answered it.
 pub async fn set_org_settings(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<OrgExecSettings>,
+    body: Result<Json<OrgExecSettings>, JsonRejection>,
 ) -> Result<Json<OrgExecSettings>, ApiError> {
     let tid = tenant_of(&tenant_id).await?;
     require_permission(
@@ -1068,6 +1077,7 @@ pub async fn set_org_settings(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     let mut tenant = state
         .tenants
         .set_remote_exec_enabled(tid, body.remote_exec_enabled)

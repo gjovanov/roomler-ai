@@ -243,14 +243,14 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 | An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:538`, `crates/modules/fleet/src/hub.rs:2407` |
 | A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1901`, `peer.rs:1940`, `peer.rs:1866` |
 
-"Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2206`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
+"Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2257`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
 
 > ⚠️ **Never the whole `100.64.0.0/10`.** That is real CGNAT space: an LTE modem, a cloud VPC's secondary range and Tailscale all hand out addresses in it, and a CIDR rule would silently strip their candidates. The footprint registry only ever grows, so a WS reconnect or runtime restart never opens a window in which an overlay address reads as foreign. **A daemon start does (#3359):** a session requested before the first runtime notes its blocks keeps an empty v4 list for its whole life, and on Windows the name rule can't help, because webrtc-util names every adapter `""`.
 
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3911`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:4956`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:5001`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -291,8 +291,8 @@ flowchart TD
 | Input | Where it comes from |
 |---|---|
 | that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1090`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:4915`). The Hub sends `auto` to no other agent |
-| that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:2531`) |
-| the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:3769`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:145`) |
+| that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:2538`) |
+| the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:3776`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:145`) |
 | the far TURN | `RcOverlayAutoWire.far_turn`: the last netcheck (`stun_udp`, since P2b alone) of the target and of the browser's best device, read by the server (below). The target folds its own netcheck in at the offer (D8, `own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:768`). `None` = not measured, read as usable |
 | the carriers | `mesh_carriers_of` (`agents/roomlerd/src/rc_overlay.rs:556`), one LocalAPI `peers` call for every viewer device: `Direct` direct, `Relay`/`Tunnel` relayed, anything else unknown. The best of them decides |
 | the rule | `auto_allows` (`rc_overlay.rs:538`) |
@@ -323,7 +323,7 @@ flowchart LR
   - **The rule** is `far_turn_verdict` (`crates/modules/network/src/hooks.rs:231`): either end measured dead is `false`; both measured alive is `true`; anything else is not measured.
   - The gate waits at most 500 ms, then sends no hint. A slow read costs the hint, never the session.
 - **Which devices are the browser's** follows the Hub's own precedence (`viewer_devices_of`, `controller.rs:696`). Probed descriptors win over named devices, and every one the Hub hands out counts, through the Hub's own `bounded_relays` and `named_devices` (`crates/modules/fleet/src/hub.rs:105`, `:126`). The browser sends them all: the first as `local_relay`, the rest as `local_relay_also` (`ui/src/composables/useRemoteControl.ts:4383`).
-- **The target folds in its own netcheck** at the offer (D8): one LocalAPI `status` call beside the `peers` call (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:768`). If that netcheck found no UDP out, the far TURN is dead whatever the server saw (`with_own_reach`, `:787`). This is what measures a Mac: its RC target is the GUI worker's row, and that row has no overlay node for the hook to find (`find_live_by_agent`, `crates/services/src/dao/overlay_node.rs:476`). The per-user half answers `status` itself, so it lends the root daemon's netcheck along with the rest of the machine's network fields (`with_machine_network`, `agents/roomlerd/src/person_socket.rs:305`).
+- **The target folds in its own netcheck** at the offer (D8): one LocalAPI `status` call beside the `peers` call (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:768`). If that netcheck found no UDP out, the far TURN is dead whatever the server saw (`with_own_reach`, `:787`). This is what measures a Mac: its RC target is the GUI worker's row, and that row has no overlay node for the hook to find (`find_live_by_agent`, `crates/services/src/dao/overlay_node.rs:501`). The per-user half answers `status` itself, so it lends the root daemon's netcheck along with the rest of the machine's network fields (`with_machine_network`, `agents/roomlerd/src/person_socket.rs:305`).
 - **The Hub** reads `auto` as `off` for an agent that does not advertise `rc-overlay-auto` (`effective_rc_overlay`, `crates/modules/fleet/src/hub.rs:2964`). It decides this once per request, for the relay and the session alike.
 - **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3122`; `forward_offer`, `:2407`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
 - **Across pods** the relay envelope carries `rc_overlay_auto` and `rc_overlay_far_turn` beside the bool (`rc_overlay_to_relay`, `crates/modules/remote/src/relay.rs:591`; `rc_overlay_from_relay`, `:604`). An older pod reads only the bool, so `auto` reaches it as `off`.
@@ -3398,7 +3398,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3681`](../crates/localapi/src/lib.rs#L3681), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:109`](../crates/modules/remote/src/session_policy.rs#L109)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3687`](../crates/localapi/src/lib.rs#L3687), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:523`](../crates/remote_control/src/models.rs#L523)) and re-announced on the heartbeat when it changes |
 
@@ -5324,7 +5324,7 @@ with an agent release. Every pairing behaves as before FR-138, or ends the sessi
 | The page predates P1c | It ignores `resume_secs` and `rc:session.detached` and never rejoins. The device's claim resumes the session, which waits the window for a viewer and then ends `controller_hangup`, marked `limit: hold_expired`. The page's own socket loss holds the session the same way, and its next request, which names nothing in `replaces`, reaps the held one as the same person's | `a_resume_its_viewer_never_rejoins_ends_marked_hold_expired` (`crates/tests/src/rc_resume_ends_tests.rs:610`); `a_held_session_never_costs_its_own_viewer_the_slot` (`crates/tests/src/rc_resume_rejoin_tests.rs:393`), its second half |
 | The page predates D5 = A | It hangs up before it redials a session the server called detached, so the row reads `controller_hangup` (§11.18) | `a_controllers_end_during_the_gap_is_enforced_at_the_claim` (`crates/tests/src/rc_resume_rejoin_tests.rs:558`) |
 | A supervised Mac's GUI worker or daemon predates P2b | The delegated session takes the path it took before (§11.16.1's version table). A P2b daemon with an older worker claims nothing for it, and the server ends it at the hello | `p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions` (`agents/roomlerd/src/delegate.rs:3518`); `p2b_the_orders_and_both_fields_keep_a_stable_wire_and_older_frames_parse` (`:5287`) |
-| The server is rolled back during a gap, to an image at or above the floor below | The session's audit listing still reads, a kind the image does not know as `unknown`. Whether a kept session resumes is that image's claim to decide; an image that never answers the claim leaves the device to close the peer at its own deadline, so the session ends at the window | `an_audit_listing_holding_the_new_kinds_and_an_unknown_one_still_reads` (`crates/tests/src/rc_resume_tests.rs:257`); `an_audit_page_holding_an_unknown_kind_still_reads` (`crates/remote_control/src/models.rs:11280`); `a_reconnect_does_not_move_the_deadline` (`agents/roomlerd/src/session_table.rs:2572`) |
+| The server is rolled back during a gap, to an image at or above the floor below | The session's audit listing still reads, a kind the image does not know as `unknown`. Whether a kept session resumes is that image's claim to decide; an image that never answers the claim leaves the device to close the peer at its own deadline, so the session ends at the window | `an_audit_listing_holding_the_new_kinds_and_an_unknown_one_still_reads` (`crates/tests/src/rc_resume_tests.rs:257`); `an_audit_page_holding_an_unknown_kind_still_reads` (`crates/remote_control/src/models.rs:11285`); `a_reconnect_does_not_move_the_deadline` (`agents/roomlerd/src/session_table.rs:2572`) |
 
 The integration tests run on every master push that touches the server or the agent (`integration-tests.yml`), the
 agent's unit tests on Linux and on Windows in `ci.yml`, and the page's in the frontend checks.
@@ -7146,6 +7146,18 @@ after `kill -9`. Only `run` gates on the lock — `enroll`,
 `service install/uninstall`, `caps`, `displays`, `encoder-smoke`,
 `self-update` stay runnable alongside a live agent.
 
+**Machine guard** (`agents/roomlerd/src/machine_guard.rs`, #4280): one
+daemon per machine, whatever config a `run` loads. `run` takes it before
+anything host-global, and a run that finds it held leaves with 8 (0 on
+macOS). Only a privileged daemon (SYSTEM or an elevated administrator on
+Windows, root on Linux and macOS) can hold it; an unprivileged start can
+check for it but never creates it. It is keyed by the overlay
+interface's name and held only while its owner lives, so a holder that
+ends leaves it free. On Windows only SYSTEM and Administrators, at high
+integrity, can take it or change it, and any other signed-in account can
+only read whether it is held. The rule, and how each supervisor reads the
+code: [multi-org.md §2](multi-org.md#the-machines-guard-one-daemon-per-machine-enforced-4280).
+
 **Internal liveness watchdog** (`agents/roomlerd/src/watchdog.
 rs`): process-singleton via `OnceLock<Arc<Watchdog>>`; pumps tick
 via global `watchdog::tick("name")` free helpers (no parameter
@@ -7409,7 +7421,7 @@ otherwise keep (§11.16). The reconnect is the same either way.
 | control WS, a failed heartbeat send (`signaling.rs:2720`) or read (`:3418`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:160`, set at `:2337`). Both are read before the send, or on a read error before the closes (`session_ended`, `:122`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:100`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
 | the reconnect after any of them (`signaling.rs:1548`) | the session's reason, `AgentDidNotRun` (`:84`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
 | `/derp` RX deadline (`agents/roomlerd/src/derp.rs:488`) | the keepalive's due instant (`:475`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
-| direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:679`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3166`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
+| direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:679`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3322`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
 | relay carrier rx-stale, at 90 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:779`) | the same | the same | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the relay's …` |
 
 - ⚠️ The slack is what "about as long" means: how quiet the carrier gets
@@ -7497,7 +7509,7 @@ ruled out by the rule above. The lock behind that borrow is what held it.
   finished, so every field's guard was still held when the next field
   borrowed: ten nested read locks on one lock.
 - The view's one writer is the overlay runtime's `publish_view`
-  (`send_replace`, `crates/tunnel-core/src/overlay/runtime.rs:1985`), on
+  (`send_replace`, `crates/tunnel-core/src/overlay/runtime.rs:1992`), on
   every 5 s sweep and on carrier events. A publish that landed between
   two of `status()`'s borrows left nothing able to move:
 
@@ -7789,7 +7801,7 @@ clean, and Windows can end a worker before its service host hears of a
 restart. On released 0.4.197 two `shutdown /r` within five minutes of a
 self-update reached `crash_count=3`, and a healthy device tried to roll
 itself back. `config::previous_run`
-([`crates/agent-core/src/config.rs:2682`](../crates/agent-core/src/config.rs#L2682))
+([`crates/agent-core/src/config.rs:2707`](../crates/agent-core/src/config.rs#L2707))
 is the one table that decides, on every start:
 
 | How the last run ended | Who can say | `PreviousRun` | Counts |
@@ -7825,7 +7837,7 @@ the crash *reports* because the watchdog wrote its own.
 **A worker with no enrollment counts nowhere** (#4028). The SCM host's
 worker for an account with no config, and no last good copy of one that
 holds an enrollment (#4157), exits `NO_ENROLLMENT_EXIT_CODE`
-(78, [`daemon_error.rs:153`](../agents/roomlerd/src/daemon_error.rs#L153)).
+(78, [`daemon_error.rs:210`](../agents/roomlerd/src/daemon_error.rs#L210)).
 `should_record_supervisor_crash` leaves it out of the reports, and the host
 backs it off exactly as an exit 1. Since #4324 it does not count toward the
 host's crash-loop alarm and never raises it: the host names the way forward in
@@ -7850,7 +7862,7 @@ config itself would, and the service starts that worker for such a copy
 restores a config from its last good copy (`config.toml.prev`), the live
 file missing or unreadable, it clears the copy's run marks first:
 `last_run_unhealthy` and `last_run_boot` (`clear_run_marks`,
-[`crates/agent-core/src/config.rs:5158`](../crates/agent-core/src/config.rs#L5158)).
+[`crates/agent-core/src/config.rs:5183`](../crates/agent-core/src/config.rs#L5183)).
 A save kept that copy while its run went on, so its mark says nothing of
 how the run ended. Before #4157 the copy kept the mark, and the start after
 a restore read the run before it as `Crashed` on the same boot, one step
@@ -7877,10 +7889,10 @@ Each one now marks its run clean before it ends, through
 [`agents/roomlerd/src/run_end.rs`](../agents/roomlerd/src/run_end.rs):
 
 - `run_cmd` opens the run's book once the start's mark is saved
-  ([`app.rs:4406`](../agents/roomlerd/src/app.rs#L4406)), and never on the
+  ([`app.rs:4451`](../agents/roomlerd/src/app.rs#L4451)), and never on the
   read-only view an unenrolled GUI worker runs on (FR-43 P3a). It shares the
   P6 write lock with the book
-  ([`app.rs:4866`](../agents/roomlerd/src/app.rs#L4866)).
+  ([`app.rs:4911`](../agents/roomlerd/src/app.rs#L4911)).
 - The mark takes that lock, reads the file again, calls
   `mark_clean_shutdown` and saves, on a thread of its own. The end waits for
   it at most `MARK_BUDGET` (2 s) and then exits anyway. A mark that comes too
@@ -7907,7 +7919,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4378`](../agents/roomlerd/src/app.rs#L4378),
+([`agents/roomlerd/src/app.rs:4423`](../agents/roomlerd/src/app.rs#L4423),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 
@@ -8355,7 +8367,7 @@ flowchart LR
   | The supervisor returned an error | `ServiceSpecific(2)` | restarts it |
   | The supervisor panicked | `ServiceSpecific(3)` | restarts it |
   | No supervisor at all (the worker path or the startup sequence failed) | `ServiceSpecific(4)` | restarts it |
-  | The worker found the single-instance lock held, and the orphan check read every roomlerd process without finding an earlier host's worker: a second installed flavour (#2465, §19.8.9) | `0` | leaves the service stopped |
+  | The worker found the single-instance lock or the machine's guard held (#4280), and the orphan check read every roomlerd process without finding an earlier host's worker: a second installed flavour, or a console `run` that holds the machine (#2465, §19.8.9) | `0` | leaves the service stopped |
   | The same refusal, but some roomlerd process could not be read, so an orphan cannot be ruled out (#2465) | `ServiceSpecific(5)` | restarts it |
 
   ⚠️ A requested stop must stay `0`. With non-crash failure actions on, any other

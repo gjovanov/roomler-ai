@@ -389,7 +389,7 @@ can do.
 ### 3.2 P0a — fail toward withhold (#2081)
 
 `SystemTun` refuses an exemption wherever it has no arm: a `cfg(not(any(linux, windows)))` `add_host_exemption`
-returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:705-716` withholds and `roomler status`
+returns `ErrorKind::Unsupported`, so on macOS the gate at `route_guard.rs:740-751` withholds and `roomler status`
 says why. The trait default stays `Ok(())`, now documented as safe only for a device that installs no OS routes
 (the in-memory mocks, netstack); changing it would move every mock and netstack for no safety gain. Netstack's untrue
 `active` belongs to P0c. The test that fails on master is
@@ -480,12 +480,12 @@ beside the words.
   given (`crates/tunnel-core/src/overlay/netstack_socks.rs:75`), and the exit install puts the split-default in the
   userspace router, so a literal does reach the exit. Names the front is handed resolve only to overlay peers, it
   refuses IPv6 destinations, and nothing else on the host uses the exit. So:
-  - `ExitNodeStatus.socks5_port` (`crates/localapi/src/lib.rs:111`): `roomler status` says "active for SOCKS5
+  - `ExitNodeStatus.socks5_port` (`crates/localapi/src/lib.rs:117`): `roomler status` says "active for SOCKS5
     clients of 127.0.0.1:1080 only", and never `v6 on`.
   - The host's DNS is never steered from a netstack node
-    (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:496`): on Windows and macOS the steer is host-wide and
+    (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:527`): on Windows and macOS the steer is host-wide and
     would route nothing through the exit.
-  - A netstack node withholds every route offer (`crates/tunnel-core/src/overlay/nat.rs:179`): its stack forwards
+  - A netstack node withholds every route offer (`crates/tunnel-core/src/overlay/nat.rs:209`): its stack forwards
     nothing. On 0.4.141, a netstack node on a host where iptables worked offered `/0`.
 
 **Order.**
@@ -520,7 +520,7 @@ Mirror the Linux arm with the BSD tools the macOS code already drives, and close
    change`: it resolves its target the way the lookup does, and on the field Mac it left the pin untouched. The table
    then decides; a pin that does not hold comes out again and the call errs.
 4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:7201` on macOS, an empty default
-   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:743`)
+   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:778`)
    asks at most every 3 s, re-pins each, and DELETES one it cannot re-pin before forgetting it, so an untracked
    route never outlives the exit. Then the usual rule applies: a v4 pin missing means WITHHOLD.
 5. **`del_host_exemption`** removes only the pin the table shows, never a route on our utun (a peer route): with no
@@ -528,8 +528,8 @@ Mirror the Linux arm with the BSD tools the macOS code already drives, and close
    removes the `/1`s (`tun.rs:5305-5348` at the time of writing); pins an unclean exit leaves behind are N13, all
    three OSes.
 6. **The two 0.4.132 follow-ups.** The pin WARN fires once per (endpoint, cause) (`note_exemption_failure`,
-   `route_guard.rs:539`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
-   (`exemption_withheld_reason`, `route_guard.rs:551`) instead of `no original default route?`.
+   `route_guard.rs:570`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
+   (`exemption_withheld_reason`, `route_guard.rs:582`) instead of `no original default route?`.
 
 Kill switch: `ROOMLERD_EXIT_CLIENT_MACOS=0` refuses every exemption, as 0.4.132 did. DNS is not steered yet (P1c):
 `roomler status` says `DNS NOT steered`.
@@ -639,7 +639,7 @@ Prefer the SCDynamicStore to files: a supplemental resolver (`SupplementalMatchD
 `SCDynamicStoreAddTemporaryValue` should disappear when the daemon's store session ends, which would make the steer
 crash-safe by construction (unverified; P1c's first task). The fallback for the split zone is `/etc/resolver/<domain>`
 (honoured by the system resolver, not by `dig`), purged at boot. Keep the existing bound-resolver gate
-(`runtime.rs:2452-2472`): never steer at a `:53` that did not bind.
+(`runtime.rs:2530-2550`): never steer at a `:53` that did not bind.
 
 *Done first, 2026-10-14, on throwaway tart VMs with `scutil` only, before any code (§8):* a temporary key's holder
 SIGKILLed → the key is gone within 1–4 s (two keys in one session: both); the same key without the flag survives its
@@ -653,7 +653,7 @@ test of the SIGKILL property itself.
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
-  is 15, `docs/installation.md:2718-2733`), in the GUI worker, under the Screen Recording grant it already holds. The
+  is 15, `docs/installation.md:2722-2737`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
   *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
   `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
@@ -796,10 +796,10 @@ test of the SIGKILL property itself.
   lists a device with no node by itself (`overlay: "no_node"`, `crates/api/src/routes/agent_self.rs`). The fix keeps
   the server and the companion as they are:
   - the root half serves the console user a person socket (FR-27 P11's mechanism) at
-    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:5238`). The directory is root's and writable by
-    nobody else (`root_only_dir`, `:5507`), so root binds and then hands the socket over (`bind_root_owned`,
-    `:5520`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
-  - `person_may` (`:3782`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
+    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:5244`). The directory is root's and writable by
+    nobody else (`root_only_dir`, `:5513`), so root binds and then hands the socket over (`bind_root_owned`,
+    `:5526`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
+  - `person_may` (`:3788`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
     socket the same way, and its companion's Devices page was refused there before;
   - the per-user half asks the root half only when its own answer is `no_node` and it is not root
     (`agents/roomlerd/src/person_socket.rs:180`). It shows the root half's answer only when that is `ok` (`:188`),
@@ -814,9 +814,9 @@ test of the SIGKILL property itself.
 
   Built:
   - **One async hook at the dispatch of each request**, `LocalApiState::status_view` and `peers_view`
-    (`crates/localapi/src/lib.rs:3036`, `:3041`, dispatched at `:4071`). They default to the sync reads, so the
+    (`crates/localapi/src/lib.rs:3042`, `:3047`, dispatched at `:4077`). They default to the sync reads, so the
     tests' fakes are untouched. #3864 later put two more beside them, `consent_pending_view` and
-    `consent_decide_view` (`:3162`, `:3170`), which default to the daemon's own consent questions and answers. A
+    `consent_decide_view` (`:3168`, `:3176`), which default to the daemon's own consent questions and answers. A
     one-row Mac's GUI worker (FR-43 P3) overrides them to list the root half's questions beside its own and to
     send the root half the answers to them.
   - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2212`, `:2225`), with P2g's
@@ -824,12 +824,12 @@ test of the SIGKILL property itself.
     `Peers` is the root half's, and `Status` is its own with the root half's overlay addresses, exit status,
     MagicDNS and, since FR-128 D8, netcheck (`with_machine_network`, `:289`). On a one-row Mac's GUI worker
     (FR-43 P3a), `Status` also takes the root half's identity and link (`with_machine_identity`, `:313`).
-  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3789`). That drops
+  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3795`). That drops
     the endpoints of either end and of a relay, the carrier snapshot, the path decision and the probes, which
     name other devices' public and LAN addresses.
   - **A root half slow to answer** (1.5 s) leaves the half's own answer for that poll.
   - **The answer names its lender (#2892).** `with_machine_network` also sets `NodeStatus.network_from`
-    (`crates/localapi/src/lib.rs:197`; the root half's node id and name), additive and absent unless lent. Until then `roomler status` as the console
+    (`crates/localapi/src/lib.rs:203`; the root half's node id and name), additive and absent unless lent. Until then `roomler status` as the console
     user printed the root half's address as the per-user half's, right above that half's own "overlay OFF"
     enrollments, and told it to join the mesh with netstack. The CLI marks the lent lines "(the root daemon's)",
     adds a `network` line naming that daemon, and reads the enrollments' closing line as "off the mesh by design";
@@ -1032,7 +1032,7 @@ test of the SIGKILL property itself.
   off master: its P2 (#3475, merged as `9da76c4e6`) shipped in agent 0.4.201, and 0.4.200 is the last release that
   carries P4c. The code is kept whole on `park/hive-fr90` at `7106d588d`; every anchor below is read there (at master
   `7106d588d`), and none of the files it names is on master. Master keeps two traces of P4c: `hive_adopt`, one of 23
-  retired config keys (`crates/agent-core/src/config.rs:4462`), and the hidden `roomler hive hook`
+  retired config keys (`crates/agent-core/src/config.rs:4487`), and the hidden `roomler hive hook`
   (`agents/roomler-cli/src/cli.rs:1063`; `docs/retired-names.md`, *Reserved after FR-90 was parked*), which exits 0.
   It answers the hook entries already written into Claude Code's settings, such as the bare `roomler.exe hive hook`
   that P4c wrote on Windows. As the parked head has it, the adopt socket is a named pipe,

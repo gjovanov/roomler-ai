@@ -975,12 +975,12 @@ enum OrgAction {
     /// Disable a secondary enrollment without deleting it (no supervised
     /// WS loop for it on the next daemon start).
     Disable { label: String },
-    /// Swap a secondary enrollment into the PRIMARY slot (and the current
-    /// primary into `[[orgs]]`, under `--demoted-label` or else the given
-    /// secondary's old label). The primary drives machine-wide effects:
-    /// self-update source, attention sentinels, and declared tunnel routes.
-    /// Each enrollment keeps its place on the mesh where it maps exactly
-    /// (#2540); the output says what it could not keep.
+    /// Swap a secondary enrollment into the PRIMARY slot (and the current primary into
+    /// `[[orgs]]`, under `--demoted-label` or else the given secondary's old label). The
+    /// primary drives machine-wide effects: self-update source, attention sentinels, and
+    /// declared tunnel routes. Each enrollment keeps its place on the mesh where it maps
+    /// exactly (#2540); the output says what it could not keep. Refused while the primary
+    /// enrollment is ephemeral (#4370): an ephemeral row never sits beside another org.
     SetPrimary {
         label: String,
         /// The label the current primary takes in `[[orgs]]`. Default: the
@@ -3949,6 +3949,73 @@ fn owner_of_folder(file: &Path) -> String {
     String::new()
 }
 
+/// #4280 — `run`'s gate, in its order, before anything host-global: the config's
+/// state (#4023), an install in flight (FR-150 P2), the machine's guard
+/// (`hold`), this config's single-instance lock, then `DAEMON_RAN`. From its end
+/// this process is the daemon of this machine; everything after it in `run_cmd`
+/// (the start purge of the overlay's routes, the LocalAPI, the first connect) is
+/// host-global. A run that leaves here marks, saves and counts nothing in any
+/// config: the crash mark (`config::mark_run_starting`) comes long after it.
+///
+/// `Ok(Some(lock))` = go on, holding the lock. `Ok(None)` = another process holds
+/// this config's lock and the platform leaves with a clean end (macOS; Linux and
+/// Windows exit 8 here). `hold` is the machine's guard,
+/// `roomlerd::machine_guard::hold_here`, and a stand-in in the run-order test, so
+/// that no test takes the machine's own.
+async fn start_gate<F, Fut>(
+    config_path: &Path,
+    unenrolled: bool,
+    supervision: roomlerd::supervision::Supervision,
+    supervisor_flag: Option<&str>,
+    hold: F,
+) -> Result<Option<instance_lock::InstanceLock>>
+where
+    F: FnOnce(roomlerd::supervision::Supervision) -> Fut,
+    Fut: std::future::Future<Output = Result<(), roomlerd::daemon_error::MachineHeld>>,
+{
+    let at_start = config_at_start::of(config_path, unenrolled, supervision);
+    if at_start == config_at_start::AtStart::NoConfig {
+        // #4023 — a state, not a fault: no crash is recorded, and a supervisor that reads 78 gets
+        // 78 (#4028, #4071). #4157 — an enrolled copy is restored instead, if the run may restore.
+        return Err(roomlerd::daemon_error::NoConfig::under(config_path, supervision).into());
+    }
+    // FR-150 P2 — before the lock: the per-user task's daemon started inside an install leaves.
+    roomlerd::daemon_error::leave_if_an_install_runs(supervisor_flag)?;
+    // #4280 — the machine's guard, before the lock: the lock is this config's, and the overlay's
+    // interface and routes, the LocalAPI pipe, exit, DNS and firewall state and the device's
+    // connection are the machine's. Another daemon of this machine holds it: leave with the
+    // lock's code (`daemon_error::MachineHeld`). A supervised start waits for it a bounded while
+    // first, for a predecessor that is still exiting and holds both.
+    hold(supervision).await?;
+    // Take the single-instance lock before doing anything else. If another agent is already
+    // attached to this config (typically the Scheduled Task / systemd unit launched at logon),
+    // exit cleanly instead of fighting it for the WS connection. Only `run` gates on the lock —
+    // `enroll`, `service install`, `caps`, `displays`, `encoder-smoke`, `self-update` are
+    // intentionally runnable alongside an active agent.
+    let instance_lock =
+        match instance_lock::acquire(config_path).context("acquiring single-instance lock")? {
+            instance_lock::AcquireOutcome::Acquired(g) => g,
+            instance_lock::AcquireOutcome::AlreadyRunning => {
+                // FR-97 P6e (#1538) — never `eprintln!`: on a failing stderr it
+                // panics, and this benign exit became a crash on a Mac.
+                logging::say_on_stderr(
+                    "Another roomlerd is already running for this config; exiting.\n\
+                 (use `roomlerd service status` to check the auto-start hook,\n\
+                 or stop the running instance before starting a new one.)",
+                );
+                tracing::warn!("single-instance lock held by another process; exiting");
+                return already_running_exit().map(|()| None);
+            }
+        };
+    // FR-97 P0e — from here this process IS the daemon, so what it leaves in
+    // the host is its own to purge once the runtime is gone
+    // (`purge_after_daemon`). Never before the lock: on macOS a second
+    // `run` returns through `main` (no `process::exit` there), and would
+    // otherwise purge the RUNNING daemon's exit routes and pins.
+    DAEMON_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(Some(instance_lock))
+}
+
 /// The daemon. `Ok(Some(code))` = it ended through the graceful path a
 /// requested restart (FR-84 D3, `Request::RestartDaemon`) started, and the
 /// process must leave with `code` for its supervisor to relaunch it;
@@ -3973,40 +4040,18 @@ async fn run_cmd(
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
     let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
-    let at_start = config_at_start::of(config_path, unenrolled, supervision);
-    if at_start == config_at_start::AtStart::NoConfig {
-        // #4023 — a state, not a fault: no crash is recorded, and a supervisor that reads 78 gets
-        // 78 (#4028, #4071). #4157 — an enrolled copy is restored instead, if the run may restore.
-        return Err(roomlerd::daemon_error::NoConfig::under(config_path, supervision).into());
-    }
-    // FR-150 P2 — before the lock: the per-user task's daemon started inside an install leaves.
-    roomlerd::daemon_error::leave_if_an_install_runs(supervisor_flag)?;
-    // Take the single-instance lock before doing anything else. If another agent is already
-    // attached to this config (typically the Scheduled Task / systemd unit launched at logon),
-    // exit cleanly instead of fighting it for the WS connection. Only `run` gates on the lock —
-    // `enroll`, `service install`, `caps`, `displays`, `encoder-smoke`, `self-update` are
-    // intentionally runnable alongside an active agent.
-    let _instance_lock =
-        match instance_lock::acquire(config_path).context("acquiring single-instance lock")? {
-            instance_lock::AcquireOutcome::Acquired(g) => g,
-            instance_lock::AcquireOutcome::AlreadyRunning => {
-                // FR-97 P6e (#1538) — never `eprintln!`: on a failing stderr it
-                // panics, and this benign exit became a crash on a Mac.
-                logging::say_on_stderr(
-                    "Another roomlerd is already running for this config; exiting.\n\
-                 (use `roomlerd service status` to check the auto-start hook,\n\
-                 or stop the running instance before starting a new one.)",
-                );
-                tracing::warn!("single-instance lock held by another process; exiting");
-                return already_running_exit().map(|()| None);
-            }
-        };
-    // FR-97 P0e — from here this process IS the daemon, so what it leaves in
-    // the host is its own to purge once the runtime is gone
-    // (`purge_after_daemon`). Never before the lock: on macOS a second
-    // `run` returns through `main` (no `process::exit` there), and would
-    // otherwise purge the RUNNING daemon's exit routes and pins.
-    DAEMON_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+    // #4280 — the gate, before anything host-global: from its end this process IS the daemon.
+    let Some(_instance_lock) = start_gate(
+        config_path,
+        unenrolled,
+        supervision,
+        supervisor_flag,
+        roomlerd::machine_guard::hold_here,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
     // Up to 0.4.126 a tarball install left /usr and the unit directories
     // another account's (tarball_owner.rs). A host that is already damaged
     // updates through its OLD updater, which never looks at a directory, so
@@ -9239,6 +9284,65 @@ mod smoke_ffmpeg_tests {
     }
 }
 
+/// #4280 — the start's gate leaves on a held machine before this config's lock and
+/// before `DAEMON_RAN`. The gate alone runs here, never `run_cmd` past it: past the
+/// gate a start purges the overlay interface's routes, and an elevated test process
+/// would purge this machine's. The machine's guard is a stand-in that answers held,
+/// so no test takes the machine's own.
+#[cfg(test)]
+mod machine_gate_tests {
+    use super::*;
+
+    /// Cell 2 — an unsupervised start on an enrolled config, on a machine whose guard
+    /// another daemon holds, is refused at the gate with the typed error (8 off macOS,
+    /// 0 on macOS). `DAEMON_RAN` stays false, so no exit purge runs; this config's lock
+    /// was never taken; the config is byte-for-byte what it was, alone in its folder.
+    #[test]
+    fn a_held_machine_leaves_at_the_gate_before_the_lock_and_writes_nothing() {
+        use roomlerd::daemon_error::{MachineHeld, exit_code};
+        use roomlerd::supervision::Supervision;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "agent_token = \"t\"\n").expect("a config");
+        let before = std::fs::read(&cfg).expect("the config");
+        let asked = std::cell::Cell::new(None);
+        let res = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(start_gate(&cfg, false, Supervision::None, None, |s| {
+                asked.set(Some(s));
+                async { Err(MachineHeld::here()) }
+            }));
+        let err = res.err().expect("a held machine leaves at the gate");
+        assert!(err.downcast_ref::<MachineHeld>().is_some(), "{err:#}");
+        let code = if cfg!(any(target_os = "linux", windows)) {
+            8
+        } else {
+            0
+        };
+        assert_eq!(exit_code(&err), Some(code));
+        assert_eq!(asked.get(), Some(Supervision::None));
+        assert!(
+            !DAEMON_RAN.load(std::sync::atomic::Ordering::SeqCst),
+            "a run that leaves at the gate must not arm the exit purge"
+        );
+        assert!(
+            matches!(
+                instance_lock::acquire(&cfg).expect("the lock"),
+                instance_lock::AcquireOutcome::Acquired(_)
+            ),
+            "the gate left before this config's lock"
+        );
+        assert_eq!(std::fs::read(&cfg).expect("the config"), before);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("the folder")
+            .map(|e| e.expect("an entry").file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.toml")]);
+    }
+}
+
 /// #4028 — a `run` with no config, from its first check to the code `main` ends
 /// with. `run_cmd` returns at that check, before it takes a lock or writes
 /// anything, so the real function runs here, on a path that does not exist.
@@ -9364,3 +9468,67 @@ mod adopt_line;
 
 /// #4157 — what a `run` does with its config before it takes the lock.
 mod config_at_start;
+
+/// #4370 — `org set-primary` through the command's own arm, on a config file.
+#[cfg(test)]
+mod org_cmd_tests {
+    use super::*;
+
+    /// #4370 T3 — `org set-primary` on a device whose primary enrollment is
+    /// ephemeral: refused, saying so, and the config file is not written: its
+    /// bytes are the same, and no `.prev` copy appears.
+    #[test]
+    fn org_set_primary_refuses_an_ephemeral_primary_and_leaves_the_file_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = config::test_fixture();
+        cfg.ephemeral = true;
+        cfg.agent_id = "row-eph-a".into();
+        cfg.orgs = vec![config::OrgEntry {
+            label: "acme".into(),
+            server_url: "https://acme.invalid".into(),
+            ws_url: None,
+            agent_token: "tok-acme".into(),
+            agent_id: "aid-acme".into(),
+            tenant_id: "tid-acme".into(),
+            enabled: true,
+            overlay_mode: config::OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        }];
+        config::save(&path, &cfg).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let prev = config::prev_path(&path);
+        let prev_before = std::fs::read(&prev).ok();
+
+        let err = org_cmd(
+            &path,
+            OrgAction::SetPrimary {
+                label: "acme".into(),
+                demoted_label: None,
+            },
+        )
+        .expect_err("an ephemeral primary is never promoted away");
+
+        let said = err.to_string();
+        assert!(
+            said.contains("ephemeral") && said.contains("row-eph-a"),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "the file is byte for byte as it was"
+        );
+        assert_eq!(std::fs::read(&prev).ok(), prev_before, "nothing was saved");
+        let file = config::load(&path).unwrap();
+        assert!(file.ephemeral);
+        assert_eq!(file.agent_id, "row-eph-a");
+        assert_eq!(file.orgs.len(), 1);
+        assert_eq!(file.orgs[0].agent_id, "aid-acme");
+    }
+}

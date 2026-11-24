@@ -533,6 +533,7 @@ async fn the_daemons_derp_dial_relays_on_its_header() {
                 supports_org_relay: false,
                 advertised_routes: vec![],
                 route_offer_withheld: None,
+                exit_serves_v6: None,
             })
             .await
             .unwrap();

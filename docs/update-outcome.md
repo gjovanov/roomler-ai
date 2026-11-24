@@ -160,7 +160,7 @@ read the watcher's verdict at its start and settled nothing at its clean-run mar
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
-(`crates/localapi/src/lib.rs:484`), a `LastInstallStatus` (`:581`) whose
+(`crates/localapi/src/lib.rs:490`), a `LastInstallStatus` (`:587`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` stdout line spell them so
 one grep finds all three surfaces (locked by
@@ -179,10 +179,10 @@ say:
 | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) | `WATCHER STOPPED — agent-v0.4.172 started 3d ago: <note>` | WARN |
 | `Unreadable` | a file is there and does not parse; `note` carries the error chain | `record UNREADABLE — <error> (<path>)` | WARN |
 
-The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`crates/localapi/src/lib.rs:659`): the
+The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`crates/localapi/src/lib.rs:665`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
-a record older than that (`never_reported`, `:669`).
+a record older than that (`never_reported`, `:675`).
 
 > ⚠️ **Three states must stay apart, and they do by construction.** A daemon
 > that predates the field sends no `last_install` key, and the CLI prints
@@ -263,7 +263,7 @@ $ roomler status
   the sentence per word, `last_install_line`, `:2966`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:2208`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4363`). `journalctl -u
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4408`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`post_install.rs:2192`): the two quiet states and a watcher

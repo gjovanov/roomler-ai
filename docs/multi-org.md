@@ -50,6 +50,51 @@ worth recording why so nobody re-proposes it:
 
 So: **one daemon, many orgs**. Everything below follows from that.
 
+### The machine's guard: one daemon per machine, enforced (#4280)
+
+A `roomlerd run` takes a guard that belongs to the machine, not to its config, before anything
+above: before the start's purge of the overlay's routes, the LocalAPI pipe and the first connect
+(`start_gate`, `agents/roomlerd/src/app.rs:3965`; the guard is
+`agents/roomlerd/src/machine_guard.rs`). A run that finds it held leaves there, whatever config it
+loaded and elevated or not, and marks, saves and counts nothing.
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Who holds it | SYSTEM, or an elevated administrator | root | root |
+| An unprivileged run | reads whether it is held, and never creates it | takes none | takes none: the screen worker is a second run on purpose |
+| A run that finds it held leaves with | 8 | 8 | 0 |
+
+- **Only a privileged daemon can hold the machine's guard; an unprivileged start can check for it
+  but never creates it.** It is keyed by the overlay interface's name, and it is held only while its
+  owner lives, so a holder that ends, a crash included, leaves it free.
+- On Windows only SYSTEM and Administrators, at high integrity, can take it or change it; any other
+  signed-in account can only read whether it is held. On Linux and macOS it is the kernel's lock on
+  a 0600 file in the root daemon's own folder, `/var/run/roomler`.
+- **The first privileged holder stays.** A start under a supervisor (the service host, the per-user
+  task's launcher, systemd, launchd) waits up to 30 s for the guard, because its holder is most
+  likely its own predecessor, still exiting; any other start leaves at once.
+- **Every supervisor reads the code as "leave"** (`daemon_error::machine_held_exit_code`): systemd
+  does not restart on 8 (`RestartPreventExitStatus=7 8`), the per-user task's launcher stays down
+  on 8 (`agents/roomlerdw/src/ends.rs`), launchd leaves a clean exit alone, and the Windows service
+  host stops instead of respawning, unless its reaper ended a predecessor of its own.
+- The service host's worker hand-off has two covers: the bounded wait, and that reaper, which ends
+  this host's own predecessor that outlived the wait and then respawns the worker
+  ([remote-control.md §19.8.9](remote-control.md#1989-a-worker-its-host-left-behind-2465)). If an
+  elevated console `roomlerd run` holds the guard when the service's worker starts, the worker
+  leaves with 8 and the host stops the service until a reboot or a manual start.
+- A start that can neither take nor read the guard runs without it and logs
+  `machine guard unavailable; running without it` at WARN: a machine left with no daemon is the one
+  answer the guard must never give.
+- A daemon that runs unprivileged holds no guard, so a privileged start beside it still runs. That
+  is a per-user install's daemon on Linux, and two daemons on Windows: every per-user install's,
+  because its scheduled task runs at `LeastPrivilege` (`agents/roomlerd/src/service.rs:1506`), and
+  the service's user-context worker whenever the service starts it with the person's standard
+  rights: a standard user, `ROOMLERD_ELEVATE_WORKER=0`, or SystemContext waiting for a machine
+  enrollment (`user_arm_elevates`, `agents/roomlerd/src/win_service/supervisor.rs:1053`). None of
+  them can create the overlay interface: an unprivileged process cannot create a WireGuard TUN
+  ([vmtest.md](vmtest.md)); on Windows `WintunCreateAdapter` is a privileged device install
+  (`supervisor.rs:412`), and the service's optional `netd` child hosts nothing yet.
+
 ---
 
 ## 3. P1 — the foundation: `[[orgs]]` (shipped, #313)
@@ -127,6 +172,37 @@ then cost a two-org host its mesh path, measured on 2026-10-19.
 
 The command prints the outcome for each enrollment, with the way back on where
 it could not keep one.
+
+⚠️ **An ephemeral primary is never swapped out** (#4370). While the primary
+enrollment is ephemeral, `set-primary` refuses, whatever label it is given:
+`promote_org_to_primary` checks it before anything else
+(`crates/agent-core/src/config.rs:2367-2380`), and the file stays as it was,
+since `org_cmd` saves only after its arm succeeds
+(`agents/roomlerd/src/app.rs:3602`). The swap would put the ephemeral row
+beside another org, which #4352 rules out. An `[[orgs]]` entry has no
+`ephemeral`, so the swap would leave:
+- **the moved row** in `[[orgs]]`, where the device no longer knows it is
+  ephemeral. The restart that applies the swap stops the run that started as
+  that row, and when it is an OS stop it removes that row on the server
+  ([#4352](ephemeral-nodes.md#a-stop-removes-only-the-row-its-run-started-as-4352))
+  while the file still lists it;
+- **the promoted org**, a permanent row, marked ephemeral: every later stop
+  asks the server to remove it and is refused (403).
+
+The way on is the order the server's 409 gives
+([ephemeral-nodes.md](ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)):
+remove the ephemeral row on its Devices page, enroll the machine in that org
+again with a standard enrollment token (the config keeps its settings and its
+`[[orgs]]`), then run `set-primary` again.
+
+**Known limit: the reverse case is swapped as before.** A permanent primary can
+sit beside an `[[orgs]]` entry whose row the server holds as ephemeral: a join
+could add one before #4352 refused it. The device cannot tell, since an
+`OrgEntry` carries no flag, so `set-primary` promotes that entry and marks the
+new primary permanent. No stop removes its row, and the server's reaper, where
+it runs, removes it once the device is silent past its deadline. To make it
+permanent, remove it on its Devices page and enroll again with a standard
+enrollment token.
 
 **Per-org supervisors.** `run_cmd` starts one supervised loop per enabled org.
 `OrgCtx` threads the per-enrollment identity through `run` / `connect_once` /
@@ -265,7 +341,7 @@ sequenceDiagram
 
 | `reason` | the server sends it when | `roomler status` says |
 |---|---|---|
-| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:526-529`](../crates/modules/network/src/overlay.rs#L526-L529)) | retrying will not help; an operator has to act |
+| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:530-533`](../crates/modules/network/src/overlay.rs#L530-L533)) | retrying will not help; an operator has to act |
 | `network_unavailable` | the tenant's network row cannot be read or created, or an allocated ordinal falls outside the network's address space | retrying will not help; an operator has to act |
 | `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
 | `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
@@ -276,11 +352,11 @@ either case: its signalling loop reconnects on its own ladder, and a retry at th
 refusal would race it.
 
 - **The wire.** `rc:overlay.join_refused { reason, detail }`
-  ([`signaling.rs:3436-3442`](../crates/remote_control/src/signaling.rs#L3436-L3442)) goes only to a
+  ([`signaling.rs:3443-3449`](../crates/remote_control/src/signaling.rs#L3443-L3449)) goes only to a
   node whose join set `supports_join_refusal`
   ([`signaling.rs:1681`](../crates/remote_control/src/signaling.rs#L1681)). An older node keeps the
   old silence, and the server's ERROR line, `alert = "overlay_join_refused"`
-  ([`overlay.rs:281-298`](../crates/modules/network/src/overlay.rs#L281-L298)), is then the only
+  ([`overlay.rs:284-301`](../crates/modules/network/src/overlay.rs#L284-L301)), is then the only
   trace. The frame is a new top-level variant, which an old agent drops as an unknown
   frame, so it needed no forward-compatible pre-roll.
 - **The device.** The daemon logs `overlay: the server REFUSED our join` at ERROR and
@@ -301,7 +377,7 @@ refusal would race it.
   The line stays for the daemon's lifetime, even after a later join succeeds: "refused
   twenty minutes ago" is the only trace left once the log rotates, and `server` already
   says what is true now. A daemon that predates the field sends no `join_refusal`
-  ([`lib.rs:297`](../crates/localapi/src/lib.rs#L297)), and then nothing is printed, never a
+  ([`lib.rs:303`](../crates/localapi/src/lib.rs#L303)), and then nothing is printed, never a
   false "clear". `roomler status --json` carries it as
   `join_refusal { reason, detail, at_unix, retryable }`.
 

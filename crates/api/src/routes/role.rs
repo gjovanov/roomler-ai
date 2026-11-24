@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
 };
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
@@ -147,16 +147,21 @@ pub async fn list(
     Ok(Json(response))
 }
 
+/// `POST /api/tenant/{tenant_id}/role`. `MANAGE_ROLES` is decided before the
+/// body is read (#4254): a caller without it gets the gate's answer whatever
+/// the body is, and a holder is answered one that does not parse as the
+/// `Json` extractor answered it (`ApiError::JsonBody`).
 pub async fn create(
     State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<CreateRoleRequest>,
+    body: Result<Json<CreateRoleRequest>, JsonRejection>,
 ) -> Result<Json<RoleResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     let held = require_manage_roles(&state, tid, auth.user_id).await?;
+    let Json(body) = body?;
     let perms = body.permissions.unwrap_or(0);
     check_grant(held, 0, perms)?;
 
@@ -177,18 +182,25 @@ pub async fn create(
     Ok(Json(to_response(role)))
 }
 
+/// `PUT /api/tenant/{tenant_id}/role/{role_id}`. `MANAGE_ROLES` is decided
+/// before the body is read and before the role's id is (#4254): a caller
+/// without it gets the gate's answer whatever the body and the id are. A
+/// holder is answered a body that does not parse as the `Json` extractor
+/// answered it, whatever the id, since the extractor answered before any id
+/// was read. Only the org's id, which the gate needs, is parsed first.
 pub async fn update(
     State(state): State<Core>,
     auth: AuthUser,
     Path((tenant_id, role_id)): Path<(String, String)>,
-    Json(body): Json<UpdateRoleRequest>,
+    body: Result<Json<UpdateRoleRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let rid = ObjectId::parse_str(&role_id)
-        .map_err(|_| ApiError::BadRequest("Invalid role_id".to_string()))?;
 
     let held = require_manage_roles(&state, tid, auth.user_id).await?;
+    let Json(body) = body?;
+    let rid = ObjectId::parse_str(&role_id)
+        .map_err(|_| ApiError::BadRequest("Invalid role_id".to_string()))?;
 
     // Read the role's CURRENT mask so only the delta is gated. Tenant-scoped,
     // so a role id from another org is a 404 rather than a cross-tenant read.

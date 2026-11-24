@@ -23,7 +23,7 @@
 //!   server's own decision, written here, only when a value changed).
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, State, rejection::JsonRejection};
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::{TenantSettings, role::permissions};
 use roomler_ai_remote_control::models::{
@@ -123,11 +123,16 @@ pub async fn get_org_settings(
 /// are online now (this pod directly, other pods over the ctrl lane) and
 /// every other device at its next connect. Each value that actually CHANGED
 /// is recorded in the history, naming the admin (P7).
+///
+/// The bit is decided before the body is read (#4254): a caller without it
+/// gets the gate's answer whatever the body is, and a holder is answered one
+/// that does not parse as the `Json` extractor answered it, before the
+/// handler judges what the body sets.
 pub async fn set_org_settings(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<OrgKeepBusySettingsUpdate>,
+    body: Result<Json<OrgKeepBusySettingsUpdate>, JsonRejection>,
 ) -> Result<Json<OrgKeepBusySettings>, ApiError> {
     let tid = tenant_of(&tenant_id)?;
     require_permission(
@@ -138,6 +143,7 @@ pub async fn set_org_settings(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     if body.keep_busy_denied.is_none() && body.keep_busy_default_pattern.is_none() {
         return Err(ApiError::BadRequest(
             "Nothing to set: keep_busy_denied and/or keep_busy_default_pattern".into(),

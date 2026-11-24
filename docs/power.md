@@ -205,7 +205,7 @@ sequenceDiagram
 heartbeat as an optional `power`
 ([`signaling.rs:686`](../crates/remote_control/src/signaling.rs#L686)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:5043`](../agents/roomlerd/src/app.rs#L5043)) and
+anything connects ([`app.rs:5088`](../agents/roomlerd/src/app.rs#L5088)) and
 after every pass, with what it actually holds, not what it wanted
 ([`power.rs:371`](../agents/roomlerd/src/power.rs#L371)). A request the OS has
 not answered yet holds nothing (§1.1).
@@ -270,8 +270,8 @@ sleep would say hello again and erase the reason.
 
 | surface | field | reads |
 |---|---|---|
-| `roomler status` | `power` ([`lib.rs:215`](../crates/localapi/src/lib.rs#L215)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2471`](../agents/roomler-cli/src/localclient.rs#L2471)) |
-| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3438`](../agents/roomler-cli/src/localclient.rs#L3438)) |
+| `roomler status` | `power` ([`lib.rs:221`](../crates/localapi/src/lib.rs#L221)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2471`](../agents/roomler-cli/src/localclient.rs#L2471)) |
+| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3440`](../agents/roomler-cli/src/localclient.rs#L3440)) |
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
 | the admin agent API | `power`, `sleep` ([`agent.rs:947`](../crates/modules/fleet/src/agent.rs#L947)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
