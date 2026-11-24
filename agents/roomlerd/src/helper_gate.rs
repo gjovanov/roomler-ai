@@ -1,0 +1,940 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+//! FR-151 — the gate of the Mac's root update helper (`com.roomler.update`):
+//! an automatic update waits for live work on a Mac as it does on Windows and
+//! Linux (#3429, [`crate::updater::periodic_gate`]).
+//! docs/fr/FR-151-mac-update-waits-for-live-work.md
+//!
+//! The helper installs a package whose postinstall restarts both halves of the
+//! Mac: the root daemon and the console person's daemon. Before it installs it
+//! reads each half ([`Reading`]): the root half over the system socket, the
+//! person's half through FR-147's child (`roomlerd one-row-home live-work`).
+//! This module is the decision, pure and compiled on every OS; the effects are
+//! the macOS arm of `updater::run_update_helper`.
+//!
+//! | Reading | When | Counts as |
+//! |---|---|---|
+//! | `answered` | the daemon answered `live_work` | its counts |
+//! | `not_running` | no socket, a socket nobody serves, nobody at the console | nothing |
+//! | `older` | the daemon does not know the verb | one unit of live work |
+//! | `no_answer` | anything else: silence, an error, a malformed reply | one unit of live work |
+//!
+//! - **The budget** is #3429's: a defer rechecks after an hour (R5b: two
+//!   minutes for the root half's network transition alone), and the cap
+//!   forces the install, with a warning that names what it cuts. Root keeps
+//!   it in [`BUDGET_FILE`] ([`Budget`]), so it survives a reboot, and only a
+//!   due cycle counts ([`Budget::due`]): a wake never does.
+//! - **Who skips the wait** ([`helper_arm`]): a fresh ask recorded by the root
+//!   half (an operator's push) skips it over everything; a fresh ask recorded
+//!   by the person's half (a push to that row, or "Apply update") skips it
+//!   over that half's work and the root half's remote-control sessions only.
+//! - **The wait** ([`next_step`]): the helper stays up, ticks every [`TICK`],
+//!   reads again at `next_due` or at a wake, and exits on the opt-out, a
+//!   replaced program, SIGTERM or [`AWAKE_CEILING`].
+//! - **The kill switch** [`KILL_SWITCH`] installs with no reading, as before.
+
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use tunnel_core::localapi::LiveWorkInfo;
+
+use crate::busy::Busy;
+use crate::updater::{
+    DeferDecision, MAX_CONSECUTIVE_DEFERS, TRANSFER_DEFER_RECHECK, UPDATE_HELPER_MIN_GAP,
+};
+
+/// How old an ask may be and still skip the wait: the helper it woke runs
+/// within seconds, so an older one is a stale record, and the cycle is a wake.
+pub const ASK_FRESH: Duration = Duration::from_secs(10 * 60);
+/// The bound on each half's answer to `live_work`.
+pub const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a waiting helper looks at its markers, the wake file and the clock.
+pub const TICK: Duration = Duration::from_secs(5);
+/// A waiting helper's awake time at most (an `Instant`, which stops while the
+/// Mac sleeps). A chain takes about seven hours, so this never ends a healthy
+/// one; the budget stays for the next run.
+pub const AWAKE_CEILING: Duration = Duration::from_secs(8 * 60 * 60);
+/// The budget's file, in root's log folder beside `update-attempt`.
+pub const BUDGET_FILE: &str = "update-defers.json";
+/// The lock one helper holds while it runs, beside the budget.
+pub const LOCK_FILE: &str = "update-helper.lock";
+/// The most bytes the budget's file may hold.
+pub const BUDGET_MAX_BYTES: usize = 4096;
+/// Root's marker that gives back the install without a reading.
+pub const KILL_SWITCH: &str = "/etc/roomler/install-over-live-work";
+const BUDGET_FORMAT: u32 = 1;
+
+/// One half's answer to `live_work`, as the gate counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    Answered(LiveWorkInfo),
+    /// No socket, a socket nobody serves, or nobody at the console: a stopped
+    /// daemon serves nothing an install could cut.
+    NotRunning,
+    /// The daemon answered that it does not know the verb (older than FR-151).
+    Older,
+    /// No answer within the bound, an error, or a reply that did not parse.
+    NoAnswer,
+}
+
+impl Reading {
+    /// The word the log line uses.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Reading::Answered(_) => "answered",
+            Reading::NotRunning => "not_running",
+            Reading::Older => "older",
+            Reading::NoAnswer => "no_answer",
+        }
+    }
+
+    /// Unread: counted as one unit of live work, so a wrong "idle" never cuts
+    /// a session. A wrong "busy" costs one defer, and defers are capped.
+    pub fn unread(&self) -> bool {
+        matches!(self, Reading::Older | Reading::NoAnswer)
+    }
+
+    /// The counts this half answered, in `Busy`'s words.
+    fn counts(&self) -> Busy {
+        match self {
+            Reading::Answered(i) => Busy {
+                rc_sessions: i.rc_sessions as usize,
+                ssh_connections: i.ssh_connections as usize,
+                exec_runs: i.exec_runs as usize,
+                work: i.work as usize,
+                net_transition: i.net_transition,
+                install_in_flight: false,
+            },
+            _ => Busy::IDLE,
+        }
+    }
+
+    /// This half recorded an ask no older than [`ASK_FRESH`].
+    fn fresh_ask(&self) -> bool {
+        matches!(self, Reading::Answered(i) if i.ask_age_secs.is_some_and(|age| age <= ASK_FRESH.as_secs()))
+    }
+}
+
+/// The defer budget root keeps across runs: the defers in a row so far, and
+/// when the next counted cycle is due (unix seconds on the wall clock, which
+/// keeps running while the Mac sleeps). No chain is pending when `defers`
+/// is 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Budget {
+    pub defers: u32,
+    pub next_due: u64,
+}
+
+/// [`Budget`] on disk: `{"v":1,"defers":3,"next_due":1795900000}`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetFile {
+    v: u32,
+    defers: u32,
+    next_due: u64,
+}
+
+impl Budget {
+    /// No chain pending.
+    pub const RESET: Budget = Budget {
+        defers: 0,
+        next_due: 0,
+    };
+
+    /// A chain of defers is pending.
+    pub fn chain(&self) -> bool {
+        self.defers > 0
+    }
+
+    /// The file's bytes, strictly: at most [`BUDGET_MAX_BYTES`], one object
+    /// with nothing unknown in it, of this format, `defers` within the cap.
+    /// `None` reads as no chain pending.
+    pub fn parse(bytes: &[u8]) -> Option<Budget> {
+        if bytes.len() > BUDGET_MAX_BYTES {
+            return None;
+        }
+        let file: BudgetFile = serde_json::from_slice(bytes).ok()?;
+        (file.v == BUDGET_FORMAT && file.defers <= MAX_CONSECUTIVE_DEFERS).then_some(Budget {
+            defers: file.defers,
+            next_due: file.next_due,
+        })
+    }
+
+    /// The bytes [`Budget::parse`] reads back.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&BudgetFile {
+            v: BUDGET_FORMAT,
+            defers: self.defers,
+            next_due: self.next_due,
+        })
+        .unwrap_or_default()
+    }
+
+    /// Whether a cycle at `now` counts against the budget: no chain is
+    /// pending, `next_due` has come, or `next_due` is further away than one
+    /// recheck (the clock went back). Inside a chain only root's own
+    /// `next_due` counts, so a wake can neither hold an update off nor bring
+    /// the force closer.
+    pub fn due(&self, now: u64) -> bool {
+        !self.chain()
+            || now >= self.next_due
+            || self.next_due - now > TRANSFER_DEFER_RECHECK.as_secs()
+    }
+}
+
+/// What one cycle does with the readings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperArm {
+    /// Install now. `warning` names what a forced install cuts; `forced` is a
+    /// fresh ask or the cap, which skips the second reading.
+    Install {
+        warning: Option<String>,
+        forced: bool,
+    },
+    /// Do not install now: keep `budget`, counted when the cycle was due.
+    Defer { budget: Budget, counted: bool },
+}
+
+/// Whether the helper reads the halves before it installs: not with the kill
+/// switch, which installs as before FR-151.
+pub fn reads_before_install(kill_switch: bool) -> bool {
+    !kill_switch
+}
+
+/// The arm of one cycle at `now`, from the two readings and the budget.
+pub fn helper_arm(root: &Reading, person: &Reading, budget: Budget, now: u64) -> HelperArm {
+    let forced = || HelperArm::Install {
+        warning: forced_warning(root, person),
+        forced: true,
+    };
+    // An operator's push: only root serves the system socket, so only root
+    // can have recorded it, and it skips the wait over both halves.
+    if root.fresh_ask() {
+        return forced();
+    }
+    // The person's own ask (a push to their row, or "Apply update") skips it
+    // over their own half's work and the root half's remote-control sessions,
+    // which are on that person's desktop: never over the root half's SSH
+    // connections, runs, transfers or recording, a network transition, or a
+    // root half it could not read.
+    let root_beyond_sessions = match root {
+        Reading::Answered(i) => {
+            i.ssh_connections > 0 || i.exec_runs > 0 || i.work > 0 || i.net_transition
+        }
+        Reading::NotRunning => false,
+        Reading::Older | Reading::NoAnswer => true,
+    };
+    if person.fresh_ask() && !root_beyond_sessions {
+        return forced();
+    }
+    let active = root.counts().cuttable_count()
+        + person.counts().cuttable_count()
+        + usize::from(root.unread())
+        + usize::from(person.unread());
+    // R5b reads the root half alone: it owns the overlay and the netstate.
+    let transition = root.counts().net_transition;
+    if !budget.due(now) {
+        // A wake inside a chain: it installs only when nothing is live, and
+        // it never counts.
+        return if active == 0 && !transition {
+            HelperArm::Install {
+                warning: None,
+                forced: false,
+            }
+        } else {
+            HelperArm::Defer {
+                budget,
+                counted: false,
+            }
+        };
+    }
+    // #3429's rule, on what both halves serve: `periodic_gate` reads only
+    // the cut count and the transition, so the unread halves join the count.
+    let gate = Busy {
+        rc_sessions: active,
+        net_transition: transition,
+        ..Busy::IDLE
+    };
+    match crate::updater::periodic_gate(&gate, budget.defers) {
+        (DeferDecision::Proceed, _) => HelperArm::Install {
+            warning: None,
+            forced: false,
+        },
+        (DeferDecision::DeferOnce, recheck) => HelperArm::Defer {
+            budget: Budget {
+                defers: budget.defers + 1,
+                next_due: now.saturating_add(recheck.as_secs()),
+            },
+            counted: true,
+        },
+        (DeferDecision::ForceAfterDefers, _) => forced(),
+    }
+}
+
+/// The arm after the download, from a second reading: a forced arm stands
+/// (it skips the second reading), anything else is decided again on the same
+/// budget and the same `now`, so a defer drops the download.
+pub fn second_arm(
+    first: &HelperArm,
+    root: &Reading,
+    person: &Reading,
+    budget: Budget,
+    now: u64,
+) -> HelperArm {
+    match first {
+        HelperArm::Install { forced: true, .. } => first.clone(),
+        _ => helper_arm(root, person, budget, now),
+    }
+}
+
+/// What an install now would cut or wedge, for the log: both halves' counts,
+/// the root half's network transition, and each unread half.
+pub fn what_it_cuts(root: &Reading, person: &Reading) -> String {
+    let (r, p) = (root.counts(), person.counts());
+    let busy = Busy {
+        rc_sessions: r.rc_sessions + p.rc_sessions,
+        ssh_connections: r.ssh_connections + p.ssh_connections,
+        exec_runs: r.exec_runs + p.exec_runs,
+        work: r.work + p.work,
+        // R5b reads the root half alone: it owns the overlay and the netstate.
+        net_transition: r.net_transition,
+        install_in_flight: false,
+    };
+    let mut parts = Vec::new();
+    if busy != Busy::IDLE {
+        parts.push(busy.to_string());
+    }
+    for (half, reading) in [("the root half", root), ("the person's half", person)] {
+        if reading.unread() {
+            parts.push(format!("{half}, unread ({})", reading.word()));
+        }
+    }
+    if parts.is_empty() {
+        "nothing".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// The warning a forced install gives: `None` when it cuts nothing.
+pub fn forced_warning(root: &Reading, person: &Reading) -> Option<String> {
+    let what = what_it_cuts(root, person);
+    (what != "nothing").then(|| format!("forced update proceeding despite: {what}"))
+}
+
+/// The defer line's fields, after `update-helper: deferring the install:`.
+pub fn defer_line(
+    root: &Reading,
+    person: &Reading,
+    budget: Budget,
+    now: u64,
+    counted: bool,
+) -> String {
+    format!(
+        "busy={} consecutive_defers={} next_check_secs={} cycle={} root={} person={}",
+        what_it_cuts(root, person),
+        budget.defers,
+        budget.next_due.saturating_sub(now),
+        if counted { "due" } else { "wake" },
+        root.word(),
+        person.word(),
+    )
+}
+
+/// What the feed said, when the cycle installs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeSaid {
+    /// The Mac runs the newest release.
+    UpToDate,
+    /// The probe or the download failed.
+    Failed,
+}
+
+/// The budget after a cycle that installed nothing: up to date resets it, a
+/// failed probe or download keeps it.
+pub fn budget_after_probe(said: ProbeSaid, budget: Budget) -> Budget {
+    match said {
+        ProbeSaid::UpToDate => Budget::RESET,
+        ProbeSaid::Failed => budget,
+    }
+}
+
+/// Keep `new` as the budget in memory, then write it. The budget in memory is
+/// the one that counts within a run, so a failed write (a full disk) cannot
+/// keep a chain from the force; the error is returned to be logged.
+pub fn keep_budget(
+    mem: &mut Budget,
+    new: Budget,
+    write: impl FnOnce(&Budget) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    *mem = new;
+    write(mem)
+}
+
+/// What a waiting helper sees at one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Observed {
+    /// SIGTERM came (launchd's bootout, a shutdown).
+    pub stop: bool,
+    /// `/etc/roomler/disable-auto-update` or another opt-out marker is there.
+    pub opt_out: bool,
+    /// [`KILL_SWITCH`] is there.
+    pub kill_switch: bool,
+    /// The helper's own program changed device or inode (a manual install).
+    pub program_replaced: bool,
+    /// The helper's awake time since it started.
+    pub awake: Duration,
+    /// The wall clock, unix seconds.
+    pub now: u64,
+    /// The wake file came back since the last cycle.
+    pub wake: bool,
+    /// Awake time since the last cycle ended.
+    pub since_cycle: Duration,
+}
+
+/// Why a waiting helper exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitWhy {
+    Stopped,
+    OptedOut,
+    Replaced,
+    Ceiling,
+}
+
+/// A waiting helper's next step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Exit without installing; the budget stays for the next run.
+    Exit(ExitWhy),
+    /// The kill switch appeared: install with no reading.
+    InstallOverAll,
+    /// Run a cycle: due when [`Budget::due`] says so, else a wake.
+    Cycle,
+    /// Nothing to do for this long; the helper looks again every [`TICK`].
+    Wait(Duration),
+}
+
+/// A waiting helper's next step, in this order: SIGTERM, the opt-out, the kill
+/// switch, a replaced program, the ceiling, a due cycle, a wake whose gap has
+/// passed, a wake still inside its gap (wait out the rest), else one tick.
+pub fn next_step(seen: &Observed, budget: Budget) -> Step {
+    if seen.stop {
+        return Step::Exit(ExitWhy::Stopped);
+    }
+    if seen.opt_out {
+        return Step::Exit(ExitWhy::OptedOut);
+    }
+    if seen.kill_switch {
+        return Step::InstallOverAll;
+    }
+    if seen.program_replaced {
+        return Step::Exit(ExitWhy::Replaced);
+    }
+    if seen.awake >= AWAKE_CEILING {
+        return Step::Exit(ExitWhy::Ceiling);
+    }
+    if budget.due(seen.now) {
+        return Step::Cycle;
+    }
+    if seen.wake {
+        return match UPDATE_HELPER_MIN_GAP.checked_sub(seen.since_cycle) {
+            Some(rest) if !rest.is_zero() => Step::Wait(rest),
+            _ => Step::Cycle,
+        };
+    }
+    Step::Wait(TICK)
+}
+
+/// What one cycle's arm leaves as the budget: an install resets it, just
+/// before `installer(8)` runs; a defer keeps the one it carries.
+pub fn budget_for(arm: &HelperArm, budget: Budget) -> Budget {
+    match arm {
+        HelperArm::Install { .. } => Budget::RESET,
+        HelperArm::Defer { budget: kept, .. } => {
+            let _ = budget;
+            *kept
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_795_900_000;
+    const HOUR: u64 = 3600;
+
+    fn answered(rc: u32, ssh: u32, exec: u32, work: u32, net: bool, ask: Option<u64>) -> Reading {
+        Reading::Answered(LiveWorkInfo {
+            rc_sessions: rc,
+            ssh_connections: ssh,
+            exec_runs: exec,
+            work,
+            net_transition: net,
+            ask_age_secs: ask,
+        })
+    }
+    fn idle() -> Reading {
+        answered(0, 0, 0, 0, false, None)
+    }
+    fn session() -> Reading {
+        answered(1, 0, 0, 0, false, None)
+    }
+    fn chain(defers: u32, next_due: u64) -> Budget {
+        Budget { defers, next_due }
+    }
+    fn counted(defers: u32, next_due: u64) -> HelperArm {
+        HelperArm::Defer {
+            budget: chain(defers, next_due),
+            counted: true,
+        }
+    }
+    fn installs() -> HelperArm {
+        HelperArm::Install {
+            warning: None,
+            forced: false,
+        }
+    }
+    fn forced(what: &str) -> HelperArm {
+        HelperArm::Install {
+            warning: Some(format!("forced update proceeding despite: {what}")),
+            forced: true,
+        }
+    }
+    fn waiting(now: u64) -> Observed {
+        Observed {
+            awake: Duration::from_secs(HOUR),
+            now,
+            since_cycle: Duration::from_secs(HOUR),
+            ..Observed::default()
+        }
+    }
+
+    /// C1 — a session in the person's half, the root half not running, no
+    /// chain: the first defer, rechecked in an hour.
+    #[test]
+    fn a_persons_session_defers_by_the_hour() {
+        let arm = helper_arm(&Reading::NotRunning, &session(), Budget::RESET, NOW);
+        assert_eq!(arm, counted(1, NOW + HOUR));
+        assert_eq!(budget_for(&arm, Budget::RESET), chain(1, NOW + HOUR));
+    }
+
+    /// C2 — the root half's SSH connection, or its exec run, defers.
+    #[test]
+    fn the_root_halfs_ssh_or_exec_defers() {
+        for root in [
+            answered(0, 1, 0, 0, false, None),
+            answered(0, 0, 1, 0, false, None),
+        ] {
+            let arm = helper_arm(&root, &idle(), Budget::RESET, NOW);
+            assert_eq!(arm, counted(1, NOW + HOUR), "{root:?}");
+        }
+    }
+
+    /// C3 — nothing live in either half (idle or not running) installs, and
+    /// the install resets the budget.
+    #[test]
+    fn nothing_live_installs_and_resets() {
+        let three = chain(3, NOW - 1);
+        for (root, person) in [
+            (idle(), idle()),
+            (Reading::NotRunning, idle()),
+            (idle(), Reading::NotRunning),
+            (Reading::NotRunning, Reading::NotRunning),
+        ] {
+            let arm = helper_arm(&root, &person, three, NOW);
+            assert_eq!(arm, installs(), "{root:?} {person:?}");
+            assert_eq!(budget_for(&arm, three), Budget::RESET);
+        }
+    }
+
+    /// C4 — eight due cycles with a session live, the budget read back from
+    /// its file each time: seven defers, then the force, which names the work.
+    #[test]
+    fn seven_due_defers_then_the_force() {
+        let mut budget = Budget::RESET;
+        let mut now = NOW;
+        for n in 1..=7 {
+            let arm = helper_arm(&Reading::NotRunning, &session(), budget, now);
+            assert_eq!(arm, counted(n, now + HOUR), "defer {n}");
+            let kept = budget_for(&arm, budget);
+            budget = Budget::parse(&kept.to_bytes()).expect("the file reads back");
+            now = budget.next_due;
+        }
+        let arm = helper_arm(&Reading::NotRunning, &session(), budget, now);
+        assert_eq!(arm, forced("1 remote-control session(s)"));
+        assert_eq!(budget_for(&arm, budget), Budget::RESET);
+    }
+
+    /// C5 — a hundred wakes inside a chain with live work: every one defers,
+    /// none is counted, and the budget is unchanged.
+    #[test]
+    fn a_hundred_wakes_never_reach_the_force() {
+        let three = chain(3, NOW + 3000);
+        for i in 0..100 {
+            let arm = helper_arm(&Reading::NotRunning, &session(), three, NOW + i * 29);
+            assert_eq!(
+                arm,
+                HelperArm::Defer {
+                    budget: three,
+                    counted: false
+                },
+                "wake {i}"
+            );
+            assert_eq!(budget_for(&arm, three), three);
+        }
+    }
+
+    /// C6 — a wake inside a chain with both halves idle installs, and resets.
+    #[test]
+    fn a_wake_when_idle_installs_and_resets() {
+        let three = chain(3, NOW + 3000);
+        let arm = helper_arm(&idle(), &idle(), three, NOW);
+        assert_eq!(arm, installs());
+        assert_eq!(budget_for(&arm, three), Budget::RESET);
+    }
+
+    /// C7 — an ask the root half recorded 5 s ago (an operator's push)
+    /// forces over a person's session, and says so.
+    #[test]
+    fn the_root_halfs_push_forces_over_a_persons_session() {
+        let root = answered(0, 0, 0, 0, false, Some(5));
+        let arm = helper_arm(&root, &session(), Budget::RESET, NOW);
+        assert_eq!(arm, forced("1 remote-control session(s)"));
+    }
+
+    /// C8 — an ask the person's half recorded cannot cut the root half's SSH
+    /// connection.
+    #[test]
+    fn a_persons_push_cannot_cut_the_root_half() {
+        let person = answered(0, 0, 0, 0, false, Some(5));
+        let root = answered(0, 1, 0, 0, false, None);
+        assert_eq!(
+            helper_arm(&root, &person, Budget::RESET, NOW),
+            counted(1, NOW + HOUR)
+        );
+    }
+
+    /// C9 — the person's half's ask waives that half's own session, with the
+    /// root half not running.
+    #[test]
+    fn a_persons_push_waives_only_its_own_work() {
+        let person = answered(1, 0, 0, 0, false, Some(5));
+        let arm = helper_arm(&Reading::NotRunning, &person, Budget::RESET, NOW);
+        assert_eq!(arm, forced("1 remote-control session(s)"));
+    }
+
+    /// C10 — an unread half defers (a wrong "idle" would cut a session); a
+    /// stopped one does not.
+    #[test]
+    fn an_unread_half_defers_a_stopped_one_does_not() {
+        for person in [Reading::Older, Reading::NoAnswer] {
+            assert_eq!(
+                helper_arm(&Reading::NotRunning, &person, Budget::RESET, NOW),
+                counted(1, NOW + HOUR),
+                "{person:?}"
+            );
+        }
+        assert_eq!(
+            helper_arm(
+                &Reading::NotRunning,
+                &Reading::NotRunning,
+                Budget::RESET,
+                NOW
+            ),
+            installs()
+        );
+    }
+
+    /// C11 — R5b reads the root half's network transition alone: alone it
+    /// rechecks in two minutes, beside a session in an hour, and a transition
+    /// in the person's half alone gates nothing.
+    #[test]
+    fn r5b_reads_the_root_half_alone() {
+        let moved = answered(0, 0, 0, 0, true, None);
+        assert_eq!(
+            helper_arm(&moved, &idle(), Budget::RESET, NOW),
+            counted(1, NOW + 120)
+        );
+        assert_eq!(
+            helper_arm(&moved, &session(), Budget::RESET, NOW),
+            counted(1, NOW + HOUR)
+        );
+        assert_eq!(helper_arm(&idle(), &moved, Budget::RESET, NOW), installs());
+    }
+
+    /// C12 — an ask older than `ASK_FRESH` is a stale record: the cycle is
+    /// gated as any other.
+    #[test]
+    fn a_stale_ask_is_a_wake() {
+        let stale = Some(ASK_FRESH.as_secs() + 1);
+        let root = answered(0, 0, 0, 0, false, stale);
+        assert_eq!(
+            helper_arm(&root, &session(), Budget::RESET, NOW),
+            counted(1, NOW + HOUR)
+        );
+    }
+
+    /// C13 — "up to date" resets the budget; a failed probe or download keeps
+    /// it.
+    #[test]
+    fn up_to_date_resets_and_a_failed_probe_keeps() {
+        let three = chain(3, NOW + 10);
+        assert_eq!(
+            budget_after_probe(ProbeSaid::UpToDate, three),
+            Budget::RESET
+        );
+        assert_eq!(budget_after_probe(ProbeSaid::Failed, three), three);
+    }
+
+    /// C14 — a `next_due` further away than one recheck means the clock went
+    /// back: the cycle is due, and counted.
+    #[test]
+    fn a_clock_set_back_makes_the_cycle_due() {
+        let two = chain(2, NOW + 5 * HOUR);
+        assert!(two.due(NOW));
+        assert!(!chain(2, NOW + HOUR).due(NOW), "an hour ahead is a chain");
+        assert_eq!(
+            helper_arm(&Reading::NotRunning, &session(), two, NOW),
+            counted(3, NOW + HOUR)
+        );
+    }
+
+    /// C15 — the budget's file parses strictly; anything else is no chain.
+    #[test]
+    fn the_budget_file_parses_strictly() {
+        let good = br#"{"v":1,"defers":3,"next_due":1795900000}"#;
+        assert_eq!(Budget::parse(good), Some(chain(3, 1_795_900_000)));
+        assert_eq!(
+            Budget::parse(&chain(7, 9).to_bytes()),
+            Some(chain(7, 9)),
+            "the cap itself reads back"
+        );
+        let mut long = good.to_vec();
+        long.resize(BUDGET_MAX_BYTES + 1, b' ');
+        for bad in [
+            br#"{"v":1,"defers":3,"next_due":1795900000,"x":1}"#.to_vec(),
+            br#"{"v":2,"defers":3,"next_due":1795900000}"#.to_vec(),
+            br#"{"v":1,"defers":8,"next_due":1795900000}"#.to_vec(),
+            br#"{"v":1,"defers":4294967296,"next_due":1}"#.to_vec(),
+            br#"{"v":1,"next_due":1}"#.to_vec(),
+            b"not json".to_vec(),
+            long,
+        ] {
+            assert_eq!(
+                Budget::parse(&bad),
+                None,
+                "{}",
+                String::from_utf8_lossy(&bad)
+            );
+        }
+    }
+
+    /// C16 — a waiting helper spaces wakes by the launchd gap, exits on the
+    /// opt-out and on a replaced program, installs on the kill switch, and
+    /// otherwise waits a tick until `next_due`.
+    #[test]
+    fn next_wake_spaces_wakes_and_exits_on_markers() {
+        let one = chain(1, NOW + 3000);
+        let wake = |since: u64| Observed {
+            wake: true,
+            since_cycle: Duration::from_secs(since),
+            ..waiting(NOW)
+        };
+        assert_eq!(
+            next_step(&wake(30), one),
+            Step::Wait(Duration::from_secs(30))
+        );
+        assert_eq!(next_step(&wake(60), one), Step::Cycle);
+        assert_eq!(next_step(&waiting(NOW), one), Step::Wait(TICK));
+        assert_eq!(next_step(&waiting(NOW + 3000), one), Step::Cycle);
+        let opted = Observed {
+            opt_out: true,
+            ..wake(60)
+        };
+        assert_eq!(next_step(&opted, one), Step::Exit(ExitWhy::OptedOut));
+        let replaced = Observed {
+            program_replaced: true,
+            ..wake(60)
+        };
+        assert_eq!(next_step(&replaced, one), Step::Exit(ExitWhy::Replaced));
+        let switched = Observed {
+            kill_switch: true,
+            ..wake(60)
+        };
+        assert_eq!(next_step(&switched, one), Step::InstallOverAll);
+    }
+
+    /// C17 — the kill switch installs with no reading, as before FR-151.
+    #[test]
+    fn the_kill_switch_installs_over_live_work() {
+        assert!(!reads_before_install(true));
+    }
+
+    /// The ruling's ceiling: a waiting helper exits after 8 h of awake time,
+    /// without installing; the budget stays for the next run.
+    #[test]
+    fn the_waiting_helper_ends_at_its_ceiling() {
+        let one = chain(1, NOW + 3000);
+        let almost = Observed {
+            awake: AWAKE_CEILING - Duration::from_secs(1),
+            ..waiting(NOW)
+        };
+        assert_eq!(next_step(&almost, one), Step::Wait(TICK));
+        let over = Observed {
+            awake: AWAKE_CEILING,
+            ..waiting(NOW + 3000)
+        };
+        assert_eq!(next_step(&over, one), Step::Exit(ExitWhy::Ceiling));
+    }
+
+    /// The ruling: the budget in memory counts within a run, so a write that
+    /// always fails still reaches the force.
+    #[test]
+    fn a_failed_budget_write_still_reaches_the_force() {
+        let mut mem = Budget::RESET;
+        let mut now = NOW;
+        for n in 1..=7 {
+            let HelperArm::Defer { budget, .. } =
+                helper_arm(&Reading::NotRunning, &session(), mem, now)
+            else {
+                panic!("defer {n} expected");
+            };
+            let wrote = keep_budget(&mut mem, budget, |_| {
+                Err(std::io::Error::other("no space left on device"))
+            });
+            assert!(wrote.is_err(), "the failed write is reported, to be logged");
+            assert_eq!(mem, chain(n, now + HOUR), "the count advances anyway");
+            now = mem.next_due;
+        }
+        assert_eq!(
+            helper_arm(&Reading::NotRunning, &session(), mem, now),
+            forced("1 remote-control session(s)")
+        );
+    }
+
+    /// The ruling: SIGTERM ends a waiting helper at once and never installs,
+    /// whatever else it sees at that tick.
+    #[test]
+    fn sigterm_ends_a_waiting_helper_without_installing() {
+        let one = chain(1, NOW);
+        let everything = Observed {
+            kill_switch: true,
+            wake: true,
+            ..waiting(NOW)
+        };
+        assert_eq!(next_step(&everything, one), Step::InstallOverAll);
+        let stopped = Observed {
+            stop: true,
+            ..everything
+        };
+        assert_eq!(next_step(&stopped, one), Step::Exit(ExitWhy::Stopped));
+    }
+
+    /// The ruling: an error reply counts as unread, so it defers.
+    #[tokio::test]
+    async fn an_error_reply_counts_as_unread() {
+        let answer = crate::one_row_home::read_live_work(
+            async {
+                Err(std::io::Error::other(
+                    "localapi error: live work is not reported on this node",
+                ))
+            },
+            ASK_TIMEOUT,
+        )
+        .await;
+        assert_eq!(answer.reading(), Reading::NoAnswer);
+        assert_eq!(
+            helper_arm(&Reading::NotRunning, &answer.reading(), Budget::RESET, NOW),
+            counted(1, NOW + HOUR)
+        );
+    }
+
+    /// The operator's answer: the person's "Apply update" installs over a
+    /// session on their own desktop, on a per-user Mac (the person's half
+    /// holds it) and on a one-row Mac (the root half holds it, and the GUI
+    /// worker answers the person's socket).
+    #[test]
+    fn the_persons_click_installs_over_their_own_desktop() {
+        let click = answered(0, 0, 0, 0, false, Some(3));
+        let clicked_with_session = answered(1, 0, 0, 0, false, Some(3));
+        assert_eq!(
+            helper_arm(
+                &Reading::NotRunning,
+                &clicked_with_session,
+                Budget::RESET,
+                NOW
+            ),
+            forced("1 remote-control session(s)"),
+            "per-user Mac"
+        );
+        assert_eq!(
+            helper_arm(&session(), &click, chain(2, NOW + 100), NOW),
+            forced("1 remote-control session(s)"),
+            "one-row Mac"
+        );
+    }
+
+    /// The operator's answer: the click never installs over the root half's
+    /// SSH connection, exec run, transfer or recording, a network transition,
+    /// or a root half it could not read.
+    #[test]
+    fn the_persons_click_never_cuts_the_root_halfs_work() {
+        let click = answered(1, 0, 0, 0, false, Some(3));
+        for root in [
+            answered(0, 1, 0, 0, false, None),
+            answered(0, 0, 1, 0, false, None),
+            answered(0, 0, 0, 1, false, None),
+            answered(0, 0, 0, 0, true, None),
+            Reading::Older,
+            Reading::NoAnswer,
+        ] {
+            assert!(
+                matches!(
+                    helper_arm(&root, &click, Budget::RESET, NOW),
+                    HelperArm::Defer { counted: true, .. }
+                ),
+                "{root:?}"
+            );
+        }
+    }
+
+    /// The second reading after the download: a forced arm stands; an idle
+    /// one that now reads busy defers, on the same budget and cycle.
+    #[test]
+    fn the_second_reading_can_drop_the_download() {
+        let first = helper_arm(&idle(), &idle(), Budget::RESET, NOW);
+        assert_eq!(first, installs());
+        assert_eq!(
+            second_arm(&first, &idle(), &session(), Budget::RESET, NOW),
+            counted(1, NOW + HOUR)
+        );
+        let pushed = forced("1 remote-control session(s)");
+        assert_eq!(
+            second_arm(&pushed, &idle(), &session(), Budget::RESET, NOW),
+            pushed
+        );
+    }
+
+    /// The defer line names the work, the count, the wait, the cycle and each
+    /// half's reading.
+    #[test]
+    fn the_defer_line_names_each_half() {
+        let line = defer_line(
+            &Reading::NotRunning,
+            &session(),
+            chain(1, NOW + HOUR),
+            NOW,
+            true,
+        );
+        assert_eq!(
+            line,
+            "busy=1 remote-control session(s) consecutive_defers=1 next_check_secs=3600 \
+             cycle=due root=not_running person=answered"
+        );
+        assert_eq!(
+            what_it_cuts(&Reading::Older, &idle()),
+            "the root half, unread (older)"
+        );
+    }
+}

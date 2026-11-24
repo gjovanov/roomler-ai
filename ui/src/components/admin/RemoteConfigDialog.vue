@@ -99,7 +99,9 @@
             />
             <div class="text-caption text-medium-emphasis mb-3 ml-1">
               Leave the box untouched to keep whatever the device already has.
-              An empty list means <strong>nobody</strong>.
+              These keys are the break-glass route, for when the server cannot
+              be reached: an empty list removes the device’s own, and then only
+              server grants (<code>roomler ssh</code>) can sign in.
             </div>
 
             <v-select
@@ -247,10 +249,10 @@
           permission bit; takes effect at the next daemon restart.
         </div>
 
-        <!-- The combination checks. Each of these produces a device that is
-             "on" and reaches nobody — the exact silent-nothing this feature
-             exists to remove, so it must be caught here rather than discovered
-             later by someone whose ssh just hangs up on them. -->
+        <!-- The combination checks. Each is a key-list session that would sign
+             in and then run nothing, caught here rather than discovered later
+             by someone whose ssh does nothing. An empty key list is not one:
+             server grants (`roomler ssh`) still sign in (#4325). -->
         <v-alert
           v-for="w in combinationWarnings"
           :key="w"
@@ -484,20 +486,18 @@ const status = computed<{ type: 'success' | 'info' | 'warning' | 'error'; icon: 
   }
 })
 
-/** Combinations that produce a device which is "on" and reaches nobody. */
+/** Combinations whose key-list sessions sign in and then run nothing. A
+ *  server grant (`roomler ssh`) is tried before the key list and needs no key
+ *  and no account mode on the device, so an empty key list is not one of them
+ *  (#4325): it leaves the device to server grants, its default. */
 const combinationWarnings = computed<string[]>(() => {
   const out: string[] = []
   const d = draft.value
   if (d.ssh_enabled === true) {
     const keys = d.ssh_authorized_keys
-    if (keys && keys.length === 0) {
-      out.push(
-        'SSH is on with an empty key list, which means nobody can connect. Add a key, or leave the key list unmanaged to keep the device’s own.',
-      )
-    }
     if (keys === undefined && !d.ssh_account_mode) {
       out.push(
-        'Turning SSH on grants nothing by itself: the device also needs authorized keys and an account mode. If it already has them, ignore this.',
+        'If the device lists keys of its own and has no account mode, a key-list session authenticates and then runs nothing. Server grants (roomler ssh) need neither keys nor an account mode.',
       )
     } else if (keys && keys.length > 0 && !d.ssh_account_mode) {
       out.push(
