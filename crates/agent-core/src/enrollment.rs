@@ -9,7 +9,9 @@
 
 use anyhow::{Context, Result, bail};
 use roomler_ai_remote_control::models::OsKind;
-pub use roomler_ai_remote_control::models::{InstallInfo, InstallMethod, InstallScope};
+pub use roomler_ai_remote_control::models::{
+    EnrollingProgram, EnrollingProgramName, InstallInfo, InstallMethod, InstallScope,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AgentConfig;
@@ -30,6 +32,10 @@ struct EnrollRequest<'a> {
     machine_id: &'a str,
     machine_name: &'a str,
     os: OsKind,
+    /// The ENROLLING program's own version, which is the same value as
+    /// `enrolling_program.version`. Kept because every server from before
+    /// #3565 requires it. A newer server never writes it as the device's
+    /// version: only the daemon's own hello does.
     agent_version: &'a str,
     /// FR-102 P3 — additive, and OMITTED when unset: a server from before
     /// P3 then sees exactly the body it always saw. (It would ignore an
@@ -38,6 +44,28 @@ struct EnrollRequest<'a> {
     /// for a caller that has nothing to say.)
     #[serde(skip_serializing_if = "Option::is_none")]
     install: Option<&'a InstallInfo>,
+    /// #3565 — the program that enrolls and the version it was built as,
+    /// in a field of its own. Always sent, because every caller knows which
+    /// program it is; a server from before #3565 ignores it.
+    enrolling_program: &'a EnrollingProgram,
+}
+
+impl<'a> EnrollRequest<'a> {
+    /// The body for `inputs`. #3565: `agent_version` carries the enrolling
+    /// program's own version, as it always has, so a caller that is not the
+    /// daemon (the setup wizard, the companion) sends its own, never a
+    /// guess at the daemon's.
+    fn of(inputs: &'a EnrollInputs<'_>, os: OsKind) -> Self {
+        EnrollRequest {
+            enrollment_token: inputs.enrollment_token,
+            machine_id: inputs.machine_id,
+            machine_name: inputs.machine_name,
+            os,
+            agent_version: &inputs.program.version,
+            install: inputs.install.as_ref(),
+            enrolling_program: &inputs.program,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +91,11 @@ pub struct EnrollInputs<'a> {
     /// leaves alone on a re-enrolled one — the right answer for every
     /// re-enroll path, which knows nothing about how the binary got there.
     pub install: Option<InstallInfo>,
+    /// #3565 — the program that enrolls: each binary names itself, with its
+    /// own `env!("CARGO_PKG_VERSION")` (this library cannot know which
+    /// binary calls it). The server stores it as how the device was
+    /// enrolled, never as the device's version.
+    pub program: EnrollingProgram,
 }
 
 /// FR-102 P3 — what `roomlerd enroll` sends as its install trace, from the
@@ -280,25 +313,19 @@ pub async fn enroll_issued_with(
     let server_url = normalize_server_url(inputs.server_url);
     let url = format!("{server_url}/api/agent/enroll");
     let os = detect_os();
-    let agent_version = env!("CARGO_PKG_VERSION");
 
     tracing::info!(
         %url, os = ?os,
         install_method = inputs.install.as_ref().map(|i| i.method.as_str()),
         install_scope = inputs.install.as_ref().map(|i| i.scope.as_str()),
+        enrolling_program = %inputs.program.name,
+        enrolling_program_version = %inputs.program.version,
         "posting enrollment"
     );
 
     let resp = client
         .post(&url)
-        .json(&EnrollRequest {
-            enrollment_token: inputs.enrollment_token,
-            machine_id: inputs.machine_id,
-            machine_name: inputs.machine_name,
-            os,
-            agent_version,
-            install: inputs.install.as_ref(),
-        })
+        .json(&EnrollRequest::of(&inputs, os))
         .send()
         .await
         .context("POST /api/agent/enroll")?;
@@ -1360,7 +1387,10 @@ mod tests {
 
     // ---- FR-102 P3: the install trace on the wire ----------------------
 
-    fn request<'a>(install: Option<&'a InstallInfo>) -> EnrollRequest<'a> {
+    fn request<'a>(
+        install: Option<&'a InstallInfo>,
+        program: &'a EnrollingProgram,
+    ) -> EnrollRequest<'a> {
         EnrollRequest {
             enrollment_token: "t",
             machine_id: "m",
@@ -1368,15 +1398,17 @@ mod tests {
             os: OsKind::Linux,
             agent_version: "0.4.136",
             install,
+            enrolling_program: program,
         }
     }
 
-    /// Without an install trace the body is byte-for-byte the pre-P3 shape
-    /// — the five fields, nothing else — so a server from before P3 sees
-    /// exactly what it always saw; with one, `install` rides along.
+    /// Without an install trace the body carries no `install` field at all:
+    /// the pre-P3 fields, plus #3565's `enrolling_program`, which a server
+    /// from before it ignores. With one, `install` rides along.
     #[test]
     fn the_request_omits_install_when_unset_and_carries_it_when_set() {
-        let old = serde_json::to_value(request(None)).unwrap();
+        let program = EnrollingProgram::new(EnrollingProgramName::Roomlerd, "0.4.136");
+        let old = serde_json::to_value(request(None, &program)).unwrap();
         assert_eq!(
             old,
             serde_json::json!({
@@ -1385,12 +1417,13 @@ mod tests {
                 "machine_name": "n",
                 "os": "linux",
                 "agent_version": "0.4.136",
+                "enrolling_program": { "name": "roomlerd", "version": "0.4.136" },
             })
         );
         assert!(old.get("install").is_none());
 
         let info = InstallInfo::new(InstallMethod::ScriptSh, InstallScope::System);
-        let new = serde_json::to_value(request(Some(&info))).unwrap();
+        let new = serde_json::to_value(request(Some(&info), &program)).unwrap();
         assert_eq!(
             new["install"],
             serde_json::json!({ "method": "script-sh", "scope": "system" })
@@ -1399,7 +1432,61 @@ mod tests {
             new["install"].get("run").is_none(),
             "run is omitted until P3b sets it"
         );
-        assert_eq!(new.as_object().unwrap().len(), 6);
+        assert_eq!(new.as_object().unwrap().len(), 7);
+    }
+
+    // ---- #3565: the program that enrolls, on the wire --------------------
+
+    /// The enroll body a server from before #3565 reads: `agent_version` is
+    /// REQUIRED there (no default), and a field it does not know is ignored
+    /// (no `deny_unknown_fields`).
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OlderServerEnrollRequest {
+        enrollment_token: String,
+        machine_id: String,
+        machine_name: String,
+        os: OsKind,
+        agent_version: String,
+    }
+
+    /// AC5: the request names the program that enrolled, in a field of its
+    /// own, and still carries `agent_version`, so an older server accepts it.
+    /// Both carry the enrolling program's own version.
+    #[test]
+    fn the_request_names_its_program_and_still_carries_agent_version() {
+        let inputs = EnrollInputs {
+            server_url: "https://example.test",
+            enrollment_token: "t",
+            machine_id: "m",
+            machine_name: "n",
+            install: None,
+            program: EnrollingProgram::new(EnrollingProgramName::RoomlerSetup, "0.4.215"),
+        };
+        let body = serde_json::to_value(EnrollRequest::of(&inputs, OsKind::Windows)).unwrap();
+        assert_eq!(body["agent_version"], "0.4.215");
+        assert_eq!(
+            body["enrolling_program"],
+            serde_json::json!({ "name": "roomler-setup", "version": "0.4.215" })
+        );
+        assert!(body.get("install").is_none());
+
+        let older: OlderServerEnrollRequest =
+            serde_json::from_value(body).expect("a server from before #3565 accepts the request");
+        assert_eq!(older.agent_version, "0.4.215");
+    }
+
+    /// Each enrolling binary names itself with one of these spellings; the
+    /// server stores them as sent and locks them by its own test.
+    #[test]
+    fn each_enrolling_program_has_its_wire_spelling() {
+        let wire = |n| EnrollingProgram::new(n, "1.2.3").name;
+        assert_eq!(wire(EnrollingProgramName::Roomlerd), "roomlerd");
+        assert_eq!(wire(EnrollingProgramName::RoomlerSetup), "roomler-setup");
+        assert_eq!(
+            wire(EnrollingProgramName::RoomlerDesktop),
+            "roomler-desktop"
+        );
     }
 
     /// CLI over env over the default: a hand-typed enroll is `manual` with

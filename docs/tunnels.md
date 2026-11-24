@@ -1253,7 +1253,7 @@ Locked by lib tests, each shown red with a one-line negative control:
    ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
    The forward itself reads no permission bit: the policy is the grant, made to let
    people who hold no management bit reach what a holder named them for
-   (`crates/modules/network/src/tunnel.rs:1114`). Every decision lands in
+   (`crates/modules/network/src/tunnel.rs:1115`). Every decision lands in
    `tunnel_audit` (90 d). A device the org
    removed is refused as a target while it is removed; if its machine enrolls
    again, the device is taken out of every live policy's subjects and targets
@@ -1265,7 +1265,7 @@ Locked by lib tests, each shown red with a one-line negative control:
 ### Who a forward is matched as (#3635)
 
 A forward is matched in the org whose policies decide it, the target device's
-(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1108`); a forward from
+(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1109`); a forward from
 another org is refused `cross_tenant` whatever those policies say. In that org the
 originator is matched as the person it acts for, its `owner_user_id`:
 
@@ -1274,7 +1274,7 @@ originator is matched as the person it acts for, its `owner_user_id`:
 | A tunnel client: `roomler` on its own socket, with its tunnel-client credential | the person who enrolled it; for a paired client, whoever approved the pairing | a role that person holds in the org | `TunnelClientId` = this client; an `AgentId` never matches it | yes |
 | A device opening forwards over its own device socket: `forward --daemon`, a declared route, a supervised SOCKS5 listener ([tunnel-install.md](tunnel-install.md#declared-routes-daemon-supervised--p6)) | the device's owner, as read when the device's socket connected | a role the device's owner holds in the org | `AgentId` = this device; a `TunnelClientId` never matches it | yes |
 
-The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1000`),
+The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1001`),
 through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:757`),
 the same read every gate that matches a role makes
 ([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)):
@@ -1319,7 +1319,7 @@ flowchart TD
 | `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:398`) | a device forwards on its owner's role, and is refused once the owner left the org |
 | `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:455`) | a role of another org, and a role the org deleted, grant nothing here; the rule naming the other org's role is a stored one, because a policy write takes only the org's roles |
 | `…::the_other_subject_kinds_forward_as_before` (`:539`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
-| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2188`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
+| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2189`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
 
 ### A retired agent-session grant is refused (FR-137)
 
@@ -1333,7 +1333,7 @@ reach whatever the device may reach. So:
   (`crates/remote_control/src/signaling.rs:1363`), and no build sends it;
 - the server refuses any open that carries one, at step 3c
   (`crates/modules/network/src/tunnel.rs:698`), before a tunnel session exists
-  (step 4, `:780`), with `rc:error {code: net_grant_refused}`
+  (step 4, `:781`), with `rc:error {code: net_grant_refused}`
   (`NET_GRANT_REFUSED`, `signaling.rs:102`). An old device reads that code as the
   end of its grant, never as a reason to retry.
 

@@ -379,7 +379,7 @@ roles do not.
   The rest of the network module's gated writes followed in #4218, and a guard now
   holds the order in every module ([below](#a-gated-write-decides-its-gate-before-it-reads-its-body)).
 - ⚠️ **The forward itself reads no permission bit, and must not.**
-  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
+  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1035`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
   people who hold no management bit reach what a holder named them for, so a bit on
   the forward would either defeat it or repeat it. When a policy names a role, the
@@ -1041,7 +1041,7 @@ mint asked, whether that person holds `MANAGE_AGENTS` in the credential's org
 `require_permission`, which nobody outside the org passes):
 
 - **Both doors ask it**: `POST /api/agent/enroll`, for a token and a key alike
-  (`crates/modules/fleet/src/agent.rs:354`), and `POST /api/agent/anchor`
+  (`crates/modules/fleet/src/agent.rs:379`), and `POST /api/agent/anchor`
   (`crates/modules/fleet/src/exec_service.rs:151`). They ask after the archived-org
   gate and before the token's spend or the key's claim
   ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)). A token a
@@ -1403,7 +1403,7 @@ An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:44
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would
-leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:494`, #3525). A
+leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:506`, #3525). A
 spec that names the crate keeps its say: `RUST_LOG=debug` keeps its DEBUG lines, and
 `roomler_localapi=off` silences it. Only root sets a root daemon's `RUST_LOG`, so the
 person at the device cannot turn the record off.

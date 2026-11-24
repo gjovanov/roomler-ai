@@ -24,7 +24,7 @@ other two, or the device says why it cannot, in its hello and on screen.
 
 A capability word in the hello promises that this device serves the feature, on this OS, now.
 What a host cannot keep, the daemon takes out and explains in `AgentCaps.unavailable`, a map
-of feature → `{code, reason}` (`crates/remote_control/src/models.rs:546`, its keys at `:576`).
+of feature → `{code, reason}` (`crates/remote_control/src/models.rs:652`, its keys at `:682`).
 One seam decides it, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:2982`), over
 plain facts about the host, so the decision runs and is tested on every OS. Features with a
 channel of their own say no there: capture as `rc:media-unavailable` (FR-80), input as

@@ -2952,6 +2952,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         machine_id: &machine_id,
         machine_name,
         install: Some(install),
+        // #3565 — the daemon's own enroll names itself.
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .context("enrollment failed")?;
@@ -3417,6 +3422,11 @@ async fn re_enroll_cmd(
         // FR-102 P3 — a token refresh knows nothing about how the binary
         // got here; sending nothing leaves the row's recorded install alone.
         install: None,
+        // #3565 — the daemon's own re-enroll names itself.
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .context("re-enrollment failed")?;

@@ -142,7 +142,7 @@ each absolute move as a large jump. In relative mode the same probe read the del
 ## The viewer
 
 - **The control** is a toolbar button, shown only for an agent that advertises `mouse-rel`
-  ([`RemoteControl.vue:3765`](../ui/src/views/remote/RemoteControl.vue#L3765) `relativeMouseOffered`).
+  ([`RemoteControl.vue:3766`](../ui/src/views/remote/RemoteControl.vue#L3766) `relativeMouseOffered`).
   Pointer Lock needs a user gesture, and the click is one.
 - **Entering** asks for raw, unaccelerated deltas (`unadjustedMovement`). A browser that rejects the option
   gets plain Pointer Lock ([`useRemoteControl.ts:7371`](../ui/src/composables/useRemoteControl.ts#L7371)
