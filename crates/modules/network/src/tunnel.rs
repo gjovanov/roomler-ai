@@ -724,16 +724,17 @@ async fn handle_tunnel_open(
     // falling back. `agent_version` is refreshed on every agent WS
     // connect (update_hello), so it's current for any *online* agent —
     // and only an online agent can be tunneled to (send_to_agent fails
-    // otherwise).
-    let agent_speaks_quic = tunnel_core::transport::agent_supports_quic(&agent.agent_version);
+    // otherwise). #3565: "" while the daemon has not reported one, which
+    // both gates read as too old.
+    let agent_version = agent.reported_version().unwrap_or("");
+    let agent_speaks_quic = tunnel_core::transport::agent_supports_quic(agent_version);
     // R4 - quic-derp-v1: negotiated only when the client REQUESTED it,
     // advertised it, sent its DERP identity, and the agent's version can
     // serve it (a pre-R4 agent would ignore the setup's transport field,
     // stand up a TURN relay, and the client would burn its 30s ready-wait).
     // A derp request that cannot be honored degrades to plain quic-v1 when
     // possible (better than webrtc through a captured path), else webrtc.
-    let agent_speaks_derp =
-        tunnel_core::transport::agent_supports_derp_tunnel(&agent.agent_version);
+    let agent_speaks_derp = tunnel_core::transport::agent_supports_derp_tunnel(agent_version);
     let derp_requested = transport == tunnel_core::transport::TRANSPORT_QUIC_DERP_V1;
     let negotiated_transport = if derp_requested {
         if client_supported
@@ -745,7 +746,7 @@ async fn handle_tunnel_open(
             tunnel_core::transport::TRANSPORT_QUIC_DERP_V1.to_string()
         } else if client_supported.iter().any(|t| t == TRANSPORT_QUIC_V1) && agent_speaks_quic {
             debug!(
-                %agent_id, agent_version = %agent.agent_version, agent_speaks_derp,
+                %agent_id, %agent_version, agent_speaks_derp,
                 had_pubkey = derp_pubkey.is_some(),
                 "client requested quic-derp-v1 -> negotiating quic-v1 (derp leg unavailable)"
             );
@@ -758,7 +759,7 @@ async fn handle_tunnel_open(
             TRANSPORT_QUIC_V1.to_string()
         } else {
             debug!(
-                %agent_id, agent_version = %agent.agent_version, agent_speaks_quic,
+                %agent_id, %agent_version, agent_speaks_quic,
                 "client requested quic-v1 → negotiating webrtc-dc-v1 (agent too old, or client didn't advertise quic)"
             );
             TRANSPORT_WEBRTC_DC_V1.to_string()

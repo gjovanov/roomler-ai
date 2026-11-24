@@ -153,7 +153,9 @@ async fn enroll_revives_soft_deleted_agent() {
     let revived: Value = resp.json().await.unwrap();
     assert_eq!(revived["agent_id"].as_str().unwrap(), first_agent_id);
 
-    // Admin list now shows the revived row with the new name + version.
+    // Admin list now shows the revived row with the new name, and the
+    // program that enrolled it. #3565: the row's version is its daemon's own,
+    // and this device's daemon has not connected, so it has none yet.
     let list: Value = app
         .auth_get(
             &format!("/api/tenant/{}/agent", seeded.tenant_id),
@@ -169,7 +171,12 @@ async fn enroll_revives_soft_deleted_agent() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"].as_str().unwrap(), first_agent_id);
     assert_eq!(items[0]["name"].as_str().unwrap(), "corp3_laptop");
-    assert_eq!(items[0]["agent_version"].as_str().unwrap(), "0.2.7");
+    assert_eq!(items[0]["agent_version"].as_str().unwrap(), "");
+    assert_eq!(
+        items[0]["enrolling_program"],
+        json!({ "name": "unknown", "version": "0.2.7" }),
+        "a request without the field names only its own version"
+    );
 }
 
 #[tokio::test]

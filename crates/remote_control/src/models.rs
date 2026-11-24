@@ -182,6 +182,112 @@ impl InstallScope {
     }
 }
 
+/// #3565 — the program that enrolled a device, and the version it was built
+/// as, as the enroll request names them. Shared by both ends of
+/// `POST /api/agent/enroll`, like [`InstallInfo`].
+///
+/// It says how the device was enrolled. It is neither the device's version
+/// ([`Agent::agent_version`], which only the daemon's own hello writes) nor
+/// who enrolled it ([`Agent::enrolled_by`], a person): a different name, and
+/// a different type from both.
+///
+/// Strings on the wire and on the row: a name this build has never heard of
+/// is **clamped to `other`**, never refused, so an older server keeps
+/// enrolling a newer program. [`EnrollingProgramName`] is the vocabulary.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EnrollingProgram {
+    /// One of [`EnrollingProgramName`]'s spellings.
+    pub name: String,
+    /// The version the program was built as. Empty when the server kept none
+    /// of what it was sent ([`EnrollingProgram::clamped`]).
+    #[serde(default)]
+    pub version: String,
+}
+
+/// The ceiling on an enrolling program's version the server keeps.
+pub const ENROLLING_PROGRAM_VERSION_MAX_LEN: usize = 64;
+
+impl EnrollingProgram {
+    pub fn new(name: EnrollingProgramName, version: &str) -> Self {
+        Self {
+            name: name.wire().to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    /// What the server stores for an enroll request without the field: an
+    /// enroller from before #3565. The request's `agent_version` is that
+    /// program's own version, so it is kept here, and only here.
+    pub fn older_enroller(agent_version: &str) -> Self {
+        Self::new(EnrollingProgramName::Unknown, agent_version).clamped()
+    }
+
+    /// The server's view of a client's claim: a name outside the vocabulary
+    /// is `other`, and a version that is not a short version string is
+    /// dropped (kept empty). Never an error: the enroll must succeed whatever
+    /// this says.
+    pub fn clamped(&self) -> Self {
+        let name =
+            EnrollingProgramName::parse(self.name.trim()).unwrap_or(EnrollingProgramName::Other);
+        let version = self.version.trim();
+        let keep = !version.is_empty()
+            && version.len() <= ENROLLING_PROGRAM_VERSION_MAX_LEN
+            && version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'));
+        Self {
+            name: name.wire().to_string(),
+            version: if keep {
+                version.to_string()
+            } else {
+                String::new()
+            },
+        }
+    }
+}
+
+/// The programs that enroll a device. The wire spelling is the stored
+/// spelling, so it is locked by a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EnrollingProgramName {
+    /// The daemon's own `roomlerd enroll`, and its join of another org.
+    Roomlerd,
+    /// The setup wizard, which enrolls in-process.
+    RoomlerSetup,
+    /// The companion's enroll form.
+    RoomlerDesktop,
+    /// A spelling this build does not know: the server's clamp.
+    Other,
+    /// The request did not say: an enroller from before #3565.
+    /// Server-assigned; a client never needs to send it.
+    Unknown,
+}
+
+impl EnrollingProgramName {
+    pub const ALL: [EnrollingProgramName; 5] = [
+        EnrollingProgramName::Roomlerd,
+        EnrollingProgramName::RoomlerSetup,
+        EnrollingProgramName::RoomlerDesktop,
+        EnrollingProgramName::Other,
+        EnrollingProgramName::Unknown,
+    ];
+
+    pub fn wire(self) -> &'static str {
+        match self {
+            EnrollingProgramName::Roomlerd => "roomlerd",
+            EnrollingProgramName::RoomlerSetup => "roomler-setup",
+            EnrollingProgramName::RoomlerDesktop => "roomler-desktop",
+            EnrollingProgramName::Other => "other",
+            EnrollingProgramName::Unknown => "unknown",
+        }
+    }
+
+    /// Exact, case-sensitive, like [`InstallMethod::parse`].
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|n| n.wire() == raw)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -2196,7 +2302,15 @@ pub struct Agent {
     /// FR-97 P0d — the agent binary runs under emulation on that hardware.
     #[serde(default)]
     pub arch_emulated: bool,
-    pub agent_version: String,
+    /// The version the device's daemon reported in its hello. #3565: the
+    /// hello (`AgentDao::update_hello`) is its one writer, and an enrollment
+    /// never writes it, so a row's version is its daemon's own. `None` until
+    /// the daemon first connects: "not reported yet", absent from the row,
+    /// and `""` on the API's wire. Read it through
+    /// [`Agent::reported_version`], which also takes a hello's empty value as
+    /// not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
     /// FR-27 — the version of the `roomler-desktop` companion INSTALLED on this
     /// host, reported on the heartbeat. `None` means one of three different
     /// things and the grid must not flatten them: a pre-FR-27 agent that never
@@ -2331,6 +2445,14 @@ pub struct Agent {
     /// `None` and `unknown` as *unknown*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install: Option<InstallInfo>,
+    /// #3565 — the program that enrolled the device, and its version, as the
+    /// latest enrollment's request named them ([`EnrollingProgram`]):
+    /// `{name: "unknown", version: <its agent_version>}` for an enroller from
+    /// before the field. How the device was enrolled, never its version
+    /// ([`Self::agent_version`]) nor who enrolled it ([`Self::enrolled_by`]).
+    /// `None` on a row whose latest enrollment came before #3565.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrolling_program: Option<EnrollingProgram>,
     /// Roomler-SSH policy for this device (gate 3). Same shape and the same
     /// closed default as [`Self::exec_policy`] — every pre-feature row
     /// deserialises to [`SshMode::Off`].
@@ -2451,6 +2573,17 @@ pub struct Agent {
 
 impl Agent {
     pub const COLLECTION: &'static str = "agents";
+
+    /// #3565 — the version the device's daemon reported, or `None` while it
+    /// has not reported one yet: no hello since the row was made, or a hello
+    /// that sent an empty value. Every reader of the row's version goes
+    /// through this, so "not reported yet" never reads as a version.
+    pub fn reported_version(&self) -> Option<&str> {
+        self.agent_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -7953,6 +8086,82 @@ mod tests {
             .unwrap(),
             r#"{"method":"manual","scope":"unknown"}"#
         );
+    }
+
+    /// #3565 — the enrolling program's name is a stored spelling: renaming
+    /// one would make every existing row name a program no build sends.
+    /// Locked, and matched by equality only.
+    #[test]
+    fn enrolling_program_spellings_are_locked() {
+        let names: Vec<&str> = EnrollingProgramName::ALL.iter().map(|n| n.wire()).collect();
+        assert_eq!(
+            names,
+            [
+                "roomlerd",
+                "roomler-setup",
+                "roomler-desktop",
+                "other",
+                "unknown"
+            ]
+        );
+        for n in EnrollingProgramName::ALL {
+            assert_eq!(EnrollingProgramName::parse(n.wire()), Some(n));
+        }
+        // `roomler` is not a program, and `roomlerd` is a prefix of no other.
+        assert_eq!(EnrollingProgramName::parse("roomler"), None);
+        assert_eq!(EnrollingProgramName::parse("roomler-setup.exe"), None);
+        assert_eq!(EnrollingProgramName::parse("Roomlerd"), None);
+        assert_eq!(EnrollingProgramName::parse(""), None);
+    }
+
+    /// The server's clamp: a name from the future is `other`, a version that
+    /// is not a short version string is dropped, and a known value passes
+    /// through untouched. The enroll never fails on any of it.
+    #[test]
+    fn enrolling_program_clamps_instead_of_refusing() {
+        let known = EnrollingProgram::new(EnrollingProgramName::RoomlerSetup, "0.4.215");
+        assert_eq!(known.clamped(), known);
+        assert_eq!(
+            serde_json::to_string(&known).unwrap(),
+            r#"{"name":"roomler-setup","version":"0.4.215"}"#
+        );
+
+        let future = EnrollingProgram {
+            name: "a-program-from-later".into(),
+            version: "1.0.0-beta.2+build.7".into(),
+        };
+        assert_eq!(
+            future.clamped(),
+            EnrollingProgram {
+                name: "other".into(),
+                version: "1.0.0-beta.2+build.7".into(),
+            }
+        );
+        let junk = EnrollingProgram {
+            name: " roomlerd ".into(),
+            version: "<script>alert(1)</script>".into(),
+        };
+        assert_eq!(
+            junk.clamped(),
+            EnrollingProgram {
+                name: "roomlerd".into(),
+                version: String::new(),
+            }
+        );
+        let long = EnrollingProgram::new(EnrollingProgramName::Roomlerd, &"9".repeat(65));
+        assert_eq!(long.clamped().version, "");
+
+        // An enroller from before the field: its agent_version is its own.
+        assert_eq!(
+            EnrollingProgram::older_enroller("0.4.190"),
+            EnrollingProgram {
+                name: "unknown".into(),
+                version: "0.4.190".into(),
+            }
+        );
+        // On the wire, `version` may be absent.
+        let wire: EnrollingProgram = serde_json::from_str(r#"{"name":"roomlerd"}"#).unwrap();
+        assert_eq!(wire.version, "");
     }
 
     /// FR-19 — the `relay-server` verb: spelling locked (a rename silently

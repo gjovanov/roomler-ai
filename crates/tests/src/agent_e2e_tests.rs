@@ -120,6 +120,10 @@ async fn enrol(
         machine_id,
         machine_name,
         install: None,
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .expect("agent enrollment")

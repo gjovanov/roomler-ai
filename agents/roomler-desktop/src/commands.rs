@@ -641,11 +641,24 @@ pub async fn cmd_enroll(
             enrollment::InstallMethod::Manual,
             enrollment::InstallScope::Unknown,
         )),
+        // #3565 — the companion names itself, with its own version, which
+        // need not be the daemon's.
+        program: companion_program(),
     })
     .await
     .map_err(|e| format!("Enrollment failed: {e:#}"))?;
     config::save(&path, &cfg).map_err(|e| format!("Saving config: {e}"))?;
     Ok(status_report())
+}
+
+/// #3565 — the companion's enroll and re-enroll name the companion, with the
+/// version it was built as. The server keeps it as how the device was
+/// enrolled; the device's version is its daemon's own, from its hello.
+fn companion_program() -> enrollment::EnrollingProgram {
+    enrollment::EnrollingProgram::new(
+        enrollment::EnrollingProgramName::RoomlerDesktop,
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// FR-43 P3a, #3996 — what a re-enroll says when this account's config holds
@@ -698,6 +711,7 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
         // A token refresh says nothing about how the binary got here; the
         // server keeps the row's recorded install.
         install: None,
+        program: companion_program(),
     })
     .await
     .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;

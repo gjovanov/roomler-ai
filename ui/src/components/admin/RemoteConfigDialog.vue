@@ -328,6 +328,7 @@ import { useAgentStore, type Agent, type DesiredConfig } from '@/stores/agents'
 import { useTenantStore } from '@/stores/tenant'
 import { canGrantDeviceExec, canGrantDeviceSsh } from '@/utils/permissions'
 import { triboolChoice, triboolWord } from '@/utils/managedTribool'
+import { VERSION_NOT_REPORTED, reportedVersion } from '@/utils/deviceVersion'
 import ManagedSwitch from './ManagedSwitch.vue'
 
 const props = defineProps<{
@@ -354,6 +355,11 @@ const clearing = ref(false)
 const error = ref('')
 const sshDetailsTouched = ref(false)
 const agent = computed(() => props.agent)
+/** #3565 — the daemon's own version for the explanations below, or a plain
+ *  "not reported yet" while it has not reported one. */
+const daemonVersion = computed(
+  () => reportedVersion(agent.value?.agent_version) ?? `(version ${VERSION_NOT_REPORTED})`,
+)
 
 /** Only the managed keys. `undefined` is "leave the device alone", which is
  *  why every field is optional rather than defaulted — a struct of plain
@@ -464,14 +470,14 @@ const status = computed<{ type: 'success' | 'info' | 'warning' | 'error'; icon: 
         type: 'info',
         icon: 'mdi-help-circle-outline',
         title: 'This device cannot report back',
-        detail: `roomlerd ${agent.value?.agent_version ?? '?'} understands a pushed configuration but not how to say what it did with it. It may well have applied this — there is no way to tell from here. Update the device to find out.`,
+        detail: `roomlerd ${daemonVersion.value} understands a pushed configuration but not how to say what it did with it. It may well have applied this — there is no way to tell from here. Update the device to find out.`,
       }
     case 'push_unsupported':
       return {
         type: 'warning',
         icon: 'mdi-update',
         title: 'This device is too old',
-        detail: `roomlerd ${agent.value?.agent_version ?? '?'} predates remote configuration, so nothing is sent to it at all. Update it, or set these keys on the host directly.`,
+        detail: `roomlerd ${daemonVersion.value} predates remote configuration, so nothing is sent to it at all. Update it, or set these keys on the host directly.`,
       }
     default:
       return null

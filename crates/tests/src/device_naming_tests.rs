@@ -114,8 +114,10 @@ async fn admin_rename_survives_reenroll_and_reports_in_responses() {
     // by staying null, not by claiming a rename that never happened.
     assert!(resp["dns_renamed"].is_null());
 
-    // Re-enroll the SAME machine with the machine-reported name + a newer
-    // version: the version half must refresh, the admin rename must survive.
+    // Re-enroll the SAME machine with the machine-reported name, from a
+    // program of a newer version: the admin rename must survive, and the row
+    // records that program. #3565: the row's version stays its daemon's own
+    // (none here: this device's daemon never connected).
     enroll(
         &app,
         &t.tenant_id,
@@ -132,7 +134,11 @@ async fn admin_rename_survives_reenroll_and_reports_in_responses() {
         Some("renamed-device"),
         "re-enroll clobbered an admin rename"
     );
-    assert_eq!(agent["agent_version"].as_str(), Some("0.3.1"));
+    assert_eq!(agent["agent_version"].as_str(), Some(""));
+    assert_eq!(
+        agent["enrolling_program"],
+        json!({ "name": "unknown", "version": "0.3.1" })
+    );
 }
 
 #[tokio::test]

@@ -309,6 +309,15 @@ export interface KeepBusyBrief {
   set_by?: string
 }
 
+/** #3565 — the program that enrolled a device and the version it was built
+ *  as. `name` is one of `roomlerd`, `roomler-setup`, `roomler-desktop`,
+ *  `other` (a name the server did not know) or `unknown` (an enroller from
+ *  before the field); `version` is `""` when the server kept none. */
+export interface EnrollingProgram {
+  name: string
+  version: string
+}
+
 export interface Agent {
   id: string
   tenant_id: string
@@ -321,7 +330,15 @@ export interface Agent {
   tags?: string[]
   machine_id: string
   os: AgentOs
+  /** The version the device's daemon reported in its hello. #3565: `""`
+   *  until the daemon first connects (an enrollment writes none): read it
+   *  through `utils/deviceVersion`, which shows "not reported yet". */
   agent_version: string
+  /** #3565 — the program that enrolled the device, and its version, as the
+   *  latest enrollment named them: how the device was enrolled, never its
+   *  version. `unknown` for an enroller from before the field; absent on a
+   *  row whose latest enrollment came before it. */
+  enrolling_program?: EnrollingProgram | null
   /** FR-27 — the `roomler-desktop` version installed on the host, reported on
    *  the heartbeat. Absent means one of three things and the UI must not
    *  flatten them: a pre-FR-27 agent, no companion installed, or a probe that
@@ -1226,7 +1243,9 @@ export const useAgentStore = defineStore('agents', () => {
   /** S1a — push an immediate self-update to every agent in the tenant
    *  (or a selected subset via `agent_ids`). MANAGE_AGENTS. A row the server
    *  did not push carries `refused` (a sentence) and `refused_code`:
-   *  `pin_downgrade` (FR-2), `primary_org` or `auto_update_off` (FR-67 P7). */
+   *  `pin_downgrade` (FR-2), `version_unreported` (#3565: a pin to a row
+   *  with no reported version, unless forced), `primary_org` or
+   *  `auto_update_off` (FR-67 P7). */
   async function triggerUpdateAll(tenantId: string): Promise<BulkUpdateResponse> {
     return api.post<BulkUpdateResponse>(`/tenant/${tenantId}/agent/update`, {})
   }

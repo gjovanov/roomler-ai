@@ -51,7 +51,7 @@
           <template v-if="secondaryDeviceName(agent, hideDeviceName)">
             {{ agent.name }} ·
           </template>
-          {{ agent.os }} · {{ agent.agent_version || '—' }}
+          {{ agent.os }} · {{ reportedVersion(agent.agent_version) ?? VERSION_NOT_REPORTED }}
         </span>
       </v-toolbar-title>
       <v-spacer />
@@ -2583,6 +2583,7 @@ import { takeExternalSession } from '@/composables/useExternalLogin'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
 import { peerAuthBadge } from '@/utils/peerAuth'
+import { VERSION_NOT_REPORTED, reportedVersion } from '@/utils/deviceVersion'
 import { claimRcResume, notifyRcReloadSurface, registerRcReloadSurface } from '@/utils/staleBuildWatch'
 import type { RcReloadSurface } from '@/utils/staleBuildPolicy'
 import {

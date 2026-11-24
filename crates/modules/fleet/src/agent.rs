@@ -13,8 +13,8 @@ use axum::{
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentStatus, ConsentMode, ExecPolicy, ExternalAccessPolicy, InputMode,
-    InstallInfo, LockOnEnd, OsKind, PeerRelayPolicy, SshPolicy,
+    AccessPolicy, Agent, AgentStatus, ConsentMode, EnrollingProgram, ExecPolicy,
+    ExternalAccessPolicy, InputMode, InstallInfo, LockOnEnd, OsKind, PeerRelayPolicy, SshPolicy,
 };
 use roomler_ai_services::auth::{AgentEnrollment, EnrollmentCredential, SpendPurpose};
 use roomler_ai_services::dao::base::{DaoError, PaginationParams};
@@ -292,12 +292,37 @@ pub struct EnrollRequest {
     pub machine_id: String,
     pub machine_name: String,
     pub os: OsKind,
+    /// The version the ENROLLING program was built as, which need not be the
+    /// daemon's. #3565: it is never written as the row's version (only the
+    /// daemon's hello writes that). It is read only as the enrolling
+    /// program's version, and only when `enrolling_program` is absent (an
+    /// enroller from before that field). Still required here, as on every
+    /// older server, so every enroller keeps sending it.
     pub agent_version: String,
     /// FR-102 P3 — how the device was installed (`{method, scope, run}`).
     /// Additive: absent on every agent from before P3, which records as
     /// `unknown`. Clamped, never refused ([`InstallInfo::clamped`]).
     #[serde(default)]
     pub install: Option<InstallInfo>,
+    /// #3565 — the program that enrolled (`{name, version}`), stored on the
+    /// row as `enrolling_program`. Additive: absent from every enroller
+    /// before the field ([`Self::enrolling_program`]). Clamped, never
+    /// refused ([`EnrollingProgram::clamped`]).
+    #[serde(default)]
+    pub enrolling_program: Option<EnrollingProgram>,
+}
+
+impl EnrollRequest {
+    /// #3565 — the program that enrolled, as the row stores it: the request's
+    /// own field, clamped, or for an enroller from before that field,
+    /// `unknown` with the request's `agent_version`, which is that program's
+    /// own version.
+    pub fn enrolling_program(&self) -> EnrollingProgram {
+        match &self.enrolling_program {
+            Some(program) => program.clamped(),
+            None => EnrollingProgram::older_enroller(&self.agent_version),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -501,6 +526,9 @@ async fn enroll_row(
     body: &EnrollRequest,
     install: Option<InstallInfo>,
 ) -> Result<Agent, ApiError> {
+    // #3565: every branch stores the program that enrolled, and none writes
+    // the row's version, which is its daemon's own.
+    let program = body.enrolling_program();
     let mut row = existing;
     for round in 0..ENROLL_ROUNDS {
         match row.take() {
@@ -513,7 +541,7 @@ async fn enroll_row(
                         body.machine_name.clone(),
                         body.machine_id.clone(),
                         body.os,
-                        body.agent_version.clone(),
+                        program,
                         String::new(), // agent_token_hash unused in JWT-only scheme
                         install,
                     )
@@ -529,13 +557,7 @@ async fn enroll_row(
                     .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
                 match state
                     .agents
-                    .rehydrate(
-                        id,
-                        &body.machine_name,
-                        body.os,
-                        &body.agent_version,
-                        install.as_ref(),
-                    )
+                    .rehydrate(id, &body.machine_name, body.os, &program, install.as_ref())
                     .await
                 {
                     Ok(agent) => return Ok(agent),
@@ -568,7 +590,7 @@ async fn enroll_row(
                         enroller,
                         body.machine_name.clone(),
                         body.os,
-                        body.agent_version.clone(),
+                        program.clone(),
                         install.clone(),
                     )
                     .await?
@@ -697,6 +719,8 @@ async fn enroll_agent_ephemeral(
 
     // FR-102 P3 — the same install claim as the standard path records.
     let install = body.install.as_ref().map(InstallInfo::clamped);
+    // #3565 — the same enrolling program too, and no version for the row.
+    let program = body.enrolling_program();
     let agent = match state
         .agents
         .create_ephemeral(
@@ -705,7 +729,7 @@ async fn enroll_agent_ephemeral(
             body.machine_name,
             body.machine_id,
             body.os,
-            body.agent_version,
+            program,
             key_id,
             key.ephemeral_ttl_secs,
             install,
@@ -895,7 +919,15 @@ pub struct AgentResponse {
     pub tags: Vec<String>,
     pub machine_id: String,
     pub os: OsKind,
+    /// The version the device's daemon reported in its hello, and `""` while
+    /// it has not reported one yet (#3565: an enrollment writes none). Kept a
+    /// string on the wire, so a client that reads it as one keeps working.
     pub agent_version: String,
+    /// #3565 — the program that enrolled the device, and its version
+    /// (`{name, version}`). Omitted for a row whose latest enrollment came
+    /// before the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enrolling_program: Option<EnrollingProgram>,
     /// FR-27 — the `roomler-desktop` version installed on the host, as the
     /// device last reported it. Omitted when there is none / it could not be
     /// read / the agent predates the field: the grid must not turn three
@@ -1721,7 +1753,8 @@ pub struct TriggerUpdateRequest {
     /// rollback, repro of an old build). FR-2: on 2026-08-27 a stale
     /// operator script pinned rc.484 at a fleet already on 0.4.1 and five
     /// hosts downgraded; the server is the one place that always knows both
-    /// versions at push time.
+    /// versions at push time. #3565: a pin to a row with no reported version
+    /// is refused unless this is set.
     #[serde(default)]
     pub force: bool,
 }
@@ -1768,6 +1801,27 @@ fn pin_downgrade(pin: &str, agent_version: &str) -> Option<String> {
     }
 }
 
+/// The update push's check of a pin against the row, before anything is
+/// sent: `Some((refused_code, reason))` refuses the pin unless the caller
+/// forced it. `reported` is [`Agent::reported_version`].
+///
+/// #3565: a pin to a row with no reported version is refused unless it is
+/// forced (`version_unreported`). A row's version is its daemon's own, so a
+/// row has one from its daemon's first hello on. With a reported version,
+/// FR-2's guard decides (`pin_downgrade`).
+fn pin_refusal(pin: &str, reported: Option<&str>) -> Option<(&'static str, String)> {
+    match reported {
+        None => Some((
+            "version_unreported",
+            format!(
+                "this device has not reported its version yet, so a pin ({pin}) to it is \
+                 refused unless it is forced (force=true)"
+            ),
+        )),
+        Some(current) => pin_downgrade(pin, current).map(|reason| ("pin_downgrade", reason)),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct TriggerUpdateResult {
     pub agent_id: String,
@@ -1783,7 +1837,8 @@ pub struct TriggerUpdateResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
     /// FR-67 P7 — the refusal as a stable code a client branches on:
-    /// `pin_downgrade`, `primary_org` or `auto_update_off`.
+    /// `pin_downgrade`, `version_unreported` (#3565: a pin to a device that
+    /// has not reported its version yet), `primary_org` or `auto_update_off`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused_code: Option<&'static str>,
 }
@@ -1830,9 +1885,10 @@ pub async fn trigger_agent_update(
     let agent = state.agents.find_live_in_tenant(tid, aid).await?;
 
     // FR-2: refuse a stale pin that would downgrade, unless forced.
+    // #3565: a pin to a row with no reported version is refused unless forced.
     if let Some(pin) = body.pin.as_deref()
         && !body.force
-        && let Some(reason) = pin_downgrade(pin, &agent.agent_version)
+        && let Some((_, reason)) = pin_refusal(pin, agent.reported_version())
     {
         return Err(ApiError::Conflict(reason));
     }
@@ -1885,8 +1941,9 @@ pub struct BulkTriggerUpdateResponse {
     pub requested: usize,
     pub delivered: usize,
     /// How many targets were skipped, each with its `refused` reason and
-    /// `refused_code`: FR-2's downgrade guard (0 when force or no pin), and
-    /// FR-67 P7's devices that said they would not act on the push.
+    /// `refused_code`: FR-2's downgrade guard and #3565's devices with no
+    /// reported version (both 0 when force or no pin), and FR-67 P7's
+    /// devices that said they would not act on the push.
     pub refused: usize,
 }
 
@@ -1911,9 +1968,10 @@ pub async fn trigger_agents_update(
     )
     .await?;
 
-    // (id, running version, the device's own refusal) — the FR-2 guard needs
-    // the version per target, FR-67 P7 what the device's hello said.
-    type Target = (ObjectId, String, Option<(&'static str, String)>);
+    // (id, reported version, the device's own refusal) — the FR-2 guard needs
+    // the version per target (#3565: `None` while the daemon has not reported
+    // one), FR-67 P7 what the device's hello said.
+    type Target = (ObjectId, Option<String>, Option<(&'static str, String)>);
     let targets: Vec<Target> = match body.agent_ids {
         Some(ids) if !ids.is_empty() => {
             let mut out = Vec::with_capacity(ids.len());
@@ -1924,7 +1982,7 @@ pub async fn trigger_agents_update(
                 // "all devices" arm below, which lists live rows only.
                 let a = state.agents.find_live_in_tenant(tid, aid).await?;
                 let refusal = device_refusal(&a.capabilities);
-                out.push((aid, a.agent_version, refusal));
+                out.push((aid, a.reported_version().map(str::to_string), refusal));
             }
             out
         }
@@ -1944,7 +2002,8 @@ pub async fn trigger_agents_update(
                 .into_iter()
                 .filter_map(|a| {
                     let refusal = device_refusal(&a.capabilities);
-                    a.id.map(|i| (i, a.agent_version, refusal))
+                    let version = a.reported_version().map(str::to_string);
+                    a.id.map(|i| (i, version, refusal))
                 })
                 .collect()
         }
@@ -1955,17 +2014,18 @@ pub async fn trigger_agents_update(
     let mut refused = 0usize;
     for (aid, version, device) in &targets {
         // FR-2: skip (never fail the batch) targets a stale pin would
-        // downgrade.
+        // downgrade. #3565: skip, unless forced, targets with no reported
+        // version.
         if let Some(pin) = body.pin.as_deref()
             && !body.force
-            && let Some(reason) = pin_downgrade(pin, version)
+            && let Some((code, reason)) = pin_refusal(pin, version.as_deref())
         {
             refused += 1;
             results.push(TriggerUpdateResult {
                 agent_id: aid.to_hex(),
                 delivered: false,
                 refused: Some(reason),
-                refused_code: Some("pin_downgrade"),
+                refused_code: Some(code),
             });
             continue;
         }
@@ -2098,6 +2158,8 @@ fn to_agent_response(
 ) -> AgentResponse {
     let id = a.id.map(|i| i.to_hex()).unwrap_or_default();
     let (presence, is_online) = derive_agent_presence(state, &a, redis_fresh);
+    // #3565: "" while the daemon has not reported a version.
+    let agent_version = a.reported_version().unwrap_or_default().to_string();
     // Resolved before the struct literal moves `capabilities`: the
     // remote-config state depends on which verbs this device advertises.
     let remote_config = remote_config_view(a.desired_config, a.config_report, &a.capabilities);
@@ -2128,7 +2190,8 @@ fn to_agent_response(
         tags: a.tags,
         machine_id: a.machine_id,
         os: a.os,
-        agent_version: a.agent_version,
+        agent_version,
+        enrolling_program: a.enrolling_program,
         companion_version: a.companion_version,
         keep_busy: a.keep_busy,
         power: a.power,
@@ -2556,7 +2619,7 @@ mod tests {
 
 #[cfg(test)]
 mod fr2_downgrade_guard_tests {
-    use super::{pin_downgrade, release_ord};
+    use super::{pin_downgrade, pin_refusal, release_ord};
 
     #[test]
     fn ordering_matches_the_agent_updater() {
@@ -2582,6 +2645,23 @@ mod fr2_downgrade_guard_tests {
         // "downgrade" about what it cannot compare.
         assert!(pin_downgrade("agent-vNEXT", "0.4.1").is_none());
         assert!(pin_downgrade("agent-v0.4.0", "custom-build").is_none());
+    }
+
+    /// #3565: a pin to a row with no reported version is refused unless it
+    /// is forced. With a reported version, FR-2's guard decides, under its
+    /// own code.
+    #[test]
+    fn a_pin_to_a_row_with_no_reported_version_is_refused() {
+        let (code, reason) = pin_refusal("agent-v0.4.215", None).expect("refused");
+        assert_eq!(code, "version_unreported");
+        assert!(reason.contains("not reported"), "{reason}");
+        assert!(reason.contains("force=true"), "{reason}");
+
+        assert_eq!(pin_refusal("agent-v0.4.1", Some("0.4.1")), None);
+        assert_eq!(
+            pin_refusal("agent-v0.4.0", Some("0.4.1")).map(|(code, _)| code),
+            Some("pin_downgrade")
+        );
     }
 }
 

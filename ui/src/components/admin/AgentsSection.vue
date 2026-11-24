@@ -224,7 +224,7 @@
               </span>
               <span class="mx-1">·</span>
               <span :title="`machine_id: ${item.machine_id}`">{{ shortId(item.machine_id) }}</span>
-              <span v-if="item.version"> · v{{ item.version }}</span>
+              <span :title="versionTitle(item)"> · {{ versionLabel(item.version) }}</span>
               <!-- FR-27 — the companion's own version, and only when it
                    DISAGREES with the daemon's. Shown at all because the two
                    update by different mechanisms on every platform, so
@@ -589,7 +589,7 @@
                     <div v-if="!xs || isCardOpen(item)" class="text-caption text-medium-emphasis text-break">
                       <span v-if="secondaryDeviceName(item, hideNameWhenDisplay)">{{ item.name }} · </span>
                       <v-icon size="x-small" :icon="osIcon(item.os)" class="mr-1" />{{ item.os }}
-                      <span v-if="item.version"> · v{{ item.version }}</span>
+                      <span :title="versionTitle(item)"> · {{ versionLabel(item.version) }}</span>
                       <span :title="fmtDate(item.last_seen_at)"> · {{ fmtRelative(item.last_seen_at) }}</span>
                     </div>
                   </div>
@@ -1462,6 +1462,7 @@ import { codecChips, permissionWarnings } from './agentCodecChips'
 import { keepBusyBriefTitle } from '@/composables/keepBusy'
 import { credentialChip } from '@/utils/credentialExpiry'
 import { updateStallChip } from '@/utils/updateStall'
+import { reportedVersion, versionLabel } from '@/utils/deviceVersion'
 import { refusalShort, updateRefusal } from '@/utils/updateRefusal'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
@@ -1664,7 +1665,19 @@ function stallChip(a: Agent) {
  *  in a table cell would be worse than saying nothing. */
 function companionSkew(row: DeviceRow): string {
   const cv = agentFor(row)?.companion_version
-  return cv && cv !== row.version ? cv : ''
+  // #3565: with no version from the daemon there is nothing to disagree with.
+  const daemon = reportedVersion(row.version)
+  return cv && daemon && cv !== daemon ? cv : ''
+}
+
+/** #3565 — the version's tooltip: for a device whose daemon has not reported
+ *  a version yet, which program enrolled it. A row's version is its daemon's
+ *  own, never the enrolling program's. */
+function versionTitle(row: DeviceRow): string | undefined {
+  if (reportedVersion(row.version)) return undefined
+  const p = agentFor(row)?.enrolling_program
+  const by = p ? ` Enrolled by ${p.name}${p.version ? ` ${p.version}` : ''}.` : ''
+  return `Its daemon has not reported its version yet: it does once it connects.${by}`
 }
 const clientById = computed(() => {
   const m = new Map<string, TunnelClient>()

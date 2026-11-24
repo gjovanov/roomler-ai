@@ -394,6 +394,8 @@ pub(crate) fn agent_row(
     let (overlay_ip, overlay_node_id, magic_dns_name, magic_dns_fqdn) = node_bits(node, dns_domain);
     // FR-55 P4 — read before `a` is taken apart below.
     let sleep = roomler_ai_remote_control::models::SleepView::of(a.sleep.as_ref(), is_online);
+    // #3565 — the daemon's own version, or "" while it has not reported one.
+    let version = a.reported_version().unwrap_or_default().to_string();
     DeviceRow {
         kind: "agent",
         id: a.id.map(|i| i.to_hex()).unwrap_or_default(),
@@ -403,7 +405,7 @@ pub(crate) fn agent_row(
         tags: a.tags,
         machine_id: a.machine_id,
         os: a.os,
-        version: a.agent_version,
+        version,
         status: a.status,
         presence,
         is_online,

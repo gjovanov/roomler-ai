@@ -557,7 +557,7 @@ pub async fn dispatch(
                     format!(
                         "device runs agent {} which predates Fleet RPC — update it to use \
                          the device console",
-                        agent.agent_version
+                        agent.reported_version().unwrap_or("(unknown version)")
                     ),
                 ),
                 Err(HubError::ExecTimeout(_)) => deny(

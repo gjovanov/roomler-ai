@@ -154,11 +154,7 @@ pub async fn join_org(
             "{} runs agent {} which predates remote org-join. Update the device \
              (or enroll it at the keyboard with `roomler enroll --label …`).",
             agent.name,
-            if agent.agent_version.is_empty() {
-                "(unknown version)"
-            } else {
-                &agent.agent_version
-            }
+            agent.reported_version().unwrap_or("(unknown version)")
         )));
     }
 
