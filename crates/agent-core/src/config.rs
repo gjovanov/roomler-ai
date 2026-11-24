@@ -3724,6 +3724,11 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     }
 }
 
+/// #4379 — scaffolding for the red tests: [`load`].
+pub fn load_without_restore(path: &PathBuf) -> Result<AgentConfig> {
+    load(path)
+}
+
 /// Read a config that is EXPECTED to be absent — a probe, not a load.
 ///
 /// FR-66. [`load`] is deliberately **not** a neutral reader: with no usable
@@ -8695,6 +8700,56 @@ tenant_id = "tid2"
             std::fs::read(&prev).unwrap(),
             copy,
             "the copy is not changed"
+        );
+    }
+
+    /// #4379 — [`load_without_restore`] loads the config as it is, and only
+    /// it. A config that does not parse, is all NUL or is missing is an error
+    /// beside a last good copy [`load`] restores (each case ends with that
+    /// restore, to show the copy is one): the copy is not read or written, no
+    /// live file is written, and the folder holds what it held. A config that
+    /// loads is what [`load`] gives.
+    #[test]
+    fn load_without_restore_never_reads_or_writes_the_prev() {
+        let copy = toml::to_string(&test_fixture()).unwrap();
+        let cases: [(&str, Option<Vec<u8>>); 3] = [
+            ("not TOML", Some(b"agent_token = \"broken\n".to_vec())),
+            ("all NUL", Some(vec![0u8; 64])),
+            ("missing", None),
+        ];
+        for (case, live) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            let prev = prev_path(&path);
+            std::fs::write(&prev, &copy).unwrap();
+            if let Some(bytes) = &live {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let names = || {
+                let mut names: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            };
+            let before = names();
+            let (_cap, _guard) = captured();
+            let err = load_without_restore(&path).expect_err(case);
+            assert_eq!(not_found(&err), live.is_none(), "{case}: {err:#}");
+            assert_eq!(std::fs::read(&path).ok(), live, "{case}: the live file");
+            assert_eq!(std::fs::read_to_string(&prev).unwrap(), copy, "{case}");
+            assert_eq!(names(), before, "{case}");
+            let restored = load(&path).expect("load restores the copy");
+            assert_eq!(restored.agent_token, test_fixture().agent_token, "{case}");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &copy).unwrap();
+        let loaded = load_without_restore(&path).expect("a config that loads");
+        assert_eq!(
+            toml::to_string(&loaded).unwrap(),
+            toml::to_string(&load(&path).unwrap()).unwrap()
         );
     }
 

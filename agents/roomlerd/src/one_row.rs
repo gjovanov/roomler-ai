@@ -1398,6 +1398,54 @@ async fn ask<H: Host>(
     reply
 }
 
+/// #4379 — the server and tenant of each enrollment `root`'s file holds: its
+/// primary when it holds one, and every `[[orgs]]` entry. What `blank-prev`
+/// is handed, and all of it: a `.prev` holds a moved enrollment when it holds
+/// one of these, as [`held_by`] tells a person's enrollment root holds.
+pub fn held_orgs(root: &AgentConfig) -> Vec<crate::one_row_home::HeldOrg> {
+    use crate::one_row_home::HeldOrg;
+    let primary = root.has_primary_enrollment().then(|| HeldOrg {
+        server_url: root.server_url.clone(),
+        tenant_id: root.tenant_id.clone(),
+    });
+    primary
+        .into_iter()
+        .chain(root.orgs.iter().map(|o| HeldOrg {
+            server_url: o.server_url.clone(),
+            tenant_id: o.tenant_id.clone(),
+        }))
+        .collect()
+}
+
+/// #4379 — whom the sweep asks, in uid order, and what each child is fed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sweep {
+    pub accounts: Vec<Account>,
+    pub stdin: Vec<u8>,
+}
+
+/// #4379 — scaffolding for the red tests: nothing to do.
+pub fn sweep_plan<H: Host>(host: &mut H) -> Option<Sweep> {
+    let _ = host;
+    None
+}
+
+/// #4379 — one `blank-prev` child per account of `sweep`, in its order, each
+/// with its one line ([`ask`]); a child that fails is that line, and the next
+/// person goes on.
+pub async fn sweep_run<H: Host>(host: &mut H, sweep: &Sweep) {
+    for account in &sweep.accounts {
+        let _ = ask(host, account, Verb::BlankPrev, &sweep.stdin).await;
+    }
+}
+
+/// #4379 — the sweep: [`sweep_plan`], then [`sweep_run`].
+pub async fn sweep<H: Host>(host: &mut H) {
+    if let Some(planned) = sweep_plan(host) {
+        sweep_run(host, &planned).await;
+    }
+}
+
 /// FR-147 — who is a person ("Which homes are people"): one `read` child per
 /// account [`accounts_to_ask`] names, in uid order, and a person is an
 /// account with a config, a plist or an old copy. Converting, a child that
@@ -4348,8 +4396,13 @@ mod tests {
         login_at: Option<(&'static str, usize, u32)>,
         /// #4184 — the people whose `convert` and `put-back` are done as
         /// `one_row_home` does them, on a home that also holds what this fake
-        /// does not: the config's `.prev`.
+        /// does not: the config's `.prev`. #4379: and `blank-prev`.
         real: BTreeMap<u32, crate::one_row_home::ChildHome>,
+        /// #4379 — how often `/Users` was read.
+        users_read: std::cell::Cell<usize>,
+        /// #4379 — what each child was fed: its uid, its verb's word, its
+        /// stdin.
+        fed: Vec<(u32, &'static str, Vec<u8>)>,
     }
 
     fn one_row_daemon(kicks: u32) -> NodeStatus {
@@ -4411,11 +4464,14 @@ mod tests {
                 stop_saves: HashMap::new(),
                 login_at: None,
                 real: BTreeMap::new(),
+                users_read: std::cell::Cell::new(0),
+                fed: Vec::new(),
             }
         }
 
         /// #4184 — `uid`'s `convert` and `put-back` done by `one_row_home`
-        /// itself, each on their files as they are then.
+        /// itself, each on their files as they are then. #4379: and
+        /// `blank-prev`.
         fn with_real_child(mut self, uid: u32) -> Self {
             let h = &self.homes[&uid];
             let home = crate::one_row_home::ChildHome::with(h.config.as_ref(), h.plist.as_ref());
@@ -4589,6 +4645,14 @@ mod tests {
                 }
                 // FR-151: the one-row move never asks it.
                 Verb::LiveWork => return Err(2),
+                // #4379 — this fake keeps no `.prev`: a home that holds one is
+                // a real child's (`with_real_child`).
+                Verb::BlankPrev => {
+                    reply.blank_prev = Some(crate::one_row_home::BlankPrevAnswer {
+                        found: false,
+                        sha256: None,
+                    });
+                }
             }
             Ok(())
         }
@@ -4653,10 +4717,16 @@ mod tests {
             Ok(())
         }
         fn users(&self) -> Vec<UsersEntry> {
+            self.users_read.set(self.users_read.get() + 1);
             self.homes
                 .keys()
                 .map(|uid| UsersEntry {
-                    name: self.accounts[uid].name.clone(),
+                    // #4379 — a home whose account is gone keeps its folder's
+                    // name.
+                    name: self
+                        .accounts
+                        .get(uid)
+                        .map_or_else(|| format!("gone-{uid}"), |a| a.name.clone()),
                     uid: *uid,
                     dev: 1,
                     ino: u64::from(*uid),
@@ -4737,6 +4807,7 @@ mod tests {
             stdin: &[u8],
         ) -> Result<ChildOutput> {
             self.calls.push(format!("{} {}", verb.word(), account.uid));
+            self.fed.push((account.uid, verb.word(), stdin.to_vec()));
             let script = self.scripts.get(&(account.uid, verb.word())).copied();
             let out = |code: Option<i32>, stdout: Vec<u8>| ChildOutput {
                 pid: 4242,
@@ -4753,7 +4824,7 @@ mod tests {
             }
             // #4184 — the verb as `one_row_home` does it, on the files as they
             // are now; what it leaves is the person's files from then on.
-            if matches!(verb, Verb::Convert { .. } | Verb::PutBack)
+            if matches!(verb, Verb::Convert { .. } | Verb::PutBack | Verb::BlankPrev)
                 && let Some(home) = self.real.get_mut(&account.uid)
             {
                 let h = self.homes.get_mut(&account.uid).unwrap();
@@ -4783,6 +4854,7 @@ mod tests {
                 put_back: None,
                 put_back_legacy: None,
                 live_work: None,
+                blank_prev: None,
             };
             if let Err(code) = self.act(account.uid, verb, stdin, &mut reply) {
                 return Ok(out(Some(code), Vec::new()));
@@ -7718,5 +7790,287 @@ mod tests {
         assert_eq!(calls_of(&mac, &["put-back"]), ["put-back 501"]);
         assert_eq!(mac.files(), before);
         assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4379 — casey (uid 501, at the console) and ana (502, not logged in)
+    /// converted, each person's own process doing the verbs as
+    /// `one_row_home` does them; then each `.prev` made what a conversion
+    /// before #4184 left there: their outgoing, enrolled config. The
+    /// outgoing bytes, by uid.
+    async fn converted_with_held_prevs() -> (Fake, BTreeMap<u32, (Vec<u8>, u32)>) {
+        let mut mac = Fake::new(one_row_daemon)
+            .with_ana()
+            .with_real_child(501)
+            .with_real_child(502);
+        let outgoing: BTreeMap<u32, (Vec<u8>, u32)> = mac
+            .homes
+            .iter()
+            .map(|(uid, h)| (*uid, h.config.clone().unwrap()))
+            .collect();
+        convert_now(&mut mac).await.unwrap();
+        for (uid, file) in &outgoing {
+            mac.real.get_mut(uid).unwrap().hold_prev(Some(file));
+        }
+        mac.calls.clear();
+        mac.said.clear();
+        mac.fed.clear();
+        mac.users_read.set(0);
+        (mac, outgoing)
+    }
+
+    /// `name`'s lines from their `blank-prev` child.
+    fn blank_prev_lines(mac: &Fake, name: &str) -> Vec<String> {
+        let start = format!("{name}'s one-row-home blank-prev: ");
+        mac.said
+            .iter()
+            .filter(|l| l.starts_with(&start))
+            .cloned()
+            .collect()
+    }
+
+    /// `uid`'s `.prev` is its config's bytes, and no load of the config, as
+    /// it is, removed, all NUL or not TOML, brings an enrollment back.
+    fn prev_is_the_config(mac: &Fake, uid: u32) {
+        let home = &mac.real[&uid];
+        let config = home.config().expect("the converted config");
+        assert_eq!(home.prev(), Some((config.0, 0o600)), "{uid}");
+        let dir = tempfile::tempdir().unwrap();
+        crate::one_row_home::assert_no_load_brings_an_enrollment_back(&home.on_disk(dir.path()));
+    }
+
+    /// #4379, cell 14 — a Mac with no conversion's records: the sweep reads
+    /// no `/Users`, starts no child and says nothing, even beside a `.prev`
+    /// that holds an enrollment root's file holds.
+    #[tokio::test]
+    async fn the_sweep_does_nothing_on_a_mac_with_no_records() {
+        let mut mac = Fake::new(one_row_daemon).with_ana().with_real_child(501);
+        let held = mac.homes[&501].config.clone();
+        mac.real.get_mut(&501).unwrap().hold_prev(held.as_ref());
+        let before = mac.files();
+        sweep(&mut mac).await;
+        assert_eq!(mac.users_read.get(), 0);
+        assert!(mac.calls.is_empty(), "{:?}", mac.calls);
+        assert!(mac.said.is_empty(), "{}", mac.said());
+        assert_eq!(mac.files(), before);
+        assert_eq!(mac.real[&501].prev(), held);
+    }
+
+    /// #4379, cell 15 — the sweep asks each person's own process, console
+    /// or not, in uid order: each `.prev` that holds the enrollments that
+    /// moved to root (a primary root's own retired, an org it moved) becomes
+    /// their converted config's bytes, with one line each that says whom it
+    /// ran as. The same where root kept a conversion's every record (this
+    /// release's) or its own kept copy alone (an older release's). Root's
+    /// files are not written, and `--revert` still gives each person's
+    /// config back from the records.
+    #[tokio::test]
+    async fn the_sweep_blanks_each_persons_held_prev_console_or_not() {
+        for records in ["every record", "root's kept copy only"] {
+            let (mut mac, outgoing) = converted_with_held_prevs().await;
+            if records == "root's kept copy only" {
+                mac.root
+                    .retain(|f, _| matches!(f, RootFile::Config | RootFile::Kept));
+            }
+            let root_before = mac.root.clone();
+            sweep(&mut mac).await;
+            assert_eq!(
+                calls_of(&mac, &["blank-prev"]),
+                ["blank-prev 501", "blank-prev 502"],
+                "{records}"
+            );
+            for uid in [501, 502] {
+                prev_is_the_config(&mac, uid);
+            }
+            for name in ["casey", "ana"] {
+                let lines = blank_prev_lines(&mac, name);
+                assert_eq!(lines.len(), 1, "{records}: {}", mac.said());
+                assert!(lines[0].contains(", exit 0, "), "{records}: {}", lines[0]);
+                assert!(
+                    lines[0].contains("it ran as uid="),
+                    "{records}: {}",
+                    lines[0]
+                );
+            }
+            assert_eq!(mac.root, root_before, "{records}: root's files");
+            if records == "every record" {
+                revert_now(&mut mac).await.unwrap();
+                for uid in [501, 502] {
+                    assert_eq!(mac.real[&uid].config(), Some(outgoing[&uid].clone()));
+                }
+            }
+        }
+    }
+
+    /// #4379, cell 16 — each child is fed the server and tenant of every
+    /// enrollment root's file holds after the conversion (its primary, its
+    /// own org, the org it moved), and nothing else: no token, agent id or
+    /// key of root's or of the person's. Its command line is the one every
+    /// child of a person's has.
+    #[tokio::test]
+    async fn the_sweep_hands_the_child_root_orgs_and_no_secret() {
+        let (mut mac, outgoing) = converted_with_held_prevs().await;
+        sweep(&mut mac).await;
+        let root = mac.root_cfg();
+        let mut secrets: Vec<String> = vec![
+            root.agent_token.clone(),
+            root.agent_id.clone(),
+            "user-token".to_string(),
+            "user-1".to_string(),
+            "wg-user".to_string(),
+            "ana-token".to_string(),
+            "user-9".to_string(),
+        ];
+        secrets.extend(root.overlay_wg_secret_key.clone());
+        for o in &root.orgs {
+            secrets.extend([o.agent_token.clone(), o.agent_id.clone()]);
+            secrets.extend(o.overlay_wg_secret_key.clone());
+        }
+        let fed: Vec<&(u32, &str, Vec<u8>)> = mac
+            .fed
+            .iter()
+            .filter(|(_, verb, _)| *verb == "blank-prev")
+            .collect();
+        assert_eq!(fed.len(), 2, "{:?}", mac.calls);
+        for (uid, _, stdin) in fed {
+            let held: crate::one_row_home::HeldOrgs = serde_json::from_slice(stdin).unwrap();
+            assert_eq!(held.v, crate::one_row_home::FORMAT);
+            let pairs: Vec<(&str, &str)> = held
+                .orgs
+                .iter()
+                .map(|o| (o.server_url.as_str(), o.tenant_id.as_str()))
+                .collect();
+            assert_eq!(pairs, [(SERVER, "t1"), (SERVER, "t3"), (SERVER, "t2")]);
+            let text = String::from_utf8(stdin.clone()).unwrap();
+            for secret in secrets.iter().filter(|s| !s.is_empty()) {
+                assert!(!text.contains(secret.as_str()), "{secret} in {text}");
+            }
+            let account = mac.accounts[uid].clone();
+            assert_eq!(
+                spawn_plan(&account, Verb::BlankPrev).args,
+                crate::one_row_home::child_args(*uid, account.gid, Verb::BlankPrev)
+            );
+            assert!(outgoing.contains_key(uid));
+        }
+    }
+
+    /// #4379, cell 17 — a revert that put casey's enrolled config back and
+    /// stopped before its records went: the sweep runs, and casey's own
+    /// process leaves the config and its `.prev` byte for byte, and names
+    /// both. The person's live config is theirs to change.
+    #[tokio::test]
+    async fn the_sweep_leaves_a_person_a_revert_put_back() {
+        let (mut mac, outgoing) = converted_with_held_prevs().await;
+        let kept = mac.root[&RootFile::Kept].clone();
+        mac.root.insert(RootFile::Config, kept);
+        let plist = mac.homes[&501].plist.clone();
+        mac.homes.get_mut(&501).unwrap().config = Some(outgoing[&501].clone());
+        mac.real
+            .get_mut(&501)
+            .unwrap()
+            .hold(Some(&outgoing[&501]), plist.as_ref());
+        sweep(&mut mac).await;
+        let home = &mac.real[&501];
+        assert_eq!(home.config(), Some(outgoing[&501].clone()));
+        assert_eq!(home.prev(), Some(outgoing[&501].clone()));
+        let lines = blank_prev_lines(&mac, "casey");
+        assert_eq!(lines.len(), 1, "{}", mac.said());
+        assert!(
+            lines[0].contains("are left as they are") && lines[0].contains("config.toml.prev"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    /// #4379, cell 18 — a child of casey's that fails (exit 1, not started, a
+    /// reply that does not parse, stopped at its deadline, a folder it may
+    /// not write) is its one line, asked once, and ana's own process goes on.
+    #[tokio::test]
+    async fn a_failed_child_is_one_line_and_the_next_person_goes_on() {
+        let cases: [(&str, Option<Script>); 5] = [
+            ("exit 1", Some(Script::Exit(1))),
+            ("not started", Some(Script::NotRun)),
+            ("garbage", Some(Script::Garbage)),
+            ("its deadline", Some(Script::StoppedAfterActing)),
+            ("a folder it may not write", None),
+        ];
+        for (case, script) in cases {
+            let (mut mac, _) = converted_with_held_prevs().await;
+            match script {
+                Some(script) => {
+                    mac.scripts.insert((501, "blank-prev"), script);
+                }
+                None => mac.real.get_mut(&501).unwrap().folder_not_writable(),
+            }
+            sweep(&mut mac).await;
+            assert_eq!(
+                calls_of(&mac, &["blank-prev"]),
+                ["blank-prev 501", "blank-prev 502"],
+                "{case}"
+            );
+            assert_eq!(
+                blank_prev_lines(&mac, "casey").len(),
+                1,
+                "{case}: {}",
+                mac.said()
+            );
+            prev_is_the_config(&mac, 502);
+            assert_eq!(
+                blank_prev_lines(&mac, "ana").len(),
+                1,
+                "{case}: {}",
+                mac.said()
+            );
+        }
+    }
+
+    /// #4379, cell 19 — a home whose account is gone: no child of that uid,
+    /// and its `.prev` is left as it is.
+    #[tokio::test]
+    async fn the_sweep_asks_no_uid_without_an_account() {
+        let (mut mac, outgoing) = converted_with_held_prevs().await;
+        mac.accounts.remove(&502);
+        sweep(&mut mac).await;
+        assert_eq!(calls_of(&mac, &["blank-prev"]), ["blank-prev 501"]);
+        prev_is_the_config(&mac, 501);
+        assert_eq!(mac.real[&502].prev(), Some(outgoing[&502].clone()));
+    }
+
+    /// #4379, cell 20 — one row turned off by hand in root's file: the
+    /// conversion's records stay, and so does the sweep.
+    #[tokio::test]
+    async fn the_sweep_runs_with_one_row_turned_off_by_hand() {
+        let (mut mac, _) = converted_with_held_prevs().await;
+        let mut root = mac.root_cfg();
+        root.macos_one_row = false;
+        mac.root.insert(RootFile::Config, toml_of(&root));
+        sweep(&mut mac).await;
+        assert_eq!(
+            calls_of(&mac, &["blank-prev"]),
+            ["blank-prev 501", "blank-prev 502"]
+        );
+        for uid in [501, 502] {
+            prev_is_the_config(&mac, uid);
+        }
+    }
+
+    /// #4379, cell 21 — after a revert that finished, root's tree holds no
+    /// record: the sweep reads no `/Users`, starts no child, says nothing and
+    /// changes nothing.
+    #[tokio::test]
+    async fn the_sweep_after_a_finished_revert_does_nothing() {
+        let (mut mac, _) = converted_with_held_prevs().await;
+        revert_now(&mut mac).await.unwrap();
+        mac.calls.clear();
+        mac.said.clear();
+        mac.users_read.set(0);
+        let before = mac.files();
+        let prevs: Vec<_> = [501, 502].map(|uid| mac.real[&uid].prev()).into();
+        sweep(&mut mac).await;
+        assert_eq!(mac.users_read.get(), 0);
+        assert!(mac.calls.is_empty(), "{:?}", mac.calls);
+        assert!(mac.said.is_empty(), "{}", mac.said());
+        assert_eq!(mac.files(), before);
+        let after: Vec<_> = [501, 502].map(|uid| mac.real[&uid].prev()).into();
+        assert_eq!(after, prevs);
     }
 }

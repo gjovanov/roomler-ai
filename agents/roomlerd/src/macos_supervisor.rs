@@ -3805,20 +3805,26 @@ mod tests {
         );
     }
 
-    /// #4071 — after fast exits of 78 the give-up says for certain that the
-    /// console user has no enrollment on this Mac, and what ends it. Every other
-    /// end reads as before, and so do the two readings that come first: a
-    /// one-row worker holds no enrollment, so it cannot miss one, and a folder
-    /// another account owns is the cause whatever the exit.
+    /// #4071 — after fast exits of 78 the give-up says for certain what the
+    /// worker found, and what ends it. #4379: either of the two ends that exit
+    /// 78, no enrollment or a config that does not load (this worker no longer
+    /// restores its last good copy), and where the worker's own line says
+    /// which. Every other end reads as before, and so do the two readings
+    /// that come first: a one-row worker holds no enrollment, so it cannot
+    /// miss one, and a folder another account owns is the cause whatever the
+    /// exit.
     #[test]
     fn the_give_up_after_exit_78_names_the_missing_enrollment_for_certain() {
         let no_enrollment = Some(WorkerEnd::Code(78));
         assert_eq!(
             gave_up_reason(no_enrollment, false, None),
-            "each worker exited 78: the console user has no enrollment on this Mac. The \
-             worker runs AS the console user, loads THAT user's config, and found none. That \
-             is the Mac's state, not a fault, so no crash is recorded for it. It ends once \
-             that user enrolls: roomlerd enroll, run as them"
+            "each worker exited 78: the console user has no enrollment on this Mac, or their \
+             config does not load and this worker no longer restores its last good copy. The \
+             worker runs AS the console user and loads THAT user's config; its own line says \
+             which, in its log under the console user's Library/Application \
+             Support/live.roomler.roomler/logs. That is the Mac's state, not a fault, so no \
+             crash is recorded for it. It ends once that user enrolls (roomlerd enroll, run as \
+             them) or their config loads again"
         );
         let other = Some(WorkerEnd::Code(1));
         assert_eq!(

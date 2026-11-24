@@ -92,6 +92,29 @@ pub(super) fn of(path: &Path, unenrolled: bool, supervision: Supervision) -> AtS
     })
 }
 
+/// #4379 — scaffolding for the red tests: every run restores.
+pub(super) fn restores_a_config_that_does_not_load(
+    unenrolled: bool,
+    supervision: Supervision,
+) -> bool {
+    let _ = (unenrolled, supervision);
+    true
+}
+
+/// #4379 — scaffolding for the red tests: the base's load.
+pub(super) fn load(
+    path: &Path,
+    unenrolled: bool,
+    supervision: Supervision,
+) -> anyhow::Result<config::AgentConfig> {
+    use anyhow::Context as _;
+    let path = path.to_path_buf();
+    if restores_a_config_that_does_not_load(unenrolled, supervision) {
+        return config::load(&path).context("loading config");
+    }
+    config::load_without_restore(&path).context("loading config")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +239,50 @@ mod tests {
             Supervision::None,
         ] {
             assert!(may_restore(supervision), "{supervision:?}");
+        }
+    }
+
+    /// Every supervision a run can be under.
+    fn every_supervision() -> [Supervision; 7] {
+        [
+            Supervision::WindowsScm,
+            Supervision::WindowsTask,
+            Supervision::Systemd(SystemdUnit {
+                name: "roomlerd.service",
+                user: false,
+            }),
+            Supervision::Systemd(SystemdUnit {
+                name: "roomler.service",
+                user: true,
+            }),
+            Supervision::Launchd,
+            Supervision::MacosSupervisor,
+            Supervision::None,
+        ]
+    }
+
+    /// #4379, cell 22 — only the enrolled worker FR-43's macOS supervisor
+    /// starts never restores a config that is there and does not load: on a
+    /// Mac converted to one row its last good copy can hold an enrollment that
+    /// moved to root. Every other run restores it, as before, the worker with
+    /// no enrollment among them (its screen needs a config that loads), and
+    /// its missing config's decision is [`may_restore`]'s, as before.
+    #[test]
+    fn only_the_supervisors_enrolled_worker_never_restores_a_config_that_does_not_load() {
+        for supervision in every_supervision() {
+            for unenrolled in [false, true] {
+                let enrolled_worker = supervision == Supervision::MacosSupervisor && !unenrolled;
+                assert_eq!(
+                    restores_a_config_that_does_not_load(unenrolled, supervision),
+                    !enrolled_worker,
+                    "{supervision:?} unenrolled={unenrolled}"
+                );
+            }
+            assert_eq!(
+                may_restore(supervision),
+                supervision != Supervision::MacosSupervisor,
+                "{supervision:?}"
+            );
         }
     }
 

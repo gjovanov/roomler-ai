@@ -164,7 +164,7 @@ impl Expect {
     }
 }
 
-/// The five verbs.
+/// The six verbs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
     Read,
@@ -177,6 +177,9 @@ pub enum Verb {
     /// FR-151 — the root update helper's read of the person's half: the
     /// person's own daemon's `live_work`, over the person's own socket.
     LiveWork,
+    /// #4379 — the root daemon's sweep: the config's `.prev`, when it holds
+    /// an enrollment root's file holds, replaced ([`HeldOrgs`] on stdin).
+    BlankPrev,
 }
 
 impl Verb {
@@ -187,6 +190,7 @@ impl Verb {
             Verb::PutBack => "put-back",
             Verb::PutBackLegacy => "put-back-legacy",
             Verb::LiveWork => "live-work",
+            Verb::BlankPrev => "blank-prev",
         }
     }
 }
@@ -288,6 +292,7 @@ fn verb(args: &[String]) -> Result<Verb, String> {
         "put-back" => (Verb::PutBack, &[]),
         "put-back-legacy" => (Verb::PutBackLegacy, &[]),
         "live-work" => (Verb::LiveWork, &[]),
+        "blank-prev" => (Verb::BlankPrev, &[]),
         _ => return Err(format!("`{word}` is not a verb of {VERB}")),
     };
     for (name, _) in &pairs {
@@ -327,6 +332,10 @@ fn identity_refusal(me: &Creds, uid: u32, gid: u32) -> Option<String> {
 /// The process the child is: its credentials, stdin, and the account
 /// database.
 pub trait Me {
+    /// #4379 — this process ends once `deadline` has passed, whatever it is
+    /// doing then: root's own deadline for it, so a child root no longer waits
+    /// for (a daemon that stopped) still ends by then.
+    fn end_by(&mut self, deadline: std::time::Duration);
     /// `umask(0o077)`.
     fn umask_private(&mut self);
     /// Real and effective uid and gid, and the kernel's group list.
@@ -554,6 +563,9 @@ pub struct Reply {
     /// FR-151.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_work: Option<LiveWorkAnswer>,
+    /// #4379.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blank_prev: Option<BlankPrevAnswer>,
 }
 
 impl Reply {
@@ -591,6 +603,7 @@ impl Reply {
                 matches!(verb, Verb::PutBackLegacy),
             ),
             (reply.live_work.is_some(), matches!(verb, Verb::LiveWork)),
+            (reply.blank_prev.is_some(), matches!(verb, Verb::BlankPrev)),
         ];
         if answers.iter().any(|(has, wanted)| has != wanted) {
             return Err(format!("the reply does not answer `{}` alone", verb.word()));
@@ -692,6 +705,35 @@ pub struct ConvertAnswer {
 pub struct PutBackAnswer {
     pub config_sha256: Option<String>,
     pub plist_sha256: Option<String>,
+}
+
+/// #4379 — `blank-prev`'s stdin: the server and tenant of each enrollment
+/// root's file holds (`one_row::held_orgs`). No token, agent id or key: the
+/// child matches a `.prev`'s enrollments by these two alone, as the
+/// conversion's own test does (`one_row::held_by`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldOrgs {
+    pub v: u32,
+    pub orgs: Vec<HeldOrg>,
+}
+
+/// #4379 — one enrollment root's file holds, by its server and tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldOrg {
+    pub server_url: String,
+    pub tenant_id: String,
+}
+
+/// #4379 — `blank-prev`'s answer: whether the config's `.prev` held an
+/// enrollment root's file holds, and the sha256 of the `.prev` it wrote in
+/// its place (`None`: it wrote none).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlankPrevAnswer {
+    pub found: bool,
+    pub sha256: Option<String>,
 }
 
 /// `put-back`'s stdin: what root kept of each file, and its mode then.
@@ -833,6 +875,7 @@ impl Outcome {
             put_back: None,
             put_back_legacy: None,
             live_work: None,
+            blank_prev: None,
         };
         match answer {
             Answer::Read(a) => reply.read = Some(*a),
@@ -840,6 +883,7 @@ impl Outcome {
             Answer::PutBack(a) => reply.put_back = Some(a),
             Answer::PutBackLegacy(a) => reply.put_back_legacy = Some(a),
             Answer::LiveWork(a) => reply.live_work = Some(a),
+            Answer::BlankPrev(a) => reply.blank_prev = Some(a),
         }
         match serde_json::to_vec(&reply) {
             Ok(mut stdout) => {
@@ -872,6 +916,7 @@ enum Answer {
     PutBack(PutBackAnswer),
     PutBackLegacy(Legacy),
     LiveWork(LiveWorkAnswer),
+    BlankPrev(BlankPrevAnswer),
 }
 
 /// The child: its check of itself, then the verb. `args` is what follows
@@ -931,7 +976,7 @@ fn run(args: &[OsString], me: &mut impl Me, fs: &mut impl Fs) -> Outcome {
         return Outcome::reply(&creds, Answer::LiveWork(me.live_work()));
     }
     let stdin = match verb {
-        Verb::PutBack => match me.stdin(STDIN_BOUND) {
+        Verb::PutBack | Verb::BlankPrev => match me.stdin(STDIN_BOUND) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 return Outcome::failed(Fail::Error(format!(
@@ -961,6 +1006,7 @@ fn answer(verb: Verb, home: &Path, me: &Creds, stdin: &[u8], fs: &mut impl Fs) -
         Verb::PutBackLegacy => put_back_legacy(&at, fs).map(Answer::PutBackLegacy),
         // `run` answers it before the home is looked at.
         Verb::LiveWork => Err(Fail::Error("live-work is answered before the home".into())),
+        Verb::BlankPrev => blank_prev(&at, stdin, fs, &mut said).map(Answer::BlankPrev),
     };
     match answered {
         Ok(answer) => Outcome::reply(me, answer).saying(&said),
@@ -1195,6 +1241,20 @@ fn convert(
     })
 }
 
+/// #4379 — scaffolding for the red tests: answers, and changes nothing.
+fn blank_prev(
+    at: &Places,
+    stdin: &[u8],
+    fs: &mut impl Fs,
+    said: &mut Vec<String>,
+) -> Result<BlankPrevAnswer, Fail> {
+    let _ = (at, stdin, fs, said);
+    Ok(BlankPrevAnswer {
+        found: false,
+        sha256: None,
+    })
+}
+
 /// Each folder of `chain`, outermost first, made with its mode where it is
 /// missing; the last one must be writable.
 fn make_dirs(fs: &mut impl Fs, chain: &[(&Path, u32)]) -> Result<(), Fail> {
@@ -1367,6 +1427,19 @@ pub struct RealMe;
 
 #[cfg(unix)]
 impl Me for RealMe {
+    fn end_by(&mut self, deadline: std::time::Duration) {
+        // Whole seconds, rounded up: never before root's own deadline.
+        let secs = deadline.as_secs() + u64::from(deadline.subsec_nanos() > 0);
+        let secs = libc::c_uint::try_from(secs).unwrap_or(libc::c_uint::MAX);
+        // SAFETY: SIGALRM's default action, which ends the process (an ignored
+        // one is kept across the exec that started it), then its timer.
+        // Neither call touches memory.
+        unsafe {
+            libc::signal(libc::SIGALRM, libc::SIG_DFL);
+            libc::alarm(secs);
+        }
+    }
+
     fn umask_private(&mut self) {
         // SAFETY: sets this process's file creation mask; no memory is involved.
         unsafe { libc::umask(0o077) };
@@ -1751,6 +1824,14 @@ mod tests {
     }
 
     impl Me for FakeMe {
+        fn end_by(&mut self, deadline: std::time::Duration) {
+            assert_eq!(
+                deadline,
+                crate::one_row::CHILD_DEADLINE,
+                "root's own deadline"
+            );
+            self.asked.borrow_mut().push("deadline");
+        }
         fn umask_private(&mut self) {
             self.asked.borrow_mut().push("umask");
         }
@@ -2004,6 +2085,7 @@ mod tests {
             },
             Verb::PutBack,
             Verb::PutBackLegacy,
+            Verb::BlankPrev,
         ] {
             let args = child_args(UID, GID, verb);
             assert_eq!(args[0], VERB);
@@ -2015,11 +2097,37 @@ mod tests {
             );
             assert_eq!(super::verb(after), Ok(verb));
         }
+        // #4379 — `blank-prev` takes the ids and the version alone: what it
+        // matches comes on stdin, and no token, agent id or org is on a
+        // command line another account can read.
+        assert_eq!(
+            child_args(UID, GID, Verb::BlankPrev),
+            [
+                "one-row-home",
+                "blank-prev",
+                "--uid",
+                "501",
+                "--gid",
+                "20",
+                "--version",
+                VERSION
+            ]
+        );
+        for word in ["blank", "blank-prev-x", "Blank-Prev", "blank_prev"] {
+            let args = [word.to_string()];
+            assert!(super::verb(&args).is_err(), "{word}");
+        }
+        let mut extra = child_args(UID, GID, Verb::BlankPrev)[1..].to_vec();
+        extra.extend(["--org".to_string(), "t-1".to_string()]);
+        assert_eq!(
+            super::verb(&extra),
+            Err("blank-prev takes no --org".to_string())
+        );
     }
 
-    /// Steps 1 to 3: the umask before anything, the kernel's word before any
-    /// argument, and each way of not being exactly the account root named is
-    /// exit 2 with nothing read.
+    /// Steps 0 to 3: its deadline first (#4379), the umask before anything
+    /// else, the kernel's word before any argument, and each way of not being
+    /// exactly the account root named is exit 2 with nothing read.
     #[test]
     fn child_refuses_an_identity_it_was_not_given() {
         let other_groups = |groups: Vec<u32>| Creds { groups, ..creds() };
@@ -2080,7 +2188,7 @@ mod tests {
                 "{case}: {:?}",
                 fs.calls.borrow()
             );
-            assert_eq!(*me.asked.borrow(), ["umask", "creds"], "{case}");
+            assert_eq!(*me.asked.borrow(), ["deadline", "umask", "creds"], "{case}");
         }
     }
 
@@ -2096,7 +2204,7 @@ mod tests {
         assert_eq!(out.exit, Exit::Refused, "{}", out.stderr);
         assert!(out.stderr.contains("version 0.4.1"), "{}", out.stderr);
         assert!(fs.calls.borrow().is_empty());
-        assert_eq!(*me.asked.borrow(), ["umask", "creds", "root"]);
+        assert_eq!(*me.asked.borrow(), ["deadline", "umask", "creds", "root"]);
 
         let mut me = FakeMe {
             root_refused: false,
@@ -2104,7 +2212,7 @@ mod tests {
         };
         let out = run_with(line(Verb::Read), &mut me, &mut fs);
         assert_eq!(out.exit, Exit::Refused, "could become root again");
-        assert_eq!(*me.asked.borrow(), ["umask", "creds", "root"]);
+        assert_eq!(*me.asked.borrow(), ["deadline", "umask", "creds", "root"]);
 
         let mut me = FakeMe {
             home: None,
@@ -2112,7 +2220,10 @@ mod tests {
         };
         let out = run_with(line(Verb::Read), &mut me, &mut fs);
         assert_eq!(out.exit, Exit::Refused, "no home in the database");
-        assert_eq!(*me.asked.borrow(), ["umask", "creds", "root", "home"]);
+        assert_eq!(
+            *me.asked.borrow(),
+            ["deadline", "umask", "creds", "root", "home"]
+        );
         assert!(fs.calls.borrow().is_empty());
     }
 
@@ -2514,6 +2625,492 @@ mod tests {
         );
     }
 
+    /// #4379 — the server and tenant of each enrollment root's file holds
+    /// after a conversion of [`ENROLLED`] and [`org`]`("other", …, "t-2")`:
+    /// its own primary, which retired the person's, and the org it moved.
+    const ROOT_HOLDS: [(&str, &str); 2] = [
+        ("https://roomler.example", "t-1"),
+        ("https://roomler.example", "t-2"),
+    ];
+
+    /// `blank-prev`'s stdin for root's set `orgs`.
+    fn root_holds(orgs: &[(&str, &str)]) -> Vec<u8> {
+        serde_json::to_vec(&HeldOrgs {
+            v: FORMAT,
+            orgs: orgs
+                .iter()
+                .map(|(server_url, tenant_id)| HeldOrg {
+                    server_url: server_url.to_string(),
+                    tenant_id: tenant_id.to_string(),
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    /// An `[[orgs]]` entry `label`, for `tenant` on `server`.
+    fn org(label: &str, server: &str, tenant: &str) -> String {
+        format!(
+            "\n[[orgs]]\nlabel = \"{label}\"\nserver_url = \"{server}\"\n\
+             agent_token = \"tok-{label}\"\nagent_id = \"a-{label}\"\ntenant_id = \"{tenant}\"\n"
+        )
+    }
+
+    /// What `convert` makes of `text`: every other key kept, no enrollment.
+    fn converted(text: &str) -> String {
+        let cfg = crate::config::parse_text(text, "the outgoing config").unwrap();
+        crate::config::serialise_over(&without_enrollments(&cfg), text, Path::new(CONFIG))
+            .unwrap()
+            .0
+    }
+
+    /// `blank-prev` on `fs`'s home, root's set `orgs` on its stdin.
+    fn blank_prev_with(fs: &mut FakeFs, at: &Places, orgs: &[(&str, &str)]) -> Outcome {
+        answer(Verb::BlankPrev, &at.home, &creds(), &root_holds(orgs), fs)
+    }
+
+    /// Its reply's answer.
+    fn blank_prev_answer(out: &Outcome) -> BlankPrevAnswer {
+        Reply::parse(&out.stdout, UID, GID, Verb::BlankPrev)
+            .expect("its reply")
+            .blank_prev
+            .expect("blank-prev's answer")
+    }
+
+    /// The person's outgoing config, as an older release's conversion kept
+    /// it as the `.prev`: the primary root retired, and the org it moved.
+    fn outgoing() -> String {
+        format!(
+            "{ENROLLED}{}",
+            org("other", "https://roomler.example", "t-2")
+        )
+    }
+
+    /// #4379, cell 1 — a `.prev` that holds an enrollment root's file holds,
+    /// beside a converted config: replaced by the config's own bytes, 0600, in
+    /// one write, whether it holds the retired primary, the moved org or
+    /// both. The config is not written.
+    #[test]
+    fn blank_prev_replaces_a_held_prev_with_the_config_0600() {
+        let only_org = converted(ENROLLED) + &org("other", "https://roomler.example", "t-2");
+        for (case, held) in [
+            ("both", outgoing()),
+            ("the retired primary", ENROLLED.to_string()),
+            ("the moved org", only_org),
+        ] {
+            let (mut fs, at) = a_home();
+            let config = converted(&outgoing());
+            fs.file(&at.config, config.as_bytes(), 0o600);
+            let prev = crate::config::prev_path(&at.config);
+            fs.file(&prev, held.as_bytes(), 0o640);
+            fs.calls.borrow_mut().clear();
+            let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+            assert_eq!(out.exit, Exit::Done, "{case}: {}", out.stderr);
+            assert_eq!(
+                blank_prev_answer(&out),
+                BlankPrevAnswer {
+                    found: true,
+                    sha256: Some(sha256_hex(config.as_bytes())),
+                },
+                "{case}"
+            );
+            assert_eq!(fs.nodes[&prev].bytes, config.as_bytes(), "{case}");
+            assert_eq!(fs.nodes[&prev].mode, 0o600, "{case}");
+            assert_eq!(fs.nodes[&at.config].bytes, config.as_bytes(), "{case}");
+            assert_eq!(
+                fs.changes(),
+                [format!("write {} 600", prev.display())],
+                "{case}"
+            );
+        }
+    }
+
+    /// #4379, cell 2 — a `.prev` whose enrollments root's file does not hold,
+    /// by server and tenant together, is left byte for byte.
+    #[test]
+    fn blank_prev_leaves_a_prev_whose_org_root_does_not_hold() {
+        let cases: [(&str, &[(&str, &str)]); 4] = [
+            (
+                "another server",
+                &[
+                    ("https://other.example", "t-1"),
+                    ("https://other.example", "t-2"),
+                ],
+            ),
+            (
+                "the same server, another tenant",
+                &[("https://roomler.example", "t-9")],
+            ),
+            (
+                "the same tenant, another server",
+                &[("https://other.example", "t-1")],
+            ),
+            ("root holds none", &[]),
+        ];
+        for (case, orgs) in cases {
+            let (mut fs, at) = a_home();
+            let config = converted(&outgoing());
+            fs.file(&at.config, config.as_bytes(), 0o600);
+            let prev = crate::config::prev_path(&at.config);
+            fs.file(&prev, outgoing().as_bytes(), 0o600);
+            fs.calls.borrow_mut().clear();
+            let out = blank_prev_with(&mut fs, &at, orgs);
+            assert_eq!(out.exit, Exit::Done, "{case}: {}", out.stderr);
+            assert_eq!(
+                blank_prev_answer(&out),
+                BlankPrevAnswer {
+                    found: false,
+                    sha256: None
+                },
+                "{case}"
+            );
+            assert_eq!(fs.nodes[&prev].bytes, outgoing().as_bytes(), "{case}");
+            assert!(fs.changes().is_empty(), "{case}: {:?}", fs.changes());
+        }
+    }
+
+    /// #4379, cell 3 — a `.prev` no load restores is left byte for byte, as
+    /// whatever it is: not TOML, all NUL, not UTF-8, a folder, a link, or a
+    /// file the person may not read.
+    #[test]
+    fn blank_prev_leaves_a_prev_that_does_not_parse() {
+        for case in [
+            "not TOML",
+            "all NUL",
+            "not UTF-8",
+            "a folder",
+            "a link",
+            "unreadable",
+        ] {
+            let (mut fs, at) = a_home();
+            fs.file(&at.config, converted(ENROLLED).as_bytes(), 0o600);
+            let prev = crate::config::prev_path(&at.config);
+            let not_utf8 = [ENROLLED.as_bytes(), &[0xff, 0xfe]].concat();
+            match case {
+                "not TOML" => fs.file(
+                    &prev,
+                    b"agent_token = \"tok-person\"\nserver_url = [",
+                    0o600,
+                ),
+                "all NUL" => fs.file(&prev, &vec![0; ENROLLED.len()], 0o600),
+                "not UTF-8" => fs.file(&prev, &not_utf8, 0o600),
+                "a folder" => fs.dir(&prev, UID, 0o700, true),
+                "a link" => fs.put(&prev, Kind::Link, UID, 0o777, Vec::new(), true),
+                _ => {
+                    fs.file(&prev, ENROLLED.as_bytes(), 0o200);
+                    fs.nodes.get_mut(&prev).unwrap().readable = false;
+                }
+            }
+            let before = (fs.nodes[&prev].kind, fs.nodes[&prev].bytes.clone());
+            fs.calls.borrow_mut().clear();
+            let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+            assert_eq!(out.exit, Exit::Done, "{case}: {}", out.stderr);
+            assert!(!blank_prev_answer(&out).found, "{case}");
+            assert_eq!(
+                (fs.nodes[&prev].kind, fs.nodes[&prev].bytes.clone()),
+                before,
+                "{case}"
+            );
+            assert!(fs.changes().is_empty(), "{case}: {:?}", fs.changes());
+        }
+    }
+
+    /// #4379, cell 4 — beside no config (the person's daemon has not written
+    /// its own yet), a held `.prev` becomes its own settings with no
+    /// enrollment, as `convert` makes them: a knob and a key this build does
+    /// not know are kept. No config is written.
+    #[test]
+    fn blank_prev_beside_a_missing_config_keeps_its_settings_and_no_enrollment() {
+        let (mut fs, at) = a_home();
+        fs.nodes.remove(&at.config);
+        let prev = crate::config::prev_path(&at.config);
+        let held = format!(
+            "{ENROLLED}auto_update = false\na_key_from_a_newer_build = 1\n{}",
+            org("other", "https://roomler.example", "t-2")
+        );
+        fs.file(&prev, held.as_bytes(), 0o600);
+        fs.calls.borrow_mut().clear();
+        let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+        assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+        let written = String::from_utf8(fs.nodes[&prev].bytes.clone()).unwrap();
+        assert_eq!(
+            blank_prev_answer(&out),
+            BlankPrevAnswer {
+                found: true,
+                sha256: Some(sha256_hex(written.as_bytes())),
+            }
+        );
+        let cfg = crate::config::parse_text(&written, "the new .prev").unwrap();
+        assert!(!enrolled(&cfg), "{written}");
+        assert_eq!(cfg.auto_update, Some(false), "{written}");
+        assert_eq!(cfg.machine_name, "Mac", "{written}");
+        assert!(
+            written.contains("a_key_from_a_newer_build = 1"),
+            "{written}"
+        );
+        assert_eq!(written, converted(&held), "as convert makes it");
+        assert_eq!(fs.nodes[&prev].mode, 0o600);
+        assert!(!fs.nodes.contains_key(&at.config), "no config is written");
+        assert_eq!(fs.changes(), [format!("write {} 600", prev.display())]);
+    }
+
+    /// #4379, cell 5 — beside a config that does not load (a load would
+    /// restore the `.prev`), a held `.prev` becomes its own settings with no
+    /// enrollment, and the config is left byte for byte, whatever is wrong
+    /// with it.
+    #[test]
+    fn blank_prev_beside_a_config_that_does_not_load_leaves_that_config() {
+        for case in ["not TOML", "all NUL", "not UTF-8", "unreadable", "a folder"] {
+            let (mut fs, at) = a_home();
+            match case {
+                "not TOML" => fs.file(&at.config, b"not = [toml", 0o600),
+                "all NUL" => fs.file(&at.config, &[0; 64], 0o600),
+                "not UTF-8" => fs.file(&at.config, &[0xff, 0xfe], 0o600),
+                "unreadable" => {
+                    fs.file(&at.config, b"auto_update = true\n", 0o200);
+                    fs.nodes.get_mut(&at.config).unwrap().readable = false;
+                }
+                _ => fs.dir(&at.config, UID, 0o700, true),
+            }
+            let config_before = (
+                fs.nodes[&at.config].kind,
+                fs.nodes[&at.config].bytes.clone(),
+            );
+            let prev = crate::config::prev_path(&at.config);
+            fs.file(&prev, outgoing().as_bytes(), 0o600);
+            fs.calls.borrow_mut().clear();
+            let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+            assert_eq!(out.exit, Exit::Done, "{case}: {}", out.stderr);
+            let written = fs.nodes[&prev].bytes.clone();
+            assert_eq!(written, converted(&outgoing()).as_bytes(), "{case}");
+            assert_eq!(
+                blank_prev_answer(&out),
+                BlankPrevAnswer {
+                    found: true,
+                    sha256: Some(sha256_hex(&written)),
+                },
+                "{case}"
+            );
+            assert_eq!(
+                (
+                    fs.nodes[&at.config].kind,
+                    fs.nodes[&at.config].bytes.clone()
+                ),
+                config_before,
+                "{case}: the config as it was"
+            );
+            assert_eq!(
+                fs.changes(),
+                [format!("write {} 600", prev.display())],
+                "{case}"
+            );
+        }
+    }
+
+    /// #4379, cell 6 — a config that holds an enrollment root's file holds
+    /// (a revert's put-back, or an earlier restore) is the person's live
+    /// state: both files are left byte for byte, and the line names both.
+    #[test]
+    fn blank_prev_leaves_both_files_when_the_config_holds_a_held_enrollment() {
+        let config_org = converted(ENROLLED) + &org("other", "https://roomler.example", "t-2");
+        for (case, config) in [
+            ("its primary", ENROLLED.to_string()),
+            ("an org", config_org),
+        ] {
+            let (mut fs, at) = a_home();
+            fs.file(&at.config, config.as_bytes(), 0o600);
+            let prev = crate::config::prev_path(&at.config);
+            fs.file(&prev, outgoing().as_bytes(), 0o600);
+            fs.calls.borrow_mut().clear();
+            let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+            assert_eq!(out.exit, Exit::Done, "{case}: {}", out.stderr);
+            assert_eq!(
+                blank_prev_answer(&out),
+                BlankPrevAnswer {
+                    found: true,
+                    sha256: None
+                },
+                "{case}"
+            );
+            assert!(
+                out.stderr.contains(&at.config.display().to_string())
+                    && out.stderr.contains(&prev.display().to_string())
+                    && out.stderr.contains("are left as they are"),
+                "{case}: {}",
+                out.stderr
+            );
+            assert_eq!(fs.nodes[&at.config].bytes, config.as_bytes(), "{case}");
+            assert_eq!(fs.nodes[&prev].bytes, outgoing().as_bytes(), "{case}");
+            assert!(fs.changes().is_empty(), "{case}: {:?}", fs.changes());
+        }
+    }
+
+    /// #4379, cell 7 — the equal case: a `.prev` that is the config's own
+    /// bytes (every conversion since #4184) holds nothing root's file holds,
+    /// and nothing is written; nor where there is no `.prev`, beside a config
+    /// or none.
+    #[test]
+    fn blank_prev_writes_nothing_when_the_prev_is_the_config() {
+        for case in ["the config's bytes", "no .prev", "no .prev and no config"] {
+            let (mut fs, at) = a_home();
+            let config = converted(&outgoing());
+            fs.file(&at.config, config.as_bytes(), 0o600);
+            let prev = crate::config::prev_path(&at.config);
+            match case {
+                "the config's bytes" => fs.file(&prev, config.as_bytes(), 0o600),
+                "no .prev" => {}
+                _ => {
+                    fs.nodes.remove(&at.config);
+                }
+            }
+            fs.calls.borrow_mut().clear();
+            let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+            assert_eq!(out.exit, Exit::Done, "{case}: {}", out.stderr);
+            assert_eq!(
+                blank_prev_answer(&out),
+                BlankPrevAnswer {
+                    found: false,
+                    sha256: None
+                },
+                "{case}"
+            );
+            assert!(fs.changes().is_empty(), "{case}: {:?}", fs.changes());
+        }
+    }
+
+    /// #4379, cell 8 — a held `.prev` it cannot replace is exit 1, and its
+    /// line names the file and says what to do: one a write fails on (a
+    /// full disk), and one whose replacement would be over the bound root
+    /// reads. Nothing else is written.
+    #[test]
+    fn a_prev_blank_prev_cannot_replace_is_exit_1_and_says_what_to_do() {
+        let (mut fs, at) = a_home();
+        let config = converted(ENROLLED);
+        fs.file(&at.config, config.as_bytes(), 0o600);
+        let prev = crate::config::prev_path(&at.config);
+        fs.file(&prev, ENROLLED.as_bytes(), 0o600);
+        fs.fails_at = Some(prev.clone());
+        fs.calls.borrow_mut().clear();
+        let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+        assert_eq!(out.exit, Exit::Error, "{}", out.stderr);
+        assert!(out.stdout.is_empty());
+        assert!(
+            out.stderr.contains(&prev.display().to_string())
+                && out.stderr.contains("Remove it or free disk space"),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(fs.nodes[&prev].bytes, ENROLLED.as_bytes());
+        assert_eq!(fs.nodes[&at.config].bytes, config.as_bytes());
+        assert_eq!(fs.changes(), [format!("write {} 600", prev.display())]);
+
+        // Within the bound as it is, and over it as `convert` writes it out.
+        let (mut fs, at) = a_home();
+        fs.nodes.remove(&at.config);
+        let filler = "x".repeat(CONFIG_BOUND - ENROLLED.len() - 64);
+        let big = format!("{ENROLLED}a_key_from_a_newer_build = \"{filler}\"\n");
+        assert!(big.len() <= CONFIG_BOUND);
+        fs.file(&prev, big.as_bytes(), 0o600);
+        fs.calls.borrow_mut().clear();
+        let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+        assert_eq!(out.exit, Exit::Error, "{}", out.stderr);
+        assert!(
+            out.stderr.contains(&prev.display().to_string())
+                && out.stderr.contains(&format!("over {CONFIG_BOUND} bytes"))
+                && out.stderr.contains("Remove it"),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(fs.nodes[&prev].bytes, big.as_bytes());
+        assert!(fs.changes().is_empty(), "{:?}", fs.changes());
+    }
+
+    /// #4379, cell 9 — a held `.prev` in a folder the person may not write is
+    /// exit 4, naming the folder, before anything is written.
+    #[test]
+    fn blank_prev_in_a_folder_it_cannot_write_is_exit_4_before_anything() {
+        let (mut fs, at) = a_home();
+        let config = converted(ENROLLED);
+        fs.file(&at.config, config.as_bytes(), 0o600);
+        let prev = crate::config::prev_path(&at.config);
+        fs.file(&prev, ENROLLED.as_bytes(), 0o600);
+        fs.dir(&at.folder, 0, 0o755, false);
+        fs.calls.borrow_mut().clear();
+        let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+        assert_eq!(out.exit, Exit::NotWritable, "{}", out.stderr);
+        assert!(
+            out.stderr.contains(&at.folder.display().to_string()),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(fs.nodes[&prev].bytes, ENROLLED.as_bytes());
+        assert!(fs.changes().is_empty(), "{:?}", fs.changes());
+    }
+
+    /// #4379, cell 10 — input it cannot read is exit 2 before any file is
+    /// read: not JSON, an unknown field, another format, an org entry with a
+    /// field of its own.
+    #[test]
+    fn blank_prev_refuses_input_it_cannot_read() {
+        let cases: [(&str, &[u8]); 5] = [
+            ("not JSON", b"server_url = 1"),
+            ("nothing", b""),
+            (
+                "an unknown field",
+                br#"{"v":1,"orgs":[],"agent_token":"tok"}"#,
+            ),
+            ("another format", br#"{"v":2,"orgs":[]}"#),
+            (
+                "an org entry with a field of its own",
+                br#"{"v":1,"orgs":[{"server_url":"https://roomler.example","tenant_id":"t-1","agent_id":"a-1"}]}"#,
+            ),
+        ];
+        for (case, stdin) in cases {
+            let (mut fs, at) = a_home();
+            let prev = crate::config::prev_path(&at.config);
+            fs.file(&prev, ENROLLED.as_bytes(), 0o600);
+            fs.calls.borrow_mut().clear();
+            let out = answer(Verb::BlankPrev, &at.home, &creds(), stdin, &mut fs);
+            assert_eq!(out.exit, Exit::Refused, "{case}: {}", out.stderr);
+            assert!(out.stdout.is_empty(), "{case}");
+            let calls = fs.calls.borrow();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("read ")) && fs.changes().is_empty(),
+                "{case}: {calls:?}"
+            );
+        }
+    }
+
+    /// #4379, cell 12 — after `blank-prev`, beside a converted config and
+    /// beside none, no load of the config brings an enrollment back: as it
+    /// is, removed, all NUL, not TOML.
+    #[test]
+    fn after_blank_prev_no_load_of_the_config_brings_the_enrollment_back() {
+        for config_there in [true, false] {
+            let (mut fs, at) = a_home();
+            let prev = crate::config::prev_path(&at.config);
+            if config_there {
+                fs.file(&at.config, converted(&outgoing()).as_bytes(), 0o600);
+            } else {
+                fs.nodes.remove(&at.config);
+            }
+            fs.file(&prev, outgoing().as_bytes(), 0o600);
+            let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+            assert_eq!(out.exit, Exit::Done, "{config_there}: {}", out.stderr);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(CONFIG);
+            // Beside none, the helper starts from a config there: the new
+            // `.prev`'s own bytes, which is what a restore would make of it.
+            let live = match fs.nodes.get(&at.config) {
+                Some(node) => node.bytes.clone(),
+                None => fs.nodes[&prev].bytes.clone(),
+            };
+            std::fs::write(&path, live).unwrap();
+            std::fs::write(crate::config::prev_path(&path), &fs.nodes[&prev].bytes).unwrap();
+            assert_no_load_brings_an_enrollment_back(&path);
+        }
+    }
+
     /// Any enrollment at all: the primary's identity, an `[[orgs]]` entry, or
     /// the WireGuard key that goes with them (`one_row::without_enrollments`).
     pub(crate) fn enrolled(cfg: &crate::config::AgentConfig) -> bool {
@@ -2637,6 +3234,24 @@ mod tests {
         /// From now on a write of the config's `.prev` fails.
         pub(crate) fn prev_cannot_be_replaced(&mut self) {
             self.fs.fails_at = Some(crate::config::prev_path(&self.at().config));
+        }
+
+        /// #4379 — the config's `.prev` made `prev`, or taken away where it
+        /// is not given, as an older release's conversion left it.
+        pub(crate) fn hold_prev(&mut self, prev: Option<&(Vec<u8>, u32)>) {
+            let path = crate::config::prev_path(&self.at().config);
+            self.fs.nodes.remove(&path);
+            if let Some((bytes, mode)) = prev {
+                self.fs.file(&path, bytes, *mode);
+            }
+        }
+
+        /// #4379 — from now on the person may not write the roomler folder.
+        pub(crate) fn folder_not_writable(&mut self) {
+            let folder = self.at().folder;
+            if let Some(node) = self.fs.nodes.get_mut(&folder) {
+                node.writable = false;
+            }
         }
 
         /// The config and its `.prev` written into `dir`, as `config.toml`
@@ -3448,6 +4063,82 @@ mod tests {
             assert_no_load_brings_an_enrollment_back(&at.config);
         }
 
+        /// #4379, cell 13 — `blank-prev` on disk, over an older `.prev` that
+        /// holds the enrollments root's file holds and that its owner may not
+        /// write (0400): replaced by the converted config's bytes, 0600, a
+        /// temporary file renamed in the folder. The config is not written
+        /// (its inode is the one it had), no temporary file is left, and no
+        /// load of the config brings an enrollment back.
+        #[test]
+        fn blank_prev_replaces_a_prev_it_may_not_write() {
+            let (dir, at) = a_home();
+            let config = converted(&outgoing());
+            std::fs::write(&at.config, &config).unwrap();
+            chmod(&at.config, 0o600);
+            let inode = std::fs::metadata(&at.config).unwrap().ino();
+            let prev = crate::config::prev_path(&at.config);
+            std::fs::write(&prev, outgoing()).unwrap();
+            chmod(&prev, 0o400);
+            let stdin = root_holds(&ROOT_HOLDS);
+            let out = answer(Verb::BlankPrev, dir.path(), &creds(), &stdin, &mut RealFs);
+            assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+            assert_eq!(std::fs::read(&prev).unwrap(), config.as_bytes());
+            assert_eq!(mode(&prev), 0o600);
+            assert_eq!(std::fs::read(&at.config).unwrap(), config.as_bytes());
+            assert_eq!(std::fs::metadata(&at.config).unwrap().ino(), inode);
+            let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(
+                listing(&at.folder),
+                [name(&at.config), name(&prev)],
+                "no temporary file left"
+            );
+            assert_no_load_brings_an_enrollment_back(&at.config);
+        }
+
+        /// Set in the process [`a_child_ends_at_its_own_deadline`] starts
+        /// again from this test binary: that process is the child.
+        const AS_LATE_CHILD: &str = "ROOMLER_TEST_ONE_ROW_HOME_LATE_CHILD";
+
+        /// #4379 — a child ends at its own deadline whatever it is doing then,
+        /// so one that root no longer waits for (a daemon that stopped
+        /// mid-ask) still ends by then: `RealMe::end_by`, `run`'s first step,
+        /// with SIGALRM ignored as a parent can leave it across an exec. The
+        /// child here waits on nothing for a minute, and is ended by SIGALRM
+        /// after its deadline, a second here (rounded up), well before that.
+        #[test]
+        fn a_child_ends_at_its_own_deadline() {
+            use std::os::unix::process::ExitStatusExt;
+            if std::env::var_os(AS_LATE_CHILD).is_some() {
+                // SAFETY: a signal's disposition, in this process of its own.
+                unsafe { libc::signal(libc::SIGALRM, libc::SIG_IGN) };
+                RealMe.end_by(Duration::from_millis(1_500));
+                std::thread::sleep(Duration::from_secs(60));
+                println!("one-row-home-child|outlived its deadline");
+                return;
+            }
+            let test = "one_row_home::tests::on_disk::a_child_ends_at_its_own_deadline";
+            let started = std::time::Instant::now();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(AS_LATE_CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let took = started.elapsed();
+            assert_eq!(
+                out.status.signal(),
+                Some(libc::SIGALRM),
+                "{:?}: {}{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                took >= Duration::from_secs(1) && took < Duration::from_secs(30),
+                "{took:?}"
+            );
+        }
+
         #[test]
         fn put_back_writes_0644_and_makes_agents_dir_0755() {
             let dir = tempfile::tempdir().unwrap();
@@ -3563,7 +4254,7 @@ mod tests {
         assert_eq!(out.exit, Exit::Done);
         assert_eq!(
             *me.asked.borrow(),
-            ["umask", "creds", "root", "home", "live_work"],
+            ["deadline", "umask", "creds", "root", "home", "live_work"],
             "every check of itself first, and no stdin"
         );
         assert!(
@@ -3591,6 +4282,7 @@ mod tests {
                 put_back: None,
                 put_back_legacy: None,
                 live_work,
+                blank_prev: None,
             };
             if read {
                 let (fs, at) = a_home();
