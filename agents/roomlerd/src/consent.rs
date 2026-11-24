@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 /// Default operator-decision timeout when an operator-consent prompt
@@ -439,7 +439,7 @@ impl PendingGuard {
     /// so an Allow that passed `record_decision`'s check just before a cancel,
     /// or one the CLI's fallback wrote with no check at all, landed after it
     /// and was taken.
-    fn look(&self, deadline: Instant) -> Option<Decision> {
+    fn look(&self, deadline: tokio::time::Instant) -> Option<Decision> {
         let mut books = self.inner.pending.lock().unwrap();
         let answered = |kind| self.inner.answered(&books, &self.session_hex, kind);
         let decided = if !self.holds(&books) {
@@ -448,7 +448,7 @@ impl PendingGuard {
             Decision::Granted
         } else if answered(SentinelKind::Deny) {
             Decision::Denied
-        } else if Instant::now() >= deadline {
+        } else if tokio::time::Instant::now() >= deadline {
             Decision::Timeout
         } else {
             return None;
@@ -543,7 +543,7 @@ impl ArmedPrompt {
         // was registered — a sentinel that exists now is an answer to this
         // prompt. Purging here again would eat one recorded between arming
         // and this first poll.
-        let deadline = Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now() + timeout; // the poll's clock (#3559)
         let outcome = loop {
             if let Some(decided) = guard.look(deadline) {
                 break decided;
@@ -1384,16 +1384,20 @@ mod tests {
         assert!(SentinelKind::from_flags(false, false).is_err());
     }
 
-    #[tokio::test]
+    /// #3559 — on paused time, so a loaded runner cannot fail it: an
+    /// auto-grant answers with no time passing, since it waits on no poll and
+    /// no timer.
+    #[tokio::test(start_paused = true)]
     async fn auto_grant_resolves_immediately() {
         let dir = fixture_dir("auto");
         let broker = ConsentBroker::new(Mode::AutoGrant, dir.clone()).unwrap();
-        let start = Instant::now();
+        let start = tokio::time::Instant::now();
         let decision = broker.request("abc123").await;
         assert_eq!(decision, Decision::Granted);
-        assert!(
-            start.elapsed() < Duration::from_millis(200),
-            "auto-grant must not block on any I/O"
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "auto-grant must answer at once, waiting on no poll and no timer"
         );
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
@@ -1444,7 +1448,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
+    /// #3559 — on paused time. The directed prompt ends at its window on the
+    /// paused clock, bounded so that a window the wait ignores fails the test
+    /// instead of spinning it forever, and the directed auto-grant answers
+    /// with no time passing.
+    #[tokio::test(start_paused = true)]
     async fn request_with_mode_overrides_startup_mode() {
         // Server-authoritative consent (Phase 2): the per-session directive from
         // `ServerMsg::Request { consent_mode }` wins over the broker's startup
@@ -1454,14 +1462,15 @@ mod tests {
         // Startup = AutoGrant, but the server directs Prompt → we take the prompt
         // path and (no sentinel) time out, proving auto-grant was NOT used.
         let auto_broker = ConsentBroker::new(Mode::AutoGrant, dir.clone()).unwrap();
-        let d = auto_broker
-            .request_with_mode(
-                "aaaaaaaaaaaaaaaaaaaaaaaa",
-                Mode::Prompt {
-                    timeout: Duration::from_millis(80),
-                },
-            )
-            .await;
+        let directed = auto_broker.request_with_mode(
+            "aaaaaaaaaaaaaaaaaaaaaaaa",
+            Mode::Prompt {
+                timeout: Duration::from_millis(80),
+            },
+        );
+        let d = tokio::time::timeout(PROMPT_BOUND, directed)
+            .await
+            .expect("the directed prompt must end at its window");
         assert_eq!(
             d,
             Decision::Timeout,
@@ -1477,7 +1486,7 @@ mod tests {
             dir.clone(),
         )
         .unwrap();
-        let start = Instant::now();
+        let start = tokio::time::Instant::now();
         let d = prompt_broker
             .request_with_mode("bbbbbbbbbbbbbbbbbbbbbbbb", Mode::AutoGrant)
             .await;
@@ -1486,7 +1495,11 @@ mod tests {
             Decision::Granted,
             "Auto directive must override startup Prompt"
         );
-        assert!(start.elapsed() < Duration::from_millis(200));
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the Auto directive must answer at once, waiting on no poll and no timer"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2083,7 +2096,7 @@ mod tests {
                 let broker = broker.clone();
                 std::thread::spawn(move || broker.arm(session, Duration::from_millis(300)))
             };
-            let waited = Instant::now();
+            let waited = std::time::Instant::now();
             while leftover.exists() && waited.elapsed() < Duration::from_secs(1) {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -2213,32 +2226,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
+    /// #3559 — on paused time, so a loaded runner cannot fail it. The prompt
+    /// wait's deadline and its poll read one clock, tokio's: a
+    /// `std::time::Instant` deadline beside tokio's sleep never comes while
+    /// the paused clock jumps a poll at a time, and the bound then ends the
+    /// test, as it does for a window the wait ignores.
+    #[tokio::test(start_paused = true)]
     async fn prompt_times_out_when_no_sentinel_arrives() {
         let dir = fixture_dir("timeout");
-        let broker = ConsentBroker::new(
-            Mode::Prompt {
-                timeout: Duration::from_millis(400),
-            },
-            dir.clone(),
-        )
-        .unwrap();
-        let start = Instant::now();
-        let decision = broker.request("nopromptever").await;
+        let window = Duration::from_millis(400);
+        let broker = ConsentBroker::new(Mode::Prompt { timeout: window }, dir.clone()).unwrap();
+        let start = tokio::time::Instant::now();
+        let decision = tokio::time::timeout(PROMPT_BOUND, broker.request("nopromptever"))
+            .await
+            .expect("the prompt must end at its window");
+        let waited = start.elapsed();
         assert_eq!(decision, Decision::Timeout);
         assert!(
-            start.elapsed() >= Duration::from_millis(400),
-            "must respect timeout duration"
+            waited >= window,
+            "must respect timeout duration (got {waited:?})"
         );
         assert!(
-            start.elapsed() < Duration::from_millis(900),
-            "must not run far past timeout (got {:?})",
-            start.elapsed()
+            waited < window + POLL_INTERVAL,
+            "must end within one poll of its window (got {waited:?})"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
+    /// #3559 — on paused time: denied with no time passing, before any wait.
+    #[tokio::test(start_paused = true)]
     async fn request_with_empty_session_id_denies_safely() {
         // Defensive: a malformed signaling message that arrives with
         // an empty session_hex must NOT cause the broker to scan the
@@ -2251,9 +2267,13 @@ mod tests {
             dir.clone(),
         )
         .unwrap();
-        let start = Instant::now();
+        let start = tokio::time::Instant::now();
         assert_eq!(broker.request("").await, Decision::Denied);
-        assert!(start.elapsed() < Duration::from_millis(50));
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "an empty id must be denied at once, before any wait"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
