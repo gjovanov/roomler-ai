@@ -6454,7 +6454,7 @@ to-activate, so the browser never sees a bait-and-switch.
   hello still announces copied images as its first probe found them
   ([#3927](https://github.com/gjovanov/roomler-ai/issues/3927)). The follow
   rests on how arboard 3.6.1's `Drop` counts its handles before it closes the
-  connection, so the workspace pins `arboard` to `=3.6.1` (`Cargo.toml:326`).
+  connection, so the workspace pins `arboard` to `=3.6.1` (the `arboard` entry in the workspace's root `Cargo.toml`).
   An upgrade has to read that `Drop` again; the CI control
   `x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server`
   turns red when its rule changes. Kill switch
