@@ -728,8 +728,16 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     // `roomlerd re-enroll` does. Saving the fresh, default-everything config
     // wholesale dropped every operator setting and every `[[orgs]]`
     // enrollment on the machine.
-    let (merged, _outcome) = enrollment::apply_enrollment(Some(existing), fresh, None, false)
-        .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;
+    // #4352 — a refused fold writes nothing and removes the row the
+    // enrollment made, as every caller of the fold does.
+    let (merged, _outcome) = match enrollment::apply_enrollment(Some(existing), fresh, None, false)
+    {
+        Ok(folded) => folded,
+        Err(e) => {
+            let e = enrollment::remove_refused_row(e).await;
+            return Err(format!("Re-enrollment failed: {e:#}"));
+        }
+    };
     config::save(&path, &merged).map_err(|e| explain_save_error(e, &path, machine_global))?;
     Ok(status_report())
 }

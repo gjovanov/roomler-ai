@@ -2790,7 +2790,7 @@ mod tests {
         ));
         assert!(!is_session_gone_reject(
             RejectKind::AgentError,
-            "DC pool not ready on agent"
+            "roomlerd: DC pool not ready"
         ));
     }
 

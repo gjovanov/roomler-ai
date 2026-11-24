@@ -155,7 +155,12 @@ pub async fn enroll_folded(
         },
     )
     .await?;
-    fold(existing, fresh)
+    // #4352 — a refused fold (an ephemeral answer for a second org) writes
+    // nothing and removes the row the enrollment made.
+    match fold(existing, fresh) {
+        Err(e) => Err(roomlerd::enrollment::remove_refused_row(e).await),
+        folded => folded,
+    }
 }
 
 /// #3565 — every enroll of the wizard names the wizard, with the version it

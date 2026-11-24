@@ -82,6 +82,14 @@ overlay_mode = "off"          # off | netstack | tun — P1 forces secondaries o
 | same `(server, tenant)` | refreshes in place, keeping operator state |
 | a NEW `(server, tenant)` | **appends** a secondary org with a freshly **minted** WG key |
 | `--replace` | the legacy rebind, for when you really do mean "move this box" |
+| an **ephemeral** answer that would append a secondary or refresh one | **refused** (#4352): the config is not written, and a row the enrollment made is removed again with the answer's own token ([ephemeral-nodes.md](ephemeral-nodes.md#a-second-organization-is-never-ephemeral-4352)) |
+
+**An ephemeral key cannot add an organization.** An `[[orgs]]` entry has no
+`ephemeral`, and a stop removes only the row its run started as, so nothing
+would ever remove the row of an ephemeral secondary. To add an org, join it
+with a standard enrollment token; to run as an ephemeral device of an org,
+enroll it as the primary of a config of its own. The primary itself takes an
+ephemeral answer as before.
 
 The fresh key mint is a security property, not an optimisation: copying the
 primary's WG public key into a second org would let two orgs correlate the

@@ -245,7 +245,7 @@ and in the FR-35 memory key (`peer.rs:4819` → `"{ip}|{class}"`, which fixes "a
 onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–34`
 has only `Relay`) so DERP / TURN / org relay are distinguishable. Mitigation for the one path lost
 (proxy-only egress, 443 only): a `turns:` listener on 443 on coturn, or the loopback-TURN opt-in.
-Update `docs/multi-org.md:340–341` (its "ICE never gathers on roomler-*" is true only on Linux) and
+Update `docs/multi-org.md:547–548` (its "ICE never gathers on roomler-*" is true only on Linux) and
 `docs/overlay-nat-traversal.md` with the rule.
 
 **Field verification** (CORPLAP-1 multi-org with the VPN on; CORPLAP-3 LAN): `ICE: gathered local
@@ -256,10 +256,10 @@ brings the old `100.65.0.5 ↔ 100.65.0.6` pair back.
 
 **C2 — #1237, the sibling route war (independent; do first).** Two facts from the design pass:
 each per-org adapter already holds a **narrowed** on-link `/(96+plen)` v6 address
-(`overlay.rs:673–675` → `tun.rs:3446–3461`), but `defend_self_route` (`tun.rs:2439–2456`) evicts and
+(`overlay.rs:673–675` → `tun.rs:4143–4158`), but `defend_self_route` (`tun.rs:3136–3153`) evicts and
 asserts the **whole /96** on every adapter — the damage is the route-change notification storm, not
 a routing hole; and the same missing notion of "own adapters" makes `non_overlay_v4_addrs`
-(`tun.rs:2287–2302`) count the sibling's address as a foreign CGNAT address, so the primary's
+(`tun.rs:2984–2999`) count the sibling's address as a foreign CGNAT address, so the primary's
 **block floor is silently withheld** on multi-org hosts.
 - Own-adapter registry in tunnel-core (`tun.rs` `mod system`: `OWN_TUNS: Mutex<BTreeMap<luid,
   if_name>>`, registered at the end of `SystemTun::up_with`, deregistered in a new `Drop`;

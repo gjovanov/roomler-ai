@@ -42,6 +42,11 @@ export const useFileStore = defineStore('files', () => {
   const perPage = ref(25)
   const totalPages = ref(1)
   const loading = ref(false)
+  /** #4257 — which org `files` describes: the org of the latest fetch,
+   *  answered or not, of its own files or of one of its rooms. A fetch for
+   *  another org drops the rows first, so one org's files never show under
+   *  another org's page, while that org's list loads or after it failed. */
+  const filesTenantId = ref<string | null>(null)
 
   // Stale-response guard (devices-grid pattern): the LAST issued fetch wins.
   let seq = 0
@@ -58,7 +63,12 @@ export const useFileStore = defineStore('files', () => {
     return params.toString()
   }
 
-  async function fetchPage(path: string, mySeq: number) {
+  async function fetchPage(tenantId: string, path: string, mySeq: number) {
+    if (filesTenantId.value !== null && filesTenantId.value !== tenantId) {
+      files.value = []
+      total.value = 0
+    }
+    filesTenantId.value = tenantId
     loading.value = true
     try {
       const data = await api.get<FilesPage>(path)
@@ -74,12 +84,17 @@ export const useFileStore = defineStore('files', () => {
   }
 
   async function fetchFiles(tenantId: string, roomId: string, opts: FileFetchOpts = {}) {
-    await fetchPage(`/tenant/${tenantId}/room/${roomId}/file?${buildQuery(opts)}`, ++seq)
+    await fetchPage(tenantId, `/tenant/${tenantId}/room/${roomId}/file?${buildQuery(opts)}`, ++seq)
   }
 
   async function fetchTenantFiles(tenantId: string, opts: FileFetchOpts = {}) {
-    await fetchPage(`/tenant/${tenantId}/file?${buildQuery(opts)}`, ++seq)
+    await fetchPage(tenantId, `/tenant/${tenantId}/file?${buildQuery(opts)}`, ++seq)
   }
+
+  /** A file uploaded for `tenantId` joins the list only when the list is not
+   *  another org's. */
+  const listIsOf = (tenantId: string) =>
+    filesTenantId.value === null || filesTenantId.value === tenantId
 
   async function uploadFile(tenantId: string, roomId: string, file: File) {
     const form = new FormData()
@@ -89,7 +104,9 @@ export const useFileStore = defineStore('files', () => {
       `/tenant/${tenantId}/file/upload`,
       form,
     )
-    files.value.push(entry)
+    // #4257 — an upload answered after the page moved on to another org
+    // happened all the same; it stays out of that org's list.
+    if (listIsOf(tenantId)) files.value.push(entry)
     return entry
   }
 
@@ -115,6 +132,7 @@ export const useFileStore = defineStore('files', () => {
     perPage,
     totalPages,
     loading,
+    filesTenantId,
     fetchFiles,
     fetchTenantFiles,
     uploadFile,

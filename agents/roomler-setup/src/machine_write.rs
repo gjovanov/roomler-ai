@@ -128,6 +128,14 @@ impl Failure {
         }
     }
 
+    /// The fold refused the enrollment, in the fold's words.
+    fn enrollment(e: &anyhow::Error) -> Self {
+        Self {
+            kind: FailureKind::Enroll,
+            message: format!("enrollment: {e}"),
+        }
+    }
+
     /// Record it in the install's diagnostics, as the failure of the step that
     /// is open (#3432). Its words crossed the administrator step's channel as
     /// text, so they are the step's own: a refusal in those words.
@@ -138,6 +146,24 @@ impl Failure {
             FailureKind::Enroll => ErrorCode::EnrollRejected,
         };
         crate::steps::Steps::global().fail(code, crate::failure::Said(self.message))
+    }
+}
+
+/// Why [`write`] stopped.
+pub enum Stopped {
+    /// Step 7 failed, in these words.
+    Failed(Failure),
+    /// #4352 — the fold refused an enrollment the server had already made: an
+    /// ephemeral answer for a second organization. Nothing is written; the
+    /// caller removes the row it made
+    /// ([`roomlerd::enrollment::remove_refused_row`]) and says the result
+    /// ([`Failure::enrollment`]).
+    Refused(anyhow::Error),
+}
+
+impl From<Failure> for Stopped {
+    fn from(failure: Failure) -> Self {
+        Self::Failed(failure)
     }
 }
 
@@ -182,16 +208,19 @@ pub fn write(
     advanced: &AdvancedOptions,
     is_system_context: bool,
     flavour: WindowsInstallFlavour,
-) -> Result<Written, Failure> {
+) -> Result<Written, Stopped> {
     // #3666 — nothing folded, nothing kept (`config::save_fresh`).
     let folds = existing.is_some();
     let crate::enroll_step::Enrolled {
         mut cfg,
         outcome,
         previous_row,
-    } = crate::enroll_step::fold(existing, issued.into_config()).map_err(|e| Failure {
-        kind: FailureKind::Enroll,
-        message: format!("enrollment: {e}"),
+    } = crate::enroll_step::fold(existing, issued.into_config()).map_err(|e| {
+        if e.is::<roomlerd::enrollment::EphemeralOrgRefused>() {
+            Stopped::Refused(e)
+        } else {
+            Stopped::Failed(Failure::enrollment(&e))
+        }
     })?;
     let mut warnings = Vec::new();
     // F3: the machine id was read back from the config, so the server reuses
@@ -352,14 +381,20 @@ impl ConfigWriter {
                 config_path,
                 is_system_context,
                 existing,
-            } => write(
+            } => match write(
                 config_path,
                 existing.take().map(|cfg| *cfg),
                 issued,
                 advanced,
                 *is_system_context,
                 flavour,
-            ),
+            ) {
+                Ok(written) => Ok(written),
+                Err(Stopped::Failed(failure)) => Err(failure),
+                Err(Stopped::Refused(e)) => Err(Failure::enrollment(
+                    &roomlerd::enrollment::remove_refused_row(e).await,
+                )),
+            },
             #[cfg(target_os = "windows")]
             Self::Step(link) => {
                 let _ = flavour;
@@ -570,11 +605,40 @@ pub fn serve<R: BufRead, W: Write>(
             let _ = send(writer, &Answer::Written(written));
             Served::Written
         }
-        Err(failure) => {
+        Err(stopped) => {
+            let failure = match stopped {
+                Stopped::Failed(failure) => failure,
+                // Off the gate: nothing is written, and the removal is a
+                // network call of a few seconds at most.
+                Stopped::Refused(e) => Failure::enrollment(&remove_in_step(e)),
+            };
             let _ = send(writer, &Answer::Failed(failure));
             Served::Failed
         }
     }
+}
+
+/// #4352 — [`roomlerd::enrollment::remove_refused_row`] from the step, which is
+/// synchronous and runs outside any runtime: on a thread of its own, with a
+/// runtime of its own, so it works whatever called the step. A removal that
+/// cannot run leaves the refusal saying the row is still on the server.
+fn remove_in_step(e: anyhow::Error) -> anyhow::Error {
+    let kept = e
+        .downcast_ref::<roomlerd::enrollment::EphemeralOrgRefused>()
+        .cloned();
+    let removal = std::thread::spawn(move || {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(roomlerd::enrollment::remove_refused_row(e)),
+            Err(_) => e,
+        }
+    });
+    removal.join().unwrap_or_else(|_| match kept {
+        Some(refused) => refused.into(),
+        None => anyhow::anyhow!("the enrollment was refused"),
+    })
 }
 
 /// The wizard's next request, or how the conversation ended instead.

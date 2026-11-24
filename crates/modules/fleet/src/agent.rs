@@ -331,8 +331,9 @@ pub struct EnrollResponse {
     pub tenant_id: String,
     pub agent_token: String,
     /// FR-51 — the ROW's nature, which the daemon records (#4331): true for a
-    /// row an ephemeral key made, and for one a standard token refreshed while
-    /// it lived, since nothing after enrollment flips a row. Reaped on its TTL.
+    /// row an ephemeral key made. Nothing after enrollment flips a row, and a
+    /// standard token never refreshes a live ephemeral one (409, #4352), so a
+    /// standard token's answer is false. Reaped on its TTL.
     pub ephemeral: bool,
 }
 
@@ -393,11 +394,16 @@ pub async fn enroll_agent(
     // unique index on the pair covers soft-deleted rows too, so the lookup
     // takes tombstones and the row comes back in place rather than a second
     // one being made. A LIVE row is refreshed and keeps everything; a REMOVED
-    // one comes back as a new device (`enroll_row`).
+    // one comes back as a new device (`enroll_row`). A LIVE EPHEMERAL row is
+    // refused (#4352), before the cap and the spend, as the cap is: the token
+    // stays usable for the retry once the device is removed.
     let existing = state
         .agents
         .find_by_tenant_and_machine(tid, &body.machine_id)
         .await?;
+    if let Some(row) = &existing {
+        refuse_live_ephemeral(row, false)?;
+    }
     // S5 — plan device cap. Only a NEW row consumes a slot; a known machine
     // rehydrates below regardless of the cap (re-enrolling your existing
     // fleet must never brick). Checked BEFORE the single-use claim on
@@ -501,7 +507,10 @@ const ENROLL_ROUNDS: usize = 3;
 ///   read, the one the plan cap was checked against.
 /// * A live row: a device nobody removed enrolls again (a lost token, a
 ///   reinstall). It is refreshed and keeps everything it was allowed
-///   ([`AgentDao::rehydrate`], live-only).
+///   ([`AgentDao::rehydrate`], live-only). A live EPHEMERAL row is refused
+///   instead ([`refuse_live_ephemeral`], #4352), in every round: the route
+///   refused the row it read before the spend, and a later round's read
+///   answers the same 409.
 /// * A removed row: the machine id of a device its org removed. It comes back
 ///   as a NEW device ([`AgentDao::revive`], #3627): what the removed device was
 ///   allowed stays with the removal. First the holders drop what they hold
@@ -552,6 +561,7 @@ async fn enroll_row(
             // enrolls again from the start instead.
             None => break,
             Some(live) if live.deleted_at.is_none() => {
+                refuse_live_ephemeral(&live, true)?;
                 let id = live
                     .id
                     .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
@@ -615,6 +625,30 @@ async fn enroll_row(
          at the same moment). Enroll it again with a new enrollment token."
             .to_string(),
     ))
+}
+
+/// #4352 — a standard token over a LIVE EPHEMERAL row: 409. A refresh would
+/// keep the row ephemeral ([`AgentDao::rehydrate`] never changes its kind), and
+/// the device, which records the row's kind (#4331), would remove it at its
+/// next stop: a person who meant to make it permanent would lose it at the
+/// next reboot. `spent` says whether the single-use token is spent already (a
+/// later round of [`enroll_row`]), which decides how the retry is worded.
+///
+/// [`AgentDao::rehydrate`]: roomler_ai_services::dao::agent::AgentDao::rehydrate
+fn refuse_live_ephemeral(row: &Agent, spent: bool) -> Result<(), ApiError> {
+    if row.deleted_at.is_some() || !row.ephemeral {
+        return Ok(());
+    }
+    let retry = if spent {
+        " with a new enrollment token."
+    } else {
+        ". This enrollment token was not used: it works until it expires."
+    };
+    Err(ApiError::Conflict(format!(
+        "This machine is enrolled in this organization as an ephemeral device, which removes \
+         itself when it stops, and a standard enrollment token cannot make it permanent. \
+         Remove the device on the Devices page first, then enroll it again{retry}"
+    )))
 }
 
 /// The grants a removed device still held, by name, for the line a revive

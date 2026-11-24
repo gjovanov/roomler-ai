@@ -83,9 +83,9 @@ const availableRoles = computed(() =>
 watch(show, (v) => {
   if (v) {
     selectedRoleId.value = ''
-    if (roleStore.roles.length === 0) {
-      roleStore.fetchRoles(props.tenantId)
-    }
+    // #4257 — this org's roles, not any: a list that holds another org's
+    // roles is not empty.
+    void roleStore.ensureRoles(props.tenantId)
   }
 })
 

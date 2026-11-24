@@ -1012,7 +1012,7 @@ mint asked, whether that person holds `MANAGE_AGENTS` in the credential's org
 `require_permission`, which nobody outside the org passes):
 
 - **Both doors ask it**: `POST /api/agent/enroll`, for a token and a key alike
-  (`crates/modules/fleet/src/agent.rs:353`), and `POST /api/agent/anchor`
+  (`crates/modules/fleet/src/agent.rs:354`), and `POST /api/agent/anchor`
   (`crates/modules/fleet/src/exec_service.rs:151`). They ask after the archived-org
   gate and before the token's spend or the key's claim
   ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)). A token a

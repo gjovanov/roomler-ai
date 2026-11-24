@@ -125,18 +125,18 @@ impl Install {
                  `roomler restart` makes it use the new token now."
             }
             Self::WindowsService => {
-                "The Roomler service starts the agent again within a minute, with the \
+                "The Roomler service starts the daemon again within a minute, with the \
                  new token. If it is still running, `roomler restart` makes it use the \
                  new token now."
             }
             Self::WindowsTask => {
-                "Start the agent: `roomlerd service start`. Its task does not restart an \
-                 agent the server removed (exit 7), and starts it again only at the next \
+                "Start the daemon: `roomlerd service start`. Its task does not restart a \
+                 daemon the server removed (exit 7), and starts it again only at the next \
                  sign-in. If it is still running, `roomler restart` makes it use the new \
                  token now."
             }
             Self::MacOs => {
-                "launchd starts the agent again within seconds, with the new token. If \
+                "launchd starts the daemon again within seconds, with the new token. If \
                  it is still running, `roomler restart` makes it use the new token now."
             }
             Self::Other => "Start the daemon again: `roomlerd run`, or your service manager.",
@@ -173,16 +173,16 @@ impl Install {
                  `roomlerd run`."
             }
             Self::WindowsService => {
-                "The Roomler service starts the agent within a minute. If it is running \
+                "The Roomler service starts the daemon within a minute. If it is running \
                  already, `roomler restart` connects it now."
             }
             Self::WindowsTask => {
-                "Start the agent: `roomlerd service start` (`roomlerd service install` \
+                "Start the daemon: `roomlerd service start` (`roomlerd service install` \
                  first, if this account has no task). If it is running already, \
                  `roomler restart` connects it now."
             }
             Self::MacOs => {
-                "launchd starts the agent within seconds. If it is running already, \
+                "launchd starts the daemon within seconds. If it is running already, \
                  `roomler restart` connects it now."
             }
             Self::Other => "Start the daemon: `roomlerd run`, or your service manager.",

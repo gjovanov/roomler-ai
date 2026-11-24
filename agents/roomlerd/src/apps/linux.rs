@@ -185,7 +185,7 @@ impl LinuxWm {
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     anyhow::anyhow!(
-                        "`{program}` not installed on the agent host (apt install {apt})"
+                        "`{program}` is not installed on this device (apt install {apt})"
                     )
                 } else {
                     anyhow::Error::new(e).context(format!("running {program}"))
@@ -533,7 +533,7 @@ impl WindowManager for LinuxWm {
 /// "install X" for a program that is not there, else the error.
 fn spawn_error(program: &str, apt: &str, e: std::io::Error) -> anyhow::Error {
     if e.kind() == std::io::ErrorKind::NotFound {
-        anyhow::anyhow!("`{program}` not installed on the agent host (apt install {apt})")
+        anyhow::anyhow!("`{program}` is not installed on this device (apt install {apt})")
     } else {
         anyhow::Error::new(e).context(format!("spawning {program}"))
     }

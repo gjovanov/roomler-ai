@@ -46,7 +46,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, watch } from 'vue'
 import { useRoleStore } from '@/stores/role'
 import RoleAssignDialog from './RoleAssignDialog.vue'
 
@@ -90,9 +90,18 @@ function onRoleAssigned(roleId: string) {
   }
 }
 
-onMounted(() => {
-  if (roleStore.roles.length === 0) {
-    roleStore.fetchRoles(props.tenantId)
-  }
-})
+// #4257 — the list follows its org, and names this org's roles, not any: a
+// list that holds another org's roles is not empty. A role dialog opened on
+// the previous org's member is closed: its assign would go to the new org.
+watch(
+  () => props.tenantId,
+  (tenantId, previous) => {
+    if (previous !== undefined) {
+      showAssignDialog.value = false
+      selectedMember.value = null
+    }
+    void roleStore.ensureRoles(tenantId)
+  },
+  { immediate: true },
+)
 </script>
