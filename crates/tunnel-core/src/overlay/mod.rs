@@ -217,11 +217,27 @@ pub(crate) mod said {
     #[derive(Clone, Default)]
     pub(crate) struct Lines(Arc<Mutex<Vec<Said>>>);
 
+    /// What [`Lines::start`] hands back: this thread's scoped subscriber and a
+    /// second registered dispatcher. Two dispatchers, never one: with one,
+    /// tracing-core takes a line's interest from the default of whichever
+    /// thread reaches it first and keeps it for every thread, so a parallel
+    /// cell with no subscriber would hide the line from this one (#4375).
+    /// The scope ends first, then the second.
+    pub(crate) struct Guard {
+        _scoped: tracing::subscriber::DefaultGuard,
+        _second: tracing::Dispatch,
+    }
+
     impl Lines {
-        pub(crate) fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        pub(crate) fn start() -> (Self, Guard) {
             let lines = Self::default();
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
             let subscriber = tracing_subscriber::registry().with(Record(lines.clone()));
-            (lines, tracing::subscriber::set_default(subscriber))
+            let guard = Guard {
+                _scoped: tracing::subscriber::set_default(subscriber),
+                _second: second,
+            };
+            (lines, guard)
         }
 
         /// The events whose text carries `words`.
@@ -271,5 +287,23 @@ pub(crate) mod said {
                 let _ = write!(self.0, "{}={value:?}", field.name());
             }
         }
+    }
+
+    /// A line this thread says is recorded even when another thread with no
+    /// subscriber of its own reached that line first, as a parallel cell does
+    /// with the route guard's lines (#4375's race).
+    #[test]
+    fn a_line_another_thread_reached_first_is_still_recorded() {
+        fn reach() {
+            tracing::info!("said probe: a line two threads reach");
+        }
+        let (lines, _guard) = Lines::start();
+        std::thread::spawn(reach).join().unwrap();
+        reach();
+        assert_eq!(
+            lines.with("said probe: a line two threads reach").len(),
+            1,
+            "the capture missed a line this thread said"
+        );
     }
 }
