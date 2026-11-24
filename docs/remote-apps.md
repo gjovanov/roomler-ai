@@ -510,7 +510,7 @@ label    = "Safari"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1211`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:7005`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:7050`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
@@ -532,7 +532,7 @@ marks (#4157), and logs *RESTORED* or *RECOVERED from the previous good copy* at
 When no usable copy exists, it logs that the host must be enrolled (again) or re-enrolled,
 at ERROR, and fails. A diagnostic must never write the device's config as a side effect of being run.
 Since #4157 a start restores a missing file the same way, except the macOS supervisor's enrolled worker, which
-ends with 78 as before: on a converted one-row Mac the person's `.prev` can hold the enrollment that moved to root (#4184).
+ends with 78 as before: on a one-row Mac an earlier release converted, the person's `.prev` can hold the enrollment that moved to root (#4184).
 
 ## 9. Code map
 

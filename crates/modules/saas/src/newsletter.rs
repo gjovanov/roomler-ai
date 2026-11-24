@@ -17,7 +17,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
@@ -302,13 +302,18 @@ pub(crate) fn compose(
 
 // ── Handlers ────────────────────────────────────────────────────────────
 
-/// `POST /api/admin/newsletter/issues`
+/// `POST /api/admin/newsletter/issues`. The gate is decided before the body
+/// is read (#4254): anyone but a platform operator gets its 404 whatever the
+/// body is, so the route stays unseen, and an operator is answered a body
+/// that does not parse as the `Json` extractor answered it
+/// (`ApiError::JsonBody`).
 pub async fn create(
     State(state): State<SaasState>,
     auth: AuthUser,
-    Json(body): Json<CreateIssue>,
+    body: Result<Json<CreateIssue>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_platform_admin(&state, &auth)?;
+    let Json(body) = body?;
     if !valid_slug(&body.slug) {
         return Err(ApiError::Validation(
             "slug must be [a-z0-9-], at most 64 chars".into(),
@@ -343,14 +348,16 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(view(issue))))
 }
 
-/// `PUT /api/admin/newsletter/issues/{slug}` — drafts only.
+/// `PUT /api/admin/newsletter/issues/{slug}` — drafts only. The gate is
+/// decided before the body is read (#4254), as in [`create`].
 pub async fn update(
     State(state): State<SaasState>,
     auth: AuthUser,
     Path(slug): Path<String>,
-    Json(body): Json<IssueBody>,
+    body: Result<Json<IssueBody>, JsonRejection>,
 ) -> Result<Json<IssueView>, ApiError> {
     require_platform_admin(&state, &auth)?;
+    let Json(body) = body?;
     let clean = clean_issue_body(body)?;
     let mut set = bson::doc! {
         "subject": &clean.subject,
@@ -499,14 +506,16 @@ pub struct TestSendResult {
 /// `POST /api/admin/newsletter/issues/{slug}/test-send` — render + send to ONE
 /// address with the real headers and a sample token. No ledger, no status
 /// change; failures are propagated honestly (this caller is an operator, not
-/// an oracle-sensitive public form).
+/// an oracle-sensitive public form). The gate is decided before the body is
+/// read (#4254), as in [`create`].
 pub async fn test_send(
     State(state): State<SaasState>,
     auth: AuthUser,
     Path(slug): Path<String>,
-    Json(body): Json<TestSend>,
+    body: Result<Json<TestSend>, JsonRejection>,
 ) -> Result<Json<TestSendResult>, ApiError> {
     require_platform_admin(&state, &auth)?;
+    let Json(body) = body?;
     let issue = state
         .newsletter_issues
         .get_by_slug(&slug)
@@ -562,14 +571,17 @@ pub struct SendAccepted {
 /// `POST /api/admin/newsletter/issues/{slug}/send` — claim and fan out.
 /// Re-POSTing is the RESUME path: the CAS re-claims a `sending` issue whose
 /// claim went stale (dead pod), and the ledger makes the re-run idempotent.
+/// The gate is decided before the body is read (#4254), as in [`create`]. A
+/// request with no `Content-Type` still has no body, which is the default
+/// request, as it was while the body was an `Option<Json<T>>` extractor.
 pub async fn send(
     State(state): State<SaasState>,
     auth: AuthUser,
     Path(slug): Path<String>,
-    body: Option<Json<SendRequest>>,
+    body: Result<Option<Json<SendRequest>>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_platform_admin(&state, &auth)?;
-    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let req = body?.map(|Json(b)| b).unwrap_or_default();
 
     // Refuse BEFORE claiming: ledgering an entire list into `failed` on a
     // misconfigured pod would be strictly worse than refusing loudly.

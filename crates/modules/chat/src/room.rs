@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::oid::ObjectId;
 use roomler_ai_services::quota;
@@ -280,11 +280,19 @@ pub struct UpdateRoomRequest {
     pub visibility: Option<RoomVisibility>,
 }
 
+/// Change a room's settings.
+///
+/// Decides its gates before it reads its body (#4254): the room guard first
+/// (someone outside the org gets `not_a_member`, and a room the caller may
+/// not read gets the guard's answer for it), then `MANAGE_CHANNELS`. A caller
+/// either one refuses gets that answer whatever the body is; a caller both
+/// let through is answered a body that does not parse as the `Json`
+/// extractor answers it.
 pub async fn update(
     State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
-    Json(body): Json<UpdateRoomRequest>,
+    body: Result<Json<UpdateRoomRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -300,6 +308,7 @@ pub async fn update(
         "MANAGE_CHANNELS",
     )
     .await?;
+    let Json(body) = body?;
 
     // Closing a room must not lock its own admin out. Adding the actor BEFORE
     // the write means there is no window in which the room is members-only

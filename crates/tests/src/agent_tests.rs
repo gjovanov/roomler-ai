@@ -1706,3 +1706,150 @@ async fn a_connected_device_that_has_not_opted_in_refuses_a_save() {
 
     device.stop().await;
 }
+
+/// A server whose per-address rate limit is out of the way: the #4254 tests
+/// below send more requests than the default burst, and a 429 would read as
+/// an answer.
+async fn spawn_unlimited() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.app.rate_limit_per_sec = 1_000;
+        s.app.rate_limit_burst = 10_000;
+    })
+    .await
+}
+
+/// #4254 — the device writes decide `MANAGE_AGENTS` before they read their
+/// body at all: the update of a device, the update pushes to one device and
+/// to the org's devices, and the join of a device to a second org, whose
+/// first gate is the path's org. A member without the bit gets the one 403
+/// `forbidden` for a body that does not even parse, the answer a body the
+/// route reads gets, and someone outside the org the one `not_a_member`,
+/// whatever the device id is. While they took `Json<T>` as an extractor,
+/// axum answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone, and an id that is not one was a 400 before the
+/// gate.
+#[tokio::test]
+async fn the_device_writes_decide_manage_agents_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let app = spawn_unlimited().await;
+    let seeded = app.seed_tenant("dev-unparsed").await;
+    let other = app.seed_tenant("dev-unparsed-b").await;
+    let org = format!("/api/tenant/{}/agent", seeded.tenant_id);
+    let fresh = bson::oid::ObjectId::new().to_hex();
+    let mut writes = Vec::new();
+    for device in [fresh.as_str(), "not-an-id"] {
+        writes.push(GatedWrite {
+            method: "PUT",
+            path: format!("{org}/{device}"),
+            reads: json!({ "name": "renamed" }),
+            refused_field: r#"{"name": 7}"#,
+        });
+        writes.push(GatedWrite {
+            method: "POST",
+            path: format!("{org}/{device}/update"),
+            reads: json!({}),
+            refused_field: r#"{"force": "x"}"#,
+        });
+        writes.push(GatedWrite {
+            method: "POST",
+            path: format!("{org}/{device}/join-org"),
+            reads: json!({ "target_tenant_id": other.tenant_id }),
+            refused_field: r#"{"target_tenant_id": 7}"#,
+        });
+    }
+    writes.push(GatedWrite {
+        method: "POST",
+        path: format!("{org}/update"),
+        reads: json!({}),
+        refused_field: r#"{"agent_ids": 7}"#,
+    });
+
+    let mut wrong = Vec::new();
+    for (who, token, gate) in [
+        (
+            "a member without the bit",
+            &seeded.member.access_token,
+            Gate::Bit("MANAGE_AGENTS"),
+        ),
+        (
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+        ),
+    ] {
+        for write in &writes {
+            wrong.extend(gate_problems(&app, who, token, gate, write).await);
+        }
+    }
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4254's control. The org's owner is answered a device write that does not
+/// parse exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words, whatever the device id is: the body is read before the
+/// id, as the extractor read it before the handler ran. On the join the
+/// path's org lets the owner through, and the body is read before the org it
+/// names is asked about.
+#[tokio::test]
+async fn a_holder_is_answered_a_device_write_that_does_not_parse_as_the_json_extractor_answers_it()
+{
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_fleet::agent::{
+        BulkTriggerUpdateRequest, TriggerUpdateRequest, UpdateAgentRequest,
+    };
+    use roomler_ai_mod_fleet::agent_org::JoinOrgRequest;
+
+    let app = spawn_unlimited().await;
+    let seeded = app.seed_tenant("dev-unparsed-holder").await;
+    let owner = &seeded.admin.access_token;
+    let org = format!("/api/tenant/{}/agent", seeded.tenant_id);
+    let fresh = bson::oid::ObjectId::new().to_hex();
+
+    let mut wrong = Vec::new();
+    for device in [fresh.as_str(), "not-an-id"] {
+        wrong.extend(
+            holder_problems::<UpdateAgentRequest>(
+                &app,
+                owner,
+                "PUT",
+                &format!("{org}/{device}"),
+                r#"{"name": 7}"#,
+            )
+            .await,
+        );
+        wrong.extend(
+            holder_problems::<TriggerUpdateRequest>(
+                &app,
+                owner,
+                "POST",
+                &format!("{org}/{device}/update"),
+                r#"{"force": "x"}"#,
+            )
+            .await,
+        );
+        wrong.extend(
+            holder_problems::<JoinOrgRequest>(
+                &app,
+                owner,
+                "POST",
+                &format!("{org}/{device}/join-org"),
+                r#"{"target_tenant_id": 7}"#,
+            )
+            .await,
+        );
+    }
+    wrong.extend(
+        holder_problems::<BulkTriggerUpdateRequest>(
+            &app,
+            owner,
+            "POST",
+            &format!("{org}/update"),
+            r#"{"agent_ids": 7}"#,
+        )
+        .await,
+    );
+    assert_no_problems("the org's owner", &wrong);
+}

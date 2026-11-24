@@ -42,18 +42,22 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   stays any member's: every node receives it anyway. ⚠️ The forward reads no bit, and
   must not: the policy IS the grant, made for people who hold none
   (security-baseline.md §3).
-- **A gated write decides its gate before it reads its body** (#4187, #4218).
+- **A gated write decides its gate before it reads its body** (#4187, #4218, #4254).
   `Json<T>` as an extractor answers a body that does not parse (400/413/415/422)
   before the handler runs: a caller the gate refuses is told about the body instead,
   and a platform-operator route's 404 stops keeping it unseen. A write gated on a
   permission bit or the platform allowlist takes `Result<Json<T>, JsonRejection>` and
   unwraps it straight after the gate (`let Json(body) = body?;`), before it parses any
   id its gate does not need; `ApiError::JsonBody` answers a caller it lets through as
-  the extractor did. Every gated write of the network module does. The api crate's
-  unit test `gate_before_body` (`crates/api/src/gate_before_body.rs`) fails on a new
-  one that does not; its `DEFERRED` list is #4254's, `BY_DESIGN` holds the checks that
-  need the body, and both only shrink. ⚠️ It cannot see an ownership check or another
-  extractor (`Query<T>`, a typed `Path<T>`, `Form<T>`): those stay the reviewer's.
+  the extractor did. Every gated write of the api crate and of every module does. A
+  gate that needs the body comes after it: the billing writes' gate asks about the org
+  the body's `tenant_id` names, and their routes carry no org in their path; `join-org`
+  asks the path's org before the body and the org the body names after it. The api
+  crate's unit test `gate_before_body` (`crates/api/src/gate_before_body.rs`) fails on
+  a new one that does not; its `BY_DESIGN` list holds the checks that need the body,
+  and only shrinks. ⚠️ It cannot see an ownership check (a message edit's author check
+  is one: only its integration test shows the order) or another extractor
+  (`Query<T>`, a typed `Path<T>`, `Form<T>`): those stay the reviewer's.
 - **A member's roles are the org's own, read where a rule is evaluated.** Only the
   ids of a membership row that are `roles` rows of THAT org count: read them through
   `TenantDao::get_member_permissions` (the bits), `member_live_role_ids` (one member)

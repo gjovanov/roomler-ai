@@ -116,7 +116,64 @@ pub fn record_worker_exit(err: &anyhow::Error, record: impl FnOnce(&str)) {
         );
         return;
     }
+    if err.downcast_ref::<MachineHeld>().is_some() {
+        tracing::info!(
+            "worker exit: another daemon of this machine holds the machine's guard. That is the \
+             device's state, not a crash: no crash record is written"
+        );
+        return;
+    }
     record(&format!("worker exit: {err:#}"));
+}
+
+/// #4280 — `run` found the machine's guard held (`machine_guard`): another
+/// roomlerd is already the daemon of this machine. A state of the device, like
+/// [`NoConfig`], and no fault: the run leaves before the single-instance lock and
+/// before anything host-global, so it marks, saves and counts nothing, and no
+/// crash is recorded for it ([`record_worker_exit`]). It leaves with the
+/// single-instance lock's code ([`machine_held_exit_code`]).
+#[derive(Debug)]
+pub struct MachineHeld {
+    key: &'static str,
+}
+
+impl MachineHeld {
+    /// The guard of this machine, keyed by its overlay interface's name.
+    pub fn here() -> Self {
+        Self {
+            key: crate::machine_guard::KEY,
+        }
+    }
+}
+
+impl std::fmt::Display for MachineHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another roomlerd is already the daemon of this machine (it holds the machine's guard \
+             for the overlay interface `{}`), so this one leaves before it touches the interface, \
+             its routes, the LocalAPI or the device's connection",
+            self.key
+        )
+    }
+}
+
+impl std::error::Error for MachineHeld {}
+
+/// #4280 — the code a `run` leaves with for [`MachineHeld`]: the single-instance
+/// lock's (`app::already_running_exit`), for the same reasons
+/// (`watchdog::ALREADY_RUNNING_EXIT_CODE`). 8 on Linux and Windows, where every
+/// supervisor leaves on it: the Windows service host (`ExitReaction::Stop`), the
+/// per-user task's launcher (`agents/roomlerdw`), systemd
+/// (`RestartPreventExitStatus`). 0 on macOS, where launchd's
+/// `KeepAlive{SuccessfulExit:false}` leaves on a clean exit and FR-43's
+/// supervisor records no crash for it.
+pub fn machine_held_exit_code() -> i32 {
+    if cfg!(any(target_os = "linux", windows)) {
+        crate::watchdog::ALREADY_RUNNING_EXIT_CODE
+    } else {
+        0
+    }
 }
 
 /// #4028 — the code the worker the Windows service host started exits with when
@@ -163,6 +220,10 @@ pub const NO_ENROLLMENT_EXIT_CODE: i32 = 78;
 pub fn exit_code(error: &anyhow::Error) -> Option<i32> {
     if error.downcast_ref::<InstallInFlight>().is_some() {
         return Some(INSTALL_IN_FLIGHT_EXIT_CODE);
+    }
+    // #4280 — a machine whose guard another daemon holds.
+    if error.downcast_ref::<MachineHeld>().is_some() {
+        return Some(machine_held_exit_code());
     }
     error
         .downcast_ref::<NoConfig>()
@@ -667,6 +728,42 @@ mod exit_code_tests {
         );
         // Its words alone are not the type.
         assert_eq!(exit_code(&anyhow::anyhow!("{}", InstallInFlight)), None);
+    }
+
+    /// #4280 — a `run` that found the machine's guard held leaves with the
+    /// single-instance lock's code, 8 on Linux and Windows and 0 on macOS, bare or
+    /// under a context, writes the line std writes, and records no crash. Its
+    /// words alone are not the type.
+    #[test]
+    fn a_held_machine_leaves_with_the_single_instance_code_and_records_no_crash() {
+        use super::MachineHeld;
+        let want = if cfg!(any(target_os = "linux", windows)) {
+            crate::watchdog::ALREADY_RUNNING_EXIT_CODE
+        } else {
+            0
+        };
+        assert_eq!(want, if cfg!(target_os = "macos") { 0 } else { 8 });
+        assert_eq!(exit_code(&MachineHeld::here().into()), Some(want));
+        let under_a_context = anyhow::Error::from(MachineHeld::here()).context("starting");
+        assert_eq!(exit_code(&under_a_context), Some(want));
+        assert_eq!(exit_code(&anyhow::anyhow!("{}", MachineHeld::here())), None);
+
+        let mut written: Vec<String> = Vec::new();
+        record_worker_exit(&MachineHeld::here().into(), |s| written.push(s.to_owned()));
+        assert!(written.is_empty(), "{written:?}");
+
+        let mut out = Vec::new();
+        let mut exited = None;
+        let res = leave_through(Err(MachineHeld::here().into()), &mut out, |code| {
+            exited = Some(code)
+        });
+        let err = res.expect_err("the error comes back only because this exit returns");
+        assert_eq!(exited, Some(want));
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            format!("Error: {err:?}\n")
+        );
+        assert!(err.to_string().contains(crate::machine_guard::KEY), "{err}");
     }
 
     /// FR-150 P2 — the code is 75, pinned: the launcher's table, the docs and the

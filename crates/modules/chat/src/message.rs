@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
@@ -319,11 +319,17 @@ pub async fn create(
     Ok(Json(response))
 }
 
+/// Edit a message: its author's, on a live message of the path room.
+///
+/// Decides who may edit before it reads its body (#4254): someone who is not
+/// the author gets the answer a missing message gets whatever the body is,
+/// and the author is answered a body that does not parse as the `Json`
+/// extractor answers it.
 pub async fn update(
     State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
-    Json(body): Json<UpdateMessageRequest>,
+    body: Result<Json<UpdateMessageRequest>, JsonRejection>,
 ) -> Result<Json<MessageResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -336,12 +342,17 @@ pub async fn update(
         crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
     // Only the author edits a message, and anyone else gets the answer a
-    // missing message gets: nothing is written, re-read or sent.
-    if message.author_id != auth.user_id
-        || !state
-            .messages
-            .update_content(tid, rid, mid, auth.user_id, body.content.clone())
-            .await?
+    // missing message gets: nothing is written, re-read or sent. The author
+    // check comes before the body, and a write that matches nothing (the
+    // message went in between) gets that same answer.
+    if message.author_id != auth.user_id {
+        return Err(ApiError::NotFound("Resource not found".to_string()));
+    }
+    let Json(body) = body?;
+    if !state
+        .messages
+        .update_content(tid, rid, mid, auth.user_id, body.content)
+        .await?
     {
         return Err(ApiError::NotFound("Resource not found".to_string()));
     }

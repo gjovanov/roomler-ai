@@ -237,7 +237,7 @@ flowchart TD
 
 - ⚠️ **A registered service that is not running is no sign of an enrollment.** A daemon with no config, and no last good
   copy of one that holds an enrollment (#4157), exits ("no config found … Run 'roomlerd enroll' first"), so a fresh system
-  install's service is registered and stopped. The macOS supervisor's enrolled worker exits even beside such a copy (78, as before), because a converted one-row Mac's person copy can hold the enrollment that moved to root (#4184).
+  install's service is registered and stopped. The macOS supervisor's enrolled worker exits even beside such a copy (78, as before), because on a one-row Mac an earlier release converted, the person's copy can hold the enrollment that moved to root (#4184).
   Only the config being there decides: a host with none still reads "Not enrolled" and is offered set-up. A per-user
   install is never asked about the service's config, not even a machine-wide copy left behind.
 - **Nothing is remembered.** A one-row Mac is told by its person's file with no enrollment
@@ -2550,7 +2550,7 @@ flowchart TD
 - **A restart, not a loop.** launchd relaunches the net's exit as it does any non-zero exit, one start per 10 s at most
   (the plist's `ThrottleInterval`). The net marks no clean shutdown, so a run that it ends before the run has been
   healthy for 5 minutes counts as a crash at the next start, as any other would, and the crash-loop rollback still
-  counts it (`app.rs:4376`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
+  counts it (`app.rs:4421`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
 - **Why a code of its own.** 9, `RESTART_REQUESTED_EXIT_CODE`, is a requested restart: it says no failure happened, and
   the macOS (FR-43) and Windows supervisors keep it out of their crash records. The net's exit is a failure, so it
   leaves with 32, `APPKIT_ENDED_EXIT_CODE`, which no other exit in the tree uses, which is outside the Linux units'
