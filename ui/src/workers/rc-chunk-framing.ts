@@ -161,6 +161,12 @@ export interface ChunkFramingResult {
    *  independent failures — each `gap` costs a keyframe request, and an
    *  IDR is the largest frame on the thinnest pipe. */
   gap: boolean
+  /** FR-148 P4b-5a — on a message that completed a frame, whether that frame
+   *  is a key frame, read from its record's header as the supersede rule
+   *  reads it; absent on every message that completed none. The worker counts
+   *  the key frames it completes whole by it, per channel, for the agent's
+   *  `path delivery` line. */
+  key?: boolean
 }
 
 /** How far back a `frame_seq` may be and still count as a late chunk of a
@@ -318,7 +324,8 @@ function placeChunk(
  *
  *  When `seq` is a KEY frame, nothing it overtook is lost: it needs no frame
  *  before it, so the older partials are stragglers and `gap` stays false
- *  (FR-148 P4b-2, the switch between the two video channels). */
+ *  (FR-148 P4b-2, the switch between the two video channels). The frame is
+ *  named a key frame or not in `key` (FR-148 P4b-5a). */
 function finish(
   st: ChunkFramingState,
   seq: number,
@@ -341,7 +348,7 @@ function finish(
     }
   }
   st.lastSeq = seq
-  return { payload: out, gap: abandoned }
+  return { payload: out, gap: abandoned, key }
 }
 
 /** Whether a whole record is a key frame: bit 0 of byte 4, the flags byte of

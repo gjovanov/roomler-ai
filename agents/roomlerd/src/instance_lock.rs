@@ -32,6 +32,12 @@
 //! uninstall`, `caps`, `displays`, `encoder-smoke`, `self-update` all
 //! stay runnable alongside a live agent — they're either short-lived
 //! diagnostics or modify external state, never the WS connection.
+//!
+//! #4403 (Windows): the service's own SYSTEM worker that holds the
+//! machine's guard (`machine_guard::relaxes_config_lock`) takes this lock
+//! with [`acquire_beside_guard`]. It takes every part that is free and
+//! holds it, so every other start finds the lock as before, and it goes on
+//! either way: for that worker the machine's guard decides.
 
 #[cfg(unix)]
 use anyhow::Context;
@@ -53,10 +59,12 @@ pub struct InstanceLock {
     // Both the new `Roomler-<id>` and legacy `RoomlerAgent-<id>` mutex
     // handles are held for the process lifetime; each `WinMutex::drop`
     // calls CloseHandle, releasing that name so a fresh acquire succeeds.
+    // `acquire` holds both; `None` is a part `acquire_beside_guard` did not
+    // take (#4403).
     #[cfg(target_os = "windows")]
-    _win_new: WinMutex,
+    _win_new: Option<WinMutex>,
     #[cfg(target_os = "windows")]
-    _win_legacy: WinMutex,
+    _win_legacy: Option<WinMutex>,
     #[cfg(unix)]
     _unix: std::fs::File,
 }
@@ -154,6 +162,13 @@ unsafe extern "system" {
 ///   - `Err` — CreateMutexW failed outright.
 #[cfg(target_os = "windows")]
 fn create_named_mutex(name: &str) -> Result<Option<WinHandle>> {
+    create_named_mutex_code(name)
+        .map_err(|err| anyhow::anyhow!("CreateMutexW failed for {name} (GetLastError={err})"))
+}
+
+/// [`create_named_mutex`], whose `Err` is CreateMutexW's `GetLastError` code.
+#[cfg(target_os = "windows")]
+fn create_named_mutex_code(name: &str) -> std::result::Result<Option<WinHandle>, u32> {
     const ERROR_ALREADY_EXISTS: u32 = 183;
     unsafe extern "system" {
         fn CloseHandle(handle: WinHandle) -> i32;
@@ -165,8 +180,7 @@ fn create_named_mutex(name: &str) -> Result<Option<WinHandle>> {
     // detection).
     let h = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name_w.as_ptr()) };
     if h.is_null() {
-        let err = unsafe { GetLastError() };
-        anyhow::bail!("CreateMutexW failed for {name} (GetLastError={err})");
+        return Err(unsafe { GetLastError() });
     }
     let last = unsafe { GetLastError() };
     if last == ERROR_ALREADY_EXISTS {
@@ -180,12 +194,20 @@ fn create_named_mutex(name: &str) -> Result<Option<WinHandle>> {
     Ok(Some(h))
 }
 
+/// A config's two names, the new one and the legacy one.
+#[cfg(target_os = "windows")]
+fn win_names(id: &str) -> (String, String) {
+    (
+        format!("Local\\Roomler-{id}"),
+        format!("Local\\RoomlerAgent-{id}"),
+    )
+}
+
 #[cfg(target_os = "windows")]
 fn win_acquire(id: &str) -> Result<AcquireOutcome> {
     // Acquire BOTH names so an OLD `RoomlerAgent-<id>` instance and a NEW
     // `Roomler-<id>` instance can't both run during the rename window.
-    let new_name = format!("Local\\Roomler-{id}");
-    let legacy_name = format!("Local\\RoomlerAgent-{id}");
+    let (new_name, legacy_name) = win_names(id);
 
     // New name first.
     let Some(new_h) = create_named_mutex(&new_name)? else {
@@ -204,9 +226,87 @@ fn win_acquire(id: &str) -> Result<AcquireOutcome> {
 
     // Both freshly created — hold both handles for the process lifetime.
     Ok(AcquireOutcome::Acquired(InstanceLock {
-        _win_new: new_mutex,
-        _win_legacy: WinMutex(legacy_h),
+        _win_new: Some(new_mutex),
+        _win_legacy: Some(WinMutex(legacy_h)),
     }))
+}
+
+/// #4403 (Windows) — a part of the lock: its new name or its legacy one.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    New,
+    Legacy,
+}
+
+/// #4403 (Windows) — a part [`acquire_beside_guard`] did not take.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotTaken {
+    pub part: Part,
+    /// `None`: another process holds it. `Some(code)`: CreateMutexW failed
+    /// with this `GetLastError` code.
+    pub error: Option<u32>,
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Display for NotTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let part = match self.part {
+            Part::New => "new",
+            Part::Legacy => "legacy",
+        };
+        match self.error {
+            None => write!(f, "{part}: held by another process"),
+            Some(code) => write!(f, "{part}: CreateMutexW failed (GetLastError={code})"),
+        }
+    }
+}
+
+/// #4403 (Windows) — what [`acquire_beside_guard`] took.
+#[cfg(target_os = "windows")]
+pub struct BesideGuard {
+    /// Holds each part it took for the process lifetime, as [`acquire`]'s
+    /// lock does.
+    pub lock: InstanceLock,
+    /// Each part it did not take, the new one first.
+    pub not_taken: Vec<NotTaken>,
+}
+
+/// #4403 (Windows) — this config's lock for the service's own SYSTEM worker
+/// that holds the machine's guard (`machine_guard::relaxes_config_lock`). It
+/// takes each part of the lock that is free and holds it for the process
+/// lifetime, as [`acquire`] does, so every later start on this config finds
+/// the lock as before. It never answers [`AcquireOutcome::AlreadyRunning`]:
+/// for that worker the machine's guard, not this lock, decides whether it
+/// runs. Every other run calls [`acquire`].
+#[cfg(target_os = "windows")]
+pub fn acquire_beside_guard(config_path: &Path) -> BesideGuard {
+    let (new_name, legacy_name) = win_names(&lock_id(config_path));
+    let mut not_taken = Vec::new();
+    let mut take = |part: Part, name: &str| match create_named_mutex_code(name) {
+        Ok(Some(handle)) => Some(WinMutex(handle)),
+        Ok(None) => {
+            not_taken.push(NotTaken { part, error: None });
+            None
+        }
+        Err(code) => {
+            not_taken.push(NotTaken {
+                part,
+                error: Some(code),
+            });
+            None
+        }
+    };
+    let new = take(Part::New, &new_name);
+    let legacy = take(Part::Legacy, &legacy_name);
+    BesideGuard {
+        lock: InstanceLock {
+            _win_new: new,
+            _win_legacy: legacy,
+        },
+        not_taken,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +453,112 @@ mod tests {
         assert!(
             matches!(b, AcquireOutcome::Acquired(_)),
             "different config paths must take different locks; second must succeed even while first is held"
+        );
+    }
+
+    /// Whether a part's name exists, by the same create a start uses. A
+    /// handle it opens is closed again at once.
+    #[cfg(target_os = "windows")]
+    fn exists(name: &str) -> bool {
+        match create_named_mutex(name).expect("CreateMutexW") {
+            Some(handle) => {
+                drop(WinMutex(handle));
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// #4403 — beside the machine's guard, a free lock is taken whole and held,
+    /// so a later strict start on the same config is refused as before, and
+    /// each part exists on its own for an older instance that knows only one.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn beside_the_guard_takes_a_free_lock_and_a_later_start_is_refused() {
+        let cfg = test_cfg_path("beside_free");
+        let taken = acquire_beside_guard(&cfg);
+        assert!(taken.not_taken.is_empty(), "{:?}", taken.not_taken);
+        assert!(taken.lock._win_new.is_some() && taken.lock._win_legacy.is_some());
+        assert!(
+            matches!(acquire(&cfg).unwrap(), AcquireOutcome::AlreadyRunning),
+            "a strict start after it must still report AlreadyRunning"
+        );
+        let (new_name, legacy_name) = win_names(&lock_id(&cfg));
+        assert!(exists(&new_name) && exists(&legacy_name));
+        drop(taken);
+        assert!(
+            matches!(acquire(&cfg).unwrap(), AcquireOutcome::Acquired(_)),
+            "the lock is released with the worker"
+        );
+    }
+
+    /// #4403 — beside the machine's guard, a part already held is not taken: the
+    /// acquire goes on, holds each part that was free and names each part it
+    /// did not take. Here this test holds the parts itself.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn beside_the_guard_goes_on_and_names_each_part_it_did_not_take() {
+        let held = NotTaken {
+            part: Part::New,
+            error: None,
+        };
+        // Both parts held: it holds none and names both.
+        let cfg = test_cfg_path("beside_both_held");
+        let AcquireOutcome::Acquired(_mine) = acquire(&cfg).unwrap() else {
+            panic!("this test takes the lock first");
+        };
+        let taken = acquire_beside_guard(&cfg);
+        assert!(taken.lock._win_new.is_none() && taken.lock._win_legacy.is_none());
+        assert_eq!(
+            taken.not_taken,
+            vec![
+                held,
+                NotTaken {
+                    part: Part::Legacy,
+                    ..held
+                }
+            ]
+        );
+        assert_eq!(
+            taken.not_taken[0].to_string(),
+            "new: held by another process"
+        );
+
+        // Only the legacy part held: it holds the new one, and a strict start
+        // after it is refused.
+        let cfg = test_cfg_path("beside_legacy_held");
+        let (_, legacy_name) = win_names(&lock_id(&cfg));
+        let _legacy = WinMutex(
+            create_named_mutex(&legacy_name)
+                .unwrap()
+                .expect("the legacy part is free"),
+        );
+        let taken = acquire_beside_guard(&cfg);
+        assert!(taken.lock._win_new.is_some() && taken.lock._win_legacy.is_none());
+        assert_eq!(
+            taken.not_taken,
+            vec![NotTaken {
+                part: Part::Legacy,
+                ..held
+            }]
+        );
+        assert!(matches!(
+            acquire(&cfg).unwrap(),
+            AcquireOutcome::AlreadyRunning
+        ));
+    }
+
+    /// #4403 — a part whose create failed is named with its code.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_part_not_created_is_named_with_its_code() {
+        let failed = NotTaken {
+            part: Part::Legacy,
+            error: Some(5),
+        };
+        assert_eq!(
+            failed.to_string(),
+            "legacy: CreateMutexW failed (GetLastError=5)"
         );
     }
 }

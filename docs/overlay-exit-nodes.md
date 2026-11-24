@@ -407,7 +407,7 @@ purge finishes on a thread of its own.
 The last two rows say any Normal-priority child waits this way, so the bound
 alone does not get such a start to its probe. The next children on that path
 were the four `icacls` steps of the config save every start makes for its crash
-bookkeeping (`agents/roomlerd/src/app.rs:4432`). A save now reads the
+bookkeeping (`agents/roomlerd/src/app.rs:4485`). A save now reads the
 directory's owner and DACL in-process and runs the steps only when they would
 change something
 ([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
@@ -446,7 +446,7 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:408`, `:424`, called at `agents/roomlerd/src/app.rs:4340` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
+| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:408`, `:424`, called at `agents/roomlerd/src/app.rs:4393` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
 | Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:889` (`purge_exit_dns_within`), `:1272` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
 | Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:625` (`run_cmd`), `:1314` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
 | A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:1256` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
@@ -604,7 +604,7 @@ flowchart LR
 | A pin is recorded the moment it is in, and forgotten when it is removed | `tun.rs` `add_host_exemption` / `del_host_exemption`, each OS arm | No exit, clean or not, can leave an unrecorded pin |
 | One record per address; a re-pin through a new uplink replaces it | `HostLedger::upsert_pin` | The purge must target the route that exists |
 | The purge removes a route only while it still matches the record | `tun::purge_pins` | Linux and Windows delete the exact (address, next hop, interface) route. macOS deletes only an unscoped static host route the table shows through the recorded next hop and interface, because `route delete` keys on the destination alone |
-| The post-exit purge runs only in a process that held the single-instance lock | `main.rs` `DAEMON_RAN`, set in `run_cmd` after `instance_lock::acquire` | On macOS a second `roomlerd run` returns through `main`; purging there would strip the **running** daemon's routes |
+| The post-exit purge runs only in a process that passed `run`'s gate (the machine's guard, then the single-instance lock) | `DAEMON_RAN`, set at the end of `start_gate` (`agents/roomlerd/src/app.rs:4031`) | On macOS a second `roomlerd run` returns through `main`; purging there would strip the **running** daemon's routes |
 | The Linux and macOS ledgers are believed only from a root-owned directory and file that nobody else may write | `host_ledger::store` (Unix) | Root acts on the ledger at boot |
 | Both halves go through one in-process ledger | `host_ledger::LEDGER` | The forwarding records and the pin records never overwrite each other |
 | (N12) Every ~3 s the client re-reads each family's uplink, adopts one that moved, and re-pins every pin the table does not show through it | `stale_host_exemptions` (each OS arm), pure decision `tun::stale_pins` | Wi-Fi to Ethernet, or a new network, under an active exit. A pin through the old next hop, or one an interface took with it when it went down, black-holes the endpoint it was pinned for |

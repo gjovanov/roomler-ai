@@ -299,7 +299,7 @@ every other device, and a per-device override outlives an agent losing a cell. T
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
 and telling nobody (`agents/roomlerd/src/signaling.rs:3990`), and the viewer ignores
 that track while it holds a DataChannel transport
-(`ui/src/composables/useRemoteControl.ts:10429`). The session reads connected, with a
+(`ui/src/composables/useRemoteControl.ts:10448`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
 watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:446`)
 runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
@@ -361,7 +361,7 @@ property over `PICKER_CODECS` × `PICKER_CHROMAS`
 
 ⚠️ Until #3651, HEVC and H.264 had no 4:2:0 value. "Standard (4:2:0)" was stored as
 plain `hevc` / `h264`, which follows the Priority dial: the dropdown snapped back to
-"Auto (follows Priority)", and on Sharper, the default dial (`useRemoteControl.ts:3819`), a pair that can
+"Auto (follows Priority)", and on Sharper, the default dial (`useRemoteControl.ts:3832`), a pair that can
 do 4:4:4 opened in 4:4:4. A plain `hevc` / `h264` stored before still means chroma
 Auto and still follows the dial.
 
@@ -376,7 +376,7 @@ flowchart LR
     ST -->|"connect: resolveChroma(chroma, dial, pairCan444)"| RQ["rc:session.request<br/>preferred_transport · chroma_pref"]
 ```
 
-| Codec × colour detail | Stored value | Settings: transport · chroma (`codecChoiceToSettings`, `useRemoteControl.ts:3888`) | What the request carries |
+| Codec × colour detail | Stored value | Settings: transport · chroma (`codecChoiceToSettings`, `useRemoteControl.ts:3901`) | What the request carries |
 |---|---|---|---|
 | HEVC × Auto | `hevc` | `data-channel-hevc` · `auto` | `chroma_pref: yuv444` on Sharper when both ends do HEVC 4:4:4, else none (4:2:0) |
 | HEVC × Standard (4:2:0) | `hevc-420` | `data-channel-hevc` · `yuv420` | no `chroma_pref` (4:2:0), whatever the dial: the request HEVC × Auto sends on Balanced |
@@ -385,10 +385,10 @@ flowchart LR
 | H.264 × Standard (4:2:0) | `h264-420` | `data-channel-h264` · `yuv420` | no `chroma_pref`: the 4:2:0 cell, which the browser decodes in hardware |
 | H.264 × Crisp text (4:4:4) | `h264-444` | `data-channel-h264` · `yuv444` | `chroma_pref: yuv444` when both ends do it |
 | VP9 × Auto / 4:2:0 / 4:4:4 | `vp9` / `vp9-420` / `vp9-444` | `data-channel-vp9-444` · `auto` / `yuv420` / `yuv444` | Auto follows the dial; an explicit chroma is sent as `chroma_pref` |
-| Auto × Auto / 4:2:0 / 4:4:4 | `auto` / `auto-420` / `auto-444` | `auto` · `auto` / `yuv420` / `yuv444` | the auto rank; an explicit chroma pins it (`pickAutoTransport`, `useRemoteControl.ts:3694`) |
+| Auto × Auto / 4:2:0 / 4:4:4 | `auto` / `auto-420` / `auto-444` | `auto` · `auto` / `yuv420` / `yuv444` | the auto rank; an explicit chroma pins it (`pickAutoTransport`, `useRemoteControl.ts:3707`) |
 | AV1 × any | `av1` | `data-channel-av1` · `auto` | none: AV1 has one chroma in a session |
 
-With the legacy H.264 mapping (`roomler-rc-h264-rtp=1`, `useRemoteControl.ts:2963`), `h264` and
+With the legacy H.264 mapping (`roomler-rc-h264-rtp=1`, `useRemoteControl.ts:2976`), `h264` and
 `h264-420` take the RTP track and `<video>` (`webrtc` · `auto` / `yuv420`). That track
 is 4:2:0 only, so both send the same request. `h264-444` ignores the flag, because the
 RTP track cannot carry 4:4:4.
@@ -402,12 +402,12 @@ Two stores hold the choice:
 
 | Store | What it holds | Written | Read |
 |---|---|---|---|
-| per device | `roomler-rc-codec.v1:<agent id>` = the value | at connect, for a pick made on this page (`codecConnectAction`, `useRemoteControl.ts:2458`; `persistCodecChoice`, `:2442`) | at connect, through the persist-free apply path (`readStoredCodecChoice`, `:2430`; `applyCodecChoiceSettings`, `:8281`); a value not in the list reads as no override |
-| per browser, the default of a device with no override of its own | the settings, in four keys: `roomler-rc-video-transport.v2`, `roomler-rc-vp9-chroma`, `roomler-rc-preferred-codec`, `roomler-rc-render-path` | by the picker's setter (`codecChoice`, `useRemoteControl.ts:8263`) | at page load: the dropdowns show `settingsToCodecChoice(transport, chroma)` (`:3969`), which reads an explicit chroma back on every transport that can carry it |
+| per device | `roomler-rc-codec.v1:<agent id>` = the value | at connect, for a pick made on this page (`codecConnectAction`, `useRemoteControl.ts:2458`; `persistCodecChoice`, `:2442`) | at connect, through the persist-free apply path (`readStoredCodecChoice`, `:2430`; `applyCodecChoiceSettings`, `:8300`); a value not in the list reads as no override |
+| per browser, the default of a device with no override of its own | the settings, in four keys: `roomler-rc-video-transport.v2`, `roomler-rc-vp9-chroma`, `roomler-rc-preferred-codec`, `roomler-rc-render-path` | by the picker's setter (`codecChoice`, `useRemoteControl.ts:8282`) | at page load: the dropdowns show `settingsToCodecChoice(transport, chroma)` (`:3982`), which reads an explicit chroma back on every transport that can carry it |
 
 The transport key's reader, `readStoredVideoTransport`
-(`ui/src/composables/useRemoteControl.ts:3074`), checks the stored value against the one
-list of transports, `RC_VIDEO_TRANSPORTS` (`ui/src/composables/useRemoteControl.ts:3031`).
+(`ui/src/composables/useRemoteControl.ts:3087`), checks the stored value against the one
+list of transports, `RC_VIDEO_TRANSPORTS` (`ui/src/composables/useRemoteControl.ts:3044`).
 The type `RcVideoTransport` derives from that list, as `RcCodecChoice` derives from
 `RC_CODEC_CHOICES`, so a transport added to the list is read back after a reload with
 no second edit. A value not in the list, or a page whose storage the browser refuses,
@@ -421,14 +421,14 @@ as transport `auto` on a device with no override of its own: the chroma, a key o
 own, survived, and the codec did not. #4101 stores nothing new. A stored
 `data-channel-h264` is the value every H.264 pick has written, and it now reads as
 itself, so after the upgrade such a device opens on H.264 instead of the auto rank. The
-key stays `roomler-rc-video-transport.v2` (`ui/src/composables/useRemoteControl.ts:3045`),
+key stays `roomler-rc-video-transport.v2` (`ui/src/composables/useRemoteControl.ts:3058`),
 because a new key would reset every stored pick.
 
 A page from before #3651 that reads what a newer page stored (a tab in a session does
 not reload, and a roll can go back) stays safe. The per-device `hevc-420` / `h264-420`
 read as no override there and stay stored. The per-browser keys hold only values that
 page knows: `hevc-420` shows as HEVC × Auto and still asks for 4:2:0, because connect
-reads the chroma key directly (`resolveChroma`, `useRemoteControl.ts:11693` for HEVC, `:11589` for H.264),
+reads the chroma key directly (`resolveChroma`, `useRemoteControl.ts:11712` for HEVC, `:11608` for H.264),
 and `h264-420` shows as Auto × Standard (4:2:0) and runs the auto rank at 4:2:0. A page
 from before #4101 still reads a stored `data-channel-h264` as `auto`, as it always did.
 
@@ -1814,7 +1814,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:859`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6769`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6822`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -1828,11 +1828,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:7002`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:7055`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:7031`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:7084`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst

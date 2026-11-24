@@ -228,7 +228,7 @@ agents/
   roomler-desktop/    → the tray companion (devices, tunnels, settings, consent)
   roomler-setup/      → Tauri 2 unified install wizard (lib `wizard_app`)
 ui/src/               → api/ · components/ · composables/ · stores/ · views/ · plugins/ (docs/ui.md)
-scripts/              → dev-xvfb.sh · e2e-*.sh · name-audit.sh · fr-*.sh · anchor-*.sh · signing/
+scripts/              → dev-xvfb.sh · e2e-*.sh · name-audit.sh · says-roomlerd.cjs · fr-*.sh · anchor-*.sh · signing/
 ```
 
 **Crate dependency flow**: `config` ← `db` ← `remote_control` ← `services` ← `api`;

@@ -1,0 +1,404 @@
+# FR-133 P4 — the baseline of scripts/says-roomlerd.cjs: the person-facing "agent"s that are
+# known and owned, as a count per FILE (never a line number), grouped by surface under the owner
+# that removes them. `--check` fails when a file holds more than its count; a PR that only removes
+# them never fails. A count moves only with `node scripts/says-roomlerd.cjs --update-baseline`,
+# committed with the reason. The quoted lines under a row are the words around each hit when it
+# was written (identities left out): a pointer for the owner, not part of the check.
+#
+## daemon · owner FR-133 follow-up · 1 file · 4 hits
+4	crates/tunnel-core/src/policy.rs
+#	"client tenant {} ≠ agent tenant {}"
+#	"agent has been deleted"
+#	"agent is quarantined"
+#	"agent missing _id"
+#
+## companion · owner FR-133 follow-up · 0 files · 0 hits
+#
+## server · owner FR-133 follow-up · 21 files · 60 hits
+7	crates/api/src/growth/render.rs
+#	"Agent crashes"
+#	"Agent version"
+#	"Agent crashes"
+#	"Agent version"
+#	"By agent version"
+#	"Agent crashes"
+#	"Agent version"
+1	crates/api/src/ws/handler.rs
+#	"agent role: no credential"
+5	crates/modules/fleet/src/agent.rs
+#	"agent missing _id"
+#	"agent missing _id"
+#	"agent missing _id"
+#	"agent missing _id"
+#	"pin {pin} is older than the agent's current { } — a stale pin \ would DOWNGRADE this device; pass force=true t…"
+3	crates/modules/fleet/src/agent_exec.rs
+#	"device runs agent {} which predates Fleet RPC — update it to use \ the device console"
+#	"…uns commands as the person at its screen, and the agent it \ runs cannot: update the agent"
+#	"this device's agent cannot run commands as the person at its screen: update it, \ or run commands as root"
+3	crates/modules/fleet/src/agent_log.rs
+#	"tenant_id in route does not match agent JWT"
+#	"in route does not match agent JWT"
+#	"browser source not accepted on agent-authed route"
+1	crates/modules/fleet/src/agent_org.rs
+#	"{} runs agent {} which predates remote org-join. Update the device \ (or enroll it at the keyboard with `rooml…"
+3	crates/modules/fleet/src/auth_agent.rs
+#	"agent has been deleted"
+#	"agent is quarantined"
+#	"agent lookup: {other}"
+1	crates/modules/fleet/src/exec_service.rs
+#	"agent lookup: {other}"
+1	crates/modules/fleet/src/hub.rs
+#	"no agent"
+1	crates/modules/fleet/src/removal.rs
+#	"agent missing _id"
+4	crates/modules/fleet/src/socket.rs
+#	"Unauthorized (agent)"
+#	"Invalid agent ID"
+#	"Unauthorized (agent)"
+#	"Unauthorized (agent)"
+1	crates/modules/network/src/derp.rs
+#	"Invalid agent ID"
+4	crates/modules/network/src/routes/agent_ssh.rs
+#	"Invalid agent id"
+#	"Agent not found"
+#	"this device's agent cannot run SSH sessions as the person at its screen: update \ it, or name a local account …"
+#	"this device's agent does not honour consent_mode yet (needs the P5d agent); \ it would accept `{:?}` and ignor…"
+1	crates/modules/network/src/routes/overlay_key.rs
+#	"this device's agent predates overlay-key rotation (needs 0.4.25 or later) — \ push an update first, then rotat…"
+9	crates/modules/network/src/tunnel.rs
+#	"agent { } does not exist"
+#	"agent belongs to a different tenant"
+#	"agent is quarantined or deleted"
+#	"agent is homed on another pod; re-dial and retry"
+#	"originating agent is quarantined or deleted"
+#	"agent row vanished"
+#	"agent row vanished"
+#	"agent unreachable: {e}"
+#	"agent unreachable: {e}"
+1	crates/modules/remote/src/controller.rs
+#	"agent is homed on another pod; re-dial and retry"
+2	crates/modules/remote/src/extauth.rs
+#	"the device's agent is too old to be sent an external login"
+#	"the device's agent can verify an external login but is too old to admit the session"
+4	crates/remote_control/src/error.rs
+#	"agent {0} not online"
+#	"agent {0} not found"
+#	"agent capacity exceeded"
+#	"device {0} runs an agent without Fleet-RPC support"
+4	crates/remote_control/src/models.rs
+#	"this device's agent is too old for external access — it cannot tell the \ person at the machine that the contr…"
+#	"this device's agent does not support roomler SSH (needs a build with the \ ssh-server feature)"
+#	"…utes or more ahead; fix that clock, or update its agent to 0.4.202 or later"
+#	"this device's agent cannot hold an to one command (needs a \ build that advertises ssh-one-command)"
+1	crates/remote_control/src/signaling.rs
+#	"tunnel session not open on agent"
+3	crates/services/src/auth/mod.rs
+#	"Not an agent token"
+#	"Not an agent token"
+#	"Not an agent service token"
+#
+## install-scripts · owner FR-133 follow-up · 1 file · 3 hits
+3	agents/roomlerd/packaging/macos/postinstall
+#	"…unchd loads it at the next login and the per-user agent comes back."
+#	"is no per-user agent to go back to. To remove Roomler from it, run:"
+#	"…mler …' (an unprivileged 'roomler' finds the user agent)."
+#
+## display-identity · owner FR-133 follow-up · 1 file · 1 hit
+1	agents/roomlerd/packaging/linux/README.Debian
+#	"# (and the agent with it) exits when you log out:"
+#
+## wizard · owner FR-129 phase C · 0 files · 0 hits
+#
+## docs-site · owner FR-133 P3 · 49 files · 242 hits
+5	ui/docs/content/architecture/index.md
+#	"…ether — one control plane, three data planes, one agent per machine, and a server that coordinates without eve…"
+#	"- **One daemon per machine** icon:shield — the agent is simultaneously the remote-desktop target, the mesh nod…"
+#	"- **[The agent]** icon:terminal — What runs on a machine, and why it is one process."
+#	"…ganization?'* — no, and not out of licensing: the agent owns"
+#	"The supported answer is one agent with several enrollments — see"
+5	ui/docs/content/architecture/system-overview.md
+#	"The pieces of a Roomler deployment — agent, CLI, server and browser — and how a remote session travels through…"
+#	"…es only control messages with the browser and the agent, while pixels, input, mesh traffic, tunnels and SSH fl…"
+#	"| **The agent** ( ) | A native binary: remote-desktop target, mesh node, tunnel endpoint, SSH server | Every m…"
+#	"Each agent holds one long-lived connection to the server. Everything the server"
+#	"…ted service runs several server instances. Users, agents and rooms in one"
+10	ui/docs/content/architecture/the-agent.md
+#	"The agent"
+#	"[architecture, agent, design, windows, macos, linux]"
+#	"One agent binary on each machine, serving remote desktop, the mesh, tunnels and SSH at once"
+#	"| The network adapter, with a fixed name | Two agents cannot both own it |"
+#	"| Routing, firewall and DNS state | Two agents would fight over it |"
+#	"breaks on every row of that table. One agent with several enrollments is the"
+#	"Alongside it: — a small shim that re-execs the agent's own command"
+#	"The agent token, and the SSH host private key if SSH is enabled. Written with"
+#	"The agent updates itself, and the update path is where most of its defensive"
+#	"Idle, the agent is small: a control connection, a heartbeat and occasional path"
+1	ui/docs/content/architecture/what-the-server-sees.md
+#	"… code is public.** The server is AGPL-3.0 and the agent is MPL-2.0, so the claims on this page are checkable r…"
+3	ui/docs/content/compare/index.md
+#	"a WireGuard-style overlay network, on one agent, one identity and one server you"
+#	"What none of them does is **both lanes on one agent**."
+#	"… run Tailscale *and* RustDesk you are running two agents, two control"
+4	ui/docs/content/compare/meshcentral.md
+#	"agent-based, browser-based remote control of a fleet, free and open source"
+#	"…terface, reaching devices that will never run its agent."
+#	"| Licence | AGPL server / MPL agent | Apache-2.0 |"
+#	"…*You need to reach devices that will never run an agent**, via RDP or VNC relaying → MeshCentral."
+3	ui/docs/content/compare/netbird.md
+#	"then a separate product with its own agent, control plane and permissions."
+#	"… **You want the network *and* the screen from one agent** → Roomler."
+#	"…osing a stack rather than a product** → count the agents you will be running in a year."
+4	ui/docs/content/compare/rustdesk.md
+#	"…SSH session needs no second product and no second agent."
+#	"The server is AGPL-3.0, the agent MPL-2.0, and the split is documented with what"
+#	"…you intend to offer the product as a service. The agent's licence is"
+#	"5. **You need one agent, one identity and one audit trail** → Roomler."
+4	ui/docs/content/compare/tailscale.md
+#	"…oid, Synology, QNAP, routers, embedded. Roomler's agent is Windows, Linux and macOS, and its viewer is Chromiu…"
+#	"another agent. With Roomler the machine you just reached is already viewable in"
+#	"The server is AGPL-3.0 and the agent MPL-2.0, and self-hosting is a supported"
+#	"…emote desktop** → Roomler, or you are running two agents forever."
+2	ui/docs/content/compare/teamviewer.md
+#	"The same agent puts the machine on a WireGuard-style mesh, so after the session"
+#	"Server AGPL-3.0, agent MPL-2.0. The agent's licence is deliberately chosen so a"
+11	ui/docs/content/faq/index.md
+#	"Roomler is three products on one agent: a browser-based remote desktop, a private"
+#	"calls. You install one agent per machine and use everything from a browser tab."
+#	"machine you are reaching runs an agent."
+#	"that lane. Roomler's difference is that the same agent is also a remote desktop"
+#	"and an SSH server, so you are not running two agents, two control planes and two"
+#	"Usually, yes. Agents need only outbound access and never an inbound port. With"
+#	"…On Windows, freezing at the lock screen means the agent is not"
+#	"Yes — one agent with several enrollments. Do not install a second copy of the"
+#	"agent: it would fight the first over the network adapter, the local socket and"
+#	"… Note that joining a second organization needs an agent"
+#	"Yes. The server is AGPL-3.0 and the agent that runs on your machines is MPL-2.0."
+2	ui/docs/content/index.md
+#	"…style mesh network, and team chat and video — one agent, on Windows, macOS and Linux."
+#	"…products on one small daemon**. You install **one agent per"
+5	ui/docs/content/network/ephemeral-nodes.md
+#	"| Restarting the agent | The same device comes back | A **new** device |"
+#	"**restarting an ephemeral agent produces a second device**, with a new address."
+#	"- **On a clean stop**, the agent removes itself as it shuts down. A Windows"
+#	"An update that restarts the agent does **not** count as a shutdown — otherwise"
+#	"Ephemeral enrollment currently applies to full agents. A tunnel-only client"
+2	ui/docs/content/network/index.md
+#	"The mesh is part of the agent, not a separate install. On Windows and Linux it"
+#	"comes up with the agent. On macOS it needs the **root half** of the install,"
+6	ui/docs/content/network/multi-org.md
+#	":::danger Do not install a second copy of the agent"
+#	"…is the intuitive answer and it does not work. The agent owns things that are"
+#	"One agent, several enrollments, is the supported shape."
+#	"…ation does **not** start its connection until the agent"
+#	"that, restart the agent."
+#	"…5). Like the mesh itself on a Mac, it runs in the agent's system half, which runs as root."
+3	ui/docs/content/network/socks5.md
+#	"roomler socks5 <agent-id> --local 1080"
+#	"curl --socks5-hostname localhost:1080 http://<agent-id>:8080/"
+#	"There is no flag. Naming an agent scopes the proxy to it; not naming"
+3	ui/docs/content/network/ssh.md
+#	"The agent intercepts SSH traffic **below the operating system's socket layer**:"
+#	"into the agent before the OS ever sees them."
+#	"| | root | the agent's own account: SYSTEM on a service install, the signed-in user on an attended one |"
+2	ui/docs/content/network/subnet-routers.md
+#	"…hypervisors and appliances that will never run an agent."
+#	"Some things on a network will never run an agent — a printer, a NAS, a switch's"
+7	ui/docs/content/network/tunnels.md
+#	"agent."
+#	"…lhost:5432 -> [ your machine ] ==mesh==> [ remote agent ] -> db.internal:5432"
+#	"roomler forward <agent-id> --local 5432 --remote localhost:5432"
+#	"hand it to the local agent instead — so it survives the CLI exiting — add"
+#	"For a forward you always want, declare it in the agent's configuration instead"
+#	"of opening it by hand. The agent reconciles declared routes on every start, so"
+#	"roomler route add <agent-id> --local 5432 --remote localhost:5432"
+5	ui/docs/content/reference/api.md
+#	"| An agent | Its own long-lived agent credential |"
+#	"…udience-checked: a user token is refused where an agent token is"
+#	"Agent-authenticated routes load the device row and refuse a revoked or removed"
+#	"…t carries chat, presence, call signalling and the agent"
+#	"protocol. The same endpoint serves users and agents with different credential"
+9	ui/docs/content/reference/cli.md
+#	"…ommand-line tool. On a machine that also runs the agent it is"
+#	"a thin shim onto the agent's own command surface, so the two can never disagree"
+#	"| | Every peer the local agent sees, with its live connection type |"
+#	"| | Flows the local agent is currently running |"
+#	"| | Tail the agent's log, resolved **by** the agent — the path differs per process and platform |"
+#	"| | Hand the flow to the local agent so it outlives this command |"
+#	"Forwards the agent re-establishes on every start:"
+#	"roomler diag pair <other-agent-id> # both ends, side by side"
+#	":::warning refuses on a machine that runs the agent"
+12	ui/docs/content/reference/configuration.md
+#	"The agent's config.toml — where it lives per platform, the settings worth knowing, and which ones the server c…"
+#	"[reference, configuration, agent, security, admin]"
+#	"The agent reads one per machine."
+#	"It holds the agent token and, if SSH is enabled, the SSH host private key. It is"
+#	"| | Declared forwards the agent re-establishes on every start |"
+#	"…m a parked feature, such as the , and settings of agent"
+#	"…ssions, stay in the file through every save: this agent no longer reads them or warns about"
+#	"covers every local address. The agent warns when its port shadows an existing"
+#	"| | on | Let the agent update itself |"
+#	"Running a second agent against a separate config file does **not** give it a"
+#	":::warning The agent will not restart itself"
+#	"unsupervised agent would take that machine permanently offline. Restart it"
+2	ui/docs/content/reference/index.md
+#	"The exact surfaces — every roomler command, every agent configuration key, which ports are needed, and how the…"
+#	"- **[Configuration]** icon:blueprint — Agent keys, where the file lives per platform, and which settings the s…"
+17	ui/docs/content/reference/platform-support.md
+#	"These tables describe agent 0.4.170; a row that names a later version is coming"
+#	"… of this page follows from one question: does the agent run as the"
+#	"free port for the agent, and your apps reach the other devices through that"
+#	"| The computer's sound | ✅ | ✅ | ✅ from agent 0.4.161 |"
+#	"… with sound | ✅ | ✅ | ✅ the computer's sound from agent 0.4.161; the microphone from agent 0.4.163, and where …"
+#	"… ✅ X11 · ⛔ Wayland: the desktop app asks | ✅ from agent 0.4.153 · before it, the desktop app asks |"
+#	"…st is locked' before you connect | ✅ | ❌ | ✅ from agent 0.4.150 |"
+#	"… locked' while you are connected | ✅ | ✅ | ✅ from agent 0.4.150 |"
+#	"…er | ✅ | ✅ system installs, and X11 desktops from agent 0.4.147; a per-user Wayland desktop draws it into the …"
+#	"…✅ | ✅ X11 · 🟡 Wayland: Xwayland windows | ✅ from agent 0.4.159 |"
+#	"… ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148; on GNOME the layout is shown, and you switch …"
+#	"…ext on a non-US layout | ✅ | ✅ on any layout from agent 0.4.147; before it, a system install types only on a U…"
+#	"…tops with one screen and a per-user install, from agent 0.4.148, and the agent's own virtual desktop · ❌ Wayla…"
+#	"… ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148 · ❌ Wayland desktops and system installs: on r…"
+#	"| The setup wizard installs the agent | ✅ | ✅ since 2026-10-30 | ✅ since 2026-10-30 |"
+#	"| Processors the agent runs on | 🟡 x64; ❌ ARM | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel |"
+#	"…nux ARM | — | ✅ from 0.4.149: the wizard with the agent release, the tunnel client with the first tunnel relea…"
+4	ui/docs/content/reference/ports-and-firewall.md
+#	"The short version: **agents need outbound access and no inbound ports at all.**"
+#	"## What an agent needs"
+#	"Wherever a download comes from, the agent checks it before installing: the"
+#	"against a key built into the agent."
+4	ui/docs/content/remote-desktop/codecs-and-performance.md
+#	"The broadest support of the three. On startup the agent probes what the machine"
+#	"The agent's capability probe runs in a **separate process** on purpose: a"
+#	"than the agent. Before that, a bad driver could restart the agent straight back"
+#	"…egotiates a format and then produces nothing. The agent"
+1	ui/docs/content/remote-desktop/consent.md
+#	"The agent tries a chain of surfaces in order and **logs which one it used**:"
+5	ui/docs/content/remote-desktop/files-and-clipboard.md
+#	"On a machine whose agent runs as a system service, on Windows or on Linux, file"
+#	"(older agents used ), where only the service may read"
+#	"…inux desktop on X11 with a per-user install (from agent 0.4.148) and a Mac (from agent 0.4.154); elsewhere tex…"
+#	"- **A Linux machine whose agent runs as a system service outside any desktop session has no clipboard to share…"
+#	"- **A Mac sends the computer's sound from agent 0.4.161.** An older Mac sends none, which surprises people exp…"
+3	ui/docs/content/remote-desktop/index.md
+#	"Any machine running the agent can be opened as a **live screen in a browser"
+#	"…icon:monitor — only the machine you reach runs an agent."
+#	"| **Target** | The agent, and whatever screen-capture permission the OS demands. |"
+11	ui/docs/content/remote-desktop/per-os-permissions.md
+#	"is **which desktop** the agent can see."
+#	"it means the agent is not running in system mode. Re-install with"
+#	"indefinitely. The agent detects a stream that has delivered nothing and rebuilds"
+#	"includes the microphone (from agent 0.4.163). macOS asks the first time one"
+#	"the screen ( ), macOS asks the same way from agent"
+#	"0.4.168. Agents 0.4.166 and 0.4.167 refuse the microphone by name there,"
+#	"…cOS never asked, rather than record silence. From agent 0.4.170 the"
+#	"and opens the right pane. The agent also probes both at startup and reports the"
+#	"Linux depends on the display server, and the agent detects which one at session"
+#	"…demand, and if nothing has ever triggered it, the agent"
+#	"…ecting | A capture handle that came up empty; the agent rebuilds it |"
+3	ui/docs/content/remote-desktop/recording.md
+#	"- **macOS** records computer audio from agent 0.4.161 and the microphone from"
+#	"agent 0.4.163, or 0.4.168 where the root half runs the screen. The first time,"
+#	"- Recording arrived with agent **0.4.110**. A machine on an older agent shows no"
+4	ui/docs/content/remote-desktop/unattended-access.md
+#	"…l with the **Machine — system** service mode. The agent then runs as a"
+#	"): the agent then reads whatever the screen shows, the login screen"
+#	"**A headless machine** — enable the agent's virtual-display mode in its"
+#	"something is broken. Two alternatives ride the agent's existing control"
+2	ui/docs/content/security/device-policies.md
+#	":::warning Commands inherit the agent's identity"
+#	"It runs over the agent's **control connection**, not the mesh — deliberately, so"
+6	ui/docs/content/security/security-model.md
+#	"| Agent to server (control) | TLS |"
+#	"…desktop session | End to end, between browser and agent |"
+#	"## Agents"
+#	"Each agent has its own long-lived credential, bound to one machine and one"
+#	"checked on every request the agent makes, not only at connect time."
+#	"The server is AGPL-3.0 and the agent is MPL-2.0. Every claim on this page is"
+3	ui/docs/content/security/signed-releases.md
+#	"The agent updates itself, and it runs what it downloads **as the machine's most"
+#	"… one hostname, which is the difference between an agent that can update"
+#	"…he manifest's hash. On machines that also run the agent this"
+8	ui/docs/content/start/enrollment.md
+#	"3. It installs the agent and registers the service or task."
+#	"…*, and receives back a device id and a long-lived agent credential, which are written to the agent's config fi…"
+#	"5. The agent opens its control connection, and the machine appears under **Devices**."
+#	"The agent derives a **stable machine identity** from the hardware, and the pair"
+#	"agent credential, releases the machine's mesh address back to the pool, and"
+#	"…rganization's connection does not start until the agent restarts. Until"
+#	"The agent writes its credential into :"
+#	"It holds the agent token and, if SSH is enabled, the SSH host private key. It is"
+3	ui/docs/content/start/index.md
+#	"Create a workspace, install the Roomler agent on Windows, macOS or Linux, and reach your first machine from a …"
+#	"…king setup is three things: **a workspace**, **an agent on a"
+#	"3. **Install the agent** on the machine you want to reach, pasting the token into the command. One line, or on…"
+6	ui/docs/content/start/install/linux.md
+#	"Install the Roomler agent on Linux with one command — as a root systemd service or a per-user unit — including…"
+#	"**Tunnels only** — just the CLI, no agent:"
+#	"…isplay can still be reached as a **desktop**: the agent's"
+#	"contains the agent token, and — if you enable SSH — the SSH host"
+#	"The agent's own updater verifies the GPG signature against a key **pinned inside"
+#	"The agent self-updates on a timer, verifying the signature before handing off to"
+6	ui/docs/content/start/install/macos.md
+#	"Install the Roomler agent on macOS, grant the two privacy permissions it needs, and add the root half if you w…"
+#	"macOS is the one platform where the agent runs as **two processes**, and it is"
+#	"pane. The agent also probes both at startup, logs what is missing, and reports"
+#	"| | The agent itself. A background service with nothing to launch, so deliberately not in — but still a bundle…"
+#	"| | The agent on , for and . A symlink into the bundle, not a second copy. |"
+#	"per-user agent and the menu-bar app (for every account that has them), then the"
+6	ui/docs/content/start/install/windows.md
+#	"Install the Roomler agent on Windows with the signed MSI, the setup wizard or one PowerShell line — and pick t…"
+#	"Windows has **three ways to run the agent**, and the choice matters more here"
+#	"| | The agent — remote-desktop target, mesh node, tunnel endpoint, SSH server |"
+#	"… be and the signer should name **G ROX LTD**. The agent's"
+#	"contains the agent token, and — if you enable SSH — the SSH host"
+#	"The agent updates itself: it polls for a new release on a timer, verifies the"
+3	ui/docs/content/start/quickstart.md
+#	"## 3 · Install the agent"
+#	"…*Online** | The server holds a live socket to the agent. Everything works. |"
+#	"Remote desktop works on its own, but the same agent can also put the machine on"
+1	ui/docs/content/start/self-hosting.md
+#	"The server is **AGPL-3.0**; the agent that runs on your machines is **MPL-2.0**."
+9	ui/docs/content/start/tunnel-cli.md
+#	"…wards and a SOCKS5 proxy without running the full agent."
+#	"Not every machine needs the full agent. If you only want to **open tunnels"
+#	"## Agent or tunnel client?"
+#	"| Capability | Agent ( ) | Tunnel client ( ) |"
+#	"If you want to **reach** the machine, install the agent. If you want to **reach"
+#	"roomler forward <agent-id> --local 5432 --remote localhost:5432"
+#	":::warning On a machine that also runs the agent, refuses"
+#	"That is deliberate. On an agent host the installer owns the whole node stack,"
+#	"and the command is a thin shim that re-execs the agent's own command"
+4	ui/docs/content/start/verify-your-install.md
+#	"Confirm the Roomler agent is running, enrolled, reachable and on the mesh — and verify the artifact you instal…"
+#	"An agent can be perfectly connected to the control plane while having **no mesh"
+#	"…*Online** | The server holds a live socket to the agent | Nothing |"
+#	"… name** that makes the signature mean 'ours'. The agent's"
+6	ui/docs/content/start/what-is-roomler.md
+#	"…WireGuard-style mesh network on one self-hostable agent, with team chat and video included."
+#	"VPN** to reach a service. Roomler is one agent that is *both*, plus the team"
+#	"A 9-minute tour: installing the agent on Windows, macOS and Linux, connecting"
+#	"- **One daemon per machine** icon:shield — The agent is simultaneously the remote-desktop target, the mesh nod…"
+#	"| **The agent** ( ) | A native binary — the remote-desktop target, the mesh node, the tunnel endpoint, the SSH…"
+#	"…c, ssh, diagnostics | Same machine, alongside the agent |"
+4	ui/docs/content/troubleshooting/black-screen.md
+#	"| Frozen at a lock screen or UAC prompt | Windows agent not in system service mode |"
+#	"…nlocked can return empty frames indefinitely. The agent"
+#	"- **A GPU driver that fell over.** The agent's capability probe runs in a separate process specifically so a d…"
+#	"The agent reports its capture state, so you can tell 'no permission' from 'no"
+3	ui/docs/content/troubleshooting/collecting-diagnostics.md
+#	":::tip Diagnostics live in the CLI, not in the agent"
+#	"fleet-wide agent rollout. If someone asks you to run a subcommand you do"
+#	"- ** holds the agent token** and, with SSH enabled, the SSH host private key. Do not paste it."
+8	ui/docs/content/troubleshooting/device-offline.md
+#	"…*Online** | The server holds a live socket to the agent | Fine |"
+#	"### 2 · Is the agent running?"
+#	"The agent needs outbound HTTPS. It does **not** need any inbound port."
+#	"…the dashboard has had its credential revoked. The agent will"
+#	"The agent rolls back a version that crash-loops. If the machine reports a"
+#	"the same agent. The tell is a service that is perpetually in an"
+#	"Recent agents detect this themselves and reconnect within about two minutes. If"
+#	"it persists, restart the agent."
+2	ui/docs/content/troubleshooting/install-problems.md
+#	"The agent needs outbound HTTPS and no inbound ports. From the machine:"
+#	"… for **two** enabled units trying to run the same agent."
+#
