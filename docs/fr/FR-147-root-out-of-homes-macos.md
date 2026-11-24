@@ -282,7 +282,7 @@ its `.prev` before it writes it as the config, both the way every write of the c
 changes anything, so a `.prev` the person may not write, one another account owns among them, is replaced. Where the
 name still cannot be replaced (a folder there, a file locked by a flag, a full disk), what is there may be an older
 `.prev` that holds the enrollments this conversion takes out, and a load of the config restores it
-(`crates/agent-core/src/config.rs:3627-3674`). So `convert` stops with exit 1, after the plist went and before the
+(`crates/agent-core/src/config.rs:3652-3699`). So `convert` stops with exit 1, after the plist went and before the
 config, and the undo puts both files back (C in "Order, failure and undo"). Before #4184 a `.prev` that could not be
 written was a note on stderr, and the conversion went on.
 
@@ -359,9 +359,9 @@ verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
   group or others can write, and the package sets 644 (`postinstall:360-361`). It writes the config with its
   recorded owner bits, 0600 when none was recorded: the file holds a token and a key.
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
-  (`crates/agent-core/src/config.rs:4064-4080`): the same rules, no path, unknown keys noted from the text
-  (`note_unknown_keys` reads by path, `:4484-4488`), and no `.prev` repair, which belongs to the person's own agent
-  (`:3627-3674`). A config that does not parse stops Read, as before (`find_people`, `one_row.rs:1450`). Root never parses the
+  (`crates/agent-core/src/config.rs:4089-4105`): the same rules, no path, unknown keys noted from the text
+  (`note_unknown_keys` reads by path, `:4509-4513`), and no `.prev` repair, which belongs to the person's own agent
+  (`:3652-3699`). A config that does not parse stops Read, as before (`find_people`, `one_row.rs:1450`). Root never parses the
   plist's bytes.
 - **Failure.** A non-zero exit, a death by signal, a reply that does not parse, exceeds its bound or carries another
   identity or version, or the deadline: at Read the command stops with nothing changed; during the conversion it is
@@ -382,7 +382,7 @@ and any error runs `undo` (`:2205`), with `Done` (`:1657`) recording what to put
 | K1 | root's kept copy, then `root.json` (root) | a temporary file at most | remove them |
 | K2 | `/etc/roomler/one-row/<uid>/` per person, `record.json` last (root) | the uids before it, and one unfinished folder | remove them |
 | L | bootout by label of each loaded agent (root, `:3733`) | the job may still drain | bootstrap it back (D6) for every uid booted out |
-| L2 | `read` again, for each person L booted out (child, `:1943-1980`, #4097). The agent's graceful stop saves its config (`mark_clean_shutdown`), and in its first five minutes that save moves `last_run_unhealthy`. A save that moved only the agent's own run state (`config::RUN_STATE_KEYS`, `crates/agent-core/src/config.rs:2749`) is kept again in K2's order, `record.json` removed, the config's copy replaced, `record.json` written again last (`rekeep`, `one_row.rs:2146`), and C converts from it. Anything else that moved stops here: "this Mac changed after the plan was said" (`since_read`, `:2078`) | that uid's folder unfinished, or kept again | remove them |
+| L2 | `read` again, for each person L booted out (child, `:1943-1980`, #4097). The agent's graceful stop saves its config (`mark_clean_shutdown`), and in its first five minutes that save moves `last_run_unhealthy`. A save that moved only the agent's own run state (`config::RUN_STATE_KEYS`, `crates/agent-core/src/config.rs:2774`) is kept again in K2's order, `record.json` removed, the config's copy replaced, `record.json` written again last (`rekeep`, `one_row.rs:2146`), and C converts from it. Anything else that moved stops here: "this Mac changed after the plan was said" (`since_read`, `:2078`) | that uid's folder unfinished, or kept again | remove them |
 | W | root's file (root; `config::save` is atomic) | root's file, old or new | root's file back as a copy of its kept copy; if that write fails, no agent starts, and after S nothing else goes back (below) |
 | C | `convert` per person (child), on the bytes root kept last | that person's plist gone or not, the config old or new, each atomically | `put-back` for every person `convert` was started for, answered or not, unless their child refused before any change: exit 2, 3 or 4 (`before_any_change`, `:2184`), whose files stay as they are |
 | S, V | restart, verify (root) | the new files and the restarted daemon | everything above, the bootstraps last: the restart onto it (`:2305-2306`), then, once it has answered, the bootstraps |
@@ -735,7 +735,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - The running two-row worker saving the person's config during the conversion, as today.
 - Repairing a `~/Library/LaunchAgents` that an earlier package made (#3763).
 - The person's `config.toml.prev` after a conversion held the enrollment that moved to root, and a load of the
-  person's config (`config.rs:3627-3674`) could bring it back. #4184 fixed that for every conversion from its release
+  person's config (`config.rs:3652-3699`) could bring it back. #4184 fixed that for every conversion from its release
   on: `convert` keeps the new config as its `.prev` too ("Refusals at convert"). Left out of #4184, each named: a
   Mac converted before it keeps the enrolled `.prev` until that person's next save rotates the new file in, which
   for the console person is the screen worker's clean-run save five minutes in (`app.rs:5722`), while a person not

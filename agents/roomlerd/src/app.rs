@@ -975,12 +975,12 @@ enum OrgAction {
     /// Disable a secondary enrollment without deleting it (no supervised
     /// WS loop for it on the next daemon start).
     Disable { label: String },
-    /// Swap a secondary enrollment into the PRIMARY slot (and the current
-    /// primary into `[[orgs]]`, under `--demoted-label` or else the given
-    /// secondary's old label). The primary drives machine-wide effects:
-    /// self-update source, attention sentinels, and declared tunnel routes.
-    /// Each enrollment keeps its place on the mesh where it maps exactly
-    /// (#2540); the output says what it could not keep.
+    /// Swap a secondary enrollment into the PRIMARY slot (and the current primary into
+    /// `[[orgs]]`, under `--demoted-label` or else the given secondary's old label). The
+    /// primary drives machine-wide effects: self-update source, attention sentinels, and
+    /// declared tunnel routes. Each enrollment keeps its place on the mesh where it maps
+    /// exactly (#2540); the output says what it could not keep. Refused while the primary
+    /// enrollment is ephemeral (#4370): an ephemeral row never sits beside another org.
     SetPrimary {
         label: String,
         /// The label the current primary takes in `[[orgs]]`. Default: the
@@ -9468,3 +9468,67 @@ mod adopt_line;
 
 /// #4157 — what a `run` does with its config before it takes the lock.
 mod config_at_start;
+
+/// #4370 — `org set-primary` through the command's own arm, on a config file.
+#[cfg(test)]
+mod org_cmd_tests {
+    use super::*;
+
+    /// #4370 T3 — `org set-primary` on a device whose primary enrollment is
+    /// ephemeral: refused, saying so, and the config file is not written: its
+    /// bytes are the same, and no `.prev` copy appears.
+    #[test]
+    fn org_set_primary_refuses_an_ephemeral_primary_and_leaves_the_file_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = config::test_fixture();
+        cfg.ephemeral = true;
+        cfg.agent_id = "row-eph-a".into();
+        cfg.orgs = vec![config::OrgEntry {
+            label: "acme".into(),
+            server_url: "https://acme.invalid".into(),
+            ws_url: None,
+            agent_token: "tok-acme".into(),
+            agent_id: "aid-acme".into(),
+            tenant_id: "tid-acme".into(),
+            enabled: true,
+            overlay_mode: config::OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        }];
+        config::save(&path, &cfg).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let prev = config::prev_path(&path);
+        let prev_before = std::fs::read(&prev).ok();
+
+        let err = org_cmd(
+            &path,
+            OrgAction::SetPrimary {
+                label: "acme".into(),
+                demoted_label: None,
+            },
+        )
+        .expect_err("an ephemeral primary is never promoted away");
+
+        let said = err.to_string();
+        assert!(
+            said.contains("ephemeral") && said.contains("row-eph-a"),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "the file is byte for byte as it was"
+        );
+        assert_eq!(std::fs::read(&prev).ok(), prev_before, "nothing was saved");
+        let file = config::load(&path).unwrap();
+        assert!(file.ephemeral);
+        assert_eq!(file.agent_id, "row-eph-a");
+        assert_eq!(file.orgs.len(), 1);
+        assert_eq!(file.orgs[0].agent_id, "aid-acme");
+    }
+}

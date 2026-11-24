@@ -482,9 +482,9 @@ in P3c, after the identity gates, so a refusal is attributable and audited.
 
 **Multi-org: relay serving is PRIMARY-ORG ONLY, enforced.** ⚠️ The first draft said a device
 *"may serve N tenants"* and, two sentences later, that it *"should follow"* the primary-only
-rule. `docs/multi-org.md:313` makes exit-node and netstack primary-only because they are
+rule. `docs/multi-org.md:537-543` makes exit-node and netstack primary-only because they are
 **host-global singletons**; a UDP listener on a host-global port is exactly that. And
-`:159-161` adds the trust half for `rc:agent.update`: *"a secondary org's admin must not be
+`:222-223` adds the trust half for `rc:agent.update`: *"a secondary org's admin must not be
 able to force-update a shared binary"* — a secondary org's admin minting sessions onto the
 device owner's listener is the same escalation. Refuse the mint server-side for a
 secondary-org node, and drop a relay grant arriving on a secondary org's WS agent-side.
@@ -737,7 +737,7 @@ Verified against `origin/master`, 2026-08-28.
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3238`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3263`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 
