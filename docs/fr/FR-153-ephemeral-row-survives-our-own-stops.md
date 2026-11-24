@@ -460,7 +460,7 @@ line in the doc, A5 in (M4).
 name is out too, for A4's reason.
 
 Where it retires that name, with anchors at `96c27b1b6`: `agents/roomlerd/src/win_service/mod.rs:254`, which retires
-a pre-rename `RoomlerAgentService` before `Roomler` is registered.
+the service still registered as `LEGACY_SERVICE_NAME` before `Roomler` is registered.
 
 ### D5: a stop removes the file's row, not the run's (found on 2026-11-23 by #4339's worker)
 
