@@ -277,7 +277,7 @@ the root half holds is refused too.
 
 One stop comes after the plan was said, from the person's own process (#4184). `convert` writes the new config as
 its `.prev` before it writes it as the config, both the way every write of the child goes (`RealFs::write`,
-`agents/roomlerd/src/one_row_home.rs:1464-1488`; `write_temp`, `:1338-1351`): a new temporary file in the folder,
+`agents/roomlerd/src/one_row_home.rs:1657-1681`; `write_temp`, `:1531-1544`): a new temporary file in the folder,
 `fsync`, then a `rename` over the name. A rename asks only for write on the folder, which `convert` checks before it
 changes anything, so a `.prev` the person may not write, one another account owns among them, is replaced. Where the
 name still cannot be replaced (a folder there, a file locked by a flag, a full disk), what is there may be an older
@@ -738,9 +738,9 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
   person's config (`config.rs:3627-3674`) could bring it back. #4184 fixed that for every conversion from its release
   on: `convert` keeps the new config as its `.prev` too ("Refusals at convert"). Left out of #4184, each named: a
   Mac converted before it keeps the enrolled `.prev` until that person's next save rotates the new file in, which
-  for the console person is the screen worker's clean-run save five minutes in (`app.rs:5652`), while a person not
+  for the console person is the screen worker's clean-run save five minutes in (`app.rs:5654`), while a person not
   at the console has no writer; on such a Mac, with `macos_one_row` turned off by hand, the supervisor's enrolled
-  worker that finds a config there that does not load restores that `.prev` through `app.rs:4022` and runs the
+  worker that finds a config there that does not load restores that `.prev` through `app.rs:4024` and runs the
   copy, since `may_restore` (`config_at_start.rs:74-85`, #4157) covers only a missing config; and a
   `.prev` beside a person config that is missing, which Read never sees and `convert` leaves. The worker root's
   supervisor starts never restores a missing config at its start (#4157): with `--unenrolled` it writes a blank
