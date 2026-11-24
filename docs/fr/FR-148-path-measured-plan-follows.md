@@ -714,7 +714,7 @@ to learn what its path carries.
   2026-11-21 at 07:10Z erased them for this window. The regional relay drops an unknown destination or a full
   destination queue in silence (`crates/derp-relay/src/main.rs:952-991`). The receiving agent counts a full or
   unrouted inbound queue, but only its live overlay status shows the counts
-  (`crates/tunnel-core/src/transport/derp.rs:552-578`, `crates/tunnel-core/src/overlay/runtime.rs:1975-1983`).
+  (`crates/tunnel-core/src/transport/derp.rs:552-578`, `crates/tunnel-core/src/overlay/runtime.rs:1982-1990`).
   Below the overlay the viewer's host counts nothing. The SACKs pass the same points the other way. D52 has each
   point report itself, and AC4 (a) reads them.
 - On the mesh relay the sender's age check judges each fragment by its own wait
