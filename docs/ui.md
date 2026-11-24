@@ -582,7 +582,7 @@ elements are muted.
 - **API client**: `ui/src/api/client.ts` — token injection + refresh handling.
 - **Dev proxy**: Vite proxies `/api` + `/ws` to `http://localhost:5001`.
 - ⚠️ **The ws store holds ONE handler per frame type** (`onMediaMessage` is a `Map.set`,
-  `stores/ws.ts:432`): a second registration of a type takes the first's frames away. Conference
+  `stores/ws.ts:434`): a second registration of a type takes the first's frames away. Conference
   registers its `media:*` types through it (`stores/conference.ts:146-151`).
 
 ## Conventions
@@ -615,11 +615,11 @@ by their own subject. So every such page, and each dialog it owns, keeps four ru
 | It watches its org from the start | A `watch` with `{ immediate: true }` replaces a one-shot load on mount. A routed view watches its `tenantId` computed, never a `ref` of the route param, which setup reads once (`views/invite/InviteManageView.vue:266` held one). A section watches `() => props.tenantId` | `views/rooms/RoomList.vue:197`, `components/admin/RolesSection.vue:471` |
 | A change closes what was opened under the previous org | An editor, a prompt or a dialog closes, because its save would go to the new org, and a secret minted there goes with its dialog. What names the previous org's rows resets: a device filter, a grid's search and its page. A paging grid fetches again, because nothing fires its `@update:options` on a change of org | `components/admin/EnrollKeysSection.vue:351`, `components/admin/MembersSection.vue:535` |
 | A late answer for the previous org is dropped | A store guards its own rows (next row). A page that keeps rows in its own state notes the org it asked for: its latest load writes its rows, its error and its spinner only while that is still the page's org | `components/admin/ExecAuditSection.vue:228-248` |
-| A store records its org, and a page asks it with an ensure | The store names that ref for its rows (`roomsTenantId`), never `tenantId`: a `${tenantId}` in one of its URLs would read the ref once a parameter is renamed. A fetch for another org drops the rows at once, only the latest fetch writes, and a create or a save answered for another org leaves the list alone (`listIsOf`). A page that only lists, names or picks the rows asks with `ensureRooms`, `ensureAgents`, `ensureTenantMembers`, `ensureRoles` or `ensureTunnelClients`, which fetch unless the store holds this org's rows or is loading them, and fetch again after a failed fetch. `ensureRooms` and `ensureAgents` answer with the fetch in flight, and a fetch that a newer one superseded settles with the newest, so a caller that reads the rows after its await reads this org's newest: the welcome tour counts the devices and the rooms so (`components/layout/AppLayout.vue:1093-1096`), and the remote viewer takes the store's own row of its device (`views/remote/RemoteControl.vue:5364`). A dialog that shows an org switch asks with `ensureOrgExecEnabled`, `ensureOrgSshEnabled` or `ensureExternalAccess` (a single value, below) | `stores/rooms.ts:102`, `:144`, `:151`; `stores/agents.ts:1124`, `:1311`, `:1503`, `:1581`, `:1836`; `stores/role.ts:62`; `stores/tunnelClients.ts:117` |
+| A store records its org, and a page asks it with an ensure | The store names that ref for its rows (`roomsTenantId`), never `tenantId`: a `${tenantId}` in one of its URLs would read the ref once a parameter is renamed. A fetch for another org drops the rows at once, only the latest fetch writes, and a create or a save answered for another org leaves the list alone (`listIsOf`). A page that only lists, names or picks the rows asks with `ensureRooms`, `ensureAgents`, `ensureTenantMembers`, `ensureRoles` or `ensureTunnelClients`, which fetch unless the store holds this org's rows or is loading them, and fetch again after a failed fetch. `ensureRooms` and `ensureAgents` answer with the fetch in flight, and a fetch that a newer one superseded settles with the newest, so a caller that reads the rows after its await reads this org's newest: the welcome tour counts the devices and the rooms so (`components/layout/AppLayout.vue:1093-1096`), and the remote viewer takes the store's own row of its device (`views/remote/RemoteControl.vue:5364`). A dialog that shows an org switch asks with `ensureOrgExecEnabled`, `ensureOrgSshEnabled` or `ensureExternalAccess` (a single value, below) | `stores/rooms.ts:110`, `:152`, `:159`; `stores/agents.ts:1124`, `:1311`, `:1503`, `:1581`, `:1836`; `stores/role.ts:62`; `stores/tunnelClients.ts:117` |
 
 Never gate a fetch on an empty list: a list that holds another org's rows is not empty. The
 stores that record their org: the devices and the org's people (`stores/agents.ts:1068`,
-`:1281`), rooms (`stores/rooms.ts:102`), roles (`stores/role.ts:29`), members
+`:1281`), rooms (`stores/rooms.ts:110`), roles (`stores/role.ts:29`), members
 (`stores/members.ts:49`), tunnel clients (`stores/tunnelClients.ts:59`), overlay nodes
 (`stores/overlayRoutes.ts:86`), the two policy lists (`stores/tunnelPolicies.ts:159`,
 `stores/overlayAcl.ts:78`), files (`stores/files.ts:49`), invites (`stores/invite.ts:95`), and
@@ -639,6 +639,15 @@ Never read the org, or whether a value is known, off the value itself. The API's
 no org: `Room.tenant_id` (`stores/rooms.ts:11`) is declared and never sent
 (`crates/modules/chat/src/room.rs:29-50`). A switch's answer can hold `null`
 (`orgExecRequireSystem` from an older server).
+
+**The current room is not the room a page shows (#4395).** `current` keeps naming the last
+room opened in a chat after the chat page is left, and the Files page relies on that. The
+unread check asks `shownRoomId` instead (`stores/ws.ts:267`): the room the chat page or the
+call page shows while it is mounted, claimed with `showRoom`, whose release clears it only
+while it is still that page's claim (`stores/rooms.ts:82`, `:234`). So a message for the last
+opened room counts once its page is left, and returning to the chat clears it with
+`markAllRead` (`views/chat/ChatView.vue:477`). A page whose browser tab is hidden still shows
+its room.
 
 **What the shell reloads on a change of org.** `AppLayout` keeps the tenant store on the
 URL's org (`useRouteTenantSync`, `components/layout/AppLayout.vue:997`). On a change it
@@ -668,7 +677,7 @@ room B's URL: a message typed there went to B, and Leave left B, a call it was n
 while the server still listed the person in A. A remount alone would leave A's call
 running with nothing on the page to say so, because the mini-call widget hides on every
 call page. So the page settles its own call first, in `onBeforeRouteUpdate`
-(`views/conference/ConferenceView.vue:693`), with the question the Join button asks:
+(`views/conference/ConferenceView.vue:699`), with the question the Join button asks:
 
 | The page, when another room's call is pushed onto it | What happens |
 |---|---|
@@ -677,7 +686,7 @@ call page. So the page settles its own call first, in `onBeforeRouteUpdate`
 | in no call here | it remounts for the other room with no question, and joins nothing |
 
 The join crosses the remount as a one-shot hand-off (`composables/callSwitch.ts:22`,
-taken at `ConferenceView.vue:776`). It is for that one room, spent by the next mount
+taken at `ConferenceView.vue:782`). It is for that one room, spent by the next mount
 whatever its room, and void after 10 s. It is never a query or `history.state`, so a reload
 or a back-and-forward cannot put a camera into a call nobody just asked to join.
 `ConferenceViewRoomSwitch.spec.ts` runs the real page against the real route record.

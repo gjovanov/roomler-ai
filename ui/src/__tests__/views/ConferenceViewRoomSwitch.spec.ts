@@ -272,6 +272,24 @@ describe('#1637: the call page follows the room in its URL', () => {
   })
 })
 
+// #4395 — the call page shows its room for the unread check while it is
+// mounted, and the remount by roomId hands the claim to the next room's page.
+describe('#4395: the call page shows its room while mounted', () => {
+  it('claims its room, hands it on across the remount, and releases it on leaving', async () => {
+    await openCallPage('A', false)
+    expect(rooms.shownRoomId).toBe('A')
+
+    await switchInPlace('B')
+    await flushPromises()
+    expect(rooms.shownRoomId).toBe('B')
+
+    await router.push('/tenant/T')
+    await flushPromises()
+    expect(rooms.shownRoomId).toBeNull()
+    expect(rooms.current?.id, 'the last opened room is kept').toBe('B')
+  })
+})
+
 describe('#1637: the join hand-off across the remount', () => {
   it('is for that one room, once', () => {
     handOffJoin('B', 1_000)

@@ -365,7 +365,18 @@ watch(
   },
 )
 
+// #4395 — the room this page shows, for the unread check: claimed while the
+// page is mounted on a room (and again on a room switch), released when it
+// unmounts. `current` is not that fact: it outlives this page.
+let releaseShownRoom: (() => void) | null = null
+function showRoom(id: string | undefined) {
+  releaseShownRoom?.()
+  releaseShownRoom = id ? roomStore.showRoom(id) : null
+}
+showRoom(roomId.value)
+
 watch(roomId, async (id) => {
+  showRoom(id)
   if (id) {
     readMessageIds.value.clear()
     pendingReadIds.value.clear()
@@ -398,6 +409,8 @@ watch(() => messageStore.messages.length, () => {
 })
 
 onBeforeUnmount(() => {
+  releaseShownRoom?.()
+  releaseShownRoom = null
   if (observer) {
     observer.disconnect()
     observer = null
