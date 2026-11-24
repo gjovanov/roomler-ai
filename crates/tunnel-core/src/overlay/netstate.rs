@@ -988,7 +988,7 @@ mod backend {
     pub(super) use unix::{BackendGuard, spawn};
 
     #[cfg(all(test, not(windows)))]
-    pub(super) use unix::supervise;
+    pub(super) use unix::{supervise, supervise_until};
 
     #[cfg(windows)]
     mod win {
@@ -1218,6 +1218,28 @@ mod backend {
             cmd.spawn().ok()
         }
 
+        /// #4382 — after the child exits, the first part of the backoff waits
+        /// for the process's own stop before anything is said. A service
+        /// manager's stop (and restart, and a package upgrade's restart)
+        /// signals every process of the unit at once: the packaged systemd
+        /// units keep the default `KillMode`, so the stop's SIGTERM reaches
+        /// this child as it reaches the daemon, and a terminal's Ctrl-C
+        /// reaches the whole process group. The child is often gone before
+        /// the daemon's run loop has heard the signal, and #1867's WARN went
+        /// out at once on every restart (216 ms before the exit purge in one
+        /// observed stop). A stop marked inside the grace
+        /// ([`note_stopping`](super::super::note_stopping)) ends the wait at
+        /// once: one line at INFO, and nothing respawned, however long the
+        /// rest of the stop then takes. Carved out of the backoff and never
+        /// longer than it, so a dead child comes back exactly when it did
+        /// before.
+        ///
+        /// What is left: the daemon marks its stop when its run loop's arm
+        /// first runs, not when the signal lands. A WARN can still go out at a
+        /// stop if that arm runs later than the grace after the child's exit:
+        /// 250 ms at a first death, 1 s at most.
+        const STOP_GRACE: Duration = Duration::from_secs(1);
+
         /// #1867 — run the monitor child and RESPAWN it whenever it exits.
         ///
         /// It used to run once: when the child died (killed by an over-broad
@@ -1234,11 +1256,25 @@ mod backend {
         /// after a long healthy run). Each respawn sends one synthetic Route
         /// signal, so the monitor re-samples whatever changed while nothing was
         /// watching and the route guard re-asserts against it.
+        ///
+        /// #4382 — except when the process stops: [`STOP_GRACE`].
         pub(in super::super) fn supervise(
             make: fn() -> tokio::process::Command,
             tx: UnboundedSender<(RawSignal, String)>,
             first: Duration,
             max: Duration,
+        ) -> Option<BackendGuard> {
+            supervise_until(make, tx, first, max, super::super::stop_mark().subscribe())
+        }
+
+        /// [`supervise`], with the stop mark it reads passed in. A test
+        /// stands in its own, because the process's mark is never cleared.
+        pub(in super::super) fn supervise_until(
+            make: fn() -> tokio::process::Command,
+            tx: UnboundedSender<(RawSignal, String)>,
+            first: Duration,
+            max: Duration,
+            mut stop: tokio::sync::watch::Receiver<bool>,
         ) -> Option<BackendGuard> {
             let child = start(make)?;
             let reader = tokio::spawn(async move {
@@ -1270,22 +1306,36 @@ mod backend {
                     if started.elapsed() >= max {
                         backoff = first; // it ran for a while: a new failure, not a loop
                     }
+                    // #4382 — nothing is said until the grace has passed
+                    // without a stop.
+                    let grace = STOP_GRACE.min(backoff);
+                    if stopped_within(&mut stop, &tx, grace).await {
+                        if *stop.borrow() {
+                            tracing::info!(
+                                ?status,
+                                "netstate: the OS route monitor exited as the process stops — \
+                                 not respawning it (#4382)"
+                            );
+                        }
+                        return;
+                    }
+                    let mut wait = backoff.saturating_sub(grace);
                     tracing::warn!(
                         ?status,
-                        retry_in_ms = backoff.as_millis() as u64,
+                        retry_in_ms = wait.as_millis() as u64,
                         "netstate: the OS route monitor exited — respawning it (#1867); until it \
                          is back the route guard runs on its heartbeat alone"
                     );
                     loop {
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(max);
-                        if tx.is_closed() {
+                        if stopped_within(&mut stop, &tx, wait).await {
                             return;
                         }
+                        backoff = (backoff * 2).min(max);
                         if let Some(c) = start(make) {
                             child = c;
                             break;
                         }
+                        wait = backoff;
                     }
                     if tx
                         .send((RawSignal::Route, "netstate: backend respawned".into()))
@@ -1299,12 +1349,54 @@ mod backend {
             Some(BackendGuard { reader })
         }
 
+        /// #4382 — wait `d`, unless the process stops or nothing reads the
+        /// feed any more: then `true`, at once. The mark is a `watch`, and
+        /// `wait_for` reads the value it holds before it waits, so a mark set
+        /// before this began is seen at once and one set during it wakes it.
+        async fn stopped_within(
+            stop: &mut tokio::sync::watch::Receiver<bool>,
+            tx: &UnboundedSender<(RawSignal, String)>,
+            d: Duration,
+        ) -> bool {
+            tokio::select! {
+                () = async {
+                    if stop.wait_for(|stopping| *stopping).await.is_err() {
+                        // The mark's sender is gone (only a test's can go), so
+                        // no stop can come.
+                        std::future::pending::<()>().await;
+                    }
+                } => true,
+                () = tx.closed() => true,
+                () = tokio::time::sleep(d) => *stop.borrow() || tx.is_closed(),
+            }
+        }
+
         impl Drop for BackendGuard {
             fn drop(&mut self) {
                 self.reader.abort();
             }
         }
     }
+}
+
+/// #4382 — the process is stopping. The daemon says so as the first thing each
+/// arm of its run loop's `select!` does, before its teardown (`app.rs`,
+/// `note_stopping`), and the route monitor's supervisor then reads its child's
+/// exit as the stop's: one line at INFO, nothing respawned (the unix backend's
+/// `STOP_GRACE`). Windows has no monitor child and reads nothing here.
+///
+/// ⚠️ Never cleared: it assumes that every arm it is called from ends the
+/// process, as each does today. A future in-process re-run of the daemon would
+/// have to clear it, or a dead monitor would never be respawned again.
+pub fn note_stopping() {
+    stop_mark().send_replace(true);
+}
+
+/// The process's stop mark ([`note_stopping`]). A `watch`, so a supervisor
+/// waiting out a grace is woken by it, and one that starts after it sees it.
+fn stop_mark() -> &'static watch::Sender<bool> {
+    static MARK: OnceLock<watch::Sender<bool>> = OnceLock::new();
+    MARK.get_or_init(|| watch::channel(false).0)
 }
 
 #[cfg(test)]
@@ -1763,6 +1855,220 @@ sockaddrs: <DST,GATEWAY>
             closed.is_ok(),
             "dropping the guard must stop the supervisor and close the feed"
         );
+    }
+
+    /// #4382 — a stand-in monitor that says its pid in its one line, then
+    /// waits to be ended, as `ip monitor` and `route -n monitor` wait. `exec`
+    /// keeps the pid the line says.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn waiting_monitor() -> tokio::process::Command {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", "echo \"RTM_ADD: fake route $$\"; exec sleep 30"]);
+        c
+    }
+
+    /// The pid in the stand-in's next line; any other signal is skipped.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn next_monitor_pid(rx: &mut mpsc::UnboundedReceiver<(RawSignal, String)>) -> i32 {
+        loop {
+            let (_, line) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a line from the stand-in within 5 s")
+                .expect("the feed is open");
+            if let Some(pid) = line.strip_prefix("RTM_ADD: fake route ") {
+                return pid.trim().parse().expect("the stand-in's pid");
+            }
+        }
+    }
+
+    /// Ends the stand-in by its own pid, with the signal a service manager's
+    /// stop sends.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sigterm(pid: i32) {
+        // SAFETY: kill(2) on a child this test's supervisor started and has
+        // not reaped (it sleeps until it is ended).
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGTERM) },
+            0,
+            "kill -TERM {pid}"
+        );
+    }
+
+    /// Every line at INFO and above that THIS thread logs while the guard
+    /// lives. A `#[tokio::test]` runs the supervisor on the test's own thread.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Logs {
+        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        /// The supervisor's lines about a monitor exit, at `level`.
+        fn exits(&self, level: &str) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .filter(|l| l.contains(level) && l.contains("the OS route monitor exited"))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// #4382 — a monitor child that exits as the process stops is not a
+    /// death: no WARN, nothing respawned, one line at INFO, and the
+    /// supervisor ends by itself, however long the rest of the stop takes
+    /// (nothing here ends the process or drops the guard first). A stop
+    /// meets the exit in one of two orders:
+    /// - `mark_first`: the stop marked, then the child ended (systemd signals
+    ///   the daemon's own pid before the rest of the unit's cgroup);
+    /// - otherwise the child ended, then the stop marked 50 ms later, inside
+    ///   the grace (the field's order: the child was gone before the
+    ///   daemon's arm ran).
+    ///
+    /// Master's lines WARN at once and respawn in both.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn a_monitor_child_exits_during_a_stop(mark_first: bool) {
+        // The grace is the first backoff here (400 ms, under STOP_GRACE), so
+        // a mark 50 ms after the exit lands well inside it.
+        let (first, max) = (Duration::from_millis(400), Duration::from_millis(1600));
+        let (logs, _logs) = Logs::start();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let guard = backend::supervise_until(waiting_monitor, tx, first, max, stop_rx)
+            .expect("the first spawn must succeed");
+        let pid = next_monitor_pid(&mut rx).await;
+        if mark_first {
+            stop_tx.send_replace(true);
+            sigterm(pid);
+        } else {
+            sigterm(pid);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stop_tx.send_replace(true);
+        }
+        let mut respawned = Vec::new();
+        let ended = tokio::time::timeout(4 * max, async {
+            while let Some((_, line)) = rx.recv().await {
+                respawned.push(line);
+            }
+        })
+        .await
+        .is_ok();
+        let (warn, info) = (logs.exits("WARN"), logs.exits("INFO"));
+        assert!(
+            ended && respawned.is_empty() && warn.is_empty() && info.len() == 1,
+            "a stop is not a death (mark_first={mark_first}): ended={ended} \
+             respawned={respawned:?} warn={warn:?} info={info:?}"
+        );
+        drop(guard);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_monitor_child_that_exits_after_the_stop_is_marked_is_not_respawned() {
+        a_monitor_child_exits_during_a_stop(true).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_monitor_child_that_exits_just_before_the_stop_is_marked_is_not_respawned() {
+        a_monitor_child_exits_during_a_stop(false).await;
+    }
+
+    /// #4382 — a monitor child that exits after nobody reads its feed any more
+    /// says nothing at all: nothing would read a respawned one either. Master's
+    /// lines WARN at once.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_monitor_child_that_exits_after_its_feed_is_gone_logs_nothing() {
+        let first = Duration::from_millis(400);
+        let (logs, _logs) = Logs::start();
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let guard = backend::supervise_until(waiting_monitor, tx, first, 4 * first, stop_rx)
+            .expect("the first spawn must succeed");
+        let pid = next_monitor_pid(&mut rx).await;
+        drop(rx);
+        sigterm(pid);
+        tokio::time::sleep(2 * first).await;
+        let (warn, info) = (logs.exits("WARN"), logs.exits("INFO"));
+        assert!(
+            warn.is_empty() && info.is_empty(),
+            "the feed gone: warn={warn:?} info={info:?}"
+        );
+        drop(guard);
+    }
+
+    /// #4382 (AC2) — a monitor child ended while the process runs is still
+    /// #1867's death, even by the very SIGTERM a stop would send: one WARN,
+    /// once the grace has passed without a stop, then a respawn that wakes the
+    /// monitor and a new child.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_monitor_child_ended_while_the_process_runs_warns_and_is_respawned() {
+        let (logs, _logs) = Logs::start();
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let guard = backend::supervise_until(
+            waiting_monitor,
+            tx,
+            Duration::from_millis(100),
+            Duration::from_millis(400),
+            stop_rx,
+        )
+        .expect("the first spawn must succeed");
+        let pid = next_monitor_pid(&mut rx).await;
+        sigterm(pid);
+        // The respawn: its synthetic wake-up first, then the new child's line.
+        let mut woke = false;
+        let next = loop {
+            let (_, line) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a respawn within 5 s")
+                .expect("the feed is open");
+            if line.contains("respawned") {
+                woke = true;
+            } else if let Some(p) = line.strip_prefix("RTM_ADD: fake route ") {
+                break p.trim().parse::<i32>().expect("the new child's pid");
+            }
+        };
+        assert!(woke, "the respawn must wake the monitor");
+        assert_ne!(next, pid, "a new child, not the old one");
+        let warns = logs.exits("WARN");
+        assert_eq!(warns.len(), 1, "one WARN for one death: {warns:?}");
+        println!("#4382 AC2: {}", warns[0]);
+        assert_eq!(
+            logs.exits("INFO"),
+            Vec::<String>::new(),
+            "a death under a running process is not a stop"
+        );
+        drop(guard);
     }
 
     /// The sampler runs on the host without privileges and produces a

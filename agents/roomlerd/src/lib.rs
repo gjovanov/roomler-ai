@@ -529,6 +529,19 @@ pub fn purge_exit_routes_unless_owned(daemon_running: bool) -> bool {
     true
 }
 
+/// #4382 — the daemon is stopping. The first thing each arm of the run loop's
+/// `select!` does (`app.rs`), before `shutdown_tx`, the 200 ms flush and any
+/// teardown, and every one of those arms ends the process. The route monitor's
+/// child takes the stop's own signal (systemd's stop reaches the unit's whole
+/// cgroup, a terminal's Ctrl-C the whole process group), and netstate's
+/// supervisor reads that exit as the stop's instead of a death to WARN about
+/// and respawn (`tunnel_core::overlay::netstate::note_stopping`). At the crate
+/// root, like its siblings, so the run loop calls it with no feature gate.
+pub fn note_stopping() {
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    tunnel_core::overlay::netstate::note_stopping();
+}
+
 // Here, not in the list above, so that no line the docs anchor in this file moves.
 /// #3429 — what a restart would cut or wedge, now: the one model the periodic
 /// update check and the replaced-binary restart both read.
