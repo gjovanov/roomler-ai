@@ -511,8 +511,9 @@ pub struct LineReport {
     /// FR-148 D46 B1 — the in-flight budget's window, computed in shadow;
     /// `None` when its switch is off.
     pub budget: Option<WindowReport>,
-    /// FR-148 P4b-3 — the video channel's counts over the line; `None` when
-    /// its switch is off.
+    /// FR-148 P4b-3 — the video channel's counts over the line (FR-148
+    /// P4b-5a: its key frame ledger from the pump's start); `None` when its
+    /// switch is off.
     pub deadline: Option<crate::media_deadline::DeadlineLine>,
 }
 
@@ -1402,8 +1403,9 @@ fn say_budget_mode(session_id: ObjectId, acts: bool) {
 /// sample of the line was read with SCTP's gauges, and are left out when none
 /// was. FR-148 D46's in-flight budget follows when its switch is not `off`,
 /// and FR-148 P4b-3's video channel closes the line when its switch is not
-/// `off`, FR-148 P4b-4's key frame asks and its rule's gap last; with both off
-/// the line is as before, to the byte.
+/// `off`, FR-148 P4b-4's key frame asks and its rule's gap after it, and
+/// FR-148 P4b-5a's key frame ledger last; with both off the line is as
+/// before, to the byte.
 pub fn emit(session_id: ObjectId, line: &LineReport) {
     // The line's fields, each group after the first in its order:
     // `path_line!([] queue(q) budget(b) deadline(d))`.
@@ -1466,6 +1468,9 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
                 kf_refused_rule = $d.asks.refused_rule,
                 kf_owed_granted = $d.asks.owed_granted,
                 kf_gap_ms = ?$d.kf_gap_ms,
+                kf_written = ?$d.kf_written,
+                kf_dropped = ?$d.kf_dropped,
+                viewer_kf = %crate::media_deadline::PairOrNone($d.viewer_kf),
             ] $($rest)*)
         };
     }
@@ -2223,8 +2228,10 @@ mod tests {
     /// pump's one read: `new` is `off`, and its line carries nothing of it.
     /// FR-148 P4b-4 (D59) — N12's split of the key frame asks follows
     /// P4b-3's five fields: the viewer's asks, the lane's, the refusals by
-    /// the 500 ms gap and by the rule, the owed asks granted; the rule's gap
-    /// closes the line.
+    /// the 500 ms gap and by the rule, the owed asks granted; then the rule's
+    /// gap. FR-148 P4b-5a — the key frame ledger closes the line: the key
+    /// frames written whole and dropped, each a pair, and the viewer's newest
+    /// count of the key frames it completed, `None` before one came.
     #[test]
     fn the_video_channel_s_counts_close_the_line() {
         use crate::media_deadline::{Channel, Counters, DeadlineLine, Mode};
@@ -2243,6 +2250,9 @@ mod tests {
                 owed_granted: 3,
             },
             kf_gap_ms: Some(1_280),
+            kf_written: (7, 12),
+            kf_dropped: (2, 1),
+            viewer_kf: Some((7, 10)),
         };
         let fields = [
             "forward_tsns=Some(17)",
@@ -2256,6 +2266,9 @@ mod tests {
             "kf_refused_rule=6",
             "kf_owed_granted=3",
             "kf_gap_ms=Some(1280)",
+            "kf_written=(7, 12)",
+            "kf_dropped=(2, 1)",
+            "viewer_kf=(7, 10)",
         ];
         let off = logged(|| emit(sid(), &busy_line()));
         for (before, line) in [
@@ -2322,10 +2335,14 @@ mod tests {
             !off.contains("video_channel") && !off.contains("kf_"),
             "{off:?}"
         );
+        for gone in ["kf_written", "kf_dropped", "viewer_kf"] {
+            assert!(!off.contains(gone), "off: {gone:?} in {off:?}");
+        }
         let none = DeadlineLine {
             channel: None,
             forward_tsns: None,
             kf_gap_ms: None,
+            viewer_kf: None,
             ..deadline
         };
         let out = logged(|| {
@@ -2340,6 +2357,7 @@ mod tests {
         assert!(out.contains("forward_tsns=None"), "{out:?}");
         assert!(out.contains("video_channel=none"), "{out:?}");
         assert!(out.contains("kf_gap_ms=None"), "{out:?}");
+        assert!(out.trim_end().ends_with("viewer_kf=None"), "{out:?}");
         // The pump's read: `new` carries the switch off, and so no counts.
         let sampler = DeliverySampler::new(true);
         assert_eq!(sampler.deadline().mode(), Mode::Off);
@@ -3332,7 +3350,7 @@ mod tests {
             let task = &body[body.find(frame).unwrap()..];
             let chunks = task.find("while off < total {").expect("the chunk loop");
             let ok = task
-                .find("if ok {")
+                .find("if lane.written(&out, ok) {")
                 .expect("the arm of a frame on the wire");
             let indent = &task[task[..ok].rfind('\n').unwrap() + 1..ok];
             let end = ok + task[ok..].find(&format!("\n{indent}}}\n")).unwrap();

@@ -22,7 +22,7 @@ import { createPinia, setActivePinia } from 'pinia'
 
 vi.mock('@/api/client', () => ({ api: { get: vi.fn(async () => ({ ice_servers: [] })) } }))
 
-import { useRemoteControl } from '@/composables/useRemoteControl'
+import { decodeStatWireMessage, useRemoteControl } from '@/composables/useRemoteControl'
 import type { Agent, AgentCapabilities } from '@/stores/agents'
 import { useWsStore } from '@/stores/ws'
 
@@ -330,5 +330,41 @@ describe('FR-148 P4b-3b — the page reports its relay on each rc:decodestat', (
     await vi.advanceTimersByTimeAsync(500)
     window()
     expect(decodestats().at(-1)).not.toHaveProperty('relay')
+  })
+})
+
+describe('FR-148 P4b-5a — the page carries the worker’s key frame counts on each rc:decodestat', () => {
+  it('puts the window’s counts on its rc:decodestat as `kf`, and no key when the worker sent none or not two counts', async () => {
+    const { pc, worker } = await connect(['chunk-framing'])
+    const control = pc.made.find((c) => c.label === 'control')
+    expect(control).toBeDefined()
+    control!.readyState = 'open'
+    const decodestats = () =>
+      control!.sent
+        .map((s) => JSON.parse(s as string) as Record<string, unknown>)
+        .filter((m) => m.t === 'rc:decodestat')
+    const window = (extra: Record<string, unknown>) =>
+      worker.onmessage!({ data: { type: 'stats', fps: 30, ...extra } } as MessageEvent)
+
+    window({ kf: [2, 5] })
+    expect(decodestats().at(-1)).toMatchObject({ t: 'rc:decodestat', fps: 30, kf: [2, 5], de: 1 })
+    window({ kf: [0, 0] })
+    expect(decodestats().at(-1)!.kf).toEqual([0, 0])
+    // An unframed session's worker sends none: no key.
+    window({})
+    expect(decodestats().at(-1)).not.toHaveProperty('kf')
+    for (const bad of [[1], [1, 2, 3], [-1, 2], [1.5, 2], ['1', '2'], [1, null], '1,2', null, { bytes: 1, deadline: 2 }]) {
+      window({ kf: bad })
+      expect(decodestats().at(-1), JSON.stringify(bad)).not.toHaveProperty('kf')
+    }
+    expect(decodestats(), 'one a window').toHaveLength(12)
+  })
+
+  it('writes the counts on the wire as they came, clamped to a safe integer', () => {
+    expect(decodeStatWireMessage(30, false, null, null, null, null, null, null, null, [3, 4]).kf).toEqual([3, 4])
+    expect(
+      decodeStatWireMessage(30, false, null, null, null, null, null, null, 'tls', [Number.MAX_SAFE_INTEGER + 2, 0]),
+    ).toMatchObject({ relay: 'tls', kf: [Number.MAX_SAFE_INTEGER, 0], de: 1 })
+    expect(decodeStatWireMessage(30, false)).not.toHaveProperty('kf')
   })
 })
