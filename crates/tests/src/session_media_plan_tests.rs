@@ -110,6 +110,18 @@ impl Logged {
         )
     }
 
+    /// #4402 — as [`Logged::install`], under `filter` (`EnvFilter`
+    /// directives), for a test that reads lines at production's own levels.
+    pub(crate) fn install_filter(&self, filter: &str) -> LoggedGuard {
+        Self::hold(
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+                .with_ansi(false)
+                .with_writer(self.clone())
+                .finish(),
+        )
+    }
+
     /// `subscriber` as this thread's default, beside a second registered
     /// dispatcher ([`LoggedGuard`]).
     fn hold(subscriber: impl tracing::Subscriber + Send + Sync + 'static) -> LoggedGuard {
