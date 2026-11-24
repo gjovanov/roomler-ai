@@ -3617,8 +3617,8 @@ pub fn machine_global_config_path() -> PathBuf {
 
 /// Sibling copy of the last config that both saved AND parsed, kept so an
 /// unreadable live file can be recovered without re-enrolling the host.
-/// Public for a writer that keeps the outgoing config itself under the name
-/// [`load`] recovers from (`roomlerd one-row-home convert`).
+/// Public for a writer that keeps a copy itself under the name [`load`]
+/// recovers from (`roomlerd one-row-home convert`, which keeps the new one).
 pub fn prev_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("toml.prev")
 }
