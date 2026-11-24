@@ -310,7 +310,7 @@ sequenceDiagram
 
 | `reason` | the server sends it when | `roomler status` says |
 |---|---|---|
-| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:526-529`](../crates/modules/network/src/overlay.rs#L526-L529)) | retrying will not help; an operator has to act |
+| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:530-533`](../crates/modules/network/src/overlay.rs#L530-L533)) | retrying will not help; an operator has to act |
 | `network_unavailable` | the tenant's network row cannot be read or created, or an allocated ordinal falls outside the network's address space | retrying will not help; an operator has to act |
 | `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
 | `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
@@ -321,11 +321,11 @@ either case: its signalling loop reconnects on its own ladder, and a retry at th
 refusal would race it.
 
 - **The wire.** `rc:overlay.join_refused { reason, detail }`
-  ([`signaling.rs:3436-3442`](../crates/remote_control/src/signaling.rs#L3436-L3442)) goes only to a
+  ([`signaling.rs:3443-3449`](../crates/remote_control/src/signaling.rs#L3443-L3449)) goes only to a
   node whose join set `supports_join_refusal`
   ([`signaling.rs:1681`](../crates/remote_control/src/signaling.rs#L1681)). An older node keeps the
   old silence, and the server's ERROR line, `alert = "overlay_join_refused"`
-  ([`overlay.rs:281-298`](../crates/modules/network/src/overlay.rs#L281-L298)), is then the only
+  ([`overlay.rs:284-301`](../crates/modules/network/src/overlay.rs#L284-L301)), is then the only
   trace. The frame is a new top-level variant, which an old agent drops as an unknown
   frame, so it needed no forward-compatible pre-roll.
 - **The device.** The daemon logs `overlay: the server REFUSED our join` at ERROR and
@@ -346,7 +346,7 @@ refusal would race it.
   The line stays for the daemon's lifetime, even after a later join succeeds: "refused
   twenty minutes ago" is the only trace left once the log rotates, and `server` already
   says what is true now. A daemon that predates the field sends no `join_refusal`
-  ([`lib.rs:297`](../crates/localapi/src/lib.rs#L297)), and then nothing is printed, never a
+  ([`lib.rs:303`](../crates/localapi/src/lib.rs#L303)), and then nothing is printed, never a
   false "clear". `roomler status --json` carries it as
   `join_refusal { reason, detail, at_unix, retryable }`.
 

@@ -155,6 +155,7 @@ mod tests {
             srflx_nat: None,
             caps: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable,

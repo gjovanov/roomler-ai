@@ -125,9 +125,9 @@ flow, and the consent chain's fallbacks.
 |---|---|---|---|---|
 | In the mesh on an OS adapter | ✅ perMachine | ✅ system unit | ✅ root half, a second device row by default (one with FR-43 P3) | §2 |
 | One adapter per organization (multi-org) | ✅ | ✅ | ✅ | `agents/roomlerd/src/overlay.rs:318-324`; `docs/multi-org.md` |
-| Exit node, as a client | ✅ | ✅ | ✅ when the uplink has v6, else v6 fail-closed | `docs/overlay-exit-nodes.md`, Platform support |
-| Exit node and subnet router, serving IPv4 | 🟡 WinNAT, which needs the Hyper-V feature: without it (always on Home) the offer is withheld, with the reason | ✅ iptables | ✅ pf, in our own anchor; root half only | each OS's probe (`crates/tunnel-core/src/overlay/nat.rs:211`, `:228`, `:257`) |
-| Exit node, serving IPv6 | ⛔ v6 fail-closed | ✅ ip6tables | ✅ pf NAT66 to a stable address, where an unscoped v6 default exists | `crates/tunnel-core/src/overlay/nat.rs:451-453`; §8 |
+| Exit node, as a client | ✅ | ✅ | ✅ when the uplink has v6, else v6 fail-closed | `docs/overlay-exit-nodes.md`, Platform support. On every OS, v6 is also fail-closed through an exit that says it serves IPv4 only, and the client says why (#3562) |
+| Exit node and subnet router, serving IPv4 | 🟡 WinNAT, which needs the Hyper-V feature: without it (always on Home) the offer is withheld, with the reason | ✅ iptables | ✅ pf, in our own anchor; root half only | each OS's probe (`crates/tunnel-core/src/overlay/nat.rs:686`, `:703`, `:732`) |
+| Exit node, serving IPv6 | ⛔ the exit says so, and its clients stay v6 fail-closed | ✅ ip6tables | ✅ pf NAT66 to a stable address, where an unscoped v6 default exists | `crates/tunnel-core/src/overlay/nat.rs:974-977`; §8; what each exit states: `docs/overlay-exit-nodes.md` (#3562) |
 | MagicDNS: names resolve on the host | ✅ NRPT | 🟡 through systemd-resolved; a resolver that nothing asks is reported `steered but BYPASSED` | ✅ an SCDynamicStore resolver per utun | `crates/tunnel-core/src/overlay/dns.rs:514-515`, `:539-540`, `:565-566`; the bypass at `:468`; `docs/magicdns.md` |
 | Exit node: DNS goes through the exit | ✅ | 🟡 systemd-resolved only, else `DNS NOT steered` | ✅ | the same steer, with a catch-all domain |
 | The host firewall admits the mesh | ✅ the daemon's Defender rule, and WFP | 🟡 firewalld and ufw left to the owner, and reported | ❌ the Application Firewall is left alone | carriers pass a host firewall by conntrack; only services on the overlay address need an allow (D13, `crates/tunnel-core/src/overlay/hostfw.rs:3-8`) |
@@ -192,7 +192,7 @@ Release feature sets per OS, which decide what ships: Linux x86_64
 | The lock and sign-in screens | macOS | A capture needs a GUI login session. Reaching the login window takes an agent in the LoginWindow session and an MDM privacy profile: a different product posture, out of scope until a customer asks (FR-97 §7) |
 | Privacy mode | macOS | Since macOS 15 no public API keeps a window out of capture: ScreenCaptureKit ignores `NSWindow.sharingType = .none` (`docs/privacy-mode.md`, Platforms) |
 | A closed lid keeps sleeping | macOS | Clamshell sleep ignores idle-sleep assertions on a laptop with no external display (`agents/roomlerd/src/power.rs:30-34`) |
-| Exit node, serving IPv6 | Windows | WinNAT has no IPv6 API, so a client's v6 through a Windows exit is dropped, never leaked (`crates/tunnel-core/src/overlay/nat.rs:451-456`). Serving it would take a userspace egress (FR-97 D1) |
+| Exit node, serving IPv6 | Windows | WinNAT has no IPv6 API, so a Windows exit cannot carry a client's v6 (`crates/tunnel-core/src/overlay/nat.rs:974-980`). It says so in its join, and its clients keep v6 fail-closed, never leaked, and say why (#3562). Serving it would take a userspace egress (FR-97 D1) |
 | `named:<account>` for SSH and `exec` | Windows | Windows has no way to become an arbitrary local account without its credentials (`agents/roomlerd/src/exec.rs:757-758`) |
 | A worker's crash recorded by its supervisor | Linux | The daemon is systemd's own service: there is no supervising process of ours, and journald records how it died |
 | SystemContext | Linux, macOS | A Windows service can attach a SYSTEM worker to the interactive desktop. macOS has no such API (`agents/roomlerd/src/macos_supervisor.rs:5-10`); a Linux system install reads the scanout instead (DRM) |

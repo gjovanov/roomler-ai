@@ -162,8 +162,8 @@ Four consequences, each a sub-phase:
    already shaped per recipient, so this costs nothing structurally.
 
    Why it works: a fielded agent uses the network CIDR in exactly three places — the TUN
-   netmask (`crates/tunnel-core/src/overlay/runtime.rs:2111`), the subnet-router NAT source
-   scope (`:2087`), and change detection (`:3667`). All three are correct for an agent that
+   netmask (`crates/tunnel-core/src/overlay/runtime.rs:2162`), the subnet-router NAT source
+   scope (`:2138`), and change detection (`:3823`). All three are correct for an agent that
    is told *its own* block, and peers in other blocks are reached through the per-peer
    `/32`s the agent already installs. ⚠️ This is the compatibility claim the whole phase
    rests on, and it is to be **tested against a pinned old-agent decoder**, not argued.
@@ -219,12 +219,12 @@ and the operator's call: FR-68 P7 decides the flag.
       before the deploy, and it landed there
       ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486110349)).
       CI pins the default: `the_shipped_default_carves_a_block_for_a_new_org`
-      (`crates/tests/src/overlay_tests.rs:1860`).
+      (`crates/tests/src/overlay_tests.rs:1866`).
 - [x] **AC2** Two organizations can never be issued overlapping ranges — asserted by test, and by
       the absence of any `100.64.0.0/10` network in production.
-      Tests: `blocks_are_disjoint_across_tenants` (`crates/tests/src/overlay_tests.rs:1622`)
+      Tests: `blocks_are_disjoint_across_tenants` (`crates/tests/src/overlay_tests.rs:1627`)
       and `aligned_starts_are_never_partially_overlapping`
-      (`crates/remote_control/src/models.rs:9800`). Prod 2026-08-31: no network left on the
+      (`crates/remote_control/src/models.rs:9805`). Prod 2026-08-31: no network left on the
       `/10` ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486110349)),
       and the P3 dry run that listed every network found all four on `100.65.x`
       ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486189495)).

@@ -50,6 +50,12 @@ MASQUERADE for the overlay ULA + forwarding + `accept_ra=2` so the host keeps
 its own v6 default). Windows uses WinNAT (v4 only — see
 [Platform support](#platform-support)).
 
+The offer follows what that setup did (#3562): a setup that leaves the exit
+unable to serve withdraws `/0` and the subnet routes, with the failing step as
+the reason, and is retried until it comes up; and the exit tells its clients
+whether it serves IPv6. See
+[The offer follows the setup](#the-offer-follows-the-setup-3562).
+
 ### 2. An admin (approves it)
 
 ```
@@ -171,10 +177,116 @@ IPv6 egress (S3b) is real, not a fallback. A single `Router.v6_exit` sends all
 peer; ULA, link-local, multicast, mapped, etc. **drop fail-closed**. The
 v4/v6 gates are **independent**: v4 activates on v4 exemptions, v6 on v6
 exemptions — a v6 hiccup can't regress v4, and vice-versa. When v6 can't be
-made safe (no v6 exemptions, or a Windows exit with no WinNAT v6), v6 stays
-**fail-closed** (global v6 is dropped rather than leaked around the tunnel).
+made safe, v6 stays **fail-closed** (global v6 is dropped rather than leaked
+around the tunnel): the client cannot pin its v6 exemptions, or its exit says
+it serves IPv4 only. Until #3562 a client could not know the second: through a
+Windows exit its global v6 went into the tunnel and was dropped at the exit,
+while `roomler status` said `v6 on`. Now the exit states it (`exit_serves_v6`,
+[below](#the-offer-follows-the-setup-3562)), and the client keeps v6
+fail-closed and says why: `active, v6 fail-closed: the exit serves IPv4 only, …`.
 The WG carrier is v4-only (webrtc-rs TURN is v4-only), so v6 rides *inside* the
 tunnel; MTU is 1280 (v6 minimum, safe).
+
+## The offer follows the setup (#3562)
+
+FR-97 P0b decides the offer from a probe that runs before the first join
+(`nat::gate_offer`): a host that cannot forward or NAT offers nothing. The
+setup itself runs later, after the first netmap (`nat::enable`,
+`crates/tunnel-core/src/overlay/nat.rs:95`), and until #3562 nothing read what
+it did. A setup that failed left the exit offering `/0` with nothing behind it,
+and every client that took it lost its internet. The setup now reports a
+`SetupOutcome` (`nat.rs:302`): IPv4 either came up or names the first step
+that left it dead (`SetupStep`, `nat.rs:244`), and IPv6 is served or not. The
+offer follows it.
+
+```mermaid
+flowchart TD
+    P["probe, before the first join<br/>nat::gate_offer"] --> J["join: the probed routes"]
+    J --> NM["first netmap"]
+    NM --> E["nat::enable: forwarding + NAT<br/>for the probed routes"]
+    E --> O{"IPv4 came up?"}
+    O -- yes --> K["offer the routes; an exit states<br/>exit_serves_v6 = what its setup served"]
+    O -- "no: the failing step" --> W["withdraw /0 and the subnets<br/>reason = the step's own words<br/>revert the failed setup"]
+    W --> T["retry after 30 s · 2ⁿ, at most 30 min,<br/>once the revert has finished"]
+    T --> E
+    K --> CH{"routes, failing step or<br/>IPv6 statement changed?"}
+    W --> CH
+    CH -- yes --> RJ["re-join at once, then srflx,<br/>relayed endpoints, a netcheck"]
+    CH -- no --> Q["nothing sent"]
+```
+
+### What withdraws the offer
+
+Only what leaves the exit's IPv4 dead. A failure that degrades one route keeps
+the offer, as it always did, with a WARN.
+
+| Platform | Withdraws (`SetupStep`) | Keeps the offer | Where |
+|---|---|---|---|
+| Linux | `net.ipv4.ip_forward` reads 0 after `sysctl -w` (`Forwarding`); the MASQUERADE rule fails (`Nat`); a FORWARD rule fails and the chain's policy drops (`ForwardChain`) | a FORWARD rule fails under an ACCEPT policy (forwarded traffic passes anyway), or under a policy that cannot be read: never withdraw on a guess. `ip_forward` that cannot be read is no failure either | `linux_v4_outcome` `nat.rs:611` |
+| Windows | the overlay adapter, a default route's egress adapter, or every route's egress adapter does not forward (`Forwarding`); `New-NetNat` refused a block that no other active WinNAT instance's prefix contains (`Nat`) | one subnet route's egress refuses forwarding (a VPN miniport): that route stays degraded; a refused block that another active instance's prefix contains is translated by that instance | `windows_forwarding_dead` `nat.rs:520`, `winnat_uncovered` `nat.rs:565` |
+| macOS | `net.inet.ip.forwarding` cannot be set (`Forwarding`); our pf anchor does not load (`Nat`); `pfctl -E` returns no token (`PfEnable`) | the IPv6 forwarding sysctl fails: IPv6 is not served, IPv4 is | `serve` `pf.rs:606` |
+
+The reason names the step and, where a command failed, that command's own
+first line of stderr, bounded to 200 characters (`SetupFailure::reason`). It
+shows on the admin row and in `roomler status`, where the probe's reason does.
+
+### Retry and re-offer
+
+| Rule | Where | Why |
+|---|---|---|
+| The failed setup is reverted first, off the select loop, and its retry starts only once the revert has finished | `runtime.rs:2967` (the retry arm), `pending_revert` | WinNAT skips an identical prefix and pf reuses the anchor's name: a retry over a half-reverted setup would stack rules that one revert cannot undo |
+| A retry waits 30 s · 2ⁿ, at most 30 min, minus up to 20 % jitter, and runs only while the offer is withdrawn | `nat_retry_delay` `nat.rs:369` | A host that keeps failing costs one setup per half hour, and a fleet does not retry in step |
+| A re-join goes out only when the routes, the failing step or the IPv6 statement change; a new reason text alone never sends one | `OfferTracker::on_setup` `nat.rs:450` | A command's stderr can differ from run to run, and every join rehydrates the node's row |
+| Every re-join is followed by what the server's rehydrate wipes: srflx (the keepalive task's own advert, else the startup snapshot), the relayed endpoint union, and a fresh netcheck | `rejoin_plan` `runtime.rs:4679`, shared with the control-WS Reattach (which sends no netcheck) | A join is an update on the server, and its rehydrate clears srflx, the NAT type, the dialer bit, the relayed endpoints and the measured capability vector |
+| `ROOMLERD_ROUTE_OFFER_UNPROBED=1` keeps the offer whatever the setup did: no withdrawal, no retry, the partial setup kept | `OfferTracker::new` | The probe's own kill switch now covers the setup too |
+
+### The exit states whether it serves IPv6
+
+| The node | `exit_serves_v6` in its join | Where |
+|---|---|---|
+| Offers no default route, or its IPv4 setup failed | absent | `offer_after_setup` `nat.rs:330` |
+| An exit, before its setup has run (its first join) | `false` | `OfferTracker::new` |
+| A Linux exit | `true` only when the ip6tables rules went in, `net.ipv6.conf.all.forwarding` reads 1, and a usable `::/0` sits on a device other than the overlay that holds a global address (ip6tables applies its rules on a v4-only host too) | `linux_v6_outcome` `nat.rs:674`, `has_v6_uplink` `nat.rs:643` |
+| A Windows exit | `false`: WinNAT has no IPv6 API | `WINNAT_SERVES_V6` `nat.rs:489` |
+| A macOS exit | `true` only when an unscoped v6 default exists, the IPv6 forwarding sysctl took, the loaded anchor carries an `inet6` translation, and IPv4 came up | `served_v6` `pf.rs:167` |
+| Any node with `ROOMLERD_EXIT_V6_STATEMENT=0` | absent | |
+
+The field rides `rc:overlay.join` (`crates/remote_control/src/signaling.rs:1716`),
+is stored on the node's row as sent (`crates/remote_control/src/models.rs:7177`;
+the rehydrate `$unset`s it for a join that states nothing,
+`crates/services/src/dao/overlay_node.rs:362`), and reaches every client in its
+netmap peer (`signaling.rs:4088`, `to_netmap_peer`
+`crates/modules/network/src/overlay.rs:3063`). Absent stays absent on every
+hop: never `null`, never read as `false`.
+
+A client decides with `v6_egress` (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:442`):
+
+| The exit says | The client pinned its v6 exemptions | IPv6 through the exit | `roomler status` |
+|---|---|---|---|
+| nothing (an exit from before #3562) | yes | on, as before | `active, v6 on, …` |
+| nothing | no | fail-closed | `active, v6 fail-closed: no v6 uplink to exempt the coordination server, …` |
+| `false` | either | fail-closed | `active, v6 fail-closed: the exit serves IPv4 only, …` |
+| `true` | yes | on | `active, v6 on, …` |
+| `true` | no | fail-closed | `active, v6 fail-closed: no v6 uplink to exempt the coordination server, …` |
+
+The exit's "no" wins over a missing pin: it is the stable reason, the one an
+operator can act on. A statement that changes under a live client is followed
+at the next reconcile, both ways. The reason reaches `roomler status` through
+`ExitNodeStatus.v6_withheld_reason` (`crates/localapi/src/lib.rs:99`), worded
+by `exit_node_state` (`agents/roomler-cli/src/localclient.rs:3180`); a netstack
+client states none, since it carries no global IPv6 at all.
+
+### Deploy order
+
+| First | What happens | Why it is safe |
+|---|---|---|
+| The agent release | An older server drops the unknown field, so every client keeps today's rule. A withdrawal's re-join is handled by every server since FR-97 P0b: it reaches the admin row and the peers at once | Nothing a client reads changes until the server carries the field |
+| The server image | Older agents state nothing: the row keeps no field, and the netmap carries none, so today's rule holds. After the promote every agent reconnects, and its join carries its current statement | Absent never collapses into "no" |
+
+Not covered: a breakage after a setup that succeeded (another program flushing
+iptables, removing the WinNAT instance, or beating pf's re-assert) is not
+re-checked, and an IPv6 uplink that appears or goes after the setup keeps the
+statement the setup made until the next setup.
 
 ## DNS steering (no leak)
 
@@ -541,11 +653,11 @@ AC17 field cells (released 0.4.134, then a P0e candidate; FR-97 §8):
 | Capability | Linux (`overlay-l3`) | Windows (`overlay-l3`) | macOS (`overlay-l3`) |
 |---|---|---|---|
 | **Client**: v4 egress through an exit | ✓ | ✓ | ✓ (FR-97 P1a) |
-| **Client**: v6 egress through an exit | ✓ | ✓ | ✓ when the uplink has v6, else **fail-closed** |
+| **Client**: v6 egress through an exit (**fail-closed**, with the reason, through an exit that says it serves IPv4 only: [#3562](#the-offer-follows-the-setup-3562)) | ✓ | ✓ | ✓ when the uplink has v6, else **fail-closed** |
 | **Client**: `/32`/`/128` exemptions | `ip route replace … [onlink]`, re-pinned when the uplink moves (FR-97 P0e) | IP Helper route via the uplink's gateway, re-pinned when the uplink moves (FR-97 P0e) | `route -n add/change -host`, read back, re-pinned when the uplink moves ([below](#macos-client-fr-97-p1a)) |
 | **Client**: DNS steering | `resolvectl … ~.` | NRPT `.`-root rule | a temporary SCDynamicStore catch-all key (FR-97 P1c) |
 | **Exit**: v4 egress + NAT | iptables MASQUERADE | WinNAT, which needs the Hyper-V feature; without it (always on Home) the offer is withheld (#2077) | pf, in our own anchor under `com.apple/*` (FR-97 P1b, [below](#macos-exit-fr-97-p1b)); root daemon only |
-| **Exit**: v6 egress + NAT | ip6tables MASQUERADE | ✗ → v6 **fail-closed** | pf NAT66 to a stable global address, where an unscoped v6 default exists; else v6 **fail-closed** |
+| **Exit**: v6 egress + NAT | ip6tables MASQUERADE; it says it serves IPv6 only with v6 forwarding on and a v6 uplink (#3562) | ✗: the exit says so (`exit_serves_v6: false`), and its clients keep v6 **fail-closed** | pf NAT66 to a stable global address, where an unscoped v6 default exists; else v6 **fail-closed**, and the exit says so |
 
 A device that cannot serve as an exit advertises nothing and says why, in
 `roomler status` and in the admin routes table (FR-97 P0b), rather than
@@ -594,9 +706,9 @@ sequenceDiagram
 | Capture the uplink per family, re-read before every pin | `tun.rs:6127`, `current_uplink` `tun.rs:8622`, `bsd_default_uplink` `tun.rs:359` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
 | Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:405`, `bsd_pin_row` `tun.rs:441`, `bsd_pin_holds` `tun.rs:454`, `bsd_table` `tun.rs:8107` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
 | Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:7117` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
-| Re-check the pins | `stale_host_exemptions` `tun.rs:7205`, the gate `route_guard.rs:731` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
-| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:731` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
-| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:527`, `exemption_withheld_reason` `route_guard.rs:539` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
+| Re-check the pins | `stale_host_exemptions` `tun.rs:7205`, the gate `route_guard.rs:778` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
+| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:778` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
+| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:570`, `exemption_withheld_reason` `route_guard.rs:582` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
 
 > ⚠️ **A lookup does not show a pin.** A destination a connection has used
 > keeps an interface-scoped clone of the default route (`WASCLONED,IFSCOPE`).
@@ -719,7 +831,7 @@ A node in netstack mode (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`, or
 mesh lives in a userspace stack inside the daemon, reached through a SOCKS5
 front on `127.0.0.1`. Selecting an exit there installs the split-default in
 that userspace router only
-([`route_guard.rs:827`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L827)),
+([`route_guard.rs:862`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L862)),
 so the exit carries exactly what the front dials and nothing else.
 
 ```mermaid
@@ -741,7 +853,7 @@ flowchart LR
 | DNS | never steered | below |
 
 `roomler status` says so, from `ExitNodeStatus.socks5_port`
-([`lib.rs:111`](../crates/localapi/src/lib.rs#L111)):
+([`lib.rs:117`](../crates/localapi/src/lib.rs#L117)):
 
 ```text
   exit node   <exit> (active for SOCKS5 clients of 127.0.0.1:1080 only — IPv4 destinations; nothing else on this host uses it)
@@ -751,7 +863,7 @@ Before P0c-3 it printed `active, v6 on, DNS NOT steered`, as if every app on
 the host left through the exit (field, 2026-10-17; FR-97 §8).
 
 ⚠️ **A netstack node never steers the host's DNS**
-([`dns_steer_allowed`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L496)).
+([`dns_steer_allowed`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L527)).
 The steer is host-wide on Windows (an NRPT catch-all) and macOS (a resolver
 entry). On a node whose OS routes nothing through the exit it would only move
 every app to the public upstream over the uplink, and on a managed laptop cut
@@ -775,7 +887,13 @@ client of it would have black-holed.
   `/32` exemption, before enabling exit routing. Do **not** enable exit routing
   on a host you can only reach over its default route.
 - **Windows exits are v4-only** (no WinNAT v6): clients get v4 egress and v6
-  fail-closed.
+  fail-closed. Since #3562 the exit says so in its join, and its clients say
+  why (`v6 fail-closed: the exit serves IPv4 only`); until then they said
+  `v6 on` while the exit dropped their v6.
+- **An exit whose setup failed offers nothing, and tries again** (#3562). The
+  log says `route offer WITHDRAWN` with the failing step, and the retries back
+  off to one per 30 min. `ROOMLERD_ROUTE_OFFER_UNPROBED=1` keeps the offer as
+  it was before, partial setup and all.
 - **A re-install of the exit peer used to black-hole v4 egress** (fixed in
   FR-97). The reconcile writes the split-default `/1`s into the exit peer's
   WireGuard allowed-IPs once; a later re-install of that peer (a carrier
@@ -824,7 +942,7 @@ client of it would have black-holed.
 - **Approval reaches clients at once; the OFFER needs a re-join.** The approve
   and exit-node toggles re-fan the node to its peers immediately
   (`crates/modules/network/src/routes/overlay_route.rs:356`, `:433`, through
-  `overlay::refan_node`, `crates/modules/network/src/overlay.rs:1579`), so no
+  `overlay::refan_node`, `crates/modules/network/src/overlay.rs:1584`), so no
   client re-joins. What does is the exit node itself: the server refuses to
   approve `/0` on a node that has not advertised it, so set
   `overlay_exit_node_enabled` in its config and let it re-join first.

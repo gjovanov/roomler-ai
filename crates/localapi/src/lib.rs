@@ -91,6 +91,12 @@ pub struct ExitNodeStatus {
     /// back-compat with a daemon/CLI that predates v6 egress.
     #[serde(default)]
     pub v6_active: bool,
+    /// #3562 — why IPv6 is fail-closed while `active`: "the exit serves IPv4
+    /// only" (the exit's own statement) or "no v6 uplink to exempt the
+    /// coordination server" (this host's). `None` while `v6_active`, while not
+    /// `active`, on a netstack node, and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6_withheld_reason: Option<String>,
     /// P5/S4b — `true` when the DEFAULT ("." catch-all) DNS namespace is steered
     /// through the exit, so every non-overlay query resolves from the exit's
     /// vantage (no DNS leak to the local ISP resolver). When `active` but this is
@@ -7151,11 +7157,13 @@ mod tests {
             active: true,
             withheld_reason: None,
             v6_active: true,
+            v6_withheld_reason: None,
             dns_steered: true,
             socks5_port: None,
         };
         let json = serde_json::to_string(&os_tun).unwrap();
         assert!(!json.contains("socks5_port"), "{json}");
+        assert!(!json.contains("v6_withheld_reason"), "{json}");
         let older: ExitNodeStatus = serde_json::from_str(
             r#"{"selector":"exit","active":true,"v6_active":true,"dns_steered":true}"#,
         )

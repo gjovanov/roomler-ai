@@ -171,7 +171,7 @@ The device's report is a **claim** (the `ssh_activity` sense). What the server c
 *verify* is the join: `rc:overlay.join` under the new public key passes
 `wg_key_taken_by_other` (machine-scoped, so a device rotating its own key is admitted
 — `security-baseline.md` §4), and the server stamps what the device presented onto
-the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:633-656`
+the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:638-661`
 → `dao/agent.rs:903`). It is stamped on **every** join, not only after a rotation, so
 the grid can always show the device's current key.
 
@@ -292,8 +292,8 @@ sequenceDiagram
 an **accepted join under a different key**, the verified identity change P1c made the
 proof — in the same write that installs the new key: a compare-and-set on
 `{_id, wg_public_key: <old>, retired_keys.public_key ≠ <old>}` that `$push`es the old key
-and keeps the newest 64 (`crates/services/src/dao/overlay_node.rs:346-368`,
-`crates/modules/network/src/overlay.rs:441-471`). Never on a device's report, which is a
+and keeps the newest 64 (`crates/services/src/dao/overlay_node.rs:365-391`,
+`crates/modules/network/src/overlay.rs:444-475`). Never on a device's report, which is a
 claim. `reason` is `rotate` when the join is the one that satisfies the device's standing
 order and `rejoin` otherwise; it is forensic, and nothing acts on it. Tombstones keep
 their entries: removal is not a pardon. The ledger records in **every** mode, `off`
@@ -301,7 +301,7 @@ included, so it is full before anything enforces it.
 
 **The check** is network-wide: a join presenting a key found in ANY row's ledger of the
 org's network, live or tombstoned, is presenting a retired key
-(`dao/overlay_node.rs:145`, one read on the multikey
+(`dao/overlay_node.rs:148`, one read on the multikey
 `(network_id, retired_keys.public_key)` index). A config copied to another machine of the
 org cannot make a key live again. It is still per org, because a network is: another org's
 node for the same machine holds its own key (`AgentConfig::for_org`). The check runs after
@@ -340,7 +340,7 @@ under any other key satisfies the order (P1c and P1d hold unchanged). The frame 
 rotates.
 
 ⚠️ **The loop guard is the order already on the row** (`order_in_flight`,
-`models.rs:10769`). An order that is unsatisfied, unanswered, and delivered less than
+`models.rs:10774`). An order that is unsatisfied, unanswered, and delivered less than
 `REDELIVER_AFTER_SECS` (120 s) ago is being executed: a second retired-key join inside
 that window is refused and ordered nothing, with no second audit row. Past the window, the
 60 s ceiling bounds it. A device that refuses the order — its own switch off, say — is
@@ -432,13 +432,13 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:1040`, `:1233`, `:1262`, test `:8515`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4959-4963` |
-| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2810`, `:1020`; owner `network` (`:1997`, `modular-monolith.md`) |
-| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3244`, `:3278`, `:3303`, `:3334`, `:5695`, `:10734`, `:10749` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:1040`, `:1233`, `:1262`, test `:8520`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4959-4963` |
+| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2817`, `:1020`; owner `network` (`:2004`, `modular-monolith.md`) |
+| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3244`, `:3278`, `:3303`, `:3334`, `:5695`, `:10739`, `:10754` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
 | reconcile-on-connect | `crates/modules/fleet/src/socket.rs:317-333`, `:398-419` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
-| identity stamp at the join | `crates/modules/network/src/overlay.rs:649-672`; `crates/services/src/dao/agent.rs:1206` |
+| identity stamp at the join | `crates/modules/network/src/overlay.rs:654-677`; `crates/services/src/dao/agent.rs:1206` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1171-1201` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:1160-1321`, `:2218-2226` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:838-846` |
@@ -446,12 +446,12 @@ The server cannot see the device switch, so a switched-off device is still order
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:1091-1096`, `:1876-1881`, `:2006-2008`; `config_surface.rs:1266-1273` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2113-2214`; `ui/src/stores/agents.ts:1294-1308` |
-| P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3357`, `:3375`, `:4097`, `:3345`, `:10769`, `:11051`; the node and network fields `:7160`, `:7402` |
-| P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7421` |
-| P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:378-420`, `:441-471`, `:791`, `:812`, `:861` |
+| P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3357`, `:3375`, `:4097`, `:3345`, `:10774`, `:11056`; the node and network fields `:7160`, `:7407` |
+| P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7434` |
+| P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:381-423`, `:444-475`, `:796`, `:817`, `:866` |
 | P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:383`; nest `crates/modules/network/src/lib.rs:555`, `:613` |
 | P2 DERP | `crates/modules/network/src/derp.rs:440`, `:512-548` |
-| P2 DAO: the check · the CAS write · the switch | `crates/services/src/dao/overlay_node.rs:145`, `:346-368`; `crates/services/src/dao/overlay_network.rs:326` |
+| P2 DAO: the check · the CAS write · the switch | `crates/services/src/dao/overlay_node.rs:148`, `:365-391`; `crates/services/src/dao/overlay_network.rs:326` |
 | P2 indexes | `crates/modules/network/src/lib.rs:801-805` |
 | P2 integration tests | `crates/tests/src/retired_key_tests.rs` |
 

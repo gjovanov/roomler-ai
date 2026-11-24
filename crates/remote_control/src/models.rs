@@ -7303,6 +7303,11 @@ pub struct OverlayNode {
     /// the table with no word of why. `None` on an older device or row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_offer_withheld: Option<String>,
+    /// #3562 — whether this exit serves IPv6, as its last join stated it
+    /// (`NetmapPeer::exit_serves_v6`): `None` = an older device or row, kept
+    /// ABSENT in the document (never `null`), so its clients keep the old rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_serves_v6: Option<bool>,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
     pub created_at: DateTime,

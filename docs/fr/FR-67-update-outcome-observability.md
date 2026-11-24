@@ -123,7 +123,7 @@ flowchart LR
 
 | Piece | Where |
 |---|---|
-| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:581`; `NodeStatus.last_install`, `:484` |
+| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:587`; `NodeStatus.last_install`, `:490` |
 | The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:2130`), its pure half `summarize` (`:2149`) |
 | The startup line and its level | `log_at_startup` (`:1829`), `startup_level` (`:1813`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4418`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:1083`) |

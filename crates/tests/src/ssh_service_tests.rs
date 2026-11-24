@@ -200,6 +200,7 @@ async fn device(
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
