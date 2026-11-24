@@ -653,7 +653,7 @@ test of the SIGKILL property itself.
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
-  is 15, `docs/installation.md:2722-2737`), in the GUI worker, under the Screen Recording grant it already holds. The
+  is 15, `docs/installation.md:2728-2743`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
   *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
   `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
@@ -1234,7 +1234,7 @@ model on Windows, so the three agree on what the mode means.
       session-teardown code (`agents/roomlerd/src/macos_supervisor.rs:275-301`). Exit code 9 is a restart someone
       asked for, and signal 9 is a kill. Only the wait status tells them apart, and a test holds that.
     - *Where it goes.* `WriterContext::Supervisor`, which off Windows is the writing process's own dir: the root
-      daemon's. Its own uploader drains it, so the record reaches the server on the daemon's row (`:1793-1800`).
+      daemon's. Its own uploader drains it, so the record reaches the server on the daemon's row (`:1796-1803`).
     - *Its tail* is the daemon's own log, as on Windows. The worker's stderr is the daemon's `StandardErrorPath`,
       which a signal death writes nothing to. Its rolling log is in the person's home, which a root daemon does not
       read, and nothing ties the two halves to one org.

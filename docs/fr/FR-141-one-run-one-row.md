@@ -115,7 +115,7 @@ What each layer has to do. The daemon needs nothing new: FR-43 P3a, P3b and P3d 
 |---|---|---|
 | Pages (`app.js`, `index.html`) | "both" = two rows; a second token field | "Screen and private network" = one row while `wizard_macos_one_row` is on; one token field; Done names one row |
 | Roles and tokens (`role.rs`, `commands.rs`, `pairing.rs`) | `wants_root_half` → `halves: 2`, a root token and a person's token | a third shape beside "screen only" and "two rows": one token, `halves: 1`, which enrolls the ROOT half |
-| Enrollment (`orchestrator_unix.rs:1008-1103`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:9141-9147`); no person's enrollment, no `--user-steps` |
+| Enrollment (`orchestrator_unix.rs:1008-1103`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:9150-9156`); no person's enrollment, no `--user-steps` |
 | Privileged half (`install.sh --privileged-steps --config-from`) | marker, package, config placed, daemon started | as built (#4152), `--privileged-steps --one-row --config-from FILE`, in `install_macos_one_row_half` (`install.sh:1139-1184`): a root config there already stops it, unless it holds this attempt's own `agent_id` (a Retry's); the marker; root's config placed, or the Retry's kept; ONE package run, whose guard reads the switch, removes the LaunchAgent and starts the root half (`postinstall:380-432`); then the binary's `enroll --help` must list `--one-row`, the belt the terminal's form has too (`install.sh:1077-1082`). The terminal's `--one-row` on a Mac that is one row already runs the package only (`install.sh:1047-1065`). The two-row form stops on a root config that is one row already (the 2026-11-21 line below) |
 | Server pairing (`crates/modules/fleet/src/pairing.rs:326-334`) | `halves: 2` for a macOS daemon only | no change: `halves: 1` is accepted for every OS. `halves: 2` stays for two-row installs and older wizards. The `/pair` page shows its two-entries note only for `halves === 2` (`ui/src/views/pair/PairView.vue:110-111`) |
 | Server features (`/api/setup/features`) | `wizard_macos_daemon` | a new key, `wizard_macos_one_row`, default off |
@@ -250,9 +250,9 @@ person's half on it and says why.
     stop can still show). It promises no layout: with P2's switch on, Setup gives a new Mac one device and no two-row
     choice, so "two devices" would be true only while the switch is off. A Mac that `sudo roomlerd
     one-row` made one row is also offered `sudo roomlerd one-row --revert`, but only while root's copy from before,
-    `/etc/roomler/config.toml.pre-one-row`, is there (`agents/roomlerd/src/one_row.rs:66-84`): only that command
-    writes it, a finished revert removes it (`:3102-3107`), and with no copy the revert says only "nothing to revert"
-    (`:3176-3181`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
+    `/etc/roomler/config.toml.pre-one-row`, is there (`agents/roomlerd/src/one_row.rs:77-95`): only that command
+    writes it, a finished revert removes it (`:3205-3210`), and with no copy the revert says only "nothing to revert"
+    (`:3279-3284`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
     is not named: it keeps the config. The words are `stop_text`'s (`agents/roomler-setup/src/reinstall_guard.rs`).
   - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5831-5835`), so
     it asks the system socket (`:4939-4943`), the root daemon's own, through the same root-only connect
@@ -293,7 +293,7 @@ on the Devices page.
 - [ ] **AC1**: macOS 15 or later, the released wizard, **pairing**, the default choice, one-row switch on: **one**
   row, online. From that row on the Devices page: its overlay address(es) shown, a remote-desktop session that
   streams and takes input; `sudo roomler peers` lists the mesh; a ping over the overlay both ways; `roomler ssh`
-  once the device's `ssh_enabled` is on (`docs/installation.md:3155-3156`).
+  once the device's `ssh_enabled` is on (`docs/installation.md:3175-3176`).
 - [ ] **AC2**: the same with a **pasted** token: one field, one token, one row.
   P0 read, cell M2 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)): the
   paste path with the default choice still asks for two tokens and leaves two rows, so AC2 is not held yet.

@@ -1775,9 +1775,9 @@ jobs:
       # it runs as, not from the `HOME` sudo kept from its caller
       # (`crates/agent-core/src/appdirs.rs`). Its test runs children of itself
       # with another `HOME`; the rule's other tests run on every lane, and only
-      # a Mac runs the macOS rule against a real account database. #4157: and the restore of a missing config, which a root daemon's start now runs through.
+      # a Mac runs the macOS rule against a real account database. #4157: and the restore of a missing config, which a root daemon's start now runs through. #4379: and the load with no restore that the macOS supervisor's enrolled worker now runs on.
       - name: cargo test the agent's folders and its config restore on a real Mac (#3802, #4157)
-        run: cargo test -p roomler-node-core --lib -- appdirs::tests config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_restored_config_brings_no_crash_to_the_next_start config::tests::a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written config::tests::previous_copy_reads_the_copy_and_writes_nothing
+        run: cargo test -p roomler-node-core --lib -- appdirs::tests config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_restored_config_brings_no_crash_to_the_next_start config::tests::a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written config::tests::previous_copy_reads_the_copy_and_writes_nothing config::tests::load_without_restore_never_reads_or_writes_the_prev
 
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
@@ -1958,12 +1958,12 @@ jobs:
       # refusal: `appdirs`' Windows tests run in no other lane.
       # #4067 — and the log uploader's, the pool's idle timeout among them: they
       # ran only on Linux.
-      # #4058 — and the config load's line for a missing live file, told from an unreadable one (a refused read on NTFS among them). #4157 — and a restore that clears the run marks, a copy that does not load leaving nothing written, and the copy a start reads.
+      # #4058 — and the config load's line for a missing live file, told from an unreadable one (a refused read on NTFS among them). #4157 — and a restore that clears the run marks, a copy that does not load leaving nothing written, and the copy a start reads. #4379 — and the load that restores no copy.
       - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings; cargo test -p roomlerdw
-          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests config::tests::only_a_read_that_found_no_file_is_missing config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_config_that_does_not_parse_keeps_the_unreadable_line config::tests::a_config_whose_read_is_refused_keeps_the_unreadable_line config::tests::a_restored_config_brings_no_crash_to_the_next_start config::tests::a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written config::tests::previous_copy_reads_the_copy_and_writes_nothing
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests config::tests::only_a_read_that_found_no_file_is_missing config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_config_that_does_not_parse_keeps_the_unreadable_line config::tests::a_config_whose_read_is_refused_keeps_the_unreadable_line config::tests::a_restored_config_brings_no_crash_to_the_next_start config::tests::a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written config::tests::previous_copy_reads_the_copy_and_writes_nothing config::tests::load_without_restore_never_reads_or_writes_the_prev
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |
