@@ -72,6 +72,43 @@ describe('useRoomStore', () => {
     })
   })
 
+  // #4395 — the room a page shows, for the unread check.
+  describe('showRoom', () => {
+    it('names the room until its own release, and leaves current alone', () => {
+      const store = useRoomStore()
+      store.setCurrent(makeRoom({ id: 'r1' }), 'T')
+      const release = store.showRoom('r1')
+      expect(store.shownRoomId).toBe('r1')
+
+      release()
+
+      expect(store.shownRoomId).toBeNull()
+      expect(store.current?.id, 'the last opened room is kept').toBe('r1')
+      expect(store.currentTenantId).toBe('T')
+    })
+
+    it("a page's late release does not clear the next page's claim", () => {
+      const store = useRoomStore()
+      const releaseChat = store.showRoom('r1')
+      // The call page of the same room mounts before the chat page unmounts.
+      const releaseCall = store.showRoom('r1')
+      releaseChat()
+      expect(store.shownRoomId).toBe('r1')
+
+      releaseCall()
+      expect(store.shownRoomId).toBeNull()
+    })
+
+    it('a release after another room was claimed keeps that room', () => {
+      const store = useRoomStore()
+      const releaseA = store.showRoom('a')
+      store.showRoom('b')
+      releaseA()
+      releaseA()
+      expect(store.shownRoomId).toBe('b')
+    })
+  })
+
   describe('fetchRooms', () => {
     it('should populate rooms array from API', async () => {
       const rooms = [makeRoom({ id: 'r1' }), makeRoom({ id: 'r2' })]

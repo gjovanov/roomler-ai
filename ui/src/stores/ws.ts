@@ -258,11 +258,13 @@ export const useWsStore = defineStore('ws', () => {
           break
         }
         messageStore.addMessageFromWs(msg.data as never)
-        // Increment unread count if user is not viewing this room — but
+        // Increment unread count if no page shows this room now — but
         // NEVER for the user's own messages: since 2026-08-04 the server
         // broadcasts to ALL members including the sender (so their other
         // browsers get realtime), and a self-echo must not inflate badges.
-        if (msgData.room_id && !isOwn && roomStore.current?.id !== msgData.room_id) {
+        // #4395 — asks the room a page shows (`shownRoomId`), not `current`:
+        // that keeps naming the last opened room after its page is left.
+        if (msgData.room_id && !isOwn && roomStore.shownRoomId !== msgData.room_id) {
           roomStore.incrementUnread(msgData.room_id)
         }
         break

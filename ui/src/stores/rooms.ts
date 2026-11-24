@@ -73,6 +73,14 @@ export const useRoomStore = defineStore('rooms', () => {
    *  org, and nothing clears `current` on a change of org, so a page that names
    *  the current room under an org asks this, never `current.tenant_id`. */
   const currentTenantId = ref<string | null>(null)
+  /** #4395 — the room a page shows now: the chat page or the call page,
+   *  while it is mounted on that room; null on every other page. The unread
+   *  check asks this, never `current`, which keeps naming the last opened
+   *  room after its page is left. Only the page that claimed it releases it
+   *  (`showRoom` hands back the release): the next page's claim can land
+   *  before the previous page unmounts. */
+  const shownRoomId = ref<string | null>(null)
+  let shownBy: symbol | null = null
   const participants = ref<Participant[]>([])
   const loading = ref(false)
   const roomFiles = ref<FileEntry[]>([])
@@ -219,6 +227,19 @@ export const useRoomStore = defineStore('rooms', () => {
   function setCurrent(room: Room | null, tenantId?: string) {
     current.value = room
     currentTenantId.value = room ? (tenantId ?? null) : null
+  }
+
+  /** A page starts showing `roomId` (again, on an in-place room switch). The
+   *  release it returns clears the fact only while it is still this claim. */
+  function showRoom(roomId: string): () => void {
+    const by = Symbol('shown-room')
+    shownRoomId.value = roomId
+    shownBy = by
+    return () => {
+      if (shownBy !== by) return
+      shownRoomId.value = null
+      shownBy = null
+    }
   }
 
   // --- Call operations ---
@@ -404,6 +425,7 @@ export const useRoomStore = defineStore('rooms', () => {
     roomsTenantId,
     current,
     currentTenantId,
+    shownRoomId,
     participants,
     loading,
     rootRooms,
@@ -422,6 +444,7 @@ export const useRoomStore = defineStore('rooms', () => {
     fetchRoom,
     explore,
     setCurrent,
+    showRoom,
     fetchMembers,
     // Call operations
     updateRoomCallStatus,

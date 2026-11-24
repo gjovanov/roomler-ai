@@ -300,6 +300,11 @@ const videoInputs = computed(() =>
 
 const tenantId = computed(() => route.params.tenantId as string)
 const roomId = computed(() => route.params.roomId as string)
+// #4395 — this page shows its room while it is mounted (it remounts by
+// roomId), so the unread check does not count that room's messages here: the
+// open chat panel reads them, the closed one shows its dot. Once the page is
+// left (the mini view, another page) they count again.
+const releaseShownRoom = roomStore.showRoom(roomId.value)
 const joined = ref(false)
 const joining = ref(false)
 const showChat = ref(false)
@@ -311,7 +316,7 @@ const { smAndDown } = useDisplay()
 const canScreenShare = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia
 // A closed chat — the phone's default now — still says when someone wrote: a
 // dot on its button. The WS handler never bumps the unread count of the room
-// you are in, so arrivals are noticed here (once the first load is in, which
+// this page shows (#4395, `shownRoomId`), so arrivals are noticed here (once the first load is in, which
 // is not news); the server's count covers what came before the page opened.
 const chatUnseen = ref(false)
 let chatPrimed = false
@@ -807,6 +812,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  releaseShownRoom()
   window.removeEventListener('beforeunload', warnBeforeLeave)
   if (readAllTimer) clearTimeout(readAllTimer)
 })
