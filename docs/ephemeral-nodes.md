@@ -167,10 +167,10 @@ exec roomlerd run
   ([`wix-perMachine/main.wxs:698-700`](../agents/roomlerd/wix-perMachine/main.wxs#L698-L700),
   [`win_service/lifecycle.rs:293`](../agents/roomlerd/src/win_service/lifecycle.rs#L293)).
   The worker takes either stop as an OS-initiated stop
-  ([`app.rs:5858-5865`](../agents/roomlerd/src/app.rs#L5858-L5865)), finds no
+  ([`app.rs:5911-5918`](../agents/roomlerd/src/app.rs#L5911-L5918)), finds no
   update in flight, and an ephemeral device deletes its own row, the one its
   run started as
-  ([`app.rs:5953-5962`](../agents/roomlerd/src/app.rs#L5953-L5962)).
+  ([`app.rs:6006-6015`](../agents/roomlerd/src/app.rs#L6006-L6015)).
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
@@ -205,7 +205,7 @@ flowchart LR
 
 - **Which daemon.** The event is keyed by the config's instance id, the
   fingerprint the single-instance lock already uses
-  ([`instance_lock.rs:92`](../agents/roomlerd/src/instance_lock.rs#L92)). So
+  ([`instance_lock.rs:100`](../agents/roomlerd/src/instance_lock.rs#L100)). So
   `service stop` reaches the daemon of the config it resolved, and no other.
   `Local\` keeps the event in the person's own session, and its default DACL
   lets that person and SYSTEM signal it, which Task Manager already allows them.
@@ -326,11 +326,11 @@ that swap would put an ephemeral row beside another org.
 
 The daemon keeps the row it started as: its primary's server, org, `agent_id`
 and `ephemeral` (`updater::RunRow`, taken at
-`agents/roomlerd/src/app.rs:4713`). On an OS stop the gate
+`agents/roomlerd/src/app.rs:4766`). On an OS stop the gate
 (`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
 unchanged) reads the run's own `ephemeral`, and the removal targets the run's
 own row (`updater::stop_removal`, `:5085-5114`, at
-`agents/roomlerd/src/app.rs:5953-5981`):
+`agents/roomlerd/src/app.rs:6006-6034`):
 
 | The file at the stop | The stop removes |
 |---|---|

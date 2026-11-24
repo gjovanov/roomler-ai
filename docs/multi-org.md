@@ -54,7 +54,7 @@ So: **one daemon, many orgs**. Everything below follows from that.
 
 A `roomlerd run` takes a guard that belongs to the machine, not to its config, before anything
 above: before the start's purge of the overlay's routes, the LocalAPI pipe and the first connect
-(`start_gate`, `agents/roomlerd/src/app.rs:3975`; the guard is
+(`start_gate`, `agents/roomlerd/src/app.rs:3976`; the guard is
 `agents/roomlerd/src/machine_guard.rs`). A run that finds it held leaves there, whatever config it
 loaded and elevated or not, and marks, saves and counts nothing.
 
@@ -82,6 +82,11 @@ loaded and elevated or not, and marks, saves and counts nothing.
   ([remote-control.md §19.8.9](remote-control.md#1989-a-worker-its-host-left-behind-2465)). If an
   elevated console `roomlerd run` holds the guard when the service's worker starts, the worker
   leaves with 8 and the host stops the service until a reboot or a manual start.
+- **The service's own SYSTEM worker is decided by the guard alone** (#4403): it holds the
+  machine's guard, which already makes it the only privileged daemon on the machine, so the
+  config's single-instance lock no longer decides whether that worker runs, and the worker still
+  takes the lock, so every other start finds it as before (`config_lock`,
+  `agents/roomlerd/src/app.rs:4040`; the rule is `machine_guard::relaxes_config_lock`).
 - A start that can neither take nor read the guard runs without it and logs
   `machine guard unavailable; running without it` at WARN: a machine left with no daemon is the one
   answer the guard must never give.
