@@ -60,7 +60,7 @@
     | 18:58:49 | +1 | our `rc:keyframe` at 18:58:48.3, the positive control; a move 1.5 M → 1 M shares the window and adds nothing |
     | 18:59:01 | +1 | the resize to 1600×900, `dims_swaps` +1, the positive control |
     | 18:59:15 | +1 | the resize back, `dims_swaps` +1 |
-    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11452`) |
+    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11382`) |
 
     The other 12 moves sit in windows where `idr_count` did not move: 216 windows judged, none
     unexplained. The inequality holds as written: 4 ≤ 2 dims changes + 2 keyframe requests.
@@ -110,13 +110,13 @@
     and none of these paths has changed since 0.4.199, the build that ran. The line comes from
     `overlay_remote_is_relay_tier` (`peer.rs:2291`), a LocalAPI read that changes nothing. The
     FFmpeg DC pump calls it on its transport recheck, every 5 s (`TRANSPORT_RECHECK_INTERVAL`,
-    `peer.rs:2120`; the recheck at `:7752`). The answer goes two places:
+    `peer.rs:2121`; the recheck at `:7753`). The answer goes two places:
     - into `constrained`, which sets the rate ceiling and, on a flip, re-sends `rc:video-info`
-      (`:7766`);
+      (`:7767`);
     - into `FlipTracker` (`encode/rate_profile.rs:81`). It rebuilds the encoder only after two
       consecutive checks disagree with the state the pump was built for, at least 60 s after
       the last rebuild, and only when the frame rate changes. That rebuild logs its own line
-      (`peer.rs:7780`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
+      (`peer.rs:7781`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
       bumps, only the inline open's (`:9098`) can follow from this path, through that rebuild.
       The others are a dims swap (`:7597`), a rate swap (`:7675`) and a deferred rebuild
       (`:9641`).

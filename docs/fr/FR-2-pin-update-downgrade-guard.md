@@ -40,7 +40,7 @@ server, where it cannot be skipped by a stale script.
     (`#[serde(default)]` — additive; existing callers unchanged).
   - New `release_ord(&str) -> Option<(u64,u64,u64,u64)>`: the same ordering
     tuple as the agent updater's `parse_version`
-    (`agents/roomlerd/src/updater.rs:258-296`) — `rc.N` ranks `N`, finals
+    (`agents/roomlerd/src/updater.rs:258-298`) — `rc.N` ranks `N`, finals
     rank `u64::MAX`, so `0.3.0-rc.482 < 0.4.0 < 0.4.1`. Tags and bare semvers
     both parse; unparseable → `None`.
   - New `pin_downgrade(pin, agent_version) -> Option<String>`: `Some(reason)`
@@ -48,9 +48,9 @@ server, where it cannot be skipped by a stale script.
     recovery move). Unknown orderings are allowed: the guard cannot claim
     "downgrade" about what it cannot compare, and the agent's own artifact
     verification (`artifact_version.rs`) still gates what installs.
-  - `trigger_agent_update` (was `:761-803`): refuses with **409 Conflict**
+  - `trigger_agent_update` (was `:763-805`): refuses with **409 Conflict**
     naming both versions + the `force` hint.
-  - `trigger_agents_update` (was `:825-956`): targets are collected as
+  - `trigger_agents_update` (was `:827-958`): targets are collected as
     `(id, agent_version)` pairs; a stale pin **skips per agent** — the result
     row carries `refused: Some(reason)` and the response gains a `refused`
     count. A fleet push is never all-or-nothing over one already-updated

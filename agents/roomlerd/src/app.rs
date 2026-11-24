@@ -1109,14 +1109,14 @@ enum ServiceAction {
 ///      without `--machine-global`), when it lies in the service account's
 ///      own profile as the system names it (`system_profile`,
 ///      `appdirs::system_profile`) and opens;
-///    - else the machine-global path, so `config::load` fails with an honest
-///      "not found" naming where the machine's enrollment belongs.
+///    - else the machine-global path: its start restores a missing config from
+///      a copy that passes (#4176), or `config::load` fails with "not found".
 ///
 ///    The config of the person signed in at the console is never one of them.
 ///    That enrollment runs as that person, on the service host's user-context
 ///    arm, until the machine has its own
 ///    (`win_service::supervisor::want_system_worker`, which reads the same two
-///    rungs).
+///    rungs, then the copy).
 /// 3. Every other process: the platform default (`%APPDATA%` per user).
 fn pick_config_path(
     explicit: Option<PathBuf>,
@@ -2036,7 +2036,9 @@ async fn daemon_main() -> Result<()> {
             // runs this for a per-user install.
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
-                updater::run_update_helper().await
+                // FR-151 — SIGTERM ends a Mac's waiting helper at once, through
+                // the daemon's one handler, installed only when the gate polls it.
+                updater::run_update_helper(terminate_signal(None, Path::new("/"))).await
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
@@ -6407,6 +6409,22 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
         // /etc/roomler/disable-auto-update (`updater::OPT_OUT_MARKERS`). P5a missed
         // this string, so "Apply update" in the companion pointed at a log that no
         // longer exists on any Mac it had migrated. docs/fr/FR-46
+        //
+        // FR-151 — first the person's own ask, recorded by the daemon behind
+        // this account's OWN socket (never the system one, so it can never land
+        // in a root daemon); the helper then installs over this person's own
+        // sessions, never over the system daemon's SSH connections, runs,
+        // transfers or recording. With nobody serving that socket the wake
+        // below is a plain one, and the helper's usual wait applies.
+        let recorded = match tunnel_core::localapi::own_socket_path() {
+            Some(path) => tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut client = tunnel_core::localapi::connect_unix_at(path).await?;
+                client.ask_for_update().await
+            })
+            .await
+            .is_ok_and(|asked| asked.is_ok()),
+            None => false,
+        };
         return match updater::queue_update_check() {
             Ok(()) => {
                 println!(
@@ -6415,6 +6433,14 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
                      (If this Mac set /etc/roomler/disable-auto-update, updates are manual:\n\
                       sudo installer -pkg <pkg> -target /)"
                 );
+                if recorded {
+                    println!(
+                        "Your ask is recorded: the update installs now over your own sessions, \
+                         and waits for this Mac's SSH connections, runs, transfers and recordings."
+                    );
+                } else {
+                    println!("The update installs when nothing on this Mac is in use.");
+                }
                 Ok(())
             }
             Err(e) => Err(anyhow::anyhow!(e).context(format!(

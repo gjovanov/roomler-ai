@@ -288,9 +288,11 @@ fn recent_update_attempt_at(marker_path: &std::path::Path, cooldown: Duration) -
 
 /// The least time between two update-helper runs — launchd's `ThrottleInterval`
 /// (`com.roomler.update.plist`), made explicit for systemd. Locked to the plist
-/// by `update_helper_min_gap_matches_launchd_throttle_interval`.
-#[cfg(target_os = "linux")]
-const UPDATE_HELPER_MIN_GAP: Duration = Duration::from_secs(60);
+/// by `update_helper_min_gap_matches_launchd_throttle_interval`. FR-151: a
+/// Mac's waiting helper spaces the wakes it reads by the same gap
+/// (`helper_gate::next_step`), so a wake costs at most one cycle a minute
+/// whether launchd or the helper itself reads it.
+pub(crate) const UPDATE_HELPER_MIN_GAP: Duration = Duration::from_secs(60);
 
 /// The helper's run-spacing stamp, beside `update-attempt` in the root-owned
 /// log dir. Only root can write it, so no local user can shorten the gap.
@@ -461,7 +463,7 @@ pub struct GithubRelease {
     pub prerelease: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GithubAsset {
     pub name: String,
     pub browser_download_url: String,
@@ -1857,10 +1859,31 @@ pub async fn pin_version(tag: &str) -> CheckOutcome {
 /// `Unreachable(...)` (#1755) and verdicts into `Skipped(...)`, so a flaky
 /// link doesn't crash the agent.
 pub async fn check_once() -> CheckOutcome {
+    match probe_once().await {
+        Ok(newer) => download_newer(newer).await,
+        Err(outcome) => outcome,
+    }
+}
+
+/// FR-151 — a newer release with an installer for this platform, found by
+/// [`probe_once`] and not yet downloaded.
+#[derive(Debug, Clone)]
+pub struct NewerRelease {
+    pub current: String,
+    pub latest: String,
+    asset: GithubAsset,
+}
+
+/// FR-151 — [`check_once`]'s first half: the feed, and nothing downloaded.
+/// `Ok` when a newer release has an installer for this platform; otherwise
+/// the outcome `check_once` gives. The Mac's helper reads live work between
+/// the two halves, so a busy Mac with nothing to install never waits, and a
+/// deferred cycle downloads nothing ([`download_asset`] keeps no cache).
+pub async fn probe_once() -> Result<NewerRelease, CheckOutcome> {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let release = match fetch_latest_release().await {
         Ok(r) => r,
-        Err(e) => return failed("fetch", e),
+        Err(e) => return Err(failed("fetch", e)),
     };
     // Drafts are always skipped; prereleases are tolerated because
     // our 0.x release history marked them all `prerelease: true` and
@@ -1868,31 +1891,53 @@ pub async fn check_once() -> CheckOutcome {
     // /releases/latest endpoint excludes them. pick_latest_release
     // has already filtered by tag prefix.
     if release.draft {
-        return CheckOutcome::Skipped(format!("latest release is draft: {}", release.tag_name));
+        return Err(CheckOutcome::Skipped(format!(
+            "latest release is draft: {}",
+            release.tag_name
+        )));
     }
     let latest_parsed = match parse_version(&release.tag_name) {
         Some(_) => release.tag_name.clone(),
-        None => return CheckOutcome::Skipped(format!("unparseable tag {}", release.tag_name)),
-    };
-    if !is_newer(&latest_parsed, &current) {
-        return CheckOutcome::UpToDate {
-            current,
-            latest: latest_parsed,
-        };
-    }
-    let asset = match pick_asset_for_platform(&release.assets) {
-        Some(a) => a,
         None => {
-            return CheckOutcome::Skipped(format!(
-                "no installer asset for this platform in release {latest_parsed}"
-            ));
+            return Err(CheckOutcome::Skipped(format!(
+                "unparseable tag {}",
+                release.tag_name
+            )));
         }
     };
-    let downloaded = download_asset(asset, &latest_parsed).await;
-    match downloaded {
-        Ok(path) => CheckOutcome::UpdateReady {
+    if !is_newer(&latest_parsed, &current) {
+        return Err(CheckOutcome::UpToDate {
             current,
             latest: latest_parsed,
+        });
+    }
+    let asset = match pick_asset_for_platform(&release.assets) {
+        Some(a) => a.clone(),
+        None => {
+            return Err(CheckOutcome::Skipped(format!(
+                "no installer asset for this platform in release {latest_parsed}"
+            )));
+        }
+    };
+    Ok(NewerRelease {
+        current,
+        latest: latest_parsed,
+        asset,
+    })
+}
+
+/// FR-151 — [`check_once`]'s second half: download and verify the newer
+/// release's installer.
+pub async fn download_newer(newer: NewerRelease) -> CheckOutcome {
+    let NewerRelease {
+        current,
+        latest,
+        asset,
+    } = newer;
+    match download_asset(&asset, &latest).await {
+        Ok(path) => CheckOutcome::UpdateReady {
+            current,
+            latest,
             installer_path: path,
         },
         Err(e) => failed("download", e),
@@ -3000,6 +3045,12 @@ fn spawn_watcher(
     // ...and it keeps nothing else of ours either.
     #[cfg(unix)]
     tunnel_core::child::inherit_only_stdio(&mut cmd);
+    // #4302 — nor our console: it gets one of its own ([`watcher_creation_flags`]).
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(watcher_creation_flags());
+    }
     let _child = cmd
         .spawn()
         .context("spawning post-install-watch subprocess")?;
@@ -3015,6 +3066,62 @@ fn spawn_watcher(
     Ok(())
 }
 
+/// #4302 — the watcher's creation flags on Windows: a console of its own, with
+/// no window. With no flag a console program shares the console of the process
+/// that started it, so the watcher was in the old worker's console, and a
+/// control event sent to that console reaches every process in it. Not
+/// `DETACHED_PROCESS`: with no console at all, a console tool the watcher runs
+/// (`taskkill` on a wedge) would open a window of its own on the signed-in
+/// desktop. Not a new process group either: that turns Ctrl+C off for the
+/// watcher, and Restart Manager must still be able to stop it.
+#[cfg(target_os = "windows")]
+fn watcher_creation_flags() -> u32 {
+    windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+}
+
+/// #4302 — the runtime libraries both MSIs place beside `roomlerd.exe`
+/// (`VcRedistCrt`), which are what its import table names besides Windows'
+/// own. A staged copy of the EXE gets them beside it too
+/// ([`stage_runtime_libs`]), so everything the copy loads sits beside it.
+#[cfg(target_os = "windows")]
+const WATCHER_RUNTIME_LIBS: [&str; 3] = ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"];
+
+/// Whether [`stage_watcher_exe`] places the runtime libraries beside the copy:
+/// only in a staging dir of ours ([`is_staging_dir`]), made by this process
+/// holding the SYSTEM token ([`create_fresh_protected_dir`]). Anywhere else
+/// the copy is staged exactly as before.
+#[cfg(target_os = "windows")]
+fn may_stage_runtime_libs(staging: &std::path::Path, as_system: bool) -> bool {
+    as_system && is_staging_dir(staging)
+}
+
+/// Copy each of [`WATCHER_RUNTIME_LIBS`] found beside `exe` into `staging`.
+/// A library that is not beside `exe` (a build that does not ship it) is
+/// skipped. Returns how many were placed. Best effort: a failed copy is
+/// logged, and the watcher still runs.
+#[cfg(target_os = "windows")]
+fn stage_runtime_libs(exe: &std::path::Path, staging: &std::path::Path) -> usize {
+    let Some(exe_dir) = exe.parent() else {
+        return 0;
+    };
+    let mut placed = 0;
+    for lib in WATCHER_RUNTIME_LIBS {
+        let from = exe_dir.join(lib);
+        if !from.is_file() {
+            continue;
+        }
+        match std::fs::copy(&from, staging.join(lib)) {
+            Ok(_) => placed += 1,
+            Err(e) => tracing::warn!(
+                error = %e,
+                lib,
+                "could not place a runtime library beside the staged watcher"
+            ),
+        }
+    }
+    placed
+}
+
 /// Copy the running daemon EXE into the update staging directory
 /// (the installer's own directory) and return the path to launch the
 /// watcher from, plus whether it IS a staged copy. Fallback chain:
@@ -3024,6 +3131,9 @@ fn spawn_watcher(
 /// (pre-fix behaviour — a watcher RestartManager may kill beats no
 /// watcher at all).
 ///
+/// #4302 — in a staging dir of ours ([`may_stage_runtime_libs`]) the copy
+/// gets its runtime libraries beside it ([`stage_runtime_libs`]).
+///
 /// The name deliberately avoids the "install"/"setup"/"update"/
 /// "patch" substrings (Windows UAC's installer-detection heuristic
 /// auto-elevates EXEs matching them — the P4 lib-naming rule).
@@ -3032,6 +3142,19 @@ fn stage_watcher_exe(
     exe: &std::path::Path,
     installer_path: &std::path::Path,
 ) -> (std::path::PathBuf, bool) {
+    let with_libs = installer_path
+        .parent()
+        .is_some_and(|dir| may_stage_runtime_libs(dir, running_as_system()));
+    stage_watcher_exe_with(exe, installer_path, with_libs)
+}
+
+/// [`stage_watcher_exe`] with the runtime-library decision made by the caller.
+#[cfg(target_os = "windows")]
+fn stage_watcher_exe_with(
+    exe: &std::path::Path,
+    installer_path: &std::path::Path,
+    with_libs: bool,
+) -> (std::path::PathBuf, bool) {
     let Some(staging) = installer_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -3039,24 +3162,32 @@ fn stage_watcher_exe(
         return (exe.to_path_buf(), false);
     };
     let fixed = staging.join("roomlerd-watch.exe");
-    match std::fs::copy(exe, &fixed) {
-        Ok(_) => return (fixed, true),
+    let staged = match std::fs::copy(exe, &fixed) {
+        Ok(_) => Some(fixed),
         Err(e) => {
-            tracing::debug!(error = %e, dest = %fixed.display(), "watcher stage copy (fixed name) failed; trying pid-suffixed name")
+            tracing::debug!(error = %e, dest = %fixed.display(), "watcher stage copy (fixed name) failed; trying pid-suffixed name");
+            let suffixed = staging.join(format!("roomlerd-watch-{}.exe", std::process::id()));
+            match std::fs::copy(exe, &suffixed) {
+                Ok(_) => Some(suffixed),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "staging watcher copy failed; spawning watcher from the install-dir EXE \
+                         (RestartManager may shut it down mid-install)"
+                    );
+                    None
+                }
+            }
         }
+    };
+    let Some(copy) = staged else {
+        return (exe.to_path_buf(), false);
+    };
+    if with_libs {
+        let placed = stage_runtime_libs(exe, staging);
+        tracing::info!(placed, "runtime libraries placed beside the staged watcher");
     }
-    let suffixed = staging.join(format!("roomlerd-watch-{}.exe", std::process::id()));
-    match std::fs::copy(exe, &suffixed) {
-        Ok(_) => (suffixed, true),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "staging watcher copy failed; spawning watcher from the install-dir EXE \
-                 (RestartManager may shut it down mid-install)"
-            );
-            (exe.to_path_buf(), false)
-        }
-    }
+    (copy, true)
 }
 
 /// Resolve the effective update-check cadence for this run. Order:
@@ -3132,6 +3263,65 @@ impl UpdateAsk {
             UpdateAsk::OutageRecheck => "the update recheck after a long control-socket outage",
         }
     }
+}
+
+/// FR-151 — who asked this daemon for an update, as its [`AskBook`] keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskedBy {
+    /// An operator's push to this daemon's row (`rc:agent.update`), with its
+    /// pin, which a Mac's helper ignores: it installs the latest release.
+    Operator { pin: Option<String> },
+    /// The person this daemon runs as, through "Apply update"
+    /// (`tunnel_core::localapi::Request::AskForUpdate`).
+    Person,
+}
+
+/// FR-151 — one recorded ask: when, on the wall clock, and by whom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedAsk {
+    pub at: std::time::SystemTime,
+    pub by: AskedBy,
+}
+
+/// FR-151 — the newest ask for an update this daemon recorded, which the
+/// LocalAPI's `live_work` answers as an age. The Mac's root update helper
+/// reads it to tell an operator's push, or the person's own ask, from a plain
+/// wake of `com.roomler.update`, whose wake file carries nothing
+/// ([`MACOS_UPDATE_TRIGGER`]). Kept in memory only: a daemon that restarts
+/// has recorded none.
+#[derive(Debug, Default)]
+pub struct AskBook(std::sync::Mutex<Option<RecordedAsk>>);
+
+impl AskBook {
+    /// Record an ask now.
+    pub fn record(&self, by: AskedBy) {
+        self.record_at(by, std::time::SystemTime::now());
+    }
+
+    /// Record an ask made at `at`.
+    pub fn record_at(&self, by: AskedBy, at: std::time::SystemTime) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(RecordedAsk { at, by });
+    }
+
+    /// The newest ask recorded.
+    pub fn newest(&self) -> Option<RecordedAsk> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whole seconds since the newest ask, as of `now`. `None` when none was
+    /// recorded, or when it reads as made after `now` (the clock went back):
+    /// such an ask is never fresh.
+    pub fn age_secs(&self, now: std::time::SystemTime) -> Option<u64> {
+        let newest = self.newest()?;
+        now.duration_since(newest.at).ok().map(|age| age.as_secs())
+    }
+}
+
+/// FR-151 — this process's [`AskBook`], which the trigger forwarder writes
+/// and the LocalAPI reads.
+pub fn ask_book() -> std::sync::Arc<AskBook> {
+    static BOOK: std::sync::OnceLock<std::sync::Arc<AskBook>> = std::sync::OnceLock::new();
+    BOOK.get_or_init(Default::default).clone()
 }
 
 /// Create the update trigger channel and register its sender — for a daemon
@@ -3859,7 +4049,7 @@ async fn wait_for_the_helper_with(
                 Err(e) => tracing::warn!(error = %e, "could not write the update-helper wake file"),
             }
         }
-        return forward_triggers_to(wake, shutdown, trigger_rx).await;
+        return forward_triggers_to(wake, &ask_book(), shutdown, trigger_rx).await;
     }
 }
 
@@ -3957,16 +4147,21 @@ async fn forward_triggers(
 ) {
     forward_triggers_to(
         std::path::Path::new(update_trigger_path()),
+        &ask_book(),
         shutdown,
         trigger_rx,
     )
     .await
 }
 
-/// [`forward_triggers`] against an explicit wake path, so a test can prove a
-/// push writes the wake file and takes no install path at all.
+/// [`forward_triggers`] against an explicit wake path and [`AskBook`], so a
+/// test can prove a push writes the wake file and takes no install path at
+/// all. FR-151: an operator's push is recorded in `book` before the wake
+/// file is written, so the helper it wakes reads the push; the outage
+/// recheck records nothing, and is a plain wake.
 async fn forward_triggers_to(
     wake: &std::path::Path,
+    book: &AskBook,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut trigger_rx: tokio::sync::mpsc::Receiver<UpdateAsk>,
 ) {
@@ -3978,6 +4173,11 @@ async fn forward_triggers_to(
             maybe = trigger_rx.recv() => {
                 let Some(ask) = maybe else { return };
                 let asked = ask.label();
+                // FR-151 — before the wake file, so the helper it wakes reads
+                // the push. The recheck is a plain wake: nothing recorded.
+                if let UpdateAsk::Operator(pin) = &ask {
+                    book.record(AskedBy::Operator { pin: pin.clone() });
+                }
                 if let UpdateAsk::Operator(Some(tag)) = ask {
                     // Deliberate: pins do NOT cross the trigger boundary
                     // (see MACOS_UPDATE_TRIGGER — content is untrusted).
@@ -4114,8 +4314,12 @@ pub fn auto_update_decision(setting: Option<&str>, marker: Option<&'static str>)
 /// - Linux: the root ladder the in-process updater uses on a system install
 ///   (`apt-get`/`dpkg`, or the tarball's own placement). A per-user daemon runs
 ///   the new binary from its next restart.
+///
+/// FR-151: `stop` resolves on SIGTERM. Only the Mac's gate polls it, while
+/// it reads the halves and while it waits, so the handler is installed then
+/// and not before; Linux never polls it.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub async fn run_update_helper() -> anyhow::Result<()> {
+pub async fn run_update_helper(stop: impl std::future::Future<Output = ()>) -> anyhow::Result<()> {
     use anyhow::bail;
 
     // SAFETY: geteuid takes no arguments and cannot fail.
@@ -4233,21 +4437,430 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    match check_once().await {
-        CheckOutcome::UpToDate { current, latest } => {
-            tracing::info!(%current, %latest, "update-helper: up to date");
-            Ok(())
+    // FR-151 — a Mac's install restarts both halves: the gate reads them
+    // first, and waits in place for live work to end.
+    #[cfg(target_os = "macos")]
+    {
+        mac_gate::run(stop).await
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // A per-user Linux install's helper only replaces the binary: the
+        // daemon restarts onto it when it reads idle (`replaced_binary`).
+        // It never waits, so it never reads the stop signal either.
+        drop(stop);
+        match check_once().await {
+            CheckOutcome::UpToDate { current, latest } => {
+                tracing::info!(%current, %latest, "update-helper: up to date");
+                Ok(())
+            }
+            // #1755 — no early retry here: the unit owns this helper's cadence.
+            CheckOutcome::Skipped(reason) | CheckOutcome::Unreachable(reason) => {
+                tracing::info!(%reason, "update-helper: check skipped");
+                Ok(())
+            }
+            CheckOutcome::UpdateReady {
+                current,
+                latest,
+                installer_path,
+            } => install_from_helper(current, latest, installer_path).await,
         }
-        // #1755 — no early retry here: launchd owns this helper's cadence.
-        CheckOutcome::Skipped(reason) | CheckOutcome::Unreachable(reason) => {
-            tracing::info!(%reason, "update-helper: check skipped");
-            Ok(())
+    }
+}
+
+/// FR-151 — the Mac helper's gate, its effects: the lock, the budget's file,
+/// the two readings, a cycle and the wait. Every decision is
+/// [`crate::helper_gate`]'s, pure and tested on every OS.
+#[cfg(target_os = "macos")]
+mod mac_gate {
+    use super::*;
+    use crate::helper_gate::{self as gate, Budget, HelperArm, Observed, ProbeSaid, Reading, Step};
+    use std::future::Future;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::path::Path;
+    use std::pin::Pin;
+
+    /// How a cycle ended.
+    enum Ended {
+        /// It installed, found the Mac up to date, or did nothing: exit.
+        Done,
+        /// It deferred: wait for the next due cycle or a wake.
+        Waiting,
+    }
+
+    /// The helper's cycles, and its wait between them.
+    pub(super) async fn run(stop: impl Future<Output = ()>) -> anyhow::Result<()> {
+        tokio::pin!(stop);
+        let dir = crate::logging::log_dir();
+        let _lock = match dir.as_deref().map(take_lock) {
+            Some(Ok(Some(lock))) => Some(lock),
+            Some(Ok(None)) => {
+                tracing::info!("update-helper: another update helper runs; exiting");
+                return Ok(());
+            }
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "update-helper: its lock could not be taken; going on");
+                None
+            }
+            None => None,
+        };
+        let path = dir.as_ref().map(|d| d.join(gate::BUDGET_FILE));
+        let mut budget = path.as_deref().map_or(Budget::RESET, read_budget);
+        let started = std::time::Instant::now();
+        let exe = std::env::current_exe().ok();
+        let program = exe.as_deref().and_then(program_id);
+        let wake = Path::new(update_trigger_path());
+        let mut stopped = false;
+        loop {
+            match cycle(&mut budget, path.as_deref(), &mut stop).await? {
+                Ended::Done => return Ok(()),
+                Ended::Waiting => {}
+            }
+            let last_cycle = std::time::Instant::now();
+            loop {
+                let seen = Observed {
+                    stop: stopped,
+                    opt_out: opt_out_marker().is_some(),
+                    kill_switch: Path::new(gate::KILL_SWITCH).exists(),
+                    program_replaced: program.is_some()
+                        && exe.as_deref().and_then(program_id) != program,
+                    awake: started.elapsed(),
+                    now: unix_now(),
+                    wake: std::fs::symlink_metadata(wake).is_ok(),
+                    since_cycle: last_cycle.elapsed(),
+                };
+                match gate::next_step(&seen, budget) {
+                    Step::Exit(why) => {
+                        tracing::info!(
+                            ?why,
+                            consecutive_defers = budget.defers,
+                            "update-helper: stops waiting without installing; the budget \
+                             stays for the next run"
+                        );
+                        return Ok(());
+                    }
+                    Step::InstallOverAll | Step::Cycle => {
+                        if seen.wake {
+                            // Consumed unread, as at the start of a run.
+                            let _ = std::fs::remove_file(wake);
+                        }
+                        break;
+                    }
+                    Step::Wait(rest) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(rest.min(gate::TICK)) => {}
+                            _ = stop.as_mut() => stopped = true,
+                        }
+                    }
+                }
+            }
         }
-        CheckOutcome::UpdateReady {
-            current,
-            latest,
-            installer_path,
-        } => install_from_helper(current, latest, installer_path).await,
+    }
+
+    /// One cycle: the cooldown, the probe, the readings and the arm, the
+    /// download, the second reading, `installer(8)`.
+    async fn cycle<F: Future<Output = ()>>(
+        budget: &mut Budget,
+        path: Option<&Path>,
+        stop: &mut Pin<&mut F>,
+    ) -> anyhow::Result<Ended> {
+        if let Some(marker) = opt_out_marker() {
+            tracing::info!(marker = %marker, "auto-update opted out — exiting");
+            return Ok(Ended::Done);
+        }
+        if recent_update_attempt(STARTUP_UPDATE_COOLDOWN) {
+            tracing::info!(
+                cooldown_secs = STARTUP_UPDATE_COOLDOWN.as_secs(),
+                "update-helper: suppressed by recent-install cooldown"
+            );
+            return Ok(Ended::Done);
+        }
+        // SIGTERM ends the cycle at every await before `installer(8)`: once the
+        // gate has polled `stop`, the handler holds SIGTERM for the whole run,
+        // so nothing else would end a probe or a download that it reaches.
+        let probed = tokio::select! {
+            biased;
+            _ = stop.as_mut() => {
+                tracing::info!(
+                    "update-helper: SIGTERM while checking; exiting without installing"
+                );
+                return Ok(Ended::Done);
+            }
+            probed = probe_once() => probed,
+        };
+        let newer = match probed {
+            Ok(newer) => newer,
+            Err(CheckOutcome::UpToDate { current, latest }) => {
+                tracing::info!(%current, %latest, "update-helper: up to date");
+                let after = gate::budget_after_probe(ProbeSaid::UpToDate, *budget);
+                save(budget, after, path);
+                return Ok(Ended::Done);
+            }
+            Err(CheckOutcome::Skipped(reason) | CheckOutcome::Unreachable(reason)) => {
+                tracing::info!(%reason, "update-helper: check skipped");
+                return Ok(Ended::Done);
+            }
+            Err(CheckOutcome::UpdateReady { .. }) => return Ok(Ended::Done),
+        };
+        let now = unix_now();
+        let first = if gate::reads_before_install(Path::new(gate::KILL_SWITCH).exists()) {
+            let Some((root, person)) = read_halves(stop).await else {
+                tracing::info!("update-helper: SIGTERM while reading; exiting without installing");
+                return Ok(Ended::Done);
+            };
+            let arm = gate::helper_arm(&root, &person, *budget, now);
+            if let HelperArm::Defer {
+                budget: kept,
+                counted,
+            } = arm
+            {
+                tracing::warn!(
+                    "update-helper: deferring the install: {}",
+                    gate::defer_line(&root, &person, kept, now, counted)
+                );
+                save(budget, kept, path);
+                return Ok(Ended::Waiting);
+            }
+            tracing::info!(
+                root = root.word(),
+                person = person.word(),
+                "update-helper: the install goes ahead"
+            );
+            arm
+        } else {
+            tracing::warn!(
+                switch = gate::KILL_SWITCH,
+                "update-helper: installing over live work with no reading (the kill switch)"
+            );
+            HelperArm::Install {
+                warning: None,
+                forced: true,
+            }
+        };
+        let downloaded = tokio::select! {
+            biased;
+            _ = stop.as_mut() => {
+                tracing::info!(
+                    "update-helper: SIGTERM while downloading; exiting without installing"
+                );
+                return Ok(Ended::Done);
+            }
+            downloaded = download_newer(newer) => downloaded,
+        };
+        let (current, latest, installer_path) = match downloaded {
+            CheckOutcome::UpdateReady {
+                current,
+                latest,
+                installer_path,
+            } => (current, latest, installer_path),
+            CheckOutcome::Skipped(reason) | CheckOutcome::Unreachable(reason) => {
+                tracing::info!(%reason, "update-helper: download skipped");
+                return Ok(Ended::Done);
+            }
+            CheckOutcome::UpToDate { .. } => return Ok(Ended::Done),
+        };
+        let arm = match first {
+            HelperArm::Install { forced: true, .. } => first,
+            _ => {
+                let Some((root, person)) = read_halves(stop).await else {
+                    tracing::info!(
+                        "update-helper: SIGTERM while reading; exiting without installing"
+                    );
+                    let _ = std::fs::remove_file(&installer_path);
+                    return Ok(Ended::Done);
+                };
+                let arm = gate::second_arm(&first, &root, &person, *budget, now);
+                if let HelperArm::Defer {
+                    budget: kept,
+                    counted,
+                } = arm
+                {
+                    tracing::warn!(
+                        "update-helper: deferring the install after the download: {}",
+                        gate::defer_line(&root, &person, kept, now, counted)
+                    );
+                    let _ = std::fs::remove_file(&installer_path);
+                    save(budget, kept, path);
+                    return Ok(Ended::Waiting);
+                }
+                arm
+            }
+        };
+        if let HelperArm::Install {
+            warning: Some(warning),
+            ..
+        } = &arm
+        {
+            tracing::warn!("update-helper: {warning}");
+        }
+        // One last look before `installer(8)`: a SIGTERM after the last await
+        // (a forced install reads no half after its download) ends it too.
+        if futures::FutureExt::now_or_never(stop.as_mut()).is_some() {
+            tracing::info!("update-helper: SIGTERM before installing; exiting without installing");
+            let _ = std::fs::remove_file(&installer_path);
+            return Ok(Ended::Done);
+        }
+        // The budget resets just before `installer(8)` is spawned.
+        save(budget, gate::budget_for(&arm, *budget), path);
+        install_from_helper(current, latest, installer_path).await?;
+        Ok(Ended::Done)
+    }
+
+    /// Both halves, or `None` when SIGTERM came first.
+    async fn read_halves<F: Future<Output = ()>>(
+        stop: &mut Pin<&mut F>,
+    ) -> Option<(Reading, Reading)> {
+        tokio::select! {
+            halves = async { (read_root_half().await, read_persons_half().await) } => Some(halves),
+            _ = stop.as_mut() => None,
+        }
+    }
+
+    /// The root half, over the system socket, kept only when root serves it.
+    async fn read_root_half() -> Reading {
+        crate::one_row_home::read_live_work(
+            async {
+                let mut client = tunnel_core::localapi::connect_unix_served_by_root(
+                    tunnel_core::localapi::system_socket_path(),
+                )
+                .await?;
+                client.live_work().await
+            },
+            gate::ASK_TIMEOUT,
+        )
+        .await
+        .reading()
+    }
+
+    /// The console person's half, through FR-147's child as that person:
+    /// `one-row-home live-work`, read bounded and parsed strictly. Nobody at
+    /// the console (the login window is root's) is `not_running`.
+    async fn read_persons_half() -> Reading {
+        let uid = match std::fs::metadata("/dev/console") {
+            Ok(m) if m.uid() == 0 => return Reading::NotRunning,
+            Ok(m) => m.uid(),
+            Err(e) => {
+                tracing::warn!(error = %e, "update-helper: who is at the console could not be read");
+                return Reading::NoAnswer;
+            }
+        };
+        let Some(account) = crate::one_row::person_account(uid) else {
+            tracing::warn!(
+                uid,
+                "update-helper: the console's account could not be read"
+            );
+            return Reading::NoAnswer;
+        };
+        let verb = crate::one_row_home::Verb::LiveWork;
+        let out = match crate::one_row::spawn_person(&account, verb, b"").await {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!(error = %e, uid, "update-helper: the person's live-work child did not run");
+                return Reading::NoAnswer;
+            }
+        };
+        match crate::one_row::reply_of(&account, verb, &out) {
+            Ok(reply) => reply.live_work.map_or(Reading::NoAnswer, |a| a.reading()),
+            Err(fail) => {
+                tracing::warn!(why = %fail.why, uid, "update-helper: the person's live-work reply was not read");
+                Reading::NoAnswer
+            }
+        }
+    }
+
+    /// One helper at a time: an exclusive `flock` on [`gate::LOCK_FILE`].
+    /// `Ok(None)` when another helper holds it.
+    fn take_lock(dir: &Path) -> std::io::Result<Option<std::fs::File>> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir.join(gate::LOCK_FILE))?;
+        // SAFETY: flock on a descriptor this process owns; it never blocks.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(None)
+        } else {
+            Err(e)
+        }
+    }
+
+    /// The budget root wrote, or no chain: never through a link, a regular
+    /// file only, bounded, parsed strictly ([`Budget::parse`]).
+    fn read_budget(path: &Path) -> Budget {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Budget::RESET,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "update-helper: the defer budget could not be read; no chain is pending");
+                return Budget::RESET;
+            }
+        };
+        let regular = file.metadata().is_ok_and(|m| m.is_file());
+        let mut bytes = Vec::new();
+        let read = regular
+            && (&file)
+                .take(gate::BUDGET_MAX_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .is_ok();
+        match read.then(|| Budget::parse(&bytes)).flatten() {
+            Some(budget) => budget,
+            None => {
+                tracing::warn!(path = %path.display(), "update-helper: the defer budget is not one root wrote; no chain is pending");
+                Budget::RESET
+            }
+        }
+    }
+
+    /// Root's write: a new file of its own (0600), synced, renamed over.
+    fn write_budget(path: &Path, budget: &Budget) -> std::io::Result<()> {
+        let tmp = path.with_extension("json.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.write_all(&budget.to_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Keep `new` (it counts in memory whatever the write does), and write it.
+    fn save(mem: &mut Budget, new: Budget, path: Option<&Path>) {
+        if *mem == new {
+            return;
+        }
+        let wrote = gate::keep_budget(mem, new, |budget| match path {
+            Some(path) => write_budget(path, budget),
+            None => Err(std::io::Error::other("root has no log folder")),
+        });
+        if let Err(e) = wrote {
+            tracing::warn!(error = %e, "update-helper: the defer budget was not written; it counts in memory for this run");
+        }
+    }
+
+    /// The program's device and inode: another means a manual install.
+    fn program_id(path: &Path) -> Option<(u64, u64)> {
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
     }
 }
 
@@ -5112,7 +5725,9 @@ mod tests {
             // only thing under test here.
             return;
         }
-        let err = run_update_helper().await.expect_err("must refuse non-root");
+        let err = run_update_helper(std::future::pending())
+            .await
+            .expect_err("must refuse non-root");
         assert!(
             err.to_string().contains("must run as root"),
             "unexpected refusal: {err:#}"
@@ -6027,8 +6642,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(4);
         let w = wake.clone();
+        let book = std::sync::Arc::new(AskBook::default());
+        let b = book.clone();
         let task =
-            tokio::spawn(async move { forward_triggers_to(&w, shutdown_rx, trigger_rx).await });
+            tokio::spawn(async move { forward_triggers_to(&w, &b, shutdown_rx, trigger_rx).await });
 
         async fn appears(p: &std::path::Path) -> bool {
             for _ in 0..200 {
@@ -6040,11 +6657,19 @@ mod tests {
             false
         }
 
+        assert_eq!(book.newest(), None);
         trigger_tx
             .send(UpdateAsk::Operator(None))
             .await
             .expect("push");
         assert!(appears(&wake).await, "a push writes the wake file");
+        // FR-151 D3 — recorded before the wake file was written, so the
+        // helper it wakes reads the push.
+        assert_eq!(
+            book.newest().map(|ask| ask.by),
+            Some(AskedBy::Operator { pin: None }),
+            "a push is recorded before its wake"
+        );
 
         std::fs::remove_file(&wake).expect("the helper consumes it");
         trigger_tx
@@ -6055,6 +6680,14 @@ mod tests {
             appears(&wake).await,
             "a pinned push still only wakes the helper"
         );
+        let pinned = book.newest().expect("the pinned push is recorded");
+        assert_eq!(
+            pinned.by,
+            AskedBy::Operator {
+                pin: Some("agent-v0.4.1".to_string())
+            },
+            "with its pin, which the helper ignores"
+        );
 
         std::fs::remove_file(&wake).expect("the helper consumes it");
         trigger_tx
@@ -6064,6 +6697,11 @@ mod tests {
         assert!(
             appears(&wake).await,
             "a recheck writes the wake file as a push does"
+        );
+        assert_eq!(
+            book.newest(),
+            Some(pinned),
+            "a recheck records no ask: on a Mac it is a plain wake"
         );
 
         shutdown_tx.send(true).expect("shutdown");
@@ -6704,6 +7342,97 @@ mod tests {
         assert_eq!(fallback, fake_exe);
 
         let _ = std::fs::remove_dir_all(&staging);
+    }
+
+    /// #4302 — asked, the copy gets the runtime libraries that sit beside the
+    /// EXE; not asked, it is staged alone, as before.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn staged_watcher_gets_its_runtime_libraries_beside_it() {
+        let root = tempfile::tempdir().unwrap();
+        let install = root.path().join("install");
+        let staging = root.path().join("staging");
+        let bare = root.path().join("bare");
+        for dir in [&install, &staging, &bare] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let exe = install.join("roomlerd.exe");
+        std::fs::write(&exe, b"MZ-fake").unwrap();
+        for lib in WATCHER_RUNTIME_LIBS {
+            std::fs::write(install.join(lib), lib.as_bytes()).unwrap();
+        }
+
+        let (launch, staged) = stage_watcher_exe_with(&exe, &staging.join("pkg.msi"), true);
+        assert!(staged);
+        assert_eq!(launch, staging.join("roomlerd-watch.exe"));
+        for lib in WATCHER_RUNTIME_LIBS {
+            assert_eq!(
+                std::fs::read(staging.join(lib)).unwrap(),
+                lib.as_bytes(),
+                "{lib} is not beside the copy"
+            );
+        }
+
+        let (launch, staged) = stage_watcher_exe_with(&exe, &bare.join("pkg.msi"), false);
+        assert!(staged);
+        assert_eq!(launch, bare.join("roomlerd-watch.exe"));
+        for lib in WATCHER_RUNTIME_LIBS {
+            assert!(!bare.join(lib).exists(), "{lib} placed without being asked");
+        }
+    }
+
+    /// #4302 — the libraries go beside the copy only in a staging dir of ours,
+    /// made holding the SYSTEM token.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn runtime_libraries_only_in_a_staging_dir_of_ours() {
+        let ours = stage_dir().expect("stage_dir");
+        assert!(may_stage_runtime_libs(&ours, true));
+        assert!(!may_stage_runtime_libs(&ours, false), "not holding SYSTEM");
+        let other = std::env::temp_dir().join("rw-libs-not-ours");
+        assert!(!may_stage_runtime_libs(&other, true), "not a staging dir");
+        let _ = std::fs::remove_dir_all(&ours);
+    }
+
+    /// #4302 — the list is what both MSIs place beside the EXE. `wintun.dll` is
+    /// the one library left out: the overlay opens it when it starts, and the
+    /// watcher never starts the overlay. A library added to either MSI fails
+    /// here until it is placed on this list or left out by name.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn watcher_runtime_libraries_are_what_the_msis_ship() {
+        let mut ours = WATCHER_RUNTIME_LIBS.to_vec();
+        ours.sort_unstable();
+        for table in [
+            include_str!("../wix/main.wxs"),
+            include_str!("../wix-perMachine/main.wxs"),
+        ] {
+            let mut shipped: Vec<&str> = table
+                .split("Name='")
+                .skip(1)
+                .filter_map(|rest| rest.split('\'').next())
+                .filter(|name| name.ends_with(".dll") && *name != "wintun.dll")
+                .collect();
+            shipped.sort_unstable();
+            shipped.dedup();
+            assert_eq!(shipped, ours);
+        }
+    }
+
+    /// #4302 — the watcher gets a console of its own, with no window, and is no
+    /// process without a console.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn watcher_gets_a_console_of_its_own() {
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        };
+        let flags = watcher_creation_flags();
+        assert_eq!(flags & CREATE_NO_WINDOW, CREATE_NO_WINDOW);
+        assert_eq!(
+            flags & (DETACHED_PROCESS | CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP),
+            0
+        );
     }
 
     // ----- msiexec_argv (Plan rc.18 P1) -------------------------------

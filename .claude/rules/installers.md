@@ -9,6 +9,8 @@ paths:
   - "crates/modules/fleet/src/setup_release.rs"
   - "crates/modules/fleet/src/agent_release.rs"
   - "agents/roomlerd/Cargo.toml"
+  - "agents/roomlerd/src/updater.rs"
+  - "agents/roomlerd/src/post_install.rs"
   - "agents/roomler-desktop/Cargo.toml"
   - "scripts/install.sh"
   - "scripts/deb-bare-check.sh"
@@ -213,6 +215,16 @@ an ephemeral device removes itself, and it stays before `UnregisterAutostart`, w
 fallback needs. `StopOldDaemon` is the upgrade's, from the NEW product, with `--for-upgrade`, which
 records an update attempt first: ⚠️ a plain stop during an upgrade deletes an ephemeral device (#1683,
 `docs/ephemeral-nodes.md`).
+⚠️ **The post-install watcher stays out of Restart Manager's way, and never hides from it (#4302).** The
+installer's Restart Manager session ends a console program that holds a file the install replaces, and one
+that shares a console with such a program. So the staged watcher has everything it loads beside it, in the
+updater's own staging folder, and a console of its own: `CREATE_NO_WINDOW` alone (`watcher_creation_flags`,
+`agents/roomlerd/src/updater.rs`). Never `CREATE_NEW_PROCESS_GROUP` (it turns Ctrl+C off for the watcher)
+and never a console handler that answers TRUE (it keeps the watcher through every event): the installer must
+still be able to stop it. Never `DETACHED_PROCESS`: a console tool the watcher runs (`taskkill` on a wedge,
+spawned by `run_recovery_cmd` with no flags of its own) would open a window on the signed-in desktop. Its handler only notes the stop in `last-install.json`,
+waiting at most 200 ms for the record (`console_event_answer`, `agents/roomlerd/src/post_install.rs`).
+`docs/update-outcome.md` §3.
 ⚠️ **`<RestartOnFailure>` is not a supervisor**: it restarted nothing after exit 1 or
 `0xC000013A`. The launcher the task runs is, since FR-150 P2 (#3295): `roomlerdw.exe` starts a daemon that
 crashed, or whose start failed, again with the service supervisor's backoff, and leaves on the deliberate ends

@@ -17,9 +17,11 @@
 //! run, a file transfer or a recording. **Wedged**: a network transition in
 //! the last 10 min (R5b), an install of this daemon's own in flight.
 //!
-//! ⚠️ Only what THIS process serves. A root update helper (macOS, a per-user
-//! Linux install) installs without reading it, and a command a Windows
-//! service host runs for its worker (FR-94) is not counted in the worker.
+//! ⚠️ Only what THIS process serves. The Mac's root update helper reads it
+//! from each half it restarts, over the LocalAPI's `live_work`
+//! ([`crate::helper_gate`], FR-151); a per-user Linux install's helper
+//! installs without reading it, and a command a Windows service host runs
+//! for its worker (FR-94) is not counted in the worker.
 
 use std::sync::atomic::Ordering;
 
