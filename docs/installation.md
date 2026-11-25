@@ -3053,11 +3053,11 @@ and the server and tenant of each enrollment root's file holds on its stdin. A `
 that holds one of them becomes the person's `config.toml`, byte for byte, or, beside a
 `config.toml` that is missing or does not load, its own settings with no enrollment; it
 is written as `convert` writes it, 0600, and the config is never written. A `.prev` that
-holds none, or does not parse, is left as it is. A person whose `config.toml` itself
-holds such an enrollment is left too, and their line names both files: that config is
-their live state, and a follow-up issue decides it. One line per person goes to
-`/var/log/roomler/one-row.log`; a child that fails is its line, and the daemon's next
-start asks again. A Mac with no records looks for those three and starts nothing.
+holds none, or does not parse, is left as it is. A person whose `config.toml` itself holds such an enrollment is left
+too, and their line names both files. That file is kept (#4417): no sweep writes a person's live config; while one
+row is on, the screen worker ignores the enrollments in it; `--revert` writes the kept copy from root's records over
+it, and converting again clears it. One line per person goes to `/var/log/roomler/one-row.log`; a child that fails is
+its line, and the daemon's next start asks again. A Mac with no records looks for those three and starts nothing.
 
 ```mermaid
 sequenceDiagram

@@ -4500,4 +4500,108 @@ mod tests {
         );
         assert!(path.ends_with("roomler/roomler.sock"), "{}", path.display());
     }
+
+    /// #4417 — a person's live config that holds an enrollment root's file
+    /// holds is kept: `blank-prev` writes no file, and the config is as it
+    /// was, whatever the `.prev` beside it is: one that holds such an
+    /// enrollment too (the config's own bytes, as each save leaves it, among
+    /// them), one that holds none, no `.prev`, or one that does not load.
+    /// What it says is pinned word for word: the line that names both files
+    /// beside a `.prev` that holds one (cell 6 pins those files; its test of
+    /// the config's name is met by the `.prev`'s, which begins with it), the
+    /// line that names a `.prev` it could not read, and nothing beside the
+    /// others.
+    #[test]
+    fn blank_prev_never_writes_a_live_config_that_holds_a_held_enrollment() {
+        let config_org = converted(ENROLLED) + &org("other", "https://roomler.example", "t-2");
+        let prev_not_held = converted(ENROLLED) + &org("mine", "https://roomler.example", "t-9");
+        let not_utf8 = [ENROLLED.as_bytes(), &[0xff, 0xfe]].concat();
+        let as_it_is = |fs: &FakeFs, path: &Path| {
+            fs.nodes
+                .get(path)
+                .map(|n| (n.kind, n.mode, n.bytes.clone()))
+        };
+        for (held, config) in [
+            ("its primary", ENROLLED.to_string()),
+            ("an org", config_org),
+            ("both", outgoing()),
+        ] {
+            for case in [
+                "holds one",
+                "is the converted config",
+                "holds an org root's file does not hold",
+                "is not there",
+                "is not TOML",
+                "is all NUL",
+                "is not UTF-8",
+                "is a folder",
+                "is a link",
+                "is unreadable",
+            ] {
+                let what = format!("a config that holds {held}, a .prev that {case}");
+                let (mut fs, at) = a_home();
+                fs.file(&at.config, config.as_bytes(), 0o600);
+                let prev = crate::config::prev_path(&at.config);
+                match case {
+                    "holds one" => fs.file(&prev, outgoing().as_bytes(), 0o600),
+                    "is the converted config" => {
+                        fs.file(&prev, converted(&outgoing()).as_bytes(), 0o600)
+                    }
+                    "holds an org root's file does not hold" => {
+                        fs.file(&prev, prev_not_held.as_bytes(), 0o600)
+                    }
+                    "is not there" => {}
+                    "is not TOML" => fs.file(
+                        &prev,
+                        b"agent_token = \"tok-person\"\nserver_url = [",
+                        0o600,
+                    ),
+                    "is all NUL" => fs.file(&prev, &vec![0; ENROLLED.len()], 0o600),
+                    "is not UTF-8" => fs.file(&prev, &not_utf8, 0o600),
+                    "is a folder" => fs.dir(&prev, UID, 0o700, true),
+                    "is a link" => fs.put(&prev, Kind::Link, UID, 0o777, Vec::new(), true),
+                    _ => {
+                        fs.file(&prev, ENROLLED.as_bytes(), 0o200);
+                        fs.nodes.get_mut(&prev).unwrap().readable = false;
+                    }
+                }
+                let before = (as_it_is(&fs, &at.config), as_it_is(&fs, &prev));
+                fs.calls.borrow_mut().clear();
+                let out = blank_prev_with(&mut fs, &at, &ROOT_HOLDS);
+                assert_eq!(out.exit, Exit::Done, "{what}: {}", out.stderr);
+                assert_eq!(
+                    blank_prev_answer(&out),
+                    BlankPrevAnswer {
+                        found: case == "holds one",
+                        sha256: None
+                    },
+                    "{what}"
+                );
+                assert_eq!(
+                    (as_it_is(&fs, &at.config), as_it_is(&fs, &prev)),
+                    before,
+                    "{what}: the config and its .prev as they were"
+                );
+                assert!(fs.changes().is_empty(), "{what}: {:?}", fs.changes());
+                let not_read = |error: ReadError| {
+                    format!(
+                        "{} is there and was not read ({error:?}): it is left as it is",
+                        prev.display()
+                    )
+                };
+                let words = match case {
+                    "holds one" => format!(
+                        "{} holds an enrollment root's file holds, and that config is the person's \
+                         own to change: it and {} are left as they are",
+                        at.config.display(),
+                        prev.display()
+                    ),
+                    "is a folder" | "is a link" => not_read(ReadError::NotRegular),
+                    "is unreadable" => not_read(ReadError::Eacces),
+                    _ => String::new(),
+                };
+                assert_eq!(out.stderr, words, "{what}");
+            }
+        }
+    }
 }
