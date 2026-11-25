@@ -611,10 +611,10 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:386`,
 |---|---|
 | TURN in the month to date (P4c-0) | `crates/services/src/dao/stats.rs:208`: `turn_bytes` beside `derp_bytes`, read by the job and the org's page alike, so the two never disagree; the page says which it counts (`counts_turn`, `crates/api/src/routes/cost.rs:578`) |
 | An over-allowance org (P4c-1) | `crates/modules/network/src/overlay.rs:2711` (`turn_withheld`) |
-| The relay request | `overlay.rs:1186`: no TURN grant, both ends' verdicts re-stamped DERP, a forced-DERP pin for a node too old for verdicts. Only when `keeps_pair_on_derp` (`:2718`) says both ends have a DERP floor and the requester's `/derp` is up |
-| The verdict | `overlay.rs:2655`: the org's pairs are pinned to DERP, as a churn pin would; an active org relay still outranks it |
-| The warm creds | `overlay.rs:210`: none while over (a latency optimisation, never reach) |
-| The re-stamp | `overlay.rs:1586` (`refan_networks`), called when the pod's set changes (`crates/modules/network/src/relay_allowance.rs:208`), so a pair flips when its org crosses, not at the next incidental re-fan |
+| The relay request | `crates/modules/network/src/overlay.rs:1208`: no TURN grant, both ends' verdicts re-stamped DERP, a forced-DERP pin for a node too old for verdicts. Only when `keeps_pair_on_derp` (`:2883`) says both ends have a DERP floor and the requester's `/derp` is up |
+| The verdict | `crates/modules/network/src/overlay.rs:2820`: the org's pairs are pinned to DERP, as a churn pin would; an active org relay still outranks it |
+| The warm creds | `crates/modules/network/src/overlay.rs:215`: none while over (a latency optimisation, never reach) |
+| The re-stamp | `crates/modules/network/src/overlay.rs:1608` (`refan_networks`), called when the pod's set changes (`crates/modules/network/src/relay_allowance.rs:208`), so a pair flips when its org crosses, not at the next incidental re-fan |
 | The pod's map | `relay_allowance.rs:170`: each entry is tagged with its database, and an app's refresh replaces only its own entries. Production is unchanged, and it is what lets the integration test drive the map |
 
 - **Proof:** `relay_allowance_tests::turn_bytes_count_toward_the_allowance_only_with_count_turn`

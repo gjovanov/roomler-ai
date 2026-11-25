@@ -129,12 +129,12 @@ different fix:
 
 | step | what | reports | anchor |
 |---|---|---|---|
-| 1 | kill switch `overlay_key_rotation == false` | `refused: disabled` | `signaling.rs:6340-6355` |
-| 2 | the device's **own** 60 s ceiling, per org — "a bound that exists only on the ordering side is not a bound" | `refused: rate_limited` | `signaling.rs:3635-3656`, `:6358-6373` |
+| 1 | kill switch `overlay_key_rotation == false` | `refused: disabled` | `agents/roomlerd/src/signaling.rs:6340-6355` |
+| 2 | the device's **own** 60 s ceiling, per org — "a bound that exists only on the ordering side is not a bound" | `refused: rate_limited` | `agents/roomlerd/src/signaling.rs:3635-3656`, `:6358-6373` |
 | 3 | mint `WgKeypair::generate()` — the enrollment mint; `None` in a build with no overlay surface | `refused: unsupported` | `agents/roomlerd/src/key_rotation.rs:19-30` |
 | 4 | **persist first**: under the daemon-wide write lock, `config::load` → set the secret on the primary scalar or on the `[[orgs]]` entry whose `tenant_id` is this loop's → bump `overlay_wg_key_epoch` → atomic `config::save` (tmp + fsync + 0600/ACL + `.prev` + rename) | on error: `failed` + detail, **identity unchanged** | `agents/roomlerd/src/remote_config.rs:656-688` |
-| 5 | queue the same report for the *next* session, then send `rc:agent.key_rotated { rotated, old_pub, new_pub, key_epoch }` on this one and give the pump 300 ms | `rotated` | `signaling.rs:6435-6461` |
-| 6 | close every peer, tunnel peer and QUIC peer this org loop carries (the `Goodbye` teardown), return `ConnectError::KeyRotated { secret, epoch }` | — | `signaling.rs:6465-6477`, `:1783` |
+| 5 | queue the same report for the *next* session, then send `rc:agent.key_rotated { rotated, old_pub, new_pub, key_epoch }` on this one and give the pump 300 ms | `rotated` | `agents/roomlerd/src/signaling.rs:6435-6461` |
+| 6 | close every peer, tunnel peer and QUIC peer this org loop carries (the `Goodbye` teardown), return `ConnectError::KeyRotated { secret, epoch }` | — | `agents/roomlerd/src/signaling.rs:6465-6477`, `:1783` |
 | 7 | the loop adopts the key + epoch into its one config snapshot and re-enters `connect_once` **immediately** — one device re-joining, not a fleet event, so no stagger | — | `signaling.rs:1453-1480` |
 | 8 | `overlay::maybe_start` sees the fingerprint change (it includes the public key), rebuilds the runtime; the join carries the new key and epoch | — | `agents/roomlerd/src/overlay.rs:416` |
 
@@ -248,7 +248,7 @@ on every connect rather than only when nobody is watching. Three field cycles on
 | cycle | what the run showed | the rule it left |
 |---|---|---|
 | 1 → **P1b** | 30 ms after the re-join, the reconnect's own register re-pushed the **same** order (the `rotated` report, sent on the dying session and written by a spawned task, had not landed); the device refused the duplicate under its own ceiling, and that refusal **overwrote** the success — the grid read `refused (rate_limited)` for a rotation that worked | an order delivered < **120 s** ago is in progress, not lost: `should_redeliver` (`models.rs:6622`, `:6647`); and a refusal never overwrites a `rotated` report for the same order (`dao/agent.rs:877-894`) |
-| 2 → **P1c** | the dying-session report was **lost** this time, so the state stuck at `delivered` although the server had verified the new key at the join | the order snapshots `public_key_before`; a join under another key resolves `rotated` with or without a report; the agent **re-sends** its report on the next session, keyed per org (`signaling.rs:3591-3633`) |
+| 2 → **P1c** | the dying-session report was **lost** this time, so the state stuck at `delivered` although the server had verified the new key at the join | the order snapshots `public_key_before`; a join under another key resolves `rotated` with or without a report; the agent **re-sends** its report on the next session, keyed per org (`agents/roomlerd/src/signaling.rs:3591-3633`) |
 | 3 → **P1d** | the cycle-2 order (report lost, no snapshot) was re-delivered on every later connect — a pod roll, then the 0.4.26 restart: **three rotations for one click** | `order_is_satisfied` (`models.rs:6632`): a verified identity change after the order satisfies it, and a satisfied order is never pushed again |
 
 ⚠️ The dying-session copy of the report was lost in **3 of the 4** ordered runs. The
@@ -305,7 +305,7 @@ org's network, live or tombstoned, is presenting a retired key
 `(network_id, retired_keys.public_key)` index). A config copied to another machine of the
 org cannot make a key live again. It is still per org, because a network is: another org's
 node for the same machine holds its own key (`AgentConfig::for_org`). The check runs after
-`wg_key_taken_by_other` and before any address is leased (`overlay.rs:378-420`), so a
+`wg_key_taken_by_other` and before any address is leased (`crates/modules/network/src/overlay.rs:381-423`), so a
 refused join holds no lease.
 
 | `retired_key_mode` | the ledger | a join presenting a retired key | a DERP registration with one | the device |
@@ -317,7 +317,7 @@ refused join holds no lease.
 **The refusal** is `rc:overlay.join_refused { reason: key_retired, detail }`
 (`crates/remote_control/src/signaling.rs:463`). It is not retryable: the same key is
 refused again, and the way out is a new key. The detail says when and why the key retired
-and names no key (`overlay.rs:813`). A ledger read that fails refuses `store_unavailable`
+and names no key (`crates/modules/network/src/overlay.rs:813`). A ledger read that fails refuses `store_unavailable`
 under `enforce`, failing closed like the uniqueness check above it.
 
 ⚠️ **Old agents survive the new reason.** Agents from 0.4.41 run a decoder whose unknown
@@ -330,7 +330,7 @@ server's log and audit carry the reason.
 
 **The self-heal** is the route's own order path. `place_order`
 (`crates/modules/network/src/routes/overlay_key.rs:156`) is what the route calls and what
-the join calls for a refused agent (`overlay.rs:878`): the shared one-a-minute ceiling,
+the join calls for a refused agent (`crates/modules/network/src/overlay.rs:883`): the shared one-a-minute ceiling,
 `decide()`'s cells, the order on the row as desired state, the push, and ONE audit row.
 The server places it as nobody — `OrderedBy::Server`, the zero `user_id`, and
 `trigger: key_retired` on both the order and its audit row (`overlay_key.rs:114`) — and
