@@ -346,6 +346,7 @@ where
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+    use roomler_ai_remote_control::models::TokenRotation;
 
     // ── bearer parsing (ported from the duplicate `extract_bearer` that
     //    `agent_log` and `agent_crash` each carried before this extractor) ──
@@ -390,17 +391,144 @@ mod tests {
     /// included. The kill switch passes everything.
     #[test]
     fn only_a_token_of_the_rows_generation_is_accepted() {
-        assert_eq!(generation_refusal(0, 0, true), None, "never removed");
-        assert_eq!(generation_refusal(1, 1, true), None, "minted after it");
+        assert_eq!(generation_refusal(0, 0, false, true), None, "never removed");
+        assert_eq!(
+            generation_refusal(1, 1, false, true),
+            None,
+            "minted after it"
+        );
         assert!(
-            generation_refusal(0, 1, true).is_some(),
+            generation_refusal(0, 1, false, true).is_some(),
             "minted before the removal"
         );
         assert!(
-            generation_refusal(2, 1, true).is_some(),
+            generation_refusal(2, 1, false, true).is_some(),
             "a generation the row never had"
         );
-        assert_eq!(generation_refusal(0, 1, false), None, "the kill switch");
+        assert_eq!(
+            generation_refusal(0, 1, false, false),
+            None,
+            "the kill switch"
+        );
+    }
+
+    /// FR-155 (T11, Q2): a token below a generation a rotation made is
+    /// refused in the rotation's words, and one below a generation a removal
+    /// made in the removal's. A token of the row's generation is not refused,
+    /// and with the switch off nothing is.
+    #[test]
+    fn a_rotated_generation_is_refused_with_its_own_reason() {
+        let rotated = generation_refusal(2, 3, true, true).expect("below a rotation");
+        let removed = generation_refusal(2, 3, false, true).expect("below a removal");
+        assert_ne!(rotated, removed, "each cause has its own words");
+        assert!(rotated.contains("rotation"), "{rotated}");
+        assert!(removed.contains("removed"), "{removed}");
+        assert_eq!(
+            generation_refusal(0, 3, true, true),
+            Some(rotated),
+            "any generation below the one a rotation made"
+        );
+        assert_eq!(
+            generation_refusal(4, 3, true, true),
+            Some(removed),
+            "a generation the row never had, as before"
+        );
+        assert_eq!(generation_refusal(3, 3, true, true), None, "equal");
+        assert_eq!(generation_refusal(3, 3, false, true), None, "equal");
+        assert_eq!(generation_refusal(2, 3, true, false), None, "switch off");
+        assert_eq!(generation_refusal(2, 3, false, false), None, "switch off");
+
+        // What the callers pass: the row's generation came from a rotation
+        // when its last rotation made it.
+        let made = |generation| rotation_at(generation, "aa");
+        assert!(rotation_made_generation(3, Some(&made(3))));
+        assert!(
+            !rotation_made_generation(3, Some(&made(2))),
+            "a removal came after the rotation"
+        );
+        assert!(!rotation_made_generation(3, None), "never rotated");
+    }
+
+    fn rotation_at(generation: u32, key_sha256: &str) -> TokenRotation {
+        TokenRotation {
+            generation,
+            key_sha256: key_sha256.to_string(),
+            at: bson::DateTime::from_millis(0),
+        }
+    }
+
+    /// FR-155 (T9): the rotation route's admission. A token of the row's
+    /// generation is a first call. A token one generation below, when the
+    /// row's last rotation made the row's generation and the rotation key
+    /// hashes to that rotation's, asks again for its answer. Anything else is
+    /// refused, and so is a token whose `exp` has passed, with no extension.
+    #[test]
+    fn rotation_admission() {
+        use RotationAdmission::{First, Refused, Replay};
+        let key = "ab".repeat(32);
+        let other = "cd".repeat(32);
+        let now = 1_800_000_000;
+        let live = now + 3600;
+        let made = |generation| rotation_at(generation, &key);
+        let admit = |token_gen, exp, row_gen, last: Option<&TokenRotation>, hash: &str| {
+            super::rotation_admission(token_gen, exp, now, row_gen, last, hash)
+        };
+
+        // A first call.
+        assert_eq!(admit(0, live, 0, None, &key), First, "never rotated");
+        assert_eq!(
+            admit(3, live, 3, Some(&made(3)), &other),
+            First,
+            "with the token a rotation answered, any key"
+        );
+        assert_eq!(
+            admit(3, live, 3, Some(&made(2)), &key),
+            First,
+            "after a removal that followed a rotation"
+        );
+
+        // An answer asked again.
+        assert_eq!(admit(2, live, 3, Some(&made(3)), &key), Replay);
+        assert_eq!(
+            admit(2, live, 3, Some(&made(3)), &other),
+            Refused(RotationRefusal::RotationKey),
+            "another key"
+        );
+        assert_eq!(
+            admit(2, live, 3, None, &key),
+            Refused(RotationRefusal::Generation),
+            "the row's generation came from a removal"
+        );
+        assert_eq!(
+            admit(2, live, 3, Some(&made(2)), &key),
+            Refused(RotationRefusal::Generation),
+            "the last rotation made an earlier generation"
+        );
+
+        // Neither.
+        assert_eq!(
+            admit(1, live, 3, Some(&made(3)), &key),
+            Refused(RotationRefusal::Generation),
+            "two below"
+        );
+        assert_eq!(
+            admit(4, live, 3, Some(&made(3)), &key),
+            Refused(RotationRefusal::Generation),
+            "above the row's"
+        );
+
+        // `exp`, for a first call and an answer asked again alike.
+        assert_eq!(
+            admit(3, now, 3, None, &key),
+            Refused(RotationRefusal::Expired),
+            "at its exp"
+        );
+        assert_eq!(
+            admit(2, now - 1, 3, Some(&made(3)), &key),
+            Refused(RotationRefusal::Expired),
+            "past it"
+        );
+        assert_eq!(admit(3, now + 1, 3, None, &key), First, "a second left");
     }
 
     #[test]
