@@ -394,8 +394,8 @@ sequenceDiagram
   for the members-only rooms only, `room_members` by `$in` lists of their orgs, the rooms and
   the people, the three fields `RoomDao::is_member` names
   (`crates/services/src/dao/room.rs:565`), served by the unique `(room_id, user_id)` index
-  (`crates/modules/chat/src/lib.rs:224`) with the org checked on the rows it fetches, or by
-  `(user_id, tenant_id)` (`:225`); no index is new. Each query has a projection and reads the
+  (`crates/modules/chat/src/lib.rs:240`) with the org checked on the rows it fetches, or by
+  `(user_id, tenant_id)` (`:241`); no index is new. Each query has a projection and reads the
   primary whatever the connection string says (`seat_check.rs:951`), so a person added a
   moment ago reads as a member, as the join's own gate read them; all three together within
   `READ_TIMEOUT` = 5 s (`:117`). A pod with 300 seats in 20 rooms makes three indexed queries
