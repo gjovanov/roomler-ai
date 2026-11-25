@@ -5,12 +5,7 @@
 # committed with the reason. The quoted lines under a row are the words around each hit when it
 # was written (identities left out): a pointer for the owner, not part of the check.
 #
-## daemon · owner FR-133 follow-up · 1 file · 4 hits
-4	crates/tunnel-core/src/policy.rs
-#	"client tenant {} ≠ agent tenant {}"
-#	"agent has been deleted"
-#	"agent is quarantined"
-#	"agent missing _id"
+## daemon · owner FR-133 follow-up · 0 files · 0 hits
 #
 ## companion · owner FR-133 follow-up · 0 files · 0 hits
 #
