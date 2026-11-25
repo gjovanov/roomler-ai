@@ -3791,7 +3791,12 @@ sequenceDiagram
 | off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:2365` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
 
 ⚠️ **Installing stays a separate click.** The menu item says "Check for Updates", and on macOS
-**Install update** queues the root update helper (FR-27).
+**Install update** queues the root update helper (FR-27). Since FR-151 that click is also the
+person's own ask: `roomlerd self-update`, run as them, records it in the daemon behind their own
+socket (`ask_for_update`) before it wakes the helper. The update then installs at once over what
+their own half serves and the root half's remote-control sessions, and still waits for the root
+half's SSH connections, runs, transfers and recordings
+([installation.md](installation.md#macos-the-root-update-helpers-gate-fr-151)).
 
 ### 13.2 A tray too old for its daemon (Windows, #3781)
 
