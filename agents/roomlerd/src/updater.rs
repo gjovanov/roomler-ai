@@ -3577,8 +3577,8 @@ pub async fn run_periodic(
     // #1755 — checks in a row that failed on the transport.
     let mut transport_failures: u32 = 0;
     // The recheck the LAST defer chose (fast for a net transition, the
-    // hour for transfers) or a transport failure's early retry (#1755);
-    // `None` = full periodic interval.
+    // hour for transfers), a held outage recheck's look (#4407), or a
+    // transport failure's early retry (#1755); `None` = full periodic interval.
     let mut defer_recheck: Option<Duration> = None;
     // #4407 — the last cycle held an outage recheck ([`CycleArm::Held`]), so
     // this one never holds: one hold per recheck, never two in a row.
@@ -3879,9 +3879,10 @@ impl CycleArm {
 /// kind (the timer has its own carve-out, the skipped first check). Only an
 /// operator's push takes the forced arm. The recheck after a long
 /// control-socket outage is the timer's cycle run early: before #4245 it
-/// took the push's arm and installed over live work. Pure: the cells' entry,
-/// and the loop's. `after_hold`: the cycle before this one held an outage
-/// recheck ([`CycleArm::Held`], #4407).
+/// took the push's arm and installed over live work. Since #4407 it holds
+/// once instead where the gate would defer it for live work beside a
+/// network move ([`CycleArm::Held`]); `after_hold`, the cycle before this
+/// one held, keeps that to one hold. Pure: the cells' entry, and the loop's.
 pub(crate) fn cycle_arm(
     ask: Option<&UpdateAsk>,
     busy: &crate::busy::Busy,
@@ -3889,7 +3890,6 @@ pub(crate) fn cycle_arm(
     in_cooldown: bool,
     after_hold: bool,
 ) -> CycleArm {
-    let _ = after_hold;
     match ask {
         Some(_) if in_cooldown => CycleArm::Cooldown,
         // S1a — the operator asked NOW: the one ask the gate never holds.
@@ -3901,7 +3901,24 @@ pub(crate) fn cycle_arm(
         // and one at the cap forces, as the timer's cycle does.
         Some(UpdateAsk::OutageRecheck) | None => {
             let (decision, recheck) = periodic_gate(busy, consecutive_defers);
-            CycleArm::Gated { decision, recheck }
+            // #4407 — but a recheck the gate would defer for live work beside
+            // a network move holds once instead, uncounted: the move may have
+            // ended that work, and the device hears the end only once the
+            // mesh carries it. The look after the hold is the timer's cycle,
+            // which never holds. Not right after a hold, and not at the cap,
+            // where the gate forces as before.
+            let hold = matches!(ask, Some(UpdateAsk::OutageRecheck))
+                && !after_hold
+                && decision == DeferDecision::DeferOnce
+                && busy.net_transition
+                && busy.cuttable();
+            if hold {
+                CycleArm::Held {
+                    recheck: OUTAGE_RECHECK_HOLD,
+                }
+            } else {
+                CycleArm::Gated { decision, recheck }
+            }
         }
     }
 }
@@ -8482,47 +8499,29 @@ mod tests {
     /// takes the timer's arm for every `Busy` and every count. R5b included:
     /// a long outage often ends because the network moved, and a transition
     /// alone defers the recheck two minutes, as it does the timer's cycle.
+    /// One carve-out since #4407: where the timer's arm is a defer for live
+    /// work beside a network move, a recheck holds once instead; right after
+    /// a hold it takes the timer's arm there too.
     #[test]
     fn an_outage_recheck_is_the_timers_cycle_run_early() {
         use crate::busy::Busy;
-        let session = Busy {
-            rc_sessions: 1,
-            ..Busy::IDLE
-        };
         let moved = Busy {
             net_transition: true,
             ..Busy::IDLE
         };
-        let cases = [
-            Busy::IDLE,
-            session,
-            Busy {
-                ssh_connections: 1,
-                ..Busy::IDLE
-            },
-            Busy {
-                exec_runs: 1,
-                ..Busy::IDLE
-            },
-            Busy {
-                work: 1,
-                ..Busy::IDLE
-            },
-            moved,
-            Busy {
-                net_transition: true,
-                ..session
-            },
-            Busy {
-                install_in_flight: true,
-                ..Busy::IDLE
-            },
-        ];
-        for busy in cases {
+        let recheck = UpdateAsk::OutageRecheck;
+        for busy in busy_cases() {
             for defers in [0, 1, MAX_CONSECUTIVE_DEFERS - 1, MAX_CONSECUTIVE_DEFERS] {
+                let timer = cycle_arm(None, &busy, defers, false, false);
                 assert_eq!(
-                    cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, defers, false, false),
-                    cycle_arm(None, &busy, defers, false, false),
+                    cycle_arm(Some(&recheck), &busy, defers, false, true),
+                    timer,
+                    "{busy} after {defers} defers, right after a hold"
+                );
+                let held = busy.net_transition && busy.cuttable() && timer == the_hour();
+                assert_eq!(
+                    cycle_arm(Some(&recheck), &busy, defers, false, false),
+                    if held { the_hold() } else { timer },
                     "{busy} after {defers} defers"
                 );
             }
