@@ -8432,6 +8432,85 @@ tenant_id = "tid2"
             }
             assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
         }
+
+        /// #4453 — the name beside it that a `.prev` a start would not take is
+        /// set aside under. No reader loads it.
+        const SET_ASIDE: &str = "config.toml.prev.set-aside";
+
+        /// Where the copy a start refuses is in `tree` once a save has run: set
+        /// aside with what it held, and no longer at its name.
+        fn set_aside_in(tree: &MachineTree, case: Beside, wrong: &mut Vec<String>) {
+            let aside = tree.folder().join(SET_ASIDE);
+            if tree.prev().exists() {
+                wrong.push(format!(
+                    "{case:?}: the copy a start refuses is still at its name"
+                ));
+            } else if std::fs::read_to_string(&aside).ok() != Some(enrolled(THE_COPY)) {
+                wrong.push(format!(
+                    "{case:?}: the copy a start refuses is not at {SET_ASIDE}"
+                ));
+            }
+        }
+
+        /// #4453 — an elevated save's read of its merge base sets aside a
+        /// `.prev` that a start would not take, beside a config that loads and
+        /// beside one that does not.
+        #[test]
+        fn an_elevated_saves_read_sets_aside_a_copy_a_start_refuses() {
+            if !elevated_or_skip("an elevated save's read beside a copy a start refuses") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in [
+                Beside::ConfigThatLoads,
+                Beside::CopyInheritsWrite,
+                Beside::CopyInheritsWriteFromTheFolder,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let tree = tree_beside(root.path(), case);
+                let _ = base(&tree);
+                set_aside_in(&tree, case, &mut wrong);
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// #4453 — an elevated save that stops with its config not written has
+        /// set aside a `.prev` that a start would not take: beside a config
+        /// that loads, beside one that does not load, and, writing a fresh
+        /// config, with no config. The save's own temp file cannot be made: a
+        /// folder that holds a file has its name.
+        #[test]
+        fn an_elevated_save_that_stops_sets_aside_a_copy_a_start_refuses() {
+            if !elevated_or_skip("an elevated save that stops, beside a copy a start refuses") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in [
+                Beside::ConfigThatLoads,
+                Beside::CopyInheritsWrite,
+                Beside::NoConfigACopyAStartRefuses,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let tree = tree_beside(root.path(), case);
+                stand_in(&tree);
+                let temp = tree
+                    .config()
+                    .with_extension(format!("toml.tmp.{}", std::process::id()));
+                std::fs::create_dir(&temp).unwrap();
+                std::fs::write(temp.join("held"), "").unwrap();
+                let mut cfg = test_fixture();
+                cfg.machine_name = "the save".into();
+                let saved = match case {
+                    Beside::NoConfigACopyAStartRefuses => save_fresh(&tree.config(), &cfg),
+                    _ => save(&tree.config(), &cfg),
+                };
+                if saved.is_ok() {
+                    wrong.push(format!("{case:?}: the save did not stop"));
+                }
+                set_aside_in(&tree, case, &mut wrong);
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
     }
 
     /// #4176 — a machine config that is missing is restored at a start only
