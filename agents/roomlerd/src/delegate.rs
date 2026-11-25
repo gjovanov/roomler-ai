@@ -2390,6 +2390,15 @@ impl DelegateHost {
         *self.inner.worker_uid.lock().expect("worker uid mutex")
     }
 
+    /// FR-149 P1 — the worker as the session panel reads it
+    /// (`indicator::session_panel::TheRoad`): the account it was started for
+    /// ([`Self::worker_uid`]), and whether it said
+    /// [`crate::indicator::session_panel::CONSENT_PANEL`] on the channel it
+    /// holds now ([`Self::says_consent_panel`]).
+    pub fn panel_worker(&self) -> Option<(u32, bool)> {
+        Some((self.worker_uid()?, self.says_consent_panel()))
+    }
+
     /// FR-138 P2b — whether `session`'s params crossed `keepable`.
     pub(crate) fn is_keepable(&self, session: &str) -> bool {
         self.inner
@@ -2456,6 +2465,14 @@ impl DelegateHost {
     pub(crate) fn end_channel_for_test(&self) {
         self.channel_ended();
         self.records_channel_ended("closed");
+    }
+
+    /// #4421 — the account a worker is started for, noted as
+    /// [`Self::open_for`] notes it at each spawn, for a test (that one is
+    /// Unix's, and binds the worker's socket).
+    #[cfg(test)]
+    pub(crate) fn started_for_test(&self, uid: u32) {
+        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
     }
 
     /// #3992 — a worker's capabilities held as `serve` holds the ones its frame
