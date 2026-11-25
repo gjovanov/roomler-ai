@@ -9,6 +9,7 @@ mod gate_before_body;
 pub mod growth;
 pub mod logging;
 pub mod middleware;
+mod request_log;
 pub mod routes;
 pub mod stall_watchdog;
 pub mod state;
@@ -34,7 +35,7 @@ use std::sync::Arc;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{
     cors::{Any, CorsLayer},
-    trace::TraceLayer,
+    trace::{DefaultOnRequest, TraceLayer},
 };
 
 fn build_cors_layer(origins: &[String], frontend_url: &str) -> CorsLayer {
@@ -430,18 +431,25 @@ pub fn build_router(state: AppState) -> Router {
         // `Authorization: Bearer`, which no span records; #3656), and TraceLayer's default
         // span records the FULL uri at DEBUG — pod logs held live long-lived agent JWTs (field
         // 2026-08-18, task #15). Queries that carry no token stay logged verbatim (pagination).
-        .layer(TraceLayer::new_for_http().make_span_with(
-            |req: &axum::http::Request<axum::body::Body>| {
-                let uri = req.uri();
-                let shown = match uri.query() {
-                    Some(q) if q.contains("token") => {
-                        format!("{}?<token redacted>", uri.path())
-                    }
-                    _ => uri.to_string(),
-                };
-                tracing::debug_span!("request", method = %req.method(), uri = %shown)
-            },
-        ))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<axum::body::Body>| {
+                    let uri = req.uri();
+                    let shown = match uri.query() {
+                        Some(q) if q.contains("token") => {
+                            format!("{}?<token redacted>", uri.path())
+                        }
+                        _ => uri.to_string(),
+                    };
+                    tracing::debug_span!("request", method = %req.method(), uri = %shown)
+                })
+                // #4402 — the two lines every request wrote at DEBUG were 30 %
+                // of the busier pod's log: the started line at TRACE, the
+                // finished line at DEBUG only for a refusal, an error or a
+                // slow answer (`request_log`).
+                .on_request(DefaultOnRequest::new().level(tracing::Level::TRACE))
+                .on_response(request_log::ResponseLine),
+        )
         .layer(cors)
         .with_state(state)
 }

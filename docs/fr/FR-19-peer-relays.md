@@ -709,7 +709,7 @@ device has N per-tenant rows with independently-set names; resolving from any ot
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:144-146`.
 It does: the name is the one this network's netmap gives the relay node
 (`crates/tunnel-core/src/overlay/runtime.rs:3302`, `:4484`), and the netmap takes it from that
-network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:3027-3031`). A
+network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:3187-3191`). A
 relay node missing from the map shows as its node id in hex.
 
 ### 9. Where the code goes — implementation map
