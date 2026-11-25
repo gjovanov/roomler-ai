@@ -21,8 +21,9 @@
 //
 // WHAT IS READ: the text a person can meet, per kind of file (readers below)
 //
-//   Rust        string literals outside comments, log macros (trace! ... error!) and
-//               test code (#[cfg(test)] and #[test] items, *_tests.rs, tests/)
+//   Rust        string literals outside comments, log macros (trace! ... error!, and a
+//               file's own macro_rules! that calls one) and test code (#[cfg(test)]
+//               and #[test] items, *_tests.rs, tests/)
 //   JS          string literals outside comments and console.* calls; ${...} is code
 //   HTML        text between tags; placeholder, title, aria-label, alt; inline <script>
 //   Markdown    prose; code spans and fenced code as code; comments and link targets out
@@ -291,6 +292,112 @@ function saysAgent(text, prose) {
 const LOG_MACROS = ['trace!', 'debug!', 'info!', 'warn!', 'error!']
 const TEST_ATTR = /^#\[\s*(?:cfg\s*\(\s*(?:test\s*\)|all\s*\(\s*test\b)|test\s*\]|tokio::test\b)/
 
+/** `code` with its comments, string literals and char literals blanked (same length, newlines kept). */
+function maskRust(code) {
+  const n = code.length
+  const out = code.split('')
+  const blank = (a, b) => {
+    for (let k = a; k < b && k < n; k++) if (out[k] !== '\n') out[k] = ' '
+  }
+  let i = 0
+  while (i < n) {
+    const c = code[i]
+    if (c === '/' && code[i + 1] === '/') {
+      const e = code.indexOf('\n', i)
+      const end = e < 0 ? n : e
+      blank(i, end)
+      i = end
+    } else if (c === '/' && code[i + 1] === '*') {
+      let d = 1
+      let j = i + 2
+      while (j < n && d > 0) {
+        if (code.startsWith('/*', j)) (d += 1), (j += 2)
+        else if (code.startsWith('*/', j)) (d -= 1), (j += 2)
+        else j += 1
+      }
+      blank(i, j)
+      i = j
+    } else if (c === 'r' || c === 'b') {
+      // r"..", r#".."#, br"..", b"..": a raw or byte string, unless this is the tail of a longer word.
+      const m = /^b?r(#*)"/.exec(code.slice(i, i + 40))
+      if (m && !/[A-Za-z0-9_]/.test(code[i - 1] ?? '')) {
+        const close = '"' + m[1]
+        const e = code.indexOf(close, i + m[0].length)
+        const end = e < 0 ? n : e + close.length
+        blank(i, end)
+        i = end
+      } else i += 1
+    } else if (c === '"') {
+      let j = i + 1
+      while (j < n && code[j] !== '"') j += code[j] === '\\' ? 2 : 1
+      blank(i, j + 1)
+      i = j + 1
+    } else if (c === "'") {
+      // A char literal ('"', '{', '\'') blanks; a lifetime ('a) does not.
+      if (code[i + 1] === '\\') {
+        const e = code.indexOf("'", i + 3)
+        const end = e < 0 ? n : e + 1
+        blank(i, end)
+        i = end
+      } else if (code[i + 2] === "'") {
+        blank(i, i + 3)
+        i += 3
+      } else i += 1
+    } else i += 1
+  }
+  return out.join('')
+}
+
+const LOG_CALL = new RegExp(`(?<![A-Za-z0-9_])(?:${LOG_MACROS.map((m) => m.slice(0, -1)).join('|')})!\\s*[(\\[{]`)
+
+/** The macros whose text a person can meet: a body that calls one is no log macro. */
+const PERSON_MACROS = ['println', 'print', 'eprintln', 'eprint', 'format', 'format_args', 'write', 'writeln', 'bail', 'anyhow', 'panic', 'ensure']
+const PERSON_CALL = new RegExp(`(?<![A-Za-z0-9_])(?:${PERSON_MACROS.join('|')})!\\s*[(\\[{]`)
+
+/**
+ * The names (with their `!`) of the `macro_rules!` of THIS file whose body calls a log macro, or
+ * another such macro of the file, and calls no person-facing macro (PERSON_MACROS, or a local macro
+ * that does): a file's own log wrapper, such as the network module's `miss_line!`. Rust's `macro_rules!` scope is textual, so the list is per file. Out of scope: a
+ * `#[macro_export]` macro that another file calls, whose name this reader cannot know there.
+ */
+function localLogMacros(code) {
+  const masked = maskRust(code)
+  const defs = []
+  const re = /(?<![A-Za-z0-9_])macro_rules!\s*([A-Za-z_][A-Za-z0-9_]*)\s*([({[])/g
+  for (let m; (m = re.exec(masked)); ) {
+    let d = 1
+    let j = re.lastIndex
+    while (j < masked.length && d > 0) {
+      const c = masked[j]
+      if (c === '(' || c === '[' || c === '{') d += 1
+      else if (c === ')' || c === ']' || c === '}') d -= 1
+      j += 1
+    }
+    defs.push({ name: `${m[1]}!`, body: masked.slice(re.lastIndex, j) })
+  }
+  const calls = (body, name) => new RegExp(`(?<![A-Za-z0-9_])${name}\\s*[(\\[{]`).test(body)
+  // Fail closed: a macro whose body ALSO calls a person-facing macro (or a local one that does) is not
+  // a log macro, even though it logs: `{ tracing::warn!($($t)+); bail!($($t)+) }` hands the same text
+  // to a person, and its literal has to stay in the guard's sight.
+  const person = new Set()
+  for (let grew = true; grew; ) {
+    grew = false
+    for (const { name, body } of defs) {
+      if (person.has(name)) continue
+      if (PERSON_CALL.test(body) || [...person].some((o) => calls(body, o))) person.add(name), (grew = true)
+    }
+  }
+  const names = new Set()
+  for (let grew = true; grew; ) {
+    grew = false
+    for (const { name, body } of defs) {
+      if (names.has(name) || person.has(name)) continue
+      if (LOG_CALL.test(body) || [...names].some((o) => calls(body, o))) names.add(name), (grew = true)
+    }
+  }
+  return [...names]
+}
+
 /**
  * Every string literal of Rust `code`: P2a's lexer (notice_text_tests.rs `literals`),
  * plus nested block comments, byte raw strings and test-only items.
@@ -301,15 +408,18 @@ function rustLiterals(code) {
   let i = 0
   let depth = 0
   let logAt = null
+  let logOwn = false // the log macro being read is this file's own wrapper, not one of the five
   let attr = null // an attribute being read: { depth, test }
   let test = null // a test-only item being read: { depth, body }
   const wordChar = (c) => c !== undefined && /[A-Za-z0-9_]/.test(c)
+  const ownLogs = localLogMacros(code) // this file's own wrappers of the five (a literal inside one is a log line too)
   const push = (start, end) =>
     out.push({
       text: code.slice(start, end),
       at: start,
       prose: false,
       skip: test ? 'test code' : logAt !== null ? 'a log line' : undefined,
+      own: !test && logAt !== null && logOwn,
     })
   while (i < n) {
     const c = code[i]
@@ -328,7 +438,10 @@ function rustLiterals(code) {
       if (attr === null && test === null) attr = { depth, test: TEST_ATTR.test(code.slice(i, i + 40)) }
       i += 1
     } else if (c === '(' || c === '[' || c === '{') {
-      if (logAt === null && LOG_MACROS.some((m) => code.endsWith(m, i))) logAt = depth
+      if (logAt === null) {
+        if (LOG_MACROS.some((m) => code.endsWith(m, i))) (logAt = depth), (logOwn = false)
+        else if (ownLogs.some((m) => code.endsWith(m, i) && !wordChar(code[i - m.length - 1]))) (logAt = depth), (logOwn = true)
+      }
       if (c === '{' && test && !test.body && depth === test.depth) test.body = true
       depth += 1
       i += 1
@@ -877,7 +990,9 @@ function scanText(file, text, kind) {
   const starts = lineStarts(text)
   const lines = text.split('\n')
   const hits = []
+  const wrapped = [] // lines of a literal that says "agent" and is skipped only as a log line of the file's own macro
   for (const item of kind.read(text)) {
+    if (item.skip && item.own && saysAgent(item.text, item.prose)) wrapped.push(lineOf(starts, item.at))
     if (item.skip || !saysAgent(item.text, item.prose)) continue
     const said = oneLine(item.text)
     if (KEPT_PHRASES.some((k) => keeps(k, file, said))) continue
@@ -904,6 +1019,9 @@ function scanText(file, text, kind) {
     if (m) m.used = true
     return !m
   })
+  // A marker on a log line of the file's own macro is true: it says the wording stays for a person
+  // who reads the log, and the line is no longer a hit only because the macro is read as a log.
+  for (const m of markers) if (wrapped.some((l) => m.covers.includes(l))) m.used = true
   for (const m of markers.filter((mk) => !mk.used)) {
     faults.push({ file, line: m.line, why: `${MARKER} covers no "agent" (its line and the next): remove the marker` })
   }
@@ -1354,6 +1472,62 @@ function selfTest({ quiet = false } = {}) {
   ok("the HTML reader reads the companion's case", eq(words, ['a b', 'Hi ', 'there', '24-hex id']), JSON.stringify(words))
   const rust = 'let c = \'"\'; fn f<\'a>() {} warn!("a log"); bail!("an error");'
   ok("the Rust reader reads the companion's case", eq(rustLiterals(rust).map((g) => [g.text, g.skip === 'a log line']), [['a log', true], ['an error', false]]))
+
+  // A file's own log macro (FR-133 P4 follow-up): a `macro_rules!` whose body calls one of the five
+  // tracing macros is a log macro in that file, so a literal handed to it is a log line, as in
+  // overlay.rs's `miss_line!`. One that wraps no log macro is not, and its literals still count.
+  const wrapped = String.raw`
+        macro_rules! miss_line {
+            ($cond:expr, $($line:tt)+) => {
+                if $cond { tracing::debug!($($line)+); } else { tracing::trace!($($line)+); }
+            };
+        }
+        macro_rules! shout { ($($t:tt)+) => { miss_line!(true, $($t)+) }; }
+        fn f() {
+            miss_line!(true, id = 1, "an agent line");
+            shout!("another agent line");
+            bail!("an agent error");
+        }
+    `
+  const gotWrapped = rustLiterals(wrapped)
+  ok(
+    "a literal inside a file's own log macro is a log line, one macro away too",
+    eq(gotWrapped.map((g) => [g.text, g.skip === 'a log line']), [['an agent line', true], ['another agent line', true], ['an agent error', false]]),
+    JSON.stringify(gotWrapped.map((g) => [g.text, g.skip])),
+  )
+  const plain = String.raw`
+        macro_rules! say { ($($t:tt)+) => { println!($($t)+) }; }
+        macro_rules! oops { ($($t:tt)+) => { eprintln!($($t)+) }; }
+        macro_rules! fail { ($($t:tt)+) => { bail!($($t)+) }; }
+        macro_rules! fmt { ($($t:tt)+) => { format!($($t)+) }; }
+        macro_rules! quiet { ($($t:tt)+) => { /* info!("a comment") */ { let _s = "warn!(x)"; format!($($t)+) } }; }
+        macro_rules! both { ($($t:tt)+) => {{ tracing::warn!($($t)+); bail!($($t)+) }}; }
+        macro_rules! via_both { ($($t:tt)+) => { both!($($t)+) }; }
+        macro_rules! also { ($($t:tt)+) => {{ tracing::info!($($t)+); let _ = write!(out, $($t)+); }}; }
+        fn f() {
+            say!("the agent said"); oops!("the agent erred"); fail!("the agent failed"); fmt!("the agent formatted"); quiet!("the agent hid");
+            both!("the agent both"); via_both!("the agent via both"); also!("the agent also");
+        }
+    `
+  const gotPlain = rustLiterals(plain).filter((g) => /^the agent/.test(g.text))
+  ok(
+    'a local macro that wraps no log macro, or one that also calls a person-facing macro (or one that does), does not skip its literals',
+    gotPlain.length === 8 && gotPlain.every((g) => g.skip === undefined),
+    JSON.stringify(gotPlain.map((g) => [g.text, g.skip])),
+  )
+
+  // A marker on a line of the file's own log macro is true (overlay.rs keeps one there), while one on
+  // a plain log line, or on an own-macro line that no longer says "agent", still covers nothing.
+  const own = 'macro_rules! hint { ($($t:tt)+) => { tracing::debug!($($t)+) }; }\n'
+  const scanRs = (body) => scanText('agents/roomlerd/src/x.rs', own + body, kindOf('agents/roomlerd/src/x.rs'))
+  const markedOwn = scanRs('fn f() {\n    // AGENT-WORD-KEPT: a log message; reads of the log count this wording\n    hint!(a = 1, "an agent line");\n}\n')
+  const plainLog = scanRs('fn f() {\n    // AGENT-WORD-KEPT: a log message; reads of the log count this wording\n    tracing::debug!(a = 1, "an agent line");\n}\n')
+  const reworded = scanRs('fn f() {\n    // AGENT-WORD-KEPT: a log message; reads of the log count this wording\n    hint!(a = 1, "a daemon line");\n}\n')
+  ok(
+    "a marker on the file's own log macro holds, and one on a plain log line or a reworded one is still a fault",
+    markedOwn.hits.length === 0 && markedOwn.faults.length === 0 && plainLog.faults.length === 1 && reworded.faults.length === 1,
+    JSON.stringify([markedOwn, plainLog, reworded]),
+  )
 
   // Each reader on a fixture file: a person-facing "agent" FAILS; an identity, a comment,
   // a log line, test code and a marked occurrence with a reason pass; a marker with no
