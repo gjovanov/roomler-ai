@@ -450,6 +450,8 @@ enqueues its line (up to 16,384 lines queued) and returns. One `log-writer` thre
 the container's log pipe stops draining, that thread waits alone, the queue fills, and further
 lines are **dropped and counted**. Once a minute, and once the pipe drains again, the log says so:
 `log output was not draining: lines were dropped so the server kept serving (#1731) … total=N`.
+The lines carry ANSI colour codes only when stdout is a terminal and `NO_COLOR` is unset or empty
+(`crates/api/src/logging.rs:58`, #4402), so a pod's log is plain text.
 
 Before this, the fmt layer wrote stdout **synchronously under the process-wide stdout lock**. The
 server runs as many tokio workers as its CPU limit, **two** in production, so a stopped pipe froze
