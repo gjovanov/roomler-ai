@@ -38,6 +38,7 @@ mod commands;
 mod desktop_log;
 mod editor;
 mod first_run;
+mod full_screen;
 mod panels;
 #[cfg(target_os = "linux")]
 mod pin;
@@ -220,6 +221,9 @@ fn main() {
             // hidden (visible:false in tauri.conf.json); operator
             // opens it from the tray menu.
             tray::install(app.handle())?;
+            // #4419 — before the main window is first shown: on a Mac its
+            // full-screen behaviour is set, never left to AppKit's guess.
+            full_screen::make_explicit(app.handle());
             // FR-84 D6 — a launch that asked for a view (the Welcome on a
             // first run, `--first-run`, `--view=`) shows the window at once;
             // the page routes itself from `cmd_launch_intent` when it loads.

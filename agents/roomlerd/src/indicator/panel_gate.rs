@@ -1002,7 +1002,7 @@ mod tests {
     /// `false` from each of the gate's verdicts is followed, beside a taken
     /// panel's, from the marker to the person's list and back: it is listed
     /// with a surface the app shows (every one but `native`,
-    /// `agents/roomler-desktop/src/main.rs:410`), and the person's answer
+    /// `agents/roomler-desktop/src/main.rs:414`), and the person's answer
     /// there decides it, an approval and a denial alike. Nothing denies it
     /// and nothing grants it on its own. The control: a question the panel
     /// takes is listed `native`, which the app leaves to the panel.
