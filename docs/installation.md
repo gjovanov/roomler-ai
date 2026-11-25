@@ -4208,10 +4208,10 @@ it. On the signed-in road it always did; on the login-window road it does since
 agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3892`,
 `WatchPaths` in `com.roomler.update.plist:67-70`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
-that way. Since FR-151 the helper reads such a session first: an order to the
-root daemon's row installs over it at once, which ends it, and an order to a
-per-user half's row waits until it ends
-([the helper's gate](#macos-the-root-update-helpers-gate-fr-151)).
+that way. Since FR-151 the helper reads such work first: an order to the root
+daemon's row installs over it at once, which ends it, while an order to a
+per-user half's row does not skip the wait for the root daemon's SSH
+connections and exec runs ([the helper's gate](#macos-the-root-update-helpers-gate-fr-151)).
 
 Two things #3783 did not change:
 
