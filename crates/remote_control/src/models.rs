@@ -11684,12 +11684,15 @@ mod deny_reasons_say_device_not_agent {
         ]
         .map(SshDenyReason::message);
         let external = ExternalRcDenyReason::ALL.iter().map(|r| r.message());
+        // "agent" as a word, the P4 guard's rule (`scripts/says-roomlerd.cjs`):
+        // a permission's name (`MANAGE_AGENTS`) is one word of its own, and
+        // FR-90's "agent session" is an identity.
         for text in ssh.into_iter().chain(external) {
             let rest = text.replace("agent session", "");
-            assert!(
-                !rest.to_ascii_lowercase().contains("agent"),
-                "{text:?} says agent"
-            );
+            let says_agent = rest
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|w| w.eq_ignore_ascii_case("agent") || w.eq_ignore_ascii_case("agents"));
+            assert!(!says_agent, "{text:?} says agent");
         }
     }
 }
