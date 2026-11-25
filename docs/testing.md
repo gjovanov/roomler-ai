@@ -795,7 +795,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8310`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8322`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -1048,7 +1048,7 @@ carrier: the target is reachable, the bytes arrive intact, and the carrier stays
 
 ⚠️ **Stability counts transitions from an allow-list of carrier shapes** (`direct`, `lan`,
 `relay:*`). The `CONN` column of `roomler peers` also carries *states* — `upgrading` (a
-make-before-break probe on a relayed peer, [`localclient.rs:1278`](../agents/roomler-cli/src/localclient.rs#L1278)),
+make-before-break probe on a relayed peer, [`localclient.rs:1284`](../agents/roomler-cli/src/localclient.rs#L1284)),
 `stalled`, `offline` — and counting those as carriers once reported a healthy peer as flapping.
 They are tallied separately, and any value outside both lists is **reported, never counted**.
 A result reads `transitions=<n>/<k>samples`: for three runs the lane printed
@@ -1070,7 +1070,7 @@ corporate laptop, a real relay path, or both:
 | round 2 | `scp` exited 1 after every *successful* transfer: the sftp subsystem never sent an exit status | #1559 — the pump waits for the child and reports it ([`ssh.rs:1386`](../agents/roomlerd/src/ssh.rs#L1386)) |
 | round 2 | a device whose stored SSH host key was unreadable published **no** key, permanently, so no caller could verify it | #1565 — an unreadable key counts as no key and is replaced ([`ssh.rs:510`](../agents/roomlerd/src/ssh.rs#L510)) |
 | round 3 | a caller with a faster control path than the target dialled before the target had its grant: `Permission denied (publickey)`, 0/3 on one laptop | FR-83 (#1597) — the server answers only after the device confirms the grant ([`agent_ssh.rs:478`](../crates/modules/network/src/routes/agent_ssh.rs#L478)) |
-| round 3 | `roomler proxy`'s own `--help` recipe could not work (`%h` arrives as `<name>.roomler`) | #1573 — the suffix and the MagicDNS domain are stripped ([`localclient.rs:617`](../agents/roomler-cli/src/localclient.rs#L617)) |
+| round 3 | `roomler proxy`'s own `--help` recipe could not work (`%h` arrives as `<name>.roomler`) | #1573 — the suffix and the MagicDNS domain are stripped ([`localclient.rs:623`](../agents/roomler-cli/src/localclient.rs#L623)) |
 
 ### Reference run — `20260924-155559`, every target on agent 0.4.101
 

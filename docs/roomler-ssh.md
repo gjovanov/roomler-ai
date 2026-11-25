@@ -1333,7 +1333,7 @@ server's. These bounds hold whatever the device's clock says:
 4. **A queued grant dies with its connection.** It waits on the connection's
    own queue (`crates/modules/fleet/src/hub.rs:3291`), so a reconnect drops it,
    and a connection that hears nothing for 80 s (`WS_RX_DEADLINE`,
-   `agents/roomlerd/src/signaling.rs:66`, checked at `:2393`) reconnects. On a
+   `agents/roomlerd/src/signaling.rs:66`, checked at `:2421`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
    (`agents/roomlerd/src/ssh.rs:3225`), and no window longer than 60 s from
@@ -1417,7 +1417,7 @@ as `grant_refused`. The wire gets no new value, so every server release reads
 it. It is not `other`, a reason this build would not know, and not `expired`,
 which #3511 retired. The worker logs it as it logs any refusal of
 `record_grant`, `rc:ssh.grant rejected` with the grant id
-([`signaling.rs:6199`](../agents/roomlerd/src/signaling.rs#L6199)), and the
+([`signaling.rs:6227`](../agents/roomlerd/src/signaling.rs#L6227)), and the
 error names the case: "a grant id is honoured at most once, and its first copy
 was redeemed" (or is still pending, expired unredeemed, or was dropped from a
 full table).
@@ -1427,8 +1427,8 @@ differently so that it does:
 
 | Path | A copy is | Why the first copy's answer stands |
 |---|---|---|
-| the worker's own table | refused, `invalid` | One loop records and acknowledges each grant in order (`handle_server_msg`, [`signaling.rs:3326`](../agents/roomlerd/src/signaling.rs#L3326)), and its answers leave on one queue ([`signaling.rs:2760`](../agents/roomlerd/src/signaling.rs#L2760)). The server reads one socket's frames in order ([`socket.rs:560-583`](../crates/modules/fleet/src/socket.rs#L560)), and the first answer removes the caller's wait ([`ssh_grant_acks.rs:108-120`](../crates/modules/network/src/ssh_grant_acks.rs#L108)). The copy's refusal finds no wait, and the server logs `ssh: grant ack with no waiter` at debug ([`agent_socket.rs:141-155`](../crates/modules/network/src/agent_socket.rs#L141)) |
-| the SYSTEM service (FR-105) | dropped by the worker: no second ring and no acknowledgement, only a warning, `rc:ssh.grant already handed to the SYSTEM service (or refused); this copy is dropped, no ack` ([`signaling.rs:6097-6106`](../agents/roomlerd/src/signaling.rs#L6097)) | Here a refusal could undo the first copy. The service's claim is single use ([`ssh_pending.rs:44-68`](../crates/services/src/dao/ssh_pending.rs#L44)), so a copy's ring ends in a 404 ([`agent_ssh.rs:1263-1290`](../crates/modules/network/src/routes/agent_ssh.rs#L1263)), which the worker would answer as a refusal. The first copy's claim can land on a server instance other than the one holding the caller's wait. That wait reads the claim from the shared row every 400 ms, and until then it still takes a worker's refusal ([`ssh_grant_acks.rs:115`](../crates/modules/network/src/ssh_grant_acks.rs#L115)): its refusal arm would deny the caller ([`agent_ssh.rs:545-566`](../crates/modules/network/src/routes/agent_ssh.rs#L545)) while the service holds the grant. So the worker remembers each via-service id at first sight, before any outcome (`first_sight_via_service`, [`ssh.rs:3557`](../agents/roomlerd/src/ssh.rs#L3557)), in a memory of its own with the same horizon and bound, never the table's. A grant the worker refused is as dead as one the service took, and its first refusal already answered |
+| the worker's own table | refused, `invalid` | One loop records and acknowledges each grant in order (`handle_server_msg`, [`signaling.rs:3354`](../agents/roomlerd/src/signaling.rs#L3354)), and its answers leave on one queue ([`signaling.rs:2788`](../agents/roomlerd/src/signaling.rs#L2788)). The server reads one socket's frames in order ([`socket.rs:560-583`](../crates/modules/fleet/src/socket.rs#L560)), and the first answer removes the caller's wait ([`ssh_grant_acks.rs:108-120`](../crates/modules/network/src/ssh_grant_acks.rs#L108)). The copy's refusal finds no wait, and the server logs `ssh: grant ack with no waiter` at debug ([`agent_socket.rs:141-155`](../crates/modules/network/src/agent_socket.rs#L141)) |
+| the SYSTEM service (FR-105) | dropped by the worker: no second ring and no acknowledgement, only a warning, `rc:ssh.grant already handed to the SYSTEM service (or refused); this copy is dropped, no ack` ([`signaling.rs:6125-6134`](../agents/roomlerd/src/signaling.rs#L6125)) | Here a refusal could undo the first copy. The service's claim is single use ([`ssh_pending.rs:44-68`](../crates/services/src/dao/ssh_pending.rs#L44)), so a copy's ring ends in a 404 ([`agent_ssh.rs:1263-1290`](../crates/modules/network/src/routes/agent_ssh.rs#L1263)), which the worker would answer as a refusal. The first copy's claim can land on a server instance other than the one holding the caller's wait. That wait reads the claim from the shared row every 400 ms, and until then it still takes a worker's refusal ([`ssh_grant_acks.rs:115`](../crates/modules/network/src/ssh_grant_acks.rs#L115)): its refusal arm would deny the caller ([`agent_ssh.rs:545-566`](../crates/modules/network/src/routes/agent_ssh.rs#L545)) while the service holds the grant. So the worker remembers each via-service id at first sight, before any outcome (`first_sight_via_service`, [`ssh.rs:3557`](../agents/roomlerd/src/ssh.rs#L3557)), in a memory of its own with the same horizon and bound, never the table's. A grant the worker refused is as dead as one the service took, and its first refusal already answered |
 
 Left as they are:
 
@@ -1514,7 +1514,7 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4329`](../agents/roomlerd/src/signaling.rs#L4329), [`:5891`](../agents/roomlerd/src/signaling.rs#L5891)), as the recording question does
+first the same way ([`signaling.rs:4357`](../agents/roomlerd/src/signaling.rs#L4357), [`:5919`](../agents/roomlerd/src/signaling.rs#L5919)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,

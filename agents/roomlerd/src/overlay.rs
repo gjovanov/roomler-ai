@@ -110,6 +110,23 @@ struct RuntimeSlot {
 static RUNTIME_SLOTS: std::sync::Mutex<std::collections::BTreeMap<String, RuntimeSlot>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// #4367 — does this tenant's overlay runtime still run? The LocalAPI's
+/// `peers` answer asks it for an org whose control socket is down, before it
+/// lists what that org's mesh holds: the runtime outlives the socket, but its
+/// view (a watch) keeps the last list it published after the runtime ends, so
+/// "the view has peers" is no proof that the data plane still holds them.
+///
+/// No slot: the overlay is off for the tenant ([`maybe_start`] removed it) or
+/// never started in this process. A closed channel: the runtime ended (its
+/// receiver dropped), whatever ended it.
+pub fn runtime_alive(tenant: &str) -> bool {
+    RUNTIME_SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(tenant)
+        .is_some_and(|s| !s.evt_tx.is_closed())
+}
+
 /// R4 — the per-tenant CENTRAL DERP mux, exposed to the tunnel plane for the
 /// `quic-derp-v1` flavor. `Weak` so a mux that died with its runtime reads
 /// as absent instead of leaking; the stored hex is the node's own pubkey
@@ -1521,4 +1538,53 @@ pub fn record_join_refusal(reason: signaling::OverlayJoinRefusal, detail: &str) 
 /// The last refusal, if this daemon has seen one.
 pub fn last_join_refusal() -> Option<localapi::JoinRefusalStatus> {
     LAST_JOIN_REFUSAL.lock().ok().and_then(|s| s.clone())
+}
+
+#[cfg(test)]
+mod runtime_alive_tests {
+    use super::*;
+
+    /// #4367 — the probe the LocalAPI's `peers` answer asks before it lists
+    /// what an org's mesh holds while that org's control socket is down: no
+    /// slot is no runtime (the overlay is off or never started), and a slot
+    /// whose runtime ended (its receiver dropped) is no runtime either, though
+    /// the runtime's view keeps its last list.
+    #[test]
+    fn a_runtime_is_alive_only_while_its_slot_holds_an_open_channel() {
+        // A tenant no other test uses: the slots are process-global.
+        let tenant = "t-4367-runtime-alive";
+        assert!(!runtime_alive(tenant), "no slot: the overlay never started");
+
+        let (evt_tx, evt_rx) = mpsc::channel::<OverlayEvent>(1);
+        RUNTIME_SLOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                tenant.to_string(),
+                RuntimeSlot {
+                    fingerprint: RuntimeFingerprint {
+                        wg_public_key: "pk".into(),
+                        netstack_port: None,
+                        advertised_routes: Vec::new(),
+                        exit_node: None,
+                        tenant_id: tenant.into(),
+                        server_url: "https://example.invalid".into(),
+                        lan_ips: Vec::new(),
+                    },
+                    evt_tx,
+                },
+            );
+        assert!(runtime_alive(tenant), "the runtime runs");
+        assert!(!runtime_alive("t-4367-another-tenant"), "per tenant");
+
+        // The runtime ends: its loop returns and drops the receiver.
+        drop(evt_rx);
+        assert!(!runtime_alive(tenant), "the runtime ended");
+
+        RUNTIME_SLOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(tenant);
+        assert!(!runtime_alive(tenant), "the overlay was turned off");
+    }
 }

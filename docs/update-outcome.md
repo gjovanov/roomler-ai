@@ -108,7 +108,7 @@ sequenceDiagram
 > the daemon's `started_at_ms` is 1792967954; the watcher's `finished_unix` is
 > 1792967960. For those seconds the record honestly reads `InProgress`, which
 > is why the daemon reads the file **on every answer** rather than once at
-> startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:1083`),
+> startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:1143`),
 > and why a fresh `InProgress` is "still at work", not a failure (§4).
 
 ### On a per-Machine hop: what ended the watcher, and what #4302 changes
@@ -216,7 +216,7 @@ record's file. Two topologies split roles:
   worker's own token, and only the S-1-5-18 SID is `SystemContext`
   (`agents/roomlerd/src/system_context/worker_role.rs:208`); `roomler status`
   shows the same fact as `privileged` (`process_is_privileged`,
-  `agents/roomlerd/src/localapi_state.rs:510`), `service (per-user)` when it is
+  `agents/roomlerd/src/localapi_state.rs:517`), `service (per-user)` when it is
   false. The dev box is the attended case (`privileged: false`): the 0.4.172
   and 0.4.174 records sit under the signed-in user's profile, while the SYSTEM
   profile's copy is a July `InProgress` for `agent-v0.3.0-rc.183` — a watcher
@@ -259,8 +259,8 @@ $ roomler status
   status` (fleet RPC, `docs/fleet-rpc.md`), or `roomler status --json` and read
   `.last_install`. The line sits right under `version` — the record and the
   binary it produced, together — and is printed only when the daemon reports
-  the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2556`;
-  the sentence per word, `last_install_line`, `:2955`).
+  the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2562`;
+  the sentence per word, `last_install_line`, `:2961`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:2208`,
   called from `run_cmd`, `agents/roomlerd/src/app.rs:4471`). `journalctl -u
@@ -323,7 +323,7 @@ $ roomler status
 - **P5 — the fleet answer.** No wire message carries the verdict yet; the
   server still infers success from a changed `agent_version` on the next
   hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7250`,
+  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7278`,
   where `update_mode` is stamped), additive `#[serde(default)]` on
   `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
   P7's shape does not cover: on Windows the first hello after an update carries

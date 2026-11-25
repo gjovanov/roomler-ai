@@ -5023,6 +5023,7 @@ async fn run_cmd(
             updates_ignored: primary_ctx.updates_ignored.clone(),
             overlay_mode: cfg.primary_overlay_mode().wire(),
             token: primary_ctx.token.clone(),
+            control_lost_at_ms: primary_ctx.control_lost_at_ms.clone(),
         }];
         for ((org, problem), org_ctx) in org_partition.iter().zip(org_ctxs.iter()) {
             let org_ctx = org_ctx.clone();
@@ -5040,6 +5041,7 @@ async fn run_cmd(
                 updates_ignored: org_ctx.updates_ignored.clone(),
                 overlay_mode: org.overlay_mode.wire(),
                 token: org_ctx.token.clone(),
+                control_lost_at_ms: org_ctx.control_lost_at_ms.clone(),
             });
             if org.enabled && problem.is_none() {
                 org_spawns.push((org.clone(), org_ctx, connected, terminal));
@@ -5225,7 +5227,15 @@ async fn run_cmd(
             Some(code)
         });
     }
-    let daemon_state = localapi_state::DaemonState::new(
+    // #4367 — how the LocalAPI tells a tenant's live data plane from a dead
+    // one while that org's control socket is down: its overlay runtime still
+    // runs. A build without the overlay holds no mesh at all.
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    let runtime_alive: localapi_state::RuntimeAlive =
+        std::sync::Arc::new(roomlerd::overlay::runtime_alive);
+    #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+    let runtime_alive: localapi_state::RuntimeAlive = std::sync::Arc::new(|_: &str| false);
+    let daemon_state = localapi_state::DaemonState::for_daemon(
         cfg.agent_id.clone(),
         cfg.machine_name.clone(),
         tunnel_core::localapi::DaemonMode::Service,
@@ -5236,6 +5246,7 @@ async fn run_cmd(
         Some(pinger.clone()),
         tunnel_hub.clone(),
         rtt_cache.clone(),
+        runtime_alive,
     )
     .with_routes(route_reconciler)
     // The rename verb persists through the daemon's own resolved
@@ -5609,6 +5620,7 @@ async fn run_cmd(
                         updates_ignored: org_ctx.updates_ignored.clone(),
                         overlay_mode: org.overlay_mode.wire(),
                         token: org_ctx.token.clone(),
+                        control_lost_at_ms: org_ctx.control_lost_at_ms.clone(),
                     });
                 }
                 // FR-84 D5b — and its HTTP identity, replacing any row for

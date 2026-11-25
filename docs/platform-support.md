@@ -80,7 +80,7 @@ flowchart LR
   (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`, in every OS's release build) still gives it the mesh,
   outbound, through a loopback SOCKS5 front. Other nodes cannot reach the host's own services
   that way, but Roomler SSH answers, because it terminates inside the daemon
-  (`agents/roomlerd/src/overlay.rs:334-340`).
+  (`agents/roomlerd/src/overlay.rs:351-357`).
 - A Mac needs both halves for both planes: a root process has no WindowServer, and the person
   cannot create a `utun`. Each half is its own enrollment, so such a Mac is two device rows by
   default. FR-43 P3's switch, or `sudo roomlerd one-row` on a Mac already enrolled, makes it one
@@ -110,7 +110,7 @@ flowchart LR
 | Clipboard: a copied image reaches the viewer by itself | ✅ | ✅ an X11 session with a per-user install, through XFixes' selection events (FR-97 P3e-3a, from 0.4.148) · ❌ Wayland and a system install: on request only, said as `not-watched` | ✅ from 0.4.154, through the pasteboard's change count (FR-97 P2e-1); before it, on request only | image watching rides Windows' clipboard sequence number, on X11 the change gate (`agents/roomlerd/src/clipboard.rs:1319`, `:1846`), on a Mac the change count (`agents/roomlerd/src/clipboard.rs:1452`); `docs/remote-control.md`, the watcher on X11 and on a Mac |
 | Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:4419-4423` |
 | An idle desktop costs little CPU | ✅ dirty regions | ✅ X11 damage; Wayland's compositor sends frames on change; the DRM arm skips an unchanged frame | ❌ every frame is a full frame | `Damage::Unknown` (`agents/roomlerd/src/capture/scrap_backend.rs:642`); `docs/wayland.md` |
-| The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:3283-3286`) |
+| The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:3293-3296`) |
 | Privacy mode (the curtain) | ✅ Windows 10 2004 and later | ❌ | ⛔ | `docs/privacy-mode.md`, Platforms; §8 |
 | Lock the computer when the last session ends | ✅ | ✅ `loginctl lock-session` | ❌ no mechanism yet: an end that should lock logs that it could not | `docs/privacy-mode.md`, lock on end |
 
@@ -124,7 +124,7 @@ flow, and the consent chain's fallbacks.
 | Feature | Windows | Linux | macOS | Why, and where |
 |---|---|---|---|---|
 | In the mesh on an OS adapter | ✅ perMachine | ✅ system unit | ✅ root half, a second device row by default (one with FR-43 P3) | §2 |
-| One adapter per organization (multi-org) | ✅ | ✅ | ✅ | `agents/roomlerd/src/overlay.rs:318-324`; `docs/multi-org.md` |
+| One adapter per organization (multi-org) | ✅ | ✅ | ✅ | `agents/roomlerd/src/overlay.rs:335-341`; `docs/multi-org.md` |
 | Exit node, as a client | ✅ | ✅ | ✅ when the uplink has v6, else v6 fail-closed | `docs/overlay-exit-nodes.md`, Platform support. On every OS, v6 is also fail-closed through an exit that says it serves IPv4 only, and the client says why (#3562) |
 | Exit node and subnet router, serving IPv4 | 🟡 WinNAT, which needs the Hyper-V feature: without it (always on Home) the offer is withheld, with the reason | ✅ iptables | ✅ pf, in our own anchor; root half only | each OS's probe (`crates/tunnel-core/src/overlay/nat.rs:686`, `:703`, `:732`) |
 | Exit node, serving IPv6 | ⛔ the exit says so, and its clients stay v6 fail-closed | ✅ ip6tables | ✅ pf NAT66 to a stable address, where an unscoped v6 default exists | `crates/tunnel-core/src/overlay/nat.rs:974-977`; §8; what each exit states: `docs/overlay-exit-nodes.md` (#3562) |
