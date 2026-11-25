@@ -17,6 +17,7 @@
 //! counted instead of stopping the server. A dropped line is a lost log line.
 //! A blocked worker was a dead pod.
 
+use std::ffi::OsStr;
 use std::io::Write;
 
 use tracing_appender::non_blocking::{ErrorCounter, NonBlocking, NonBlockingBuilder, WorkerGuard};
@@ -42,15 +43,31 @@ pub fn nonblocking<W: Write + Send + 'static>(output: W) -> (NonBlocking, Worker
         .finish(output)
 }
 
-/// The fmt layer that writes the server's log lines into `writer`.
-/// `colour` is whether the lines carry ANSI colour codes. For now it is not
-/// read: the layer colours as the library defaults, whatever the output is.
-pub fn layer<S, W>(writer: W, _colour: bool) -> fmt::Layer<S, DefaultFields, Format, W>
+/// #4402 — whether the server's log lines carry ANSI colour codes: only when
+/// stdout is a terminal, and never when `NO_COLOR` holds a value
+/// (<https://no-color.org>: any non-empty value; an empty one counts as unset).
+///
+/// The fmt layer never asks what its output is. Left to itself it coloured
+/// every line, so the pods printed the codes into their log pipe, and the node
+/// stored them: 41 % of the busier pod's bytes in the hour read after #4414,
+/// which kept its log a few hours short of a day. A terminal is a person
+/// reading; a pipe is a container runtime, a file or another program.
+///
+/// `main` asks the real stdout once at start, before the non-blocking writer
+/// takes it over (the layer writes into that writer, never into stdout).
+pub fn colour(stdout_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
+    stdout_is_terminal && no_color.is_none_or(OsStr::is_empty)
+}
+
+/// The fmt layer that writes the server's log lines into `writer`, coloured
+/// only when `colour` says so (see [`colour`]). The line's text is the same
+/// either way: timestamp, level, target, message and fields.
+pub fn layer<S, W>(writer: W, colour: bool) -> fmt::Layer<S, DefaultFields, Format, W>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
     W: for<'w> MakeWriter<'w> + 'static,
 {
-    fmt::layer().with_writer(writer)
+    fmt::layer().with_writer(writer).with_ansi(colour)
 }
 
 /// Report dropped lines once a minute, through the log itself. If the output
@@ -190,5 +207,42 @@ mod tests {
             line.contains("peers=3"),
             "the field reads as before: {line:?}"
         );
+    }
+
+    /// The other direction: on a terminal the same layer still colours.
+    #[test]
+    fn a_log_with_colour_holds_escape_codes() {
+        let line = written(true);
+        assert!(
+            line.contains("a line with a field"),
+            "the event is written: {line:?}"
+        );
+        assert!(
+            line.contains('\x1b'),
+            "colour codes when colour is on: {line:?}"
+        );
+    }
+
+    /// The decision, every input: colour only on a terminal, and `NO_COLOR`
+    /// with any non-empty value turns it off; empty counts as unset.
+    #[test]
+    fn colour_only_on_a_terminal_and_never_under_no_color() {
+        let cases: [(bool, Option<&str>, bool); 8] = [
+            (true, None, true),
+            (true, Some(""), true),
+            (true, Some("1"), false),
+            (true, Some("0"), false),
+            (false, None, false),
+            (false, Some(""), false),
+            (false, Some("1"), false),
+            (false, Some("0"), false),
+        ];
+        for (terminal, no_color, want) in cases {
+            assert_eq!(
+                colour(terminal, no_color.map(OsStr::new)),
+                want,
+                "terminal={terminal} NO_COLOR={no_color:?}"
+            );
+        }
     }
 }
