@@ -134,6 +134,14 @@ The **four-trap ladder** to make self-signed signing work in CI, each field-hit 
   #3429's budget and waits in place for the recheck, and an operator's push or the console
   person's own ask skips the wait, each within what it may cut. The wake file stays a pure
   wake, and the install itself (`installer -pkg … -target /`) is unchanged.
+- Note (2026-11-24, [FR-151](FR-151-mac-update-waits-for-live-work.md)): that gate shipped
+  in 0.4.235 (#4297) and was read on twelve lab Macs on 2026-11-24. Its cycle, the Macs it
+  covers and each line it writes to `/var/log/roomler/update.log` are in
+  [installation.md](../installation.md#macos-the-root-update-helpers-gate-fr-151). Two
+  things a reader of this unit meets there: a failed feed probe at a waiting helper's due
+  minute ends the run with `check skipped`, so the next counted cycle waits for the
+  unit's `StartInterval` (6 h) or a wake; and an install the helper did not start leaves a
+  waiting helper running, which exits by itself within 5 s (FR-151 D1).
 
 ## Related
 
