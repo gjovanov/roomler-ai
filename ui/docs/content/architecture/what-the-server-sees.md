@@ -69,6 +69,6 @@ self-hosted deployment — see [self-hosting](/docs/start/self-hosting/).
 
 - **Audit logs** record every session, command and SSH request, including refusals with their reason.
 - **Device-held gates** cannot be flipped by us.
-- **The code is public.** The server is AGPL-3.0 and the agent is MPL-2.0, so the claims on this page are checkable rather than promised.
+- **The code is public.** The server is AGPL-3.0 and the daemon is MPL-2.0, so the claims on this page are checkable rather than promised.
 
 See [security model](/docs/security/security-model/) for the full picture.
