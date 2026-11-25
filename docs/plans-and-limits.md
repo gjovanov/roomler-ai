@@ -207,9 +207,20 @@ sequenceDiagram
 ```
 
 A seat is a member who accepted; a pending invite is not one. Checkout bills
-`quantity = seats` (`crates/services/src/stripe.rs:286`); the reconcile keeps it equal to the member count
-(`crates/services/src/stripe.rs:553`, spawned by `crates/modules/saas/src/stripe.rs:173`); a plan change moves the existing
-subscription's item instead of starting a second one (`crates/services/src/stripe.rs:442`).
+`quantity = seats` (`crates/services/src/stripe.rs:291`); the reconcile keeps it equal to the member count
+(`crates/services/src/stripe.rs:558`, spawned by `crates/modules/saas/src/stripe.rs:173`); a plan change moves the existing
+subscription's item instead of starting a second one (`crates/services/src/stripe.rs:447`).
+
+The billing page's current-plan card reads the org's billing from `GET /api/stripe/summary`
+alone (`crates/services/src/stripe.rs:594`, MANAGE_TENANT): the status, the period end,
+"Cancels at period end", and "Manage Subscription" (Stripe's portal: cancel, card, invoices)
+from `has_billing_account`, a non-empty customer id (`crates/services/src/stripe.rs:1459`).
+The ids themselves never reach the browser. `GET /api/tenant`, which every member reads,
+carries no billing (`crates/api/src/routes/tenant.rs:16`); until #4431 the card read it from
+there, so a paying org saw none of the four. A member without MANAGE_TENANT is refused the
+summary and sees none of them. The status shows only while it describes a subscription
+(`ui/src/views/billing/BillingView.vue:317`): a checkout's start records the customer with
+an `active` status before any subscription exists, and an abandoned checkout leaves it there.
 
 | Setting | Effect | Default |
 |---|---|---|

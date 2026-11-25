@@ -4,13 +4,6 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
 
-interface TenantBilling {
-  status?: string
-  cancel_at_period_end?: boolean
-  current_period_end?: string | number | Date
-  customer_id?: string
-}
-
 interface Tenant {
   id: string
   name: string
@@ -21,7 +14,9 @@ interface Tenant {
   description?: string
   icon?: string
   plan?: string
-  billing?: TenantBilling
+  // No billing here: `GET /api/tenant`, which every member reads, never sends
+  // it. The billing page reads the org's billing from `GET /api/stripe/summary`
+  // (MANAGE_TENANT).
 }
 
 interface MyMembership {
