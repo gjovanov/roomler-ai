@@ -509,16 +509,41 @@ where
 /// #4423 — the line `roomlerd self-update`, run as a person on a Mac, prints
 /// once the daemon behind their own socket recorded their ask: what
 /// [`helper_arm`] does with that ask on this Mac, by what the person could see
-/// of the root half.
-pub fn ask_recorded_says(_root: RootHalfSeen) -> &'static str {
-    "Your ask is recorded: the update installs now over your own sessions, \
-     and waits for this Mac's SSH connections, runs, transfers and recordings."
+/// of the root half. With none, the ask installs at once over everything. With
+/// one, it does too, unless the root half serves more than remote-control
+/// sessions (`root_beyond_sessions`): then the ask lapses with [`ASK_FRESH`],
+/// before the hour's recheck, and the update waits as for a plain wake
+/// ([`NO_ASK_SAYS`]). A look that failed says the narrower line, which names
+/// no wait: never a wait the helper may not keep.
+pub fn ask_recorded_says(root: RootHalfSeen) -> &'static str {
+    match root {
+        RootHalfSeen::Runs => ASK_WAITS_FOR_THE_ROOT_HALF,
+        RootHalfSeen::NotRunning | RootHalfSeen::Unread => ASK_INSTALLS_NOW,
+    }
 }
+
+/// #4423 — [`ask_recorded_says`] with no root half to wait for, and the
+/// narrower promise.
+const ASK_INSTALLS_NOW: &str = "Your ask is recorded: the update installs now over every \
+     remote-control session, and over every SSH connection, run, transfer and recording your \
+     own roomlerd serves.";
+
+/// #4423 — [`ask_recorded_says`] on a Mac with a root half: two rows, or one
+/// row. The line is conditional on what the root half serves, so it holds
+/// whatever the helper then reads of it.
+const ASK_WAITS_FOR_THE_ROOT_HALF: &str = "Your ask is recorded: the update installs now over \
+     every remote-control session, and over every SSH connection, run, transfer and recording \
+     your own roomlerd serves, unless this Mac's root daemon serves an SSH connection, a run, a \
+     transfer or a recording, does not answer, or saw its network move in the last 10 minutes. \
+     In that case it installs when nothing on this Mac is in use, or within about seven hours \
+     if something still is.";
 
 /// #4423 — the line `roomlerd self-update`, run as a person on a Mac, prints
 /// when no ask was recorded: the wake is a plain one, and [`helper_arm`]
-/// takes #3429's rule on both halves.
-pub const NO_ASK_SAYS: &str = "The update installs when nothing on this Mac is in use.";
+/// takes #3429's rule on both halves, on every shape, until the force after
+/// seven counted defers an hour apart.
+pub const NO_ASK_SAYS: &str = "The update installs when nothing on this Mac is in use, or \
+     within about seven hours if something still is.";
 
 #[cfg(test)]
 mod tests {
