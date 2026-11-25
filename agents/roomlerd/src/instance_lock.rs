@@ -23,10 +23,10 @@
 //!   SHA-256 prefix of the config path so different enrollments on one
 //!   machine for one user are ALSO caught — those would collide on
 //!   `agent_id` server-side and stomp each other in subtler ways.
-//! - **Unix**: `flock(LOCK_EX | LOCK_NB)` on a file in the runtime
-//!   dir (`$XDG_RUNTIME_DIR` or `~/.cache/...` fallback). The kernel
-//!   releases the lock when the FD is closed (Drop) or the process
-//!   reaped — no stale-lock cleanup needed after a `kill -9`.
+//! - **Unix**: `flock(LOCK_EX | LOCK_NB)` on a file in the runtime dir (`$XDG_RUNTIME_DIR`, else
+//!   the cache dir), opened without following a link and taken only as a regular file of the
+//!   daemon's own uid with a single name; anything else is refused and left as it is. The kernel
+//!   frees the lock when the FD closes (Drop) or the process is reaped: no cleanup after `kill -9`.
 //!
 //! Subcommands gated: **only `run`**. `enroll`, `service install/
 //! uninstall`, `caps`, `displays`, `encoder-smoke`, `self-update` all
@@ -315,21 +315,56 @@ pub fn acquire_beside_guard(config_path: &Path) -> BesideGuard {
 
 #[cfg(all(unix, not(target_os = "windows")))]
 fn unix_acquire(id: &str) -> Result<AcquireOutcome> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-
     let path = unix_lock_path(id)?;
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let mut file = OpenOptions::new()
+    // SAFETY: geteuid takes nothing and cannot fail.
+    lock_at(&path, unsafe { libc::geteuid() })
+}
+
+/// The lock on the file at `path`, for a daemon whose effective uid is `euid`.
+///
+/// The open does not follow a link at the file's own name and does not wait
+/// on a file that is not regular (`O_NOFOLLOW | O_NONBLOCK`; std adds
+/// `O_CLOEXEC`), and it creates the file when nothing is there. Through that
+/// descriptor (fstat) the file must be a regular file of `euid` with a single
+/// name ([`lock_file_verdict`]). Anything else is refused, with what was
+/// found, and left as it is. Only after these checks: the `flock`, then the
+/// pid.
+#[cfg(all(unix, not(target_os = "windows")))]
+fn lock_at(path: &Path, euid: u32) -> Result<AcquireOutcome> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let opened = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&path)
-        .with_context(|| format!("opening {} for lock", path.display()))?;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(err) => {
+            // The open failed. What is there, read without following a link,
+            // names it by the same checks; an open that failed on a regular
+            // file of the daemon's own, or on nothing, keeps the system's own
+            // reason.
+            if let Ok(md) = std::fs::symlink_metadata(path) {
+                lock_file_verdict(FileKind::of(md.file_type()), md.uid(), md.nlink(), euid)
+                    .map_err(|why| refused(path, &why))?;
+            }
+            return Err(err).with_context(|| format!("opening {} for lock", path.display()));
+        }
+    };
+    let md = file
+        .metadata()
+        .with_context(|| format!("reading {} for lock", path.display()))?;
+    lock_file_verdict(FileKind::of(md.file_type()), md.uid(), md.nlink(), euid)
+        .map_err(|why| refused(path, &why))?;
     let fd = file.as_raw_fd();
     // SAFETY: fd is owned by `file` for the duration of this call;
     // flock with LOCK_NB returns immediately rather than blocking.
@@ -358,6 +393,89 @@ fn unix_lock_path(id: &str) -> Result<std::path::PathBuf> {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| dirs.cache_dir().to_path_buf());
     Ok(parent.join(format!("roomler-agent-{id}.lock")))
+}
+
+/// A refused lock file's error: its path, what was found, and that it was
+/// left as it is.
+#[cfg(all(unix, not(target_os = "windows")))]
+fn refused(path: &Path, why: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the lock file {} is not a regular file of this daemon's own: {why}; roomlerd left it as it is",
+        path.display()
+    )
+}
+
+/// What the lock file's fstat found (or, for an open that failed, its lstat).
+#[cfg(all(unix, not(target_os = "windows")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileKind {
+    Regular,
+    Folder,
+    Link,
+    Fifo,
+    Socket,
+    CharDevice,
+    BlockDevice,
+    Other,
+}
+
+#[cfg(all(unix, not(target_os = "windows")))]
+impl FileKind {
+    fn of(file_type: std::fs::FileType) -> Self {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_file() {
+            Self::Regular
+        } else if file_type.is_dir() {
+            Self::Folder
+        } else if file_type.is_symlink() {
+            Self::Link
+        } else if file_type.is_fifo() {
+            Self::Fifo
+        } else if file_type.is_socket() {
+            Self::Socket
+        } else if file_type.is_char_device() {
+            Self::CharDevice
+        } else if file_type.is_block_device() {
+            Self::BlockDevice
+        } else {
+            Self::Other
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Regular => "a regular file",
+            Self::Folder => "a folder",
+            Self::Link => "a link",
+            Self::Fifo => "a FIFO",
+            Self::Socket => "a socket",
+            Self::CharDevice => "a character device",
+            Self::BlockDevice => "a block device",
+            Self::Other => "not a regular file",
+        }
+    }
+}
+
+/// The checks the lock file passes before anything is written to it: a
+/// regular file, owned by the daemon's effective uid `euid`, with a single
+/// name (`links`, the fstat's link count). `Err` says what was found instead.
+#[cfg(all(unix, not(target_os = "windows")))]
+fn lock_file_verdict(
+    kind: FileKind,
+    uid: u32,
+    links: u64,
+    euid: u32,
+) -> std::result::Result<(), String> {
+    if kind != FileKind::Regular {
+        return Err(format!("it is {}", kind.name()));
+    }
+    if uid != euid {
+        return Err(format!("it belongs to uid {uid}, not to uid {euid}"));
+    }
+    if links != 1 {
+        return Err(format!("it has {links} names, not one"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -453,6 +571,213 @@ mod tests {
         assert!(
             matches!(b, AcquireOutcome::Acquired(_)),
             "different config paths must take different locks; second must succeed even while first is held"
+        );
+    }
+
+    #[cfg(unix)]
+    fn my_euid() -> u32 {
+        // SAFETY: geteuid takes nothing and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    /// A refused lock's error, as the daemon would print it.
+    #[cfg(unix)]
+    fn refusal(outcome: Result<AcquireOutcome>) -> String {
+        match outcome {
+            Err(err) => format!("{err:#}"),
+            Ok(AcquireOutcome::Acquired(_)) => "acquired".to_string(),
+            Ok(AcquireOutcome::AlreadyRunning) => "already running".to_string(),
+        }
+    }
+
+    /// (a) A fresh path: the lock creates a regular file of this uid that
+    /// holds this process's pid.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_path_becomes_a_regular_file_of_this_uid_holding_the_pid() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("instance.lock");
+        let AcquireOutcome::Acquired(_lock) = lock_at(&path, my_euid()).expect("the lock") else {
+            panic!("a fresh path is taken");
+        };
+        let md = std::fs::symlink_metadata(&path).expect("the lock file");
+        assert!(md.file_type().is_file());
+        assert_eq!(md.uid(), my_euid());
+        assert_eq!(md.nlink(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the pid"),
+            format!("{}\n", std::process::id())
+        );
+    }
+
+    /// (b) A regular file of this uid already there (an earlier run's) is the
+    /// one reused and locked: the same file, now holding this pid, and a
+    /// second take of it finds it held.
+    #[cfg(unix)]
+    #[test]
+    fn a_regular_file_already_there_is_reused_and_locked() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("instance.lock");
+        std::fs::write(&path, "4242\n").expect("an earlier run's file");
+        let before = std::fs::metadata(&path).expect("the file").ino();
+        let AcquireOutcome::Acquired(_lock) = lock_at(&path, my_euid()).expect("the lock") else {
+            panic!("an earlier run's file is taken");
+        };
+        assert_eq!(std::fs::metadata(&path).expect("the file").ino(), before);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the pid"),
+            format!("{}\n", std::process::id())
+        );
+        assert_eq!(refusal(lock_at(&path, my_euid())), "already running");
+    }
+
+    /// (c) A FIFO at the lock path is refused, and it is still there, still
+    /// the same FIFO.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_lock_path_is_refused_and_left_as_it_is() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("instance.lock");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+        // SAFETY: a NUL-terminated path that lives across the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+        let before = std::fs::symlink_metadata(&path).expect("the FIFO");
+        let error = refusal(lock_at(&path, my_euid()));
+        assert!(
+            error.contains(&path.display().to_string()) && error.contains("a FIFO"),
+            "refused, naming the path and what was found: {error}"
+        );
+        let after = std::fs::symlink_metadata(&path).expect("the FIFO is still there");
+        assert!(after.file_type().is_fifo());
+        assert_eq!(
+            (after.ino(), after.mode(), after.uid()),
+            (before.ino(), before.mode(), before.uid())
+        );
+    }
+
+    /// (d) A folder at the lock path is refused and left as it is, empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_at_the_lock_path_is_refused_and_left_as_it_is() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("instance.lock");
+        std::fs::create_dir(&path).expect("a folder");
+        let before = std::fs::symlink_metadata(&path).expect("the folder");
+        let error = refusal(lock_at(&path, my_euid()));
+        assert!(
+            error.contains(&path.display().to_string()) && error.contains("a folder"),
+            "refused, naming the path and what was found: {error}"
+        );
+        let after = std::fs::symlink_metadata(&path).expect("the folder is still there");
+        assert!(after.file_type().is_dir());
+        assert_eq!(
+            (after.ino(), after.mode(), after.uid()),
+            (before.ino(), before.mode(), before.uid())
+        );
+        assert_eq!(std::fs::read_dir(&path).expect("the folder").count(), 0);
+    }
+
+    /// A regular file whose owner is not the daemon's uid is refused and left
+    /// as it is: its contents, size, mode and time. The daemon's uid here is
+    /// a stand-in that is not this process's own; no file changes owner.
+    #[cfg(unix)]
+    #[test]
+    fn a_regular_file_of_another_uid_is_refused_and_left_as_it_is() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("instance.lock");
+        std::fs::write(&path, "4242\n").expect("a file");
+        let before = std::fs::metadata(&path).expect("the file");
+        let daemon = my_euid().wrapping_add(1);
+        let error = refusal(lock_at(&path, daemon));
+        assert!(
+            error.contains(&path.display().to_string())
+                && error.contains(&format!(
+                    "it belongs to uid {}, not to uid {daemon}",
+                    my_euid()
+                )),
+            "refused, naming the path and what was found: {error}"
+        );
+        let after = std::fs::metadata(&path).expect("the file");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("its contents"),
+            "4242\n"
+        );
+        assert_eq!(
+            (
+                after.ino(),
+                after.len(),
+                after.mode(),
+                after.mtime(),
+                after.mtime_nsec()
+            ),
+            (
+                before.ino(),
+                before.len(),
+                before.mode(),
+                before.mtime(),
+                before.mtime_nsec()
+            )
+        );
+    }
+
+    /// The checks themselves, on stand-in values: only a regular file of the
+    /// daemon's uid with exactly one name passes, and each refusal says what
+    /// was found.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_regular_file_of_the_daemons_uid_with_one_name_passes() {
+        let daemon = 1000;
+        assert_eq!(
+            lock_file_verdict(FileKind::Regular, daemon, 1, daemon),
+            Ok(())
+        );
+        assert_eq!(lock_file_verdict(FileKind::Regular, 0, 1, 0), Ok(()));
+        for (links, why) in [
+            (0, "it has 0 names, not one"),
+            (2, "it has 2 names, not one"),
+        ] {
+            assert_eq!(
+                lock_file_verdict(FileKind::Regular, daemon, links, daemon),
+                Err(why.to_string())
+            );
+        }
+        assert_eq!(
+            lock_file_verdict(FileKind::Regular, 0, 1, daemon),
+            Err("it belongs to uid 0, not to uid 1000".to_string())
+        );
+        assert_eq!(
+            lock_file_verdict(FileKind::Regular, daemon, 1, 0),
+            Err("it belongs to uid 1000, not to uid 0".to_string())
+        );
+        for (kind, why) in [
+            (FileKind::Folder, "it is a folder"),
+            (FileKind::Link, "it is a link"),
+            (FileKind::Fifo, "it is a FIFO"),
+            (FileKind::Socket, "it is a socket"),
+            (FileKind::CharDevice, "it is a character device"),
+            (FileKind::BlockDevice, "it is a block device"),
+            (FileKind::Other, "it is not a regular file"),
+        ] {
+            assert_eq!(
+                lock_file_verdict(kind, daemon, 1, daemon),
+                Err(why.to_string()),
+                "{kind:?}"
+            );
+        }
+        // What is checked first is what the error names.
+        assert_eq!(
+            lock_file_verdict(FileKind::Fifo, 0, 2, daemon),
+            Err("it is a FIFO".to_string())
+        );
+        assert_eq!(
+            lock_file_verdict(FileKind::Regular, 0, 2, daemon),
+            Err("it belongs to uid 0, not to uid 1000".to_string())
         );
     }
 
