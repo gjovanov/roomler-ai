@@ -1137,8 +1137,13 @@ For one device's history, replace the last `grep -oE …` with `grep 'agent_id=<
 
 ⚠️ **`kubectl logs` reads only the pod's current log file.** The kubelet rotates that
 file at its size cap, which under daytime traffic has been every 10 to 15 minutes, so an
-empty grep can be the file's boundary rather than the absence of a disconnect. For an
-older window, read the rotated files through the kubelet's log proxy. The newest rotated
+empty grep can be the file's boundary rather than the absence of a disconnect. Most of
+those lines were one DEBUG line per item: two for each request, one for each peer of an
+overlay fan-out, one for each inserted row and one for each WS message sent or received.
+Since #4402 they write at TRACE, except a request's finished line for a 4xx, a 5xx or an
+answer of 1 s or more (`crates/api/src/request_log.rs:32`), and a fan-out pass writes one
+`overlay: delta fanned out` line with its counts (`crates/modules/network/src/overlay.rs:2250`).
+For an older window, read the rotated files through the kubelet's log proxy. The newest rotated
 file is plain text and the older ones are gzipped, and each line there carries the CRI
 prefix `<ts> stdout F`:
 

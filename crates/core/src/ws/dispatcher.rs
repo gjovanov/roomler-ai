@@ -4,7 +4,7 @@ use axum::extract::ws::Message;
 use bson::oid::ObjectId;
 use futures::SinkExt;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use super::redis_pubsub::RedisPubSub;
 use super::storage::WsStorage;
@@ -21,7 +21,9 @@ pub async fn broadcast(ws_storage: &WsStorage, user_ids: &[ObjectId], message: &
             if let Err(e) = guard.send(Message::text(text)).await {
                 warn!(?user_id, %e, "Failed to send WS message");
             } else {
-                debug!(?user_id, "WS message sent");
+                // #4402 — TRACE: one line per connection per message, with
+                // no type; a failed send keeps its WARN.
+                trace!(?user_id, "WS message sent");
             }
         }
     }

@@ -4706,7 +4706,7 @@ sequenceDiagram
 | A9, D6 — the host bumps an attach generation each time a channel ends, however it ends, an I/O error included (a worker gone mid-write is EPIPE), before the next worker can attach: a record of an older one is never claimed, counted or resumed. Each bound record hears its session end as `error`, which the server hears on this connection, or after the next hello, and the worker's `keep-delegated` goes with the channel. The queue, the caps and keep busy's questions are cleared by `run` however the channel ends, outside the switch, a line over the read limit included | `records_channel_ended`, `agents/roomlerd/src/delegate.rs:2320`; `channel_ended`, `:2278`; `prune_records`, `agents/roomlerd/src/session_table.rs:1189` |
 | A10 — kept records count against `rc_max_sessions` | `len`, `agents/roomlerd/src/session_table.rs:1506` |
 | A11 — a loop that holds the host says `rc-resume` with the switch on, as every loop does. The verb asks for a window, and nothing else changes before one (P4-0) | `connection_keeps`, `agents/roomlerd/src/session_table.rs:115` |
-| P4-0 — one device, one switch: the root's `rc_sessions_survive_reattach`, set in its environment or its config, binds the GUI worker, whose own table and hello would otherwise follow the person's config | `WORKER_ENV_FORWARD`, `agents/roomlerd/src/macos_supervisor.rs:353`; `the_roots_resume_switch_binds_the_worker`, `:2305` |
+| P4-0 — one device, one switch: the root's `rc_sessions_survive_reattach`, set in its environment or its config, binds the GUI worker, whose own table and hello would otherwise follow the person's config | `WORKER_ENV_FORWARD`, `agents/roomlerd/src/macos_supervisor.rs:353`; `the_roots_resume_switch_binds_the_worker`, `:2308` |
 | B2 — the worker serves a message about a session whose params said `keepable`, or that its delegated table holds, on that table; anything else as before | `agents/roomlerd/src/signaling.rs:3222` |
 | B3, B6 — such a session's peer is built on a link to the delegation channel, and its own end closes it at once, attached or kept, with its real end: after a roll no server echoes it | `agents/roomlerd/src/signaling.rs:4728`; `forward`, `agents/roomlerd/src/session_table.rs:478`; `serve`, `:1910` |
 | B4 — the orders (`Detached`, `Resumed`, `Close`, `Ended`, and the channel's own `Paused` and `Attached`) travel a lane of their own, served by the delegated table wherever the worker's loop waits, its own connection down included | `worker_lane`, `agents/roomlerd/src/delegate.rs:382`; `obey`, `agents/roomlerd/src/session_table.rs:1058`; `next_side`, `agents/roomlerd/src/signaling.rs:7528`; `serving_delegated`, `:7563` |
@@ -7837,7 +7837,7 @@ the crash *reports* because the watchdog wrote its own.
 **A worker with no enrollment counts nowhere** (#4028). The SCM host's
 worker for an account with no config, and no last good copy of one that
 holds an enrollment (#4157), exits `NO_ENROLLMENT_EXIT_CODE`
-(78, [`daemon_error.rs:210`](../agents/roomlerd/src/daemon_error.rs#L210)).
+(78, [`daemon_error.rs:249`](../agents/roomlerd/src/daemon_error.rs#L249)).
 `should_record_supervisor_crash` leaves it out of the reports, and the host
 backs it off exactly as an exit 1. Since #4324 it does not count toward the
 host's crash-loop alarm and never raises it: the host names the way forward in
@@ -7852,7 +7852,7 @@ launcher leaves on it. Only those three workers exit 78: every other `run`
 with no config still exits 1. The macOS supervisor's worker exits 78 even
 beside an enrolled copy, because it never restores at its start (#4157): on a
 one-row Mac an earlier release converted, the person's `config.toml.prev` can
-hold the enrollment that moved to root (#4184). The other two restore a missing config
+hold the enrollment that moved to root (#4184). Since #4379 it exits 78 also on a config that is there and does not load (`ConfigDoesNotLoad`), which it no longer restores either. The other two restore a missing config
 from such a copy, and exit 78 only without one. The service's SYSTEM worker
 restores its machine config only from a copy that passes every check the
 config itself would, and the service starts that worker for such a copy
