@@ -45,7 +45,7 @@ Desktop host (systemd --user)
   journalctl --user -u roomler.service -f
 
   # A headless host additionally needs lingering, or the user manager
-  # (and the agent with it) exits when you log out:
+  # (and roomlerd with it) exits when you log out:
   sudo loginctl enable-linger "$USER"
 
 Self-update note: with the helper on (step 4), each update installs
