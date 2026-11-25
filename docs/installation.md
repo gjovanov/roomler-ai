@@ -1619,7 +1619,7 @@ install's update, which has no service, logs nothing about the switch, #3889),
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6445`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6457`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1688,7 +1688,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6312`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6324`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1937,7 +1937,7 @@ One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1441`). It gives the role to `service install` and
 `service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
 and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
-(`agents/roomlerd/src/app.rs:8042`) reads every custom action with an `ExeCommand` in both WiX
+(`agents/roomlerd/src/app.rs:8054`) reads every custom action with an `ExeCommand` in both WiX
 files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
 installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
 
@@ -1953,7 +1953,7 @@ whole stack with no level, which tracing reads as TRACE in every daemon that kee
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
 `service uninstall --as-service` logs `Companion login start removed.` rather than printing it
-(`agents/roomlerd/src/app.rs:6253`), and its answer stays `Service deregistered`.
+(`agents/roomlerd/src/app.rs:6265`), and its answer stays `Service deregistered`.
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
@@ -1973,8 +1973,8 @@ step shows what it always showed (`crates/agent-core/src/logging.rs:2089`). A da
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2132`). The Windows lane runs the module
 beside `stderr_capture` (`.github/workflows/ci.yml:1966`). In `roomlerd`,
-`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8136`) and
-`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8169`)
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8148`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8181`)
 pin the role per command and the end line of a failure.
 
 ### Where a step on the service account finds its folders (#3702)
@@ -2066,7 +2066,7 @@ profile, or the machine's data folder) or is reached through a link below it (`k
   daemon, which runs unelevated, merges at its next start, so the merge never runs above the
   integrity level of the folder owner's own processes. When the token cannot be read, the merge
   is left too (`DataMerge`, `crates/agent-core/src/appdirs.rs:1343`;
-  `agents/roomlerd/src/app.rs:7760`). A data folder whose NEW folder is not there still moves by
+  `agents/roomlerd/src/app.rs:7772`). A data folder whose NEW folder is not there still moves by
   one rename.
 - Every run writes a note that names what it moved, what it kept beside, and what it left for
   the next start (`crates/agent-core/src/appdirs.rs:1456`).
@@ -2668,7 +2668,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3602`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3625`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2776,7 +2776,7 @@ two privacy grants below remain the person's; the Done page says so.
 **A Mac that is one row already gets nothing from the wizard (FR-141 P3).** Before
 it offers the device install, the wizard asks the root daemon over the person
 socket it serves the console user (`/var/run/roomler-person/<uid>.sock`), which
-answers `status` (`crates/localapi/src/lib.rs:3788-3790`) with
+answers `status` (`crates/localapi/src/lib.rs:3811-3813`) with
 `gui_worker.one_row` in it (`:536-549`). When the root daemon says one row, the
 Welcome page says "This Mac is one device already", Continue stays off for every
 device card, and pairing start and the install's preflight refuse with the same
@@ -2980,8 +2980,8 @@ the stricter of the person's and its own.
 Each org's row says what the worker has told the daemon from the connection's first
 message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
 permissions, what it can record, its Remote Apps words and its audio, and the stricter
-`rc_*` floor ([`signaling.rs:7101`](../agents/roomlerd/src/signaling.rs#L7101)), built
-into the caps by one function ([`:7149`](../agents/roomlerd/src/signaling.rs#L7149)).
+`rc_*` floor ([`signaling.rs:7129`](../agents/roomlerd/src/signaling.rs#L7129)), built
+into the caps by one function ([`:7177`](../agents/roomlerd/src/signaling.rs#L7177)).
 So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
 restarts of the daemon measured in #3992, is on the row at once, rather than the root's
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
@@ -3563,7 +3563,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5799`).
+(`crates/localapi/src/lib.rs:5822`).
 
 On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
 the console user's `roomler …` is the screen worker the root daemon starts for
@@ -3592,9 +3592,9 @@ The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3602`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3625`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
-read-only and refuses to set by name (`localapi::person_may`, `:3788`). Whether
+read-only and refuses to set by name (`localapi::person_may`, `:3811`). Whether
 the console user should flip those from the app is the decision left open on
 #2871; until it is taken, they stay with `sudo`.
 

@@ -110,7 +110,7 @@ numbers. On `rc:overlay.join` the server looks the machine up by
   capability vector, the warm relay. So a node that joins again mid-session
   (a control-WS Reattach, or an exit whose setup changed its offer, #3562)
   follows the join with what it wiped (`rejoin_plan`,
-  `crates/tunnel-core/src/overlay/runtime.rs:4679`), and an exit's re-offer
+  `crates/tunnel-core/src/overlay/runtime.rs:4682`), and an exit's re-offer
   reaches the admin row and every peer at once
   ([`overlay-exit-nodes.md`](./overlay-exit-nodes.md#the-offer-follows-the-setup-3562)).
 - **no live node** → `allocate_host` pops the head of `free_hosts` (FIFO, so an
@@ -617,7 +617,7 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2221`](../crates/tunnel-core/src/overlay/runtime.rs#L2221),
+  ([`runtime.rs:2224`](../crates/tunnel-core/src/overlay/runtime.rs#L2224),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
@@ -625,7 +625,7 @@ does instead:
   `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
   or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
 - `roomler status` prints it only when the firewall limits what a mesh peer
-  reaches ([`localclient.rs:3212`](../agents/roomler-cli/src/localclient.rs#L3212)):
+  reaches ([`localclient.rs:3218`](../agents/roomler-cli/src/localclient.rs#L3218)):
 
   ```text
     host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
@@ -919,7 +919,7 @@ needs the relay's log of the same minutes.
 
 ⚠️ **Since rc.400 the always-on floor opens `/derp` on every node at startup**
 (`ROOMLERD_OVERLAY_DERP_FLOOR`, default on;
-`crates/tunnel-core/src/overlay/runtime.rs:2710`), so that DERP can carry every
+`crates/tunnel-core/src/overlay/runtime.rs:2713`), so that DERP can carry every
 fresh pair from birth while better tiers upgrade over it. A DERP verdict from the
 server opens it mid-run too (below). The lazy rule below is what a node does with
 the floor switched off.
@@ -1205,8 +1205,8 @@ match this node`), and an org-relay grant that needs them is refused.
   while the router read online. A wave now also restores them:
   - **What is defended.** Per installed peer, the subnets its crypto-router
     entry holds (what install routed, `WgDevice::peer_subnets`, read on the
-    select loop at `crates/tunnel-core/src/overlay/runtime.rs:3597` and
-    `crates/tunnel-core/src/overlay/runtime.rs:3797`) that the network map
+    select loop at `crates/tunnel-core/src/overlay/runtime.rs:3600` and
+    `crates/tunnel-core/src/overlay/runtime.rs:3800`) that the network map
     still approves (`defended_subnets_of`,
     `crates/tunnel-core/src/overlay/runtime/route_guard.rs:138`). An approved
     subnet that no install has routed yet is not defended: an OS route with
@@ -1304,8 +1304,8 @@ match this node`), and an org-relay grant that needs them is refused.
   So the child usually exits before the daemon's run loop has heard the stop,
   and #1867's WARN used to go out on every restart. The daemon now marks its
   stop as the first thing each arm of `run`'s shutdown `select!` does
-  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5869`, `:5905`,
-  `:5917`). After the child exits, the supervisor waits out the first part of
+  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5881`, `:5917`,
+  `:5929`). After the child exits, the supervisor waits out the first part of
   the backoff, at most 1 s (`STOP_GRACE`,
   `crates/tunnel-core/src/overlay/netstate.rs:1241`), before it says anything:
 
@@ -1486,7 +1486,7 @@ an installer the old daemon started is still running.
 | macOS | a utun is a socket, and macOS takes no close-on-exec flag at `socket()`, so the descriptor is marked on the line after the create | create → mark. The long-lived children and every child that runs a caller's code sweep everything above stderr ([`roomler-ssh.md`](roomler-ssh.md#interactive-sessions-p4a-unix-p4b-windows)) |
 | Windows | Wintun has no descriptor to inherit | — |
 
-`tun_kernel_tests` (`agents/roomlerd/src/overlay.rs:1394`) checks it against a
+`tun_kernel_tests` (`agents/roomlerd/src/overlay.rs:1411`) checks it against a
 real kernel in CI, as root.
 
 ### A Mac's utun: its own address as peer, and the block routed on it (#4117)
@@ -1674,8 +1674,8 @@ packet the Mac sends to its own overlay address goes into the utun, and the
 daemon reads it. No peer holds that address, so on #4117's code `ping <self>`
 on the Mac got no answer, and neither did the Mac's own lookups of overlay
 names: MagicDNS listens on `<self>:53`
-(`crates/tunnel-core/src/overlay/runtime.rs:2529`), and macOS sends the overlay
-zone there (`runtime.rs:2569`, then
+(`crates/tunnel-core/src/overlay/runtime.rs:2532`), and macOS sends the overlay
+zone there (`runtime.rs:2572`, then
 `crates/tunnel-core/src/overlay/dns.rs:566`). Linux and Windows deliver such a
 packet through their kernel's local route for the address, and the daemon
 never sees it.
@@ -1712,7 +1712,7 @@ flowchart TD
 * **The utun's own address** is the one it was brought up with, read once, at
   the bring-up (`SelfDelivery`, `tun.rs:8241`, from `up_with` at
   `tun.rs:6176`). It does not change while the utun lives: a runtime whose
-  netmap names another address exits for a rebuild (`runtime.rs:4185`), and
+  netmap names another address exits for a rebuild (`runtime.rs:4188`), and
   the daemon reuses a utun only for the same address. Each utun hands back only
   its own address; a sibling org's utun hands back its own.
 * **IPv6.** macOS routes the derived IPv6 as a local address, and still, on
@@ -1794,7 +1794,7 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   `overlay::runtime_alive` (`agents/roomlerd/src/overlay.rs:122`): the tenant's
   runtime slot exists and its event channel is open. The daemon builds its
   LocalAPI state only with that probe (`DaemonState::for_daemon`,
-  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5185`); the
+  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5238`); the
   constructor without one is test-only.
 - **The mark** (`PeerInfo::control_down`, `crates/localapi/src/lib.rs:1026`) is
   additive. Its `since_ms` is when this device lost that socket, stamped by the

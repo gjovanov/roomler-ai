@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2163`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:3383`).
+(`agents/roomlerd/src/signaling.rs:3411`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -605,7 +605,7 @@ there'."*
 `base(Relay) = B_RELAY` for **both TURN and DERP** — so `roomler why` *already* cannot
 distinguish a 52 ms coturn hop from a 175 ms DERP hop. That distinction has never lived in
 the tier ladder; it lives in `PeerInfo.relay_kind` + `relay_transport`, rendered by
-`relay_qualified_label` (`localclient.rs:2232`) as `relay:{kind}/{transport}`.
+`relay_qualified_label` (`localclient.rs:2238`) as `relay:{kind}/{transport}`.
 
 So the design is:
 
@@ -693,10 +693,10 @@ the count `stale_drops()` reads (`transport/derp.rs:461`) as `dropped_stale` whe
 
 | surface | addition |
 |---|---|
-| `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`agents/roomler-cli/src/localclient.rs:2232`) |
+| `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`agents/roomler-cli/src/localclient.rs:2238`) |
 | `roomler peers --json` | `relay_kind: "org"`, `relay_transport: "udp"` and `relay_server`, the relay node's name (`PeerInfo`, `crates/localapi/src/lib.rs:930`; `OrgRelayConn::relay_server`, `crates/tunnel-core/src/overlay/orgrelay/client.rs:347-349`) |
 | `roomler why <peer>` | the relay row names the kind; the tier ladder is unchanged (§6) |
-| `roomler status` | relay node: an `org relay` line with the bound `ip:port` and `reachable (probes answered)`, or `bound — NOT yet proven reachable` until a probe is answered, then `answered=… refused: shape=… not-probe=… rate=…` (`print_status`, `agents/roomler-cli/src/localclient.rs:2839-2853`). `roomler netcheck` prints no org-relay line |
+| `roomler status` | relay node: an `org relay` line with the bound `ip:port` and `reachable (probes answered)`, or `bound — NOT yet proven reachable` until a probe is answered, then `answered=… refused: shape=… not-probe=… rate=…` (`print_status`, `agents/roomler-cli/src/localclient.rs:2845-2859`). `roomler netcheck` prints no org-relay line |
 | relay node | **one counter per refusal reason** in `RelayStats` (`crates/tunnel-core/src/overlay/orgrelay/server.rs:44-69`): unknown VNI, unbound source, not yet bound, session expired or idle, past the bind deadline, at the session cap, rate-limited, not relay-shaped, unknown control, and `drop_bad_tag1` / `drop_bad_cookie` / `drop_bad_tag2`, beside `forwarded`, `bound` and the session counts. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood. Two readers: `roomler status` (the probe responder's counters, above) and a daemon log line, `org-relay server counters`, every 300 s when they have changed (`report_loop`, `agents/roomlerd/src/relay_server.rs:143`). ⚠️ That line carries 13 counters. The session cap, `refused_not_shaped`, `refused_unknown_control` and the not-yet-bound, expired, idle and bind-deadline drops have no reader (`relay_stats()`, `:66`, has no caller). There are no per-session packet or byte counts, and no wrong-tenant reason |
 | process-global | none for the org relay. `ORG_RELAY_SESSIONS_OPENED_TOTAL` / `_CLOSED_TOTAL` were never added, and `crates/tunnel-core/src/evidence.rs` holds no org-relay counter. The session counts are the relay's own `sessions_installed`, `_revoked` and `_reaped` (above). ⚠️ **Not a gauge**: like the overlay's evidence counters (`crates/tunnel-core/src/evidence.rs:3-6`), they are *"cumulative since start; readers DIFF two snapshots, they never judge an absolute"* (`server.rs:44-45`). No surface shows the live session count |
 | server | `peer_relay_audit` (90 d TTL) — every **approval**, mint and refusal, reason enumerated, written in one place via `decide() -> Result<Granted, DenyReason>`, read behind `VIEW_EXEC_AUDIT` (`VIEW_RELAY_AUDIT` after #888). **P3b:** `GET …/peer-relay-audit` (`?agent_id=`), one row shape for both actions (`action: approve \| mint`) so "who made this device a relay, and what went through it?" is one query on `agent_id`; `PeerRelayDenyReason` is the enumerated vocabulary (12 arms, wire-locked) |
@@ -708,7 +708,7 @@ never have measured, and an unmeasured capability is `None`, never `false` (`Cap
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:144-146`.
 It does: the name is the one this network's netmap gives the relay node
-(`crates/tunnel-core/src/overlay/runtime.rs:3302`, `:4484`), and the netmap takes it from that
+(`crates/tunnel-core/src/overlay/runtime.rs:3305`, `:4487`), and the netmap takes it from that
 network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:3187-3191`). A
 relay node missing from the map shows as its node id in hex.
 
@@ -733,7 +733,7 @@ Verified against `origin/master`, 2026-08-28.
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:1007-1008` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
 | Permission bits + `ALL` bump | `crates/db/src/models/role.rs:153`, `:183` |
-| CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
+| CLI surfaces | `agents/roomler-cli/src/localclient.rs:1053` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
@@ -1005,7 +1005,7 @@ Then take mars's relay down and assert re-selection to zeus without a DERP round
 a service restart"* — false: `config_surface.rs:19` states *"Every key is read at daemon
 startup, so the whole surface is `restart_required = true`"* (hardcoded `:495`, `:509`,
 asserted by `every_key_gets_and_applies` `:2959`), and the CLI's live-apply allowlist is
-exactly `exec_enabled | remote_config_enabled` (`localclient.rs:988`). A bound UDP socket
+exactly `exec_enabled | remote_config_enabled` (`localclient.rs:994`). A bound UDP socket
 does not close on a TOML write, and restarting `roomlerd` on **mars** would kill the host
 driving every `roomler exec` in this plan. **Revoke server-side** (`Agent.peer_relay_policy`
 → `rc:relay.revoke`) — which also exercises §7's revocation path.

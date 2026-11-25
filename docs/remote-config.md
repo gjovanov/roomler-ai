@@ -571,7 +571,7 @@ flowchart TD
 
 **A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
 daemon whose binary was replaced restarts through the same door once nothing it
-serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:364-423`).
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:371-430`).
 It runs the same supervisor proof, record and systemd read-back, but not
 `local_restart_enabled`, because no local client is asking. It is not a server
 lever: what sets it off is a file replaced ON the device, by the root update
@@ -656,15 +656,15 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3602`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3625`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check
    of the folder each time a recording starts. **Gate 4 is not among them.**
    `exec_enabled`, `ssh_enabled` and `remote_config_enabled` are served
    read-only there (`ConfigEntry::read_only = "root_only"`, `person_view`,
-   `:3730`), and a `ConfigSet` of them is refused by name with the
-   administrator's command (`not_on_the_person_socket_for_key`, `:3774`): on a
+   `:3753`), and a `ConfigSet` of them is refused by name with the
+   administrator's command (`not_on_the_person_socket_for_key`, `:3797`): on a
    root-mode install gate 4 stays `sudo roomler config set exec_enabled true`,
    on both OSes. The pane shows the root daemon's value of the switch, marked,
    instead of another daemon's — on a two-half Mac the machine-side rows come

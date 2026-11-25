@@ -123,7 +123,7 @@ suspect first.
 ## On the device
 
 The handler sits in the WS loop that received the order, next to `ConfigPush`
-(`agents/roomlerd/src/signaling.rs:6309-6451`). Every branch **reports**, refusals
+(`agents/roomlerd/src/signaling.rs:6337-6479`). Every branch **reports**, refusals
 included — the operator is looking at a security action and each refusal has a
 different fix:
 
@@ -136,7 +136,7 @@ different fix:
 | 5 | queue the same report for the *next* session, then send `rc:agent.key_rotated { rotated, old_pub, new_pub, key_epoch }` on this one and give the pump 300 ms | `rotated` | `signaling.rs:6407-6433` |
 | 6 | close every peer, tunnel peer and QUIC peer this org loop carries (the `Goodbye` teardown), return `ConnectError::KeyRotated { secret, epoch }` | — | `signaling.rs:6437-6449`, `:1757` |
 | 7 | the loop adopts the key + epoch into its one config snapshot and re-enters `connect_once` **immediately** — one device re-joining, not a fleet event, so no stagger | — | `signaling.rs:1427-1454` |
-| 8 | `overlay::maybe_start` sees the fingerprint change (it includes the public key), rebuilds the runtime; the join carries the new key and epoch | — | `agents/roomlerd/src/overlay.rs:399` |
+| 8 | `overlay::maybe_start` sees the fingerprint change (it includes the public key), rebuilds the runtime; the join carries the new key and epoch | — | `agents/roomlerd/src/overlay.rs:416` |
 
 ⚠️ **Persist before anything else.** A key that is not written down would be lost at
 the next restart and the device would come back as the identity it just retired —
@@ -324,7 +324,7 @@ under `enforce`, failing closed like the uniqueness check above it.
 reason is `Unknown` — the fallback shipped in the same commit as `supports_join_refusal`
 (#1081) — so they log the refusal at ERROR with its detail, record it for
 `roomler status`, and neither retry nor tear down
-(`agents/roomlerd/src/overlay.rs:1019`). An agent before 0.4.41 never advertised
+(`agents/roomlerd/src/overlay.rs:1036`). An agent before 0.4.41 never advertised
 `supports_join_refusal`, is sent no frame, and waits on a netmap that does not come; the
 server's log and audit carry the reason.
 
@@ -442,7 +442,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | the conditional report write | `crates/services/src/dao/agent.rs:1171-1201` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:1160-1321`, `:2218-2226` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:838-846` |
-| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6309-6451`, `:3563-3605`, `:3607-3628`, `:1427-1454` |
+| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6337-6479`, `:3591-3633`, `:3635-3656`, `:1453-1480` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:1091-1096`, `:1876-1881`, `:2006-2008`; `config_surface.rs:1266-1273` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2113-2214`; `ui/src/stores/agents.ts:1344-1358` |
