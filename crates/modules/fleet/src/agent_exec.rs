@@ -1292,4 +1292,40 @@ mod tests {
             assert!(!m.contains("anchor"), "{m}");
         }
     }
+
+    /// FR-133 P2e: every exec refusal reaches a person (the device console
+    /// and `roomler exec` print it), on every OS, so none calls the daemon an
+    /// "agent". The one that says what to update names roomlerd.
+    #[test]
+    fn exec_refusals_say_device_or_roomlerd_never_agent() {
+        for r in [
+            ExecDenyReason::OrgDisabled,
+            ExecDenyReason::NoPermission,
+            ExecDenyReason::DeviceDisabled,
+            ExecDenyReason::CallerNotAllowed,
+            ExecDenyReason::ShellNotAllowed,
+            ExecDenyReason::OriginNotAllowed,
+            ExecDenyReason::Unsupported,
+            ExecDenyReason::Offline,
+            ExecDenyReason::ConsentDenied,
+            ExecDenyReason::RateLimited,
+            ExecDenyReason::AgentDisabled,
+            ExecDenyReason::SystemRequired,
+            ExecDenyReason::ClaimRefused,
+            ExecDenyReason::RunAsUnavailable,
+        ] {
+            for os in [OsKind::Windows, OsKind::Linux, OsKind::Macos] {
+                let m = deny_message(r, os);
+                assert!(
+                    !m.to_ascii_lowercase().contains("agent"),
+                    "{r:?} on {os:?} says agent: {m}"
+                );
+            }
+        }
+        assert_eq!(
+            deny_message(ExecDenyReason::RunAsUnavailable, OsKind::Linux),
+            "this device's policy runs commands as the person at its screen, and the daemon it \
+             runs cannot: update roomlerd"
+        );
+    }
 }

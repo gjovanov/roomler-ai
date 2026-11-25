@@ -41,7 +41,7 @@ pub async fn ws_upgrade(
         // is refused with 503 rather than silently dropped.
         Some("agent") => match native_credential(&headers, params.token) {
             Some(t) => with_challenge(state.modules.agent_upgrade(t, params.tid, ws).await, true),
-            None => with_challenge(unauthorized("agent role: no credential"), false),
+            None => with_challenge(unauthorized("role=agent: no credential"), false),
         },
         Some("tunnel-client") => match native_credential(&headers, params.token) {
             Some(t) => with_challenge(state.modules.tunnel_client_upgrade(t, params.tid, ws), true),
@@ -453,5 +453,18 @@ mod tests {
         assert_eq!(session_cookie(&HeaderMap::new()), None);
         assert_eq!(session_cookie(&with_cookie("access_token=")), None);
         assert_eq!(session_cookie(&with_cookie("theme=dark")), None);
+    }
+
+    /// FR-133 P2e: a native client that asks for `role=agent` with no
+    /// credential reads why in the 401 body, which names the wire role as the
+    /// caller spelled it (`role=agent`, an identity) rather than an "agent
+    /// role". The daemon reads the status and the challenge, never the body.
+    /// Read from the source: docs anchor this file's lines.
+    #[test]
+    fn the_device_role_refusal_names_the_wire_role() {
+        let src = include_str!("handler.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("the tests module")];
+        assert!(code.contains("unauthorized(\"role=agent: no credential\")"));
+        assert!(!code.contains("agent role: no credential"));
     }
 }

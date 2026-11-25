@@ -1800,4 +1800,90 @@ mod tests {
             "a person reads this in the daemon's notice: {text}"
         );
     }
+
+    /// FR-133 P2e: what fleet's handlers send a caller, inline where only a
+    /// live row or a socket reaches it, so read from the source (docs anchor
+    /// these files' lines). Each names the device or `roomlerd`, and the old
+    /// "agent" words are gone. `agent_id` is a route parameter, an identity.
+    /// `agent_org.rs` keeps "predates remote org-join": `crates/tests`'
+    /// agent_tests match it.
+    #[test]
+    fn fleet_refusals_say_device_not_agent() {
+        fn code(src: &str) -> &str {
+            &src[..src.find("#[cfg(test)]").unwrap_or(src.len())]
+        }
+        let files: [(&str, &str, &[&str], &[&str]); 8] = [
+            (
+                "socket.rs",
+                code(include_str!("socket.rs")),
+                &["\"Unauthorized (device)\"", "\"Invalid device ID\""],
+                &["Unauthorized (agent)", "Invalid agent ID"],
+            ),
+            (
+                "agent_log.rs",
+                code(include_str!("agent_log.rs")),
+                &[
+                    "tenant_id in route does not match the device credential",
+                    "agent_id in route does not match the device credential",
+                    "browser source not accepted on a device-authed route",
+                ],
+                &["match agent JWT", "accepted on agent-authed route"],
+            ),
+            (
+                "agent_org.rs",
+                code(include_str!("agent_org.rs")),
+                &["runs roomlerd {} which predates remote org-join. Update the device"],
+                &["runs agent {}"],
+            ),
+            (
+                "agent_exec.rs",
+                code(include_str!("agent_exec.rs")),
+                &[
+                    "device runs roomlerd {} which predates Fleet RPC",
+                    "this device's daemon cannot run commands as the person at its screen",
+                ],
+                &["runs agent {}", "this device's agent", "update the agent"],
+            ),
+            (
+                "agent.rs",
+                code(include_str!("agent.rs")),
+                &["\"device missing _id\""],
+                &["agent missing _id", "the agent's current"],
+            ),
+            (
+                "removal.rs",
+                code(include_str!("removal.rs")),
+                &["\"device missing _id\""],
+                &["agent missing _id"],
+            ),
+            (
+                "auth_agent.rs",
+                code(include_str!("auth_agent.rs")),
+                &[
+                    "\"device lookup: {other}\"",
+                    "\"device has been deleted\"",
+                    "\"device is quarantined\"",
+                ],
+                &[
+                    "agent lookup",
+                    "agent has been deleted",
+                    "agent is quarantined",
+                ],
+            ),
+            (
+                "exec_service.rs",
+                code(include_str!("exec_service.rs")),
+                &["\"device lookup: {other}\""],
+                &["agent lookup"],
+            ),
+        ];
+        for (file, code, says, said) in files {
+            for words in says {
+                assert!(code.contains(words), "{file} no longer says {words}");
+            }
+            for words in said {
+                assert!(!code.contains(words), "{file} says {words} again");
+            }
+        }
+    }
 }

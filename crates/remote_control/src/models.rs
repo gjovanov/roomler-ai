@@ -11618,3 +11618,78 @@ mod fr138_session_ended_tests {
         }
     }
 }
+
+// FR-133 P2e — the refusals a person reads (`roomler ssh` and the web app
+// print `message()`, the external-access dialog shows its reason) name the
+// device's daemon, never an "agent". "agent session" is FR-90's name for a
+// kind of session, an identity, and stays. At the end of the file so no
+// anchor above moves.
+#[cfg(test)]
+mod deny_reasons_say_device_not_agent {
+    use super::*;
+
+    #[test]
+    fn the_reworded_reasons_read_as_written() {
+        assert_eq!(
+            ExternalRcDenyReason::DeviceUnsupported.message(),
+            "this device's daemon is too old for external access — it cannot tell the person \
+             at the machine that the controller is from outside the organization"
+        );
+        assert_eq!(
+            SshDenyReason::Unsupported.message(),
+            "this device's daemon does not support roomler SSH (needs a build with the \
+             ssh-server feature)"
+        );
+        assert!(
+            SshDenyReason::GrantExpiredOnArrival
+                .message()
+                .ends_with("; fix that clock, or update its daemon to 0.4.202 or later"),
+            "{}",
+            SshDenyReason::GrantExpiredOnArrival.message()
+        );
+        assert_eq!(
+            SshDenyReason::TargetTooOld.message(),
+            "this device's daemon cannot hold an agent session to one command (needs a build \
+             that advertises ssh-one-command)"
+        );
+        // `crates/tests` (ssh_grant_ack_tests, ssh_service_tests) match these words.
+        assert!(
+            SshDenyReason::Unsupported
+                .message()
+                .contains("does not support roomler SSH")
+        );
+    }
+
+    #[test]
+    fn no_reason_calls_the_daemon_an_agent() {
+        let ssh = [
+            SshDenyReason::OrgDisabled,
+            SshDenyReason::NoPermission,
+            SshDenyReason::DeviceDisabled,
+            SshDenyReason::CallerNotAllowed,
+            SshDenyReason::OriginNotAllowed,
+            SshDenyReason::Unsupported,
+            SshDenyReason::Offline,
+            SshDenyReason::NoOverlayAddress,
+            SshDenyReason::RateLimited,
+            SshDenyReason::BadPublicKey,
+            SshDenyReason::AgentDisabled,
+            SshDenyReason::GrantExpiredOnArrival,
+            SshDenyReason::GrantRefused,
+            SshDenyReason::GrantUnconfirmed,
+            SshDenyReason::ClaimRefused,
+            SshDenyReason::TicketRefused,
+            SshDenyReason::SessionNotAllowed,
+            SshDenyReason::TargetTooOld,
+        ]
+        .map(SshDenyReason::message);
+        let external = ExternalRcDenyReason::ALL.iter().map(|r| r.message());
+        for text in ssh.into_iter().chain(external) {
+            let rest = text.replace("agent session", "");
+            assert!(
+                !rest.to_ascii_lowercase().contains("agent"),
+                "{text:?} says agent"
+            );
+        }
+    }
+}

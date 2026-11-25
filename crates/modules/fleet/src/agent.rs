@@ -2840,3 +2840,24 @@ mod access_policy_view_tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }
+
+/// FR-133 P2e: one device's 409 shows this reason to the person who pinned
+/// (the bulk push shows its own words for the `pin_downgrade` code), so it
+/// names the device's daemon version, never "the agent's". A tag pin carries
+/// `agent-v`, the release tags' own spelling and an identity, so the test pins
+/// bare versions.
+#[cfg(test)]
+mod pin_downgrade_words_tests {
+    use super::pin_downgrade;
+
+    #[test]
+    fn the_downgrade_refusal_names_the_daemon_version() {
+        let reason = pin_downgrade("0.4.200", "0.4.237").expect("a downgrade");
+        assert_eq!(
+            reason,
+            "pin 0.4.200 is older than this device's daemon version 0.4.237 — a stale pin \
+             would DOWNGRADE this device; pass force=true to do it deliberately"
+        );
+        assert!(!reason.to_ascii_lowercase().contains("agent"), "{reason}");
+    }
+}

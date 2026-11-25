@@ -1714,4 +1714,43 @@ mod tests {
             "a new window"
         );
     }
+
+    /// FR-133 P2e: the external-login refusals reach the organization's
+    /// audit view (the outsider is told only `unavailable`), and the
+    /// controller's rehome message rides an `rc:error` whose code the web app
+    /// maps to its own words. Both are inline where only a live session
+    /// reaches them, so read from the source (docs anchor these files'
+    /// lines). Each names the device's daemon, never an "agent".
+    #[test]
+    fn remote_refusals_say_device_not_agent() {
+        fn code(src: &str) -> &str {
+            &src[..src.find("#[cfg(test)]").unwrap_or(src.len())]
+        }
+        let files: [(&str, &str, &[&str], &[&str]); 2] = [
+            (
+                "extauth.rs",
+                code(include_str!("extauth.rs")),
+                &[
+                    "\"the device's daemon is too old to be sent an external login\"",
+                    "\"the device's daemon can verify an external login but is too old to admit \
+                     the session\"",
+                ],
+                &["device's agent is too old", "device's agent can verify"],
+            ),
+            (
+                "controller.rs",
+                code(include_str!("controller.rs")),
+                &["\"device is homed on another pod; re-dial and retry\""],
+                &["\"agent is homed on another pod"],
+            ),
+        ];
+        for (file, code, says, said) in files {
+            for words in says {
+                assert!(code.contains(words), "{file} no longer says {words}");
+            }
+            for words in said {
+                assert!(!code.contains(words), "{file} says {words} again");
+            }
+        }
+    }
 }

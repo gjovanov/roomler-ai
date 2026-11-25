@@ -8174,4 +8174,39 @@ mod tests {
             "a person reads this in the daemon's notice: {message}"
         );
     }
+
+    /// FR-133 P2e: a device frame on a socket with no device id is refused as
+    /// "no device". The error is logged (the agent socket's dispatch warning)
+    /// and never sent, and a person reads that log.
+    #[tokio::test]
+    async fn a_device_frame_with_no_device_is_refused_as_no_device() {
+        let hub = test_hub().await;
+        let ctx = DispatchCtx {
+            role: Role::Agent,
+            user_id: None,
+            agent_id: None,
+            controller_name: None,
+            controller_tx: None,
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: RcOverlayMode::Off,
+            session_policy: OrgPolicy::Unavailable,
+            max_duration: None,
+            idle_secs: None,
+            lock_on_end: None,
+            org_session_cap: None,
+            slot: None,
+        };
+        let err = hub
+            .dispatch(&ctx, ClientMsg::AgentLocalRelay { relay: None })
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PermissionDenied("no device")),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "permission denied: no device");
+    }
 }
