@@ -1324,12 +1324,23 @@ impl ExitTally {
 /// #4324 — the way forward for a worker with nothing to run, from what the host
 /// knows: which worker it started. The SYSTEM worker runs the machine's own
 /// enrollment, every other the signed-in person's (`app.rs`, `pick_config_path`).
+/// #4411 — a person's worker the host started while SystemContext waited for a
+/// machine enrollment (`waiting`, [`system_context_waiting_args`]) names the
+/// machine's way first, and that person's own enrollment as the other. A SYSTEM
+/// worker is never started so, and its line is its own whatever `waiting` says.
 /// It names no path: the host never resolves the worker's config.
-pub fn nothing_to_run_way_forward(system_context: bool, _waiting: bool) -> &'static str {
+pub fn nothing_to_run_way_forward(system_context: bool, waiting: bool) -> &'static str {
     if system_context {
         "SYSTEM can open no machine enrollment on this device, nor a copy of one to \
          restore. Enroll the device for the machine (the setup wizard, or \
          `roomlerd enroll --machine-global`), or put the machine config back"
+    } else if waiting {
+        "SystemContext is on, but SYSTEM can open no machine enrollment, so the \
+         worker runs as the account signed in at the console, and that account has \
+         no enrollment on this device either, nor a copy of one to restore. Enroll \
+         the device for the machine (the setup wizard, or \
+         `roomlerd enroll --machine-global`), or else as that account \
+         (`roomlerd enroll`), or put the account's config back"
     } else {
         "the account signed in at the console has no enrollment on this device, nor \
          a copy of one to restore. Enroll the device as that account (the setup \
