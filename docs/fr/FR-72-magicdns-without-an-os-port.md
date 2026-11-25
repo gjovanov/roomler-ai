@@ -1,5 +1,7 @@
 # FR-72 — One MagicDNS resolver per daemon
 
+**Anchors:** master `27549b6e0` (closed 2026-09-09): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** P1 + P2 + P6 shipped and field-verified — **MagicDNS now resolves on the enforced-DNS host too**; P3 (#1363) shipped, its lab cells pending; P5 parked · **Opened:** 2026-09-05
 
 > ⚠️ **Re-aimed 2026-09-05, same day, after the verification overturned the

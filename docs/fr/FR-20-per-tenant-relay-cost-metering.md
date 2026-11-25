@@ -1,5 +1,7 @@
 # FR-20 — Per-tenant relay cost metering
 
+**Anchors:** master `27549b6e0` (closed 2026-09-09): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#807](https://github.com/gjovanov/roomler-ai/issues/807) · **Status:** design · **Owner:** @gjovanov
 
 ## Goal

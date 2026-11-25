@@ -1,5 +1,7 @@
 # FR-28: A pod roll freezes every relay-carried session
 
+**Anchors:** master `34f4c04fc` (closed 2026-11-22): this spec is the record of the work, and its line anchors read at that commit.
+
 Status: **FR-28 closes on AC3 to AC6, and all four are met. P2 (a flat redial, default OFF) is in every agent
 since 0.4.200, and P3 (the image pre-pull) is in force since 2026-11-07. With P3 alone a reattach takes p50 3.5 s
 and p90 4.0 s, against 7.8 s and 8.8 s before it. With the switch on as well, two hosts were back 1.9 to 2.9 s
@@ -155,7 +157,7 @@ under 0.4 s after its container started.
 backoff ladder (1, 2, 4, 8, 10 s; `agents/roomlerd/src/derp.rs:50`, `:618`): 3.4 s in one roll,
 7.5–7.7 s in ten, 15.2–15.8 s in two, 25.9 s in one. A replacement that listens just after a step
 waits for the next one. The control WS doubles the same way, up to 60 s
-(`agents/roomlerd/src/signaling.rs:1580`).
+(`agents/roomlerd/src/signaling.rs:1594`).
 
 A device in two orgs holds one socket per org, each pinned by its own tenant, so it can lose a
 socket in each wave. That accounts for the 6–8 hosts per roll that log two closes: on the roll of
@@ -258,7 +260,7 @@ flowchart TD
 | A major network change (only the control socket listens for one) | Restarts at 1 s | Back to 30 |
 
 The code: `FlatRedial` (`agents/roomlerd/src/ws_connect.rs:75`) with its allowance and wait (`:48`, `:53`), the
-control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1559`, `:1290`), and `/derp`'s
+control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1573`, `:1290`), and `/derp`'s
 (`agents/roomlerd/src/derp.rs:604`, `:598`). Regional relays keep their ladder
 (`agents/roomlerd/src/derp.rs:381`): no pod rolls under one.
 
@@ -307,7 +309,7 @@ this size it is a number to measure first. The flip is a staged rollout and the 
   `RUST_LOG=roomlerd=info,warn` (`agents/roomlerd/packaging/linux/roomlerd.service:53`), which replaces the default
   filter whole (`crates/agent-core/src/logging.rs:430-437`). Of `tunnel_core`'s INFO lines it then keeps only the
   socket-buffer line appended for FR-110 (`:453-463`), and the line is `info!` in `tunnel_core`
-  (`crates/tunnel-core/src/overlay/runtime.rs:3982`). So a read on such a host ends at the hello and the agent's
+  (`crates/tunnel-core/src/overlay/runtime.rs:3977`). So a read on such a host ends at the hello and the agent's
   own reattach line, which the `roomlerd` target keeps (`agents/roomlerd/src/overlay.rs:265`). A criterion written
   on `control-WS reattached` has the same gap on every packaged Linux host. The filter sets what every such host
   uploads, so widening it is a change of its own, with its own read of the volume.
@@ -396,7 +398,7 @@ One host on 0.4.48 took 60 s on every roll, the shape of the oldest agents, and 
   offsets between hosts do not enter it.
 - **A host can close in both waves.** A daemon with two enrollments runs one signaling loop for each
   (`agents/roomlerd/src/signaling.rs:632-636`) and uploads both loops' lines under its primary's row
-  (`agents/roomlerd/src/app.rs:4883-4896`). Five such rows closed in both waves, about 12 s apart, because their
+  (`agents/roomlerd/src/app.rs:4750-4763`). Five such rows closed in both waves, about 12 s apart, because their
   two organisations sit on different pods. Each socket is still cut once a roll.
 
 ### The switch-on half (2026-11-22)
@@ -496,7 +498,7 @@ it in advance, so the sequence is: pod dies → agent keeps handing frames to a 
 socket → a send hard-errors → `DeathReason::HardDead`
 (`crates/tunnel-core/src/overlay/runtime/establish.rs:734-754`) → carrier rebuild →
 `MuxEvent::Recovered` opens the fast-walk window
-(`crates/tunnel-core/src/overlay/runtime.rs:2781-2784`).
+(`crates/tunnel-core/src/overlay/runtime.rs:2703-2706`).
 
 That recovery path has already been optimised once (#28: `DERP_RECOVERY_WALK_WINDOW`
 + `DERP_RECOVERY_RECHECK`, after a field case where "the WS returned in 1.5 s and the
@@ -610,8 +612,8 @@ out. AC3 to AC6 keep their words.
 | Docs | **Met**: AC4's numbers and both halves of AC3 are in | Done |
 
 ⚠️ What moved with AC1: the reader for it does not exist either. `video DC delivery gap` is console-only and logs
-only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:19`, warned at
-`ui/src/composables/useRemoteControl.ts:8530`).
+only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:19`, warned at (2026-11-23)
+`ui/src/composables/useRemoteControl.ts:8530`). (2026-11-24)
 
 ## Out of scope
 

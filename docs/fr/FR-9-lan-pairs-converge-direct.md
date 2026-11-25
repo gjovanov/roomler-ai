@@ -2,6 +2,8 @@
 
 **Status:** CLOSED — #741 / #744 / #746 / #747 / #758 / #765 / #782 — field-verified, shipped rc.480 → 0.4.8.
 
+**Anchors:** master `783aa3c1f` (closed 2026-08-27): this spec is the record of the work, and its line anchors read at that commit.
+
 Renumbered from `FR-01` by the registry tie-break: #767 claimed `FR-1` 98 s earlier, and the
 lower issue id keeps the number.
 

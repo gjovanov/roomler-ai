@@ -1,5 +1,7 @@
 # FR-4: Conference media-path integrity — every mediasoup-serving node forwards the RTC range, and a dead media path is loud
 
+**Anchors:** master `85b9ebd54` (closed 2026-08-27): this spec is the record of the work, and its line anchors read at that commit.
+
 **Status:** shipped + field-verified 2026-08-27 (retroactive FR for the 2026-08-26 "no
 video" incident arc). Tracking issue: [#776](https://github.com/gjovanov/roomler-ai/issues/776).
 

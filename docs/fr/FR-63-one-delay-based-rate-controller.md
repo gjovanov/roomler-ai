@@ -2,11 +2,13 @@
 
 **Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). What it shipped stays in the tree: the opener, the simulator (B0) and the shadow controller (B1). Its open work moved: the read of B1's shadow is FR-148 P0, the flip (B2) and the deletions (B3, B4) are FR-148 P5, and the flip criterion gains an under-drive clause. FR-148 §12 maps each open criterion. At the close: in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field; **B1 shadow controller shipped in `agent-v0.4.188`** (2026-10-30; `encode::ratectl` beside the governor, six `shadow_*` heartbeat fields, observe-only — drives nothing); **B1b: AC2's instrument built** (`scripts/rc-shadow-report.cjs`, the bounded fleet read of `agent_logs`) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
+**Anchors:** master `1c584fb7e` (closed 2026-11-16): this spec is the record of the work, and its line anchors read at that commit.
+
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
 ## Goal
 
-Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodput, the FR-35 learner and rate memory, FR-59's floor relief / arrival clamp / drain / seed contradiction / remembered-rate opener, the FR-15 age loop — composed with "the lower of" rules in `RateGovernor::pre_encode_tick` (`agents/roomlerd/src/encode/governor.rs:596`) and `tick_viewer_window` (:708), with **one** pure, delay-based controller that runs in **shadow** for a release before it drives anything, and is verified against a deterministic simulator replaying recorded field traces rather than against the fleet.
+Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodput, the FR-35 learner and rate memory, FR-59's floor relief / arrival clamp / drain / seed contradiction / remembered-rate opener, the FR-15 age loop — composed with "the lower of" rules in `RateGovernor::pre_encode_tick` (`agents/roomlerd/src/encode/governor.rs:547`) and `tick_viewer_window` (:708), with **one** pure, delay-based controller that runs in **shadow** for a release before it drives anything, and is verified against a deterministic simulator replaying recorded field traces rather than against the fleet.
 
 ## Key design
 
@@ -534,7 +536,7 @@ either — which is the number B1 has to beat.
   | number | why | how firm |
   |---|---|---|
   | a gate on the spend | a bar over all clean windows has no power: B1 scores 96 %, a pinned shadow 93 % | measured, one host |
-  | 2 Mbps direct | the direct floor is 1.5-4 M (`encode/mod.rs:307-312`), so most lower spend cannot be capped at all; 186 of that host's 200 clean windows sit under it | measured, one host |
+  | 2 Mbps direct | the direct floor is 1.5-4 M (`encode/mod.rs:302-307`), so most lower spend cannot be capped at all; 186 of that host's 200 clean windows sit under it | measured, one host |
   | 0.5 Mbps constrained | the constrained floor is 200 k against a ~3 M nominal cap | **not measured**: no real constrained line was read. Check it against the fleet table first |
   | ×1.25 | a small excess can be overshoot. The result does not hang on it: B1 at ≥ 2 Mbps is 43 % over by more than this, 57 % over at all | judgement |
   | 90 %, ≥ 20 sessions | mirror the existing bar, so no new number to defend | judgement |

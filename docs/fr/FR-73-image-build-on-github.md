@@ -16,6 +16,8 @@ proves write access with a dry-run push) · **AC4 done 2026-09-06 12:14Z — the
 **Issue**: [#1389](https://github.com/gjovanov/roomler-ai/issues/1389) ·
 **Related**: FR-6 (build-speed SLO — this lane inherits its ≤10 min warm target as an aspiration, not a gate), FR-69 (the publish workflow this one copies its smoke from), FR-37 (the e2e lane, which pins by image tag and gains a second registry to pin from)
 
+**Anchors:** master `22974efce` (closed 2026-09-06): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Move the hosted (prod) image's build and storage off the build host and onto GitHub:

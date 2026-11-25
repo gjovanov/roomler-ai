@@ -1,5 +1,7 @@
 # FR-143: SourceForge gets each release's installers from our own workflow, and nothing else
 
+**Anchors:** master `4c14ccb72` (closed 2026-11-20): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#3691](https://github.com/gjovanov/roomler-ai/issues/3691) · **Status:** P0 done by hand 2026-11-11, AC3 met; P1 merged 2026-11-11 (#3694); P2: the two credentials stored and the first live publish green 2026-11-11, AC5 met. The same evening showed that P1's trigger never fires for a real release, so P1b (#3712, merged 2026-11-11) makes the wizard lane dispatch the publish. AC1, AC2 and AC4 met 2026-11-12 on the first two releases cut after it, and the old webhook was deleted the same night (P3). AC6 met 2026-11-19, and the FR closed the same day
 **Related:** FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), which left "SourceForge's per-OS default downloads on future releases" out of scope), FR-6 ([#773](https://github.com/gjovanov/roomler-ai/issues/773), the `seed-cache` release), FR-84 (the wizard's lockstep with the agent release)
 

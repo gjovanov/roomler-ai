@@ -1,5 +1,7 @@
 # FR-8: Claude session restore after reboot — `crestore` (WT tabs / VS Code terminals)
 
+**Anchors:** master `404c2438a` (closed 2026-08-27): this spec is the record of the work, and its line anchors read at that commit.
+
 **Status: SHIPPED + field-verified (retrospective).** Planned + implemented 2026-08-18 (tracker, WT target, phases 1–3), extended 2026-08-26 (VS Code target, phase 4) and 2026-08-28 (effort, phase 5). Phases 6 and 7 followed on 2026-11-18 and 2026-11-19: a session can come back from a short handoff pack instead of a full resume, and a session about to stop writes its own handoff first. This is **dev-box tooling**: it lives in `%USERPROFILE%\.claude\session-restore\` on the dev box, not in this repo's source tree — documented here per the FR workflow because every roomler-ai working session (and every other project's) runs through it.
 
 ## Problem / Goal
