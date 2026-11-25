@@ -23,7 +23,7 @@
 //! The list-price figure (`Plan::price_monthly_cents` × seats) stays where
 //! it was (`routes/cost.rs`), labelled an estimate; nothing here reads it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
@@ -997,6 +997,24 @@ pub fn trial_to_paid(orgs: &HashMap<ObjectId, OrgBilling>, start: i64, end: i64)
     (trials, converted)
 }
 
+/// #4432 — the failed payments Growth counts: the `invoice_payment_failed`
+/// rows of an invoice that was never paid, i.e. with no `invoice_paid` row of
+/// the same invoice (`stripe_id`) at any time. A card that needs 3-D Secure
+/// fails once per authentication attempt and then pays: those attempts were
+/// never a lost payment. Each failed attempt of an invoice never paid counts.
+/// `rows` is the whole record, not only the window being counted: an invoice
+/// may be paid after the window that holds its failure.
+pub fn unpaid_failures(rows: &[BillingEvent]) -> impl Iterator<Item = &BillingEvent> {
+    let paid: HashSet<&str> = rows
+        .iter()
+        .filter(|r| r.kind == BillingKind::InvoicePaid)
+        .map(|r| r.stripe_id.as_str())
+        .collect();
+    rows.iter().filter(move |r| {
+        r.kind == BillingKind::InvoicePaymentFailed && !paid.contains(r.stripe_id.as_str())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1251,6 +1269,36 @@ mod tests {
         r.amount_cents = Some(amount);
         r.interval_months = Some(1.0);
         r
+    }
+
+    /// #4432 — a failure counts only for an invoice never paid: prod's three
+    /// 3-D Secure attempts on an invoice paid minutes later count none, an
+    /// invoice paid a month after its failure counts none, and another
+    /// invoice's payment clears nothing.
+    #[test]
+    fn a_failure_counts_only_for_an_invoice_never_paid() {
+        use BillingKind::{InvoicePaid, InvoicePaymentFailed};
+        let t = ObjectId::new();
+        let on = |kind: BillingKind, invoice: &str, ts: i64| {
+            let mut r = row(kind, t, ts);
+            r.stripe_id = invoice.to_string();
+            r
+        };
+        let rows = vec![
+            on(InvoicePaymentFailed, "in_sca", 1_000),
+            on(InvoicePaymentFailed, "in_sca", 2_000),
+            on(InvoicePaymentFailed, "in_sca", 3_000),
+            on(InvoicePaid, "in_sca", 4_000),
+            on(InvoicePaymentFailed, "in_lost", 5_000),
+            on(InvoicePaymentFailed, "in_lost", 6_000),
+            on(InvoicePaid, "in_other", 7_000),
+            on(InvoicePaymentFailed, "in_late", 8_000),
+            on(InvoicePaid, "in_late", 8_000 + 40 * DAY_MS),
+        ];
+        let counted: Vec<(&str, i64)> = unpaid_failures(&rows)
+            .map(|r| (r.stripe_id.as_str(), r.ts.timestamp_millis()))
+            .collect();
+        assert_eq!(counted, [("in_lost", 5_000), ("in_lost", 6_000)]);
     }
 
     fn month(label: &str) -> (String, i64, i64) {

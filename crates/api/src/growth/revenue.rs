@@ -459,7 +459,10 @@ pub fn channel_rows(
     rows
 }
 
-/// The range's invoices, failures, first payments and cancellations.
+/// The range's invoices, failures, first payments and cancellations. A
+/// failure counts only for an invoice never paid
+/// ([`billing::unpaid_failures`], #4432): `rows` is the whole record, so a
+/// payment after the range still clears a failure inside it.
 pub fn range_totals(
     rows: &[BillingEvent],
     orgs: &HashMap<ObjectId, OrgBilling>,
@@ -486,11 +489,11 @@ pub fn range_totals(
                     .entry(r.currency.clone().unwrap_or_else(|| "unknown".into()))
                     .or_insert(0) += r.amount_cents.unwrap_or(0);
             }
-            BillingKind::InvoicePaymentFailed => totals.payment_failures += 1,
             BillingKind::SubscriptionDeleted => totals.cancellations += 1,
             _ => {}
         }
     }
+    totals.payment_failures = billing::unpaid_failures(rows).filter(inside).count() as i64;
     totals.billed = billed
         .into_iter()
         .map(|(currency, cents)| CurrencyCents { currency, cents })
