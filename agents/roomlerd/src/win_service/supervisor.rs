@@ -1324,12 +1324,23 @@ impl ExitTally {
 /// #4324 — the way forward for a worker with nothing to run, from what the host
 /// knows: which worker it started. The SYSTEM worker runs the machine's own
 /// enrollment, every other the signed-in person's (`app.rs`, `pick_config_path`).
+/// #4411 — a person's worker the host started while SystemContext waited for a
+/// machine enrollment (`waiting`, [`system_context_waiting_args`]) names the
+/// machine's way first, and that person's own enrollment as the other. A SYSTEM
+/// worker is never started so, and its line is its own whatever `waiting` says.
 /// It names no path: the host never resolves the worker's config.
-pub fn nothing_to_run_way_forward(system_context: bool) -> &'static str {
+pub fn nothing_to_run_way_forward(system_context: bool, waiting: bool) -> &'static str {
     if system_context {
         "SYSTEM can open no machine enrollment on this device, nor a copy of one to \
          restore. Enroll the device for the machine (the setup wizard, or \
          `roomlerd enroll --machine-global`), or put the machine config back"
+    } else if waiting {
+        "SystemContext is on, but SYSTEM can open no machine enrollment, so the \
+         worker runs as the account signed in at the console, and that account has \
+         no enrollment on this device either, nor a copy of one to restore. Enroll \
+         the device for the machine (the setup wizard, or \
+         `roomlerd enroll --machine-global`), or else as that account \
+         (`roomlerd enroll`), or put the account's config back"
     } else {
         "the account signed in at the console has no enrollment on this device, nor \
          a copy of one to restore. Enroll the device as that account (the setup \
@@ -1354,6 +1365,13 @@ struct ActiveWorker {
     /// The worker looks identical from outside (same binary, same PID)
     /// — only the spawn site knows which token was used.
     is_system_context: bool,
+    /// #4411 — started on the user-context arm while SystemContext waited for a
+    /// machine enrollment: the state the spawn logged and handed the worker
+    /// ([`system_context_waiting_args`]). Kept from the spawn, so the exit's
+    /// way-forward line reads the state this worker was started under, never the
+    /// host's at the exit, which may have changed since. `false` for the SYSTEM
+    /// worker.
+    system_context_waiting: bool,
     /// When the worker was spawned. Drives [`reap_resets_counter`].
     spawned_at: Instant,
     /// #1683 — the stop event this worker was told to wait on (`--stop-event`).
@@ -1362,6 +1380,17 @@ struct ActiveWorker {
     /// shutdown path then hard-terminates, exactly as before this change. Held
     /// here so its handle is closed (RAII) when the worker is reaped or swapped.
     stop_event: Option<HostStopEvent>,
+}
+
+impl ActiveWorker {
+    /// #4411 — the way forward this worker's exit with nothing to run names
+    /// ([`nothing_to_run_way_forward`]), from what the host started it as and
+    /// nothing else: not the host's state at the exit, and not
+    /// `win_service::system_context_waiting`, the worker's own note, which is
+    /// never set in this host.
+    fn way_forward(&self) -> &'static str {
+        nothing_to_run_way_forward(self.is_system_context, self.system_context_waiting)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1865,7 +1894,8 @@ pub fn run(
                             // #4324 — a worker with nothing to run: one line
                             // names the way forward, at the first such exit,
                             // and again only after another code or a run past
-                            // its start (`ExitTally`).
+                            // its start (`ExitTally`). #4411 — the one for the
+                            // state the host started it under (`way_forward`).
                             if notice.way_forward {
                                 tracing::warn!(
                                     pid = w.process.pid,
@@ -1873,7 +1903,7 @@ pub fn run(
                                     system_context = w.is_system_context,
                                     "supervisor: the worker had no config to run (exit {}): {}. It is respawned on the usual backoff, with no crash-loop alarm; this line comes again only after another exit code or a run past its start",
                                     code,
-                                    nothing_to_run_way_forward(w.is_system_context)
+                                    w.way_forward()
                                 );
                             }
 
@@ -2077,6 +2107,8 @@ pub fn run(
                                     process: p,
                                     session: sid,
                                     is_system_context: false,
+                                    // #4411 — what this spawn logged and handed it.
+                                    system_context_waiting,
                                     spawned_at: Instant::now(),
                                     stop_event: stop_ev,
                                 });
@@ -2246,6 +2278,7 @@ pub fn run(
                             process: p,
                             session: sid,
                             is_system_context: true,
+                            system_context_waiting: false,
                             spawned_at: Instant::now(),
                             stop_event: stop_ev,
                         });
@@ -4625,20 +4658,114 @@ mod tests {
 
     /// The line names the way forward for the worker the host started: enroll the
     /// device, how, or put its config back. The SYSTEM worker's way is the
-    /// machine's own enrollment.
+    /// machine's own enrollment. #4411 — the three texts, pinned by the state each
+    /// is for: the SYSTEM worker's, and the person's on a host that does not wait,
+    /// as #4324 wrote them; and the person's worker the host started while
+    /// SystemContext waited for a machine enrollment, which names the machine's
+    /// way first and that person's own enrollment as the other.
     #[test]
     fn the_way_forward_names_how_to_enroll_and_the_config_to_put_back() {
-        for (system_context, how) in [
-            (false, "(the setup wizard, or `roomlerd enroll`)"),
+        const SYSTEM: &str = "SYSTEM can open no machine enrollment on this device, nor a copy of \
+                              one to restore. Enroll the device for the machine (the setup \
+                              wizard, or `roomlerd enroll --machine-global`), or put the \
+                              machine config back";
+        const PERSON: &str = "the account signed in at the console has no enrollment on this \
+                              device, nor a copy of one to restore. Enroll the device as that \
+                              account (the setup wizard, or `roomlerd enroll`), or put the \
+                              account's config back";
+        const WAITING: &str = "SystemContext is on, but SYSTEM can open no machine enrollment, \
+                               so the worker runs as the account signed in at the console, and \
+                               that account has no enrollment on this device either, nor a copy \
+                               of one to restore. Enroll the device for the machine (the setup \
+                               wizard, or `roomlerd enroll --machine-global`), or else as that \
+                               account (`roomlerd enroll`), or put the account's config back";
+        let machine = "(the setup wizard, or `roomlerd enroll --machine-global`)";
+        for (system_context, waiting, pinned, how) in [
+            (true, false, SYSTEM, machine),
             (
-                true,
-                "(the setup wizard, or `roomlerd enroll --machine-global`)",
+                false,
+                false,
+                PERSON,
+                "(the setup wizard, or `roomlerd enroll`)",
             ),
+            (false, true, WAITING, machine),
         ] {
-            let text = nothing_to_run_way_forward(system_context);
+            let text = nothing_to_run_way_forward(system_context, waiting);
+            assert_eq!(
+                text, pinned,
+                "system_context={system_context} waiting={waiting}"
+            );
             assert!(text.contains("Enroll the "), "{text:?}");
             assert!(text.contains(how), "{text:?}");
             assert!(text.contains("config back"), "{text:?}");
         }
+        // While the host waits, the machine's way comes first, the person's after.
+        let at = |s: &str| {
+            WAITING
+                .find(s)
+                .unwrap_or_else(|| panic!("{s:?} in {WAITING:?}"))
+        };
+        assert!(at("`roomlerd enroll --machine-global`") < at("`roomlerd enroll`)"));
+        // A SYSTEM worker is never started while the host waits; were one, its
+        // line would be its own.
+        assert_eq!(nothing_to_run_way_forward(true, true), SYSTEM);
+    }
+
+    /// A worker's record as a spawn arm keeps it, on this test process's own
+    /// handles, duplicated so that the record's drop closes only its copies. No
+    /// test waits on, or ends, the process it names.
+    fn a_record(is_system_context: bool, system_context_waiting: bool) -> ActiveWorker {
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+        let copy = |pseudo: HANDLE| {
+            let mut handle: HANDLE = std::ptr::null_mut();
+            // SAFETY: a pseudo-handle of this process, duplicated into this
+            // process; `handle` is an owned out-param.
+            let ok = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    pseudo,
+                    GetCurrentProcess(),
+                    &mut handle,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            assert_ne!(ok, 0, "DuplicateHandle");
+            handle
+        };
+        // SAFETY: both return a pseudo-handle and take nothing.
+        let (process, thread) = unsafe { (copy(GetCurrentProcess()), copy(GetCurrentThread())) };
+        ActiveWorker {
+            process: OwnedProcess::from_raw_parts(process, thread, std::process::id()),
+            session: 1,
+            is_system_context,
+            system_context_waiting,
+            spawned_at: Instant::now(),
+            stop_event: None,
+        }
+    }
+
+    /// #4411 — the line reads the state the host started its worker under, which
+    /// the worker's record keeps from the spawn. Two records of a person's worker
+    /// in this one host at one moment, one started while SystemContext waited for
+    /// a machine enrollment and one not, name different ways forward: nothing the
+    /// host reads at the exit decides it, nor the worker's own note
+    /// (`win_service::system_context_waiting`), which is never set in a host.
+    #[test]
+    fn the_line_reads_the_state_its_worker_was_started_under() {
+        for (system_context, waiting) in [(true, false), (false, false), (false, true)] {
+            assert_eq!(
+                a_record(system_context, waiting).way_forward(),
+                nothing_to_run_way_forward(system_context, waiting),
+                "system_context={system_context} waiting={waiting}"
+            );
+        }
+        assert_ne!(
+            a_record(false, true).way_forward(),
+            a_record(false, false).way_forward(),
+            "a person's worker started while the host waited names its own way forward"
+        );
     }
 }
