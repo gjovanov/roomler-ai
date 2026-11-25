@@ -1658,14 +1658,8 @@ impl Me for RealMe {
 /// where root starts no child.
 #[cfg(unix)]
 fn child_socket_path() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        tunnel_core::localapi::own_socket_path_in(darwin_user_temp_dir()?, None)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
+    // The seam (FR-151 P1, commit 1): the child asks no socket.
+    None
 }
 
 /// FR-151 — `confstr(_CS_DARWIN_USER_TEMP_DIR)`: this account's own temp
