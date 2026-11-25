@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
                 .into()
             }),
         )
-        .with(tracing_subscriber::fmt::layer().with_writer(log_writer))
+        .with(roomler_ai_api::logging::layer(log_writer, true))
         .init();
     roomler_ai_api::logging::report_dropped_lines(dropped_log_lines);
 
