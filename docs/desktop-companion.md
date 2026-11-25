@@ -1478,7 +1478,7 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/peer.rs`) | Why |
 |---|---|---|
-| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12910`), asked as the channel opens (`files_channel_here`, `:12919`, from the `"files"` arm, `:1338`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3873`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1178`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4734`) |
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12910`), asked as the channel opens (`files_channel_here`, `:12919`, from the `"files"` arm, `:1338`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3873`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1178`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4762`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
 | The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12945`), `attach_files_declined` (`:12968`), `declined_reply` (`:12999`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
 | The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12878`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session roomlerd." |
@@ -2102,8 +2102,8 @@ flowchart TD
   the `--autostart` restart of a tray the refresh lost, and the restart of a companion a Linux
   package update stopped (`companion/package_sync.rs`).
 - **Every caller of the start is a question or a banner:** the remote-control prompt
-  (`start_for_prompt`, `companion.rs:1393`, from `signaling.rs:4462`), the exec prompt
-  (`exec_surfaces_up`, `signaling.rs:7968`), a recording's and an SSH session's question
+  (`start_for_prompt`, `companion.rs:1393`, from `signaling.rs:4490`), the exec prompt
+  (`exec_surfaces_up`, `signaling.rs:7996`), a recording's and an SSH session's question
   (`Companion::verdict`, `companion.rs:1462`, which a recording reads through `Companion::up`),
   and Linux's being-viewed banner (`indicator/notify.rs:747`). The other callers are
   `tray_start_tests`' own.
@@ -2219,7 +2219,7 @@ sequenceDiagram
   ([`person_socket.rs:435`](../agents/roomlerd/src/person_socket.rs#L435)). It drops every connection whose kernel
   uid is neither that person's nor root's (`person_peer_ok`,
   [`crates/localapi/src/lib.rs:5281`](../crates/localapi/src/lib.rs#L5281), applied at `:5463`). It is 0600 and the
-  person's, in a folder only root writes (`:5564`). An answer is taken only after the seat is asked again (#3845).
+  person's, in a folder only root writes (`:5587`). An answer is taken only after the seat is asked again (#3845).
   The worker's own socket is 0600 in the person's private temporary folder. Nothing is written anywhere: the root's
   folder stays in root's home.
 - **The floor is every host's.** With the road closed, the app is not the question's surface: no

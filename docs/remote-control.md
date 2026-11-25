@@ -249,7 +249,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
-> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3911`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
+> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3939`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
 > - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:5066`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
@@ -3230,7 +3230,7 @@ With the file channel off, no other folder stands in for the daemon's own. Until
 issue #3939 a folder below the system's temporary folder did, or that folder
 itself. The LocalAPI still lists every question and decides it
 ([`consent_pending`](../agents/roomlerd/src/localapi_state.rs#L1295) reads the
-broker's books, `:1152`), so the tray, `roomlerd consent --list` and
+broker's books, `:1310`), so the tray, `roomlerd consent --list` and
 `--approve` / `--deny` and a native panel all work, and a question nobody answers
 ends at its window, as before. A question then takes one answer: the first
 decides, and a second is refused. The broker keeps its configured mode either way,
@@ -3949,7 +3949,7 @@ hears the terminate and `merge_live_stats` matches nothing. So a session with no
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
 P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:955`)
 and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2856`), by the
-same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6876`) queues the sample on
+same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6904`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:295`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
@@ -7417,9 +7417,9 @@ otherwise keep (§11.16). The reconnect is the same either way.
 
 | line | the lateness it reads | slack | after a freeze it reads |
 |---|---|---|---|
-| control WS RX deadline (`signaling.rs:2393`) | the keepalive's own due instant, which `tick()` returns (`:2336`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
-| control WS, a failed heartbeat send (`signaling.rs:2720`) or read (`:3418`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:160`, set at `:2337`). Both are read before the send, or on a read error before the closes (`session_ended`, `:122`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:100`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
-| the reconnect after any of them (`signaling.rs:1548`) | the session's reason, `AgentDidNotRun` (`:84`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
+| control WS RX deadline (`signaling.rs:2421`) | the keepalive's own due instant, which `tick()` returns (`:2364`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
+| control WS, a failed heartbeat send (`signaling.rs:2748`) or read (`:3446`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:160`, set at `:2365`). Both are read before the send, or on a read error before the closes (`session_ended`, `:122`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:100`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
+| the reconnect after any of them (`signaling.rs:1574`) | the session's reason, `AgentDidNotRun` (`:84`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
 | `/derp` RX deadline (`agents/roomlerd/src/derp.rs:488`) | the keepalive's due instant (`:475`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
 | direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:679`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3325`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
 | relay carrier rx-stale, at 90 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:779`) | the same | the same | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the relay's …` |
@@ -7739,7 +7739,7 @@ org had no front until the next restart. Two things now prevent it:
   locked by `overlay::socket_inherit_tests`
   (`agents/roomlerd/src/overlay.rs:1347-1402`), which a child process
   spawned in the test cannot get past.
-- The front waits out a busy port (`overlay.rs:868-927`).
+- The front waits out a busy port (`overlay.rs:885-944`).
 
 **Never leave the service stopped (#2711, Windows perMachine).** The
 watcher is the only actor that outlives the install, so its last act
