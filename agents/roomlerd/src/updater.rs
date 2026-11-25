@@ -3580,6 +3580,9 @@ pub async fn run_periodic(
     // hour for transfers) or a transport failure's early retry (#1755);
     // `None` = full periodic interval.
     let mut defer_recheck: Option<Duration> = None;
+    // #4407 — the last cycle held an outage recheck ([`CycleArm::Held`]), so
+    // this one never holds: one hold per recheck, never two in a row.
+    let mut after_hold = false;
     loop {
         if *shutdown.borrow() {
             return;
@@ -3641,7 +3644,14 @@ pub async fn run_periodic(
         let in_cooldown = ask.is_some() && recent_update_attempt(STARTUP_UPDATE_COOLDOWN);
         let busy = crate::busy::gate_now(&rc_sessions).await;
         let cycle = cycle_name(ask.as_ref());
-        let arm = cycle_arm(ask.as_ref(), &busy, consecutive_defers, in_cooldown);
+        let arm = cycle_arm(
+            ask.as_ref(),
+            &busy,
+            consecutive_defers,
+            in_cooldown,
+            after_hold,
+        );
+        after_hold = matches!(arm, CycleArm::Held { .. });
         let defers_before = consecutive_defers;
         consecutive_defers = arm.defers_after(consecutive_defers);
         match arm {
@@ -3682,6 +3692,22 @@ pub async fn run_periodic(
                     return;
                 }
                 schedule_transport_retry(&mut defer_recheck, retry, transport_failures);
+                continue;
+            }
+            // #4407 — an outage recheck met live work beside a network move,
+            // which may have ended that work unheard: no check, no defer
+            // counted, one look after the hold. That look is the timer's cycle,
+            // on the rule below, with the live work read again.
+            CycleArm::Held { recheck } => {
+                defer_recheck = Some(recheck);
+                tracing::info!(
+                    %busy,
+                    consecutive_defers,
+                    next_check_secs = recheck.as_secs(),
+                    %cycle,
+                    "auto-updater: deferring once, uncounted — the network just moved, and the live \
+                     work counted may have ended with it"
+                );
                 continue;
             }
             // rc.19 gate, #3429: don't fire an installer over live work. The
@@ -3791,6 +3817,19 @@ pub(crate) fn forced_update_warning(busy: &crate::busy::Busy) -> Option<String> 
         .then(|| format!("forced update proceeding despite: {busy}"))
 }
 
+/// #4407 — how long an outage recheck that meets live work beside a network
+/// move is held, once and uncounted ([`CycleArm::Held`]): the move's own
+/// window, [`NET_TRANSITION_WINDOW`]. The move may have ended an SSH session on
+/// the mesh that the device still counts: it hears the end only once the mesh
+/// carries it, within about a minute of the mesh's return when the session has
+/// output in flight (lab: 19 s), and for a quiet session at the SSH server's
+/// own 10-minute inactivity timeout (`ssh.rs`), which has run since the move.
+/// The move came before the recheck, so the look after the hold comes after
+/// its window and after that timeout: a session the move ended is gone, and
+/// R5b has nothing left to wait for. A session still counted then is live, and
+/// takes the hour.
+pub const OUTAGE_RECHECK_HOLD: Duration = NET_TRANSITION_WINDOW;
+
 /// #4245 — the arm one cycle of [`run_periodic`] takes ([`cycle_arm`]).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CycleArm {
@@ -3809,13 +3848,17 @@ pub(crate) enum CycleArm {
         decision: DeferDecision,
         recheck: Duration,
     },
+    /// #4407 — an outage recheck that met live work beside a network move:
+    /// no check, and one look again after `recheck` ([`OUTAGE_RECHECK_HOLD`]),
+    /// with no defer counted.
+    Held { recheck: Duration },
 }
 
 impl CycleArm {
     /// The consecutive-defer count after this cycle: ONE budget, whichever
     /// cycle spends it. A defer adds one, a check the gate let through
-    /// (forced at the cap or not) starts it again, and an operator's push or
-    /// a suppressed ask leaves it as it was.
+    /// (forced at the cap or not) starts it again, and an operator's push, a
+    /// suppressed ask or a held recheck (#4407) leaves it as it was.
     pub(crate) fn defers_after(&self, consecutive_defers: u32) -> u32 {
         match self {
             CycleArm::Gated {
@@ -3823,7 +3866,9 @@ impl CycleArm {
                 ..
             } => consecutive_defers.saturating_add(1),
             CycleArm::Gated { .. } => 0,
-            CycleArm::Cooldown | CycleArm::Forced { .. } => consecutive_defers,
+            CycleArm::Cooldown | CycleArm::Forced { .. } | CycleArm::Held { .. } => {
+                consecutive_defers
+            }
         }
     }
 }
@@ -3835,13 +3880,16 @@ impl CycleArm {
 /// operator's push takes the forced arm. The recheck after a long
 /// control-socket outage is the timer's cycle run early: before #4245 it
 /// took the push's arm and installed over live work. Pure: the cells' entry,
-/// and the loop's.
+/// and the loop's. `after_hold`: the cycle before this one held an outage
+/// recheck ([`CycleArm::Held`], #4407).
 pub(crate) fn cycle_arm(
     ask: Option<&UpdateAsk>,
     busy: &crate::busy::Busy,
     consecutive_defers: u32,
     in_cooldown: bool,
+    after_hold: bool,
 ) -> CycleArm {
+    let _ = after_hold;
     match ask {
         Some(_) if in_cooldown => CycleArm::Cooldown,
         // S1a — the operator asked NOW: the one ask the gate never holds.
@@ -8230,7 +8278,7 @@ mod tests {
         let busy = crate::busy::now(&one_live_session());
         assert_eq!(busy.rc_sessions, 1, "{busy}");
         assert_eq!(
-            cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, 0, false),
+            cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, 0, false, false),
             CycleArm::Gated {
                 decision: DeferDecision::DeferOnce,
                 recheck: TRANSFER_DEFER_RECHECK,
@@ -8250,7 +8298,7 @@ mod tests {
             ..crate::busy::Busy::IDLE
         };
         assert_eq!(
-            cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, 0, false),
+            cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, 0, false, false),
             CycleArm::Gated {
                 decision: DeferDecision::DeferOnce,
                 recheck: TRANSFER_DEFER_RECHECK,
@@ -8267,6 +8315,7 @@ mod tests {
             Some(&UpdateAsk::OutageRecheck),
             &crate::busy::Busy::IDLE,
             0,
+            false,
             false,
         );
         assert!(
@@ -8291,7 +8340,7 @@ mod tests {
         let mut defers = 0;
         for cycle in 0..MAX_CONSECUTIVE_DEFERS {
             let ask = (cycle % 2 == 1).then_some(&recheck);
-            let arm = cycle_arm(ask, &busy, defers, false);
+            let arm = cycle_arm(ask, &busy, defers, false, false);
             assert!(
                 matches!(
                     arm,
@@ -8308,7 +8357,7 @@ mod tests {
             defers, MAX_CONSECUTIVE_DEFERS,
             "each defer counts once, whichever cycle it was"
         );
-        let at_cap = cycle_arm(Some(&recheck), &busy, defers, false);
+        let at_cap = cycle_arm(Some(&recheck), &busy, defers, false, false);
         assert_eq!(
             at_cap,
             CycleArm::Gated {
@@ -8331,7 +8380,7 @@ mod tests {
     #[test]
     fn an_operators_push_with_a_live_session_still_takes_the_forced_arm() {
         let busy = crate::busy::now(&one_live_session());
-        let arm = cycle_arm(Some(&UpdateAsk::Operator(None)), &busy, 0, false);
+        let arm = cycle_arm(Some(&UpdateAsk::Operator(None)), &busy, 0, false, false);
         let CycleArm::Forced {
             pin: None,
             warning: Some(warning),
@@ -8344,6 +8393,7 @@ mod tests {
             Some(&UpdateAsk::Operator(Some("agent-v0.4.1".into()))),
             &busy,
             MAX_CONSECUTIVE_DEFERS,
+            false,
             false,
         );
         assert!(
@@ -8411,14 +8461,14 @@ mod tests {
         let live = crate::busy::now(&one_live_session());
         for busy in [crate::busy::Busy::IDLE, live] {
             for ask in [UpdateAsk::OutageRecheck, UpdateAsk::Operator(None)] {
-                let arm = cycle_arm(Some(&ask), &busy, 2, true);
+                let arm = cycle_arm(Some(&ask), &busy, 2, true, false);
                 assert_eq!(arm, CycleArm::Cooldown, "{ask:?} with {busy}");
                 assert_eq!(arm.defers_after(2), 2, "{ask:?}");
             }
         }
         assert!(
             matches!(
-                cycle_arm(None, &crate::busy::Busy::IDLE, 0, true),
+                cycle_arm(None, &crate::busy::Busy::IDLE, 0, true, false),
                 CycleArm::Gated {
                     decision: DeferDecision::Proceed,
                     ..
@@ -8471,14 +8521,14 @@ mod tests {
         for busy in cases {
             for defers in [0, 1, MAX_CONSECUTIVE_DEFERS - 1, MAX_CONSECUTIVE_DEFERS] {
                 assert_eq!(
-                    cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, defers, false),
-                    cycle_arm(None, &busy, defers, false),
+                    cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, defers, false, false),
+                    cycle_arm(None, &busy, defers, false, false),
                     "{busy} after {defers} defers"
                 );
             }
         }
         assert_eq!(
-            cycle_arm(Some(&UpdateAsk::OutageRecheck), &moved, 0, false),
+            cycle_arm(Some(&UpdateAsk::OutageRecheck), &moved, 0, false, false),
             CycleArm::Gated {
                 decision: DeferDecision::DeferOnce,
                 recheck: NET_DEFER_RECHECK,
@@ -8504,6 +8554,315 @@ mod tests {
             "rc:agent.update"
         );
         assert!(!UpdateAsk::OutageRecheck.label().contains("rc:agent.update"));
+    }
+
+    // ---- #4407 — the outage recheck holds once for work a network move ended ----
+    //
+    // A move during a long control-socket outage can end an SSH session on the
+    // mesh that the device still counts when the socket comes back: it hears
+    // the end only once the mesh carries it. The outage recheck that finds live
+    // work beside a move holds once, for `OUTAGE_RECHECK_HOLD`, with no defer
+    // counted, and the look after it is the timer's cycle on #3429's rule,
+    // deciding from what it reads then. Each cell decides from `Busy` values it
+    // builds, as the #4245 cells above do.
+
+    /// What the outage recheck read in #4407's lab case: one SSH connection
+    /// (the session the move ended, still open on the device's side), and the
+    /// network moved in the last 10 min.
+    fn moved_with_a_session() -> crate::busy::Busy {
+        crate::busy::Busy {
+            ssh_connections: 1,
+            net_transition: true,
+            ..crate::busy::Busy::IDLE
+        }
+    }
+
+    /// The `Busy` values the arm cells sweep: nothing, each kind of live work
+    /// alone, a move alone, a move beside a session and beside an SSH
+    /// connection, and an install in flight.
+    fn busy_cases() -> [crate::busy::Busy; 9] {
+        use crate::busy::Busy;
+        let session = Busy {
+            rc_sessions: 1,
+            ..Busy::IDLE
+        };
+        [
+            Busy::IDLE,
+            session,
+            Busy {
+                ssh_connections: 1,
+                ..Busy::IDLE
+            },
+            Busy {
+                exec_runs: 1,
+                ..Busy::IDLE
+            },
+            Busy {
+                work: 1,
+                ..Busy::IDLE
+            },
+            Busy {
+                net_transition: true,
+                ..Busy::IDLE
+            },
+            Busy {
+                net_transition: true,
+                ..session
+            },
+            moved_with_a_session(),
+            Busy {
+                install_in_flight: true,
+                ..Busy::IDLE
+            },
+        ]
+    }
+
+    /// `run_periodic`'s bookkeeping over a run of cycles outside the
+    /// install-storm cooldown, each cycle given by what woke it and the `Busy`
+    /// it read: every cycle's arm, with the defer count after it.
+    fn cycles(run: &[(Option<UpdateAsk>, crate::busy::Busy)]) -> Vec<(CycleArm, u32)> {
+        let (mut defers, mut after_hold) = (0, false);
+        run.iter()
+            .map(|(ask, busy)| {
+                let arm = cycle_arm(ask.as_ref(), busy, defers, false, after_hold);
+                after_hold = matches!(arm, CycleArm::Held { .. });
+                defers = arm.defers_after(defers);
+                (arm, defers)
+            })
+            .collect()
+    }
+
+    /// How long a run of cycles waits in all: each hold's or defer's recheck.
+    fn waited(run: &[(CycleArm, u32)]) -> Duration {
+        run.iter()
+            .map(|(arm, _)| match arm {
+                CycleArm::Held { recheck }
+                | CycleArm::Gated {
+                    decision: DeferDecision::DeferOnce,
+                    recheck,
+                } => *recheck,
+                _ => Duration::ZERO,
+            })
+            .sum()
+    }
+
+    /// The arm of a defer for live work: rechecked in the hour, counted.
+    fn the_hour() -> CycleArm {
+        CycleArm::Gated {
+            decision: DeferDecision::DeferOnce,
+            recheck: TRANSFER_DEFER_RECHECK,
+        }
+    }
+
+    /// The arm of the one hold.
+    fn the_hold() -> CycleArm {
+        CycleArm::Held {
+            recheck: OUTAGE_RECHECK_HOLD,
+        }
+    }
+
+    /// RED first (#4407): the outage recheck finds an SSH session beside a
+    /// network move. Before #4407 it deferred by the hour and counted the
+    /// defer. It holds once: no check, a look again after
+    /// [`OUTAGE_RECHECK_HOLD`], and the count as it was.
+    #[test]
+    fn an_outage_recheck_with_a_session_beside_a_move_holds_once_uncounted() {
+        let busy = moved_with_a_session();
+        let arm = cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, 0, false, false);
+        assert_eq!(arm, the_hold(), "{busy}");
+        assert_eq!(arm.defers_after(0), 0, "the hold counted a defer");
+        assert_eq!(arm.defers_after(3), 3, "the hold reset the count");
+    }
+
+    /// Criterion 1 (#4407): the session the move ended is gone by the look.
+    /// The hold is the move's own window, and the move came before the
+    /// recheck, so the look is the first check after that window, and it
+    /// checks, as a recheck with no session does once R5b's window has passed.
+    /// Had the network moved again meanwhile, the look takes R5b's 2-minute
+    /// recheck as the timer's cycle does, and the check after it proceeds.
+    #[test]
+    fn the_look_after_the_hold_checks_once_the_ended_session_is_gone() {
+        use crate::busy::Busy;
+        const {
+            assert!(OUTAGE_RECHECK_HOLD.as_secs() >= NET_TRANSITION_WINDOW.as_secs());
+            assert!(OUTAGE_RECHECK_HOLD.as_secs() < TRANSFER_DEFER_RECHECK.as_secs());
+        }
+        let recheck = Some(UpdateAsk::OutageRecheck);
+        let run = cycles(&[
+            (recheck.clone(), moved_with_a_session()),
+            (None, Busy::IDLE),
+        ]);
+        assert_eq!(run[0], (the_hold(), 0));
+        assert_eq!(
+            waited(&run[..1]),
+            OUTAGE_RECHECK_HOLD,
+            "the look comes after the hold, not the hour"
+        );
+        assert!(
+            matches!(
+                run[1],
+                (
+                    CycleArm::Gated {
+                        decision: DeferDecision::Proceed,
+                        ..
+                    },
+                    0
+                )
+            ),
+            "the look does not check: {:?}",
+            run[1]
+        );
+
+        let moved_again = Busy {
+            net_transition: true,
+            ..Busy::IDLE
+        };
+        let run = cycles(&[
+            (recheck, moved_with_a_session()),
+            (None, moved_again),
+            (None, Busy::IDLE),
+        ]);
+        assert_eq!(
+            run[1],
+            (
+                CycleArm::Gated {
+                    decision: DeferDecision::DeferOnce,
+                    recheck: NET_DEFER_RECHECK,
+                },
+                1
+            )
+        );
+        assert!(
+            matches!(
+                run[2].0,
+                CycleArm::Gated {
+                    decision: DeferDecision::Proceed,
+                    ..
+                }
+            ),
+            "{:?}",
+            run[2]
+        );
+    }
+
+    /// Criterion 2 (#4407): a session that stays live across the recheck. The
+    /// hold counts nothing; the look reads the session and defers by the hour,
+    /// counted, as the recheck did before #4407. The force still takes seven
+    /// counted defers in a row, so it comes one hold later than before, never
+    /// sooner. At the cap the recheck forces at once, as before: no hold.
+    #[test]
+    fn a_live_session_keeps_the_hour_and_the_count_so_the_force_comes_no_sooner() {
+        let cap = MAX_CONSECUTIVE_DEFERS as usize;
+        let still_live = crate::busy::Busy {
+            ssh_connections: 1,
+            ..crate::busy::Busy::IDLE
+        };
+        let mut run = vec![(Some(UpdateAsk::OutageRecheck), moved_with_a_session())];
+        run.extend(std::iter::repeat_n((None, still_live), cap + 1));
+        let run = cycles(&run);
+        assert_eq!(run[0], (the_hold(), 0));
+        for (n, cycle) in run[1..=cap].iter().enumerate() {
+            assert_eq!(*cycle, (the_hour(), n as u32 + 1), "look {n}");
+        }
+        assert!(
+            matches!(
+                run[cap + 1].0,
+                CycleArm::Gated {
+                    decision: DeferDecision::ForceAfterDefers,
+                    ..
+                }
+            ),
+            "{:?}",
+            run[cap + 1]
+        );
+        // Before #4407 the recheck was the first of the seven counted defers,
+        // and the force came seven hours after it.
+        assert_eq!(
+            waited(&run[..=cap]),
+            OUTAGE_RECHECK_HOLD + MAX_CONSECUTIVE_DEFERS * TRANSFER_DEFER_RECHECK
+        );
+        assert_eq!(
+            cycle_arm(
+                Some(&UpdateAsk::OutageRecheck),
+                &moved_with_a_session(),
+                MAX_CONSECUTIVE_DEFERS,
+                false,
+                false,
+            ),
+            CycleArm::Gated {
+                decision: DeferDecision::ForceAfterDefers,
+                recheck: TRANSFER_DEFER_RECHECK,
+            },
+            "at the cap"
+        );
+    }
+
+    /// Criterion 3 (#4407): one hold per recheck, and then today's rule, so no
+    /// short recheck repeats. An outage recheck right after a hold defers by
+    /// the hour and counts; the look, still reading a session beside a move,
+    /// takes the hour too, since the timer's cycle never holds; and a later
+    /// recheck, after another long outage, may hold once again.
+    #[test]
+    fn after_one_hold_the_rule_is_todays() {
+        let busy = moved_with_a_session();
+        let recheck = Some(UpdateAsk::OutageRecheck);
+        assert_eq!(
+            cycle_arm(recheck.as_ref(), &busy, 0, false, true),
+            the_hour(),
+            "a second hold in a row"
+        );
+        let run = cycles(&[
+            (recheck.clone(), busy),
+            (recheck.clone(), busy),
+            (None, busy),
+            (recheck, busy),
+        ]);
+        assert_eq!(
+            run,
+            vec![
+                (the_hold(), 0),
+                (the_hour(), 1),
+                (the_hour(), 2),
+                (the_hold(), 2)
+            ]
+        );
+    }
+
+    /// Criterion 4 (#4407): only the outage recheck holds. The timer's cycle,
+    /// an operator's push and an ask inside the install-storm cooldown take
+    /// the arms they took before #4407, for every `Busy`, every count, and
+    /// either side of a hold.
+    #[test]
+    fn the_timer_a_push_and_the_cooldown_never_hold() {
+        let push = UpdateAsk::Operator(None);
+        for busy in busy_cases() {
+            for defers in [0, 1, MAX_CONSECUTIVE_DEFERS - 1, MAX_CONSECUTIVE_DEFERS] {
+                for after_hold in [false, true] {
+                    let at = format!("{busy} after {defers} defers, after a hold: {after_hold}");
+                    let (decision, recheck) = periodic_gate(&busy, defers);
+                    assert_eq!(
+                        cycle_arm(None, &busy, defers, false, after_hold),
+                        CycleArm::Gated { decision, recheck },
+                        "the timer, {at}"
+                    );
+                    assert_eq!(
+                        cycle_arm(Some(&push), &busy, defers, false, after_hold),
+                        CycleArm::Forced {
+                            pin: None,
+                            warning: forced_update_warning(&busy),
+                        },
+                        "a push, {at}"
+                    );
+                    for ask in [UpdateAsk::OutageRecheck, push.clone()] {
+                        assert_eq!(
+                            cycle_arm(Some(&ask), &busy, defers, true, after_hold),
+                            CycleArm::Cooldown,
+                            "{ask:?} in the cooldown, {at}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ---- #1755 — a check that failed on the transport retries early ----
