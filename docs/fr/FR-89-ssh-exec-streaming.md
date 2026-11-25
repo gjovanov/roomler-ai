@@ -35,17 +35,20 @@ changed it.
 
 ## The mechanism, in the code (`origin/rec-demo-ssh-bytes-mac-banner`, #1819, the branch this builds on)
 
+Anchors are master `0019b4967` (#1819, 2026-10-07), that branch as it merged, before #1830 changed it. There
+`exec.rs` has 11 lines more than on the branch, all above these anchors.
+
 | What | Where | Why it blocks streaming |
 |---|---|---|
-| The SSH exec handler hands the command to the Fleet-RPC engine with the engine's maxima | `agents/roomlerd/src/ssh.rs:2020` `run_exec` → `:2066-2067` (`timeout_ms: MAX_TIMEOUT_MS`, `max_output_bytes: MAX_OUTPUT_BYTES`) → `:2073-2075` `run_fed` | the engine returns ONE `ExecOutcome` when the process is gone |
-| The whole output is sent after the run, then the ceiling notice | `ssh.rs:1983-1990`, `:1994-2006` | nothing reaches the channel while the command runs |
-| The engine re-clamps timeout and ceiling, takes the permit, registers cancel | `agents/roomlerd/src/exec.rs:1135` `run_fed`, `:1148-1149` | the clamps are for a wire the server bounded; SSH never needed them |
-| Both pipes are drained into a `Vec` against ONE shared budget | `exec.rs:1272-1276`, `read_capped` `:1367` | the reader stops at the budget; past it the child dies of SIGPIPE / `ERROR_NO_DATA` |
-| The process waits in a `select!` over `wait` / `sleep(timeout)` / `cancel` | `exec.rs:1281-1294` | a fixed wall clock kills a long transfer |
-| Windows `console_user`: `CreateProcessAsUserW` with three pipes, two blocking drain threads to EOF | `exec.rs:1953` `win_console::run`, `:2021-2024`; `agents/roomlerd/src/win_service/supervisor.rs:2117` `spawn_in_session_captured`, `:2318` `read_pipe_to_end` | the drain is "read everything, then return" — but the pipes are there; only the drain shape buffers |
-| The one-hour blocking `wait_for_exit` backstop | `exec.rs:2050-2052` | sized against `MAX_TIMEOUT_MS`; a command with no wall clock can outlive it |
-| The pty path streams with no ceiling and no timeout, and its lifetime is the channel's | `ssh.rs:1085` `start_pty_session`, the pump `:1191-1225` | the shape exec should have, minus the terminal |
-| The session deadline's doc says an exec in flight "is bounded by the engine's own wall-clock ceiling" | `ssh.rs:829-833`, `arm_session_deadline` `:859` | true today, false after this — the disconnect must cancel the command |
+| The SSH exec handler hands the command to the Fleet-RPC engine with the engine's maxima | `agents/roomlerd/src/ssh.rs:1887` `run_exec` → `:1933-1934` (`timeout_ms: MAX_TIMEOUT_MS`, `max_output_bytes: MAX_OUTPUT_BYTES`) → `:1940-1942` `run_fed` | the engine returns ONE `ExecOutcome` when the process is gone |
+| The whole output is sent after the run, then the ceiling notice | `ssh.rs:1948-1955`, `:1959-1971` | nothing reaches the channel while the command runs |
+| The engine re-clamps timeout and ceiling, takes the permit, registers cancel | `agents/roomlerd/src/exec.rs:942` `run_fed`, `:955-956` | the clamps are for a wire the server bounded; SSH never needed them |
+| Both pipes are drained into a `Vec` against ONE shared budget | `exec.rs:1120-1124`, `read_capped` `:1189` | the reader stops at the budget; past it the child dies of SIGPIPE / `ERROR_NO_DATA` |
+| The process waits in a `select!` over `wait` / `sleep(timeout)` / `cancel` | `exec.rs:1129-1142` | a fixed wall clock kills a long transfer |
+| Windows `console_user`: `CreateProcessAsUserW` with three pipes, two blocking drain threads to EOF | `exec.rs:1889` `win_console::run`, `:1957-1960`; `agents/roomlerd/src/win_service/supervisor.rs:1826` `spawn_in_session_captured`, `:2026` `read_pipe_to_end` | the drain is "read everything, then return" — but the pipes are there; only the drain shape buffers |
+| The one-hour blocking `wait_for_exit` backstop | `exec.rs:1986-1988` | sized against `MAX_TIMEOUT_MS`; a command with no wall clock can outlive it |
+| The pty path streams with no ceiling and no timeout, and its lifetime is the channel's | `ssh.rs:1094` `start_pty_session`, the pump `:1193-1218` | the shape exec should have, minus the terminal |
+| The session deadline's doc says an exec in flight "is bounded by the engine's own wall-clock ceiling" | `ssh.rs:819-823`, `arm_session_deadline` `:850` | true today, false after this — the disconnect must cancel the command |
 | `docs/roomler-ssh.md:580-584` | "`CreateProcessAsUserW`'s streaming form currently only exists in the pty's pseudoconsole path — there is no pipes variant yet" | outdated since P5b: `spawn_in_session_captured` IS the pipes variant; it drained to EOF, and now it streams |
 
 ## Key design
