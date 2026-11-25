@@ -141,23 +141,40 @@ describe('a plan set outside billing (#4433)', () => {
   it('says why when the server refuses a checkout as managed, and reads the org again', async () => {
     // The page was loaded before the plan was granted, so it still offers Pro.
     const w = await mountWith(free)
-    const words = "This organization's plan was set by Roomler, not through billing."
     vi.mocked(api.post).mockRejectedValue(
-      Object.assign(new Error(words), { status: 409, data: { error: 'plan_managed', message: words } }),
+      Object.assign(new Error('refused'), { status: 409, data: { error: 'plan_managed', message: 'refused' } }),
     )
     answerWith(() => managed('enterprise'))
 
-    const upgrade = w.findAll('button').find((b) => b.text().trim() === 'Upgrade to Pro')
-    expect(upgrade).toBeDefined()
-    await upgrade!.trigger('click')
-    await flushPromises()
+    await clickUpgradeToPro(w)
 
-    const alert = w.get('[data-testid="billing-error"]')
-    expect(alert.text()).toContain(words)
-    expect(alert.text()).not.toContain('Checkout failed')
+    // The page's own words, chosen by the code: never a bare "Checkout failed".
+    const alert = w.get('[data-testid="billing-error"]').text()
+    expect(alert).toContain('set by Roomler')
+    expect(alert).not.toContain('Checkout failed')
     const summaryReads = vi.mocked(api.get).mock.calls.filter(([url]) => url === SUMMARY_URL)
     expect(summaryReads).toHaveLength(2)
     expect(buttonsOf(w)).not.toContain('Upgrade to Pro')
     expect(notice(w).exists()).toBe(true)
   })
+
+  it('keeps any other refused checkout as it was', async () => {
+    const w = await mountWith(free)
+    const words = 'This organization already has a subscription — change the plan instead'
+    vi.mocked(api.post).mockRejectedValue(
+      Object.assign(new Error(words), { status: 409, data: { error: 'conflict', message: words } }),
+    )
+
+    await clickUpgradeToPro(w)
+
+    expect(w.get('[data-testid="billing-error"]').text()).toContain(`Checkout failed: ${words}`)
+    expect(notice(w).exists()).toBe(false)
+  })
 })
+
+async function clickUpgradeToPro(w: Page) {
+  const upgrade = w.findAll('button').find((b) => b.text().trim() === 'Upgrade to Pro')
+  expect(upgrade).toBeDefined()
+  await upgrade!.trigger('click')
+  await flushPromises()
+}

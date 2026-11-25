@@ -669,6 +669,30 @@ impl Plan {
             Plan::Enterprise => "enterprise",
         }
     }
+
+    /// The plan a wire id names ([`Self::id`] read back), or `None`.
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "free" => Some(Plan::Free),
+            "pro" => Some(Plan::Pro),
+            "business" => Some(Plan::Business),
+            "enterprise" => Some(Plan::Enterprise),
+            _ => None,
+        }
+    }
+
+    /// #4433 — the plan's place on the ladder: Free < Pro < Business <
+    /// Enterprise. Written out rather than read off the variants' order, so
+    /// reordering them, or adding a tier, cannot quietly change which
+    /// checkout lowers a plan (`services::stripe::checkout_lowers_plan`).
+    pub fn rank(&self) -> u8 {
+        match self {
+            Plan::Free => 0,
+            Plan::Pro => 1,
+            Plan::Business => 2,
+            Plan::Enterprise => 3,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -768,6 +792,30 @@ mod plan_tests {
         assert_eq!(ent.storage_bytes, biz.storage_bytes);
         assert_eq!(ent.max_devices, biz.max_devices);
         assert_eq!(ent.video_max_participants, biz.video_max_participants);
+    }
+
+    /// #4433 — the ladder a checkout is measured on: each plan ranks
+    /// strictly above the one before it, and every wire id reads back as its
+    /// plan.
+    #[test]
+    fn plans_rank_free_pro_business_enterprise() {
+        let ladder = [Plan::Free, Plan::Pro, Plan::Business, Plan::Enterprise];
+        for pair in ladder.windows(2) {
+            assert!(
+                pair[0].rank() < pair[1].rank(),
+                "{:?} must rank below {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(Plan::Free.rank(), 0, "Free is the floor");
+        for plan in ladder {
+            let id = plan.id();
+            assert_eq!(Plan::from_id(id), Some(plan), "{id}");
+        }
+        for other in ["", "Pro", "team", "enterprise "] {
+            assert_eq!(Plan::from_id(other), None, "{other:?}");
+        }
     }
 
     /// Zero and absurd seat counts are clamped and saturate — never a wrap.
