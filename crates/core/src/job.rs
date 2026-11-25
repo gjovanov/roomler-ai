@@ -29,6 +29,10 @@ pub struct Job {
     pub name: &'static str,
     /// `true` = only the pod holding the startup lease runs it. Anything that
     /// writes shared state at boot must be gated; a per-pod cache warm need not.
+    /// Nor need a write that stays right on BOTH counts: beside a live pod's
+    /// own writes (the stale-call reset is not: it ends calls live there) and
+    /// beside a second run of the job, e.g. each write a compare on the value
+    /// it read. Chat's `room-member-count` is one, and it runs on every pod.
     pub leader_gated: bool,
     pub cadence: Cadence,
     pub run: Arc<dyn Fn() -> JobFuture + Send + Sync>,
