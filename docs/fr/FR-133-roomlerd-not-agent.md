@@ -1,6 +1,6 @@
 # FR-133: Nothing a person reads calls the daemon an "agent" — it is `roomlerd`
 
-**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 shipped in 0.4.192 (#3209); AC1 to AC4 and AC7 met 2026-11-03; P2a shipped in 0.4.234 (#4307); P2b built (#4314), promoted 2026-11-23 (`hosted-20261123-a238604`); P2c shipped in 0.4.236 (#4343); P2d built (#4418), the tunnel gate's refusals, a server change; P4 built (#4412), the guard in CI's `name-audit` job ([The guard (P4)](#the-guard-p4)); P3 proposed (D1–D3 decided 2026-10-30); spec and claim 2026-10-30 ·
+**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 shipped in 0.4.192 (#3209); AC1 to AC4 and AC7 met 2026-11-03, AC5b met 2026-11-25; P2a shipped in 0.4.234 (#4307); P2b built (#4314), promoted 2026-11-23 (`hosted-20261123-a238604`); P2c shipped in 0.4.236 (#4343); P2d built (#4418), the tunnel gate's refusals, a server change; P4 built (#4412), the guard in CI's `name-audit` job ([The guard (P4)](#the-guard-p4)); P3 proposed (D1–D3 decided 2026-10-30); spec and claim 2026-10-30 ·
 **Related:** FR-46 ([#1051](https://github.com/gjovanov/roomler-ai/issues/1051), the retired `roomler-agent` names; its "MSI installer identity — its own program" row is this FR's P1) ·
 FR-21 (the retired-name guard, `scripts/name-audit.sh`) · FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), the wizard; its phase C renames the wizard's own words)
 
@@ -88,9 +88,20 @@ and needs those lookups to accept both names.
 - [ ] **AC5** — Every page, progress line and Done text of the released wizard, every companion
       page and the web app's person-facing strings contain no "agent" outside the allowlist
       (asserted by tests, then by P4's guard).
-- [ ] **AC5b** — The daemon's notifications, the text the daemon writes for the web viewer, and
+- [x] **AC5b** — The daemon's notifications, the text the daemon writes for the web viewer, and
       the CLI and LocalAPI output contain no "agent" outside the allowlist (asserted by tests,
-      then by P4's guard).
+      then by P4's guard). **Met (2026-11-25):** P2a (#4307) read after publication in
+      agent-v0.4.234, GREEN ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7115908297));
+      P2c (#4343) read after publication in agent-v0.4.236, GREEN
+      ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7132981129));
+      P2d (#4418), the tunnel gate's four reasons: the unit test
+      `policy::tests::gate_refusal_reasons_say_device_not_agent`, and a read of the RUNNING
+      production server after the roll to `hosted-20261125-236a9f7`
+      ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7157059067)): the
+      four new phrases are in the binary and the gate's old cross-tenant phrase is at 0 (the three
+      other old phrases there come only from the server's own surface, outside AC5b); and P4's
+      guard (#4412), whose daemon row has been 0 since #4418 (see
+      [the baseline from P2d on](#the-guard-p4)).
 - [ ] **AC6** — The docs site's pages say `roomlerd`.
 - [x] **AC7** — Docs: `docs/installation.md` and the `ship-it` skill updated, with a
       `docs/README.md` row if a doc is added. **Met:** `docs/installation.md:550` and
@@ -141,7 +152,9 @@ flowchart TD
 | `node scripts/says-roomlerd.cjs --update-baseline` | rewrites the baseline from the tree; refused while a marker is at fault |
 
 **What it reads.** A reader per kind of file: Rust string literals outside comments, log macros and
-test code (P2a's lexer); JS strings outside comments and `console.*` calls; a page's text and its
+test code (P2a's lexer; a log macro is one of the five tracing macros or a file's own `macro_rules!`
+that calls one and calls no person-facing macro (`println!`, `format!`, `bail!` and the like, or a local macro that does), such as the network module's `miss_line!`, found per file because a macro's scope is
+textual, so a `#[macro_export]` macro that another file calls is not seen); JS strings outside comments and `console.*` calls; a page's text and its
 `placeholder`, `title`, `aria-label` and `alt`; Markdown prose; the quoted strings and heredocs of
 `sh` and `ps1`; a `.wxs`'s attribute values and text; the shown keys of a `Cargo.toml`,
 `tauri.conf.json`, `.desktop` entry or systemd unit; every line of an installed README; and the
@@ -161,7 +174,8 @@ and its message names the entry to add.
 **Keeping one.** Reword it first: `roomlerd`, "the daemon", or "device" as P2b words them. When the
 word must stay, a comment says why, on the line above it or on its own line:
 `AGENT-WORD-KEPT: <the reason>`. It covers its own line and the next line that is neither blank nor
-a comment. A marker with no reason fails, and so does one that covers nothing. A phrase in a file
+a comment. A marker with no reason fails, and so does one that covers nothing (a marker on a log
+line of the file's own macro covers it, as `overlay.rs`'s does). A phrase in a file
 that cannot hold a comment, or in one whose comments a person reads (an installed README), or one
 that only a log line carries, goes in the script's `KEPT_PHRASES` with its reason; a listed phrase
 that is gone fails too. A new identity goes in `IDENTITIES` with its reason, and in the key-design
@@ -218,3 +232,4 @@ surface.
 | 2026-11-02 | released 0.4.197 MSIs, a clean throwaway Win11 guest, `install.ps1` as production serves it | ✅ **AC1, AC2, AC3**, read during FR-129's field run ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-6578314826)). AC1: the per-machine MSI lists one entry, **Roomler (per-Machine)** 0.4.197, G ROX LTD, and UAC on the secure desktop reads "Roomler installer, Verified publisher: G ROX LTD"; the per-user MSI lists one entry, **Roomler** 0.4.197. AC2: 0.4.188 per-machine (`Roomler Agent (per-Machine)`) with SystemContext on, then `msiexec /i` of the 0.4.197 per-machine MSI: one entry under the new name, service Running and Automatic, `ROOMLERD_ENABLE_SYSTEM_SWAP=1` kept. AC3: `-Uninstall` on the wizard's install, on 0.4.188, on the upgraded one and on the per-user one: 0 entries, no service, no `roomlerd.exe`. What it leaves behind is [#3247](https://github.com/gjovanov/roomler-ai/issues/3247#issuecomment-6578313265). |
 | 2026-11-03 | released 0.4.197 `.deb`, a Linux device, read-only through `roomler exec` | ✅ **AC4.** `apt show roomlerd` and `dpkg -s roomlerd`, version `0.4.197-1`: `Description: Roomler daemon (roomlerd): remote desktop, private WireGuard mesh and tunnels`, and the extended description opens "Roomler Daemon". Neither holds the word. Before P1 the package said "Roomler AI remote-control agent — runs on the controlled host, connects to the Roomler API." (the source at `00c264cc6^`). `Provides: roomler-agent` and `Replaces: …, roomler-agent` remain in the same output: those are the retired package's identity, and the criterion is about the summary. |
 | 2026-11-23 | `hosted-20261123-a238604`, production's served web app | ✅ **P2b.** The served bundle, read by chunk for 7 sampled strings ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7096073584)): before the roll (entry `index-CXJcFygu.js`, 08:31Z) every old string was there and no new one; after it (entry `index-CNJBMpkJ.js`, 08:46Z) no old string and every new one. This is the web app's share of AC5, which stays open (the companion ships in 0.4.234, and P4's guard is not built). |
+| 2026-11-25 | `hosted-20261125-236a9f7`, production's running server, after the roll | ✅ **P2d, and AC5b's last piece** ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7157059067)). The four reworded gate reasons are in the running binary and the gate's old cross-tenant phrase is at 0; the three other old phrases there come only from the server's own surface (the 60), which is outside AC5b. With P2a (0.4.234) and P2c (0.4.236) read GREEN and P4's guard at 0 hits for the daemon, AC5b is met and ticked. |

@@ -2,6 +2,8 @@
 
 **Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **CLOSED 2026-08-30 — every functional criterion field-verified.** The browser renders a GNOME Wayland desktop, drives it, types into it, sees the greeter and a locked screen, and survives a reboot with nobody logged in. ⚠️ Two performance numbers did NOT meet their stated bar; see the acceptance list · **Owner:** agent / capture
 
+**Anchors:** master `51d355887` (closed 2026-08-30): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Capture a **Wayland** desktop, **unattended** — including while the session is
@@ -134,14 +136,14 @@ is tempting to skip. Do not skip it permanently. RustDesk's shape is a separate
 attacker-controllable field is a CRTC-id equality filter. That is the right
 target for a binary shipping to every fleet host — and it maps onto this repo's
 existing self-spawn precedent (`roomlerd caps-probe`,
-`#[command(hide = true)]` at `app.rs:162`, spawned via `current_exe()` at
-`encode/caps.rs:270`), so it needs **no new packaged artifact**.
+`#[command(hide = true)]` at `app.rs:149`, spawned via `current_exe()` at (2026-10-27)
+`encode/caps.rs:79`), so it needs **no new packaged artifact**.
 
 ### The seam is unchanged
 
-`ScreenCapture` (`capture/mod.rs:611`), chosen in `open_default`
-(`capture/mod.rs:2837`); backends at `:16` scrap, `:22` x11_damage, `:51` wgc,
-`:60` synthetic. DRM is a fifth — no pump changes.
+`ScreenCapture` (`capture/mod.rs:266`), chosen in `open_default`
+(`capture/mod.rs:413`); backends at `:16` scrap, `:22` x11_damage, `:25` wgc,
+`:34` synthetic. DRM is a fifth — no pump changes.
 
 ## Host readiness — measured on `scw-m2-asahi`, 2026-08-29
 

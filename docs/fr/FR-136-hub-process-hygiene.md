@@ -8,6 +8,8 @@ runs: the navigator, the pane that shrank around it, and hub-guard 0.4.0–0.4.3
 and §8 for the view.
 [FR-152](FR-152-cold-hub-continues-from-handoff.md) builds on it in turn: hub-guard's sixth part, `cold`, rotates a hub coordinator whose cache went cold ([`agent-hub.md` §12.5](../agent-hub.md#125-the-cold-rotation)).
 
+**Anchors:** master `70ec2b621` (closed 2026-11-05): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Problem / Goal
 
 On 2026-11-03 a hub worker passed a docs-anchor helper its file list inline, where the helper expects a

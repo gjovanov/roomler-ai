@@ -81,6 +81,13 @@ row** and an **acceptance criterion** for it ("docs updated/created with diagram
 FR-69's [`../modular-monolith.md`](../modular-monolith.md) (owed after the fact), FR-73's
 pipeline section in [`../deployment.md`](../deployment.md).
 
+**The commit that closes an FR pins its spec** (#4413). It adds the preamble pin
+`` **Anchors:** master `<sha>` (closed <date>) `` as its own paragraph under the CLOSED
+banner, naming the master commit the close reads. A closed spec is the record of the work,
+so its `file:line` anchors read at that commit, and the anchor passes that re-point line
+numbers after a code move leave a pinned spec alone. CI's `scripts/fr-registry-audit.sh`
+fails a closed row whose spec has no preamble pin.
+
 A `file:N-M` range reads start ≤ end: CI's `scripts/anchor-range-audit.sh` fails on a new
 inverted one. The 31 already on master when it landed (2026-10-21, all half-shifted) are
 pinned in `scripts/anchor-range-baseline.txt`. Fix one and delete its line; the baseline only

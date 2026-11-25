@@ -1,5 +1,7 @@
 # FR-89: SSH exec output streams — no ceiling, no wall clock, the channel owns the command's life
 
+**Anchors:** master `9e29aed04` (closed 2026-10-08): this spec is the record of the work, and its line anchors read at that commit.
+
 Issue: [#1826](https://github.com/gjovanov/roomler-ai/issues/1826) · builds on
 [#1819](https://github.com/gjovanov/roomler-ai/pull/1819) (byte-exact exec output, the ceiling notice) ·
 related [#1747](https://github.com/gjovanov/roomler-ai/issues/1747) (the client's stdin reaches the command).

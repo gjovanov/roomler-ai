@@ -1,5 +1,7 @@
 # FR-26 — Remote-desktop viewer: display name, quality-metric toggles, FSR default, settings reorg
 
+**Anchors:** master `cfaa6aea9` (closed 2026-08-29): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#840](https://github.com/gjovanov/roomler-ai/issues/840)
 **Status:** shipped in #845 — **field-verified 2026-08-29, all criteria met**
 

@@ -2,6 +2,8 @@
 
 **Issue:** [#1503](https://github.com/gjovanov/roomler-ai/issues/1503) · **Status:** **closed 2026-09-08** — shipped `agent-v0.4.88` → `0.4.92`; every criterion field-verified, one viewer session per cell across Intel / AMD / NVIDIA / RADV · **Opened:** 2026-09-08 · **Glossary:** [`CONTEXT.md`](../../CONTEXT.md) · **ADR:** [0001](../adr/0001-encoder-backends-compiled-in-discovered-at-runtime.md) · **Related:** [FR-77](FR-77-encoder-chroma-matrix.md) · [FR-62](FR-62-encoder-rate-changes-without-an-idr.md) · [`docs/encoders.md`](../encoders.md)
 
+**Anchors:** master `37f4d21d1` (closed 2026-09-08): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Two more **backends** in the one runtime-probed build per platform (FR-77's shape,

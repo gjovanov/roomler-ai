@@ -22,6 +22,8 @@ diagrams, under the standing rule that closing an FR requires its docs (CLAUDE.m
 [#1311](https://github.com/gjovanov/roomler-ai/pull/1311) · P0 contract + baseline
 [#1312](https://github.com/gjovanov/roomler-ai/pull/1312)
 
+**Anchors:** master `a21afd6ee` (closed 2026-09-05): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Decouple the server into pillar modules behind one small core, as a **modular monolith**:
@@ -66,7 +68,7 @@ Two more measurements shaped the design rather than motivating it:
   consent and cluster metrics. It is the device control-plane multiplexer, not a remote-desktop
   object — which is why device management becomes a module of its own (D3).
 - **The wire already groups by pillar.** `ClientMsg`/`ServerMsg`
-  (`crates/remote_control/src/signaling.rs:503`, `:2370`) carry ~134 variants; the `rc:` names
+  (`crates/remote_control/src/signaling.rs:525`, `:2315`) carry ~134 variants; the `rc:` names (2026-11-04)
   group as tunnel 35 · overlay 18 · agent 8 · rpc 5 · ssh 4 · sdp 4 · relay 4 · session 3 ·
   consent 3. The namespaces map onto modules without touching a byte (D7).
 

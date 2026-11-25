@@ -1532,8 +1532,8 @@ sequenceDiagram
 
 ### The six kinds — `billing_events`
 
-[`process`, stripe.rs:1242](../crates/services/src/stripe.rs) records every billing kind
-before the tenant-state updates it always made; [`parse`, billing.rs:297](../crates/services/src/billing.rs)
+[`process`, stripe.rs:1248](../crates/services/src/stripe.rs) records every billing kind
+before the tenant-state updates it always made; [`parse`, billing.rs:340](../crates/services/src/billing.rs)
 reads Stripe's objects for both API versions in the field (the classic shape and the
 2025-03-31 "basil" one, which moved `invoice.subscription` under `parent`, a line's
 `proration` under `parent.subscription_item_details` and the subscription's period onto its
@@ -1548,9 +1548,9 @@ items).
 | `invoice.payment_failed` | `invoice_payment_failed` | `amount_cents` = `amount_due` |
 | `customer.subscription.trial_will_end` | `trial_will_end` | the trial's end |
 
-- **The org** ([`tenant_for`, stripe.rs:690](../crates/services/src/stripe.rs)): the
+- **The org** ([`tenant_for`, stripe.rs:1070](../crates/services/src/stripe.rs)): the
   `tenant_id` the checkout stamps on the **subscription's** metadata (from P4,
-  `subscription_data[metadata]`, [stripe.rs:210](../crates/services/src/stripe.rs)), else the
+  `subscription_data[metadata]`, [stripe.rs:395](../crates/services/src/stripe.rs)), else the
   org whose `billing.customer_id` / `billing.subscription_id` the object names. An object that
   names no org here is logged with its ids and not recorded — revenue nobody can be credited
   with is not a row.
@@ -1671,11 +1671,11 @@ current month.
 ### The backfill — operator-run, once
 
 `POST /api/admin/growth/billing/backfill?since=YYYY-MM-DD` (`saas`,
-[`backfill`, saas stripe.rs:137](../crates/modules/saas/src/stripe.rs)) — platform admins only,
+[`backfill`, saas stripe.rs:277](../crates/modules/saas/src/stripe.rs)) — platform admins only,
 404 otherwise and with growth off. It reads Stripe's **paid** invoices (created since `since`
 when given; 100 a page, at most 100 pages) into `invoice_paid` rows with `source: backfill`
-([`backfill_paid_invoices`, stripe.rs:396](../crates/services/src/stripe.rs)), then refreezes the
-closed months those invoices touch ([`refreeze`, saas stripe.rs:190](../crates/modules/saas/src/stripe.rs))
+([`backfill_paid_invoices`, stripe.rs:777](../crates/services/src/stripe.rs)), then refreezes the
+closed months those invoices touch ([`refreeze`, saas stripe.rs:330](../crates/modules/saas/src/stripe.rs))
 and leaves a `growth_pulls` marker (`billing_backfill:YYYY-MM-DD`) the views read. It only
 reads Stripe. Idempotent: an invoice already on record (the webhook's, or an earlier run's) is
 counted under `already` and left as it was; one naming no org here under `no_org`.

@@ -1,5 +1,7 @@
 # FR-7: Signed releases — Windows Authenticode (Azure), Linux GPG + provenance, macOS identity
 
+**Anchors:** master `860fc2c13` (closed 2026-08-27): this spec is the record of the work, and its line anchors read at that commit.
+
 **Status: SHIPPED + field-verified** (retroactive FR per the CLAUDE.md standing rule —
 the program ran 2026-08-15 → 2026-08-26; this spec records what was required, what was
 built, and how each requirement was proven. Tracking issue: gjovanov/roomler-ai#778. Renumbered FR-3→FR-7 per the lower-issue-id tie-break after the day-one mint races.)

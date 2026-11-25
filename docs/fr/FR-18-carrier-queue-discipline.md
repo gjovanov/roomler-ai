@@ -7,6 +7,8 @@ released in 0.4.189) and the docs AC was met. On 2026-10-31 the fleet read met A
 half. On 2026-11-02 a week of natural traffic moved AC1, AC3 and AC5 to partial. The drag
 ACs wait on the CORPLAP-1 ↔ CORPLAP-3 relay pair.
 
+**Anchors:** master `1c584fb7e` (closed 2026-11-16): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Why this is the priority — the LAN-relay test came back negative
 
 Before committing to queue work, we tested whether a LAN-local DERP relay could serve

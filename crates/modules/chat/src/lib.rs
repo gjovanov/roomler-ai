@@ -33,13 +33,16 @@ use roomler_ai_services::{
     GiphyService,
     dao::{file::FileDao, message::MessageDao, reaction::ReactionDao, room::RoomDao},
 };
-use roomler_core::{Capabilities, Core, Module, Role, TenantCtx, WsHandlerSpec, WsRegistration};
+use roomler_core::{
+    Capabilities, Core, Job, Module, Role, TenantCtx, WsHandlerSpec, WsRegistration,
+};
 
 pub mod export;
 pub mod file;
 pub mod giphy;
 pub mod guards;
 pub mod media_type;
+pub mod member_count;
 pub mod membership;
 pub mod message;
 pub mod reaction;
@@ -185,6 +188,19 @@ impl Module for ChatState {
     /// A room membership ends with the org membership under it.
     fn hooks(&self) -> roomler_core::Hooks {
         membership::hooks(self)
+    }
+
+    /// #4409: each boot sets a room's stored member count to its member rows
+    /// ([`member_count`]). Not leader-gated: every write compares the count
+    /// it read, so a pass is right beside a live pod's joins and leaves and
+    /// beside another pass, and a roll's last pod to boot passes after the
+    /// old code is gone.
+    fn jobs(&self) -> Vec<Job> {
+        let state = self.clone();
+        vec![Job::at_startup(member_count::JOB, false, move || {
+            let state = state.clone();
+            async move { member_count::repair(&state).await }
+        })]
     }
 
     /// `typing:start` / `typing:stop` on the user socket.

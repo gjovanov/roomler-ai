@@ -3,6 +3,8 @@
 **Issue:** [#1362](https://github.com/gjovanov/roomler-ai/issues/1362) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). The classifier stays, as FR-79's gate generalised it. The field repeats of a transit stall (AC3, AC4, AC6) moved to FR-148 P1 and P3, and AC5's second half to its P5. FR-148 §12 maps each open criterion. At the close: proposed 2026-09-05; T1a+T1b+T1c shipped (hold default off); AC2 days 1–4 read (96 % gaps); **AC3 field hold-on half FAILED 2026-09-08 — the hold masks the wrong mover; deletion proposed (§Open decisions)**; **T1b, T2 and T2b were superseded 2026-09-08 by [FR-79](FR-79-one-validity-gate.md)'s one validity gate, which deleted all three and their switches**; **2026-10-29**: the classifier documented (AC7) and a 15-day fleet read of 40,654 constrained windows against the gate — AC2 met; the hold's property holds where nothing is measured and **fails through FR-79 V5's `stall_is_ours` loop** (AC3–AC6 `[~]`, §Open decisions) ·
 **Parent:** split out of FR-70 (#1330) on its own open question; FR-70's M0 is this FR's instrument.
 
+**Anchors:** master `1c584fb7e` (closed 2026-11-16): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 When the path between the wire and the viewer's decode worker stalls — a
@@ -357,7 +359,7 @@ The docs for the classifier live with the gate's, as the section it feeds:
       clean episodes cut** — 55 drops of exactly ×0.85 (×0.72 where two fell in
       one heartbeat) on gap or split windows with nothing sender-side — every one
       on a session whose prior stood at 0.02–0.8 M. The mover is V5's
-      `stall_is_ours` (`governor.rs:1219`): it compares `desired` with `pipe_bps`
+      `stall_is_ours` (`governor.rs:1154`): it compares `desired` with `pipe_bps`
       (`:607`), whose last source is the prior's stand-in (`:613`), and on every
       window it fires on it pushes that prior back with no measurement attached
       (`:1377`, `RatePrior::on_window(None, true)`: one step down per two dirty

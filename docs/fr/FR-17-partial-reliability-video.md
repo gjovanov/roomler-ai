@@ -8,6 +8,8 @@ that #1169 replaced, so those runs do not yet say what unordered delivery buys o
 receiver that exists now (field log). Tracking issue: `FR-17` (#799). Sibling of FR-16
 (#798, the harness that must gate it); the architectural half of the FR-1 program.
 
+**Anchors:** master `1c584fb7e` (closed 2026-11-16): this spec is the record of the work, and its line anchors read at that commit.
+
 ## The measurement
 
 Prod `agent_logs`, 2026-08-27, both hosts on 0.4.9, 1920×1200@30 over a DERP relay:
@@ -222,7 +224,7 @@ path says `true` (`:264`). The flag stays once per MESSAGE while the counter say
 frames died. Nothing changes on the ordered default (a test over an in-order stream of
 mixed chunk counts pins it), and the forced-IDR rate stays bounded where it was — the
 worker's 250 ms debounce and the agent's 500 ms `MIN_KF_GAP` on `rc:keyframe`
-(`agents/roomlerd/src/peer.rs:11440`), at most 2/s per session — now reachable under
+(`agents/roomlerd/src/peer.rs:11457`), at most 2/s per session — now reachable under
 heavy loss instead of never. Unit evidence, red then green: master's spec was 15/15 green
 against the defective module; the new spec failed 4 of 19 against it (the overtaken-frame
 test, completion on the last chunk, the collision, and the seeded property at
@@ -257,8 +259,8 @@ that could not tolerate reordering; what unordered delivery costs or buys on thi
 not been measured.
 
 ⚠️ **The default flip is NOT taken, and its criterion is written down.** `videoDcOptions`
-(`useRemoteControl.ts:5094`) still opens `{ ordered: false, maxRetransmits: 0 }` (`:5099`)
-only behind `roomler-rc-unordered-video=1` (`storedUnorderedVideo`, `:5106`). FR-59's
+(`useRemoteControl.ts:5093`) still opens `{ ordered: false, maxRetransmits: 0 }` (`:5098`)
+only behind `roomler-rc-unordered-video=1` (`storedUnorderedVideo`, `:5085`). FR-59's
 criterion for the flip: an airport-class session with the opt-in ON showing
 `chunkStragglers` climbing while `chunkGaps` stays flat and fps holds — both counters are
 in the worker's stats (`rc-dc-worker.ts:459`). Stragglers

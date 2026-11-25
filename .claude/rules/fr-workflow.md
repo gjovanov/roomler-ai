@@ -57,6 +57,13 @@ write-up filed afterwards. Registry and full protocol: **`docs/fr/README.md`**.
    push-triggered, because closing an issue leaves no trace in the repo at all.
    Pre-existing debt is pinned per-FR in `scripts/fr-ac-debt-baseline.txt`, each
    line saying *why* that FR closed without them.
+   ⚠️ **The commit that closes an FR pins its spec** (#4413): it adds the preamble
+   pin `` **Anchors:** master `<sha>` (closed <date>) `` as its own paragraph under
+   the CLOSED banner, naming the master commit the close reads. A closed spec is
+   the record of the work, so its `file:line` anchors read at that commit; without
+   the pin, every anchor pass that re-points line numbers after a code move
+   shifts them. Enforced by `scripts/fr-registry-audit.sh` + CI: a closed row
+   whose spec has no preamble pin fails it.
 5. **Docs before close** (operator, 2026-09-05): closing requires the docs that
    describe what it built to be updated or created, in the house style of the other
    `docs/*.md` — **mermaid diagrams**, tables, callouts, `file:line` anchors, and a

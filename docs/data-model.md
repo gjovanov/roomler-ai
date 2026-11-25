@@ -38,8 +38,8 @@ erDiagram
 | `users` | Accounts. Unique `email`, `username`; text index on `display_name`+`username`. ⚠️ Unique `email` is a **reservation**, so it holds only an address the account has *proven* (activation, or a provider that verified it) — an unproven claim goes to the non-indexed `unverified_email` and the row takes a `.invalid` placeholder |
 | `tenant_members` | Membership + role assignment. Unique `(tenant_id, user_id)` |
 | `roles` | Permission bitfield (`u64`; 35 bits defined, of which 32–34 are reserved and never reused: parked FR-90's `HIVE_RUN`, `KNOWHOW_VIEW` and `KNOWHOW_EDIT`, still set in stored masks — [permissions.md](permissions.md#reserved-bits-32-34-fr-137)). Unique `(tenant_id, name)`, ordered by `position` |
-| `rooms` | Hierarchical tree (text + voice/video): `parent_id`, unique `(tenant_id, path)`, sparse-unique `meeting_code`; text index on `name`+`purpose`+`tags`. Optional `binding {module, ref}` — another module owns what the room *means*; chat stores it and never interprets it. No module sets it now: the rooms parked FR-90 bound (`secret`, path `hive-<session id>`) still carry it and open as plain Secret rooms (FR-137) |
-| `room_members` | Per-room membership |
+| `rooms` | Hierarchical tree (text + voice/video): `parent_id`, unique `(tenant_id, path)`, sparse-unique `meeting_code`; text index on `name`+`purpose`+`tags`. Optional `binding {module, ref}` — another module owns what the room *means*; chat stores it and never interprets it. No module sets it now: the rooms parked FR-90 bound (`secret`, path `hive-<session id>`) still carry it and open as plain Secret rooms (FR-137). `member_count` is the number of its `room_members` rows, moved by the code that writes a row ([below](#a-rooms-member_count-is-its-member-rows-4409)) |
+| `room_members` | Per-room membership: one row per member, unique `(room_id, user_id)` (`crates/modules/chat/src/lib.rs:240`). A leave deletes the row, so the rows with a room's `room_id` are its members: what the member route lists and counts as its `total`, and what `rooms.member_count` counts |
 | `messages` | Chat. Thread via `thread_id`, pins, embeds; text index on `content`. `author_type` `user` (default) · `bot` · `webhook` · `system`; a non-user author carries its own `author_display`, which is read **only** when `author_type` is not `user` — a person cannot rename themselves through it. Optional `binding`, set by no module now (parked FR-90's turn stubs still carry both fields) |
 | `reactions` | Unicode + custom-emoji reactions, keyed by `message_id` |
 | `recordings` | Call recordings; storage provider `S3`/`MinIO`/`Local`. `created_by`: who started it (absent on older rows) |
@@ -51,6 +51,7 @@ erDiagram
 | `notifications` | @mention & system notifications; `is_read`. ⚠️ A `notification_type` a build does not know reads as `other` — one new kind must not fail a user's whole list on an older pod mid-roll. Parked FR-90's stored `approval_request` rows read so too (`crates/db/src/models/notification.rs:42`) |
 | `push_subscriptions` | Web-push endpoints (VAPID) |
 | `background_tasks` | Export/processing pipeline; TTL-expired |
+| `locks` | Server-wide coordination documents, one per `_id`; no index beyond `_id`, no TTL. `startup_maintenance`: the 120 s startup lease (`expires_at`) that one pod wins at boot and the leader-gated startup jobs run under (`crates/api/src/main.rs:228-245`). `room_member_count`: where the last member-count pass that stopped early stopped — `after` (the last room `_id` of the last batch it finished) and `at`; absent once a pass reaches the last room ([below](#a-rooms-member_count-is-its-member-rows-4409)) |
 | `activation_codes` | Email activation. One row per account, replaced by every new link; TTL on `valid_to`. ⚠️ So nothing that must outlive the link can live here: the resend cooldown's stamp is `users.activation_resent_at` (#3199) |
 | `stripe_events` | Stripe webhook dedupe/audit. **FR-102 P4**: an event whose processing failed is un-marked, so Stripe's retry is processed rather than skipped |
 | `billing_events` | FR-102 P4 (`saas`): what Stripe billed — one row per webhook event of the six billing kinds (`subscription_created` · `subscription_updated` · `subscription_deleted` · `invoice_paid` · `invoice_payment_failed` · `trial_will_end`) and one per paid invoice the operator's backfill read: `tenant_id`, `kind`, `plan`, `seats`, `amount_cents` (invoices: what was billed, after coupons, before tax; `null` on a subscription event, never 0), `recurring_cents` (the non-proration subscription lines — the basis of billed MRR), `interval_months`, `currency`, `period_start` / `period_end`, `stripe_id` (`in_…` / `sub_…`), `subscription_id`, `status`, `reason`, `cancel_at_period_end`, `event_id` (absent on a backfilled row), `source` (`webhook` · `backfill`), `ts`, `recorded_at`. **Never a card, an address or a name.** Indexes: sparse-unique `event_id`; unique `(kind, stripe_id)` partial on `kind: invoice_paid` (the webhook and the backfill meet on it); `(tenant_id, ts)`; `(kind, ts)`. No TTL — **kept with the org**: `roomler_core::growth::purge_tenant` takes them; the monthly totals frozen into `growth_daily` carry no org and stay ([growth-observability.md](growth-observability.md#revenue-what-stripe-billed-p4)) |
@@ -73,6 +74,51 @@ erDiagram
 | `growth_post_snapshots` | FR-102 P8: a post's metrics at `T+1d` · `T+7d` · `T+28d` — `{platform, platform_id, snapshot, taken_at, metrics {raw name: number}, received_at}`, the platform's own metric names kept verbatim. Unique `(platform, platform_id, snapshot)` and **written once** (`$setOnInsert`): a snapshot pushed twice is stored once (AC18). No TTL |
 | `growth_pulls` | FR-102 P6: one row per `(source, UTC day)` a puller attempted, `_id = "<source>:<YYYY-MM-DD>"` — `status` (`ok` once a pull succeeded, and it stays `ok` through a later failure; `failed` while none has), `pulled_at`, `attempted_at`, `attempts`, `rows`, `error` (a short reason, never a credential), `missing_goal`, `truncated`. What lets a reader of `growth_daily` tell **not pulled** (no row) or **failed** from a pulled zero. Written by the `saas` purestat puller, read by the Campaigns table's pull summary. **P4**: `billing:YYYY-MM-01` marks a month's billed totals frozen (the host's nightly freeze), and `billing_backfill:YYYY-MM-DD` a run of the operator's Stripe backfill (`rows` = invoices recorded) — what tells "billed since the webhook was wired" from "billed, history included". **P7a**: `github:YYYY-MM-DD` (the closed day's snapshot, `truncated` when the release list hit its 10-page bound) and `github_traffic:YYYY-MM-DD` (with a token), written by the `saas` GitHub puller and read by `growth::github` — only an `ok` day is a snapshot. **P7b**: `search_console:YYYY-MM-DD` for each FINAL day pulled (a day Google has not settled has no row: pending, never 0), `content:YYYY-MM-DD` and `url_inspection:YYYY-MM-DD` for the day's read of the blog's feed and its inspections, and `bing:YYYY-MM-DD` for a cycle's read of Bing (under the day it followed). Index `(source, day)`; no TTL, like the rows it describes |
 | `growth_org_daily` | FR-102 P2: one row per org per UTC day with any activity, `_id = "{tenant_hex}:{YYYY-MM-DD}"` — the day's `rc_sessions` / `rc_session_minutes` / `rc_controllers`, `calls` / `call_participant_minutes`, `tunnel_flows`, `ssh_sessions`, `exec_runs`, `devices_online`, `members_active`, and `value` (bool) + `value_kinds`. Folded whole by a singleton nightly host job (recompute-last-3-closed-days, replace-then-prune per day); it **outlives the 90-day audit rows** it was computed from, which is why it exists. Indexes `(tenant_id, day)` and `(day)`. Bounded by a **25-month TTL** on `day_start`; `roomler_core::growth::purge_tenant` is the one call an org deletion must make to take an org's rows (and its `growth_daily` rows) with it, but **no org hard-delete path exists yet** (orgs are only archived, reversibly), so the TTL is what bounds it for now ([growth-observability.md](growth-observability.md)) |
+
+### A room's `member_count` is its member rows (#4409)
+
+`rooms.member_count` is the number of the room's `room_members` rows: the rows
+`RoomDao::list_members` reads (`crates/services/src/dao/room.rs:544`) and the member route
+answers as its `total` (`crates/modules/chat/src/room.rs:440`, `:484`). The code that
+writes a row moves the count in the same call, and nothing else writes it:
+
+| Writer | The row | The count |
+|---|---|---|
+| `new_room`, the constructor (`crates/services/src/dao/room.rs:107`) | none yet | stored **0** |
+| `RoomDao::create`'s join of the creator (`:173-174`) | inserted | +1 |
+| `RoomDao::join` (`:485-489`) | inserted | +1 |
+| `RoomDao::join_participant`, the first call join of someone with no row (`:880-883`, through `bump_participant_count` `:894-899`) | inserted | +1, with `participant_count` |
+| `RoomDao::leave` (`:509-525`): a leave, and every row of an org membership that ends (`crates/modules/chat/src/membership.rs:70-87`) | deleted | −1 |
+| `RoomDao::cascade_delete` (`:362-364`) | all deleted | the room is deleted with them |
+
+Until #4409 the constructor stored 1 and the creator's join added another, so every room
+made before the fix read one member ahead of its rows.
+
+**The repair.** Chat's startup job `room-member-count` (`crates/modules/chat/src/lib.rs:198`)
+runs one pass of `MemberCountRepair` (`crates/services/src/dao/room_member_count.rs:117`) at
+every boot of every pod, on the boot path before the listener binds
+(`crates/api/src/main.rs:256`, `:340`). Once the stored counts are right a pass reads and
+changes nothing.
+
+| What a pass holds | How |
+|---|---|
+| Reads are bounded, on the primary | rooms in `_id` order, 500 at a time, with a projection of `_id` and `member_count`; one `$group` on `room_members` per batch. All three reads (the rooms, the `$group`, the cursor) go to the primary whatever the connection string prefers (`on_the_primary`, `crates/services/src/dao/room_member_count.rs:257`): the order below holds only on one member, and with a `readPreference` naming a secondary in a replica set the rows could come from a member that has not yet applied a join, so a right count would be written one behind |
+| A join or a leave is never lost | the rows are counted **after** the batch's counts are read; each write is an `update_many` per pair of (count read, rows), filtered on `member_count` still the count read (`crates/services/src/dao/room_member_count.rs:194`), so a count that moved fails the compare and waits for the next pass (`skipped`) |
+| It writes nothing else | only `member_count`, only where it differs from the rows, on the raw collection (no `updated_at` stamp) |
+| A pass is bounded | at most 20,000 rooms, and no new batch after 10 s (`crates/services/src/dao/room_member_count.rs:68-74`); a pass that stops early keeps the last room of its last finished batch in `locks` `room_member_count`, the next pass begins after it, and the pass that reaches the last room deletes it |
+| One line a pass | `room member counts: a pass` with `job`, `rooms_read`, `changed`, `skipped`, `more`, `ms` (`crates/modules/chat/src/member_count.rs:33`), then the host's `startup job done` |
+
+Measured on 20,000 rooms in a local MongoDB 7.0, over three runs: rooms one ahead, 0.05 to
+0.07 ms a room (1.1 to 1.3 s a pass); the worst shape, every room its own (count read, rows)
+pair and so one write a room, 0.9 to 1.3 ms a room, so the 10 s bound stops a pass after
+8,000 to 11,000 rooms.
+
+It is **not leader-gated** (`crates/core/src/job.rs:30-36`). Every write compares the
+count it read, so a pass is right beside a live pod's joins and leaves and beside a second
+pass. And in a roll the first pod to boot holds the 120 s lease while the other pod still
+runs the old code and makes rooms one ahead; the second pod boots inside that lease, so a
+gated job would skip there and leave those rooms until some later boot. Ungated, the last
+pod to boot passes after the old code is gone.
 
 ## Fleet: agents, remote desktop, tunnels, overlay
 

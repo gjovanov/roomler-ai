@@ -6,6 +6,8 @@ target on agent 0.4.101): PASS 26/0, SSH 30/30, 0 transitions over 189 **measure
 every pair. Docs: [`testing.md` → the overlay stress lane](../testing.md#the-overlay-stress-lane-fr-81).
 ⚠️ AC6's round-one evidence was 0 over *zero* samples and is withdrawn — see round three.
 
+**Anchors:** master `807e5511d` (closed 2026-09-25): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Boot a **throwaway VM** into the fleet org and hammer the private mesh against real endpoints —
