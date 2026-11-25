@@ -92,15 +92,9 @@
 #	"Not an agent token"
 #	"Not an agent service token"
 #
-## install-scripts · owner FR-133 follow-up · 1 file · 3 hits
-3	agents/roomlerd/packaging/macos/postinstall
-#	"…unchd loads it at the next login and the per-user agent comes back."
-#	"is no per-user agent to go back to. To remove Roomler from it, run:"
-#	"…mler …' (an unprivileged 'roomler' finds the user agent)."
+## install-scripts · owner FR-133 follow-up · 0 files · 0 hits
 #
-## display-identity · owner FR-133 follow-up · 1 file · 1 hit
-1	agents/roomlerd/packaging/linux/README.Debian
-#	"# (and the agent with it) exits when you log out:"
+## display-identity · owner FR-133 follow-up · 0 files · 0 hits
 #
 ## wizard · owner FR-129 phase C · 0 files · 0 hits
 #

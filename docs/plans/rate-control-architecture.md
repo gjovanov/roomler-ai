@@ -61,7 +61,7 @@ from scratchpad to `scripts/`.
 ## FR-A — Encoder rate changes without an IDR (first)
 
 **A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:440–499`, dispatch
-`encoder_smoke_cmd` :6273) with `--reconfigure-sweep [--width/--height 1280×800]
+`encoder_smoke_cmd` :6762) with `--reconfigure-sweep [--width/--height 1280×800]
 [--frames-per-rung 30] [--constrained] [--json]`: synthetic desktop frame with a moving 200×200
 block (solid colours make P-frames ~0 bytes and hide CBR/QVBR); 30 frames at 6 M, then rungs
 `4.5M 3M 2M 1.5M 1M 750k 550k 400k 300k 200k` down and back (20 changes via `set_bitrate`). Per
@@ -72,22 +72,22 @@ mean_bytes/(rung/fps/8)`. **Pass** = 0 key packets after the opener, `set_bitrat
 Arc/Meteor-Lake host (`av1_qsv`), the RTX box (`hevc/av1_nvenc`), one Apple Silicon Mac
 (`hevc_videotoolbox`); AMD recorded as unmeasured. Add a defaulted trait method
 `VideoEncoder::rate_stats()` (`encode/mod.rs:1311`) so the sweep reads counters. The sweep bypasses
-the coarsen gate (:1591–1594).
+the coarsen gate (:2423–2426).
 
 **A1 — in-place applies, gated.** Replace `supports_dynamic_bitrate = name.contains("nvenc")`
 (encoder.rs:1172) with `rate_mode: RateReconfig::{InPlace, Rebuild}` resolved at open (InPlace for
-`*_nvenc`, `*_qsv`; Rebuild for `*_amf`, `*_videotoolbox`); keep `supports_dynamic_bitrate()` (:1471)
+`*_nvenc`, `*_qsv`; Rebuild for `*_amf`, `*_videotoolbox`); keep `supports_dynamic_bitrate()` (:2520)
 = `InPlace` so no pump call site changes. QSV in-place arm writes **`bit_rate = target;
 rc_max_rate = target; rc_buffer_size = target × hrd_pct/100`** (CBR: TargetKbps must move with
 MaxKbps). Fix the existing NVENC bug: :1615 writes `rc_buffer_size = target` while the open sized it
-`maxrate × hrd_pct/100` (:262) — store `hrd_pct` on the struct. Dead-band: InPlace applies raw
+`maxrate × hrd_pct/100` (:297) — store `hrd_pct` on the struct. Dead-band: InPlace applies raw
 targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `encoder_inplace_rate`
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
-(six places: `config_surface.rs` KEYS near :630 / get :877 / set :1290; `config.rs` field :879,
+(six places: `config_surface.rs` KEYS near :1547 / get :2177 / set :2769; `config.rs` field :1298,
 default :1996, `env_bridge_bools` :2122 array 72→73; `enrollment.rs:280`; parity test :1935).
 Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:10175–10370`) with
 `rate_mode`; read `idr_count` against `keyframe_requests` (`session_telemetry.rs:30`). A startup
-`probe_and_cache_rate_reconfig` (like `VP9_QSV_IDR_VERDICT`, encoder.rs:71): open 640×480, change
+`probe_and_cache_rate_reconfig` (like `VP9_QSV_IDR_VERDICT`, encoder.rs:73): open 640×480, change
 rate once, count key flags — per host, per codec, OnceLock; a driver table is not evidence.
 
 **A2 — NVENC (and VT) without the forced IDR.** Patches in `.github/ffmpeg-patches/`:
@@ -97,10 +97,10 @@ optionally behind a private `reconfig_idr` option so it is upstreamable),
 `0002-videotoolbox-runtime-bitrate.patch` (`VTSessionSetProperty(AverageBitRate/DataRateLimits)` in
 `vtenc_send_frame` on change, as WebRTC's VT encoder does), `0003-amf-runtime-bitrate.patch`
 (written, disabled, unmeasured). Applied in all three builders: Linux `patch -p1` after the tarball
-(`vendor-ffmpeg-windows.yml:198–200`), macOS after the clone (`vendor-ffmpeg-macos.yml:62–64`),
+(`vendor-ffmpeg-windows.yml:345–347`), macOS after the clone (`vendor-ffmpeg-macos.yml:71–73`),
 Windows by injecting `PATCHES` into the copied portfile's `vcpkg_from_github(` (same anchor-replace
-technique :75–95). Drift gate: each builder writes `ROOMLER-PATCHES.txt` (sha256 per patch) into
-the asset and `release-agent.yml`'s three fetch steps (:341–352, :1002–1004, :1926–1934) assert it
+technique :84–146). Drift gate: each builder writes `ROOMLER-PATCHES.txt` (sha256 per patch) into
+the asset and `release-agent.yml`'s three fetch steps (:415–436, :1567–1569, :2821–2829) assert it
 matches `.github/ffmpeg-patches/*`. `const NVENC_RECONFIG_FORCES_IDR: bool` flips to false in the
 asset-bump PR; the pump's `held_increase` arm (`peer.rs:9524–9527`) keys on it.
 
@@ -190,9 +190,9 @@ one 15 % cut per burst, no clamp > 10 s); **fast pair misremembered slow** (seed
 ≥ 50 % of ceiling in 10 s, ≥ 90 % in 30 s).
 
 **B1 — shadow.** `RateGovernor` gains `shadow: Option<ratectl::Controller>` (on by default,
-observe-only), fed at the live positions (`pre_encode_tick` entry :482 → `observe_send`; after the
-floor/ceiling resolve :622 → `set_domain`; `on_backpressure_skip` :465, `on_send_overflow` :645,
-`note_send_stall` :667 → events; `tick_viewer_window` after the unpacks :738/:748/:785 →
+observe-only), fed at the live positions (`pre_encode_tick` entry :1090 → `observe_send`; after the
+floor/ceiling resolve :1359 → `set_domain`; `on_backpressure_skip` :1036, `on_send_overflow` :1383,
+`note_send_stall` :1412 → events; `tick_viewer_window` after the unpacks :1507/:1518/:1525 →
 `fold_window`); `pre_encode_tick` grows `bytes_inflight, queue_budget` at both pumps
 (`peer.rs:9495`, `:5044`). Heartbeat adds `shadow_target_bps, shadow_state, shadow_measured_bps,
 shadow_disagree_pct, shadow_pauses, shadow_reason`. `scripts/rc-shadow-report.py` reads a week of
@@ -235,14 +235,14 @@ before B2: done in #4061).
 2. **srflx**: the mapped address bypasses every filter (`agent_gather.rs:828–862`) — a 3-line
    addition to the already-forked webrtc-ice (`webrtc-ice.patch`, `--regen`) applying `ip_filter`
    to `xoraddr.ip` at :744, plus a belt at the signaling hop `peer.rs:740–756`.
-3. **Remote candidates** in `add_remote_candidate` (`peer.rs:1302–1351`), after mDNS resolution:
+3. **Remote candidates** in `add_remote_candidate` (`peer.rs:1947–2017`), after mDNS resolution:
    drop non-relay candidates whose address equals a LocalAPI `peers()` overlay IP or our own (same
-   query as :1644–1651, 400 ms timeout, fail-open); relay-typed exempt (keeps the loopback TURN,
+   query as :2247–2254, 400 ms timeout, fail-open); relay-typed exempt (keeps the loopback TURN,
    `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:1009–1018`).
 
 Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`carrier_rank.rs:282`)
 and in the FR-35 memory key (`peer.rs:4819` → `"{ip}|{class}"`, which fixes "a fast day carried
-onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–34`
+onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–42`
 has only `Relay`) so DERP / TURN / org relay are distinguishable. Mitigation for the one path lost
 (proxy-only egress, 443 only): a `turns:` listener on 443 on coturn, or the loopback-TURN opt-in.
 Update `docs/multi-org.md:628–629` (its "ICE never gathers on roomler-*" is true only on Linux) and
@@ -288,7 +288,7 @@ a routing hole; and the same missing notion of "own adapters" makes `non_overlay
    viewer→agent loss — every FR-59 mechanism needed one).
 3. **The field A/B is a script** — `scripts/rc-ab.sh <agent> <minutes>`: Playwright opens the
    viewer (an `ui/e2e` RC fixture: `remote-session-smoke.spec.ts` has the Connect flow,
-   `vmtest-remote.spec.ts:99` the wiggle; a Worker-timed motion driver replaces it), pulls the
+   `vmtest-remote.spec.ts:205` the wiggle; a Worker-timed motion driver replaces it), pulls the
    agent's series (the FR-59 helper moved from the scratchpad into `scripts/rc-field.sh`), prints
    the before/after table. CORPLAP-1 from neo16 is the standing cell; add it to the vmtest matrix.
 4. **Kill switches get a retirement date** — a table in `docs/fr/README.md` (switch, default,

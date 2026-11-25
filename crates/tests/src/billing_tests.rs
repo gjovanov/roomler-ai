@@ -1726,6 +1726,118 @@ mod fr115 {
         assert_eq!(s["seats_billed"], 1);
         assert_eq!(s["currency"], "eur");
     }
+
+    /// The summary as the browser receives it: the body as sent, and as JSON.
+    async fn summary_of(app: &TestApp, t: &crate::fixtures::seed::SeededTenant) -> (String, Value) {
+        let resp = app
+            .auth_get(
+                &format!("/api/stripe/summary?tenant_id={}", t.tenant_id),
+                &t.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "the summary was refused");
+        let text = resp.text().await.unwrap();
+        let json = serde_json::from_str(&text).unwrap();
+        (text, json)
+    }
+
+    /// The org's billing as the start of a checkout records it: a Stripe
+    /// customer, no subscription yet.
+    async fn set_customer(app: &TestApp, tenant_id: &str, customer: &str) {
+        let tid = ObjectId::parse_str(tenant_id).unwrap();
+        app.db
+            .collection::<bson::Document>("tenants")
+            .update_one(
+                doc! { "_id": tid },
+                doc! { "$set": { "billing": {
+                    "customer_id": customer, "subscription_id": Bson::Null,
+                    "current_period_end": Bson::Null, "status": "active",
+                    "cancel_at_period_end": false, "seats": Bson::Null,
+                    "interval": Bson::Null, "currency": Bson::Null,
+                } } },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// #4431 — the billing page's current-plan card reads the summary alone:
+    /// the status, the period end, "Cancels at period end", and "Manage
+    /// Subscription" from `has_billing_account`, which is true once the org
+    /// has a Stripe customer (subscribed or not) and false for an empty id.
+    /// The page lost all four for a paying org while it read them from
+    /// `GET /api/tenant`, which never carried them. The ids themselves never
+    /// reach the browser.
+    #[tokio::test]
+    async fn the_summary_says_a_billing_account_exists_without_naming_it() {
+        let base = fake_stripe(Fake::default()).await;
+        let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+        let t = app.seed_tenant("billing-account").await;
+
+        let (_, s) = summary_of(&app, &t).await;
+        assert_eq!(s["has_billing_account"], false, "a fresh org has none");
+
+        const CUSTOMER: &str = "cus_summary_never_names_it";
+        set_customer(&app, &t.tenant_id, CUSTOMER).await;
+        let (text, s) = summary_of(&app, &t).await;
+        assert_eq!(s["has_billing_account"], true, "{text}");
+        assert_eq!(s["subscribed"], false, "{text}");
+        assert!(
+            !text.contains(CUSTOMER),
+            "the summary names the customer: {text}"
+        );
+
+        set_customer(&app, &t.tenant_id, "").await;
+        let (text, s) = summary_of(&app, &t).await;
+        assert_eq!(s["has_billing_account"], false, "an empty id: {text}");
+
+        // The org the page failed: Pro, cancelled at the period's end.
+        subscribe(&app, &t.tenant_id, "pro").await;
+        app.db
+            .collection::<bson::Document>("tenants")
+            .update_one(
+                doc! { "_id": ObjectId::parse_str(&t.tenant_id).unwrap() },
+                doc! { "$set": {
+                    "billing.cancel_at_period_end": true,
+                    "billing.current_period_end": bson::DateTime::from_millis(1_900_000_000_000),
+                } },
+            )
+            .await
+            .unwrap();
+        let (text, s) = summary_of(&app, &t).await;
+        assert_eq!(s["plan"], "pro", "{text}");
+        assert_eq!(s["status"], "active", "{text}");
+        assert_eq!(s["subscribed"], true, "{text}");
+        assert_eq!(s["cancel_at_period_end"], true, "{text}");
+        assert!(s["current_period_end"].is_string(), "{text}");
+        assert_eq!(s["has_billing_account"], true, "{text}");
+        for id in ["cus_fake", "sub_fake"] {
+            assert!(!text.contains(id), "the summary names {id}: {text}");
+        }
+    }
+
+    /// #4431 — the summary is the only place the page reads an org's billing
+    /// from, so its gate is what keeps that billing from a member without
+    /// MANAGE_TENANT: such a member gets the gate's 403, and the page shows
+    /// none of it.
+    #[tokio::test]
+    async fn the_summary_gate_refuses_a_member_without_manage_tenant() {
+        use crate::tunnel_policy_permission_tests::{Gate, call};
+
+        let app = TestApp::spawn().await;
+        let t = app.seed_tenant("summary-gate").await;
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("/api/stripe/summary?tenant_id={}", t.tenant_id),
+            &t.member.access_token,
+            None,
+        )
+        .await;
+        let problem = Gate::Bit("MANAGE_TENANT").problem(status, &body.to_string());
+        assert!(problem.is_none(), "{problem:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -391,7 +391,7 @@ persons_half() {
     rm_err=$(as_person /bin/rm -f "$PLIST_TARGET" 2>&1) || true
     if [ -L "$PLIST_TARGET" ] || [ -e "$PLIST_TARGET" ]; then
       echo "WARNING: the account of $CONSOLE_USER could not remove \"$PLIST_TARGET\","
-      echo "  so launchd loads it at the next login and the per-user agent comes back."
+      echo "  so launchd loads it at the next login and the per-user roomlerd comes back."
       [ -z "$rm_err" ] || echo "  $rm_err"
       folder_said=0
       if folder_not_the_persons; then folder_said=1; fi
@@ -423,7 +423,7 @@ persons_half() {
         local one_row_server
         one_row_server=$(root_server_url)
         echo "  This Mac is one row (macos_one_row = true in the same file), so there"
-        echo "  is no per-user agent to go back to. To remove Roomler from it, run:"
+        echo "  is no per-user roomlerd to go back to. To remove Roomler from it, run:"
         echo "    curl -fsSL ${one_row_server:-<your server>}/api/setup/install.sh | sh -s -- --uninstall"
       fi
     else
@@ -646,7 +646,7 @@ if daemon_is_enabled; then
       echo "    sudo launchctl kickstart -k system/com.roomler.daemon"
     fi
     echo "  Its LocalAPI lives at /var/run/roomler/roomler.sock — reach it with"
-    echo "  'sudo roomler …' (an unprivileged 'roomler' finds the user agent)."
+    echo "  'sudo roomler …' (an unprivileged 'roomler' finds the per-user roomlerd)."
   fi
 else
   # A previously-enabled daemon must go away when the marker does, or an

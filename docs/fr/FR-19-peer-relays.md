@@ -182,7 +182,7 @@ So the rules are:
 3. **`VNI = 0x2112A4` is never minted**, so a relay frame can never present the STUN magic
    cookie at bytes 4–7.
 4. Disjointness is proven over **WG × STUN × disco × Geneve**, table-driven — the standard
-   `disco.rs:45-52` already sets: *"Shape disjointness (load-bearing — a false match steals
+   `disco.rs:47-54` already sets: *"Shape disjointness (load-bearing — a false match steals
    a live datagram and blacks out the mesh)"*, locked by
    `disco_shape_is_disjoint_from_wg_and_stun`.
 
@@ -284,7 +284,7 @@ so the relay keeps no per-attempt state. Rotation period ≤ the 30 s bind lifet
 
 **(3) Anti-amplification** — ⚠️ **the bind path answers unauthenticated packets by design,
 on UDP/3478, which is already among the most-sprayed reflection ports on the internet.** The
-repo's own rule is stated at `crates/tunnel-core/src/overlay/disco.rs:69-70`: *"a reply is
+repo's own rule is stated at `crates/tunnel-core/src/overlay/disco.rs:71-72`: *"a reply is
 exactly this long too, so the responder can never amplify (reply bytes == request bytes)"*,
 implemented as a fixed `FRAME_LEN = 85`. FR-19 adopts it: **`Bind` is padded so
 `len(response) ≤ len(request)`**, and an acceptance criterion asserts the ratio. Without
@@ -317,7 +317,7 @@ Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
   concatenation of a textual `addr:port` and a variable-width integer lets distinct tuples
   serialise identically (IPv4 vs IPv6 forms; digits sliding into the adjacent field).
 - **Constant-time comparison, using `subtle`.** ⚠️ Every MAC compare in this tree today is a
-  plain slice compare — `disco.rs:222` (whose comment says *"Constant-time-ish"* and is not),
+  plain slice compare — `disco.rs:225` (whose comment says *"Constant-time-ish"* and is not),
   `wg.rs:2934`, `derp.rs:351`. For WireGuard's `mac1` that is defensible; its own doc calls it
   *"a ROUTER's pre-filter … not an authenticator"*. Here the MAC **is** the authenticator, so
   "model it on the existing one" would propagate the defect.
@@ -328,14 +328,14 @@ Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
   re-mint, the round trip this feature exists to avoid; permit it unauthenticated and it is
   a hijack primitive. The overlay already models this event (`Carrier::set_direct_dst`,
   `wg.rs:238`, repoints on cryptographic evidence; `Routed::SessionRoam`,
-  `carrier_plane.rs:766`). Re-bind keeps the same VNI and updates one `boundAddrPort`.
+  `carrier_plane.rs:773`). Re-bind keeps the same VNI and updates one `boundAddrPort`.
 
 ### Lifetimes
 
 **30 s** to complete the bind, **5 min** idle, and an **absolute `max_lifetime`**
 independent of idle refresh. ⚠️ The absolute bound is not optional: `idle_deadline` is
 *refreshed on traffic*, and with a 25 s WireGuard persistent keepalive
-(`wg.rs:51 KEEPALIVE_SECS = 25`) it **never fires while a carrier is installed**. Without a
+(`wg.rs:53 KEEPALIVE_SECS = 25`) it **never fires while a carrier is installed**. Without a
 `max_lifetime` an active session has no expiry at all, and capacity is governed solely by
 mint policy and `relay_max_sessions`.
 
@@ -369,8 +369,8 @@ Verdict machinery to extend, verified against master:
 | what | anchor |
 |---|---|
 | Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
-| …delegating to the pure decision | `overlay.rs:2049` `relay_verdict_core` |
-| Measured caps supersede presence | `overlay.rs:1997-2006` (in `verdict_from_nodes`, `:1976`) |
+| …delegating to the pure decision | `overlay.rs:3025` `relay_verdict_core` |
+| Measured caps supersede presence | `overlay.rs:2970-2981` (in `verdict_from_nodes`, `:2953`) |
 | Wire verdict enum | `crates/remote_control/src/signaling.rs:3464` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1289` `relay_strategy` |
 
@@ -396,8 +396,8 @@ the Geneve header has no tenant field, so the relay's demux key is ambiguous acr
 the boundary that matters. **The VNI is globally unique per relay node**, and `tenant_id`
 lives in the session entry. This is the lesson the carrier plane already learned in the
 opposite direction: `alloc_index` is *"a process-unique 24-bit session index"*
-(`carrier_plane.rs:1000`) precisely because *"with N orgs on one socket, a source-keyed table
-cannot tell them apart"* (`:13-21`). It is also typed **`u24`**, not `u32`: the wire field
+(`carrier_plane.rs:1007`) precisely because *"with N orgs on one socket, a source-keyed table
+cannot tell them apart"* (`:15-23`). It is also typed **`u24`**, not `u32`: the wire field
 is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 | # | gate | owner | actual default |
@@ -429,7 +429,7 @@ tenant that genuinely has ACLs disabled, so a caller shaped like the existing pr
 while its author believes it fails closed. Required: a `try_load_acl(…) -> Result<AclCtx, _>`
 for the new gate, with the two existing callers keeping their posture via an explicit
 `.unwrap_or_else(|_| AclCtx::off())` — which also turns their fail-open into a visible
-decision. Same for `overlay_source_of` (`overlay.rs:1896`), which swallows both errors
+decision. Same for `overlay_source_of` (`overlay.rs:2749`), which swallows both errors
 (`.ok()` → `owner_user_id: None`; `unwrap_or_default()` → empty roles), silently failing to
 match a `UserId`/`RoleId`-scoped grant with no log — against `feedback_log_every_silent_drop`.
 
@@ -572,11 +572,11 @@ a residential NAT is also the wrong shape regardless of reachability.
 existing `relay_band_udp` probe *"generalises"* and *"becomes a `CapVector` field"*. Both
 halves are wrong:
 
-- `probe_relay_band` (`netcheck.rs:144`) takes `alloc: &dyn RelayConn` — a **live coturn TURN
+- `probe_relay_band` (`netcheck.rs:146`) takes `alloc: &dyn RelayConn` — a **live coturn TURN
   allocation** — bootstraps permissions through it and reads the *allocation* for the echo.
   **Coturn is the responder.** An org relay must answer the probe itself; that is a new
   protocol, and it is why P1 ships a bind-only responder.
-- `CapVector` (`netcheck.rs:60`) is four scalars in a **single process-global slot**
+- `CapVector` (`netcheck.rs:62`) is four scalars in a **single process-global slot**
   (`:213`), shipped once per node. Reachability is a **pairwise (node × relay × port)** fact
   — an N×M table. It cannot be a `CapVector` field; it needs its own report
   (`rc:overlay.relay_probe`).
@@ -611,7 +611,7 @@ So the design is:
 
 - **`RelayKind::Org`** joins `Turn` and `Derp` (`crates/tunnel-core/src/overlay/relay_link.rs:165`).
   `relay:org/udp` appears in the CONN column **for free** via `relay_transport_info`
-  (`wg.rs:204`), with `relay_server()` supplying `relay_via`.
+  (`wg.rs:206`), with `relay_server()` supplying `relay_via`.
 - **The transport is a fourth `RelayConn` impl.** `Carrier::Relay { conn: Arc<dyn RelayConn>, dst, dead }`
   (`wg.rs:159`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:416`)
   just calls `conn.send_to(buf, dst)`. DERP plugs in exactly this way — `impl RelayConn for
