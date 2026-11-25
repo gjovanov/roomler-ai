@@ -60,6 +60,10 @@ mod recording_tests;
 /// attachments and typing.
 #[cfg(test)]
 mod room_access_tests;
+/// #4409 — a room's stored member count is the number of its member rows,
+/// from its creation on, and the repair of the counts stored wrong.
+#[cfg(test)]
+mod room_member_count_tests;
 /// A reply's thread and quote are live messages of its own room, a thread
 /// lists its own room's replies, and a mention reaches the room's members.
 #[cfg(test)]
