@@ -1,5 +1,7 @@
 # FR-82: A permission refusal is not a logout, and a managed role is not frozen at its birthday
 
+**Anchors:** master `b7793c004` (closed 2026-09-09): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1540](https://github.com/gjovanov/roomler-ai/issues/1540) · **Status:** **shipped + field-verified 2026-09-09** (`b7793c004`, image `hosted-20260909-786f016`) — **all 10 criteria met; AC8 closed by the operator from the reporting seat on 2026-09-09** ·
 **Field report:** a GROX member opened `/tenant/69a1dbba…/devices`, got a 403 and
 was signed out of the product.
