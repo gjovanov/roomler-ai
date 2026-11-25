@@ -77,8 +77,9 @@ fn segment_of(
 /// #3802 — the agent's folders in one account's tree, as `ProjectDirs` names
 /// them: the config folder, the data folder and the local data folder.
 /// [`project_dirs`] returns this rather than a `ProjectDirs` because on macOS
-/// the tree hangs off the home the account database names ([`dirs_for`]), and
-/// a `ProjectDirs` takes its home from `$HOME` with no way to be given another.
+/// the tree hangs off the home the account database names, and for root on
+/// Linux off `/root` (#3866) ([`dirs_for`]), and a `ProjectDirs` takes its
+/// home from `$HOME` with no way to be given another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppDirs {
     config: PathBuf,
@@ -133,6 +134,195 @@ fn macos_dirs(app: &str, account_home: impl FnOnce() -> Option<PathBuf>) -> Opti
     })
 }
 
+/// #3866 — an account's own folders on Linux, as the XDG Base Directory
+/// specification names them: its home, its config, data, cache and state
+/// folders, and its runtime folder where it has one.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnFolders {
+    pub home: PathBuf,
+    pub config: PathBuf,
+    pub data: PathBuf,
+    pub cache: PathBuf,
+    pub state: PathBuf,
+    pub runtime: Option<PathBuf>,
+}
+
+/// Root's home on Linux: `/root`, the home systemd gives a service that runs
+/// with `User=root`.
+#[cfg(any(target_os = "linux", test))]
+const ROOT_HOME: &str = "/root";
+
+/// #3866 — the Linux rule, pure: the folders of the account `euid`, with
+/// `var` as the process's environment and `account_home` as the home the
+/// account database names for that account.
+///
+/// - Root (`euid` 0) reads no variable and asks the account database
+///   nothing. Its home is `/root`, as systemd gives it to a service with
+///   `User=root`, and each folder is the XDG default beneath it, with no
+///   runtime folder. So a root process uses root's own folders beneath
+///   `/root`, whatever `HOME` or `XDG_*` it was started with, and a daemon
+///   that systemd started as root keeps the folders it has always had.
+/// - Any other account resolves as `directories` resolves it: its home is
+///   `HOME` where that is not empty, else the account database's; each
+///   `XDG_*_HOME` and `XDG_RUNTIME_DIR` counts where it names an absolute
+///   folder, else the default beneath the home. `None` with neither home.
+///
+/// A folder counts as absolute by `Path::has_root`, which is
+/// `Path::is_absolute` on Linux; written so, the rule tests on every
+/// platform.
+#[cfg(any(target_os = "linux", test))]
+fn linux_folders(
+    euid: u32,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    account_home: impl FnOnce() -> Option<PathBuf>,
+) -> Option<OwnFolders> {
+    let root = euid == 0;
+    let home = if root {
+        PathBuf::from(ROOT_HOME)
+    } else {
+        var("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .or_else(account_home)?
+    };
+    let given = |name: &str| {
+        if root {
+            return None;
+        }
+        var(name)
+            .map(PathBuf::from)
+            .filter(|folder| folder.has_root())
+    };
+    Some(OwnFolders {
+        config: given("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config")),
+        data: given("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")),
+        cache: given("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache")),
+        state: given("XDG_STATE_HOME").unwrap_or_else(|| home.join(".local/state")),
+        runtime: given("XDG_RUNTIME_DIR"),
+        home,
+    })
+}
+
+/// #3866 — this process's own folders on Linux ([`linux_folders`]): its
+/// effective uid, its environment as it is at the call, and, for a process
+/// that is not root and has no `HOME`, the home the account database names
+/// for its account, read once per process.
+#[cfg(target_os = "linux")]
+pub fn own_folders() -> Option<OwnFolders> {
+    static ACCOUNT_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+    // SAFETY: `geteuid` is a thread-safe read of the caller's own credentials.
+    let euid = unsafe { libc::geteuid() };
+    linux_folders(
+        euid,
+        |name| std::env::var_os(name),
+        || ACCOUNT_HOME.get_or_init(own_home).clone(),
+    )
+}
+
+/// #3866 — the daemon's folders for segment `app` in an account's own
+/// folders on Linux (`own`), laid out as `ProjectDirs` lays them out there:
+/// the config folder, and the data folder, which is the local data folder
+/// too.
+#[cfg(any(target_os = "linux", test))]
+fn linux_dirs(app: &str, own: Option<OwnFolders>) -> Option<AppDirs> {
+    let own = own?;
+    Some(AppDirs {
+        config: own.config.join(app),
+        data: own.data.join(app),
+        data_local: own.data.join(app),
+    })
+}
+
+/// #3866 — an account's Videos folder on Linux: the one `user-dirs.dirs` in
+/// its own config folder names (`XDG_VIDEOS_DIR`), read as `directories`'
+/// `UserDirs` reads it ([`user_dir_in`]). `None` where the file names none,
+/// or there is no file. `read` stands in for the file system.
+#[cfg(any(target_os = "linux", test))]
+pub fn videos_dir(
+    own: &OwnFolders,
+    read: impl FnOnce(&Path) -> Option<Vec<u8>>,
+) -> Option<PathBuf> {
+    let text = read(&own.config.join("user-dirs.dirs"))?;
+    user_dir_in(&own.home, &text, "VIDEOS")
+}
+
+/// The folder a `user-dirs.dirs` text names for `name` (its
+/// `XDG_<name>_DIR` line), as `dirs-sys` parses the file: blanks around the
+/// key and the value are trimmed, and the value is a double-quoted
+/// `"$HOME/…"`, a folder beneath `home`, or a double-quoted absolute folder,
+/// with each backslash taking the byte after it as it is. `"$HOME/"` alone
+/// and any other value name no folder, and of the lines that name one, the
+/// last counts.
+#[cfg(any(target_os = "linux", test))]
+fn user_dir_in(home: &Path, text: &[u8], name: &str) -> Option<PathBuf> {
+    fn trimmed(bytes: &[u8]) -> &[u8] {
+        let blank = |b: &&u8| **b == b' ' || **b == b'\t';
+        let start = bytes.iter().take_while(blank).count();
+        let bytes = &bytes[start..];
+        &bytes[..bytes.len() - bytes.iter().rev().take_while(blank).count()]
+    }
+    let mut found = None;
+    for line in text.split(|b| *b == b'\n') {
+        let Some(at) = line.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        let key = trimmed(&line[..at]);
+        if key
+            .strip_prefix(b"XDG_")
+            .and_then(|key| key.strip_suffix(b"_DIR"))
+            != Some(name.as_bytes())
+        {
+            continue;
+        }
+        let Some(value) = trimmed(&line[at + 1..])
+            .strip_prefix(b"\"")
+            .and_then(|value| value.strip_suffix(b"\""))
+        else {
+            continue;
+        };
+        let (beneath_home, value) = if value == b"$HOME/" {
+            continue;
+        } else if let Some(rest) = value.strip_prefix(b"$HOME/") {
+            (true, rest)
+        } else if value.starts_with(b"/") {
+            (false, value)
+        } else {
+            continue;
+        };
+        let mut unescaped = Vec::with_capacity(value.len());
+        let mut bytes = value.iter();
+        while let Some(&byte) = bytes.next() {
+            if byte == b'\\' {
+                unescaped.extend(bytes.next());
+            } else {
+                unescaped.push(byte);
+            }
+        }
+        let folder = path_of_bytes(unescaped);
+        found = Some(if beneath_home {
+            home.join(folder)
+        } else {
+            folder
+        });
+    }
+    found
+}
+
+/// A path from the bytes a file names it by.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn path_of_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+}
+
+/// A path from the bytes a file names it by; outside Unix only the tests
+/// read one, and their paths are UTF-8.
+#[cfg(all(test, not(unix)))]
+fn path_of_bytes(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// #3802 — the agent's folders for segment `app` in the tree of the account
 /// this process runs as.
 ///
@@ -147,15 +337,23 @@ fn macos_dirs(app: &str, account_home: impl FnOnce() -> Option<PathBuf>) -> Opti
 /// (the LaunchAgent, the worker `sudo -u` starts, the tray), resolves the same
 /// folders as before.
 ///
-/// Everywhere else `ProjectDirs` decides, as it always has: `$HOME` and the
-/// XDG variables on Linux, the known folders on Windows.
+/// #3866 — on Linux the tree is in the account's own folders
+/// ([`own_folders`]): a root process uses root's own folders beneath
+/// `/root`, whatever `HOME` or `XDG_*` it was started with, and any other
+/// process honours `HOME` and the XDG variables as `ProjectDirs` does.
+///
+/// On Windows `ProjectDirs` decides, as it always has: the known folders.
 fn dirs_for(app: &str) -> Option<AppDirs> {
     #[cfg(target_os = "macos")]
     {
         static ACCOUNT_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
         macos_dirs(app, || ACCOUNT_HOME.get_or_init(own_home).clone())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_dirs(app, own_folders())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         ProjectDirs::from(QUALIFIER, ORG, app).map(|dirs| AppDirs::from(&dirs))
     }
@@ -187,7 +385,9 @@ fn app_segment() -> &'static str {
 /// The agent's folders ([`dirs_for`]), resolved to the NEW segment unless a
 /// pre-rename install is detected (then the OLD segment, so its enrolled
 /// config is never orphaned). `None` only if the platform exposes no config
-/// dir at all, or on macOS the account database names no home.
+/// dir at all, or on macOS the account database names no home, or on Linux a
+/// process that is not root has no `HOME` and no home in the account
+/// database.
 pub fn project_dirs() -> Option<AppDirs> {
     dirs_for(app_segment())
 }
@@ -2719,6 +2919,312 @@ mod tests {
         assert_eq!(macos_dirs(NEW_APP, || None), None);
     }
 
+    // ── #3866: a Linux process's own folders ──────────────────────────────
+
+    /// `pairs` as a process's environment, the stand-in [`linux_folders`]
+    /// reads.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.into())
+        }
+    }
+
+    /// The XDG defaults beneath `home`, with no runtime folder.
+    fn defaults_beneath(home: impl Into<PathBuf>) -> OwnFolders {
+        let home = home.into();
+        OwnFolders {
+            config: home.join(".config"),
+            data: home.join(".local/share"),
+            cache: home.join(".cache"),
+            state: home.join(".local/state"),
+            runtime: None,
+            home,
+        }
+    }
+
+    /// The account database's home, as a stand-in that names `home`.
+    fn database(home: &str) -> impl FnOnce() -> Option<PathBuf> {
+        let home = PathBuf::from(home);
+        move || Some(home)
+    }
+
+    /// An account database that must not be asked.
+    fn not_asked() -> Option<PathBuf> {
+        panic!("the account database was asked")
+    }
+
+    /// The folder the single-instance lock is taken in: the runtime folder,
+    /// else the cache folder.
+    fn lock_folder(own: &OwnFolders) -> &Path {
+        own.runtime.as_deref().unwrap_or(own.cache.as_path())
+    }
+
+    /// A `HOME` and XDG folders of another account.
+    const ANOTHER_ACCOUNTS: &[(&str, &str)] = &[
+        ("HOME", "/home/p"),
+        ("XDG_CONFIG_HOME", "/home/p/.config"),
+        ("XDG_DATA_HOME", "/home/p/.local/share"),
+        ("XDG_CACHE_HOME", "/home/p/.cache"),
+        ("XDG_STATE_HOME", "/home/p/.local/state"),
+        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+    ];
+
+    /// #3866 AC1 — a root command uses root's own folders, whatever `HOME`
+    /// and `XDG_*` it was given: each folder is the XDG default beneath
+    /// `/root`, it has no runtime folder, so its lock is in root's own cache
+    /// folder, and its Videos folder is the one root's own `user-dirs.dirs`
+    /// names. It asks the account database nothing.
+    #[test]
+    fn a_root_command_uses_roots_own_folders_whatever_home_it_was_given() {
+        let own = linux_folders(0, env_of(ANOTHER_ACCOUNTS), not_asked).unwrap();
+        assert_eq!(own, defaults_beneath("/root"));
+        assert_eq!(lock_folder(&own), Path::new("/root/.cache"));
+        for app in [NEW_APP, OLD_APP] {
+            let dirs = linux_dirs(app, Some(own.clone())).unwrap();
+            assert_eq!(dirs.config_dir(), Path::new("/root/.config").join(app));
+            assert_eq!(dirs.data_dir(), Path::new("/root/.local/share").join(app));
+            assert_eq!(dirs.data_local_dir(), dirs.data_dir());
+        }
+        let videos = videos_dir(&own, |file| {
+            assert_eq!(file, Path::new("/root/.config/user-dirs.dirs"));
+            Some(b"XDG_VIDEOS_DIR=\"$HOME/Videos\"\n".to_vec())
+        });
+        assert_eq!(videos.as_deref(), Some(Path::new("/root/Videos")));
+        // Values that are empty or relative change nothing either.
+        let other: &[(&str, &str)] = &[
+            ("HOME", ""),
+            ("XDG_CONFIG_HOME", ""),
+            ("XDG_DATA_HOME", "share"),
+            ("XDG_RUNTIME_DIR", "run"),
+        ];
+        assert_eq!(
+            linux_folders(0, env_of(other), not_asked),
+            Some(defaults_beneath("/root"))
+        );
+    }
+
+    /// #3866 — root's folders are beneath `/root` whatever the account
+    /// database names for root: `/home/root`, another home, or no entry at
+    /// all (as in some container images).
+    #[test]
+    fn root_uses_slash_root_whatever_the_account_database_names() {
+        let none: &[(&str, &str)] = &[];
+        for given in [ANOTHER_ACCOUNTS, none] {
+            for names in [Some("/home/root"), Some("/srv/admin"), None] {
+                assert_eq!(
+                    linux_folders(0, env_of(given), move || names.map(PathBuf::from)),
+                    Some(defaults_beneath("/root")),
+                    "{given:?} {names:?}"
+                );
+            }
+        }
+    }
+
+    /// #3866 AC2 — a daemon that systemd started keeps every folder. The
+    /// environment systemd gives the shipped units: `roomlerd.service` runs
+    /// with `User=root`, so `HOME=/root`, `USER`, `LOGNAME` and `SHELL`, and
+    /// sets no `XDG_*`; `roomler-update.service` has no `User=`, so no
+    /// `HOME`. Root's folders are the ones `directories` gave that
+    /// environment (for the update helper, on a host whose account database
+    /// names `/root`): the XDG defaults beneath `/root`, with no runtime
+    /// folder, so the lock stays `/root/.cache/roomler-agent-<id>.lock`. A
+    /// runtime folder in the environment, `/run/user/0`, does not move it
+    /// either, and nothing here looks at whether a folder exists.
+    #[test]
+    fn a_daemon_systemd_started_keeps_every_folder() {
+        const PATH: (&str, &str) = (
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        let daemon: &[(&str, &str)] = &[
+            PATH,
+            ("HOME", "/root"),
+            ("USER", "root"),
+            ("LOGNAME", "root"),
+            ("SHELL", "/bin/sh"),
+            ("ROOMLERD_CONFIG", "/etc/roomler/config.toml"),
+            ("RUST_LOG", "roomlerd=info,warn"),
+        ];
+        let update_helper: &[(&str, &str)] = &[PATH, ("RUST_LOG", "info")];
+        let with_runtime: Vec<(&str, &str)> = daemon
+            .iter()
+            .copied()
+            .chain([("XDG_RUNTIME_DIR", "/run/user/0")])
+            .collect();
+        for unit in [daemon, with_runtime.as_slice(), update_helper] {
+            let own = linux_folders(0, env_of(unit), not_asked).unwrap();
+            assert_eq!(own.home, Path::new("/root"), "{unit:?}");
+            assert_eq!(own.config, Path::new("/root/.config"), "{unit:?}");
+            assert_eq!(own.data, Path::new("/root/.local/share"), "{unit:?}");
+            assert_eq!(own.cache, Path::new("/root/.cache"), "{unit:?}");
+            assert_eq!(own.state, Path::new("/root/.local/state"), "{unit:?}");
+            assert_eq!(own.runtime, None, "{unit:?}");
+            assert_eq!(lock_folder(&own), Path::new("/root/.cache"), "{unit:?}");
+            let dirs = linux_dirs(NEW_APP, Some(own)).unwrap();
+            assert_eq!(dirs.config_dir(), Path::new("/root/.config/roomler"));
+            assert_eq!(dirs.data_dir(), Path::new("/root/.local/share/roomler"));
+        }
+    }
+
+    /// #3866 AC3 — a person's command honours `HOME` and the XDG variables
+    /// as `directories` does: each `XDG_*` folder that is absolute as given,
+    /// an empty or relative one the default beneath `HOME`, an empty or
+    /// missing `HOME` the account database's home, and no folders with
+    /// neither. The account database is not read while `HOME` names a home.
+    #[test]
+    fn a_persons_command_honours_xdg() {
+        let person: &[(&str, &str)] = &[
+            ("HOME", "/home/p"),
+            ("XDG_CONFIG_HOME", "/data/p/config"),
+            ("XDG_DATA_HOME", "/data/p/share"),
+            ("XDG_CACHE_HOME", "/data/p/cache"),
+            ("XDG_STATE_HOME", "/data/p/state"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ];
+        let own = linux_folders(1000, env_of(person), not_asked).unwrap();
+        assert_eq!(
+            own,
+            OwnFolders {
+                home: PathBuf::from("/home/p"),
+                config: PathBuf::from("/data/p/config"),
+                data: PathBuf::from("/data/p/share"),
+                cache: PathBuf::from("/data/p/cache"),
+                state: PathBuf::from("/data/p/state"),
+                runtime: Some(PathBuf::from("/run/user/1000")),
+            }
+        );
+        assert_eq!(lock_folder(&own), Path::new("/run/user/1000"));
+        let videos = videos_dir(&own, |file| {
+            assert_eq!(file, Path::new("/data/p/config/user-dirs.dirs"));
+            Some(b"XDG_VIDEOS_DIR=\"$HOME/Videos\"\n".to_vec())
+        });
+        assert_eq!(videos.as_deref(), Some(Path::new("/home/p/Videos")));
+        let relative: &[(&str, &str)] = &[
+            ("HOME", "/home/p"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", ""),
+            ("XDG_RUNTIME_DIR", "run"),
+        ];
+        assert_eq!(
+            linux_folders(1000, env_of(relative), || None),
+            Some(defaults_beneath("/home/p"))
+        );
+        let empty: &[(&str, &str)] = &[("HOME", "")];
+        let none: &[(&str, &str)] = &[];
+        for no_home in [empty, none] {
+            assert_eq!(
+                linux_folders(1000, env_of(no_home), database("/home/q")),
+                Some(defaults_beneath("/home/q")),
+                "{no_home:?}"
+            );
+            assert_eq!(linux_folders(1000, env_of(no_home), || None), None);
+        }
+    }
+
+    /// #3866 — the Videos folder is read from `user-dirs.dirs` as
+    /// `directories`' `UserDirs` reads it.
+    #[test]
+    fn the_videos_folder_is_read_as_user_dirs_reads_it() {
+        let own = defaults_beneath("/home/p");
+        let named = |text: &str| {
+            videos_dir(&own, |file| {
+                assert_eq!(file, Path::new("/home/p/.config/user-dirs.dirs"));
+                Some(text.as_bytes().to_vec())
+            })
+        };
+        for (text, want) in [
+            ("XDG_VIDEOS_DIR=\"$HOME/Videos\"\n", "/home/p/Videos"),
+            ("XDG_VIDEOS_DIR=\"/srv/videos\"", "/srv/videos"),
+            (
+                " \tXDG_VIDEOS_DIR = \"$HOME/My\\ Videos\"\t ",
+                "/home/p/My Videos",
+            ),
+            (
+                "XDG_VIDEOS_DIR=\"$HOME/a\"\nXDG_VIDEOS_DIR=\"$HOME/b\"\nXDG_VIDEOS_DIR=\"$HOME/\"\n",
+                "/home/p/b",
+            ),
+            (
+                "# Written by xdg-user-dirs-update\nXDG_MUSIC_DIR=\"$HOME/Music\"\nXDG_VIDEOS_DIR=\"$HOME/Clips\"\n",
+                "/home/p/Clips",
+            ),
+        ] {
+            assert_eq!(named(text).as_deref(), Some(Path::new(want)), "{text:?}");
+        }
+        for text in [
+            "",
+            "# XDG_VIDEOS_DIR=\"$HOME/Videos\"",
+            "XDG_VIDEOS_DIR=$HOME/Videos",
+            "XDG_VIDEOS_DIR=\"Videos\"",
+            "XDG_VIDEOS_DIR=\"$HOME/\"",
+            "XDG_VIDEOS_DIR=\"$HOME\"",
+            "XDG_VIDEOS_DIR=\"\"",
+            "XDG_VIDEOS_DIR=\"",
+            "XDG_DIR=\"/srv\"",
+            "XDG_MUSIC_DIR=\"$HOME/Music\"",
+            "XDG_VIDEOS_DIR=\"$HOME/Videos\"\r",
+        ] {
+            assert_eq!(named(text), None, "{text:?}");
+        }
+        assert_eq!(videos_dir(&own, |_| None), None);
+    }
+
+    /// #3866 — this process's own folders, from its real environment, which
+    /// is read and never changed: where it is not root, exactly what
+    /// `directories` resolves (its `BaseDirs` and its `UserDirs`' Videos
+    /// folder); where it is root, the XDG defaults beneath `/root`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_processs_folders_are_what_directories_gives_unless_it_is_root() {
+        let own = own_folders();
+        // SAFETY: a read of this process's own credentials.
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(own, Some(defaults_beneath(ROOT_HOME)));
+            return;
+        }
+        let base = directories::BaseDirs::new();
+        assert_eq!(own.is_some(), base.is_some());
+        let (Some(own), Some(base)) = (own, base) else {
+            return;
+        };
+        assert_eq!(own.home, base.home_dir());
+        assert_eq!(own.config, base.config_dir());
+        assert_eq!(own.data, base.data_dir());
+        assert_eq!(own.data, base.data_local_dir());
+        assert_eq!(own.cache, base.cache_dir());
+        assert_eq!(Some(own.state.as_path()), base.state_dir());
+        assert_eq!(own.runtime.as_deref(), base.runtime_dir());
+        let theirs =
+            directories::UserDirs::new().and_then(|u| u.video_dir().map(Path::to_path_buf));
+        assert_eq!(videos_dir(&own, |file| std::fs::read(file).ok()), theirs);
+    }
+
+    /// The home this process's folders hang off where its account decides
+    /// them, not `HOME`: on macOS the one the account database names, and on
+    /// Linux `/root` for root (#3866); `None` where `ProjectDirs` decides.
+    fn account_home_decides() -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            Some(own_home().expect("the account database names this account's home"))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: a read of this process's own credentials.
+            let root = unsafe { libc::geteuid() } == 0;
+            root.then(|| PathBuf::from(ROOT_HOME))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
     /// Set in the child [`a_child_given_another_home_keeps_its_accounts_folders`]
     /// starts: the child prints what it resolves and writes nothing.
     const CHILD_3802: &str = "ROOMLER_TEST_3802_CHILD";
@@ -2741,6 +3247,17 @@ mod tests {
             Some(home) => child.env("HOME", home),
             None => child.env_remove("HOME"),
         };
+        // The child's folders hang off the home it is given, not off XDG
+        // folders of whoever runs this.
+        for name in [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+        ] {
+            child.env_remove(name);
+        }
         let out = child.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
@@ -2770,9 +3287,11 @@ mod tests {
     /// `ProjectDirs` in that same child follows the `HOME` it was given, which
     /// shows the child really had another one. With its own `HOME`, or none,
     /// a child resolves exactly what `ProjectDirs` resolves, so nothing an
-    /// installed Mac reads moves. Everywhere else every answer is
-    /// `ProjectDirs`'. The child only resolves paths: the `HOME` it is given
-    /// stays empty, and nothing is made in the home of whoever runs this.
+    /// installed Mac reads moves. #3866: a root child on Linux takes its
+    /// folders from its own account the same way. Everywhere else every
+    /// answer is `ProjectDirs`'. The child only resolves paths: the `HOME` it
+    /// is given stays empty, and nothing is made in the home of whoever runs
+    /// this.
     #[test]
     fn a_child_given_another_home_keeps_its_accounts_folders() {
         if std::env::var_os(CHILD_3802).is_some() {
@@ -2794,20 +3313,19 @@ mod tests {
             "the child wrote into the HOME it was given"
         );
         for (name, ours, theirs) in &another {
-            #[cfg(target_os = "macos")]
-            {
-                let account = own_home().expect("the account database names this account's home");
-                assert!(
-                    theirs.starts_with(given.path()),
-                    "{name}: ProjectDirs did not follow the given HOME: {theirs:?}"
-                );
-                assert!(
-                    ours.starts_with(&account) && !ours.starts_with(given.path()),
-                    "{name}: {ours:?} is not in {account:?}, the home of the account the child runs as"
-                );
+            match account_home_decides() {
+                Some(account) => {
+                    assert!(
+                        theirs.starts_with(given.path()),
+                        "{name}: ProjectDirs did not follow the given HOME: {theirs:?}"
+                    );
+                    assert!(
+                        ours.starts_with(&account) && !ours.starts_with(given.path()),
+                        "{name}: {ours:?} is not in {account:?}, the home of the account the child runs as"
+                    );
+                }
+                None => assert_eq!(ours, theirs, "{name}: the folders moved off ProjectDirs"),
             }
-            #[cfg(not(target_os = "macos"))]
-            assert_eq!(ours, theirs, "{name}: the folders moved off ProjectDirs");
         }
         #[cfg(unix)]
         let own = own_home();

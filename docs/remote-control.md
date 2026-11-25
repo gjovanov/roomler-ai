@@ -7145,6 +7145,11 @@ Both kernel-released on process death, no stale-lock cleanup needed
 after `kill -9`. Only `run` gates on the lock — `enroll`,
 `service install/uninstall`, `caps`, `displays`, `encoder-smoke`,
 `self-update` stay runnable alongside a live agent.
+On Linux the lock's folder is the account's own
+(`appdirs::own_folders`, #3866): a root process takes it in root's own
+cache folder, `/root/.cache/roomler-agent-<id>.lock`, whatever `HOME` or
+`XDG_RUNTIME_DIR` it was started with, where a daemon that systemd started
+has always taken it (`instance_lock.rs:393` `unix_lock_path`).
 
 **Machine guard** (`agents/roomlerd/src/machine_guard.rs`, #4280): one
 daemon per machine, whatever config a `run` loads. `run` takes it before

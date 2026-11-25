@@ -91,7 +91,7 @@ was left. That was a full `sysinfo` disk refresh, which on macOS queries every v
 and the loop's next tick waited for it. **Since FR-85 P7 the check is off the loop.**
 [`recorder.rs:141`](../agents/roomlerd/src/recording/recorder.rs#L141) `watch_free_space` asks it on a blocking
 thread every `disk_check_every` (5 s) and raises a flag. The loop only reads that flag and stops `disk_low` as
-before. [`folder.rs:300`](../agents/roomlerd/src/recording/folder.rs#L300) refreshes storage only, so the IOKit
+before. [`folder.rs:315`](../agents/roomlerd/src/recording/folder.rs#L315) refreshes storage only, so the IOKit
 walks are gone too. A check that takes 120 ms, asked every 250 ms, cost a 3-second recording 25 late ticks inside
 the loop, and costs it none now (`tests/recorder.rs`). On release 0.4.201, which carries P7, the same MacBook
 recorded 10:29 beside a relay-capped session with 0 late ticks of 18,871, and 2:33 with no session with 0 of 4,598.
@@ -289,6 +289,12 @@ but the recorder skipped would only be a courtesy.
 | Default | `Videos\Roomler`, **only if** local, not under OneDrive, and it survives a real write probe | `~/Movies/Roomler` | XDG videos dir + `Roomler` |
 | Fallback | `%USERPROFILE%\Roomler Recordings` | same rule | same rule |
 | Last resort | the recorder's data dir (`%LOCALAPPDATA%\…\recordings`, never roaming) | `~/Library/Application Support/…/recordings` | `~/.local/share/roomler/recordings` |
+
+On Linux `~`, the XDG videos folder and the data folder are the account's own
+(`appdirs::own_folders`, #3866): a person's come from `HOME`, the XDG variables
+and their `user-dirs.dirs`; a root command's home is `/root`, whatever `HOME` it
+was given, with root's own folders and `user-dirs.dirs` beneath it
+([`folder.rs:160`](../agents/roomlerd/src/recording/folder.rs#L160) `default_choice`).
 
 **The write rule** — which identity writes where, and the fallback:
 

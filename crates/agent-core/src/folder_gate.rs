@@ -185,18 +185,6 @@ const KNOWN: &[KnownRow] = &[
     (
         "agents/roomler-cli/src/update.rs",
         "sudo_user_config_path",
-        Build::Linux,
-        &["BaseDirs::new"],
-        Row::Right(
-            "Linux: `sudo roomler self-update` runs as root and re-bases the path \
-             onto the home the account database gives `SUDO_USER`, so it names \
-             that person's config; the `directories` lookup only names the home it \
-             is re-based from",
-        ),
-    ),
-    (
-        "agents/roomler-cli/src/update.rs",
-        "sudo_user_config_path",
         Build::Macos,
         &["BaseDirs::new"],
         Row::Right(
@@ -353,76 +341,6 @@ const KNOWN: &[KnownRow] = &[
             3834,
             "macOS: `roomlerd record` typed with `sudo` keeps the caller's `HOME`, \
              so this names the caller's Movies folder, not root's",
-        ),
-    ),
-    // Linux: a root command run through a `sudo` that keeps `HOME`, or with
-    // `-E` the XDG variables.
-    (
-        "agents/roomlerd/src/service.rs",
-        "user_unit_path_for",
-        Build::Linux,
-        &["BaseDirs::new"],
-        Row::Tracked(
-            3866,
-            "Linux: where `sudo` keeps the caller's `HOME`, `sudo roomlerd service \
-             install`, `start` or `stop` (root, no packaged unit) names the caller's \
-             `systemd/user` folder here",
-        ),
-    ),
-    (
-        "agents/roomler-cli/src/config.rs",
-        "default_config_path",
-        Build::Linux,
-        &["ProjectDirs::from"],
-        Row::Tracked(
-            3866,
-            "Linux: where `sudo` keeps the caller's `HOME`, a `roomler` command typed \
-             with `sudo` names the caller's tunnel config here",
-        ),
-    ),
-    (
-        "agents/roomlerd/src/instance_lock.rs",
-        "unix_lock_path",
-        Build::Linux,
-        &["BaseDirs::new"],
-        Row::Tracked(
-            3866,
-            "Linux: where `sudo` keeps the caller's `HOME`, `sudo roomlerd run` \
-             (root) takes its lock in the caller's folders here",
-        ),
-    ),
-    (
-        "agents/roomlerd/src/recording/folder.rs",
-        "default_choice",
-        Build::Linux,
-        &["BaseDirs::new", "UserDirs::new"],
-        Row::Tracked(
-            3866,
-            "Linux: where `sudo` keeps the caller's `HOME`, `roomlerd record` typed \
-             as root names the caller's Videos folder here",
-        ),
-    ),
-    (
-        "agents/roomlerd/src/display_match.rs",
-        "guard_path",
-        Build::Linux,
-        &["XDG_RUNTIME_DIR"],
-        Row::Tracked(
-            3866,
-            "Linux: a root command typed with `sudo -E` keeps the caller's \
-             `XDG_RUNTIME_DIR`, so this names the caller's runtime folder",
-        ),
-    ),
-    (
-        "agents/roomlerd/src/capture/portal/screencast.rs",
-        "for_current_user",
-        Build::Linux,
-        &["HOME", "XDG_STATE_HOME"],
-        Row::Tracked(
-            3866,
-            "Linux: where `sudo` keeps the caller's `HOME`, or with `sudo -E`, which keeps the \
-             caller's XDG variables, `roomlerd portal-helper` typed with `sudo` (root) names the \
-             caller's state folder here; with `sudo -E`, so does the helper `roomlerd run` starts",
         ),
     ),
     // Linux: a root daemon that needs the seat person's settings.

@@ -635,7 +635,9 @@ pub fn config_for_self_update(path: Option<std::path::PathBuf>) -> Result<Tunnel
 }
 
 /// The invoking user's config under `sudo`: the default path, re-based from
-/// this process's home onto theirs.
+/// this process's home onto theirs. #3866: on Linux this process's home is
+/// its own account's (`appdirs::own_folders`), the one the default path is
+/// beneath: `/root` for a root command, whatever `HOME` it was given.
 #[cfg(unix)]
 fn sudo_user_config_path() -> Option<std::path::PathBuf> {
     let user = std::env::var("SUDO_USER")
@@ -643,6 +645,9 @@ fn sudo_user_config_path() -> Option<std::path::PathBuf> {
         .filter(|u| !u.is_empty() && u != "root")?;
     let their_home = home_of(&user)?;
     let ours = crate::config::default_config_path().ok()?;
+    #[cfg(target_os = "linux")]
+    let our_home = roomler_node_core::appdirs::own_folders()?.home;
+    #[cfg(not(target_os = "linux"))]
     let our_home = directories::BaseDirs::new()?.home_dir().to_path_buf();
     rebase_home(&ours, &our_home, &their_home)
 }
