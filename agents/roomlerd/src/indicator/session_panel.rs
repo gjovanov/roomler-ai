@@ -248,7 +248,7 @@ impl Road for TheRoad {
     }
     fn worker(&self) -> Option<(u32, bool)> {
         let host = crate::consent_relay::one_row_host()?;
-        Some((host.worker_uid()?, host.says_consent_panel()))
+        host.panel_worker()
     }
     fn console_owner(&self) -> Option<u32> {
         console_owner()
@@ -2047,5 +2047,165 @@ mod tests {
         }
         assert_eq!(panel.shows(), 1, "the show never ended");
         assert_eq!(panel.up(), None, "a late show stayed on the panel");
+    }
+
+    // ---- #4421: the worker the road reads -------------------------------
+
+    /// [`HostRoad`], whose worker is read from its host as `TheRoad` reads it
+    /// ([`DelegateHost::panel_worker`]), where `HostRoad`'s is uid 501 with
+    /// the word its host holds.
+    struct HostWorkerRoad(HostRoad);
+
+    #[async_trait::async_trait]
+    impl Road for HostWorkerRoad {
+        fn one_row(&self) -> bool {
+            self.0.one_row()
+        }
+        fn switch_on(&self) -> bool {
+            self.0.switch_on()
+        }
+        fn worker(&self) -> Option<(u32, bool)> {
+            self.0.0.panel_worker()
+        }
+        fn console_owner(&self) -> Option<u32> {
+            self.0.console_owner()
+        }
+        fn person_socket_serves(&self) -> Option<u32> {
+            self.0.person_socket_serves()
+        }
+        fn root_panel_up(&self) -> bool {
+            self.0.root_panel_up()
+        }
+        fn session_panel_up(&self) -> bool {
+            self.0.session_panel_up()
+        }
+        async fn ask(&self, id: &str, question: PanelQuestion, within: Duration) -> Asked {
+            self.0.ask(id, question, within).await
+        }
+        fn on_the_panel(&self, id: &str) -> bool {
+            self.0.on_the_panel(id)
+        }
+        fn to_the_app(&self, id: &str) -> bool {
+            self.0.to_the_app(id)
+        }
+    }
+
+    /// What a question came to: `ask`'s answer; the chain's `native`,
+    /// `session_panel` and `why`; and how many times the root daemon's own
+    /// panel was tried.
+    type CameTo = (
+        SessionPanel,
+        bool,
+        Option<&'static str>,
+        Option<String>,
+        usize,
+    );
+
+    /// What a question comes to on `road`, where the root daemon's own panel
+    /// cannot show it (#4053).
+    async fn comes_to(road: &dyn Road, v: &PromptView) -> CameTo {
+        let asked = ask(road, v).await;
+        let tried = std::sync::atomic::AtomicUsize::new(0);
+        let p = chain(road, v, || {
+            tried.fetch_add(1, Ordering::SeqCst);
+            Err(NotShown::NoPanel)
+        })
+        .await;
+        (asked, p.native, p.session_panel, p.why, tried.into_inner())
+    }
+
+    /// A question the session panel was not asked, for `not`: the root
+    /// daemon's own panel tried once, and with none the app (`native=false`),
+    /// logged `session_panel=not_asked why=<not>`.
+    fn not_asked_for(not: NotAsked) -> CameTo {
+        (
+            SessionPanel::NotAsked(not),
+            false,
+            Some("not_asked"),
+            Some(not.why().to_string()),
+            1,
+        )
+    }
+
+    /// #4421 — the worker the road reads is the attached one. A question
+    /// asked after a worker's channel ended, whose account the host keeps
+    /// until a revoke (the app's road reads it), or after the next spawn
+    /// noted the account and before its worker attached, is not asked for
+    /// `no_worker`. Only the reason is new: the question takes the road it
+    /// took, not asked, the root daemon's own panel tried, then the app.
+    ///
+    /// Red before #4421: both read `no_word`, an attached worker's reason, as
+    /// FR-149's lab rounds 3 and 4 logged it for C9's first question.
+    #[tokio::test]
+    async fn between_a_workers_end_and_the_next_attach_the_reason_is_no_worker() {
+        let host = DelegateHost::new();
+        host.started_for_test(501);
+        let road = HostWorkerRoad(HostRoad(host.clone()));
+        let v = view(ID, Duration::from_secs(30));
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        says_the_word(&mut lines, &mut cwr).await;
+        assert_eq!(
+            host.panel_worker(),
+            Some((501, true)),
+            "attached, word said"
+        );
+        // The worker ends: its channel's end takes its word, then `attached`.
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert_eq!(host.worker_uid(), Some(501), "kept until a revoke");
+        let ended = comes_to(&road, &v).await;
+        // The supervisor's next spawn notes the account again (`open_for`).
+        host.started_for_test(501);
+        let spawned = comes_to(&road, &v).await;
+        assert_eq!(
+            [
+                ("its channel ended", ended),
+                ("the next spawn, not attached yet", spawned)
+            ],
+            [
+                ("its channel ended", not_asked_for(NotAsked::NoWorker)),
+                (
+                    "the next spawn, not attached yet",
+                    not_asked_for(NotAsked::NoWorker)
+                ),
+            ]
+        );
+    }
+
+    /// #4421 — an attached worker that has not said [`CONSENT_PANEL`] is not
+    /// asked for `no_word`, and no `PanelAsk` crosses to it; once it says the
+    /// word, the question is asked and shown on its panel. The road reads
+    /// whether a worker is attached, and leaves both as they were.
+    #[tokio::test]
+    async fn an_attached_worker_without_its_word_is_no_word() {
+        let host = DelegateHost::new();
+        host.started_for_test(501);
+        let road = HostWorkerRoad(HostRoad(host.clone()));
+        let v = view(ID, Duration::from_secs(30));
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        assert_eq!(comes_to(&road, &v).await, not_asked_for(NotAsked::NoWord));
+        // Nothing crossed: the next frame is a ping's answer.
+        read_so_far(&mut lines, &mut cwr).await;
+
+        says_the_word(&mut lines, &mut cwr).await;
+        let at = v.clone();
+        let chained =
+            tokio::spawn(async move { chain(&road, &at, || panic!("a second panel")).await });
+        match next_frame(&mut lines).await {
+            DelegateFrame::PanelAsk { id, .. } => assert_eq!(id, ID),
+            other => panic!("expected the question, got {other:?}"),
+        }
+        told(&mut cwr, ID, PanelState::Shown).await;
+        let p = chained.await.unwrap();
+        assert!(p.native && p.on_the_session_panel(), "{p:?}");
+        host.hide_panel(ID);
+        assert!(matches!(
+            next_frame(&mut lines).await,
+            DelegateFrame::PanelHide { .. }
+        ));
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
     }
 }
