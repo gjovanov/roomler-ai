@@ -110,7 +110,8 @@ changes nothing.
 
 Measured on 20,000 rooms in a local MongoDB 7.0: rooms one ahead, 0.05 ms a room (about
 1 s a pass); the worst shape, every room its own (count read, rows) pair and so one write a
-room, about 1.3 ms a room, so the 10 s bound stops a pass after about 8,000 rooms.
+room, 1 to 1.3 ms a room over two runs, so the 10 s bound stops a pass after 8,000 to
+11,000 rooms.
 
 It is **not leader-gated** (`crates/core/src/job.rs:30-36`). Every write compares the
 count it read, so a pass is right beside a live pod's joins and leaves and beside a second

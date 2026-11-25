@@ -576,10 +576,18 @@ async fn measure_a_pass_over_the_cap() {
             break;
         }
     }
-    // Every room right: a pass reads them all and writes nothing.
-    let t0 = Instant::now();
-    let p = repair(&app).pass().await.unwrap();
-    line("all-right", p, t0.elapsed().as_millis());
+    // Every room right: a pass reads them all and writes nothing. It too reads
+    // exactly its cap and says `more`, and the shape below must begin at the
+    // first room, so the passes run until one reaches the end and clears the
+    // cursor.
+    loop {
+        let t0 = Instant::now();
+        let p = repair(&app).pass().await.unwrap();
+        line("all-right", p, t0.elapsed().as_millis());
+        if !p.more {
+            break;
+        }
+    }
 
     // The worst shape: every room of a batch its own (count read, rows) pair,
     // so one write a room.
