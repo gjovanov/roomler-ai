@@ -260,7 +260,7 @@ $ roomler status
   `.last_install`. The line sits right under `version` — the record and the
   binary it produced, together — and is printed only when the daemon reports
   the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2556`;
-  the sentence per word, `last_install_line`, `:2966`).
+  the sentence per word, `last_install_line`, `:2955`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:2208`,
   called from `run_cmd`, `agents/roomlerd/src/app.rs:4471`). `journalctl -u
