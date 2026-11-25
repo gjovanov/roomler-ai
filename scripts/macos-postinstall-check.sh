@@ -827,7 +827,7 @@ not_called "launchctl bootstrap gui/501 $LA/com.roomler.agent.plist"
 absent "$LA/com.roomler.agent.plist"
 said "is owned by the ROOT DAEMON"
 said "To go back to the per-user LaunchAgent, set that key false"
-not_said "no per-user agent to go back to"
+not_said "no per-user roomlerd to go back to"
 daemon_reloaded
 done_case
 
@@ -837,14 +837,14 @@ done_case
 # on a Mac that `roomlerd one-row` made one row, that command's revert.
 ONE_ROW_ROOT=$(printf '%s\n' 'server_url = "https://roomler.example"' \
     'macos_supervise_gui_worker = true' 'macos_one_row = true')
-start "signed in, one row: no per-user agent to go back to, and the uninstall names the Mac's server"
+start "signed in, one row: no per-user roomlerd to go back to, and the uninstall names the Mac's server"
 signed_in_two_rows
 enrolled "$ONE_ROW_ROOT"
 run
 rc_is 0
 absent "$LA/com.roomler.agent.plist"
 said "is owned by the ROOT DAEMON"
-said "no per-user agent to go back to"
+said "no per-user roomlerd to go back to"
 said "curl -fsSL https://roomler.example/api/setup/install.sh | sh -s -- --uninstall"
 not_said "To go back to the per-user LaunchAgent"
 not_said "one-row --revert"

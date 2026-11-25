@@ -84,8 +84,8 @@ Sealing closes the write side only. Every reader below keeps working.
 > folder it makes is sealed when it is made. A file it writes is made fresh and published by a rename relative to
 > the held folder. A removal deletes, by handle, what the same walk opened.
 
-The bases in use: `appdirs::machine_program_data()` (`crates/agent-core/src/appdirs.rs:230-236`),
-`appdirs::machine_program_files()` (`:241-243`) and `appdirs::profile_of_account(sid)` (`:251-263`).
+The bases in use: `appdirs::machine_program_data()` (`crates/agent-core/src/appdirs.rs:316-322`),
+`appdirs::machine_program_files()` (`:327-329`) and `appdirs::profile_of_account(sid)` (`:337-349`).
 
 The writer's walk (`walk_sealed`); the clean-up's `walk` makes nothing and ends in `remove_tree`:
 
@@ -119,7 +119,7 @@ re-exported as `machine_tree::{HeldPath, Seal, Refusal, Why, TreeRemoval}`. It r
 | `HeldPath::base(base)` | opens the base itself (a reparse point refused); `GetFinalPathNameByHandleW` must equal `GetLongPathNameW(base)`, both without `\\?\` and compared case-insensitively; a `\\?\UNC\` path is refused |
 | `open_dir(name)`, `walk(names)` | each name opened below the previous handle (`NtCreateFile` with `RootDirectory`, `FILE_OPEN`, `FILE_DIRECTORY_FILE` and `FILE_OPEN_REPARSE_POINT`), a reparse point refused, its final path checked. `Ok(None)` when a name is not there. Makes nothing |
 | `sealed_dir(name, seal)`, `walk_sealed(names, seal)` | as `walk`, and a folder that is not there is made with the seal's security descriptor in `OBJECT_ATTRIBUTES` (`FILE_OPEN_IF`): sealed from its creation, with no moment in between. The last name gets the leaf policy below |
-| `HeldPath::machine(target, seal)` | `base(machine_program_data())`, then `walk_sealed` down the names below it (`appdirs::names_below`, `appdirs.rs:423-449`), so every site names its folder as it does today and the segment rule (`resolve_machine_global`, `appdirs.rs:546-554`) stays in one place. The machine folder and its parent, whether passed through or the `target` itself, are only opened (made sealed when they are not there): the leaf policy never moves or re-seals an existing one of those two, which hold the machine config and are FR-94's to repair, and the seal then goes on the files written in them |
+| `HeldPath::machine(target, seal)` | `base(machine_program_data())`, then `walk_sealed` down the names below it (`appdirs::names_below`, `appdirs.rs:509-535`), so every site names its folder as it does today and the segment rule (`resolve_machine_global`, `appdirs.rs:632-640`) stays in one place. The machine folder and its parent, whether passed through or the `target` itself, are only opened (made sealed when they are not there): the leaf policy never moves or re-seals an existing one of those two, which hold the machine config and are FR-94's to repair, and the seal then goes on the files written in them |
 | `write_file(name, bytes, seal)` | a fresh temp below the held folder (`FILE_CREATE`, so an entry already there is never written into), written and flushed (#2955), then renamed onto `name` with `FileRenameInformation` whose `RootDirectory` is the held folder. A folder at `name` fails the rename, and the temp is deleted by handle |
 | `write_file_new(name, bytes, seal)` | `FILE_CREATE` straight into `name`: the first writer wins (`Ok(false)` when it was there) |
 | `append_file(name, seal)` | for logs: `FILE_OPEN_IF` and append. A file already there must be a plain file with one link, owned by SYSTEM or Administrators; otherwise it is deleted by handle and made again |
@@ -195,15 +195,15 @@ Notes on the calls:
 ### P1: crash records
 
 `crashes_dir_for(ctx)` (`crash_recorder.rs:347-359`) answers one of two: the machine tree, on Windows when the
-writer runs as SYSTEM (the supervisor's records, `:359-362`, and a SYSTEM process's own below
+writer runs as SYSTEM (the supervisor's records, `:361-364`, and a SYSTEM process's own below
 `service-logs\crashes`); or a plain path otherwise (the person's own daemon in its profile; macOS and Linux
 unchanged).
 
 | Site | Today | After |
 |---|---|---|
 | `record_inner` (`crash_recorder.rs:233-343`) | `create_dir_all`, the temp file and `fs::rename`, by path | `HeldPath::machine(&dir, Seal::Readable)`, then `write_file("<ts>-<pid>.json", ..)` |
-| `scan_dir`, `should_suppress` (`:581-583`, `:858-859`) | `read_dir` by path | `entries()` and `read_file(name, MAX_PAYLOAD_BYTES)` |
-| `quarantine` (`:724-733`) | `create_dir_all(malformed)`, `fs::rename` | `sealed_dir("malformed", ..)` and `rename_file(name, &malformed, name, false)` |
+| `scan_dir`, `should_suppress` (`:583-585`, `:1072-1073`) | `read_dir` by path | `entries()` and `read_file(name, MAX_PAYLOAD_BYTES)` |
+| `quarantine` (`:726-735`) | `create_dir_all(malformed)`, `fs::rename` | `sealed_dir("malformed", ..)` and `rename_file(name, &malformed, name, false)` |
 | the uploader's deletes (`crash_uploader.rs:133`, `:429-430`) | `remove_file(path)` | `remove_file(name)` on the held folder the sidecar was read from: the uploader carries a name and its folder, not a path |
 | the uploader's verdicts ledger, `crash-verdicts.txt` in the uploading process's log folder (a SYSTEM worker's `service-logs`; before, `crash_uploader.rs:269-293` at `0c5c1dbe6`) | `OpenOptions` create and append, `read_to_string`, by path | as built after review: `crash_recorder::append_verdict` (`crash_recorder.rs:752`): `HeldPath::machine(&log_dir, Seal::Readable)`, then `append_file("crash-verdicts.txt", Seal::Readable)`; `read_verdicts` (`:782`) reads it below the held folder with `read_file`. A refusal is one WARN per process start, not counted |
 
@@ -232,7 +232,7 @@ meets a link or is refused, naming the path. `remove_tree` takes `dry_run`: its 
    domain-qualified name names exactly one account. It needs no privilege beyond the elevated operator's, so it
    works where this arm runs, a command run by hand; the session's token (`WTSQueryUserToken`, then
    `token_user_sid`, `agents/roomlerd/src/win_identity.rs:358`) would need SYSTEM's.
-2. The profile is `appdirs::profile_of_account(&sid)` (`appdirs.rs:251-263`): `ProfileList\<sid>\ProfileImagePath`,
+2. The profile is `appdirs::profile_of_account(&sid)` (`appdirs.rs:337-349`): `ProfileList\<sid>\ProfileImagePath`,
    with only `%SystemRoot%` and `%SystemDrive%` filled in, from the kernel's answers.
 3. No profile recorded: nothing is removed, and the report says why, in words that tell the cases apart: "the
    system records no profile for the session's account", or "cannot tell the session's account". Today's "no
@@ -268,11 +268,11 @@ the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a
 | Site | Today | After |
 |---|---|---|
 | the prune (`logging.rs:1095-1117`) | `read_dir`, `remove_file(entry.path())` | `entries()`, the same name and age rule, `remove_file(name)` |
-| the panic file (`:1107-1128`) | `fs::write` | the hook keeps the `Arc<HeldPath>`: `write_file("panic-<pid>-<ts>.log", ..)` |
-| the stderr file (`:798-804`) | `OpenOptions`, create and append | `append_file(name, Seal::Readable)` |
+| the panic file (`:1119-1140`) | `fs::write` | the hook keeps the `Arc<HeldPath>`: `write_file("panic-<pid>-<ts>.log", ..)` |
+| the stderr file (`:810-816`) | `OpenOptions`, create and append | `append_file(name, Seal::Readable)` |
 | the encoder caps cache (`agents/roomlerd/src/encode/caps_cache.rs:316-328`, its path `:183-187`) | `create_dir_all`, `fs::write(tmp)`, `fs::rename` | `write_file(FILE_NAME, ..)`; its readers read with `read_file` |
 | the install outcome (`agents/roomlerd/src/post_install.rs:206-208`, `:254-297`) | `create_dir_all`, `fs::write` | `write_file("last-install.json", ..)` |
-| the wedged MSI log (`post_install.rs:639-647`) | `fs::rename` to `.prev`, `fs::copy` | `rename_file("msi-wedged.log", held, "msi-wedged.prev.log", true)`, then `write_file` of the copy, read from SYSTEM's own staging |
+| the wedged MSI log (`post_install.rs:984-992`) | `fs::rename` to `.prev`, `fs::copy` | `rename_file("msi-wedged.log", held, "msi-wedged.prev.log", true)`, then `write_file` of the copy, read from SYSTEM's own staging |
 | the update-attempt marker (`agents/roomlerd/src/updater.rs:230-232`, `:242-256`) | `create_dir_all`, `fs::write` | `write_file("update-attempt", ..)` |
 
 The uploader's verdicts ledger (`crash-verdicts.txt`) is a `service-logs` writer too, and P1's since the review
@@ -408,7 +408,7 @@ The docs:
   (`docs/security-baseline.md:671`): a privileged process acts on the machine folder only through
   `machine_tree::HeldPath`, with the walk as a mermaid flow, the two seals and the leaf policy.
 - `.claude/rules/security.md`: the one-line rule for new code.
-- `docs/operator-systemcontext-smoke.md` (`:302-305`, `:401-402`): the folders are sealed (SYSTEM and
+- `docs/operator-systemcontext-smoke.md` (`:373-376`, `:483-484`): the folders are sealed (SYSTEM and
   Administrators write, Users read), and what a `<name>.moved-<unix>` entry means.
 - The module docs: `machine_tree.rs:3-77`, `install_cleanup.rs:19-47`, `crash_recorder.rs:17-62`,
   `win_identity.rs:16-20`.
