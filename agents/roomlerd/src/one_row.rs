@@ -8178,4 +8178,44 @@ mod tests {
         let after: Vec<_> = [501, 502].map(|uid| mac.real[&uid].prev()).into();
         assert_eq!(after, prevs);
     }
+
+    /// #4417 — a sweep planned before a revert, whose children run after the
+    /// revert put each person's config back: every config is left as the
+    /// revert wrote it, and so is each `.prev` beside it (the moved
+    /// enrollment's, or one an earlier sweep replaced), and root's files are
+    /// as the revert left them. The sweep writes no person's config, so it
+    /// needs no order against a revert.
+    #[tokio::test]
+    async fn a_sweep_planned_before_a_revert_leaves_the_configs_the_revert_put_back() {
+        for prevs in ["the moved enrollment's", "one an earlier sweep replaced"] {
+            let (mut mac, outgoing) = converted_with_held_prevs().await;
+            if prevs == "one an earlier sweep replaced" {
+                sweep(&mut mac).await;
+            }
+            let planned = sweep_plan(&mut mac).expect("the conversion's records");
+            revert_now(&mut mac).await.unwrap();
+            let put_back = |mac: &Fake| [501, 502].map(|uid| mac.real[&uid].config());
+            let given_back = [501, 502].map(|uid| Some(outgoing[&uid].clone()));
+            assert_eq!(put_back(&mac), given_back, "{prevs}: the revert");
+            let before = mac.files();
+            let prevs_before = [501, 502].map(|uid| mac.real[&uid].prev());
+            if prevs == "the moved enrollment's" {
+                assert_eq!(
+                    prevs_before, given_back,
+                    "each .prev holds the outgoing config"
+                );
+            }
+            mac.calls.clear();
+            sweep_run(&mut mac, &planned).await;
+            assert_eq!(
+                calls_of(&mac, &["blank-prev"]),
+                ["blank-prev 501", "blank-prev 502"],
+                "{prevs}"
+            );
+            assert_eq!(put_back(&mac), given_back, "{prevs}: the configs");
+            assert_eq!(mac.files(), before, "{prevs}: root's files and the homes");
+            let prevs_after = [501, 502].map(|uid| mac.real[&uid].prev());
+            assert_eq!(prevs_after, prevs_before, "{prevs}: each .prev");
+        }
+    }
 }

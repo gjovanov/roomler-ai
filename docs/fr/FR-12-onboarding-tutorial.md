@@ -1,5 +1,7 @@
 # FR-12 — Onboarding tutorial ("Welcome tour")
 
+**Anchors:** master `94fd6b844` (closed 2026-09-01): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#788](https://github.com/gjovanov/roomler-ai/issues/788)
 **Status:** P1 + P2 + **P3 shipped and FIELD-VERIFIED** — the arc is complete
 

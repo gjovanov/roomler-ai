@@ -310,14 +310,15 @@ const currentPlan = computed(() => summary.value?.plan || currentTenant.value?.p
 const subscribed = computed(() => summary.value?.subscribed === true)
 /** The current-plan card reads the org's billing from the summary alone:
  * `GET /api/tenant` carries none, and a member without MANAGE_TENANT gets no
- * summary, so sees none of it. The status shows while it describes a
- * subscription: the start of a checkout records the org's Stripe customer
- * with an `active` status before any subscription exists, and an abandoned
- * checkout leaves it there, so `active` with nothing subscribed is no status. */
+ * summary, so sees none of it. The status chip shows only while the org is
+ * subscribed (`subscribed`: active, trialing or past due). Without a live
+ * subscription the stored status describes none the org has: the start of a
+ * checkout records `active` before any subscription exists, a checkout
+ * abandoned at 3-D Secure leaves `incomplete`, and an ended one `canceled`
+ * on a Free org (#4432). */
 const status = computed(() => {
   const s = summary.value
-  if (!s?.status || (s.status === 'active' && !s.subscribed)) return null
-  return s.status
+  return s?.subscribed && s.status ? s.status : null
 })
 const seatsNow = computed(() => Math.max(1, summary.value?.seats_now ?? 1))
 /** A PAID plan sells annually here (`utils/billingCurrency`). */

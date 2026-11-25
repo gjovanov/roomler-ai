@@ -195,7 +195,7 @@ sequenceDiagram
     participant API as roomler (saas)
     participant S as Stripe
     UI->>API: POST /api/stripe/checkout {plan, interval, currency}
-    API->>API: refuse a currency not on sale · refuse a 2nd subscription (409)
+    API->>API: refuse a currency not on sale · refuse a 2nd live subscription (409)
     API->>S: Checkout Session, quantity = seats
     S-->>API: customer.subscription.created / .updated (webhook)
     API->>API: tenants.billing ← plan, status, seats, interval, currency
@@ -211,16 +211,40 @@ A seat is a member who accepted; a pending invite is not one. Checkout bills
 (`crates/services/src/stripe.rs:558`, spawned by `crates/modules/saas/src/stripe.rs:173`); a plan change moves the existing
 subscription's item instead of starting a second one (`crates/services/src/stripe.rs:447`).
 
+The org's billing status follows Stripe's **subscription**; the webhook
+(`crates/services/src/stripe.rs:1279`) writes it like this:
+
+| Stripe event | What it writes on the org |
+|---|---|
+| `customer.subscription.created` / `.updated` | status, period end, cancel flag, seats, interval, currency, and the plan its price names while it bills (`crates/services/src/stripe.rs:1157`). The org is the one holding the subscription, else the one named on its metadata, unless that org holds another subscription and either this one has ended (`canceled`, `incomplete_expired`) or the one held bills (`crates/services/src/stripe.rs:1559`) |
+| `checkout.session.completed` | the plan bought, the subscription, the customer, `active` |
+| `customer.subscription.deleted` | Free and `canceled`, only on the org holding that subscription |
+| `invoice.payment_failed` | a renewal: `past_due` at once, whether or not the subscription's own update follows. The **first** invoice (`billing_reason: subscription_create`): nothing (`crates/services/src/stripe.rs:1443`) |
+| `invoice.paid` | nothing; the subscription's own update makes it `active` |
+
+A card that needs 3-D Secure, as most EU cards do under PSD2, fails the first invoice once
+per authentication attempt before it pays, and the subscription stays `incomplete` until it
+does. Until #4432 each of those failures marked the org past due, which counts as
+subscribed: the first real purchase read `past_due` for 16 minutes, and a buyer who
+abandoned the authentication was refused a new checkout (409) until Stripe expired the
+subscription, about a day later. An abandoned checkout now leaves the org on Free with an
+`incomplete` subscription, which does not bill (`crates/services/src/stripe.rs:1534`:
+active, trialing or past due), so a new checkout is accepted at once. The retry is a
+second subscription, and when Stripe expires the abandoned one, its end never lands on the
+org that pays for the retry. A renewal that fails still marks the org past due, and a
+past-due org still cannot start a second checkout.
+
 The billing page's current-plan card reads the org's billing from `GET /api/stripe/summary`
 alone (`crates/services/src/stripe.rs:594`, MANAGE_TENANT): the status, the period end,
 "Cancels at period end", and "Manage Subscription" (Stripe's portal: cancel, card, invoices)
-from `has_billing_account`, a non-empty customer id (`crates/services/src/stripe.rs:1459`).
+from `has_billing_account`, a non-empty customer id (`crates/services/src/stripe.rs:1571`).
 The ids themselves never reach the browser. `GET /api/tenant`, which every member reads,
 carries no billing (`crates/api/src/routes/tenant.rs:16`); until #4431 the card read it from
 there, so a paying org saw none of the four. A member without MANAGE_TENANT is refused the
-summary and sees none of them. The status shows only while it describes a subscription
-(`ui/src/views/billing/BillingView.vue:317`): a checkout's start records the customer with
-an `active` status before any subscription exists, and an abandoned checkout leaves it there.
+summary and sees none of them. The status shows only while the org is subscribed
+(`ui/src/views/billing/BillingView.vue:319`): without a live subscription the stored status
+describes none the org has. A checkout's start records `active` before any subscription
+exists, an abandoned one leaves `incomplete`, and an ended one `canceled` (#4432).
 
 | Setting | Effect | Default |
 |---|---|---|
