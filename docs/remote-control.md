@@ -5199,7 +5199,7 @@ already ended (a half-open socket kept it), whose reason and `now` would rewrite
 it. An asked end still replaces an earlier SEEN end, as every end did before FR-138, and at window 0 that is
 load-bearing: FR-27 audits a device with no prompt surface as `consent_timeout` and then ends it `no_prompt_surface`
 on the same row (`crates/modules/fleet/src/hub.rs:2258`), and the growth digest's `by_end_reason` reads the second
-(`crates/api/src/growth/digest.rs:2358`). A filter of `ended_at: null` (first end wins) would turn every such row into
+(`crates/api/src/growth/digest.rs:2362`). A filter of `ended_at: null` (first end wins) would turn every such row into
 `consent_timeout`.
 
 | Off is today | What happens |

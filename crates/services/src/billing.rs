@@ -23,7 +23,7 @@
 //! The list-price figure (`Plan::price_monthly_cents` × seats) stays where
 //! it was (`routes/cost.rs`), labelled an estimate; nothing here reads it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
@@ -471,7 +471,7 @@ pub struct OrgBilling {
     pub currency: Option<String>,
     /// Paid invoices with a recurring part above 0, oldest first.
     pub paid: Vec<Paid>,
-    /// When a subscription was deleted.
+    /// When a subscription was deleted, unless it expired `incomplete`.
     pub ended: Vec<i64>,
     /// The first invoice paid with an amount above 0 (the funnel's "paid").
     pub paid_since: Option<i64>,
@@ -514,6 +514,13 @@ impl OrgBilling {
                         }
                     }
                 }
+                // #4432 — a subscription that expired `incomplete` never
+                // took a payment, so its end ends no paid period. A checkout
+                // abandoned at 3-D Secure can be retried and paid at once,
+                // and Stripe expires the abandoned one about a day later,
+                // inside the retry's paid period.
+                BillingKind::SubscriptionDeleted
+                    if r.status.as_deref() == Some("incomplete_expired") => {}
                 BillingKind::SubscriptionDeleted => out.ended.push(ts),
                 BillingKind::SubscriptionCreated
                 | BillingKind::SubscriptionUpdated
@@ -997,6 +1004,24 @@ pub fn trial_to_paid(orgs: &HashMap<ObjectId, OrgBilling>, start: i64, end: i64)
     (trials, converted)
 }
 
+/// #4432 — the failed payments Growth counts: the `invoice_payment_failed`
+/// rows of an invoice that was never paid, i.e. with no `invoice_paid` row of
+/// the same invoice (`stripe_id`) at any time. A card that needs 3-D Secure
+/// fails once per authentication attempt and then pays: those attempts were
+/// never a lost payment. Each failed attempt of an invoice never paid counts.
+/// `rows` is the whole record, not only the window being counted: an invoice
+/// may be paid after the window that holds its failure.
+pub fn unpaid_failures(rows: &[BillingEvent]) -> impl Iterator<Item = &BillingEvent> {
+    let paid: HashSet<&str> = rows
+        .iter()
+        .filter(|r| r.kind == BillingKind::InvoicePaid)
+        .map(|r| r.stripe_id.as_str())
+        .collect();
+    rows.iter().filter(move |r| {
+        r.kind == BillingKind::InvoicePaymentFailed && !paid.contains(r.stripe_id.as_str())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1251,6 +1276,57 @@ mod tests {
         r.amount_cents = Some(amount);
         r.interval_months = Some(1.0);
         r
+    }
+
+    /// #4432 — a failure counts only for an invoice never paid: prod's three
+    /// 3-D Secure attempts on an invoice paid minutes later count none, an
+    /// invoice paid a month after its failure counts none, and another
+    /// invoice's payment clears nothing.
+    #[test]
+    fn a_failure_counts_only_for_an_invoice_never_paid() {
+        use BillingKind::{InvoicePaid, InvoicePaymentFailed};
+        let t = ObjectId::new();
+        let on = |kind: BillingKind, invoice: &str, ts: i64| {
+            let mut r = row(kind, t, ts);
+            r.stripe_id = invoice.to_string();
+            r
+        };
+        let rows = vec![
+            on(InvoicePaymentFailed, "in_sca", 1_000),
+            on(InvoicePaymentFailed, "in_sca", 2_000),
+            on(InvoicePaymentFailed, "in_sca", 3_000),
+            on(InvoicePaid, "in_sca", 4_000),
+            on(InvoicePaymentFailed, "in_lost", 5_000),
+            on(InvoicePaymentFailed, "in_lost", 6_000),
+            on(InvoicePaid, "in_other", 7_000),
+            on(InvoicePaymentFailed, "in_late", 8_000),
+            on(InvoicePaid, "in_late", 8_000 + 40 * DAY_MS),
+        ];
+        let counted: Vec<(&str, i64)> = unpaid_failures(&rows)
+            .map(|r| (r.stripe_id.as_str(), r.ts.timestamp_millis()))
+            .collect();
+        assert_eq!(counted, [("in_lost", 5_000), ("in_lost", 6_000)]);
+    }
+
+    /// #4432 — a checkout abandoned at 3-D Secure and paid on the retry: the
+    /// abandoned subscription expires `incomplete` a day later, inside the
+    /// retry's paid period, and leaves its MRR alone. A cancellation there
+    /// still ends it.
+    #[test]
+    fn an_expired_incomplete_subscription_ends_no_paid_period() {
+        let t = ObjectId::new();
+        let (_, nov, _) = month("2026-11");
+        let start = nov + 10 * DAY_MS;
+        let ended = |status: &str| {
+            let mut r = row(BillingKind::SubscriptionDeleted, t, start + DAY_MS);
+            r.status = Some(status.to_string());
+            r
+        };
+        let after = start + 2 * DAY_MS;
+        let orgs = fold(&[paid(t, start, 800, 800), ended("incomplete_expired")]);
+        assert_eq!(orgs[&t].mrr_at(after), 800, "the abandoned one never paid");
+        let orgs = fold(&[paid(t, start, 800, 800), ended("canceled")]);
+        assert_eq!(orgs[&t].mrr_at(after), 0, "a cancellation ends the period");
     }
 
     fn month(label: &str) -> (String, i64, i64) {

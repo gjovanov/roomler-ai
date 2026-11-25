@@ -7,7 +7,7 @@ use roomler_ai_db::models::tenant::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::billing::PriceIds;
 
@@ -1147,6 +1147,11 @@ impl StripeService {
     /// configured price names; that is what makes a plan changed in Stripe's
     /// portal reach the org, which the status-only handler never did.
     ///
+    /// #4432 — found by the metadata, the org may hold ANOTHER subscription:
+    /// a checkout abandoned at 3-D Secure leaves one `incomplete`, and the
+    /// retry starts a second. [`may_take_over`] decides whether this one is
+    /// written over it; one that may not is logged (ids only) and skipped.
+    ///
     /// Read-merge-write of the whole `billing` subdocument: a dotted `$set`
     /// fails on `billing: null` (Mongo error 28, live 2026-07-27).
     async fn apply_subscription(
@@ -1161,7 +1166,8 @@ impl StripeService {
         let mut tenant = tenants
             .find_one(doc! { "billing.subscription_id": sub_id })
             .await?;
-        if tenant.is_none()
+        let holds_it = tenant.is_some();
+        if !holds_it
             && let Some(tid) = sub["metadata"]["tenant_id"]
                 .as_str()
                 .and_then(|h| ObjectId::parse_str(h).ok())
@@ -1173,8 +1179,33 @@ impl StripeService {
             return Ok(None);
         };
         let tid = tenant.id.ok_or(StripeError::TenantNotFound)?;
+        let stripe_status = sub["status"].as_str().unwrap_or_default();
+        if !holds_it && !may_take_over(&tenant, stripe_status) {
+            let holds = tenant
+                .billing
+                .as_ref()
+                .and_then(|b| b.subscription_id.as_deref())
+                .unwrap_or_default();
+            if matches!(stripe_status, "active" | "trialing" | "past_due" | "unpaid") {
+                // Two subscriptions bill this org (two checkouts both paid):
+                // the org stays with the one it holds; the other needs
+                // cancelling in Stripe.
+                warn!(
+                    tenant_id = %tid, subscription_id = %sub_id, holds = %holds,
+                    status = %stripe_status,
+                    "a second subscription bills this org: not applied"
+                );
+            } else {
+                info!(
+                    tenant_id = %tid, subscription_id = %sub_id, holds = %holds,
+                    status = %stripe_status,
+                    "a subscription the org does not hold: not applied"
+                );
+            }
+            return Ok(None);
+        }
 
-        let status = match sub["status"].as_str().unwrap_or_default() {
+        let status = match stripe_status {
             "active" => SubscriptionStatus::Active,
             "past_due" | "unpaid" => SubscriptionStatus::PastDue,
             "canceled" | "incomplete_expired" => SubscriptionStatus::Canceled,
@@ -1292,6 +1323,27 @@ impl StripeService {
                     .find_one(doc! { "_id": tenant_id })
                     .await?
                     .and_then(|t| t.billing);
+                // #4432 — a checkout completing while the org holds ANOTHER
+                // subscription that bills: two checkouts were both paid, and
+                // both subscriptions bill. The org follows this one; the
+                // other needs cancelling in Stripe.
+                if let Some(b) = &existing_billing
+                    && let Some(held) = b
+                        .subscription_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty() && *s != subscription_id)
+                    && matches!(
+                        b.status,
+                        SubscriptionStatus::Active
+                            | SubscriptionStatus::Trialing
+                            | SubscriptionStatus::PastDue
+                    )
+                {
+                    warn!(
+                        tenant_id = %tenant_hex, subscription_id = %subscription_id, holds = %held,
+                        "checkout completed while the org holds another billing subscription"
+                    );
+                }
                 // FR-115 — the seats, interval and currency the checkout
                 // asked for, unless a subscription event already recorded
                 // Stripe's own (it is the authority; this is the fallback).
@@ -1389,24 +1441,61 @@ impl StripeService {
             }
 
             "invoice.payment_failed" => {
-                let subscription_id = obj["subscription"].as_str().unwrap_or_default();
+                // Either API shape: the 2025-03-31 one moved the invoice's
+                // subscription under `parent`.
+                let subscription_id = crate::billing::invoice_subscription(obj).unwrap_or_default();
+                let invoice_id = obj["id"].as_str().unwrap_or_default();
+                let reason = obj["billing_reason"].as_str().unwrap_or_default();
+                if reason == FIRST_INVOICE {
+                    // #4432 — the subscription's FIRST invoice. A card that
+                    // needs 3-D Secure fails once per attempt until the buyer
+                    // approves, and an abandoned one never pays. The
+                    // subscription is `incomplete` meanwhile, and its own
+                    // events say so: past due counted as subscribed, and a
+                    // new checkout was refused until Stripe expired it a day
+                    // later. Recorded above; nothing changes on the org.
+                    info!(
+                        subscription_id = %subscription_id, invoice_id = %invoice_id,
+                        "a first invoice's payment failed: the org follows its subscription"
+                    );
+                } else if subscription_id.is_empty() {
+                    warn!(
+                        invoice_id = %invoice_id, billing_reason = %reason,
+                        "Invoice payment failed, on no subscription"
+                    );
+                } else {
+                    // A renewal: past due at once, whether or not the
+                    // subscription's own `past_due` update follows.
+                    let collection = db.collection::<Tenant>(Tenant::COLLECTION);
+                    collection
+                        .update_one(
+                            doc! { "billing.subscription_id": subscription_id.as_str() },
+                            doc! {
+                                "$set": {
+                                    "billing.status": bson::to_bson(&SubscriptionStatus::PastDue).unwrap_or_default(),
+                                    "updated_at": DateTime::now(),
+                                }
+                            },
+                        )
+                        .await?;
 
-                let collection = db.collection::<Tenant>(Tenant::COLLECTION);
-                collection
-                    .update_one(
-                        doc! { "billing.subscription_id": subscription_id },
-                        doc! {
-                            "$set": {
-                                "billing.status": bson::to_bson(&SubscriptionStatus::PastDue).unwrap_or_default(),
-                                "updated_at": DateTime::now(),
-                            }
-                        },
-                    )
-                    .await?;
+                    warn!(
+                        subscription_id = %subscription_id, invoice_id = %invoice_id,
+                        billing_reason = %reason,
+                        "Invoice payment failed"
+                    );
+                }
+            }
 
-                warn!(
-                    subscription_id = %subscription_id,
-                    "Invoice payment failed"
+            // #4432 — recorded above. The org's status is the subscription's
+            // to set: a paid first invoice makes it `active`, a paid renewal
+            // clears `past_due`, each in a `customer.subscription.updated`.
+            "invoice.paid" => {
+                let subscription_id = crate::billing::invoice_subscription(obj).unwrap_or_default();
+                let invoice_id = obj["id"].as_str().unwrap_or_default();
+                debug!(
+                    subscription_id = %subscription_id, invoice_id = %invoice_id,
+                    "Invoice paid"
                 );
             }
 
@@ -1452,6 +1541,29 @@ pub fn has_live_subscription(t: &Tenant) -> bool {
                     | SubscriptionStatus::PastDue
             )
     })
+}
+
+/// Stripe's `billing_reason` on a subscription's first invoice (#4432).
+const FIRST_INVOICE: &str = "subscription_create";
+
+/// #4432 — whether an event for a subscription the org does NOT hold (found
+/// by the `tenant_id` on the subscription's metadata) may be written onto it.
+/// Always while the org holds none: an update can land before
+/// `checkout.session.completed`. While it holds another, only a subscription
+/// that has not ended takes over, and only from one that does not bill (an
+/// old canceled or `incomplete` one). A checkout abandoned at 3-D Secure can
+/// be retried at once, and Stripe expires the abandoned subscription about a
+/// day later: written over the retry the org pays for, its end would make the
+/// page offer a checkout again, and the paying subscription's own events,
+/// its deletion included, would match no org.
+fn may_take_over(t: &Tenant, stripe_status: &str) -> bool {
+    let holds_another = t
+        .billing
+        .as_ref()
+        .and_then(|b| b.subscription_id.as_deref())
+        .is_some_and(|s| !s.is_empty());
+    let ended = matches!(stripe_status, "canceled" | "incomplete_expired");
+    !holds_another || (!ended && !has_live_subscription(t))
 }
 
 /// An org with a Stripe customer (a non-empty `billing.customer_id`): the
@@ -1632,6 +1744,43 @@ mod tests {
             SubscriptionStatus::Active,
             Some("")
         )));
+    }
+
+    /// #4432 — a subscription the org does not hold lands on an org holding
+    /// none whatever it says; on one holding another, only while it has not
+    /// ended and the one held does not bill.
+    #[test]
+    fn a_subscription_the_org_does_not_hold_never_replaces_one_that_bills() {
+        use SubscriptionStatus::{Active, Canceled, Incomplete, PastDue, Trialing};
+        let every = [
+            "incomplete",
+            "active",
+            "trialing",
+            "past_due",
+            "canceled",
+            "incomplete_expired",
+        ];
+        for held in [None, Some("")] {
+            let t = tenant_with(Active, held);
+            for s in every {
+                assert!(may_take_over(&t, s), "holding {held:?}, {s}");
+            }
+        }
+        for old in [Incomplete, Canceled] {
+            let t = tenant_with(old.clone(), Some("sub_old"));
+            for s in ["incomplete", "active", "trialing", "past_due"] {
+                assert!(may_take_over(&t, s), "holding {old:?}, {s}");
+            }
+            for s in ["canceled", "incomplete_expired"] {
+                assert!(!may_take_over(&t, s), "holding {old:?}, an ended {s}");
+            }
+        }
+        for live in [Active, Trialing, PastDue] {
+            let t = tenant_with(live.clone(), Some("sub_live"));
+            for s in every {
+                assert!(!may_take_over(&t, s), "holding {live:?}, {s}");
+            }
+        }
     }
 
     /// The billing page's "Manage Subscription" opens the portal, which needs
