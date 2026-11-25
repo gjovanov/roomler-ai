@@ -7140,7 +7140,7 @@ Win: `CreateMutexW` named `Local\RoomlerAgent-<sha-prefix12-of-
 config-path>` (`Local\` namespace = per-session scope; SHA disambig
 covers two enrolments on the same machine for the same user). Unix:
 `flock(LOCK_EX | LOCK_NB)` on `$XDG_RUNTIME_DIR/roomler-agent-<id>.
-lock` (or `~/.cache/...` fallback) with PID written for diagnostics.
+lock` (or `~/.cache/...` fallback) with PID written for diagnostics. That file is opened without following a link at its own name, and taken only as a regular file of the daemon's own uid with a single name; anything else is refused and left as it is (`lock_at`).
 Both kernel-released on process death, no stale-lock cleanup needed
 after `kill -9`. Only `run` gates on the lock — `enroll`,
 `service install/uninstall`, `caps`, `displays`, `encoder-smoke`,
