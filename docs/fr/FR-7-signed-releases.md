@@ -1,6 +1,6 @@
 # FR-7: Signed releases — Windows Authenticode (Azure), Linux GPG + provenance, macOS identity
 
-**Anchors:** master `85b9ebd54` (closed 2026-08-27): this spec is the record of the work, and its line anchors read at that commit.
+**Anchors:** master `860fc2c13` (closed 2026-08-27): this spec is the record of the work, and its line anchors read at that commit.
 
 **Status: SHIPPED + field-verified** (retroactive FR per the CLAUDE.md standing rule —
 the program ran 2026-08-15 → 2026-08-26; this spec records what was required, what was

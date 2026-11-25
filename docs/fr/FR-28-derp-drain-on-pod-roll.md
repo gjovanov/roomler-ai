@@ -612,8 +612,8 @@ out. AC3 to AC6 keep their words.
 | Docs | **Met**: AC4's numbers and both halves of AC3 are in | Done |
 
 ⚠️ What moved with AC1: the reader for it does not exist either. `video DC delivery gap` is console-only and logs
-only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:18`, warned at
-`ui/src/composables/useRemoteControl.ts:8514`).
+only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:19`, warned at (2026-11-23)
+`ui/src/composables/useRemoteControl.ts:8530`). (2026-11-24)
 
 ## Out of scope
 

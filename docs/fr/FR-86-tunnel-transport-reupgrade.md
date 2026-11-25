@@ -34,10 +34,10 @@ NEXT session's first rung, and a healthy fallen-back session never ends on its o
 
 | What | Where | Why it blocks a re-upgrade |
 |---|---|---|
-| Each session binds the route's loopback port itself | `crates/tunnel-core/src/driver.rs:370` `bind_local_listener`, called at `:702` (`run_webrtc_session`, `:559`) and `:1435` (`run_quic_session`, `:1246`) | A second session cannot open beside the first — both would bind `127.0.0.1:<port>` |
+| Each session binds the route's loopback port itself | `crates/tunnel-core/src/driver.rs:369` `bind_local_listener`, called at `:682` (`run_webrtc_session`, `:550`) and `:1374` (`run_quic_session`, `:1185`) | A second session cannot open beside the first — both would bind `127.0.0.1:<port>` |
 | Each session owns its accept loop and spawns one task per connection, holding `Arc`s to ITS pool / connection | `driver.rs` `run_webrtc_session` accept loop after `:682`; `run_quic_session` after `:1374` | Connections are welded to the session that accepted them |
-| Ending a session sends `rc:tunnel.terminate` (the #1754 guard) | `driver.rs:113` `TerminateOnDrop`, armed in `run_tunnel_session` (`:398`) | Ending a session to switch transport cuts every connection it carries — at the exit, the peer is closed |
-| The ladder runs once per session open | `client_mgr.rs:1025` `run_session_with_fallback`, `:1150` `drive_one`, driven by `:810` `run_flow_supervisor` | A fallback is permanent for the life of the session |
+| Ending a session sends `rc:tunnel.terminate` (the #1754 guard) | `driver.rs:112` `TerminateOnDrop`, armed in `run_tunnel_session` (`:393`) | Ending a session to switch transport cuts every connection it carries — at the exit, the peer is closed |
+| The ladder runs once per session open | `client_mgr.rs:929` `run_session_with_fallback`, `:1054` `drive_one`, driven by `:714` `run_flow_supervisor` | A fallback is permanent for the life of the session |
 | During a reconnect the port is unbound | the listener lives and dies with the session | A client connecting during a reconnect gets `connection refused` |
 
 ## Key design

@@ -62,7 +62,7 @@
     | 18:58:49 | +1 | our `rc:keyframe` at 18:58:48.3, the positive control; a move 1.5 M → 1 M shares the window and adds nothing |
     | 18:59:01 | +1 | the resize to 1600×900, `dims_swaps` +1, the positive control |
     | 18:59:15 | +1 | the resize back, `dims_swaps` +1 |
-    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11166`) |
+    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11382`) (2026-11-24) |
 
     The other 12 moves sit in windows where `idr_count` did not move: 216 windows judged, none
     unexplained. The inequality holds as written: 4 ≤ 2 dims changes + 2 keyframe requests.
@@ -110,18 +110,18 @@
   - 🔑 **The carrier line is not a source.** Each of the three came 1–3 s after an agent line
     `overlay carrier under the nominated pair is not direct`. The code read here is master's,
     and none of these paths has changed since 0.4.199, the build that ran. The line comes from
-    `overlay_remote_is_relay_tier` (`peer.rs:2273`), a LocalAPI read that changes nothing. The
+    `overlay_remote_is_relay_tier` (`peer.rs:2236`), a LocalAPI read that changes nothing. The (2026-11-24)
     FFmpeg DC pump calls it on its transport recheck, every 5 s (`TRANSPORT_RECHECK_INTERVAL`,
-    `peer.rs:2158`; the recheck at `:7661`). The answer goes two places:
+    `peer.rs:2121`; the recheck at `:7753`). The answer goes two places: (2026-11-24)
     - into `constrained`, which sets the rate ceiling and, on a flip, re-sends `rc:video-info`
-      (`:7672`);
+      (`:7767`); (2026-11-24)
     - into `FlipTracker` (`encode/rate_profile.rs:81`). It rebuilds the encoder only after two
       consecutive checks disagree with the state the pump was built for, at least 60 s after
       the last rebuild, and only when the frame rate changes. That rebuild logs its own line
-      (`peer.rs:7693`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
-      bumps, only the inline open's (`:9010`) can follow from this path, through that rebuild.
-      The others are a dims swap (`:7506`), a rate swap (`:7584`) and a deferred rebuild
-      (`:9571`).
+      (`peer.rs:7781`), re-opens the encoder and restarts the counters. Of the four `send_epoch` (2026-11-24)
+      bumps, only the inline open's (`:9098`) can follow from this path, through that rebuild. (2026-11-23)
+      The others are a dims swap (`:7597`), a rate swap (`:7675`) and a deferred rebuild (2026-11-23)
+      (`:9641`). (2026-11-23)
 
     Neither happened: every heartbeat read `constrained=true`, and `idr_count` never restarted.
     The 1–3 s is the line's cadence. The heartbeat's `constrained` is the variable the recheck
@@ -197,7 +197,7 @@
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
-    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7477`), which
+    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7569`), which (2026-11-24)
     keeps the encoder's counters. A read that cannot see that IDR cannot vouch for the
     absence of the others.
   - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
@@ -222,7 +222,7 @@
     the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
     Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
     An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
-    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9051`)
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9056`) (2026-11-24)
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
@@ -233,7 +233,7 @@
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
       and move nothing. Δ`rate_moves` marks a real move. The read judges the first
-      complete 2 s heartbeat window (`peer.rs:6991`) after a Δ`rate_moves`, on
+      complete 2 s heartbeat window (`peer.rs:7080`) after a Δ`rate_moves`, on (2026-11-24)
       Δ`bytes_written` ÷ Δ`frames_encoded`. A window that starts at most 2 s after the
       move and holds the ratio shows the encoder had tracked by then.
     - ≈ 1.0 is a CBR's contract. NVENC is quality-capped VBR and sits under its cap on
@@ -375,7 +375,7 @@ the only route by which `global_quality` stops being inert.
 
 ## Goal
 
-A remote-desktop encoder follows the rate controller's target **without an IDR and without a rebuild**. Today `FfmpegEncoder::set_bitrate` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3013–3143`) costs an IDR on every move: NVENC through FFmpeg's `reconfig_encoder` (n8.1.2 sets `resetEncoder=1; forceIDR=1` on a bitrate-only change), QSV/AMF/VideoToolbox through a full encoder rebuild under a comment that predates FFmpeg 6.0's runtime `update_bitrate()`. Nine of the 34 rate/quality heuristics in `encode/` exist only to ration that cost (coarsen ladder, deferred applies, 15-s thrift, background swap, settle-KF thrift, refine-vs-cap fight, opener grace, FlipTracker and kf_gate cooldowns); on LAN pairs the AIMD crosses a rung nearly every window — 44 swap IDRs in one day on one host (2026-09-02).
+A remote-desktop encoder follows the rate controller's target **without an IDR and without a rebuild**. Today `FfmpegEncoder::set_bitrate` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1585–1671`) costs an IDR on every move: NVENC through FFmpeg's `reconfig_encoder` (n8.1.2 sets `resetEncoder=1; forceIDR=1` on a bitrate-only change), QSV/AMF/VideoToolbox through a full encoder rebuild under a comment that predates FFmpeg 6.0's runtime `update_bitrate()`. Nine of the 34 rate/quality heuristics in `encode/` exist only to ration that cost (coarsen ladder, deferred applies, 15-s thrift, background swap, settle-KF thrift, refine-vs-cap fight, opener grace, FlipTracker and kf_gate cooldowns); on LAN pairs the AIMD crosses a rung nearly every window — 44 swap IDRs in one day on one host (2026-09-02).
 
 Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`select_rc_mode` tests `rc_max_rate == bit_rate` first and we set both to the cap), which is why every 0.4.49 frame on CORPLAP-1 was exactly `target ÷ fps ÷ 8` bytes; and the existing NVENC in-place write sizes `rc_buffer_size = target` while the open used `maxrate × hrd_pct` — every move silently resizes the HRD window.
 
