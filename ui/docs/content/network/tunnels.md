@@ -9,13 +9,13 @@ order: 5
 
 A **tunnel** forwards a port on the machine you are sitting at to a service on a
 machine somewhere else. The service does not have to be on the mesh, or even
-know Roomler exists — it just has to be reachable *from* the machine running the
-agent.
+know Roomler exists — it just has to be reachable *from* the machine running
+`roomlerd`.
 
 ## The shape of it
 
 ```
-localhost:5432  ->  [ your machine ]  ==mesh==>  [ remote agent ]  ->  db.internal:5432
+localhost:5432  ->  [ your machine ]  ==mesh==>  [ remote roomlerd ]  ->  db.internal:5432
 ```
 
 Nothing is exposed to the internet. The remote service keeps listening only
@@ -24,7 +24,7 @@ where it always did.
 ## Open one
 
 ```bash
-roomler forward --agent <agent-id> --local 5432 --remote localhost:5432
+roomler forward --agent <device-id> --local 5432 --remote localhost:5432
 ```
 
 Then use `localhost:5432` with any client you already have — `psql`, a GUI, an
@@ -37,7 +37,7 @@ way that looks like the device is missing.
 :::
 
 The command stays in the foreground and tears the forward down on `Ctrl-C`. To
-hand it to the local agent instead — so it survives the CLI exiting — add
+hand it to the local daemon instead — so it survives the CLI exiting — add
 `--daemon`, then manage it with:
 
 ```bash
@@ -54,13 +54,13 @@ isolated VLAN.
 
 ## Permanent tunnels
 
-For a forward you always want, declare it in the agent's configuration instead
-of opening it by hand. The agent reconciles declared routes on every start, so
+For a forward you always want, declare it in the daemon's configuration instead
+of opening it by hand. The daemon reconciles declared routes on every start, so
 the tunnel comes back after a reboot, and it backs off rather than hammering the
 server if one cannot be established.
 
 ```bash
-roomler route add --agent <agent-id> --local 5432 --remote localhost:5432
+roomler route add --agent <device-id> --local 5432 --remote localhost:5432
 roomler route ls
 roomler route disable <id>
 roomler route rm <id>

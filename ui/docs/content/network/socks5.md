@@ -13,7 +13,7 @@ network rather than talking to a single database.
 ## Start one
 
 ```bash
-roomler socks5 --agent <agent-id> --local 1080
+roomler socks5 --agent <device-id> --local 1080
 ```
 
 Then point a client at `localhost:1080`:
@@ -40,14 +40,14 @@ reach, addressing each by its device id as the SOCKS hostname.
 
 ```bash
 roomler socks5 --local 1080                                  # mesh mode
-curl --socks5-hostname localhost:1080 http://<agent-id>:8080/
+curl --socks5-hostname localhost:1080 http://<device-id>:8080/
 ```
 
 That turns the proxy into a single entry point to your whole private network
 rather than to one site of it.
 
 :::tip Omitting a flag is the mode switch
-There is no `--mesh` flag. Naming an agent scopes the proxy to it; not naming
+There is no `--mesh` flag. Naming a device scopes the proxy to it; not naming
 one opens it to the whole organization, subject to the same access rules.
 :::
 

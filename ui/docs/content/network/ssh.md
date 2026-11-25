@@ -15,9 +15,9 @@ ssh dev-box
 
 ## Why there is no listening port
 
-The agent intercepts SSH traffic **below the operating system's socket layer**:
+The daemon intercepts SSH traffic **below the operating system's socket layer**:
 packets addressed to the machine's own mesh address on the SSH port are diverted
-into the agent before the OS ever sees them.
+into `roomlerd` before the OS ever sees them.
 
 That is not cleverness for its own sake — it is what makes the feature possible
 at all:
@@ -75,7 +75,7 @@ An unparseable setting is a refusal, not a fallback.
 
 | Account mode | Linux and macOS | Windows |
 |---|---|---|
-| `daemon` | root | the agent's own account: SYSTEM on a service install, the signed-in user on an attended one |
+| `daemon` | root | the daemon's own account: SYSTEM on a service install, the signed-in user on an attended one |
 | `named` | that local account | refused: becoming another user needs their password |
 | `console_user` | the person signed in at the machine's own screen | the user signed in at the console |
 
