@@ -293,7 +293,7 @@ administrator.** Once that config is there, the daemon keeps its folder to
 SYSTEM and Administrators (#3073, #3609), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
 or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1297`), and the
-install refuses it before anything is downloaded (`:295`). Before the enroll it
+install refuses it before anything is downloaded (`:299`). Before the enroll it
 also stops on a config it may not read (`agents/roomler-setup/src/machine_write.rs:183`,
 never reported as a damaged config) or a folder it may not write (`:186`). The
 token is never spent on a config that cannot be written. A **fresh** install of
@@ -627,9 +627,9 @@ host now runs on an older config, and that must never look like a normal boot.
 | The live file | ERROR line | Where |
 |---|---|---|
 | **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3664` |
-| **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3643` |
+| **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3672` |
 
-"Not there" is read off the read's own error (`not_found`, `:3863`), never off an `exists()`
+"Not there" is read off the read's own error (`not_found`, `:3919`), never off an `exists()`
 that could race the read, and a parse error is never read as missing. Before #4058 a live file
 that a person or a test had removed took the second line, which named a truncation that never
 happened.
@@ -643,7 +643,7 @@ copy could not be used).
 | The live file | ERROR line | Where |
 |---|---|---|
 | **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3711` |
-| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3679` |
+| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3719` |
 
 Before #4102 both took the second line, so a device with no config at all, such as one never
 enrolled where `roomlerd org ls` ran, was told its config was unreadable.
@@ -683,7 +683,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:4291`):
+ignores (`serialise_for`, `:4363`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -709,14 +709,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:4097`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:4169`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
-`audit` (`:2882`) — is rewritten to that reading, for instance after a rollback. Only the keys
+`audit` (`:2918`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:4165`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:4149`), never one read off the entry on disk. A newer build's
+`:4237`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:4221`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -737,11 +737,11 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:4243`), so the merge can only
+serialise to exactly what the struct alone would have written (`:4315`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4437`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4509`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
@@ -1135,9 +1135,9 @@ flowchart TD
   of the watcher's races Restart Manager's late stop (#2711). A failed install starts at the
   first rung, as #3292's start did.
 - **The rungs run the binary the install laid down** (`--origin-exe`; `UserDaemon::resolve`,
-  `post_install.rs:920`), never the watcher's own image. That is a copy in the staging
+  `post_install.rs:1275`), never the watcher's own image. That is a copy in the staging
   folder, and a task registered from it would name a launcher in `%TEMP%`. The launcher is
-  spawned with no handle of the watcher's (`:984`).
+  spawned with no handle of the watcher's (`:1339`).
 - **The record says it in three places.** The field sits in `last-install.json`, in
   `NodeStatus.last_install` (`InstallDaemon`, `crates/localapi/src/lib.rs:626`, additive both
   ways), and in the next daemon's `last install:` line, a WARN when the watcher left no daemon
@@ -1843,7 +1843,7 @@ conhost left at Normal, the exit-DNS purge's 10 s bound logged its warning 40.1 
 | What the worker writes | Since #3438 | Why |
 |---|---|---|
 | tracing | The rolling log only (`crates/agent-core/src/logging.rs:260`) | The file has every line, and a console write waits for its conhost |
-| stderr | The rolling log, the same dated file tracing writes, from the end of `init` (`:245`); `NUL` past 256 MiB in a day, as for the per-user daemon (#3292) | The watchdog's last words (`say_on_stderr`), a panic, a stack overflow and FFmpeg print only there |
+| stderr | The rolling log, the same dated file tracing writes, from the end of `init` (`:283`); `NUL` past 256 MiB in a day, as for the per-user daemon (#3292) | The watchdog's last words (`say_on_stderr`), a panic, a stack overflow and FFmpeg print only there |
 | stdout, other than tracing | The console, as before | Only tracing's lines were measured waiting there |
 
 The rule asks two things (`console_nobody_reads`, `crates/agent-core/src/logging.rs:303`):
@@ -1985,8 +1985,8 @@ folder they name from the system, never from the environment they were started w
 | What | Where it comes from | Code |
 |---|---|---|
 | The folder variables of a process on the service account | Set first thing in `main`, before the process has a second thread: the machine's (`ProgramData`, `ProgramFiles` and the rest) from the kernel and the machine's registry, and `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` of the service account's own profile. A process on any other account keeps the environment the system gave it. | `crates/agent-core/src/appdirs.rs:336`, `agents/roomlerd/src/app.rs:1391` |
-| The machine's data and program folders | `machine_program_data`, `machine_program_files`: the machine's registry, on the kernel's system drive. The machine tree, the SystemContext attempt record, the per-Machine install folder, the peer-presence marker and the cleanup step's service-log sweep are rooted there. | `crates/agent-core/src/appdirs.rs:230`, `crates/agent-core/src/appdirs.rs:241` |
-| The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:292`, `crates/agent-core/src/appdirs.rs:251` |
+| The machine's data and program folders | `machine_program_data`, `machine_program_files`: the machine's registry, on the kernel's system drive. The machine tree, the SystemContext attempt record, the per-Machine install folder, the peer-presence marker and the cleanup step's service-log sweep are rooted there. | `crates/agent-core/src/appdirs.rs:316`, `crates/agent-core/src/appdirs.rs:327` |
+| The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:378`, `crates/agent-core/src/appdirs.rs:337` |
 | The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1121`, `agents/roomlerd/src/win_service/supervisor.rs:977` |
 | The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:814`, `crates/agent-core/src/appdirs.rs:823`, `crates/agent-core/src/appdirs.rs:673`, `crates/agent-core/src/appdirs.rs:1061`, `crates/agent-core/src/appdirs.rs:779` |
 | The one-time sweep of the vacated install folder | Reached by handle from the folder it lives below (FR-145): the machine's `Program Files` for a per-Machine install; for a per-User one, the profile the system records for the step's own account, found by its SID, then `AppData\Local\Programs`. Each folder on the way is opened below the one above it, never through a link. The product files are deleted below the held folder, and the folder itself, when empty, through the held folder above it. A folder that is a link, or sits below one, is left as it is, with a line that names it. | `agents/roomlerd/src/install_cleanup.rs:308`, `agents/roomlerd/src/install_cleanup.rs:349` |
@@ -2293,15 +2293,15 @@ exit code (`scripts/install.sh:2125-2204`):
 
 | Line | What it says | When its source cannot be read |
 |---|---|---|
-| `release named by the server's feed: <tag>` (`name_release`, called at `:677` on Linux and `:847` on a Mac) | the tag of the release that holds the file the script downloads. The script takes the first matching file over the whole feed, so when the newest release lacks this host's file, the download comes from an older release, and that one is named | `unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)` |
-| `installed daemon's own --version: <v>` (`report_installed_version`, `:2067`, called at `:2157`) | the first line of the daemon's `--version`, without its `roomlerd ` prefix; `none (download-only installs nothing)` on a `--download-only` run | `no answer (<binary> --version exited <rc>)`, `no answer (<binary> --version printed nothing)`, or the `unreadable (…)` words above |
+| `release named by the server's feed: <tag>` (`name_release`, called at `:692` on Linux and `:862` on a Mac) | the tag of the release that holds the file the script downloads. The script takes the first matching file over the whole feed, so when the newest release lacks this host's file, the download comes from an older release, and that one is named | `unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)` |
+| `installed daemon's own --version: <v>` (`report_installed_version`, `:2174`, called at `:2266`) | the first line of the daemon's `--version`, without its `roomlerd ` prefix; `none (download-only installs nothing)` on a `--download-only` run | `no answer (<binary> --version exited <rc>)`, `no answer (<binary> --version printed nothing)`, or the `unreadable (…)` words above |
 | `NOTE: the installed daemon's <v> differs from the release this script resolved, <tag>` | printed only when both are readable and the tag without `agent-v` is not `<v>` | not printed |
 
 What the feed or the binary says is printed only when it fits the alphabet `A-Z a-z 0-9 . _ + -` and
-64 characters (`fits_alphabet`, `:2024`), so a tag cannot carry terminal control onto the screen. The
+64 characters (`fits_alphabet`, `:2131`), so a tag cannot carry terminal control onto the screen. The
 tag is read from the line its release object starts on, which begins with `"tag_name"` as the server
 writes it; any other shape reads as unreadable, never as another release's tag. The tunnel role prints
-neither line: its CLI names itself after an install (`installed: roomler <v>`, `:1268`).
+neither line: its CLI names itself after an install (`installed: roomler <v>`, `:1363`).
 
 `scripts/install-sh-output-check.sh` pipes the real script into the shell as the one-liner does, under
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
@@ -2336,9 +2336,9 @@ flowchart TD
 |---|---|---|
 | The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2291` | the shell has read every byte before the first command runs |
 | Its first statement is `exec </dev/null` | `:94` | what it starts reads an end of file in every mode: piped, from a file (where stdin would be the person's keystrokes) and from the wizard |
-| The last line, `main "$@"`, is its only call, and nothing follows it | `:2267` | dash runs bytes that arrive in the same read as the call, and any shell runs them from a file |
-| Its last statement is `exit` | `:2265` | a byte after the last line never runs, whatever path `main` takes |
-| `main` is called as a plain command | `:2267` | `main \|\| …`, `if main` and `! main` each turn `set -e` off for the whole script |
+| The last line, `main "$@"`, is its only call, and nothing follows it | `:2292` | dash runs bytes that arrive in the same read as the call, and any shell runs them from a file |
+| Its last statement is `exit` | `:2290` | a byte after the last line never runs, whatever path `main` takes |
+| `main` is called as a plain command | `:2292` | `main \|\| …`, `if main` and `! main` each turn `set -e` off for the whole script |
 
 What the script asks a person goes to the terminal device, never to stdin: `sudo` asks for its
 password there, and so does the pairing's *"Join …?"* (see [Pairing from a terminal](#pairing-from-a-terminal)).
@@ -3329,7 +3329,7 @@ console user are skipped and every root row runs as on any install
   macOS release build (`viewer-indicator-macos`,
   `.github/workflows/release-agent.yml:2915`) runs the AppKit `main`
   (`agents/roomlerd/src/app.rs:1293`), which cannot return the error for std
-  to print: its daemon thread exits 1 itself (`:1321-1323`). That thread
+  to print: its daemon thread exits 1 itself (`:1325-1327`). That thread
   writes the error on stderr as std prints it for the other `main`, `Error:`
   and then every cause, before it logs it through tracing
   (`agents/roomlerd/src/daemon_error.rs:26`, `:34`). A failed write is
@@ -3525,7 +3525,7 @@ console user are skipped and every root row runs as on any install
   this section, and an administrator removes that one item by hand after the
   same `ls -ld` checks.
 - **No scratch file.** `launchctl bootstrap`'s error text is kept in a shell
-  variable (`BOOTSTRAP_ERR`, `UPDATE_ERR`, `:161`, `:633`, `:641`), so the script
+  variable (`BOOTSTRAP_ERR`, `UPDATE_ERR`, `:157`, `:756`, `:764`), so the script
   writes nothing to `/tmp`.
 
 `installer-smoke`'s macOS job holds this on a real install: the runner's own
@@ -4193,7 +4193,7 @@ pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
 macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3149-3150`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
-`:1437-1442`).
+`:1550-1555`).
 
 **A helper that waits for live work reads `running` too** (FR-151). An install
 the helper did not start finds it so during a chain, and leaves it alone. The
