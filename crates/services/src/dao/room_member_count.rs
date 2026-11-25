@@ -32,6 +32,14 @@
 //!   before the count is read would lose a join that lands between the two
 //!   reads (rows 1; the join makes rows 2 and the count 3; the read sees 3;
 //!   the write sets 1).
+//! - Every read it makes, the batch of rooms, the `$group` and the cursor,
+//!   goes to the primary whatever the connection string prefers
+//!   ([`MemberCountRepair::new`]). The order above holds only on one member:
+//!   with `readPreference` naming a secondary in a replica set, the counts
+//!   could come from the primary and the rows from a member that has not yet
+//!   applied a join (count 5 over 5 rows; the lagging member counts 4; the
+//!   compare with 5 holds on the primary, and the write sets 4, one behind),
+//!   and a pass could begin after a cursor that is already gone.
 //!
 //! What a pass cannot see is a join or a leave half done at the moment of its
 //! write: the row already written or removed and counted, its count not yet
@@ -48,7 +56,10 @@ use std::{
 
 use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use futures::TryStreamExt;
-use mongodb::{Collection, Database};
+use mongodb::{
+    Collection, Database,
+    options::{CollectionOptions, ReadPreference, SelectionCriteria},
+};
 use roomler_ai_db::models::{Room, RoomMember};
 
 use super::base::DaoResult;
@@ -84,11 +95,13 @@ pub struct MemberCountRepair {
 }
 
 impl MemberCountRepair {
+    /// The repair over `db`'s rooms, member rows and `locks`, each read on the
+    /// primary whatever `db` prefers (the module doc says why).
     pub fn new(db: &Database) -> Self {
         Self {
-            rooms: db.collection(Room::COLLECTION),
-            members: db.collection(RoomMember::COLLECTION),
-            locks: db.collection("locks"),
+            rooms: on_the_primary(db, Room::COLLECTION),
+            members: on_the_primary(db, RoomMember::COLLECTION),
+            locks: on_the_primary(db, "locks"),
         }
     }
 
@@ -238,6 +251,18 @@ impl MemberCountRepair {
     }
 }
 
+/// `db`'s collection `name`, reading the primary whatever the connection
+/// string prefers: a `readPreference` in it moves `db`'s default, and the
+/// collection would inherit it. Its write and read concerns stay `db`'s.
+fn on_the_primary(db: &Database, name: &str) -> Collection<Document> {
+    db.collection_with_options(
+        name,
+        CollectionOptions::builder()
+            .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+            .build(),
+    )
+}
+
 /// A stored count as a whole number: an integer, or a double with no fraction.
 /// Anything else (missing, a fraction, a string) is no count, so it differs
 /// from every number of rows and a pass sets it.
@@ -247,5 +272,64 @@ fn count_of(v: Option<&Bson>) -> Option<i64> {
         Bson::Int64(n) => Some(*n),
         Bson::Double(f) if f.fract() == 0.0 => Some(*f as i64),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mongodb::Client;
+
+    use super::*;
+
+    /// A pass reads the counts, then the rows, then writes on a compare with
+    /// the count it read, and its cursor says where to begin. That holds only
+    /// when every read is of one member, so a connection string that names a
+    /// secondary must not move the pass's reads off the primary. The driver
+    /// connects lazily: no server is needed to read where a handle reads.
+    #[tokio::test]
+    async fn a_pass_reads_the_primary_whatever_the_connection_string_prefers() {
+        let client = Client::with_uri_str(
+            "mongodb://127.0.0.1:9/?readPreference=secondaryPreferred&w=majority",
+        )
+        .await
+        .unwrap();
+        let db = client.database("member_count_reads");
+        // The control: the handle a server passes in prefers a secondary, and
+        // carries a write concern of its own.
+        assert!(
+            matches!(
+                db.selection_criteria(),
+                Some(SelectionCriteria::ReadPreference(
+                    ReadPreference::SecondaryPreferred { .. }
+                ))
+            ),
+            "the control reads {:?}",
+            db.selection_criteria()
+        );
+        assert!(
+            db.write_concern().is_some(),
+            "the control has no write concern"
+        );
+
+        let repair = MemberCountRepair::new(&db);
+        for (name, c) in [
+            ("rooms", &repair.rooms),
+            ("room_members", &repair.members),
+            ("locks", &repair.locks),
+        ] {
+            assert!(
+                matches!(
+                    c.selection_criteria(),
+                    Some(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+                ),
+                "{name} reads {:?}",
+                c.selection_criteria()
+            );
+            assert_eq!(
+                format!("{:?}", c.write_concern()),
+                format!("{:?}", db.write_concern()),
+                "{name} keeps the handle's write concern"
+            );
+        }
     }
 }

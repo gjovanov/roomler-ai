@@ -95,23 +95,23 @@ Until #4409 the constructor stored 1 and the creator's join added another, so ev
 made before the fix read one member ahead of its rows.
 
 **The repair.** Chat's startup job `room-member-count` (`crates/modules/chat/src/lib.rs:198`)
-runs one pass of `MemberCountRepair` (`crates/services/src/dao/room_member_count.rs:104`) at
+runs one pass of `MemberCountRepair` (`crates/services/src/dao/room_member_count.rs:117`) at
 every boot of every pod, on the boot path before the listener binds
 (`crates/api/src/main.rs:256`, `:340`). Once the stored counts are right a pass reads and
 changes nothing.
 
 | What a pass holds | How |
 |---|---|
-| Reads are bounded | rooms in `_id` order, 500 at a time, with a projection of `_id` and `member_count`; one `$group` on `room_members` per batch |
-| A join or a leave is never lost | the rows are counted **after** the batch's counts are read; each write is an `update_many` per pair of (count read, rows), filtered on `member_count` still the count read (`crates/services/src/dao/room_member_count.rs:181`), so a count that moved fails the compare and waits for the next pass (`skipped`) |
+| Reads are bounded, on the primary | rooms in `_id` order, 500 at a time, with a projection of `_id` and `member_count`; one `$group` on `room_members` per batch. All three reads (the rooms, the `$group`, the cursor) go to the primary whatever the connection string prefers (`on_the_primary`, `crates/services/src/dao/room_member_count.rs:257`): the order below holds only on one member, and with a `readPreference` naming a secondary in a replica set the rows could come from a member that has not yet applied a join, so a right count would be written one behind |
+| A join or a leave is never lost | the rows are counted **after** the batch's counts are read; each write is an `update_many` per pair of (count read, rows), filtered on `member_count` still the count read (`crates/services/src/dao/room_member_count.rs:194`), so a count that moved fails the compare and waits for the next pass (`skipped`) |
 | It writes nothing else | only `member_count`, only where it differs from the rows, on the raw collection (no `updated_at` stamp) |
-| A pass is bounded | at most 20,000 rooms, and no new batch after 10 s (`crates/services/src/dao/room_member_count.rs:57-63`); a pass that stops early keeps the last room of its last finished batch in `locks` `room_member_count`, the next pass begins after it, and the pass that reaches the last room deletes it |
+| A pass is bounded | at most 20,000 rooms, and no new batch after 10 s (`crates/services/src/dao/room_member_count.rs:68-74`); a pass that stops early keeps the last room of its last finished batch in `locks` `room_member_count`, the next pass begins after it, and the pass that reaches the last room deletes it |
 | One line a pass | `room member counts: a pass` with `job`, `rooms_read`, `changed`, `skipped`, `more`, `ms` (`crates/modules/chat/src/member_count.rs:33`), then the host's `startup job done` |
 
-Measured on 20,000 rooms in a local MongoDB 7.0: rooms one ahead, 0.05 ms a room (about
-1 s a pass); the worst shape, every room its own (count read, rows) pair and so one write a
-room, 1 to 1.3 ms a room over two runs, so the 10 s bound stops a pass after 8,000 to
-11,000 rooms.
+Measured on 20,000 rooms in a local MongoDB 7.0, over three runs: rooms one ahead, 0.05 to
+0.07 ms a room (1.1 to 1.3 s a pass); the worst shape, every room its own (count read, rows)
+pair and so one write a room, 0.9 to 1.3 ms a room, so the 10 s bound stops a pass after
+8,000 to 11,000 rooms.
 
 It is **not leader-gated** (`crates/core/src/job.rs:30-36`). Every write compares the
 count it read, so a pass is right beside a live pod's joins and leaves and beside a second
