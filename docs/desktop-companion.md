@@ -78,7 +78,7 @@ while the prompt window asks a question:
 | device view (`Status` + `Peers`) | `src/front/app.js:194` → `cmd_device_view`, `src/commands.rs:505` | 2 s | 1 |
 | Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:550` → `cmd_tunnels_view`, `src/commands.rs:3139` | 2 s, visible only | 1 |
 | consent (in-window) | `src/front/consent.js:200` | 1.5 s | 1 |
-| consent watcher (Rust; a failed read keeps the screen, §10.9.2) | `src/main.rs:320` | 750 ms, each poll 5 s at most | 1 |
+| consent watcher (Rust; a failed read keeps the screen, §10.9.2) | `src/main.rs:324` | 750 ms, each poll 5 s at most | 1 |
 | consent (the prompt window, §10.9) | `src/front/panel-consent.js:210` | 750 ms | 1 |
 
 **What went wrong (field, 2026-09-25):** the Routes page's tables appeared and disappeared
@@ -2079,8 +2079,8 @@ flowchart TD
 | Piece | Where | What |
 |---|---|---|
 | the decision | `decide_startup`, `agents/roomler-desktop/src/first_run.rs:75` | an explicit `--view=` first, then a start for a prompt stays in the tray, the tour done or not. It never leaves either: `Exit` stays for `--autostart` with the login-start switch off |
-| the held tour | `holds_the_tour`, `first_run.rs:154`; set in `main.rs:87` | a start that stayed in the tray with the tour not done, which only a start for a prompt does. The person's own opening of the window shows the tour once: a second launch forwarded to the running companion (`decide_second_instance`, `first_run.rs:118`), a reopen on macOS (`decide_reopen`, `first_run.rs:264`; §10.7), the tray icon and its Device status (`tray_path`, `first_run.rs:188`, called by `show_status`, `tray.rs:544`, from `:83` and `:111`). The explicit items (Welcome tour…, Onboarding…, Check for Updates) are as before, and the daemon's next start for a prompt, forwarded, shows nothing |
-| macOS | `asks_the_daemon`, `first_run.rs:200`, asked at `main.rs:83`; `daemon_has_something_to_show`, `first_run.rs:222`; `something_to_show`, `:208` | only a start with no argument at all, for a person whose tour is not done, asks; Windows and Linux are told. The answer is the LocalAPI's `consent_pending` and `rc_sessions`, 300 ms for all of it, and a list that fails reads as an empty one, which holds no tour back (the consent watch keeps its last answer instead, §10.9.2): a question the daemon does not show natively, or a session the banner is for (`wants_banner`). No answer is no reason, and the tour shows as before. The process that answers is whoever serves the person's `$TMPDIR/roomler.sock`, the one the consent watch polls: the screen worker on a one-row Mac, the per-user agent on a two-row Mac. Since #3864 the screen worker's answer holds the root daemon's questions too (§10.8), so on a one-row Mac the root's question keeps the tour back. Since #3967 so does the per-user agent's on a two-row Mac (§10.8.1) |
+| the held tour | `holds_the_tour`, `first_run.rs:154`; set in `main.rs:88` | a start that stayed in the tray with the tour not done, which only a start for a prompt does. The person's own opening of the window shows the tour once: a second launch forwarded to the running companion (`decide_second_instance`, `first_run.rs:118`), a reopen on macOS (`decide_reopen`, `first_run.rs:264`; §10.7), the tray icon and its Device status (`tray_path`, `first_run.rs:188`, called by `show_status`, `tray.rs:544`, from `:83` and `:111`). The explicit items (Welcome tour…, Onboarding…, Check for Updates) are as before, and the daemon's next start for a prompt, forwarded, shows nothing |
+| macOS | `asks_the_daemon`, `first_run.rs:200`, asked at `main.rs:84`; `daemon_has_something_to_show`, `first_run.rs:222`; `something_to_show`, `:208` | only a start with no argument at all, for a person whose tour is not done, asks; Windows and Linux are told. The answer is the LocalAPI's `consent_pending` and `rc_sessions`, 300 ms for all of it, and a list that fails reads as an empty one, which holds no tour back (the consent watch keeps its last answer instead, §10.9.2): a question the daemon does not show natively, or a session the banner is for (`wants_banner`). No answer is no reason, and the tour shows as before. The process that answers is whoever serves the person's `$TMPDIR/roomler.sock`, the one the consent watch polls: the screen worker on a one-row Mac, the per-user agent on a two-row Mac. Since #3864 the screen worker's answer holds the root daemon's questions too (§10.8), so on a one-row Mac the root's question keeps the tour back. Since #3967 so does the per-user agent's on a two-row Mac (§10.8.1) |
 
 - **Old and new together.** An older companion started with `--for-prompt` ignores it, as it
   ignores any argument it does not know, and shows the tour as before. A newer companion that
@@ -2118,8 +2118,8 @@ How that reaches the running companion depends on the platform:
 
 | Platform | What opening the app again does | What the companion hears |
 |---|---|---|
-| Windows, Linux | starts a second process, which the single-instance plugin ends after it forwards its arguments to the running one | the plugin's callback (`agents/roomler-desktop/src/main.rs:107`): `a second launch` |
-| macOS | starts nothing: AppKit hands the running app a **reopen** (`applicationShouldHandleReopen`). That is a double-click in Finder or Launchpad, Spotlight, or `open -a`. `LSUIElement` gives the app no Dock tile to click | `RunEvent::Reopen`, matched by `reopened` (`main.rs:285`) and handled by `reopen` (`:302`): `a reopen shows …` |
+| Windows, Linux | starts a second process, which the single-instance plugin ends after it forwards its arguments to the running one | the plugin's callback (`agents/roomler-desktop/src/main.rs:108`): `a second launch` |
+| macOS | starts nothing: AppKit hands the running app a **reopen** (`applicationShouldHandleReopen`). That is a double-click in Finder or Launchpad, Spotlight, or `open -a`. `LSUIElement` gives the app no Dock tile to click | `RunEvent::Reopen`, matched by `reopened` (`main.rs:289`) and handled by `reopen` (`:306`): `a reopen shows …` |
 
 Until #3941 the companion had no handler for the reopen. It ran with `.run(context)`, whose
 callback does nothing, so on a Mac the menu-bar icon was the only way back to the window.
@@ -2135,11 +2135,11 @@ flowchart LR
 | Piece | Where | What |
 |---|---|---|
 | the decision | `decide_reopen`, `agents/roomler-desktop/src/first_run.rs:264` | `decide_second_instance` with no argument: the window where the person left it (`Show`), or the Welcome tour while a start for a prompt holds it back and it is not done (§10.6). A reopen carries no argument, so it is never a login start or a start for a prompt, and never does nothing |
-| the window | `show_main_window`, `agents/roomler-desktop/src/main.rs:264`; `open_window`, `first_run.rs:322` | the second launch's code, moved out of its callback, not copied. It routes the page to the view asked for, releasing a held tour as it shows it (offered once), then shows and focuses the window. `Show` leaves the page where the person left it, as a double-click does on Windows; the tray's icon and Device status route to the Overview instead (`tray_path`) |
+| the window | `show_main_window`, `agents/roomler-desktop/src/main.rs:268`; `open_window`, `first_run.rs:322` | the second launch's code, moved out of its callback, not copied. It routes the page to the view asked for, releasing a held tour as it shows it (offered once), then shows and focuses the window. `Show` leaves the page where the person left it, as a double-click does on Windows; the tray's icon and Device status route to the Overview instead (`tray_path`) |
 | the line | `log_reopen`, `first_run.rs:283` | one line per reopen, beside `a second launch`: `a reopen shows the main window` or `a reopen shows the tour`, with `first_run_done`, `tour_held`, `has_visible_windows` and the decision. It is the lab's second witness beside the window |
 | the tray's line (#3996) | `log_tray_open`, `first_run.rs:303`, from `show_status`, `tray.rs:544` | the tray's icon and its Device status log one line beside it: `a tray click shows the Overview` or `a tray click shows the tour`, with `item` (`icon` or `Device status`), `tour_held` and `view`. Until #3996 that click logged nothing |
 | `has_visible_windows` | AppKit's answer, passed on by tao | logged, not obeyed: the being-viewed banner and the consent panel are windows too, so it can be true while the main window is closed |
-| the run loop | `.build(…)` then `.run(…)`, `main.rs:247` | `.run(context)` was `build(context)` then `run` with a callback that does nothing (Tauri 2.11). The tray's and the menu's handlers, every plugin's `on_event` (the macOS single-instance socket's cleanup at exit) and the window bookkeeping still run before the callback. The callback never prevents an exit, and off macOS it matches nothing |
+| the run loop | `.build(…)` then `.run(…)`, `main.rs:251` | `.run(context)` was `build(context)` then `run` with a callback that does nothing (Tauri 2.11). The tray's and the menu's handlers, every plugin's `on_event` (the macOS single-instance socket's cleanup at exit) and the window bookkeeping still run before the callback. The callback never prevents an exit, and off macOS it matches nothing |
 
 - **Unchanged:** the second launch on Windows and Linux (its decision, its line, what it shows),
   the tray, the close-to-hide, and exit requests.
@@ -2249,7 +2249,7 @@ sequenceDiagram
   past the hub's 5 s (`docs/remote-control.md`, "The window runs from the request").
 - **One viewer, with the native panel up.** The app now receives that question too, marked
   `native`, and filters it out (the watch's `on_the_prompt`,
-  [`main.rs:410`](../agents/roomler-desktop/src/main.rs#L410); the prompt window,
+  [`main.rs:414`](../agents/roomler-desktop/src/main.rs#L414); the prompt window,
   `panel-consent.js:191`), as a Windows SYSTEM install's tray does with a question its own panel
   shows. A Linux system daemon has no native panel, so its tray shows every question. There is
   one Approve on the screen, the panel's: the app shows no button for that question.
@@ -2883,7 +2883,7 @@ What starts that second again, and what does not:
 | the app raises a prompt that is up, for a question its watch has not seen | yes | `show` |
 | the app raises the main window for the fallback modal (#2815) | yes | `show` |
 | a new question replaces the one under the pointer | yes | `shownAt`, set in `render` (`panel-consent.js`) and `show` (`consent.js`) |
-| a poll that changes nothing, the page's or the watch's | no | the page puts a question up only once the one it shows is gone. The watch raises the prompt only for a question it has not seen (`SessionWatch::poll`, `agents/roomler-desktop/src/main.rs:516`) |
+| a poll that changes nothing, the page's or the watch's | no | the page puts a question up only once the one it shows is gone. The watch raises the prompt only for a question it has not seen (`SessionWatch::poll`, `agents/roomler-desktop/src/main.rs:520`) |
 | a read of the questions that failed, the page's or the watch's | no | both keep the question they show (§10.9.2) |
 
 Each click sends `shown`, the time in ms that the page has shown its question. The app counts
@@ -2931,7 +2931,7 @@ of failed reads. Since #3973 a root daemon gives the companion it starts the ses
 #### 10.9.2 A failed read changes nothing on the screen (#3998)
 
 The session watch asks the device service for the questions and the live sessions every 750 ms
-(`consent_watch_loop`, [`main.rs:320`](../agents/roomler-desktop/src/main.rs#L320)). Until #3998
+(`consent_watch_loop`, [`main.rs:324`](../agents/roomler-desktop/src/main.rs#L324)). Until #3998
 it read a failed read as an empty answer: a connect that failed, a failed read of the questions,
 a failed read of the sessions. One such read took the prompt and the banner down, and the next
 good read put the question up again, placed and armed again (§10.9.1). A busy pipe, a broken
@@ -2939,12 +2939,12 @@ reply or a restarting service was enough. The banner's own page did the same wit
 said "Being viewed" with no name, beside a Disconnect that ended nothing.
 
 Now the watch keeps the service's last answer, list by list (`SessionWatch`,
-[`main.rs:444`](../agents/roomler-desktop/src/main.rs#L444)):
+[`main.rs:448`](../agents/roomler-desktop/src/main.rs#L448)):
 
 | A poll | The prompt | The banner, and the tray's red |
 |---|---|---|
 | answers a list | follows it | follows it |
-| fails: a busy pipe, a broken or refused reply, a poll past 5 s | keeps its question and its place for 10 s of failed reads at most (`QUESTIONS_KEPT_FOR`, `main.rs:366`), then comes down | keep what they show for as long as no answer comes |
+| fails: a busy pipe, a broken or refused reply, a poll past 5 s | keeps its question and its place for 10 s of failed reads at most (`QUESTIONS_KEPT_FOR`, `main.rs:370`), then comes down | keep what they show for as long as no answer comes |
 | proves that no service is there | comes down at once | come down at once |
 
 The two differ on purpose. A question the service cannot decide must not linger: a click on it
@@ -2993,10 +2993,10 @@ flowchart TD
 
 | Part | What it does | Where |
 |---|---|---|
-| the watch | one poll at a time, each list its own answer, and a list that failed keeps the last answer's | `SessionWatch::poll`, [`main.rs:459`](../agents/roomler-desktop/src/main.rs#L459) |
-| the poll's bound | 5 s for the connect and both lists (`WATCH_READ_WITHIN`, `main.rs:361`). A poll past it is a failed one. Until #3998 nothing bounded it, and a read that never ended stopped the watch with whatever it showed | `read_within`, [`main.rs:377`](../agents/roomler-desktop/src/main.rs#L377) |
+| the watch | one poll at a time, each list its own answer, and a list that failed keeps the last answer's | `SessionWatch::poll`, [`main.rs:463`](../agents/roomler-desktop/src/main.rs#L463) |
+| the poll's bound | 5 s for the connect and both lists (`WATCH_READ_WITHIN`, `main.rs:365`). A poll past it is a failed one. Until #3998 nothing bounded it, and a read that never ended stopped the watch with whatever it showed | `read_within`, [`main.rs:381`](../agents/roomler-desktop/src/main.rs#L381) |
 | the proof | a connect that failed while the own endpoint is gone comes back as `NotFound`, which the tray reads as no service (`tray::no_service`, unchanged). Since #4020 every connect of the app whose error is read goes through it (§3.1) | `connect_service` and `proven`, [`commands.rs:3098`](../agents/roomler-desktop/src/commands.rs#L3098), [`:3112`](../agents/roomler-desktop/src/commands.rs#L3112) |
-| the tray's red | the same answer as the banner (`tray_answer`, `main.rs:396`). The recording watch connects through the same proof, so the red comes down with a stopped daemon on every host | `spawn_recording_watch`, `tray.rs:438` |
+| the tray's red | the same answer as the banner (`tray_answer`, `main.rs:400`). The recording watch connects through the same proof, so the red comes down with a stopped daemon on every host | `spawn_recording_watch`, `tray.rs:438` |
 | the banner's page | `cmd_rc_sessions` answers an error for a failed read, and the page keeps its words | `sessions_answer`, [`commands.rs:3077`](../agents/roomler-desktop/src/commands.rs#L3077); `poll`, `panel-viewing.js:68` |
 | a click with no service | "Could not reach the device service: it is not running." on the prompt's status line, and `device service not running` in the log | `answer_click`, [`commands.rs:2971`](../agents/roomler-desktop/src/commands.rs#L2971) |
 
@@ -3095,6 +3095,52 @@ was at that moment.
   daemon's panel). Both open on the secondary. With the pointer moved to the primary, the next
   question opens there. With one screen, nothing changes.
 
+### 10.10 The main window's full-screen behaviour is set, never guessed (macOS, #4419)
+
+On a Mac (0.4.236, macOS 15.7.7, a one-row guest) the menu-bar app ended within three seconds
+of Fast User Switching's menu-bar item being turned on in System Settings, and within a second
+of System Settings being closed, with the app's main window on the screen. Its crash report
+holds no frame of the app's own code between the run loop and the exception: the main thread
+was in `-[NSApplication run]`, called by tao's event loop, inside the run loop's display cycle.
+
+| Frames, innermost first | What they are |
+|---|---|
+| `objc_exception_throw`, then `-[__NSSingleObjectEnumerator init] + 0` | an exception raised inside an enumeration |
+| `NSViewUpdateVibrancyForSubtree` × 3 | AppKit's vibrancy pass, three views down the window's tree |
+| `-[NSWindow displayIfNeeded]`, `NSDisplayCycleFlush` | a window drawn in the display cycle (`+[CATransaction NS_setFlushesWithDisplayLink]`'s run-loop observer) |
+| `-[NSApplication _crashOnException:]` | the exception reached the run loop uncaught, and AppKit ends the process |
+
+Firefox met the same frames and traced them
+([bugzilla 2031249](https://bugzilla.mozilla.org/show_bug.cgi?id=2031249)): a titled window
+whose `collectionBehavior` holds no full-screen bit has AppKit guess, at each pass, whether it
+may go full screen (`_implicitlyAllowsFullScreenPrimary`). When the guess changes between two
+passes of one cycle, `-[NSThemeFrame _updateButtons]` adds the full-screen button to
+`NSTitlebarView` while the vibrancy pass walks that view's subviews: "Collection was mutated
+while being enumerated". In their trace the three frames are the window's frame view, the
+title bar's container and the title bar.
+
+| | |
+|---|---|
+| The window | the main window, the companion's only titled window on a Mac (`tauri.conf.json`: decorations, resizable). The panels are built with `decorations(false)` (`panels.rs:346`) and the red frame's strips are borderless with an explicit behaviour (`panels.rs:831-836`): no title bar, no button. 0.4.237's red-frame changes (#4388, #4398) touch only the strips |
+| The fix | `full_screen::make_explicit` (`agents/roomler-desktop/src/full_screen.rs:79`), called once in `setup` before the window is first shown (`agents/roomler-desktop/src/main.rs:226`), sets the bits a choice needs where the window holds none (`explicit_full_screen`, `full_screen.rs:59`) |
+| The bits | a resizable window: `FullScreenPrimary` and `FullScreenAllowsTiling` (0x880), the value Firefox's fix gives its windows. A fixed-size one: `FullScreenNone` and `FullScreenDisallowsTiling`. A choice the window holds is kept: AppKit raises at two of either kind. The bit values are checked against objc2-app-kit's when the Mac build compiles. Not read in the lab: what AppKit's guess gave this window before, the app being a menu-bar app (`LSUIElement`). The field cell reads the green button's action |
+| The log | `the main window's full-screen behaviour is explicit (#4419)`, with `before`, `after` and `resizable` |
+| Other OSes | nothing: `make_explicit` is empty there |
+
+- **Tested:** `full_screen::tests` in rust-unit's "Test the desktop companion (roomler-desktop)"
+  and in "The desktop companion on Windows — clippy + unit tests (#3940)": a window made with no
+  choice is given one of each, the main window's 0x880, a fixed-size window's bits, a choice
+  already held kept with every other bit. They fail against the behaviour before #4419, the
+  window's 0 left as tao made it. `make_explicit` and the bit checks compile in "macOS overlay
+  compile check", step "cargo check the desktop companion". None of these runs on a Mac, and no
+  test can make AppKit change its guess.
+- **Field:** the lab did not make the app end again. On published 0.4.237, ten changes of the
+  item (five on, five off) through System Settings' own control, each followed by System
+  Settings closing with the main window on the screen: the same pid and no crash report 30 s
+  after every change. On published 0.4.236, the version that ended, with its updates turned off,
+  the same ten changes gave the same. The change removes the guess the frames point to; its
+  field cell is the same sequence on a build that carries it.
+
 ## 11. Testing it
 
 - **Unit:** `cargo test -p roomler-desktop` (the Rust side), `cargo test -p roomler-localapi
@@ -3188,7 +3234,7 @@ dialog's **Approve**. Now the capture open's wait hook marks its session `asking
 dialog is the wait (`agents/roomlerd/src/peer.rs:5860`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1440`), and the banner comes up only for a session that sees the
-screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:535`). The mark goes
+screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:539`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
 
@@ -3207,7 +3253,7 @@ also keeps a system install's Wayland capture opt-in.
 | Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:54` |
 | Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:50-52` |
 | Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:383` |
-| Stays through a failed read | a read of the sessions that fails, or a LocalAPI stall, never takes it down: only an answer with no live session does, or proven no service (§10.9.2) | `SessionWatch`, `agents/roomler-desktop/src/main.rs:444` |
+| Stays through a failed read | a read of the sessions that fails, or a LocalAPI stall, never takes it down: only an answer with no live session does, or proven no service (§10.9.2) | `SessionWatch`, `agents/roomler-desktop/src/main.rs:448` |
 | Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
 | Frame | a 2 px red frame for the whole session round the screen the viewer sees: the captured display, the menu bar's (#4392, below) — four click-through strips (macOS). It follows that screen: laid out round it as it is at each show, and again at each screen change while it is up (#4376, below) | `panels.rs:608`; `frame::show` `:658`, `marked_screen` `:730`, `on_screen_change` `:799` |
 
@@ -3338,7 +3384,7 @@ the one placement it allows a client (`agents/roomler-desktop/src/pin.rs`):
 | Desktop | How the banner gets to the top | Where |
 |---|---|---|
 | **KDE Plasma** (Wayland) | A KWin script, loaded into the running KWin over D-Bus (`org.kde.kwin.Scripting`). It finds the banner by its title (`BANNER_TITLE`), puts it at the top centre of its screen, 48 px down, and keeps it above everything and out of the task switchers. It places the banner again each time it maps, because a hidden banner comes back as a new window. Nothing is written to the person's KWin configuration, and the script goes when that KWin does. | `pin.rs:120`, the script `pin.rs:82` |
-| **GNOME** (Wayland) | mutter offers no placement, no layer-shell and no scripting. The companion runs under **Xwayland** instead (`GDK_BACKEND=x11`), where an X11 window places itself and stays above. It is set as `main`'s first statement: GTK reads it when it starts, and an environment variable may only be set while no other thread exists. | `pin.rs:63`, `agents/roomler-desktop/src/main.rs:53` |
+| **GNOME** (Wayland) | mutter offers no placement, no layer-shell and no scripting. The companion runs under **Xwayland** instead (`GDK_BACKEND=x11`), where an X11 window places itself and stays above. It is set as `main`'s first statement: GTK reads it when it starts, and an environment variable may only be set while no other thread exists. | `pin.rs:63`, `agents/roomler-desktop/src/main.rs:54` |
 | X11, Windows, macOS | Unchanged: the window places itself. | `panels.rs:473` |
 
 ```mermaid
@@ -3649,7 +3695,7 @@ flowchart TD
 |---|---|---|
 | the path check, 1 s | `PATH_CHECK`, `agents/roomlerd/src/person_socket.rs:124` | one `lstat` in a tmpfs; a lost socket is served again within it and one look |
 | the look, 5 s | `POLL`, as before | unchanged |
-| told within, 6 s | `TOLD_WITHIN`, `agents/roomlerd/src/rc_sessions.rs:398` | above the longest gap between two reads of a working companion: it sleeps 750 ms between polls and gives a read 5 s (`WATCH_READ_WITHIN`, `agents/roomler-desktop/src/main.rs:361`). A companion started for the session is waited for 2.5 s at most (`TRAY_START_WAIT`), and polls 750 ms after it is up. One slower than that to its first read gets the notification as well as its banner: the bound errs toward telling |
+| told within, 6 s | `TOLD_WITHIN`, `agents/roomlerd/src/rc_sessions.rs:398` | above the longest gap between two reads of a working companion: it sleeps 750 ms between polls and gives a read 5 s (`WATCH_READ_WITHIN`, `agents/roomler-desktop/src/main.rs:365`). A companion started for the session is waited for 2.5 s at most (`TRAY_START_WAIT`), and polls 750 ms after it is up. One slower than that to its first read gets the notification as well as its banner: the bound errs toward telling |
 | the quiet check, 1 s | `QUIET_CHECK`, `agents/roomlerd/src/indicator/notify.rs:707` | a companion gone quiet is caught within 7 s |
 
 **Unchanged:** whom the socket serves and what it answers (`Scope::Person`), the kill switches
