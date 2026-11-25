@@ -389,12 +389,14 @@ each box ticked only with its log line.
   Read 2026-11-24 with the served script and 0.4.235: a waiting helper stopped at once (`why=Stopped`), and an
   installing one was waited for until `installer(8)` exited. The script has carried #4299 since 2026-11-23, a day
   before 0.4.235 ([lane 1](https://github.com/gjovanov/roomler-ai/issues/4288#issuecomment-7137389192)).
-- [ ] **AC10** (tests): the cells above pass in CI on the lanes that build them, the behaviour cells shown RED on P1's
+- [x] **AC10** (tests): the cells above pass in CI on the lanes that build them, the behaviour cells shown RED on P1's
   seam first.
-  Open (2026-11-24): on #4297's last head (`e20cc8bfb`) every cell passes in CI, across four lanes with no failure.
+  Read 2026-11-25: on #4297's last head (`e20cc8bfb`) every cell passes in CI, across four lanes with no failure.
   #4297's description records its seam (`49dc7086d`), where 31 of the 33 FR-151 tests failed, and lists them. H6
-  (`mac_the_childs_socket_is_the_daemons`), a macOS-only behaviour cell, is not among them: it runs only in CI's macOS
-  lane, and no CI ran on the seam.
+  (`mac_the_childs_socket_is_the_daemons`), the macOS-only behaviour cell that list leaves out, was shown RED in CI's
+  macOS lane by the draft #4426, closed unmerged, whose one change gives `child_socket_path()` the seam's body: it
+  returns `None`. H6 panicked at its `expect` ("this account has a private temp folder"), the only failure among the
+  447 tests that step ran ([job](https://github.com/gjovanov/roomler-ai/actions/runs/45523465939/job/138901655609)).
 - [x] **AC11** — Docs updated in house style (tables, the helper's cycle as a mermaid flow, `file:line` anchors):
   `docs/installation.md`'s "An update waits for live work (#3429)" with the macOS rows and the helper's log lines; the
   helper plist's header; FR-5's note; wherever the docs list the LocalAPI verbs; this spec's field log; and a row in
