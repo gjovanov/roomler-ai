@@ -451,7 +451,7 @@ pub async fn enroll_agent(
 
     let agent_id = agent
         .id
-        .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
     // FR-104 — which token enrolled this device, so an `anchor: true` token
     // can anchor exactly this one afterwards. Best-effort: a failure here
     // costs only that second use (the anchor then needs a fresh token).
@@ -564,7 +564,7 @@ async fn enroll_row(
                 refuse_live_ephemeral(&live, true)?;
                 let id = live
                     .id
-                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                    .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
                 match state
                     .agents
                     .rehydrate(id, &body.machine_name, body.os, &program, install.as_ref())
@@ -579,7 +579,7 @@ async fn enroll_row(
             Some(removed) => {
                 let id = removed
                     .id
-                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                    .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
                 if let Err(e) = state
                     .hooks
                     .agent_revived(tid, id, &removed.machine_id)
@@ -782,7 +782,7 @@ async fn enroll_agent_ephemeral(
     };
     let agent_id = agent
         .id
-        .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
 
     // Control 4 — the per-use audit row: the record that outlives the device
     // row (which will hard-delete). Best-effort — the atomic claim above is
@@ -1835,8 +1835,8 @@ pub(crate) fn release_ord(v: &str) -> Option<(u64, u64, u64, u64)> {
 fn pin_downgrade(pin: &str, agent_version: &str) -> Option<String> {
     match (release_ord(pin), release_ord(agent_version)) {
         (Some(p), Some(c)) if p < c => Some(format!(
-            "pin {pin} is older than the agent's current {agent_version} — a stale pin \
-             would DOWNGRADE this device; pass force=true to do it deliberately"
+            "pin {pin} is older than this device's daemon version {agent_version} — a stale \
+             pin would DOWNGRADE this device; pass force=true to do it deliberately"
         )),
         _ => None,
     }

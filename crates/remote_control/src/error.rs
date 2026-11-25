@@ -4,10 +4,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("agent {0} not online")]
+    #[error("device {0} not online")]
     AgentOffline(String),
 
-    #[error("agent {0} not found")]
+    #[error("device {0} not found")]
     AgentNotFound(String),
 
     #[error("session {0} not found")]
@@ -28,7 +28,7 @@ pub enum Error {
     #[error("invalid signaling message: {0}")]
     BadMessage(&'static str),
 
-    #[error("agent capacity exceeded")]
+    #[error("device session capacity exceeded")]
     AgentBusy,
 
     /// FR-115 P3 — the organization already runs as many remote sessions at
@@ -51,7 +51,7 @@ pub enum Error {
     /// Surfaced as `412 Precondition Failed`, never as a hang: a pre-feature
     /// agent drops the unknown tag in its debug branch, so pushing anyway
     /// would leave the caller waiting out its whole deadline for silence.
-    #[error("device {0} runs an agent without Fleet-RPC support")]
+    #[error("device {0} runs a roomlerd version without Fleet-RPC support")]
     ExecUnsupported(String),
 
     /// Fleet RPC — the device accepted the request but produced no result

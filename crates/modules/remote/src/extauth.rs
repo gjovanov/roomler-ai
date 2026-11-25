@@ -436,7 +436,7 @@ async fn gates(
     // the verb here; it then never answers, and the bound below turns that into
     // `unavailable` — slower, never wrong.
     if !agent.capabilities.has_rpc(RpcCap::ExternalAccess) {
-        return Err("the device's agent is too old to be sent an external login");
+        return Err("the device's daemon is too old to be sent an external login");
     }
     Ok(tenant)
 }
@@ -1203,7 +1203,7 @@ async fn open_session(
     // is not the same promise.
     if !agent.capabilities.has_rpc(RpcCap::ExternalSession) {
         refuse(
-            "the device's agent can verify an external login but is too old to admit the session",
+            "the device's daemon can verify an external login but is too old to admit the session",
             attempt_id,
         );
         return None;

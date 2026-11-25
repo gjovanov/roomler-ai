@@ -1433,7 +1433,7 @@ pub async fn ws_upgrade_agent(
         Err(_) => {
             return Response::builder()
                 .status(401)
-                .body("Unauthorized (agent)".into())
+                .body("Unauthorized (device)".into())
                 .unwrap();
         }
     };
@@ -1451,7 +1451,7 @@ pub async fn ws_upgrade_agent(
         Err(_) => {
             return Response::builder()
                 .status(400)
-                .body("Invalid agent ID".into())
+                .body("Invalid device ID".into())
                 .unwrap();
         }
     };
@@ -1493,7 +1493,7 @@ pub async fn ws_upgrade_agent(
             info!(%agent_id, %tenant_id, "refusing agent WS: row gone (a reaped ephemeral device?)");
             return Response::builder()
                 .status(401)
-                .body("Unauthorized (agent)".into())
+                .body("Unauthorized (device)".into())
                 .unwrap();
         }
         Err(_) => None,
@@ -1509,7 +1509,7 @@ pub async fn ws_upgrade_agent(
         info!(%agent_id, reason, row_gen = row.token_gen, "refusing agent WS: token predates the device's removal");
         return Response::builder()
             .status(401)
-            .body("Unauthorized (agent)".into())
+            .body("Unauthorized (device)".into())
             .unwrap();
     }
     let token_exp = claims.exp;

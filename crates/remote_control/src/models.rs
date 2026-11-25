@@ -4625,7 +4625,7 @@ impl ExternalRcDenyReason {
                  (clearing it does not)"
             }
             Self::DeviceUnsupported => {
-                "this device's agent is too old for external access — it cannot tell the \
+                "this device's daemon is too old for external access — it cannot tell the \
                  person at the machine that the controller is from outside the organization"
             }
         }
@@ -5327,7 +5327,7 @@ impl SshDenyReason {
                 "the device you are calling from is not permitted to originate SSH sessions"
             }
             Self::Unsupported => {
-                "this device's agent does not support roomler SSH (needs a build with the \
+                "this device's daemon does not support roomler SSH (needs a build with the \
                  ssh-server feature)"
             }
             Self::Offline => "the device is offline",
@@ -5342,7 +5342,7 @@ impl SshDenyReason {
             }
             Self::GrantExpiredOnArrival => {
                 "the grant expired before the device got it — its clock is probably about 11 \
-                 minutes or more ahead; fix that clock, or update its agent to 0.4.202 or later"
+                 minutes or more ahead; fix that clock, or update its daemon to 0.4.202 or later"
             }
             Self::GrantRefused => {
                 "the device refused the session grant — its own log (`roomler logs \
@@ -5363,7 +5363,7 @@ impl SshDenyReason {
             }
             Self::SessionNotAllowed => "no SSH policy on this device admits agent sessions",
             Self::TargetTooOld => {
-                "this device's agent cannot hold an agent session to one command (needs a \
+                "this device's daemon cannot hold an agent session to one command (needs a \
                  build that advertises ssh-one-command)"
             }
         }

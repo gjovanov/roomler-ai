@@ -543,7 +543,7 @@ async fn handle_tunnel_open(
                 ServerMsg::Error {
                     session_id: None,
                     code: "agent_not_found".into(),
-                    message: format!("agent {agent_id} does not exist"),
+                    message: format!("device {agent_id} does not exist"),
                     open_nonce: open_nonce.clone(),
                 },
             )
@@ -566,7 +566,7 @@ async fn handle_tunnel_open(
             ServerMsg::Error {
                 session_id: None,
                 code: "cross_tenant".into(),
-                message: "agent belongs to a different tenant".into(),
+                message: "device belongs to a different tenant".into(),
                 open_nonce: open_nonce.clone(),
             },
         )
@@ -582,7 +582,7 @@ async fn handle_tunnel_open(
             ServerMsg::Error {
                 session_id: None,
                 code: "agent_unavailable".into(),
-                message: "agent is quarantined or deleted".into(),
+                message: "device is quarantined or deleted".into(),
                 open_nonce: open_nonce.clone(),
             },
         )
@@ -657,7 +657,7 @@ async fn handle_tunnel_open(
             ServerMsg::Error {
                 session_id: None,
                 code: "agent_on_other_pod".into(),
-                message: "agent is homed on another pod; re-dial and retry".into(),
+                message: "device is homed on another pod; re-dial and retry".into(),
                 open_nonce: open_nonce.clone(),
             },
         )
@@ -681,7 +681,7 @@ async fn handle_tunnel_open(
                 ServerMsg::Error {
                     session_id: None,
                     code: "origin_unavailable".into(),
-                    message: "originating agent is quarantined or deleted".into(),
+                    message: "originating device is quarantined or deleted".into(),
                     open_nonce: open_nonce.clone(),
                 },
             )
@@ -1085,7 +1085,7 @@ async fn handle_forward_request(
                 dst_host,
                 dst_port,
                 RejectKind::AgentError,
-                "agent row vanished",
+                "device row vanished",
             )
             .await;
             send_msg(
@@ -1095,7 +1095,7 @@ async fn handle_forward_request(
                     request_session_id,
                     flow_id,
                     RejectKind::AgentError,
-                    "agent row vanished".into(),
+                    "device row vanished".into(),
                 ),
             )
             .await;
@@ -1204,7 +1204,7 @@ async fn handle_forward_request(
                         dst_host,
                         dst_port,
                         RejectKind::AgentError,
-                        &format!("agent unreachable: {e}"),
+                        &format!("device unreachable: {e}"),
                     )
                     .await;
                     send_msg(
@@ -1214,7 +1214,7 @@ async fn handle_forward_request(
                             request_session_id,
                             flow_id,
                             RejectKind::AgentError,
-                            format!("agent unreachable: {e}"),
+                            format!("device unreachable: {e}"),
                         ),
                     )
                     .await;

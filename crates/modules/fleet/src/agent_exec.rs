@@ -555,7 +555,7 @@ pub async fn dispatch(
                     audit,
                     ExecDenyReason::Unsupported,
                     format!(
-                        "device runs agent {} which predates Fleet RPC — update it to use \
+                        "device runs roomlerd {} which predates Fleet RPC — update it to use \
                          the device console",
                         agent.reported_version().unwrap_or("(unknown version)")
                     ),
@@ -724,8 +724,8 @@ fn deny_message(reason: ExecDenyReason, os: OsKind) -> String {
         // FR-97 P5a — off Windows the daemon itself drops to that person, and
         // only a build that advertises `console-user` does.
         ExecDenyReason::RunAsUnavailable => {
-            "this device's policy runs commands as the person at its screen, and the agent it \
-             runs cannot: update the agent"
+            "this device's policy runs commands as the person at its screen, and the daemon it \
+             runs cannot: update roomlerd"
                 .to_string()
         }
     }
@@ -983,7 +983,7 @@ pub async fn set_policy(
         && !agent.capabilities.has_rpc(RpcCap::ConsoleUser)
     {
         return Err(ApiError::BadRequest(
-            "this device's agent cannot run commands as the person at its screen: update it, \
+            "this device's daemon cannot run commands as the person at its screen: update it, \
              or run commands as root"
                 .into(),
         ));

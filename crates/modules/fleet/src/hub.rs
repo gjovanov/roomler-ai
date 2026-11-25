@@ -3600,7 +3600,7 @@ impl Hub {
                 // FR-121 — the device's own report, keyed by the
                 // authenticated socket's agent id, never by anything in the
                 // frame.
-                let agent_id = ctx.agent_id.ok_or(Error::PermissionDenied("no agent"))?;
+                let agent_id = ctx.agent_id.ok_or(Error::PermissionDenied("no device"))?;
                 self.set_agent_local_relay(agent_id, relay);
                 Ok(())
             }
