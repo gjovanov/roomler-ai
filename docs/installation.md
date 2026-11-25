@@ -891,7 +891,7 @@ Details worth knowing:
   inherited entries counted, and a `.prev` beside a config inherited no right for
   another account to change it (`machine_tree.rs:691`). It repairs the attempt
   record either way, and what was not closed stays refused at every start and
-  tick, until an elevated save writes a closed tree. An elevated save whose config does not load takes the `.prev` beside it only where a start would, by the same rule: from one a start refuses it recovers nothing, and it says so in one line (#4453, `crates/agent-core/src/config.rs:3853`). A config that was not the
+  tick, until an elevated save writes a closed tree. An elevated save whose config does not load takes the `.prev` beside it only where a start would, by the same rule: from one a start refuses it recovers nothing, and it says so in one line (#4453, `crates/agent-core/src/config.rs:3853`). Whatever the config's state, an elevated save sets aside a `.prev` a start would not take, as `config.toml.prev.set-aside` beside it (`-1` to `-9` when that name is taken), a name no reader loads, and says `machine tree: a config.toml.prev that a start would not take is set aside`; one it cannot move stays at its name, keeping the entries it was found with as its own, and where neither can be done the save stops, naming the file and what to do (`crates/agent-core/src/machine_tree.rs:3184`). A config that was not the
   machine's is never run, never folded into (below), and `roomlerd re-enroll`
   and `roomlerd org` refuse it with nothing sent. Such a device stays without
   SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd

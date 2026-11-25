@@ -4682,7 +4682,7 @@ fn save_with_base(path: &PathBuf, base: Base<'_>, cfg: &AgentConfig, kept: Kept)
     // replaced W4(c)'s four `icacls` steps (#3073, #3291): it runs in-process,
     // and on a chain already as it should be it changes nothing.
     #[cfg(windows)]
-    let machine = machine_tree_of(path);
+    let machine = machine_tree_for_a_save(path).map_err(anyhow::Error::msg)?;
     #[cfg(windows)]
     if let Some(tree) = &machine
         && crate::machine_tree::Switches::from_env().repair
@@ -4905,7 +4905,7 @@ pub fn machine_config_as_found(path: &std::path::Path) -> Result<()> {
 /// there was nothing to take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
 #[cfg(windows)]
 pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, String> {
-    let Some(tree) = machine_tree_of(path) else {
+    let Some(tree) = machine_tree_for_a_save(path)? else {
         return Ok(false);
     };
     if !crate::machine_tree::Switches::from_env().repair {
@@ -4930,7 +4930,7 @@ pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, 
 /// take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
 #[cfg(windows)]
 pub fn take_machine_parent(path: &std::path::Path) -> std::result::Result<bool, String> {
-    let Some(tree) = machine_tree_of(path) else {
+    let Some(tree) = machine_tree_for_a_save(path)? else {
         return Ok(false);
     };
     if !crate::machine_tree::Switches::from_env().repair {
@@ -5311,6 +5311,25 @@ fn copy_beside_the_config(
             anyhow::bail!("{why}")
         }
     }
+}
+
+/// #4453 — [`machine_tree_of`] for an elevated save at `path` ([`save_with_base`],
+/// [`take_machine_folder`], [`take_machine_parent`]), which also sets aside a
+/// `.prev` beside the config that a start would not take
+/// (`machine_tree::set_aside_a_copy_a_start_refuses`). As every change the
+/// machine tree makes, it is off with `ROOMLERD_MACHINE_TREE_REPAIR=0`. `Err`
+/// names the file and what to do when it is neither moved nor kept as found.
+#[cfg(windows)]
+fn machine_tree_for_a_save(
+    path: &std::path::Path,
+) -> std::result::Result<Option<crate::machine_tree::MachineTree>, String> {
+    let tree = machine_tree_of(path);
+    if let Some(tree) = &tree
+        && crate::machine_tree::Switches::from_env().repair
+    {
+        crate::machine_tree::set_aside_a_copy_a_start_refuses(tree)?;
+    }
+    Ok(tree)
 }
 
 fn derive_ws_url(http_url: &str) -> String {
