@@ -79,6 +79,11 @@ pub struct BillingSummary {
     /// A subscription is live (active, trialing or past due): plan changes go
     /// through `change-plan`, never a second checkout.
     pub subscribed: bool,
+    /// The org has a Stripe customer, so the billing portal (cancel, card,
+    /// invoices) opens for it: the page's "Manage Subscription" reads this.
+    /// The fact only; the customer and subscription ids never leave the
+    /// server.
+    pub has_billing_account: bool,
 }
 
 /// FR-115 — one org's seat sync.
@@ -610,6 +615,7 @@ impl StripeService {
                 .and_then(|d| d.try_to_rfc3339_string().ok()),
             cancel_at_period_end: b.is_some_and(|b| b.cancel_at_period_end),
             subscribed: has_live_subscription(&tenant),
+            has_billing_account: has_billing_account(&tenant),
         })
     }
 
@@ -1448,6 +1454,15 @@ pub fn has_live_subscription(t: &Tenant) -> bool {
     })
 }
 
+/// An org with a Stripe customer (a non-empty `billing.customer_id`): the
+/// billing portal can open for it, whatever its subscription's state.
+pub fn has_billing_account(t: &Tenant) -> bool {
+    t.billing
+        .as_ref()
+        .and_then(|b| b.customer_id.as_deref())
+        .is_some_and(|c| !c.is_empty())
+}
+
 /// A subscription's first (and, for us, only) item: its id and quantity.
 fn first_item(sub: &Value) -> Option<(String, u32)> {
     let item = sub["items"]["data"].as_array()?.first()?;
@@ -1617,6 +1632,21 @@ mod tests {
             SubscriptionStatus::Active,
             Some("")
         )));
+    }
+
+    /// The billing page's "Manage Subscription" opens the portal, which needs
+    /// a Stripe customer: an org has a billing account once it has a
+    /// non-empty customer id, subscribed or not.
+    #[test]
+    fn a_billing_account_is_a_non_empty_customer_id() {
+        let mut t = tenant_with(SubscriptionStatus::Canceled, None);
+        assert!(has_billing_account(&t), "a customer with no subscription");
+        t.billing.as_mut().unwrap().customer_id = Some(String::new());
+        assert!(!has_billing_account(&t), "an empty customer id");
+        t.billing.as_mut().unwrap().customer_id = None;
+        assert!(!has_billing_account(&t), "billing without a customer");
+        t.billing = None;
+        assert!(!has_billing_account(&t), "no billing at all");
     }
 
     #[test]
