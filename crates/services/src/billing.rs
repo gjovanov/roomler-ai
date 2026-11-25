@@ -471,7 +471,7 @@ pub struct OrgBilling {
     pub currency: Option<String>,
     /// Paid invoices with a recurring part above 0, oldest first.
     pub paid: Vec<Paid>,
-    /// When a subscription was deleted.
+    /// When a subscription was deleted, unless it expired `incomplete`.
     pub ended: Vec<i64>,
     /// The first invoice paid with an amount above 0 (the funnel's "paid").
     pub paid_since: Option<i64>,
@@ -514,6 +514,13 @@ impl OrgBilling {
                         }
                     }
                 }
+                // #4432 — a subscription that expired `incomplete` never
+                // took a payment, so its end ends no paid period. A checkout
+                // abandoned at 3-D Secure can be retried and paid at once,
+                // and Stripe expires the abandoned one about a day later,
+                // inside the retry's paid period.
+                BillingKind::SubscriptionDeleted
+                    if r.status.as_deref() == Some("incomplete_expired") => {}
                 BillingKind::SubscriptionDeleted => out.ended.push(ts),
                 BillingKind::SubscriptionCreated
                 | BillingKind::SubscriptionUpdated
@@ -1299,6 +1306,27 @@ mod tests {
             .map(|r| (r.stripe_id.as_str(), r.ts.timestamp_millis()))
             .collect();
         assert_eq!(counted, [("in_lost", 5_000), ("in_lost", 6_000)]);
+    }
+
+    /// #4432 — a checkout abandoned at 3-D Secure and paid on the retry: the
+    /// abandoned subscription expires `incomplete` a day later, inside the
+    /// retry's paid period, and leaves its MRR alone. A cancellation there
+    /// still ends it.
+    #[test]
+    fn an_expired_incomplete_subscription_ends_no_paid_period() {
+        let t = ObjectId::new();
+        let (_, nov, _) = month("2026-11");
+        let start = nov + 10 * DAY_MS;
+        let ended = |status: &str| {
+            let mut r = row(BillingKind::SubscriptionDeleted, t, start + DAY_MS);
+            r.status = Some(status.to_string());
+            r
+        };
+        let after = start + 2 * DAY_MS;
+        let orgs = fold(&[paid(t, start, 800, 800), ended("incomplete_expired")]);
+        assert_eq!(orgs[&t].mrr_at(after), 800, "the abandoned one never paid");
+        let orgs = fold(&[paid(t, start, 800, 800), ended("canceled")]);
+        assert_eq!(orgs[&t].mrr_at(after), 0, "a cancellation ends the period");
     }
 
     fn month(label: &str) -> (String, i64, i64) {
