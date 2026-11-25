@@ -2390,12 +2390,23 @@ impl DelegateHost {
         *self.inner.worker_uid.lock().expect("worker uid mutex")
     }
 
-    /// FR-149 P1 — the worker as the session panel reads it
+    /// FR-149 P1 — the attached worker as the session panel reads it
     /// (`indicator::session_panel::TheRoad`): the account it was started for
     /// ([`Self::worker_uid`]), and whether it said
     /// [`crate::indicator::session_panel::CONSENT_PANEL`] on the channel it
     /// holds now ([`Self::says_consent_panel`]).
+    ///
+    /// #4421 — `None` while no worker is attached. From a channel's end to the
+    /// next attach the account stays until a revoke (the app's road reads it),
+    /// and a question asked then is not asked for `no_worker`, not for an
+    /// attached worker's `no_word`. `attached` is read first: the word is said
+    /// only on an attached channel and cleared before `attached` is
+    /// ([`Self::serve`]), so with a worker attached this reads what it read
+    /// before.
     pub fn panel_worker(&self) -> Option<(u32, bool)> {
+        if !self.inner.attached.load(Ordering::Acquire) {
+            return None;
+        }
         Some((self.worker_uid()?, self.says_consent_panel()))
     }
 
