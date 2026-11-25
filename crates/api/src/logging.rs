@@ -53,8 +53,8 @@ pub fn nonblocking<W: Write + Send + 'static>(output: W) -> (NonBlocking, Worker
 /// which kept its log a few hours short of a day. A terminal is a person
 /// reading; a pipe is a container runtime, a file or another program.
 ///
-/// `main` asks the real stdout once at start, before the non-blocking writer
-/// takes it over (the layer writes into that writer, never into stdout).
+/// `main` asks the real stdout once at start, beside the `nonblocking` call:
+/// the layer writes into that writer, never into stdout, so it cannot ask.
 pub fn colour(stdout_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
     stdout_is_terminal && no_color.is_none_or(OsStr::is_empty)
 }
