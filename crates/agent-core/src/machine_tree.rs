@@ -713,10 +713,10 @@ fn holds_the_machines(tree: &MachineTree, config: bool, out: &mut Repairs) -> bo
     }
 }
 
-/// What a copy beside the config inherits, as found ([`closed_as_found`] over those entries;
-/// no DACL fails it); its owner and own entries are judged where it is read.
+/// #4176, #4453 — what a copy beside the config inherits, as found, at a start and at a save
+/// ([`closed_as_found`]; no DACL fails it). Its owner and own entries are judged where it is read.
 #[cfg(windows)]
-fn copy_inherits_as_found(tree: &MachineTree) -> Result<(), Refusal> {
+pub(crate) fn copy_inherits_as_found(tree: &MachineTree) -> Result<(), Refusal> {
     let (copy, what) = (tree.prev(), tree.prev().display().to_string());
     let Some(entry) = open_entry(&copy, win::Kind::File, false)? else {
         return Ok(());

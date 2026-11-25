@@ -3848,18 +3848,18 @@ pub fn read_merge_base(path: &PathBuf) -> MergeBase {
 
 /// #3609 — [`read_merge_base`] at the machine-global location: the repair and
 /// the check before anything is folded (`machine_tree::may_fold`), and the
-/// checked `.prev` ([`load_private_prev`]).
+/// `.prev` only where a start would take it ([`copy_beside_the_config`]).
 #[cfg(windows)]
 fn machine_merge_base(
     path: &PathBuf,
     tree: &crate::machine_tree::MachineTree,
     switches: crate::machine_tree::Switches,
 ) -> MergeBase {
-    merge_base(
-        path,
-        || crate::machine_tree::may_fold(tree, switches),
-        |prev| load_private_prev(prev),
-    )
+    // #4453 — a `.prev` beside a config that does not load is taken or
+    // refused as a start takes or refuses it, by what it inherits as found
+    // (`machine_tree::copy_inherits_as_found`).
+    let copy = copy_beside_the_config(tree);
+    merge_base(path, || crate::machine_tree::may_fold(tree, switches), copy)
 }
 
 /// The merge base at `path`. `private` says, once the file is known to be
@@ -5278,6 +5278,38 @@ fn note_machine_copy(tree: &crate::machine_tree::MachineTree, copy: &Result<Agen
             );
         }
         *last = why;
+    }
+}
+
+/// #4453 — what an elevated save recovers a machine config that does not load
+/// from ([`machine_merge_base`]): the `.prev` beside it, taken or refused as a
+/// start takes or refuses it. It is taken only when what it inherits was the
+/// machine's as found (`machine_tree::copy_inherits_as_found`, the rule a start
+/// applies to a copy beside its config), and then through
+/// [`load_private_prev`], as before. One that was not is said in one line, and
+/// nothing is recovered from it: the writer writes a fresh config, as for any
+/// `.prev` it does not take.
+#[cfg(windows)]
+fn copy_beside_the_config(
+    tree: &crate::machine_tree::MachineTree,
+) -> impl FnOnce(&PathBuf) -> Result<AgentConfig> {
+    use crate::machine_tree::Refusal;
+    let config = tree.config();
+    let refused = match crate::machine_tree::copy_inherits_as_found(tree) {
+        Ok(()) | Err(Refusal::Absent) => None,
+        Err(Refusal::NotPrivate(why)) => Some(why),
+    };
+    move |prev: &PathBuf| match refused {
+        None => load_private_prev(prev),
+        Some(why) => {
+            tracing::warn!(
+                config = %config.display(),
+                reason = %why,
+                "config: the machine config does not load, and the copy beside it is not taken, \
+                 as a start does not take it: what it inherits was not the machine's as found"
+            );
+            anyhow::bail!("{why}")
+        }
     }
 }
 
