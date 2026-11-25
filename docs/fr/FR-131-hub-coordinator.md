@@ -1,5 +1,7 @@
 # FR-131: Hub — one coordinator session runs the backlog through parallel worker sessions (`/hub` skill + hub view)
 
+**Anchors:** master `9e110558a` (closed 2026-10-30): this spec is the record of the work, and its line anchors read at that commit.
+
 **Status: P1, P2, P3 and P4 done 2026-10-30. Every acceptance criterion is met, so FR-131 is ready to
 close: once the P3 close-out PR merges, the hub ticks AC10 in #3127's body, posts the Result comment and
 closes the issue, under the operator's rule of 2026-10-30 19:50Z.**

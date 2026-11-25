@@ -2,6 +2,8 @@
 
 > **CLOSED 2026-09-01** — issue #951 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
+**Anchors:** master `b46d6cab3` (closed 2026-09-01): this spec is the record of the work, and its line anchors read at that commit.
+
 Status: **P1–P6 implemented; field-verification pending** (2026-08-29). Tracking issue: `FR-39` (#951).
 Spec on master up front; the work is known and mostly mechanical.
 

@@ -1,5 +1,7 @@
 # FR-115 — Plans that give the network away and charge for what costs money
 
+**Anchors:** master `5e90f9071` (closed 2026-10-31): this spec is the record of the work, and its line anchors read at that commit.
+
 | | |
 |---|---|
 | **Issue** | [#2557](https://github.com/gjovanov/roomler-ai/issues/2557) |
@@ -59,7 +61,7 @@ Only `max_devices` and `max_tunnel_clients` are **established** — enforced wha
 an org created after 2026-08-30, by standing decision (`crates/db/src/models/tenant.rs:58`), so
 for a new signup MagicDNS and exit nodes already pass. The advertised "1 concurrent session"
 (Free) and "5" (Pro) are enforced **nowhere**: FR-32 withheld the gate because nothing wrote
-`remote_sessions` (`crates/services/src/dao/remote_session.rs:75`). That table is written now —
+`remote_sessions` (`crates/services/src/dao/remote_session.rs:52`). That table is written now —
 projected from the audit stream (`crates/remote_control/src/audit.rs:3`) — but it is
 best-effort: three rows have shown "open" for up to 25 days. **A gate must not count it.**
 
@@ -127,14 +129,14 @@ landed yet is computed at one seat, the floor, so a missing number can only unde
 
 ### Plans bind only where they are sold
 
-Every org is created on `free` (`crates/services/src/dao/tenant.rs:316`), on every server.
+Every org is created on `free` (`crates/services/src/dao/tenant.rs:284`), on every server.
 On the hosted service that is a plan; on a self-hosted server it is only the absence of
 one. So `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where the hosted
-`saas` module is compiled in and switched on (`crates/api/src/state.rs:327`). The published
+`saas` module is compiled in and switched on (`crates/api/src/state.rs:323`). The published
 self-host image and the compose build are both built without it. With it false, the one
 decision point refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and the
 two fences that read the plan outside it stand down too: the session cap
-(`crates/modules/remote/src/controller.rs:854`) and the meeting sweep
+(`crates/modules/remote/src/controller.rs:824`) and the meeting sweep
 (`crates/modules/conference/src/meeting_cap.rs:104`).
 
 ⚠️ Found while documenting P5, after P1 and P3 had merged. Without the flag, P1's
@@ -190,10 +192,10 @@ a live session is **never** ended by the fence (`business-model.md` §6 rule 4).
 like the device cap: no org is over it today.
 
 **As built (P3).** The authz gate reads the cap from the device's org
-(`org_session_cap_of`, `crates/modules/remote/src/controller.rs:684`) and hands it to the hub
+(`org_session_cap_of`, `crates/modules/remote/src/controller.rs:654`) and hands it to the hub
 in `DispatchCtx`, and in the body of a request relayed to the pod that owns the device. The
 hub counts that org's live sessions after its coalesce, so a re-asked session is not a
-second one (`crates/modules/fleet/src/hub.rs:1771`). Tenant affinity puts an org's devices
+second one (`crates/modules/fleet/src/hub.rs:1702`). Tenant affinity puts an org's devices
 and its controllers on one pod, so that pod's count is the org's. Redis leases are needed
 only for the one case affinity cannot place: a session to **another** org's device, which
 must count against the controller's org. That is **P3b** (#2637), live since 2026-10-21 with
@@ -201,20 +203,20 @@ must count against the controller's org. That is **P3b** (#2637), live since 202
 outsider's session (FR-52's extauth path) opens
 uncapped. A refusal is `org_session_limit`
 (`crates/remote_control/src/error.rs:41`), which the viewer does not retry
-(`ui/src/composables/useRemoteControl.ts:831`). It names the person and the device holding
+(`ui/src/composables/useRemoteControl.ts:735`). It names the person and the device holding
 the slot, and a Pro org at its cap (one per billed seat) is told the way past it is a
 session ending or Business. Kill switch `rc.org_session_cap = false`.
 
 ### P3b, as proposed: a cluster-wide session count that heals itself (O6 + O7 decided 2026-10-20)
 
 **Why P3's count cannot carry it.** P3 counts on the hub that owns the device
-(`crates/modules/fleet/src/hub.rs:1719`). Under tenant affinity, that hub holds every live
+(`crates/modules/fleet/src/hub.rs:1653`). Under tenant affinity, that hub holds every live
 session of the device's org, so the count is complete for a same-org session. A cross-org
 session breaks that assumption: the org that pays is the controller's, and its sessions live
 on whichever pods hold the devices they reach. Today FR-52's external path opens its session
-uncapped (`crates/modules/remote/src/extauth.rs:341`), waiting for this phase. P3's own count
+uncapped (`crates/modules/remote/src/extauth.rs:305`), waiting for this phase. P3's own count
 also has a documented race: the count and the insert are two steps, so two starts in the same
-instant can both pass (`hub.rs:1732`).
+instant can both pass (`hub.rs:1666`).
 
 **The record: session slots in the cluster directory.** C-1's directory
 (`crates/core/src/cluster/directory.rs`) already keeps per-entity records in Redis on exactly
@@ -254,7 +256,7 @@ sequenceDiagram
 **Why this is durable.**
 
 - **One atomic claim.** The Lua claim drops expired members, checks the count and adds the
-  session in one step, so the race at `hub.rs:1732` closes.
+  session in one step, so the race at `hub.rs:1666` closes.
 - **It heals itself.** A lease lives 90 s and is renewed every 30 s by the pod that holds the
   session. A pod that dies stops renewing, and its slots free themselves within 90 s. A Redis
   restart loses the set, but renewal is an upsert, so within one renewal round every live
@@ -271,7 +273,7 @@ sequenceDiagram
   P3's hub count stays as the fallback.
 
 **Whose quota an external session uses (O6 + O7, decided by the operator 2026-10-20).** FR-52's
-outsider is an account (`docs/fr/FR-52-cross-org-remote-access.md:427`). That account is not a
+outsider is an account (`docs/fr/FR-52-cross-org-remote-access.md:388`). That account is not a
 member of the device's org, and it may belong to several orgs of its own, or to none.
 
 - **No paid org is needed (O7).** Any account that may start an external session today still may.
@@ -324,9 +326,9 @@ flowchart LR
 ```
 
 - DERP already meters per network on the forward path
-  (`crates/modules/network/src/derp.rs:754`). The throttle adds **one** set lookup on that
+  (`crates/modules/network/src/derp.rs:754`). The throttle adds **one** set lookup on that (2026-11-04)
   path, consulted only for networks the 60 s flush flagged; the path must stay within FR-18's
-  budget, measured with the same bench FR-20 used (`derp.rs:775`).
+  budget, measured with the same bench FR-20 used (`derp.rs:775`). (2026-11-04)
 - TURN attribution is FR-20's deferred P3, taken up with the option FR-20 already chose
   (`--redis-statsdb`; the username is `<expiry>:<id>`, `crates/remote_control/src/turn_creds.rs:6`).
 - Throttled, never refused (D4). The tenant analytics page shows usage against the allowance in
@@ -368,7 +370,7 @@ flowchart LR
   (an upgrade takes effect within one job period).
 - **API pods** refresh a local `DashSet<network_id>` every 60 s. The forward path adds one
   lock-free lookup, and only for frames already past the ACL; it is measured with FR-20's bench
-  (`crates/modules/network/src/derp.rs:775`) against FR-18's latency budget before it ships.
+  (`crates/modules/network/src/derp.rs:775`) against FR-18's latency budget before it ships. (2026-11-04)
 - **PoPs are DB-free and must stay so.** Tickets cannot carry the flag: they live 24 h and are
   checked once, at connect (`crates/remote_control/src/derp_ticket.rs:33`). Instead the API,
   which already polls each PoP's `/stats`, sends the PoP the set on that poll, signed with the
@@ -522,7 +524,7 @@ sequenceDiagram
 |---|---|
 | The parser, one for both readers | `crates/remote_control/src/turn_stats.rs:42` (`parse`), moved from the cluster's collector |
 | The PoP's store and its collector | `crates/derp-relay/src/main.rs:262` (`TurnUsage`), `:388` (the subscription to `TURN_STATS_REDIS`) |
-| The PoP's endpoint | `crates/derp-relay/src/main.rs:649` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
+| The PoP's endpoint | `crates/derp-relay/src/main.rs:618` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
 | The signed request | `crates/remote_control/src/derp_ticket.rs:220` (sign), `:239` (verify): audience `derp-turn-usage`, a `region` claim, 60 s |
 | The pull | `crates/core/src/relay_load.rs:314` (`TurnUsagePull`), from endpoints whose `/stats` reports `turn_usage` (`:186`) |
 | The booking, one for both readers | `crates/core/src/turn_bytes.rs:86` (`record`). The cluster's claim key is P4b-1's, unchanged (`:71`) |
@@ -558,7 +560,7 @@ mechanism does not exist, so this section replaces it.
   (`crates/modules/network/src/relay_allowance.rs:53`) and read by `rate_of(network)` in one
   atomic load (`:66`).
 - **TURN credentials are minted in ten places.** Only the overlay's pair grant
-  (`crates/modules/network/src/overlay.rs:1341`) and warm grant (`:206`) can ask `rate_of`
+  (`crates/modules/network/src/overlay.rs:1309`) and warm grant (`:204`) can ask `rate_of` (2026-11-04)
   cheaply. The remote-desktop hub, the credentials route, conference and hive cannot: they do
   not depend on the network module, and the hub's mints are synchronous.
 - **coturn has nothing to throttle with.** It runs one realm, one shared secret, no user
@@ -567,10 +569,10 @@ mechanism does not exist, so this section replaces it.
   session's bytes with no regard for packet type, so it would also hold WireGuard handshakes,
   which P4a was built never to do.
 - **The overlay already has the right lever.** A pair with no TURN grant stays on its DERP
-  floor (`crates/tunnel-core/src/overlay/relay_link.rs:2339`), and P4a already holds DERP's
+  floor (`crates/tunnel-core/src/overlay/relay_link.rs:2119`), and P4a already holds DERP's
   bulk frames to the plan's rate while letting every handshake through. The server can also
   stamp a pair's relay tier itself (`server_relay_verdict`,
-  `crates/modules/network/src/overlay.rs:2660`), flipping both ends at once.
+  `crates/modules/network/src/overlay.rs:2573`), flipping both ends at once. (2026-11-04)
 
 **Proposal, in two steps.**
 
@@ -587,7 +589,7 @@ mechanism does not exist, so this section replaces it.
   its 10-person, 60-minute meetings (P5).
 - A tunnel's TURN leg cannot be steered from the server: `quic-derp-v1` is negotiated only
   when the client asked for it and sent its DERP identity
-  (`crates/modules/network/src/tunnel.rs:738`).
+  (`crates/modules/network/src/tunnel.rs:878`).
 
 Their bytes still count toward the allowance (P4c-0), so an org that relays heavily through
 them has its mesh throttled. The alternative to O10 is a second coturn listener per site with
@@ -605,16 +607,16 @@ handshake held.
 ### P4c, as built (dark, 2026-10-23)
 
 Built as proposed, behind two switches that ship **off**: `relay_allowance.count_turn` for
-P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:386`, `:392`).
+P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:374`, `:380`). (2026-11-20)
 
 | Piece | Where |
 |---|---|
 | TURN in the month to date (P4c-0) | `crates/services/src/dao/stats.rs:208`: `turn_bytes` beside `derp_bytes`, read by the job and the org's page alike, so the two never disagree; the page says which it counts (`counts_turn`, `crates/api/src/routes/cost.rs:578`) |
-| An over-allowance org (P4c-1) | `crates/modules/network/src/overlay.rs:2711` (`turn_withheld`) |
-| The relay request | `overlay.rs:1186`: no TURN grant, both ends' verdicts re-stamped DERP, a forced-DERP pin for a node too old for verdicts. Only when `keeps_pair_on_derp` (`:2718`) says both ends have a DERP floor and the requester's `/derp` is up |
-| The verdict | `overlay.rs:2655`: the org's pairs are pinned to DERP, as a churn pin would; an active org relay still outranks it |
-| The warm creds | `overlay.rs:210`: none while over (a latency optimisation, never reach) |
-| The re-stamp | `overlay.rs:1586` (`refan_networks`), called when the pod's set changes (`crates/modules/network/src/relay_allowance.rs:208`), so a pair flips when its org crosses, not at the next incidental re-fan |
+| An over-allowance org (P4c-1) | `crates/modules/network/src/overlay.rs:2611` (`turn_withheld`) (2026-11-04) |
+| The relay request | `overlay.rs:1161`: no TURN grant, both ends' verdicts re-stamped DERP, a forced-DERP pin for a node too old for verdicts. Only when `keeps_pair_on_derp` (`:2621`) says both ends have a DERP floor and the requester's `/derp` is up (2026-11-04) |
+| The verdict | `overlay.rs:2573`: the org's pairs are pinned to DERP, as a churn pin would; an active org relay still outranks it (2026-11-04) |
+| The warm creds | `overlay.rs:210`: none while over (a latency optimisation, never reach) (2026-11-04) |
+| The re-stamp | `overlay.rs:1559` (`refan_networks`), called when the pod's set changes (`crates/modules/network/src/relay_allowance.rs:208`), so a pair flips when its org crosses, not at the next incidental re-fan (2026-11-04) |
 | The pod's map | `relay_allowance.rs:170`: each entry is tagged with its database, and an app's refresh replaces only its own entries. Production is unchanged, and it is what lets the integration test drive the map |
 
 - **Proof:** `relay_allowance_tests::turn_bytes_count_toward_the_allowance_only_with_count_turn`
@@ -629,7 +631,7 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:386`,
   - **Enterprise has no relay allowance.** Its relay is "custom" on the ladder
     (`crates/db/src/models/tenant.rs:624`).
   - **The operator's orgs are exempt.** `relay_allowance.exempt_tenants`
-    (`crates/config/src/settings.rs:398`) names them, and `is_exempt`
+    (`crates/config/src/settings.rs:386`) names them, and `is_exempt` (2026-11-20)
     (`crates/services/src/relay_allowance.rs:42`) is asked by both the job and the org's page.
   - **That org's real seats are recorded** (data, in the annex).
 
@@ -682,7 +684,7 @@ allowance, that path is now throttled on DERP (P4a), and the overlay leaves TURN
 - **In practice it changes less than the ladder suggests.** `ExitNodes` is not an established
   limit (`crates/services/src/quota.rs:93`), and every new org's `plan_enforcement` is `warn`.
   So a Free org in `warn` could already make an exit node: the gate in `set_exit_node`
-  (`crates/modules/network/src/routes/overlay_route.rs:404`) let it through and counted a quota
+  (`crates/modules/network/src/routes/overlay_route.rs:394`) let it through and counted a quota
   collision. P4d stops counting that collision, and lets an org in `enforce` do the same. Such
   an org was refused 403 before.
 - **Proof:** `free_gives_devices_and_mesh_and_fences_concurrency` (`tenant.rs`), and
@@ -705,7 +707,7 @@ number is advertised beyond what the current single-worker room is known to carr
 
 **A sweep, not a timer.** A timer lives in the pod that started the call, and a rolling
 deploy restarts pods: the call would outlive its timer and run uncapped. Every pod reads
-the calls in progress every 30 s (`crates/modules/conference/src/meeting_cap.rs:253`) and
+the calls in progress every 30 s (`crates/modules/conference/src/meeting_cap.rs:248`) and
 decides each one with `quota::evaluate_for` on the new `Limit::MeetingMinutes`, read as
 "may it run one more minute?" (`meeting_cap.rs:58`). The comparison stays in the one
 place plan limits are compared, and like the device cap it is **established**: `warn`,
@@ -734,8 +736,8 @@ sequenceDiagram
 
 | Guard | Where | What it prevents |
 |---|---|---|
-| The warning is a write conditional on `current_call_id = call` and `cap_warned_call_id ≠ call` | `crates/services/src/dao/room.rs:700` | two pods warning one meeting; warning a meeting that ended |
-| The end is a write conditional on `current_call_id = call` and `in_progress` | `room.rs:719` | ending the **next** meeting in a room restarted between the sweep's read and its write |
+| The warning is a write conditional on `current_call_id = call` and `cap_warned_call_id ≠ call` | `crates/services/src/dao/room.rs:743` | two pods warning one meeting; warning a meeting that ended |
+| The end is a write conditional on `current_call_id = call` and `in_progress` | `room.rs:762` | ending the **next** meeting in a room restarted between the sweep's read and its write |
 | The FR-102 collision is counted after the won end | `meeting_cap.rs:198` | a meeting counted twice when two pods reach it together |
 | `meetings.free_cap = false` | `crates/config/src/settings.rs` (`MeetingsSettings`) | the kill switch: no meeting is warned or ended |
 
@@ -896,7 +898,7 @@ decision 5), and any limit on a self-hosted server — self-hosting stays free a
 | 2026-10-23 | **P4d's red, same deploy**: the throwaway Free org's admin enables an exit node on an id that names no node. The plan gate runs before the lookup (`set_exit_node`), so the answer is the gate's alone | In `enforce`: **403**, *"Exit nodes are not available on the Free plan. Upgrade to enable."* In `warn`, every new org's default: **404**, from the lookup. So the gate let it through and only counted a collision. The org went back to `warn` |
 | 2026-10-23 | **`hosted-20261023-f530ac6` promoted** (a peer session; pods 22:47:57Z and 22:48:14Z), carrying #2798, so Enterprise's unlimited relay went live with it. **Red, switches off on that image** | Both pods' env carried only `ENABLED` and `TURN_ATTRIBUTION`. With both TURN rows still in, the set was empty at 22:49:36Z and again at 22:52:24Z. The page read `used_bytes: 0`, `counts_turn: false`, `exempt: false`: the new fields, answered by the new code |
 | 2026-10-23 | **P4c on** (deploy `a29d397`: `COUNT_TURN`, `TURN` and the six exempt ids; rollout restart 22:52:41Z, both pods Ready with the three keys by 22:53:06Z), on the operator's go (O8–O11) | **Fleet:** 28 of the 28 agents seen in the 30 minutes before the restart were seen after it. **P4c-0 green (22:53:32Z):** the set held exactly one network, the throwaway org's, at 125,000 B/s, on TURN alone. The operator's org, with the identical row, stayed out, and no real org entered (the annex). The page read `used_bytes` 11,000,000,000, `counts_turn: true`, `throttled: true`. Each pod logged the network entering at its first refresh (22:52:56Z, 22:53:44Z) and re-stamped its pairs. **P4c-1 green, over (23:14:07Z and three more asks a minute apart):** a's verdict for b `derp` and no TURN grant to a. c got no grant and a forced-DERP pin (1,800,000 ms, the central relay) |
-| 2026-10-23 | **Wrong turn: the first "back under" read measured P7, not P4c** | The first run asked for a relay every ~70 s. Once the org was back under (both pods re-stamping its 3 nodes, 22:57:56Z and 22:58:44Z), every request followed a grant, and P7's churn detector counts exactly that. Three grant→re-request cycles in 10 minutes pin a pair to DERP for 30 minutes (`crates/modules/network/src/overlay.rs:1132`), and both pairs were pinned at 23:02Z. So the second run's reads after the org went back under showed that pin, not P4c's: a remaining TTL counting down from 800,082 ms, and a forced DERP for a too. The first run's client log was lost as well: `grep` buffered a pipeline that `timeout` then killed. The harness now asks once before and once after the flip, and `tee`s its log |
+| 2026-10-23 | **Wrong turn: the first "back under" read measured P7, not P4c** | The first run asked for a relay every ~70 s. Once the org was back under (both pods re-stamping its 3 nodes, 22:57:56Z and 22:58:44Z), every request followed a grant, and P7's churn detector counts exactly that. Three grant→re-request cycles in 10 minutes pin a pair to DERP for 30 minutes (`crates/modules/network/src/overlay.rs:1127`), and both pairs were pinned at 23:02Z. So the second run's reads after the org went back under showed that pin, not P4c's: a remaining TTL counting down from 800,082 ms, and a forced DERP for a too. The first run's client log was lost as well: `grep` buffered a pipeline that `timeout` then killed. The harness now asks once before and once after the flip, and `tee`s its log |
 | 2026-10-23 | **P4c-1 back under, on fresh pods** (`hosted-20261023-c680ec9`, a peer's promote at 23:29Z, so no pod held a P7 pin) | Over (23:36:04Z): `derp`, no grant, c pinned for 1,800,000 ms. The rows were removed (23:36:09Z), and the probe asked nothing. **At 23:40:31Z, a's verdict for b flipped `derp` → `single-relay-anchor`,** pushed by the re-stamp, not asked for. **At 23:40:36Z both were granted TURN** (2 servers to a), and nobody was pinned. Cleanup: the 3 simulated devices deleted, the synthetic rows gone (0 left), the set empty. The throwaway org stays for P4d's green |
 | 2026-10-24 | **Promoted `hosted-20261024-6a327b8`** (08:31Z, the operator's go), carrying P4d (#2803) with peers' merged work (FR-97 P2a and records, the 0.4.161 and 0.4.162 bumps, the grid sort fix #2804, FR-119 P2b-9). It was held overnight for a member's remote session on a live device, which re-attached seconds after every roll, until the operator's go. The session had ended by the time of the roll | Pods up at 08:31:31Z and 08:31:53Z, 0 restarts, `/health` 200 on 0.4.162. P4c's three keys are still in both pods' env. **Fleet:** every agent seen in the 30 minutes before the roll was seen after it (0 missing) |
 | 2026-10-24 | **P4d's green**, against its red of 2026-10-23 (the old deploy), on the same throwaway Free org | **Plans list:** `/api/stripe/plans` reads `exit_nodes: true` for Free (it read `false`), and Free's network line is *"Private network with MagicDNS and exit nodes"*. Pro no longer lists exit nodes, on the API or on the static home's Pro card. **The gate:** in `enforce`, enabling an exit node on an id that names no node now reaches the lookup, **404** (it was **403**, *"Exit nodes are not available on the Free plan"*). In `warn`, still 404. **The full flow, in `enforce`:** a simulated node that advertised `0.0.0.0/0` (`can_be_exit_node: true`) was made an exit node, 200 with `is_exit_node: true`, and un-made, 200. **Collisions:** the org's exit-node quota collisions read 2 for 2026-10-23, the red's two calls, which is the positive control. None were counted for any of today's three calls. Cleanup: the 3 simulated devices deleted, the org back in `warn`, then archived |

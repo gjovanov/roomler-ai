@@ -1,5 +1,7 @@
 # FR-49: A second org gets no mesh, and every surface reports normally
 
+**Anchors:** master `9bcb6ed4e` (closed 2026-09-01): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1084](https://github.com/gjovanov/roomler-ai/issues/1084) ·
 Status: **P1–P3 implemented, field-verified** (2026-08-31) · Found while enrolling four demo devices for
 [FR-41](FR-41-product-demo-recording.md) (#965).
@@ -13,7 +15,7 @@ to `Off` at enrolment with no way to change it short of hand-editing
 
 ## Root cause, with anchors
 
-`crates/agent-core/src/enrollment.rs:425` — every appended org, unconditionally:
+`crates/agent-core/src/enrollment.rs:351` — every appended org, unconditionally: (2026-11-04)
 
 ```rust
 let mut entry = crate::config::OrgEntry {
@@ -23,7 +25,7 @@ let mut entry = crate::config::OrgEntry {
     overlay_mode: crate::config::OrgOverlayMode::Off,
 ```
 
-`agents/roomlerd/src/app.rs:3021-3023` — `--overlay` exists, and sets the
+`agents/roomlerd/src/app.rs:2840-2842` — `--overlay` exists, and sets the (2026-11-05)
 **primary's** flag regardless of which identity was just enrolled:
 
 ```rust
@@ -44,10 +46,10 @@ device is genuinely, silently absent from the second org's mesh, and:
 
 | Surface | What it shows | What it omits |
 |---|---|---|
-| `roomlerd enroll` output (`app.rs:3108`) | "Enrolled in an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh |
-| `roomlerd org ls` (`app.rs:3504`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** |
+| `roomlerd enroll` output (`app.rs:3089`) | "Enrolled in an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh (2026-11-24) |
+| `roomlerd org ls` (`app.rs:3264`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** (2026-11-05) |
 | `roomler status` (`localapi::OrgStatus`) | label · agent id · enabled · connected · stopped · update-ignored | **no overlay field** — the org's WS *is* connected, so it reads healthy |
-| `roomler peers` (`localclient.rs:1417`) | one `── org: <label> ──` section per org **that has peers** | an overlay-off org produces **no section at all** — identical to an org whose peers are simply offline |
+| `roomler peers` (`localclient.rs:1398`) | one `── org: <label> ──` section per org **that has peers** | an overlay-off org produces **no section at all** — identical to an org whose peers are simply offline |
 | the dashboard | the device row, online | it is the server's view; the server was never told |
 
 The device is online in both orgs, answers exec and SSH in both, and has no mesh
@@ -62,7 +64,7 @@ must not render identically.
 ## And there is no supported way to turn it on
 
 `roomlerd org` offers `ls · rm · enable · disable · set-primary`
-(`app.rs:962-1009`). None of them touches `overlay_mode`. The only path is to
+(`app.rs:945-992`). None of them touches `overlay_mode`. The only path is to (2026-11-05)
 open `config.toml` — the file that also holds the agent token and the SSH host
 private key, is written atomically with a `.prev` sibling, and on Windows lives
 under a machine-global ACL-restricted directory. Hand-editing it is not a
@@ -255,7 +257,7 @@ daemon. Its primary was in an org with no overlay, and its secondary was enrolle
 | build | the secondary's front, 45 s after start | `peers --org a` | through the front |
 |---|---|---|---|
 | 🔴 released 0.4.143 | the enroll left no port, so 10800 was set by hand; **nothing listened on it**, and `status` still said `overlay netstack` | no peers | `connect: Connection refused`, at the front itself |
-| 🟢 this fix (a release-profile build with `overlay-l3,overlay-netstack,ssh-server`) | the enroll picked 10800 and printed it; it listened | 9 peers, the anchor `direct` | a CONNECT to the anchor's `:22` was refused in 0 ms, a reset over the mesh, while an unassigned address in the block timed out after 15 s; the anchor's MagicDNS answered an A query for its own name with its overlay address |
+| 🟢 this fix (a release-profile build with `overlay-l3,overlay-netstack,ssh-server`) | the enroll picked 10800 and printed it; it listened | 9 peers, the anchor `direct` | a CONNECT to the anchor's `:22` was refused in 0 ms, a reset over the mesh, while an unassigned address in the block timed out after 15 s; the anchor's MagicDNS answered an A query for its own name with its overlay address (2026-10-19) |
 
 The front answers REP 4 for every failed connect, so the TIME is what tells a refusal from no path: the netstack
 fails at once only on a reset, and waits out its 15 s connect timeout otherwise.
