@@ -162,8 +162,8 @@ Four consequences, each a sub-phase:
    already shaped per recipient, so this costs nothing structurally.
 
    Why it works: a fielded agent uses the network CIDR in exactly three places — the TUN
-   netmask (`crates/tunnel-core/src/overlay/runtime.rs:2162`), the subnet-router NAT source
-   scope (`:2138`), and change detection (`:3823`). All three are correct for an agent that
+   netmask (`crates/tunnel-core/src/overlay/runtime.rs:2165`), the subnet-router NAT source
+   scope (`:2141`), and change detection (`:3826`). All three are correct for an agent that
    is told *its own* block, and peers in other blocks are reached through the per-peer
    `/32`s the agent already installs. ⚠️ This is the compatibility claim the whole phase
    rests on, and it is to be **tested against a pinned old-agent decoder**, not argued.

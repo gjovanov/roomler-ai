@@ -98,7 +98,7 @@
 #
 ## wizard · owner FR-129 phase C · 0 files · 0 hits
 #
-## docs-site · owner FR-133 P3 · 49 files · 242 hits
+## docs-site · owner FR-133 P3 · 49 files · 241 hits
 5	ui/docs/content/architecture/index.md
 #	"…ether — one control plane, three data planes, one agent per machine, and a server that coordinates without eve…"
 #	"- **One daemon per machine** icon:shield — the agent is simultaneously the remote-desktop target, the mesh nod…"
@@ -206,10 +206,9 @@
 #	"Agent-authenticated routes load the device row and refuse a revoked or removed"
 #	"…t carries chat, presence, call signalling and the agent"
 #	"protocol. The same endpoint serves users and agents with different credential"
-9	ui/docs/content/reference/cli.md
+8	ui/docs/content/reference/cli.md
 #	"…ommand-line tool. On a machine that also runs the agent it is"
 #	"a thin shim onto the agent's own command surface, so the two can never disagree"
-#	"| | Every peer the local agent sees, with its live connection type |"
 #	"| | Flows the local agent is currently running |"
 #	"| | Tail the agent's log, resolved **by** the agent — the path differs per process and platform |"
 #	"| | Hand the flow to the local agent so it outlives this command |"

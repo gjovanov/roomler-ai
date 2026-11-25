@@ -1484,6 +1484,9 @@ fn build_overlay_view(
                 // the pure builder cannot see the selector state.
                 why: None,
                 probes: Vec::new(),
+                // #4367 — the runtime knows nothing of the control socket; the
+                // DAEMON marks the rows it lists while that socket is down.
+                control_down: None,
             }
         })
         .collect();

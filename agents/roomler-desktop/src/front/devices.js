@@ -304,6 +304,17 @@
         if (row.is_self) {
           cls = ctx.selfConnected ? 'dot dot-on' : 'dot dot-warn';
           tip = ctx.selfConnected ? 'connected to the server' : 'not connected to the server';
+        } else if (peer && peer.control_down) {
+          // #4367: this device's control socket for the peer's org is down;
+          // the mesh still holds the peer, but `online` is the server's
+          // word from before the outage, so the dot is amber, never green.
+          const since = peer.control_down.since_ms;
+          cls = peer.online ? 'dot dot-warn' : 'dot dot-off';
+          tip =
+            (peer.online ? 'reachable on the private network' : 'not reachable') +
+            ' when this device last heard the server' +
+            (since ? ' (' + agoText(since) + ')' : '') +
+            '; the Connection column is live';
         } else if (peer) {
           cls = peer.online ? 'dot dot-on' : 'dot dot-off';
           tip = peer.online ? 'reachable on the private network' : 'not reachable right now';
@@ -616,7 +627,9 @@
         display_name: null,
         os: '',
         version: '',
-        presence: p.online ? 'online' : 'offline',
+        // #4367: a kept peer's `online` is the server's last word from
+        // before this device lost its control socket: `stale`, not `online`.
+        presence: p.online ? (p.control_down ? 'stale' : 'online') : 'offline',
         last_seen_at: p.last_seen_ms ? new Date(p.last_seen_ms).toISOString() : '',
         overlay_ip: p.overlay_ip || null,
         overlay_node_id: p.node_id,
