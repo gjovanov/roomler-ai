@@ -210,7 +210,7 @@ pub fn init() {
 
     let env_filter = filter();
 
-    let stdout = fmt::layer().with_target(false).compact();
+    let ansi = true; // as before #3938: coloured, whatever the stream is
 
     // rc.58 — log-upload layer. Captures every tracing event into an
     // mpsc channel; `main.rs` claims the receiver via
@@ -255,7 +255,7 @@ pub fn init() {
         // Its writer drops them: a per-layer filter here would make the whole
         // stack's level TRACE (`init_keeps_the_level_of_the_default_filter`).
         let console = std::io::stdout.with_filter(|meta| meta.target() != STEP_TARGET);
-        let stdout = stdout.with_writer(console);
+        let stdout = console_layer(console, ansi);
         let _ = filtered(env_filter)
             .with((!quiet).then_some(stdout))
             .with(file)
@@ -264,7 +264,7 @@ pub fn init() {
         install_panic_hook(d.to_path_buf());
     } else {
         let _ = filtered(env_filter)
-            .with(stdout)
+            .with(console_layer(std::io::stdout, ansi))
             .with(upload_layer)
             .try_init();
         // No log dir → no panic hook. Stdout-only is the right
@@ -1185,6 +1185,24 @@ fn format_panic(
         buf.push('\n');
     }
     buf
+}
+
+/// #3938 — the console layer [`init`] installs, in both of its branches: the
+/// daemon's lines in the compact format with no target, written into
+/// `writer`. `colour` is not read yet: the layer keeps the library's default
+/// and colours whatever `writer` is.
+fn console_layer<S, W>(
+    writer: W,
+    _colour: bool,
+) -> fmt::Layer<S, fmt::format::DefaultFields, fmt::format::Format<fmt::format::Compact>, W>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> fmt::MakeWriter<'w> + 'static,
+{
+    fmt::layer()
+        .with_target(false)
+        .compact()
+        .with_writer(writer)
 }
 
 #[cfg(test)]
@@ -2466,6 +2484,94 @@ mod tests {
             );
             let log = today(dir.path());
             assert!(log.contains("the-last-words"), "{log}");
+        }
+    }
+
+    /// #3938 — the console's colour. Each test writes one event with a field
+    /// through [`console_layer`], the layer [`init`] installs, into a buffer and
+    /// under a scoped subscriber: the test binary shares its process.
+    mod colour {
+        use super::super::*;
+        use std::sync::Arc;
+
+        /// What the console's stream would have received.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// The line [`console_layer`] writes into `writer`, as `out` holds it.
+        fn written<W>(out: &Captured, writer: W, colour: bool) -> String
+        where
+            W: for<'w> fmt::MakeWriter<'w> + Send + Sync + 'static,
+        {
+            let subscriber = tracing_subscriber::registry().with(console_layer(writer, colour));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(peers = 3, "a console line with a field");
+            });
+            let bytes = out.0.lock().unwrap().clone();
+            String::from_utf8(bytes).expect("the console's text is UTF-8")
+        }
+
+        /// The console as the branch with no log file installs it: stdout itself.
+        fn on_stdout(colour: bool) -> String {
+            let out = Captured::default();
+            written(&out, out.clone(), colour)
+        }
+
+        /// The console as the branch with a log file installs it: a writer that
+        /// keeps an installer step's own lines for the file (#3230).
+        fn beside_a_log_file(colour: bool) -> String {
+            let out = Captured::default();
+            let console = out.clone().with_filter(|meta| meta.target() != STEP_TARGET);
+            written(&out, console, colour)
+        }
+
+        /// The issue's captures: `roomlerd enroll`'s lines in a script's output,
+        /// read through a pipe, held `\x1b[2m`, `\x1b[32m` and `\x1b[3m`. With
+        /// colour off the line holds no ESC byte, and its text is the same.
+        fn plain(branch: &str, line: &str) {
+            assert!(
+                line.contains("a console line with a field"),
+                "{branch}: the event is written: {line:?}"
+            );
+            assert!(
+                !line.contains('\x1b'),
+                "{branch}: no colour code when colour is off: {line:?}"
+            );
+            assert!(
+                line.contains("INFO"),
+                "{branch}: the level reads as before: {line:?}"
+            );
+            assert!(
+                line.contains("peers=3"),
+                "{branch}: the field reads as before: {line:?}"
+            );
+        }
+
+        #[test]
+        fn a_console_line_without_colour_holds_no_escape_byte() {
+            plain("no log file", &on_stdout(false));
+        }
+
+        #[test]
+        fn a_console_line_beside_a_log_file_without_colour_holds_no_escape_byte() {
+            plain("a log file", &beside_a_log_file(false));
         }
     }
 }

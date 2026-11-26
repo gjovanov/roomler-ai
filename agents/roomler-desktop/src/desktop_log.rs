@@ -138,7 +138,7 @@ pub fn init() -> Option<PathBuf> {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let stderr = fmt::layer().with_target(false).with_writer(std::io::stderr);
+    let stderr = console_layer(std::io::stderr, true); // as before #3938: coloured, whatever the stream is
     let path = default_path();
     let file = path
         .as_ref()
@@ -164,6 +164,27 @@ pub fn init() -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// #3938 — the stderr layer [`init`] installs: the companion's lines with no
+/// target, written into `writer`. `colour` is not read yet: the layer keeps
+/// the library's default and colours whatever `writer` is.
+fn console_layer<S, W>(
+    writer: W,
+    _colour: bool,
+) -> tracing_subscriber::fmt::Layer<
+    S,
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format,
+    W,
+>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_writer(writer)
 }
 
 #[cfg(test)]
@@ -249,5 +270,69 @@ mod tests {
             rotated_path(Path::new("C:/x/desktop.log")),
             PathBuf::from("C:/x/desktop.log.1")
         );
+    }
+
+    /// #3938 — the stderr layer's colour. Each test writes one event with a
+    /// field through [`console_layer`], the layer [`init`] installs, into a
+    /// buffer and under a scoped subscriber: the test binary shares its process.
+    mod colour {
+        use super::super::*;
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        /// What the companion's stderr would have received.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// The line [`console_layer`] writes.
+        fn written(colour: bool) -> String {
+            let out = Captured::default();
+            let subscriber =
+                tracing_subscriber::registry().with(console_layer(out.clone(), colour));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(peers = 3, "a companion line with a field");
+            });
+            let bytes = out.0.lock().unwrap().clone();
+            String::from_utf8(bytes).expect("the log is UTF-8")
+        }
+
+        /// With colour off the line holds no ESC byte, and its text is the same.
+        #[test]
+        fn a_stderr_line_without_colour_holds_no_escape_byte() {
+            let line = written(false);
+            assert!(
+                line.contains("a companion line with a field"),
+                "the event is written: {line:?}"
+            );
+            assert!(
+                !line.contains('\x1b'),
+                "no colour code when colour is off: {line:?}"
+            );
+            assert!(
+                line.contains(" INFO "),
+                "the level reads as before: {line:?}"
+            );
+            assert!(
+                line.contains("peers=3"),
+                "the field reads as before: {line:?}"
+            );
+        }
     }
 }

@@ -569,11 +569,12 @@ struct DerpParams {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    log_subscriber(
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        std::io::stdout,
+        true, // as before #3938: coloured, whatever the stream is
+    )
+    .init();
 
     let public_b64 = std::env::var("DERP_TICKET_PUBLIC_KEY")
         .expect("DERP_TICKET_PUBLIC_KEY (base64 raw 32-byte Ed25519 public key) is required");
@@ -1124,6 +1125,27 @@ fn forward_frame(
         // either way the frame is lost here, as on the central relay.
         drops.full(&key, src_pubkey);
     }
+}
+
+/// #3938 — the relay's log, as `main` installs it: `filter`, then every line
+/// into `writer`, in the library's full format. `colour` is not read yet: the
+/// log keeps the library's default and colours whatever `writer` is.
+fn log_subscriber<W>(
+    filter: tracing_subscriber::EnvFilter,
+    writer: W,
+    _colour: bool,
+) -> tracing_subscriber::fmt::SubscriberBuilder<
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format,
+    tracing_subscriber::EnvFilter,
+    W,
+>
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
 }
 
 #[cfg(test)]
@@ -2116,5 +2138,68 @@ mod tests {
             took <= Duration::from_secs(5),
             "it failed after {took:?}; the bound is 3 s"
         );
+    }
+
+    /// #3938 — the relay's log colour. Each test writes one event with a field
+    /// through [`log_subscriber`], the log `main` installs, into a buffer and
+    /// under a scoped subscriber: the test binary shares its process.
+    mod colour {
+        use super::super::*;
+
+        /// What the relay's stdout would have received: under a service or a
+        /// container runtime, a pipe whose bytes the host stores.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// The line [`log_subscriber`] writes, under the default filter.
+        fn written(colour: bool) -> String {
+            let out = Captured::default();
+            let filter = tracing_subscriber::EnvFilter::new("info");
+            let subscriber = log_subscriber(filter, out.clone(), colour).finish();
+            tracing::subscriber::with_default(subscriber, || {
+                info!(peers = 3, "a relay line with a field");
+            });
+            let bytes = out.0.lock().unwrap().clone();
+            String::from_utf8(bytes).expect("the log is UTF-8")
+        }
+
+        /// With colour off the line holds no ESC byte, and its text is the same.
+        #[test]
+        fn a_log_line_without_colour_holds_no_escape_byte() {
+            let line = written(false);
+            assert!(
+                line.contains("a relay line with a field"),
+                "the event is written: {line:?}"
+            );
+            assert!(
+                !line.contains('\x1b'),
+                "no colour code when colour is off: {line:?}"
+            );
+            assert!(
+                line.contains(" INFO "),
+                "the level reads as before: {line:?}"
+            );
+            assert!(
+                line.contains("peers=3"),
+                "the field reads as before: {line:?}"
+            );
+        }
     }
 }

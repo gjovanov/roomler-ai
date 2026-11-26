@@ -825,13 +825,20 @@ fn daemon_exe(origin: Origin) -> Option<PathBuf> {
 /// (`upgrade_auth::may_log`). tungstenite writes the tunnel token's upgrade
 /// request at TRACE, `Authorization` header included, and no `RUST_LOG` may
 /// reach those lines. An embedded `roomlerd cli` logs through the daemon's
-/// subscriber, which carries the same cap.
-fn log_subscriber(
+/// subscriber, which carries the same cap. #3938: the lines go into `writer`;
+/// `colour` is not read yet, so they are coloured whatever `writer` is.
+fn log_subscriber<W>(
     env_filter: tracing_subscriber::EnvFilter,
-) -> impl tracing::Subscriber + Send + Sync + 'static {
+    writer: W,
+    _colour: bool,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
     use tracing_subscriber::layer::SubscriberExt;
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
+        .with_writer(writer)
         .finish()
         .with(tracing_subscriber::filter::filter_fn(
             roomler_ai_remote_control::upgrade_auth::may_log,
@@ -872,7 +879,11 @@ where
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::util::SubscriberInitExt::try_init(log_subscriber(env_filter));
+    let _ = tracing_subscriber::util::SubscriberInitExt::try_init(log_subscriber(
+        env_filter,
+        std::io::stdout,
+        true, // as before #3938: coloured, whatever the stream is
+    ));
 
     let cli = Cli::parse_from(args);
     match cli.command {
@@ -1268,7 +1279,7 @@ mod tests {
     fn no_rust_log_writes_the_upgrade_request() {
         use tracing::Level;
         let trace = tracing_subscriber::EnvFilter::new("trace");
-        let dispatch = tracing::Dispatch::new(log_subscriber(trace));
+        let dispatch = tracing::Dispatch::new(log_subscriber(trace, std::io::stdout, false));
         tracing::dispatcher::with_default(&dispatch, || {
             assert!(!tracing::enabled!(
                 target: "tungstenite::handshake::client",
@@ -1775,5 +1786,69 @@ mod tests {
             "--json",
         ]);
         assert!(r.is_err(), "--json must not be accepted on `forward`");
+    }
+
+    /// #3938 — the CLI's log colour. Each test writes one event with a field
+    /// through [`log_subscriber`], the subscriber `run_from` installs, into a
+    /// buffer and under a scoped subscriber: the test binary shares its process.
+    mod colour {
+        use super::super::*;
+        use std::sync::{Arc, Mutex};
+
+        /// What the CLI's stdout would have received: a script's capture, when
+        /// a script runs `roomler`.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// The line [`log_subscriber`] writes, under the default filter.
+        fn written(colour: bool) -> String {
+            let out = Captured::default();
+            let filter = tracing_subscriber::EnvFilter::new("info");
+            let subscriber = log_subscriber(filter, out.clone(), colour);
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(peers = 3, "a CLI line with a field");
+            });
+            let bytes = out.0.lock().unwrap().clone();
+            String::from_utf8(bytes).expect("the log is UTF-8")
+        }
+
+        /// With colour off the line holds no ESC byte, and its text is the same.
+        #[test]
+        fn a_log_line_without_colour_holds_no_escape_byte() {
+            let line = written(false);
+            assert!(
+                line.contains("a CLI line with a field"),
+                "the event is written: {line:?}"
+            );
+            assert!(
+                !line.contains('\x1b'),
+                "no colour code when colour is off: {line:?}"
+            );
+            assert!(
+                line.contains(" INFO "),
+                "the level reads as before: {line:?}"
+            );
+            assert!(
+                line.contains("peers=3"),
+                "the field reads as before: {line:?}"
+            );
+        }
     }
 }
