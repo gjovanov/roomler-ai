@@ -5,14 +5,21 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use bson::oid::ObjectId;
 use serde::Deserialize;
 
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_db::models::tenant::{BillingCurrency, BillingInterval};
-use roomler_ai_services::stripe::{BillingSummary, CheckoutParams, StripeEvent, StripeService};
+use roomler_ai_services::stripe::{
+    BillingSummary, CheckoutParams, StripeError, StripeEvent, StripeService,
+};
 use roomler_core::{ApiError, Core, extractors::auth::AuthUser};
+
+/// #4433 — the code a checkout refused for a plan set outside billing
+/// answers with, in `error`: the billing page matches it, never the words.
+pub const PLAN_MANAGED: &str = "plan_managed";
 
 // ---- Request types -------------------------------------------------------
 
@@ -87,7 +94,7 @@ pub async fn create_checkout(
     State(state): State<Core>,
     auth: AuthUser,
     Json(body): Json<CheckoutRequest>,
-) -> Result<Json<roomler_ai_services::stripe::CheckoutResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tenant_id = parse_oid(&body.tenant_id)?;
     require_manage_tenant(&state, tenant_id, auth.user_id).await?;
     let interval = parse_interval(body.interval.as_deref())?;
@@ -112,10 +119,17 @@ pub async fn create_checkout(
                 cancel_url: &body.cancel_url,
             },
         )
-        .await
-        .map_err(stripe_err)?;
+        .await;
 
-    Ok(Json(result))
+    match result {
+        Ok(checkout) => Ok(Json(checkout).into_response()),
+        // #4433 — a 409 the page can tell apart from "already subscribed"
+        // (`ApiError::Conflict` would say `conflict`).
+        Err(e @ StripeError::PlanManaged) => {
+            Ok(refuse(StatusCode::CONFLICT, PLAN_MANAGED, &e.to_string()))
+        }
+        Err(e) => Err(stripe_err(e)),
+    }
 }
 
 // ---- POST /api/stripe/change-plan (authenticated, MANAGE_TENANT) ---------
@@ -384,8 +398,17 @@ async fn require_manage_tenant(
     Ok(())
 }
 
-fn stripe_err(e: roomler_ai_services::stripe::StripeError) -> ApiError {
-    use roomler_ai_services::stripe::StripeError;
+/// `{error, message}`, the shape every error answers, with a code of this
+/// module's own in `error` where `ApiError` has no variant that carries one.
+fn refuse(status: StatusCode, error: &'static str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "error": error, "message": message })),
+    )
+        .into_response()
+}
+
+fn stripe_err(e: StripeError) -> ApiError {
     match e {
         StripeError::TenantNotFound => ApiError::NotFound("Tenant not found".to_string()),
         StripeError::NoBillingAccount => {
@@ -398,8 +421,12 @@ fn stripe_err(e: roomler_ai_services::stripe::StripeError) -> ApiError {
         StripeError::InvalidSignature => {
             ApiError::Unauthorized("Invalid webhook signature".to_string())
         }
-        // FR-115 — a second checkout would bill the org twice.
-        e @ StripeError::AlreadySubscribed => ApiError::Conflict(e.to_string()),
+        // FR-115 — a second checkout would bill the org twice. #4433 —
+        // `create_checkout` answers `PlanManaged` with its own code; anywhere
+        // else it would be this plain 409.
+        e @ (StripeError::AlreadySubscribed | StripeError::PlanManaged) => {
+            ApiError::Conflict(e.to_string())
+        }
         e @ (StripeError::NotSubscribed
         | StripeError::InvalidInterval(_)
         | StripeError::InvalidCurrency(_)
