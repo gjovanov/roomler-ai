@@ -155,8 +155,9 @@ pub(crate) struct Entry {
 }
 
 /// Every running process, from a ToolHelp snapshot. `None` when Windows
-/// refuses the snapshot.
-fn snapshot() -> Option<Vec<Entry>> {
+/// refuses the snapshot. Also what a red `exec::session_lifetime` cell shows
+/// of its processes (#4444).
+pub(crate) fn snapshot() -> Option<Vec<Entry>> {
     // SAFETY: TH32CS_SNAPPROCESS + pid 0 is the documented call form.
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snap == INVALID_HANDLE_VALUE {

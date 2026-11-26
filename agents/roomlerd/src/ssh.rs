@@ -5829,10 +5829,16 @@ mod tests {
             if pids.len() == reports {
                 break pids;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the shell never reported itself"
-            );
+            if std::time::Instant::now() >= deadline {
+                // #4444 — on Windows, where its line stopped.
+                #[cfg(windows)]
+                panic!(
+                    "the shell never reported itself\n{}",
+                    crate::exec::session_lifetime::where_a_command_stopped(&dir)
+                );
+                #[cfg(unix)]
+                panic!("the shell never reported itself");
+            }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
         let _ = std::fs::remove_dir_all(&dir);
@@ -5848,6 +5854,9 @@ mod tests {
     /// nothing, and it ran on for as long as the daemon lived.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_client_vanishing_ends_a_quiet_interactive_shell() {
+        // #4444 — one PowerShell `Start-Process` cell at a time.
+        #[cfg(windows)]
+        let _turn = crate::exec::session_lifetime::Turn::wait_async().await;
         let (session, channel, processes) = a_client_on_a_quiet_shell(47).await;
         drop(channel);
         drop(session);
@@ -5863,6 +5872,9 @@ mod tests {
     /// does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_client_closing_the_channel_ends_a_quiet_interactive_shell() {
+        // #4444 — one PowerShell `Start-Process` cell at a time.
+        #[cfg(windows)]
+        let _turn = crate::exec::session_lifetime::Turn::wait_async().await;
         let (session, channel, processes) = a_client_on_a_quiet_shell(48).await;
         channel.close().await.unwrap();
         for p in &processes {
