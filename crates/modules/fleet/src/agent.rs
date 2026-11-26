@@ -1024,10 +1024,10 @@ pub async fn self_rotate(
         client_ip,
     };
 
-    // The row, tombstone included, so a removed device is told so.
+    // The row on the primary, tombstone included, so a removed device is told so.
     let agent = match state
         .agents
-        .find_any_in_tenant(caller.tenant_id, caller.agent_id)
+        .find_any_in_tenant_on_the_primary(caller.tenant_id, caller.agent_id)
         .await
     {
         Ok(agent) => agent,
@@ -1148,13 +1148,13 @@ pub async fn self_rotate(
         }));
     }
 
-    // The update matched nothing: read the row again and say why. The
-    // answer to a rotation made with this same key is given; a row that
-    // meets every condition of the update but the hour waits (429); anything
-    // else is refused.
+    // The update matched nothing: read the row again, on the primary, and
+    // say why. The answer to a rotation made with this same key is given; a
+    // row that meets every condition of the update but the hour waits (429);
+    // anything else is refused.
     let row = match state
         .agents
-        .find_any_in_tenant(caller.tenant_id, caller.agent_id)
+        .find_any_in_tenant_on_the_primary(caller.tenant_id, caller.agent_id)
         .await
     {
         Ok(row) => row,
