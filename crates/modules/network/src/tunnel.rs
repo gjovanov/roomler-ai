@@ -543,7 +543,7 @@ async fn handle_tunnel_open(
                 ServerMsg::Error {
                     session_id: None,
                     code: "agent_not_found".into(),
-                    message: format!("agent {agent_id} does not exist"),
+                    message: format!("device {agent_id} does not exist"),
                     open_nonce: open_nonce.clone(),
                 },
             )
@@ -566,7 +566,7 @@ async fn handle_tunnel_open(
             ServerMsg::Error {
                 session_id: None,
                 code: "cross_tenant".into(),
-                message: "agent belongs to a different tenant".into(),
+                message: "device belongs to a different tenant".into(),
                 open_nonce: open_nonce.clone(),
             },
         )
@@ -582,7 +582,7 @@ async fn handle_tunnel_open(
             ServerMsg::Error {
                 session_id: None,
                 code: "agent_unavailable".into(),
-                message: "agent is quarantined or deleted".into(),
+                message: "device is quarantined or deleted".into(),
                 open_nonce: open_nonce.clone(),
             },
         )
@@ -593,7 +593,7 @@ async fn handle_tunnel_open(
     // 3a½ (C-3). REHOME gate: the target agent isn't in THIS pod's hub but
     // a FOREIGN pod holds a fresh presence record — a cross-pod split, not
     // an offline agent. Without this, the open would "succeed" and every
-    // forward would then bounce off `agent unreachable` FOREVER (the client
+    // forward would then bounce off `device unreachable` FOREVER (the client
     // keeps its parked WS and never re-dials). Reject the open with the
     // rehome code — the CLI driver bails on open-errors, its reconnect
     // loop dials a FRESH WS, and the LB re-hashes it onto the owner pod —
@@ -657,7 +657,7 @@ async fn handle_tunnel_open(
             ServerMsg::Error {
                 session_id: None,
                 code: "agent_on_other_pod".into(),
-                message: "agent is homed on another pod; re-dial and retry".into(),
+                message: "device is homed on another pod; re-dial and retry".into(),
                 open_nonce: open_nonce.clone(),
             },
         )
@@ -681,7 +681,7 @@ async fn handle_tunnel_open(
                 ServerMsg::Error {
                     session_id: None,
                     code: "origin_unavailable".into(),
-                    message: "originating agent is quarantined or deleted".into(),
+                    message: "originating device is quarantined or deleted".into(),
                     open_nonce: open_nonce.clone(),
                 },
             )
@@ -1085,7 +1085,7 @@ async fn handle_forward_request(
                 dst_host,
                 dst_port,
                 RejectKind::AgentError,
-                "agent row vanished",
+                "device row vanished",
             )
             .await;
             send_msg(
@@ -1095,7 +1095,7 @@ async fn handle_forward_request(
                     request_session_id,
                     flow_id,
                     RejectKind::AgentError,
-                    "agent row vanished".into(),
+                    "device row vanished".into(),
                 ),
             )
             .await;
@@ -1204,7 +1204,7 @@ async fn handle_forward_request(
                         dst_host,
                         dst_port,
                         RejectKind::AgentError,
-                        &format!("agent unreachable: {e}"),
+                        &format!("device unreachable: {e}"),
                     )
                     .await;
                     send_msg(
@@ -1214,7 +1214,7 @@ async fn handle_forward_request(
                             request_session_id,
                             flow_id,
                             RejectKind::AgentError,
-                            format!("agent unreachable: {e}"),
+                            format!("device unreachable: {e}"),
                         ),
                     )
                     .await;
@@ -2400,5 +2400,85 @@ mod tests {
             allows(&policies, &subject, 9001),
             "a user subject in the same set evaluates as before"
         );
+    }
+
+    /// FR-133 P2e: what network sends a caller, inline in the tunnel, SSH and
+    /// DERP handlers, so read from the source (docs anchor these files'
+    /// lines). The tunnel client prints an open error as `{code}: {message}`
+    /// and the tunnel audit stores a forward's reject reason, so each names
+    /// the device, never an "agent"; the codes are wire names and stay. The
+    /// daemon's supervisor reads an open error by its code (`cross_tenant`),
+    /// and a forward's reason must never read as the client's session-death
+    /// signal (`is_session_gone_reject`). `roomler ssh` and the web app print
+    /// the SSH route's refusals.
+    #[test]
+    fn network_refusals_say_device_not_agent() {
+        use roomler_ai_remote_control::signaling::{
+            REJECT_REASON_NO_SESSION, REJECT_REASON_SESSION_GONE, REJECT_REASON_SESSION_MISMATCH,
+        };
+        fn code(src: &str) -> &str {
+            &src[..src.find("#[cfg(test)]").unwrap_or(src.len())]
+        }
+        let files: [(&str, &str, &[&str], &[&str]); 3] = [
+            (
+                "tunnel.rs",
+                code(include_str!("tunnel.rs")),
+                &[
+                    "\"device {agent_id} does not exist\"",
+                    "\"device belongs to a different tenant\"",
+                    "\"device is quarantined or deleted\"",
+                    "\"device is homed on another pod; re-dial and retry\"",
+                    "\"originating device is quarantined or deleted\"",
+                    "\"device row vanished\"",
+                    "\"device unreachable: {e}\"",
+                ],
+                &[
+                    "agent {agent_id} does not exist",
+                    "agent belongs to a different tenant",
+                    "\"agent is quarantined or deleted",
+                    "\"agent is homed on another pod",
+                    "originating agent is",
+                    "agent row vanished",
+                    "agent unreachable",
+                ],
+            ),
+            (
+                "routes/agent_ssh.rs",
+                code(include_str!("routes/agent_ssh.rs")),
+                &[
+                    "\"Invalid device id\"",
+                    "\"Device not found\"",
+                    "this device's daemon cannot run SSH sessions as the person at its screen",
+                    "this device's daemon does not honour consent_mode yet (needs the P5d daemon)",
+                ],
+                &[
+                    "Invalid agent id",
+                    "Agent not found",
+                    "this device's agent",
+                    "the P5d agent",
+                ],
+            ),
+            (
+                "derp.rs",
+                code(include_str!("derp.rs")),
+                &["\"Invalid device ID\""],
+                &["Invalid agent ID"],
+            ),
+        ];
+        for (file, code, says, said) in files {
+            for words in says {
+                assert!(code.contains(words), "{file} no longer says {words}");
+                for phrase in [
+                    REJECT_REASON_SESSION_GONE,
+                    REJECT_REASON_NO_SESSION,
+                    REJECT_REASON_SESSION_MISMATCH,
+                ] {
+                    assert!(!words.contains(phrase), "{words} reads as session death");
+                }
+            }
+            for words in said {
+                assert!(!code.contains(words), "{file} says {words} again");
+            }
+        }
     }
 }

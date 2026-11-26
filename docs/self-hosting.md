@@ -143,6 +143,9 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost logs -f r
 curl -fsS http://localhost:8080/health && echo OK
 ```
 
+The server's log is plain text here: it colours its lines only when its output is a terminal,
+and a container's output is not.
+
 Open <http://localhost:8080> and register, then create your organization from
 the dashboard. The organization owns your devices, invitations and rooms, and
 you are its owner — there is no separate admin bootstrap step and no seeded

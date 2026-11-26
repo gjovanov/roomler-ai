@@ -74,8 +74,8 @@ pub enum RejectKind {
 /// forever. Tunnel clients match on it (`RejectKind::AgentError` + this
 /// substring) and treat it as session death — end the session so the flow
 /// supervisor re-opens with fresh state instead of failing every local
-/// connection. Wire-stable: the string predates the client-side match, so
-/// rejects from older agents match too. Do not reword.
+/// connection. Wire-stable: the string predates the client-side match, so rejects from older
+/// agents match too. AGENT-WORD-KEPT: released tunnel clients match it; do not reword.
 pub const REJECT_REASON_SESSION_GONE: &str = "tunnel session not open on agent";
 
 /// Reject reason the SERVER sends when it holds NO tunnel session for the
