@@ -5,10 +5,10 @@ tags: [reference, network, firewall, ports, self-hosting]
 order: 3
 ---
 
-The short version: **agents need outbound access and no inbound ports at all.**
+The short version: **the daemon needs outbound access and no inbound ports at all.**
 A self-hosted server needs one HTTP port and, for video calls, a UDP range.
 
-## What an agent needs
+## What the daemon needs
 
 | Direction | What | Why |
 |---|---|---|
@@ -46,9 +46,9 @@ allow-list needs:
 | `github.com` and `release-assets.githubusercontent.com` | The Linux and macOS packages, the desktop companion, and every automatic update |
 | `aka.ms` | Windows only: Microsoft's Visual C++ runtime, when the installer script finds it missing |
 
-Wherever a download comes from, the agent checks it before installing: the
+Wherever a download comes from, the daemon checks it before installing: the
 publisher's signature on Windows, and on Linux and macOS a GPG signature
-against a key built into the agent.
+against a key built into `roomlerd`.
 
 ## What a self-hosted server needs
 

@@ -29,7 +29,7 @@ NetBird is the direct answer and you should evaluate it seriously.
 ### Remote desktop is in the same daemon
 
 This is the whole difference. NetBird gives you the network; seeing a screen is
-then a separate product with its own agent, control plane and permissions.
+then a separate product with its own install, control plane and permissions.
 
 Roomler's daemon is simultaneously the mesh node, the remote-desktop target, the
 tunnel endpoint and the SSH server — so a desktop session, a port forward and a
@@ -63,7 +63,7 @@ Included on the same server and accounts.
 :::steps
 1. **You need SSO or SCIM provisioning** → NetBird. This is a real gap in Roomler, not a soft one.
 2. **You need mobile clients or a Kubernetes operator** → NetBird.
-3. **You want the network *and* the screen from one agent** → Roomler.
+3. **You want the network *and* the screen from one daemon** → Roomler.
 4. **You want the most mature open-source mesh** → NetBird.
-5. **You are choosing a stack rather than a product** → count the agents you will be running in a year.
+5. **You are choosing a stack rather than a product** → count the daemons you will be running in a year.
 :::

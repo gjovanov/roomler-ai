@@ -15,7 +15,7 @@ This page is the list of what each platform wants.
 :::os
 @windows
 Windows needs no explicit user grant for capture or input. What it *does* gate
-is **which desktop** the agent can see.
+is **which desktop** the daemon can see.
 
 | Service mode | Can capture | Cannot capture |
 |---|---|---|
@@ -26,13 +26,13 @@ is **which desktop** the agent can see.
 :::warning The classic Windows symptom
 The session works fine until the remote machine shows a UAC prompt or locks —
 and then the screen freezes on the last frame. That is the secure desktop, and
-it means the agent is not running in system mode. Re-install with
+it means the daemon is not running in system mode. Re-install with
 `-Role daemon-system`.
 :::
 
 There is a second, rarer Windows case: a screen-capture handle bound during the
 transition between locked and unlocked can end up returning empty frames
-indefinitely. The agent detects a stream that has delivered nothing and rebuilds
+indefinitely. The daemon detects a stream that has delivered nothing and rebuilds
 it; if you ever see a permanently black screen that a reconnect fixes, that was
 it.
 
@@ -59,18 +59,18 @@ like an empty wallpaper, this is why, essentially every time.
 :::
 
 A third grant, **Microphone**, matters only for a screen recording that
-includes the microphone (from agent 0.4.163). macOS asks the first time one
+includes the microphone (from roomlerd 0.4.163). macOS asks the first time one
 does. Unlike the two above, it does not fail silently: if it is turned off,
 that recording is refused and names the setting. Where the **root half** runs
-the screen (`macos_supervise_gui_worker`), macOS asks the same way from agent
-0.4.168. Agents 0.4.166 and 0.4.167 refuse the microphone by name there,
-because macOS never asked, rather than record silence. From agent 0.4.170 the
+the screen (`macos_supervise_gui_worker`), macOS asks the same way from roomlerd
+0.4.168. Versions 0.4.166 and 0.4.167 refuse the microphone by name there,
+because macOS never asked, rather than record silence. From roomlerd 0.4.170 the
 first recording waits while macOS asks you. Before it, that recording could
 stop before you had answered; your answer was kept, so starting it again
 recorded.
 
 You do not have to hunt: the **menu-bar app** names whichever grant is missing
-and opens the right pane. The agent also probes both at startup and reports the
+and opens the right pane. The daemon also probes both at startup and reports the
 state to the server, so the device list shows *"No screen access"* / *"No input
 access"* rather than letting you find out by connecting.
 
@@ -87,7 +87,7 @@ installer says so when it happens rather than leaving you to discover it.
 :::
 
 @linux
-Linux depends on the display server, and the agent detects which one at session
+Linux depends on the display server, and the daemon detects which one at session
 time rather than caching an answer at startup.
 
 | Session | Capture | Input |
@@ -111,7 +111,7 @@ Two things regularly cause trouble:
 
 :::warning The portal must actually be running
 On KDE Plasma and other desktops that capture through the desktop portal, the
-portal is started on demand, and if nothing has ever triggered it, the agent
+portal is started on demand, and if nothing has ever triggered it, the daemon
 finds no capture source at all. Starting it is not always enough on its own:
 the portal front-end caches its backend choice at startup, so it may need
 restarting after the backend becomes available.
@@ -137,7 +137,7 @@ nothing to capture: enable virtual-display mode there.
 | Wallpaper only, no windows | macOS Screen Recording grant |
 | Screen fine, clicks and keys do nothing | macOS Accessibility grant (Device Control and Data Access on macOS 27), or a Linux layout problem |
 | Freezes at the lock screen or a UAC prompt | Windows not in system service mode |
-| Completely black, fixed by reconnecting | A capture handle that came up empty; the agent rebuilds it |
+| Completely black, fixed by reconnecting | A capture handle that came up empty; the daemon rebuilds it |
 | Nothing to capture on a Linux box | No logged-in session, or the portal is not running |
 
 More in [black screen](/docs/troubleshooting/black-screen/).

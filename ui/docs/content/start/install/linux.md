@@ -1,6 +1,6 @@
 ---
 title: Install on Linux
-description: Install the Roomler agent on Linux with one command — as a root systemd service or a per-user unit — including headless servers, containers and cluster nodes.
+description: Install the Roomler daemon on Linux with one command — as a root systemd service or a per-user unit — including headless servers, containers and cluster nodes.
 tags: [install, linux, getting-started, enrollment, headless]
 order: 12
 ---
@@ -77,7 +77,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --token <token> --server https://roomler.ai --name "$(hostname)"
 ```
 
-**Tunnels only** — just the CLI, no agent:
+**Tunnels only** — just the CLI, no daemon:
 
 ```bash
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
@@ -114,7 +114,7 @@ wrong — and in particular, do not "restart to fix" on that basis.
 
 ## Headless machines
 
-A server with no display can still be reached as a **desktop**: the agent's
+A server with no display can still be reached as a **desktop**: the daemon's
 virtual-display mode gives the machine a screen, so *View screen* drops you into
 a live console rather than failing. Enable it in the device's configuration
 rather than by an environment variable, so the setting survives a reboot and
@@ -134,7 +134,7 @@ see [per-OS permissions](/docs/remote-desktop/per-os-permissions/).
 | Logs | `journalctl -u roomlerd` (system) or `journalctl --user -u roomler` (per user) |
 
 :::danger The config file holds a credential
-`config.toml` contains the agent token, and — if you enable SSH — the SSH host
+`config.toml` contains the device credential, and — if you enable SSH — the SSH host
 private key. It is written `0600`. Treat it as a secret if you copy it anywhere.
 :::
 
@@ -148,13 +148,13 @@ gh attestation verify roomlerd-<version>-x86_64-unknown-linux-gnu.deb \
   --repo gjovanov/roomler-ai
 ```
 
-The agent's own updater verifies the GPG signature against a key **pinned inside
+The daemon's own updater verifies the GPG signature against a key **pinned inside
 the binary** before it will install anything, and refuses if the signature is
 absent or does not match.
 
 ## Keeping it updated
 
-The agent self-updates on a timer, verifying the signature before handing off to
+The daemon self-updates on a timer, verifying the signature before handing off to
 `dpkg`. Admins can also push a specific version per device or fleet-wide.
 
 :::warning `dpkg -i` alone does not restart the daemon

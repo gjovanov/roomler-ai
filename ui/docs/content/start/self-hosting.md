@@ -136,7 +136,7 @@ back those up, not the container.
 
 ## Licensing
 
-The server is **AGPL-3.0**; the agent that runs on your machines is **MPL-2.0**.
+The server is **AGPL-3.0**; the daemon that runs on your machines (`roomlerd`) is **MPL-2.0**.
 Running it for yourself, your family or your company is exactly what the licence
 is for. See [`LICENSING.md`](https://github.com/gjovanov/roomler-ai/blob/master/LICENSING.md)
 for the split and what it means if you intend to offer it as a service.

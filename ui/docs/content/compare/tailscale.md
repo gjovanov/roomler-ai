@@ -12,7 +12,7 @@ Be clear-eyed about this before reading anything else.
 
 :::cards
 - **Maturity and scale** icon:check — Years of production use across an enormous fleet, with the operational record only time produces. Roomler is young.
-- **Platform coverage** icon:monitor — iOS, Android, Synology, QNAP, routers, embedded. Roomler's agent is Windows, Linux and macOS, and its viewer is Chromium-first.
+- **Platform coverage** icon:monitor — iOS, Android, Synology, QNAP, routers, embedded. Roomler's daemon runs on Windows, Linux and macOS, and its viewer is Chromium-first.
 - **Public ingress** icon:external — Publishing a service to the public internet from a node is a first-class Tailscale feature. Roomler has **no equivalent** — its tunnels reach *into* your network from your own devices.
 - **Identity integrations** icon:shield — SSO, SCIM provisioning, device posture, and the breadth of IdP support enterprise procurement asks for.
 - **Ecosystem** icon:book — A large community, many published recipes, and integrations with things you already run.
@@ -29,12 +29,12 @@ recommendation and you should use it.**
 
 It is the other half of the product. With Tailscale you get a machine on a
 network and then still need something to see its screen — VNC, RDP, RustDesk,
-another agent. With Roomler the machine you just reached is already viewable in
+another install. With Roomler the machine you just reached is already viewable in
 a browser tab, under the same identity, with the same audit trail.
 
 ### The whole control plane is open source
 
-The server is AGPL-3.0 and the agent MPL-2.0, and self-hosting is a supported
+The server is AGPL-3.0 and the daemon MPL-2.0, and self-hosting is a supported
 first-class path rather than a separate product tier. Tailscale's coordination
 server is not open source; Headscale is a community reimplementation rather than
 the thing Tailscale runs.
@@ -71,7 +71,7 @@ its own identity system.
 
 :::steps
 1. **You need mobile, public ingress, or enterprise SSO** → Tailscale. These are real gaps, not soft ones.
-2. **You need a private network *and* remote desktop** → Roomler, or you are running two agents forever.
+2. **You need a private network *and* remote desktop** → Roomler, or you are running two daemons forever.
 3. **You must host the control plane yourself, on the real code** → Roomler.
 4. **You want the most battle-tested mesh available** → Tailscale.
 :::

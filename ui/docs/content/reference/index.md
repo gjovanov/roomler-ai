@@ -1,6 +1,6 @@
 ---
 title: Reference
-description: The exact surfaces — every roomler command, every agent configuration key, which ports are needed, and how the HTTP API is authenticated and scoped.
+description: The exact surfaces — every roomler command, every daemon configuration key, which ports are needed, and how the HTTP API is authenticated and scoped.
 tags: [reference, cli, configuration, api, ports]
 order: 0
 ---
@@ -11,7 +11,7 @@ are for when you already know what you want and need the exact spelling.
 
 :::cards
 - **[CLI](/docs/reference/cli/)** icon:terminal — Every `roomler` command and the flags that actually exist.
-- **[Configuration](/docs/reference/configuration/)** icon:blueprint — Agent `config.toml` keys, where the file lives per platform, and which settings the server can and cannot change.
+- **[Configuration](/docs/reference/configuration/)** icon:blueprint — `roomlerd`'s `config.toml` keys, where the file lives per platform, and which settings the server can and cannot change.
 - **[Ports and firewall](/docs/reference/ports-and-firewall/)** icon:network — What must be reachable, and what never needs opening inbound.
 - **[HTTP API](/docs/reference/api/)** icon:book — Authentication, organization scoping, rate limits and route groups.
 - **[Platform support](/docs/reference/platform-support/)** icon:compare — What works on Windows, Linux and macOS, and why where an OS cannot.

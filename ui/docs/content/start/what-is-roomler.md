@@ -1,6 +1,6 @@
 ---
 title: What is Roomler?
-description: Roomler is a browser-based remote desktop and a private WireGuard-style mesh network on one self-hostable agent, with team chat and video included.
+description: Roomler is a browser-based remote desktop and a private WireGuard-style mesh network on one self-hostable daemon, with team chat and video included.
 tags: [overview, getting-started, architecture, remote-desktop, mesh]
 hero: private-network.svg
 heroAlt: Home, office and cloud machines joined into one private encrypted network with stable addresses
@@ -9,11 +9,11 @@ order: 1
 
 Most people arrive here already running two products: something like
 **TeamViewer or RustDesk** to see a screen, and something like **Tailscale or a
-VPN** to reach a service. Roomler is one agent that is *both*, plus the team
+VPN** to reach a service. Roomler is one daemon that is *both*, plus the team
 layer, on one identity and one server you can host yourself.
 
 :::video C1YdfmhbAKM
-A 9-minute tour: installing the agent on Windows, macOS and Linux, connecting
+A 9-minute tour: installing the daemon on Windows, macOS and Linux, connecting
 from a browser tab, and how it compares with TeamViewer and AnyDesk.
 :::
 
@@ -51,7 +51,7 @@ These two shape almost every design decision, and knowing them explains a lot of
 the product's behaviour.
 
 :::badges
-- **One daemon per machine** icon:shield — The agent is simultaneously the remote-desktop target, the mesh node, the tunnel endpoint and the SSH server. It is not four cooperating services, which is why "just install another copy" is almost always the wrong answer.
+- **One daemon per machine** icon:shield — The daemon, `roomlerd`, is simultaneously the remote-desktop target, the mesh node, the tunnel endpoint and the SSH server. It is not four cooperating services, which is why "just install another copy" is almost always the wrong answer.
 - **The server coordinates, it never carries plaintext** icon:network — Pixels, keystrokes, SSH bytes and tunnel payloads travel peer-to-peer, or over a relay that only ever sees ciphertext.
 :::
 
@@ -59,8 +59,8 @@ the product's behaviour.
 
 | Piece | What it is | Where it runs |
 |---|---|---|
-| **The agent** (`roomlerd`) | A native binary — the remote-desktop target, the mesh node, the tunnel endpoint, the SSH server | Every machine you enroll |
-| **The CLI** (`roomler`) | Status, peers, tunnels, exec, ssh, diagnostics | Same machine, alongside the agent |
+| **The daemon** (`roomlerd`) | A native binary — the remote-desktop target, the mesh node, the tunnel endpoint, the SSH server | Every machine you enroll |
+| **The CLI** (`roomler`) | Status, peers, tunnels, exec, ssh, diagnostics | Same machine, alongside the daemon |
 | **The server** | Accounts, device registry, signalling, coordination, chat and the conferencing SFU | Roomler's cloud, or your own |
 | **The controller** | A browser (Chromium browsers work best; Safari and Firefox work too) | Wherever you happen to be |
 

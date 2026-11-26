@@ -10,8 +10,8 @@ order: 1
 | Traffic | Encryption |
 |---|---|
 | Browser to server | TLS |
-| Agent to server (control) | TLS |
-| Remote-desktop session | End to end, between browser and agent |
+| Daemon to server (control) | TLS |
+| Remote-desktop session | End to end, between browser and daemon |
 | Mesh traffic | End to end, between the two machines |
 | Tunnel and SSH payloads | End to end |
 | Relayed traffic | Already encrypted; the relay forwards ciphertext |
@@ -59,11 +59,11 @@ identity provider, and it is why an unverified provider sign-in behaves more
 conservatively than you might expect.
 :::
 
-## Agents
+## Devices
 
-Each agent has its own long-lived credential, bound to one machine and one
+Each device has its own long-lived credential, bound to one machine and one
 organization. Deleting a device revokes it immediately; the revocation is
-checked on every request the agent makes, not only at connect time.
+checked on every request the daemon makes, not only at connect time.
 
 ## Known limits, stated plainly
 
@@ -80,6 +80,6 @@ Please report privately rather than opening a public issue. Details are in
 
 ## Verifying rather than believing
 
-The server is AGPL-3.0 and the agent is MPL-2.0. Every claim on this page is
+The server is AGPL-3.0 and the daemon is MPL-2.0. Every claim on this page is
 checkable in the source rather than promised in prose, and the audit log records
 what was actually decided.

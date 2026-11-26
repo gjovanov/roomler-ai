@@ -1,18 +1,18 @@
 ---
 title: Install the tunnel CLI only
-description: Install just the roomler command-line client on a machine you sit at, to open port forwards and a SOCKS5 proxy without running the full agent.
+description: Install just the roomler command-line client on a machine you sit at, to open port forwards and a SOCKS5 proxy without running the full daemon.
 tags: [install, tunnels, cli, getting-started, socks5]
 order: 14
 ---
 
-Not every machine needs the full agent. If you only want to **open tunnels
+Not every machine needs the full daemon. If you only want to **open tunnels
 from** a machine — your own laptop, a jump box, a CI runner — install the
 **tunnel client**: the `roomler` CLI on its own, with no service, no screen
 capture and no mesh membership.
 
-## Agent or tunnel client?
+## Daemon or tunnel client?
 
-| Capability | Agent (`roomlerd`) | Tunnel client (`roomler`) |
+| Capability | Daemon (`roomlerd`) | Tunnel client (`roomler`) |
 |---|---|---|
 | Reach **this** machine remotely | Yes | No |
 | Open tunnels **from** this machine | Yes | Yes |
@@ -22,7 +22,7 @@ capture and no mesh membership.
 | Install footprint | Full node stack | One binary |
 
 :::tip The rule of thumb
-If you want to **reach** the machine, install the agent. If you want to **reach
+If you want to **reach** the machine, install the daemon. If you want to **reach
 out from** it, the tunnel client is enough.
 :::
 
@@ -38,7 +38,7 @@ from the device enrollment token, so mint it from the right place.
 
 ```bash
 roomler status                                                    # who am I, and am I connected
-roomler forward --agent <agent-id> --local 5432 --remote localhost:5432
+roomler forward --agent <device-id> --local 5432 --remote localhost:5432
 roomler socks5 --local 1080                                       # a SOCKS5 proxy into the mesh
 roomler flows                                                     # what is open right now
 ```
@@ -65,9 +65,9 @@ offered as. Where the CLI sits in a system folder, or came from the `.deb`, run 
 as `sudo roomler self-update`. On Linux and macOS this works from the first tunnel
 release that carries it; an older CLI there points you at the download instead.
 
-:::warning On a machine that also runs the agent, `self-update` refuses
-That is deliberate. On an agent host the installer owns the whole node stack,
-and the `roomler` command is a thin shim that re-execs the agent's own command
+:::warning On a machine that also runs the daemon, `self-update` refuses
+That is deliberate. On a daemon host the installer owns the whole node stack,
+and the `roomler` command is a thin shim that re-execs the daemon's own command
 surface — so there is nothing separate for it to update, and letting it try
 would replace a 150 KB shim with a full standalone binary.
 :::

@@ -1,11 +1,11 @@
 ---
 title: Subnet routers
-description: Expose a whole LAN through one enrolled machine, so your other devices can reach printers, NAS boxes, hypervisors and appliances that will never run an agent.
+description: Expose a whole LAN through one enrolled machine, so your other devices can reach printers, NAS boxes, hypervisors and appliances that will never run roomlerd.
 tags: [network, subnet-router, routing, lan]
 order: 3
 ---
 
-Some things on a network will never run an agent — a printer, a NAS, a switch's
+Some things on a network will never run `roomlerd` — a printer, a NAS, a switch's
 management interface, a hypervisor, an industrial controller. A **subnet router**
 is one enrolled machine that advertises a whole network range on their behalf.
 
