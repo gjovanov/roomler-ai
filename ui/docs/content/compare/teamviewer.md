@@ -50,13 +50,13 @@ anyway.
 
 ### It is also a private network
 
-The same agent puts the machine on a WireGuard-style mesh, so after the session
+The same daemon puts the machine on a WireGuard-style mesh, so after the session
 you can still reach its services by address or name — a database, an internal web
 app, SSH — without a second product.
 
 ### Open source
 
-Server AGPL-3.0, agent MPL-2.0. The agent's licence is deliberately chosen so a
+Server AGPL-3.0, daemon MPL-2.0. The daemon's licence is deliberately chosen so a
 managed-service provider can ship it.
 
 ## Side by side

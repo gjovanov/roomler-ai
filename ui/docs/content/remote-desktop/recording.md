@@ -132,10 +132,10 @@ In **Recordings**, press **Edit** on a recording.
 
 ## Limits
 
-- **macOS** records computer audio from agent 0.4.161 and the microphone from
-  agent 0.4.163, or 0.4.168 where the root half runs the screen. The first time,
+- **macOS** records computer audio from roomlerd 0.4.161 and the microphone from
+  roomlerd 0.4.163, or 0.4.168 where the root half runs the screen. The first time,
   macOS asks whether Roomler Daemon may use the microphone
   ([per-OS permissions](/docs/remote-desktop/per-os-permissions/)).
-- Recording arrived with agent **0.4.110**. A machine on an older agent shows no
+- Recording arrived with roomlerd **0.4.110**. A machine on an older daemon shows no
   Record control.
 - This page is about screens. Roomler does not record video calls.
