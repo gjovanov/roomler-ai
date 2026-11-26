@@ -6621,12 +6621,26 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
                       sudo installer -pkg <pkg> -target /)"
                 );
                 if recorded {
-                    println!(
-                        "Your ask is recorded: the update installs now over your own sessions, \
-                         and waits for this Mac's SSH connections, runs, transfers and recordings."
-                    );
+                    // #4423 — what the helper waits for depends on this Mac: a
+                    // root half or none. The person's look is the connect alone
+                    // to the socket root serves them, as `roomler status` makes it.
+                    let root = roomlerd::helper_gate::root_half_seen(
+                        async {
+                            match tunnel_core::localapi::own_person_socket_path() {
+                                Some(path) => {
+                                    tunnel_core::localapi::connect_unix_stream_served_by_root(path)
+                                        .await
+                                        .map(|_connected| ())
+                                }
+                                None => Err(std::io::Error::other("root has no person socket")),
+                            }
+                        },
+                        roomlerd::helper_gate::ROOT_HALF_LOOK,
+                    )
+                    .await;
+                    println!("{}", roomlerd::helper_gate::ask_recorded_says(root));
                 } else {
-                    println!("The update installs when nothing on this Mac is in use.");
+                    println!("{}", roomlerd::helper_gate::NO_ASK_SAYS);
                 }
                 Ok(())
             }
