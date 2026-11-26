@@ -713,10 +713,10 @@ fn holds_the_machines(tree: &MachineTree, config: bool, out: &mut Repairs) -> bo
     }
 }
 
-/// What a copy beside the config inherits, as found ([`closed_as_found`] over those entries;
-/// no DACL fails it); its owner and own entries are judged where it is read.
+/// #4176, #4453 — what a copy beside the config inherits, as found, at a start and at a save
+/// ([`closed_as_found`]; no DACL fails it). Its owner and own entries are judged where it is read.
 #[cfg(windows)]
-fn copy_inherits_as_found(tree: &MachineTree) -> Result<(), Refusal> {
+pub(crate) fn copy_inherits_as_found(tree: &MachineTree) -> Result<(), Refusal> {
     let (copy, what) = (tree.prev(), tree.prev().display().to_string());
     let Some(entry) = open_entry(&copy, win::Kind::File, false)? else {
         return Ok(());
@@ -1262,7 +1262,7 @@ pub fn may_fold(tree: &MachineTree, switches: Switches) -> Result<(), String> {
         Err(Refusal::NotPrivate(why)) => return Err(why),
     }
     if switches.repair {
-        log_repairs(&repair(tree, true));
+        set_aside_a_copy_a_start_refuses(tree).map(|()| log_repairs(&repair(tree, true)))?;
     }
     match check_config(tree) {
         Ok(()) | Err(Refusal::Absent) => Ok(()),
@@ -3169,6 +3169,113 @@ pub mod test_support {
     }
 }
 
+/// #4453 — an elevated save of the machine config (its merge base, its write,
+/// and the taking of the machine folder and its parent) sets aside a
+/// `config.toml.prev` that a start would not take ([`copy_inherits_as_found`]),
+/// and says so in one line: it is moved to `config.toml.prev.set-aside` beside
+/// it (`-1` to `-9` when that name is taken; an entry with the name is never
+/// replaced), a name no reader loads, kept for whoever looks into it. A link
+/// at its name is moved as itself, never followed. One that cannot be moved
+/// stays at its name, keeping the entries it was found with as its own
+/// ([`keep_as_found`]). A `.prev` a start takes, or none, is left as it is.
+/// `Err` when it is neither moved nor kept: it names the file and what to do,
+/// and the save stops there.
+#[cfg(windows)]
+pub(crate) fn set_aside_a_copy_a_start_refuses(tree: &MachineTree) -> Result<(), String> {
+    let why = match copy_inherits_as_found(tree) {
+        Ok(()) | Err(Refusal::Absent) => return Ok(()),
+        Err(Refusal::NotPrivate(why)) => why,
+    };
+    let copy = tree.prev();
+    let mut not_moved = "every name it is set aside under is taken".to_string();
+    for n in 0..10 {
+        let aside = copy.with_extension(match n {
+            0 => "prev.set-aside".to_string(),
+            n => format!("prev.set-aside-{n}"),
+        });
+        match rename_where_none_is(&copy, &aside) {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %aside.display(), reason = %why,
+                    "machine tree: a config.toml.prev that a start would not take is set aside"
+                );
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // Nothing at its name any more: another writer moved it meanwhile.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                not_moved = e.to_string();
+                break;
+            }
+        }
+    }
+    match keep_as_found(&copy) {
+        Ok(()) => {
+            tracing::warn!(
+                path = %copy.display(), reason = %why, %not_moved,
+                "machine tree: a config.toml.prev that a start would not take is not moved; it \
+                 stays at its name, keeping the entries it was found with as its own"
+            );
+            Ok(())
+        }
+        Err(not_kept) => {
+            tracing::warn!(
+                path = %copy.display(), reason = %why, %not_moved, %not_kept,
+                "machine tree: a config.toml.prev that a start would not take is neither moved \
+                 nor kept as found; the save stops"
+            );
+            Err(format!(
+                "{} is a copy a start would not take ({why}): it is not moved ({not_moved}), and \
+                 it does not keep the entries it was found with ({not_kept}). The save stops: \
+                 from an elevated prompt, move it out of {}, then run the save again",
+                copy.display(),
+                tree.folder().display()
+            ))
+        }
+    }
+}
+
+/// #4453 — the entries `path` was found with, kept as its own: the same
+/// entries, as they were listed, none inherited, written through its handle.
+/// A link, a folder, a file this process may not change, one with no DACL, or
+/// one with an entry that is neither an allow nor a deny is an `Err`.
+#[cfg(windows)]
+fn keep_as_found(path: &Path) -> Result<(), String> {
+    let Some(entry) = win::open(path, win::Kind::File, false, true)? else {
+        return Err(format!("{} is not there", path.display()));
+    };
+    if !entry.writable {
+        return Err(format!(
+            "{}: this process may not change its entries",
+            path.display()
+        ));
+    }
+    let sd = win::read_sd(&entry.file)
+        .map_err(|e| format!("{}: reading its security: {e}", path.display()))?;
+    let Some(aces) = sd.dacl else {
+        return Err(format!("{} has no DACL", path.display()));
+    };
+    win::set_sd(&entry.file, false, Some((&aces, true)))
+        .map_err(|e| format!("{}: keeping its entries: {e}", path.display()))
+}
+
+/// `from` renamed to `to` only while no entry has that name (`MoveFileExW`
+/// without `MOVEFILE_REPLACE_EXISTING`): `AlreadyExists` when one has. A link
+/// at `from` is renamed itself.
+#[cfg(windows)]
+fn rename_where_none_is(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (from, to) = (wide(from), wide(to));
+    // SAFETY: two NUL-terminated paths that live across the call.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4628,6 +4735,123 @@ mod tests {
                 "the reason names the entry: {why}"
             );
             assert_eq!(sddl(&elsewhere), target);
+        }
+
+        /// `path` opened for reading by a handle that shares reading and
+        /// writing, and no delete, as another process may hold it.
+        fn held_open(path: &Path) -> std::fs::File {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // FILE_SHARE_READ | FILE_SHARE_WRITE.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2)
+                .open(path)
+                .unwrap()
+        }
+
+        /// #4453 — a `.prev` that a start would not take is set aside under
+        /// the first free name, never over one that is taken, and a link at
+        /// its name is moved as itself: what it leads to stays as it is. A
+        /// `.prev` a start takes stays at its name.
+        #[test]
+        fn a_copy_a_start_refuses_is_set_aside_under_a_free_name() {
+            use std::os::windows::fs::MetadataExt as _;
+            if !elevated_or_skip("a copy a start refuses, set aside") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = config_present(root.path(), ConfigPresent::Sealed);
+            std::fs::write(tree.prev(), "taken").unwrap();
+            assert_eq!(set_aside_a_copy_a_start_refuses(&tree), Ok(()));
+            assert_eq!(std::fs::read_to_string(tree.prev()).unwrap(), "taken");
+
+            let root = tempfile::tempdir().unwrap();
+            let tree = config_present(root.path(), ConfigPresent::CopyInheritsWrite);
+            std::fs::write(tree.prev(), "the copy").unwrap();
+            let taken = tree.folder().join("config.toml.prev.set-aside");
+            std::fs::write(&taken, "one set aside earlier").unwrap();
+            assert_eq!(set_aside_a_copy_a_start_refuses(&tree), Ok(()));
+            assert!(tree.prev().symlink_metadata().is_err(), "not at its name");
+            assert_eq!(
+                std::fs::read_to_string(&taken).unwrap(),
+                "one set aside earlier"
+            );
+            let first_free = tree.folder().join("config.toml.prev.set-aside-1");
+            assert_eq!(std::fs::read_to_string(&first_free).unwrap(), "the copy");
+
+            let elsewhere = root.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("kept"), "kept").unwrap();
+            junction(&tree.prev(), &elsewhere);
+            assert_eq!(set_aside_a_copy_a_start_refuses(&tree), Ok(()));
+            assert!(tree.prev().symlink_metadata().is_err(), "the link is moved");
+            let link = tree.folder().join("config.toml.prev.set-aside-2");
+            assert_ne!(
+                link.symlink_metadata().unwrap().file_attributes() & 0x400,
+                0,
+                "a link, moved as itself"
+            );
+            assert_eq!(
+                std::fs::read_to_string(elsewhere.join("kept")).unwrap(),
+                "kept"
+            );
+        }
+
+        /// #4453 — a `.prev` that a start would not take, held open by a
+        /// handle that shares no delete, is not moved: it stays at its name,
+        /// keeping the entries it was found with as its own, none inherited.
+        #[test]
+        fn a_copy_a_start_refuses_that_is_held_open_keeps_the_entries_it_was_found_with() {
+            if !elevated_or_skip("a copy a start refuses, held open") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = config_present(root.path(), ConfigPresent::CopyInheritsWrite);
+            std::fs::write(tree.prev(), "the copy").unwrap();
+            let found = read(&tree.prev(), win::Kind::File).dacl.unwrap();
+            assert!(found.iter().all(|a| a.flags & INHERITED != 0), "{found:?}");
+            let held = held_open(&tree.prev());
+            assert_eq!(set_aside_a_copy_a_start_refuses(&tree), Ok(()));
+            drop(held);
+            assert_eq!(std::fs::read_to_string(tree.prev()).unwrap(), "the copy");
+            assert!(
+                !tree.folder().join("config.toml.prev.set-aside").exists(),
+                "nothing is set aside"
+            );
+            let own: Vec<Ace> = found
+                .iter()
+                .map(|a| Ace {
+                    flags: a.flags & !INHERITED,
+                    ..a.clone()
+                })
+                .collect();
+            let kept = read(&tree.prev(), win::Kind::File);
+            assert_eq!(kept.dacl, Some(own), "the entries it was found with");
+            assert!(kept.protected, "as its own");
+        }
+
+        /// #4453 — a `.prev` that a start would not take, which is neither
+        /// moved (held open) nor kept as found (it has no DACL), is an `Err`
+        /// that names it and what to do, and it stays as it is.
+        #[test]
+        fn a_copy_a_start_refuses_that_is_neither_moved_nor_kept_stops_the_save() {
+            if !elevated_or_skip("a copy a start refuses, neither moved nor kept") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = config_present(root.path(), ConfigPresent::Sealed);
+            std::fs::write(tree.prev(), "the copy").unwrap();
+            set_dacl(&tree.prev(), "D:NO_ACCESS_CONTROL");
+            let held = held_open(&tree.prev());
+            let why = set_aside_a_copy_a_start_refuses(&tree).expect_err("the save stops");
+            drop(held);
+            assert!(
+                why.contains(&tree.prev().display().to_string()),
+                "it names the file: {why}"
+            );
+            assert!(why.contains("elevated prompt"), "and what to do: {why}");
+            assert_eq!(std::fs::read_to_string(tree.prev()).unwrap(), "the copy");
+            assert_eq!(read(&tree.prev(), win::Kind::File).dacl, None);
         }
 
         /// Put this process where the daemon is: SeBackup, SeRestore and
