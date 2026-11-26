@@ -298,7 +298,7 @@ fn record_inner_at(
         log_tail: scrubbed_tail,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
-        hostname: detect_hostname(),
+        hostname: crate::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
         pid,
         suppressed_since_last,
     };
@@ -1435,29 +1435,6 @@ fn estimate_json_size(payload: &AgentCrashPayload) -> usize {
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
-
-fn detect_hostname() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "unknown".to_string())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Read /etc/hostname; on most Linux/macOS this is the same
-        // as `hostname(1)`. Falls back to env-var HOSTNAME if not.
-        // `.ok()` collapses the Result so `.filter` (Option) is
-        // applicable; without it CI's Linux clippy step blows up
-        // with E0599 (Result is not an iterator).
-        std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("HOSTNAME").ok())
-            .unwrap_or_else(|| "unknown".to_string())
-    }
-}
 
 /// How much of the rolling log's end a crash sidecar reads. Its callers run in a
 /// dying process, and a per-user Windows daemon's stderr reaches this file, up to
