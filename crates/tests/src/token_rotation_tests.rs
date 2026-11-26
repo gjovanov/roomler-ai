@@ -248,9 +248,8 @@ async fn a_lost_answer_is_recovered_with_the_rotation_key() {
     }
 }
 
-/// T3: one rotation per generation. Several first calls at generation G,
-/// each with its own key, sent at once: the conditional update commits one,
-/// every other call is refused, and the row ends at G+1.
+/// T3: one rotation per generation: the conditional update commits once at
+/// G, and the row ends at G+1.
 #[tokio::test]
 async fn one_rotation_per_generation() {
     let app = spawn_on().await;
@@ -269,17 +268,21 @@ async fn one_rotation_per_generation() {
     );
     assert!(
         statuses.iter().all(|s| *s == 200 || *s == 401),
-        "the others are refused: {statuses:?}"
+        "every answer is 200 or 401: {statuses:?}"
     );
-    assert_eq!(row_generation(&agent_row(&app, &agent_id).await), 1, "G+1");
+    assert_eq!(
+        row_generation(&agent_row(&app, &agent_id).await),
+        1,
+        "the row ends at G+1"
+    );
 
     let rows = audit_rows(&app, &agent_id).await;
     let firsts = rows
         .iter()
         .filter(|r| r.get_str("decision").ok() == Some("first"))
         .count();
-    assert_eq!(firsts, 1, "{:?}", decisions(&rows));
-    assert_eq!(rows.len(), 8, "one row per decision");
+    assert_eq!(firsts, 1, "one commit at G: {:?}", decisions(&rows));
+    assert_eq!(rows.len(), 8, "one audit row per decision");
 }
 
 /// T6: `rc.agent_token_rotation` off answers 404 to a first call, with an
