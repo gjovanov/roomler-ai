@@ -84,17 +84,21 @@ async fn answered_token(resp: reqwest::Response) -> String {
     body["agent_token"].as_str().unwrap().to_string()
 }
 
-/// The `gen` claim of an agent token.
-fn token_generation(token: &str) -> u64 {
+/// The claims of an agent token.
+fn token_claims(token: &str) -> Value {
     use base64::Engine as _;
     let payload = token.split('.').nth(1).expect("a JWT payload");
-    let json: Value = serde_json::from_slice(
+    serde_json::from_slice(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
             .unwrap(),
     )
-    .unwrap();
-    json["gen"].as_u64().expect("a gen claim")
+    .unwrap()
+}
+
+/// The `gen` claim of an agent token.
+fn token_generation(token: &str) -> u64 {
+    token_claims(token)["gen"].as_u64().expect("a gen claim")
 }
 
 fn oid(id: &str) -> ObjectId {
@@ -494,4 +498,186 @@ async fn a_live_row_without_a_deleted_at_field_rotates() {
     let new = answered_token(rotate(&app, &token, &rotation_key(60)).await).await;
     assert_eq!(token_generation(&new), 1);
     assert_eq!(int(&agent_row(&app, &agent_id).await, "token_gen"), Some(1));
+}
+
+/// A rotation key that is not the standard base64 of 32 bytes is answered
+/// 400 and audited `invalid_request`, and the row is not written: text that
+/// is not base64, and the base64 of 16 bytes.
+#[tokio::test]
+async fn a_malformed_rotation_key_is_refused() {
+    use base64::Engine as _;
+    let app = spawn_on().await;
+    let seeded = app.seed_tenant("fr155badkey").await;
+    let (agent_id, token) = enroll(&app, &seeded, "m-fr155-badkey").await;
+
+    let sixteen_bytes = base64::engine::general_purpose::STANDARD.encode([7u8; 16]);
+    for key in ["not base64", sixteen_bytes.as_str()] {
+        let resp = rotate(&app, &token, key).await;
+        assert_eq!(resp.status(), 400, "{key}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "bad_request", "{body}");
+    }
+    let device = agent_row(&app, &agent_id).await;
+    assert_eq!(row_generation(&device), 0, "the row is not written");
+    assert!(!device.contains_key("token_rotation"), "{device}");
+
+    let rows = audit_rows(&app, &agent_id).await;
+    assert_eq!(
+        decisions(&rows),
+        vec![decision("refused", Some("invalid_request")); 2]
+    );
+    for row in &rows {
+        assert_eq!(int(row, "gen_from"), Some(0), "{row}");
+        assert_eq!(int(row, "gen_to"), Some(0), "{row}");
+    }
+}
+
+/// A token past its `exp` is answered 401 and audited `expired`, and the row
+/// is not written: it renews first. This one is a few seconds past its
+/// `exp`, inside the token library's leeway, so it verifies and the route's
+/// own `exp` check refuses it (further past, the token check itself refuses
+/// it, with no audit row).
+#[tokio::test]
+async fn an_expired_token_does_not_rotate() {
+    let app = spawn_on().await;
+    let seeded = app.seed_tenant("fr155expired").await;
+    let (agent_id, _) = enroll(&app, &seeded, "m-fr155-expired").await;
+    let expired = forge_agent_token(&app, &agent_id, &seeded.tenant_id, -5, Some(0));
+
+    let resp = rotate(&app, &expired, &rotation_key(70)).await;
+    assert_eq!(resp.status(), 401, "a token five seconds past its exp");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "unauthorized", "{body}");
+    assert_eq!(
+        row_generation(&agent_row(&app, &agent_id).await),
+        0,
+        "the row is not written"
+    );
+
+    let rows = audit_rows(&app, &agent_id).await;
+    assert_eq!(decisions(&rows), vec![decision("refused", Some("expired"))]);
+    assert_eq!(int(&rows[0], "gen_from"), Some(0));
+    assert_eq!(int(&rows[0], "gen_to"), Some(0));
+}
+
+/// A token of a generation the rotation does not take (neither the row's,
+/// nor the one below it when a rotation made the row's) is answered 401 and
+/// audited `generation`, and the row is not written: a token minted before
+/// the device was removed, on the row its re-enrollment revived (one below
+/// the row's, which the removal made), and a token of a generation above the
+/// row's.
+#[tokio::test]
+async fn a_token_of_another_generation_does_not_rotate() {
+    let app = spawn_on().await;
+    let seeded = app.seed_tenant("fr155othergen").await;
+    let (agent_id, before_removal) = enroll(&app, &seeded, "m-fr155-othergen").await;
+    remove(&app, &seeded, &agent_id).await;
+    let (again, _) = enroll(&app, &seeded, "m-fr155-othergen").await;
+    assert_eq!(again, agent_id, "the same row is revived");
+    assert_eq!(
+        row_generation(&agent_row(&app, &agent_id).await),
+        1,
+        "the removal's generation"
+    );
+    let above = forge_agent_token(&app, &agent_id, &seeded.tenant_id, 3600, Some(5));
+
+    for (token, key, generation) in [
+        (&before_removal, rotation_key(80), 0),
+        (&above, rotation_key(81), 5),
+    ] {
+        let resp = rotate(&app, token, &key).await;
+        assert_eq!(resp.status(), 401, "a token of generation {generation}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "unauthorized", "{body}");
+    }
+    let device = agent_row(&app, &agent_id).await;
+    assert_eq!(row_generation(&device), 1, "the row is not written");
+    assert!(!device.contains_key("token_rotation"), "{device}");
+
+    let rows = audit_rows(&app, &agent_id).await;
+    assert_eq!(
+        decisions(&rows),
+        vec![decision("refused", Some("generation")); 2]
+    );
+    assert_eq!(int(&rows[0], "gen_from"), Some(0));
+    assert_eq!(int(&rows[1], "gen_from"), Some(5));
+    for row in &rows {
+        assert_eq!(int(row, "gen_to"), Some(1), "{row}");
+    }
+}
+
+/// A first call that commits writes the new token's expiry on the row
+/// (`token_exp`, which the devices list shows): the answer's `expires_at` to
+/// the second, and the new token's own `exp` or up to a few seconds below
+/// it, since the token is minted after the commit.
+#[tokio::test]
+async fn a_rotation_writes_the_new_tokens_expiry_on_the_row() {
+    let app = spawn_on().await;
+    let seeded = app.seed_tenant("fr155exp").await;
+    let (agent_id, token) = enroll(&app, &seeded, "m-fr155-exp").await;
+    // Whatever enrollment wrote, the row starts without one.
+    app.db
+        .collection::<Document>("agents")
+        .update_one(
+            doc! { "_id": oid(&agent_id) },
+            doc! { "$unset": { "token_exp": "" } },
+        )
+        .await
+        .unwrap();
+
+    let resp = rotate(&app, &token, &rotation_key(90)).await;
+    assert_eq!(resp.status(), 200, "a first call");
+    let body: Value = resp.json().await.unwrap();
+    let expires_at = chrono::DateTime::parse_from_rfc3339(body["expires_at"].as_str().unwrap())
+        .expect("expires_at is RFC 3339")
+        .timestamp();
+    let token_exp = token_claims(body["agent_token"].as_str().unwrap())["exp"]
+        .as_i64()
+        .expect("an exp claim");
+
+    let written = agent_row(&app, &agent_id)
+        .await
+        .get_datetime("token_exp")
+        .expect("the row's token_exp")
+        .timestamp_millis()
+        / 1000;
+    assert_eq!(written, expires_at, "the answer's expires_at");
+    assert!(
+        (0..=5).contains(&(token_exp - written)),
+        "the new token's exp {token_exp}, the row's {written}"
+    );
+    assert_eq!(
+        decisions(&audit_rows(&app, &agent_id).await),
+        vec![decision("first", None)]
+    );
+}
+
+/// A token whose row is gone (a reaped ephemeral device's row is deleted
+/// outright) is answered 401 and audited `row_gone`, with no `gen_to`: there
+/// was no row to read.
+#[tokio::test]
+async fn a_token_whose_row_is_gone_does_not_rotate() {
+    let app = spawn_on().await;
+    let seeded = app.seed_tenant("fr155gone").await;
+    let (agent_id, token) = enroll(&app, &seeded, "m-fr155-gone").await;
+    let deleted = app
+        .db
+        .collection::<Document>("agents")
+        .delete_one(doc! { "_id": oid(&agent_id) })
+        .await
+        .unwrap();
+    assert_eq!(deleted.deleted_count, 1, "the row is deleted");
+
+    let resp = rotate(&app, &token, &rotation_key(100)).await;
+    assert_eq!(resp.status(), 401, "no row");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "unauthorized", "{body}");
+
+    let rows = audit_rows(&app, &agent_id).await;
+    assert_eq!(
+        decisions(&rows),
+        vec![decision("refused", Some("row_gone"))]
+    );
+    assert_eq!(int(&rows[0], "gen_from"), Some(0));
+    assert!(!rows[0].contains_key("gen_to"), "{}", rows[0]);
 }
