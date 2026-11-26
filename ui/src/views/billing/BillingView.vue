@@ -48,6 +48,9 @@
           <div class="text-body-2 text-medium-emphasis mt-1" data-testid="billing-seats">
             {{ seatsLine }}
           </div>
+          <div v-if="planManaged" class="text-body-2 text-medium-emphasis mt-1" data-testid="billing-managed">
+            {{ MANAGED_NOTICE }}
+          </div>
           <div
             v-if="summary?.current_period_end"
             class="text-body-2 text-medium-emphasis mt-1"
@@ -178,6 +181,19 @@
           >
             Current Plan
           </v-btn>
+          <!-- #4433 — never a checkout that lowers a plan Roomler set. -->
+          <v-btn
+            v-else-if="plan.id !== 'free' && !subscribed && lowersPlan(plan)"
+            color="primary"
+            variant="tonal"
+            block
+            size="large"
+            class="mt-4"
+            disabled
+            :data-testid="`included-${plan.id}`"
+          >
+            Included in your plan
+          </v-btn>
           <v-btn
             v-else-if="plan.id !== 'free' && !subscribed"
             color="primary"
@@ -290,10 +306,19 @@ interface BillingSummary {
   subscribed: boolean
   /** The org has a Stripe customer: "Manage Subscription" opens its portal. */
   has_billing_account: boolean
+  /** #4433 — the plan was set by Roomler, not through billing (above Free, no
+   * live subscription). Absent from an older server, which reads as false. */
+  plan_managed?: boolean
 }
 
 const UNLIMITED = 4294967295
 const CURRENCY_KEY = 'roomler.billing.currency'
+/** #4433 — the plans in order (the server's `Plan::rank`). Enterprise is never
+ * on sale here, but an org can hold it. */
+const PLAN_RANK: Record<string, number> = { free: 0, pro: 1, business: 2, enterprise: 3 }
+const MANAGED_NOTICE = 'Your plan was set by Roomler, not through billing. To change it, contact Roomler.'
+const MANAGED_REFUSAL =
+  'Your plan was set by Roomler, not through billing, and this plan would lower it. To change your plan, contact Roomler.'
 
 const plans = ref<PlanInfo[]>([])
 const summary = ref<BillingSummary | null>(null)
@@ -439,6 +464,24 @@ function isCurrent(plan: PlanInfo): boolean {
   return (summary.value?.interval || 'month') === shownInterval(plan)
 }
 
+/** #4433 — the org's plan was set by Roomler, not through billing. */
+const planManaged = computed(() => summary.value?.plan_managed === true)
+
+/** #4433 — buying `plan` would lower a plan set outside billing: a paid
+ * checkout writes the plan it sold. The server refuses it (409
+ * `plan_managed`), and the page does not offer it. */
+function lowersPlan(plan: PlanInfo): boolean {
+  if (!planManaged.value) return false
+  return (PLAN_RANK[plan.id] ?? 0) < (PLAN_RANK[currentPlan.value] ?? 0)
+}
+
+/** The code a 409 carries in `error` (`plan_managed`, `conflict`), if any:
+ * the page decides on the code, never on the words. */
+function conflictCode(e: unknown): string | null {
+  const err = e as { status?: unknown; data?: { error?: unknown } } | null
+  return err?.status === 409 && typeof err.data?.error === 'string' ? err.data.error : null
+}
+
 function fail(e: unknown, what: string) {
   errorMessage.value = `${what}: ${(e as Error)?.message || String(e)}`
   console.error(what, e)
@@ -482,7 +525,14 @@ async function checkout(planId: string) {
     })
     if (result.url) window.location.href = result.url
   } catch (e) {
-    fail(e, 'Checkout failed')
+    if (conflictCode(e) === 'plan_managed') {
+      // #4433 — the page was older than the org's plan: say why, and read the
+      // org again so the card says who sets the plan and the offer goes.
+      errorMessage.value = MANAGED_REFUSAL
+      await fetchSummary()
+    } else {
+      fail(e, 'Checkout failed')
+    }
   } finally {
     busy.value = null
   }

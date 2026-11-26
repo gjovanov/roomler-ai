@@ -1841,6 +1841,216 @@ mod fr115 {
         let problem = Gate::Bit("MANAGE_TENANT").problem(status, &body.to_string());
         assert!(problem.is_none(), "{problem:?}");
     }
+
+    // -----------------------------------------------------------------------
+    // #4433 — a checkout never lowers a plan set outside billing
+    // -----------------------------------------------------------------------
+
+    /// #4433 — three orgs held `enterprise`, granted by hand with no
+    /// subscription, and their billing page offered "Upgrade to Pro". Paying
+    /// writes the plan the session sold (`checkout.session.completed`), so an
+    /// Enterprise org that bought Pro would have ended up on Pro. A checkout
+    /// that ranks below a plan the org holds without a live subscription is
+    /// refused 409 `plan_managed`, before anything reaches Stripe or the
+    /// org's billing.
+    mod granted_plan {
+        use super::*;
+
+        const PLAN_MANAGED: &str = "plan_managed";
+
+        /// The org on `plan`, written straight into its row as the operator
+        /// grants one by hand: no subscription, its billing left as it was.
+        async fn grant_plan(app: &TestApp, tenant_id: &str, plan: &str) {
+            let tid = ObjectId::parse_str(tenant_id).unwrap();
+            app.db
+                .collection::<bson::Document>("tenants")
+                .update_one(doc! { "_id": tid }, doc! { "$set": { "plan": plan } })
+                .await
+                .unwrap();
+        }
+
+        /// A checkout's status and body, the body as JSON when it is JSON.
+        async fn answer(resp: reqwest::Response) -> (u16, String, Value) {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            let json = serde_json::from_str(&text).unwrap_or(Value::Null);
+            (status, text, json)
+        }
+
+        /// The org's plan and billing as stored, read back after a refusal.
+        async fn plan_and_billing(app: &TestApp, tenant_id: &str) -> (String, Option<Bson>) {
+            let row = billing_of(app, tenant_id).await;
+            (
+                row.get_str("plan").unwrap().to_string(),
+                row.get("billing").cloned(),
+            )
+        }
+
+        /// (a) An Enterprise org with no billing: Pro and Business are both
+        /// below it. Each is refused with the code the page reads, nothing
+        /// reaches Stripe (not a customer, not a session, not even the
+        /// Price's currencies), and the org's billing is still null.
+        #[tokio::test]
+        async fn an_enterprise_org_without_billing_is_refused_a_lower_checkout() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-enterprise").await;
+            grant_plan(&app, &t.tenant_id, "enterprise").await;
+
+            for plan in ["pro", "business"] {
+                let (status, text, body) =
+                    answer(checkout(&app, &t, serde_json::json!({ "plan": plan })).await).await;
+                assert_eq!(status, 409, "{plan}: {text}");
+                assert_eq!(body["error"], PLAN_MANAGED, "{plan}: {text}");
+                assert!(
+                    body["message"].as_str().is_some_and(|m| !m.is_empty()),
+                    "{plan}: the refusal says why in words: {text}"
+                );
+            }
+            assert!(
+                fake.calls().is_empty(),
+                "a refused checkout reached Stripe: {:?}",
+                fake.calls()
+            );
+            let (plan, billing) = plan_and_billing(&app, &t.tenant_id).await;
+            assert_eq!(plan, "enterprise");
+            assert!(
+                matches!(billing, None | Some(Bson::Null)),
+                "a refused checkout wrote the org's billing: {billing:?}"
+            );
+        }
+
+        /// (b) A hand-granted Business org: Pro would lower it and is
+        /// refused; Business itself is its own plan and checks out (the org
+        /// starts paying for what it has).
+        #[tokio::test]
+        async fn a_granted_business_org_is_refused_pro_and_may_check_out_business() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-business").await;
+            grant_plan(&app, &t.tenant_id, "business").await;
+
+            let (status, text, body) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "pro" })).await).await;
+            assert_eq!(status, 409, "{text}");
+            assert_eq!(body["error"], PLAN_MANAGED, "{text}");
+            assert!(
+                fake.calls().is_empty(),
+                "a refused checkout reached Stripe: {:?}",
+                fake.calls()
+            );
+            let (plan, billing) = plan_and_billing(&app, &t.tenant_id).await;
+            assert_eq!(plan, "business");
+            assert!(matches!(billing, None | Some(Bson::Null)), "{billing:?}");
+
+            let (status, text, _) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "business" })).await).await;
+            assert_eq!(status, 200, "the org's own plan checks out: {text}");
+            let calls = fake.calls();
+            let session = calls
+                .iter()
+                .find(|c| c.path == "/v1/checkout/sessions")
+                .expect("no checkout session was created");
+            assert_eq!(session.field("metadata[plan]"), Some("business"));
+        }
+
+        /// (c) A hand-granted Pro org may buy Business: a higher plan is
+        /// never refused.
+        #[tokio::test]
+        async fn a_granted_pro_org_may_check_out_business() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-pro").await;
+            grant_plan(&app, &t.tenant_id, "pro").await;
+
+            let (status, text, _) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "business" })).await).await;
+            assert_eq!(status, 200, "{text}");
+            assert!(
+                fake.calls()
+                    .iter()
+                    .any(|c| c.path == "/v1/checkout/sessions"),
+                "no checkout session was created: {:?}",
+                fake.calls()
+            );
+        }
+
+        /// (d) A Free org buys Pro exactly as before.
+        #[tokio::test]
+        async fn a_free_org_still_checks_out_pro() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-free").await;
+
+            let (status, text, _) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "pro" })).await).await;
+            assert_eq!(status, 200, "{text}");
+            assert!(
+                fake.calls()
+                    .iter()
+                    .any(|c| c.path == "/v1/checkout/sessions"),
+                "no checkout session was created: {:?}",
+                fake.calls()
+            );
+        }
+
+        /// (e) A subscribed org is told it already has a subscription, as
+        /// before, even for a plan below its own: its plan changes through
+        /// change-plan, and the plan was bought, not granted.
+        #[tokio::test]
+        async fn a_subscribed_org_is_still_told_it_already_has_a_subscription() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-subscribed").await;
+            subscribe(&app, &t.tenant_id, "business").await;
+
+            let (status, text, body) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "pro" })).await).await;
+            assert_eq!(status, 409, "{text}");
+            assert_eq!(body["error"], "conflict", "{text}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("already has a subscription")),
+                "{text}"
+            );
+            assert!(
+                fake.calls()
+                    .iter()
+                    .all(|c| c.path != "/v1/checkout/sessions"),
+                "no second subscription may be started"
+            );
+        }
+
+        /// (f) The summary says whether the plan was set outside billing:
+        /// true for the Enterprise org without a subscription, false on Free
+        /// and false once a subscription bills the plan.
+        #[tokio::test]
+        async fn the_summary_says_whether_the_plan_was_set_outside_billing() {
+            let base = fake_stripe(Fake::default()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-summary").await;
+
+            let (text, s) = summary_of(&app, &t).await;
+            assert_eq!(s["plan"], "free", "{text}");
+            assert_eq!(s["plan_managed"], false, "Free: {text}");
+
+            grant_plan(&app, &t.tenant_id, "enterprise").await;
+            let (text, s) = summary_of(&app, &t).await;
+            assert_eq!(s["plan"], "enterprise", "{text}");
+            assert_eq!(s["plan_managed"], true, "Enterprise by hand: {text}");
+
+            subscribe(&app, &t.tenant_id, "pro").await;
+            let (text, s) = summary_of(&app, &t).await;
+            assert_eq!(s["subscribed"], true, "{text}");
+            assert_eq!(s["plan_managed"], false, "a subscribed Pro org: {text}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

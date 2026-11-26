@@ -84,6 +84,10 @@ pub struct BillingSummary {
     /// The fact only; the customer and subscription ids never leave the
     /// server.
     pub has_billing_account: bool,
+    /// #4433 — the plan was set by Roomler, not through billing: above Free
+    /// with no live subscription ([`plan_managed`]). The page offers no
+    /// checkout below it, and says how the plan is changed.
+    pub plan_managed: bool,
 }
 
 /// FR-115 — one org's seat sync.
@@ -148,6 +152,17 @@ pub enum StripeError {
     /// FR-115 — a plan change or seat sync needs a live subscription.
     #[error("This organization has no active subscription")]
     NotSubscribed,
+    /// #4433 — the org holds a plan above the one asked for, and no
+    /// subscription bills it: the plan was set outside billing (granted by
+    /// hand, as Enterprise is). A paid checkout writes the plan it sold, so
+    /// it would lower the org's plan; refused before Stripe or the org's
+    /// billing is touched ([`checkout_lowers_plan`]). The route answers 409
+    /// with the code `plan_managed`.
+    #[error(
+        "This organization's plan was set by Roomler, not through billing, and this \
+         checkout would lower it. To change the plan, contact Roomler."
+    )]
+    PlanManaged,
     #[error("Invalid billing interval: {0} (month or year)")]
     InvalidInterval(String),
     #[error("Invalid currency: {0} (usd or eur)")]
@@ -287,7 +302,8 @@ impl StripeService {
     /// `quantity = seats`. Refused when the org already has a live
     /// subscription: a second one would bill it twice (the "Switch to
     /// Business" button did exactly that before FR-115) — a plan change goes
-    /// through [`Self::change_plan`].
+    /// through [`Self::change_plan`]. Refused too when it would lower a plan
+    /// set outside billing (#4433, [`checkout_lowers_plan`]).
     pub async fn create_checkout_session(
         &self,
         db: &mongodb::Database,
@@ -317,6 +333,20 @@ impl StripeService {
             .ok_or(StripeError::TenantNotFound)?;
         if has_live_subscription(&tenant) {
             return Err(StripeError::AlreadySubscribed);
+        }
+        // #4433 — never a checkout that lowers a plan set outside billing: an
+        // Enterprise org granted by hand that paid for Pro would end up on
+        // Pro. Decided with the subscription check, before the Price is read
+        // and before a customer is created or recorded, so a refused checkout
+        // leaves no Stripe call and no write. An equal or higher plan passes.
+        let requested =
+            Plan::from_id(p.plan).ok_or_else(|| StripeError::InvalidPlan(p.plan.to_string()))?;
+        if checkout_lowers_plan(&tenant, &requested) {
+            info!(
+                tenant_id = %tenant_id, plan = tenant.plan.id(), requested = p.plan,
+                "checkout refused: it would lower a plan set outside billing"
+            );
+            return Err(StripeError::PlanManaged);
         }
 
         // FR-115 — the Price must carry the currency asked for. The live
@@ -616,6 +646,7 @@ impl StripeService {
             cancel_at_period_end: b.is_some_and(|b| b.cancel_at_period_end),
             subscribed: has_live_subscription(&tenant),
             has_billing_account: has_billing_account(&tenant),
+            plan_managed: plan_managed(&tenant),
         })
     }
 
@@ -1575,6 +1606,21 @@ pub fn has_billing_account(t: &Tenant) -> bool {
         .is_some_and(|c| !c.is_empty())
 }
 
+/// #4433 — the org's plan was set outside billing: above Free, with no live
+/// subscription to account for it (granted by hand, as Enterprise is). A
+/// customer left by an abandoned checkout is not a subscription.
+pub fn plan_managed(t: &Tenant) -> bool {
+    t.plan.rank() > Plan::Free.rank() && !has_live_subscription(t)
+}
+
+/// #4433 — a checkout for `requested` would lower a plan set outside
+/// billing: it ranks strictly below it ([`Plan::rank`]). A paid checkout
+/// writes the plan it sold (`checkout.session.completed`), so the org would
+/// drop to it. The org's own plan or a higher one would not lower it.
+pub fn checkout_lowers_plan(t: &Tenant, requested: &Plan) -> bool {
+    plan_managed(t) && requested.rank() < t.plan.rank()
+}
+
 /// A subscription's first (and, for us, only) item: its id and quantity.
 fn first_item(sub: &Value) -> Option<(String, u32)> {
     let item = sub["items"]["data"].as_array()?.first()?;
@@ -1796,6 +1842,51 @@ mod tests {
         assert!(!has_billing_account(&t), "billing without a customer");
         t.billing = None;
         assert!(!has_billing_account(&t), "no billing at all");
+    }
+
+    /// #4433 — a plan above Free with no live subscription was set outside
+    /// billing. A checkout below it would lower it; the org's own plan or a
+    /// higher one would not; a Free org and a subscribed org are never
+    /// "managed" (the subscribed one is refused as `AlreadySubscribed`).
+    #[test]
+    fn a_checkout_never_lowers_a_plan_set_outside_billing() {
+        let mut granted = tenant_with(SubscriptionStatus::Active, None);
+        granted.billing = None;
+        granted.plan = Plan::Enterprise;
+        assert!(plan_managed(&granted));
+        assert!(checkout_lowers_plan(&granted, &Plan::Pro));
+        assert!(checkout_lowers_plan(&granted, &Plan::Business));
+        assert!(!checkout_lowers_plan(&granted, &Plan::Enterprise));
+
+        granted.plan = Plan::Business;
+        assert!(checkout_lowers_plan(&granted, &Plan::Pro));
+        assert!(
+            !checkout_lowers_plan(&granted, &Plan::Business),
+            "its own plan"
+        );
+
+        granted.plan = Plan::Pro;
+        assert!(
+            !checkout_lowers_plan(&granted, &Plan::Business),
+            "a higher plan"
+        );
+
+        // A customer left by an abandoned checkout is not a subscription.
+        let mut abandoned = tenant_with(SubscriptionStatus::Active, None);
+        abandoned.plan = Plan::Business;
+        assert!(plan_managed(&abandoned));
+        assert!(checkout_lowers_plan(&abandoned, &Plan::Pro));
+
+        let mut free = tenant_with(SubscriptionStatus::Active, None);
+        free.billing = None;
+        free.plan = Plan::Free;
+        assert!(!plan_managed(&free));
+        assert!(!checkout_lowers_plan(&free, &Plan::Pro));
+
+        let mut subscribed = tenant_with(SubscriptionStatus::Active, Some("sub_1"));
+        subscribed.plan = Plan::Business;
+        assert!(!plan_managed(&subscribed));
+        assert!(!checkout_lowers_plan(&subscribed, &Plan::Pro));
     }
 
     #[test]
