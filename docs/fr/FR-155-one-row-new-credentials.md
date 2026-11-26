@@ -80,12 +80,14 @@ Beside `self_renew` (`crates/modules/fleet/src/agent.rs:841`, route `crates/modu
     `sha256(rotation_key)` equals that rotation's: a replay of an answer that was lost.
 
   Nothing else is admitted.
-- **The commit** is one conditional update. Filter: `{_id, tenant_id, token_gen: G, deleted_at: {$type: "null"},
-  status: {$ne: "quarantined"}}` (`$type`, never `{deleted_at: null}`), and `token_rotation.at` absent or more than
-  an hour old. Update: `{$inc: {token_gen: 1}, $set: {token_rotation: {gen: G+1, key_sha256, at}, token_exp}}`. One
-  rotation per generation: a request the update does not match is read again against the replay rule. One that
-  fails it is answered 429 when the row read again meets every condition of the filter but the hour, and is refused
-  otherwise.
+- **The commit** is one conditional update. Filter: `{_id, tenant_id, token_gen: G, deleted_at: null,
+  status: {$ne: "quarantined"}}`, and `token_rotation.at` absent or more than an hour old. `deleted_at: null` is the
+  repository's live predicate, which matches a live row with or without the field (`.claude/rules/security.md`);
+  `$type` is for partial unique indexes. At G = 0 the filter's generation is `{$in: [0, null]}`: a row enrolled
+  before FR-103 has no `token_gen` field, and reads as 0 (`crates/remote_control/src/models.rs:2384-2385`). Update:
+  `{$inc: {token_gen: 1}, $set: {token_rotation: {gen: G+1, key_sha256, at}, token_exp}}`. One rotation per
+  generation: a request the update does not match is read again against the replay rule. One that fails it is
+  answered 429 when the row read again meets every condition of the filter but the hour, and is refused otherwise.
 - **A device rotates at most once an hour.** A first call while the row's last rotation is less than an hour old is
   answered 429, and the row stays as it is. The ceiling is the filter's last condition, so it needs no state of its
   own. A replay is exempt.
