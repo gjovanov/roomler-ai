@@ -555,7 +555,7 @@ pub async fn dispatch(
                     audit,
                     ExecDenyReason::Unsupported,
                     format!(
-                        "device runs agent {} which predates Fleet RPC — update it to use \
+                        "device runs roomlerd {} which predates Fleet RPC — update it to use \
                          the device console",
                         agent.reported_version().unwrap_or("(unknown version)")
                     ),
@@ -724,8 +724,8 @@ fn deny_message(reason: ExecDenyReason, os: OsKind) -> String {
         // FR-97 P5a — off Windows the daemon itself drops to that person, and
         // only a build that advertises `console-user` does.
         ExecDenyReason::RunAsUnavailable => {
-            "this device's policy runs commands as the person at its screen, and the agent it \
-             runs cannot: update the agent"
+            "this device's policy runs commands as the person at its screen, and the daemon it \
+             runs cannot: update roomlerd"
                 .to_string()
         }
     }
@@ -983,7 +983,7 @@ pub async fn set_policy(
         && !agent.capabilities.has_rpc(RpcCap::ConsoleUser)
     {
         return Err(ApiError::BadRequest(
-            "this device's agent cannot run commands as the person at its screen: update it, \
+            "this device's daemon cannot run commands as the person at its screen: update it, \
              or run commands as root"
                 .into(),
         ));
@@ -1291,5 +1291,41 @@ mod tests {
             assert!(m.contains("person at its screen"), "{m}");
             assert!(!m.contains("anchor"), "{m}");
         }
+    }
+
+    /// FR-133 P2e: every exec refusal reaches a person (the device console
+    /// and `roomler exec` print it), on every OS, so none calls the daemon an
+    /// "agent". The one that says what to update names roomlerd.
+    #[test]
+    fn exec_refusals_say_device_or_roomlerd_never_agent() {
+        for r in [
+            ExecDenyReason::OrgDisabled,
+            ExecDenyReason::NoPermission,
+            ExecDenyReason::DeviceDisabled,
+            ExecDenyReason::CallerNotAllowed,
+            ExecDenyReason::ShellNotAllowed,
+            ExecDenyReason::OriginNotAllowed,
+            ExecDenyReason::Unsupported,
+            ExecDenyReason::Offline,
+            ExecDenyReason::ConsentDenied,
+            ExecDenyReason::RateLimited,
+            ExecDenyReason::AgentDisabled,
+            ExecDenyReason::SystemRequired,
+            ExecDenyReason::ClaimRefused,
+            ExecDenyReason::RunAsUnavailable,
+        ] {
+            for os in [OsKind::Windows, OsKind::Linux, OsKind::Macos] {
+                let m = deny_message(r, os);
+                assert!(
+                    !m.to_ascii_lowercase().contains("agent"),
+                    "{r:?} on {os:?} says agent: {m}"
+                );
+            }
+        }
+        assert_eq!(
+            deny_message(ExecDenyReason::RunAsUnavailable, OsKind::Linux),
+            "this device's policy runs commands as the person at its screen, and the daemon it \
+             runs cannot: update roomlerd"
+        );
     }
 }

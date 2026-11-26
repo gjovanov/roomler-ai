@@ -47,7 +47,7 @@ pub async fn remove_agent_device(
 ) -> DaoResult<Option<ReleasedLease>> {
     let aid = agent
         .id
-        .ok_or_else(|| DaoError::Validation("agent missing _id".into()))?;
+        .ok_or_else(|| DaoError::Validation("device missing _id".into()))?;
 
     // Holders first (remote: sessions; network: the overlay lease). A holder
     // that fails stops the cascade — deleting the row while a lease is still
