@@ -1094,7 +1094,7 @@ live rows only, and a tombstone gets `NotFound`, the answer an unknown id gets:
 | Lookup | Finds a tombstone | For |
 |---|---|---|
 | `BaseDao::find_by_id_in_tenant`, and each DAO's `find_live_in_tenant` | no: `NotFound`, like a bogus id | every GET of the thing itself, every write, every session start |
-| `BaseDao::find_any_by_id_in_tenant`, only through a DAO's named `find_any_in_tenant` | yes | a reader whose job is the tombstone, with the reason on the DAO method |
+| `BaseDao::find_any_by_id_in_tenant`, only through a DAO's named `find_any_in_tenant` (and `AgentDao::find_any_in_tenant_on_the_primary`, the token rotation's, which reads the primary) | yes | a reader whose job is the tombstone, with the reason on the DAO method |
 
 - **The live predicate is `deleted_at: null`**, which matches null and absent
   alike and is the one every live listing uses. `{"$type": "null"}` is the
@@ -1150,7 +1150,7 @@ Readers that keep the tombstone, and why:
 
 | Reader | Why it must see one |
 |---|---|
-| `auth_agent`, the agent socket upgrade, `/derp`, `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
+| `auth_agent`, the agent socket upgrade, `/derp`, the token rotation (`POST /api/agent/self/rotate`, FR-155), `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
 | `recording-activity`, `transfer-activity`, `privacy-activity`, `…/logs`, `…/crash` (both read under `MANAGE_AGENTS`, [below](#device-diagnostics-manage_agents-and-a-second-scrub)), the External access decision log and people list | an audit view of a removed device. Removing a device must not be the way to hide what it did |
 | External access's re-read of its gates as a session opens (`extauth::org_gates_open`) | a removed device is its removal's to end (`removal::kick`), not this read's, and a tombstone answering here keeps a removal that raced the open from reading as a failed read. It reached through `base` until #3327, and reads through `AgentDao::find_any_in_tenant` now |
 | `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone, and a device's row comes back with a new device's settings, everything else it was allowed staying with the removal ([#3627](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)). A tunnel client's tombstone revives only through a holder of `MANAGE_AGENTS` ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)) |
