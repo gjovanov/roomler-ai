@@ -1632,7 +1632,7 @@ carry yet and loses nothing. So SCTP's congestion window grows past what the lin
 carries, the bytes wait in the carrier, and the queue of unsent chunks keeps running
 empty: every sample reads application-limited while seconds of bytes stand on the link.
 The shaped link's TCP cells showed it (`shaped_link::tcp_shape`,
-`agents/roomlerd/src/media_delivery.rs:5800`), and so did the lab: on TURN over TCP 443
+`agents/roomlerd/src/media_delivery.rs:5918`), and so did the lab: on TURN over TCP 443
 at 2 Mbit/s the viewer's round trip ended at 1,262 ms, against 154 ms on TURN over UDP at
 the same rate.
 
@@ -1779,7 +1779,7 @@ load, a 2 s still screen and the drain.
 
 **The mesh relay's writer** (FR-148 P4b-3, D55). The relay writer's cells put a model of
 the agent's /derp writer between SCTP and the shaped link (`RelayWriter`,
-`agents/roomlerd/src/media_delivery.rs:11739`). Its mux queues each frame without waiting,
+`agents/roomlerd/src/media_delivery.rs:11961`). Its mux queues each frame without waiting,
 in a channel of 512 frames that drops a frame when full
 (`crates/tunnel-core/src/transport/derp.rs:55`, `:290-318`). Its owner task drops a frame
 that waited longer than the age bound and otherwise waits for the write
@@ -1791,7 +1791,7 @@ handed, so the socket and the 200 ms queue are one first hop of 262,992 bytes
 (`Shaper::hop`) in front of a queue that drops nothing: the writer is the path's only
 loss. A packet over the mesh's MTU of 1,280 bytes, as a full one's 1,293 are, leaves as two
 IPv4 fragments, and so as two frames (D20). The age check is per frame, and the viewer's
-end passes a pair on only whole (`RelayReader`, `:11963`). The load is the deep 2 Mbit/s
+end passes a pair on only whole (`RelayReader`, `agents/roomlerd/src/media_delivery.rs:12203`). The load is the deep 2 Mbit/s
 cell's, frames at 1.5 times the link under the pump's skip over 256 KiB, for 10 s. Then
 the screen goes still, one 200-byte message a second for 2 s, so that a later SACK
 reports a loss among the load's last packets. Without it only a T3 found one: in one of
@@ -1888,11 +1888,11 @@ At a session's open the encoder takes 0.65 to 2.8 s to start, and the path carri
 of the session's media in that time. The train spends it reading the path: it writes
 bytes on a stream of its own, lets SCTP's slow start step them up, stops at the first
 push-back, and reads the rate from SCTP's acknowledgements. Its rules are a pure state
-machine, `media_train::Train` (`agents/roomlerd/src/media_train.rs:376`). It does no
+machine, `media_train::Train` (`agents/roomlerd/src/media_train.rs:492`). It does no
 I/O, starts no task, reads no clock or environment variable, and logs nothing. Each
-call of `Train::step` (`:502`) takes the time, a reading of the association's
+call of `Train::step` (`:644`) takes the time, a reading of the association's
 acknowledgement clock (the delivery samples' clock, above) and of its gauges, and
-whether the first frame is ready, and answers `Write(n)` or `Stopped(reading)` (`:276`).
+whether the first frame is ready, and answers `Write(n)` or `Stopped(reading)` (`:312`).
 Every byte it asks for is a byte SCTP sends, after the stop too, so what the train costs
 is what it wrote, and the reading says how much.
 
@@ -1940,7 +1940,7 @@ flowchart TD
   D -- no --> E{"the round ended?"}
   E -- yes --> F{"four samples or more,<br/>and its least delay stood<br/>above the least seen?"}
   F -- yes --> X2["stop: delay"]
-  F -- no --> G{"held at the cap, by no window<br/>and no write budget,<br/>flat for a second round?"}
+  F -- no --> G{"held at a confirmed cap, by no window<br/>and no write budget,<br/>flat for a second round?"}
   G -- yes --> X3["stop: plateau"]
   G -- no --> E2
   E -- no --> E2{"a run of four samples in a row,<br/>every one standing, over half<br/>a round trip and 50 ms?"}
@@ -1954,40 +1954,44 @@ flowchart TD
 
 | Stop | When | The low edge is |
 |---|---|---|
-| `delay` | a queue stood: a delay 10 ms and one message's serialisation at the estimated rate above the least seen (`STANDING`, `agents/roomlerd/src/media_train.rs:37`; `standing`, `:780`). Either a round of four samples or more ended with its least sample standing (`ROUND_SAMPLES`, `:73`; `close_round`, `:822`), or four samples or more in a row stood, over half the least round trip and 50 ms (`EARLY_SPAN`, `:74`; `run_stands`, `:718`) | the link's rate: push-back |
-| `plateau` | two rounds held at the in-flight cap, and by neither of SCTP's windows nor the write budget, each delivered less than 10 % more than the round before (`PLATEAU_ROUNDS`, `:103`; `close_round`, `:822`) | the link's rate: push-back |
-| `loss` | a fast retransmission or a T3-rtx expiry after the first step (`:556`) | the link's rate: push-back |
-| `budget` | the next message would pass 512 KiB (`BUDGET`, `:27`); or on a slow link the write budget is spent, and all but a message of what was written came back without a judgment (`:619`) | a floor |
-| `deadline` | 2.5 s less 25 ms, or less two step intervals where steps come further apart (`DEADLINE`, `:30`; `DEADLINE_LEAD`, `:87`) | a floor |
+| `delay` | a queue stood: a delay 10 ms and one message's serialisation at the estimated rate above the least seen (`STANDING`, `agents/roomlerd/src/media_train.rs:37`; `standing`, `:1076`). Either a round of four samples or more ended with its least sample standing (`ROUND_SAMPLES`, `:75`; `close_round`, `:1128`), or four samples or more in a row stood, over half the least round trip and 50 ms (`EARLY_SPAN`, `:76`; `run_stands`, `:987`) | the link's rate: push-back |
+| `plateau` | two rounds held at the in-flight cap once later samples confirmed it (below), and by neither of SCTP's windows nor the write budget, each delivered less than 10 % more than the round before (`PLATEAU_ROUNDS`, `:136`; `close_round`, `:1128`) | the link's rate: push-back |
+| `loss` | a fast retransmission or a T3-rtx expiry after the first step (`:709`) | the link's rate: push-back |
+| `budget` | the next message would pass 512 KiB (`BUDGET`, `:27`); or on a slow link the write budget is spent, and all but a message of what was written came back without a judgment (`:772`) | a floor |
+| `deadline` | 2.5 s less 25 ms, or less two step intervals where steps come further apart (`DEADLINE`, `:30`; `DEADLINE_LEAD`, `:120`) | a floor |
 | `ready` | the first frame is ready, and the session needs the path | a floor |
-| `stall` | bytes in flight and nothing acknowledged for twice a delayed acknowledgement (200 ms) and the least round trip (`:588`) | a floor |
+| `stall` | bytes in flight and nothing acknowledged for twice a delayed acknowledgement (200 ms) and the least round trip (`:741`) | a floor |
 
 **What it writes.** The first step writes the congestion window and one message more,
-within the budget (`:515`). SCTP sends the window at once, and the extra message is
+within the budget (`:657`). SCTP sends the window at once, and the extra message is
 waiting when the first SACK comes, because the vendored SCTP grows its window only
 while bytes wait
 (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1458`). Every
 later step writes enough that bytes keep waiting until the next step: twice the most one
-step saw acknowledged, and a message (`agents/roomlerd/src/media_train.rs:606`). Three
+step saw acknowledged, and a message (`agents/roomlerd/src/media_train.rs:759`). Three
 limits hold it back. Until the first round ends, what is in flight and waiting stays
-within the first window (`:596`), so what that window acknowledges releases as much
+within the first window (`:749`), so what that window acknowledges releases as much
 again and not twice as much. Once a sample has sat 10 ms above the least (`QUEUED`,
-`:43`; `sample`, `:638`), the bottleneck has queued, and an in-flight cap applies (`cap`,
-`:808`): the estimated rate's pipe and a queue of a third of the least round trip (of
+`:45`; `judge`, `:818`), the bottleneck may have queued, and an in-flight cap applies
+(`cap`, `:1109`), on trial until what was sent after it confirms it (the cap
+on trial, below): the estimated rate's pipe and a queue of a third of the least round trip (of
 50 ms at least), never less than the best round's pipe and a message, nor three
-messages, and rounded to the nearest whole message. The estimate (`:755`) is the
+messages, and rounded to the nearest whole message. The estimate (`:1043`) is the
 highest of three: the best whole round's delivery, the rate over the newest span of at
-least 10 ms and four SACKs (`disperse`, `:657`), and the first sample's lead over the
-least, read as one packet's serialisation (`pair`, `:761`).
+least 10 ms and four SACKs (`disperse`, `:900`), and the first sample's lead over the
+least, read as one packet's serialisation (`pair`, `:1055`).
 
-On a slow link, one where that lead is 10 ms or more (`PAIR_LEAD`, `:53`), about
-1 Mbit/s and slower, a write budget applies from the same moment (`write_budget`,
-`:748`): the train writes no more than what had been acknowledged when the bottleneck
-first queued and what the estimate carries in 700 ms (`WRITE_SPAN`, `:83`). A round in
-which the budget held the writer back is spent, and a spent round is never read as a
-plateau. Once all but a message of what was written has come back without a judgment,
-the train stops on `budget` (`:619`). At 0.4 Mbit/s and 250 ms that is about 8 KB and
-34 KB, so the train writes inside P-f's 64 KB for an estimate up to 1.6 times the
+On every link a write budget applies from the same moment (`write_budget`, `:1034`): the
+train writes no more than what had been acknowledged when the cap first applied (`:697`)
+and what the estimate carries in 700 ms (`WRITE_SPAN`, `:116`). A round in which the
+budget held the writer back is spent, and a spent round is never read as a plateau. Once
+all but a message of what was written has come back without a judgment, the train stops on
+`budget` (`:779`). Where the budget counts from is set once and never moves: the budget
+holds whenever there is an estimate, on trial, confirmed or after a lift, so P-f's bound is
+one sum however many trials come and go (the cap on trial, below). At 0.4 Mbit/s the cap
+first applies with 5 to 6 KB acknowledged on path I and at 20 ms on path C, and 18 to
+19 KB at 80 and 250 ms on path C, and the link's rate carries 35 KB in 700 ms, so the
+budget holds the train inside P-f's 64 KB for an estimate up to 1.66 and 1.28 times the
 link's rate, however late its judgment comes, and the packets it leaves in flight carry
 the run of samples that judges the queue.
 
@@ -2030,9 +2034,9 @@ flowchart TD
 | Turning it off, and a cap that rises or goes, wakes the write loop | `PaceSwitch::set`, `steer`, `pacer.rs:90`, `:102` | what it held leaves at once, as the windows allow |
 
 The train's writer holds the switch while the train runs. `Pacing::on` turns it on
-(`agents/roomlerd/src/media_train.rs:308`); `Pacing::follow` steers it after every step to
-what `Train::pace` answers (`:314`, `:478`) and turns it off at the stop; and dropping a
-`Pacing` turns it off too (`:322`), so an error that ends the writer leaves no pacing
+(`agents/roomlerd/src/media_train.rs:344`); `Pacing::follow` steers it after every step to
+what `Train::pace` answers (`:350`, `:615`) and turns it off at the stop; and dropping a
+`Pacing` turns it off too (`:358`), so an error that ends the writer leaves no pacing
 behind. `Train::pace` reads only the machine's own state, as every rule above does.
 
 **The paced rate law.** Paced at a share G of the window over the least round trip R, with
@@ -2042,23 +2046,24 @@ e^(x·t/R), where x·e^x = G. At G = 1, x = 0.567 and a round grows 1.76 times; 
 still carry what left a round trip before, so the rate keeps that growth for one more round
 trip. From then on it rises by G times the link each round trip, since the link's SACKs
 keep adding to a window that chunks wait behind. The queue is what the rate put above the
-link. The train sees it only when a sample sits 10 ms above the least (`QUEUED`, `:43`),
+link. The train sees it only when a sample sits 10 ms above the least (`QUEUED`, `:45`),
 and that sample comes back a round trip and those 10 ms after its packet met the queue.
 Paced at the whole window, the first experiment broke P-e in three grid cells for that
 reason, and at half of it in one, while the 250 ms cells' push-backs became floors (D65).
 
 **The exit (D65).** Two rules hold that queue within P-e:
 
-- **The cap binds the association.** From the sample that shows the queue on, the train's
-  in-flight cap (`cap`, `:808`) goes to the pacer with the whole window (`Train::pace`,
-  `:478`), and chunks already pending wait while in flight is at or above it. The cap used
-  to hold only what the train wrote (`:602`), and what the train had handed to SCTP before
+- **The cap binds the association.** From the sample that shows the queue on, on trial or
+  confirmed, the train's in-flight cap (`cap`, `:1109`) goes to the pacer with the whole
+  window (`Train::pace`, `:615`), and chunks already pending wait while in flight is at or
+  above it. The cap used
+  to hold only what the train wrote (`:755`), and what the train had handed to SCTP before
   it still left.
 - **The gain comes from the path, until the cap.** Until the bottleneck queued, the pacer
-  lets out `pace_share` of the window (`:138`): the largest share G, up to the whole window,
-  whose queue at the cap, by the law above (`pace_queue`, `:156`), stays within three
+  lets out `pace_share` of the window (`:174`): the largest share G, up to the whole window,
+  whose queue at the cap, by the law above (`pace_queue`, `:192`), stays within three
   quarters of P-e's bound, max(R, 50 ms). It is a function of the least round trip and
-  `QUEUED` alone, and it follows the least as the least falls (`sample`, `:643`). From the
+  `QUEUED` alone, and it follows the least as the least falls (`sample`, `:801`). From the
   cap on, the share is the whole window: the cap holds the queue, and a train paced at a
   fraction of its window with nothing pending at its SACKs stops growing, and reads a
   plateau under the link (0.82 at 0.4 Mbit/s and 20 ms on path I, in the model that ranked
@@ -2073,7 +2078,7 @@ reason, and at half of it in one, while the 250 ms cells' push-backs became floo
 The share is least near 50 ms: below that P-e's bound stays 50 ms however short the round
 trip, so a shorter path has more room, counted in its round trips.
 
-**The margin, a quarter (`PACE_MARGIN`, `:120`).** The law leaves out a step's lateness,
+**The margin, a quarter (`PACE_MARGIN`, `:154`).** The law leaves out a step's lateness,
 the second packet a SACK waits for, and the serialisation a least round trip carries. A
 packet model of the vendored SCTP and the train, checked against the first experiment's
 traces before any candidate was built, put their peak queues within 15 %: 52.0 ms where the
@@ -2082,7 +2087,9 @@ cell measured 51.6 at 2 Mbit/s and 20 ms, 116.3 for 104.1 at 2 Mbit/s and 80 ms 
 73.6 and 61.2 for 69.8. A quarter covers that error. It is also about the most that keeps the
 whole window where the whole window is safe: at 250 ms its queue at the cap is 0.73 of the
 round trip, so a margin above 0.27 would pace the 250 ms paths below their window for no
-queue they build, and turn their push-backs into floors, as half the window did.
+queue they build, and turn their push-backs into floors, as half the window did. The cap's
+trial (4a-3c, below) engages at the same sample with the same bound, so it adds no lag to
+this derivation and leaves the margin as it was.
 
 **The rules, and the cell that forced each.** The rulings set the train's shape; these
 are the numbers in it. The first four were found in a packet model of the vendored SCTP
@@ -2090,29 +2097,35 @@ before the cells ran, the rest by a cell below that failed without them:
 
 | Rule | Anchor | Forced by |
 |---|---|---|
-| In flight and waiting stay within the first window until round 1 ends | `agents/roomlerd/src/media_train.rs:596` | 0.4 Mbit/s at 20 ms: SCTP's release of four packets for each SACK of two queued 77.7 ms, over P-e's 50 ms |
-| A round ends when the first byte sent after it began is acknowledged | `Round::mark`, `:349` | a round counted from bytes already in flight closed in 2 ms and read 1.23 times the link |
-| Twice the most one step acknowledged, and a message, wait | `:606` | 50 Mbit/s: with less waiting, slow start stopped growing between steps |
-| No sample from a SACK of one message | `:540` | a lone packet's SACK may have waited for the delayed acknowledgement |
-| The cap starts at a sample 10 ms above the least | `QUEUED`, `:43` | 2 Mbit/s at 80 ms, path I: two packets sent together put 4.9 ms between samples, and a cap from 5 ms held the climb at round 1's rate, a plateau at 0.11 of the link |
-| The cap's queue is a third of the least round trip, of 50 ms at least | `QUEUE_FLOOR`, `:48` | 2 Mbit/s at 250 ms, path I: with half, the peak queue reached 253 ms, over P-e's 250 |
-| The cap is never below three messages | `CAP_FLOOR_MESSAGES`, `:94` | 0.4 Mbit/s at 20 ms and 2 Mbit/s at 80 ms, path C: with one message in flight the train stalled, every SACK a lone packet's, on the vendored acknowledgement timer that #4033 fixed (below). Any receiver still holds a lone packet's SACK up to 200 ms, so the floor stays |
-| The cap is the nearest whole number of messages | `cap`, `:808` | 0.4 Mbit/s at 80 ms, path C: a pair's round trip is the least and one serialisation, so a train that writes in pairs fills a pipe of 4.4 messages only with about 5.4 in flight; cut down to whole messages, the cap kept 4, and the rounds read a plateau at 0.74 |
+| In flight and waiting stay within the first window until round 1 ends | `agents/roomlerd/src/media_train.rs:749` | 0.4 Mbit/s at 20 ms: SCTP's release of four packets for each SACK of two queued 77.7 ms, over P-e's 50 ms |
+| A round ends when the first byte sent after it began is acknowledged | `Round::mark`, `:385` | a round counted from bytes already in flight closed in 2 ms and read 1.23 times the link |
+| Twice the most one step acknowledged, and a message, wait | `:759` | 50 Mbit/s: with less waiting, slow start stopped growing between steps |
+| No sample from a SACK of one message | `:685` | a lone packet's SACK may have waited for the delayed acknowledgement |
+| The cap starts, on trial, at a sample 10 ms above the least | `QUEUED`, `:45`; `judge`, `:818` | 2 Mbit/s at 80 ms, path I: two packets sent together put 4.9 ms between samples, and a cap from 5 ms held the climb at round 1's rate, a plateau at 0.11 of the link |
+| The cap's queue is a third of the least round trip, of 50 ms at least | `QUEUE_FLOOR`, `:50` | 2 Mbit/s at 250 ms, path I: with half, the peak queue reached 253 ms, over P-e's 250 |
+| The cap is never below three messages | `CAP_FLOOR_MESSAGES`, `:127` | 0.4 Mbit/s at 20 ms and 2 Mbit/s at 80 ms, path C: with one message in flight the train stalled, every SACK a lone packet's, on the vendored acknowledgement timer that #4033 fixed (below). Any receiver still holds a lone packet's SACK up to 200 ms, so the floor stays |
+| The cap is the nearest whole number of messages | `cap`, `:1109` | 0.4 Mbit/s at 80 ms, path C: a pair's round trip is the least and one serialisation, so a train that writes in pairs fills a pipe of 4.4 messages only with about 5.4 in flight; cut down to whole messages, the cap kept 4, and the rounds read a plateau at 0.74 |
 | A standing queue is 10 ms and one message's serialisation at the estimate | `STANDING`, `:37` | 0.4 Mbit/s at 250 ms, path I: a pair's serialisation read 22.7 ms in round 4 with no queue at all |
-| A plateau needs rounds held by the cap and by no window, and no queue | `PLATEAU_ROUNDS`, `:103` | 0.4 Mbit/s at 20 ms: three messages fill the path and no sample shows a queue, so the train ran to its deadline and wrote 118 KB, over P-f's 64; 2 Mbit/s at 80 ms, path C: rounds held by the congestion window grow one packet a round, and read as a plateau at 0.52 |
-| Four samples over half the least round trip and 50 ms, every one standing, judge the queue before the round ends, and their delivery counts toward the low edge | `ROUND_SAMPLES`, `EARLY_SPAN`, `:73`, `:74`; `run_stands`, `:718` | 0.4 Mbit/s at 250 ms, path I: waiting for the round's end wrote 74.4 KB, over P-f; judged early in any round, 8 Mbit/s at 250 ms stopped on delay at 0.16; over a shorter span and with the round's own delivery left out, 2 Mbit/s at 250 ms stopped at 0.52 and 0.69 |
-| The four are a run of samples in a row: one that does not stand starts it again, and so does one that comes later after the run's newest than its own queue and a message's serialisation, since the link may have idled between them | `extend_run`, `:688` | CI run 44383834538 (below): a dip sank the whole round it fell in, rounds 3 and 4 each took one, and the judgment came in round 5. Under noise, a run that passed over the samples of packets sent below the cap spanned an idle link at 2 Mbit/s and 250 ms and read 0.69, and a run across 148 ms without a SACK read 0.29 at 8 Mbit/s and 250 ms |
-| A round's end judges delay only with four samples | `close_round`, `:822` | 50 Mbit/s at 20 ms, path C, under noise: one late sample, alone in its round, read as a queue and stopped the train on delay at 0.04 of the link |
-| Once a slow link queued, the train writes no more than what was acknowledged then and its estimate's 700 ms, and a round that budget held is no plateau | `WRITE_SPAN`, `:83`; `write_budget`, `:748` | CI run 44383834538 (below): at 0.4 Mbit/s and 250 ms the train wrote 85,200 and 64,800 bytes while its judgment waited, over P-f |
-| The write budget is a slow link's only | `write_budget`, `:748` | 2 Mbit/s at 250 ms, path I: with a budget on every link the estimate was 38 kB/s when the queue first showed, and the train stopped on its deadline at 0.45 |
-| A rate from the spacing of SACKs spans 10 ms and four SACKs at least | `DISPERSION_SPAN`, `DISPERSION_ACKS`, `:59`, `:60` | 2 Mbit/s at 250 ms, path I: over one SACK it read 2.55 Mbit/s on a link that carries 1.95 |
-| The deadline comes 25 ms early, or two step intervals | `DEADLINE_LEAD`, `:87` | 50 Mbit/s at 250 ms, path C: the train ran past 2,500 ms |
-| The first write keeps within the budget | `:515` | a congestion window of 4 MiB (`the_first_write_keeps_within_the_budget`) |
-| The association paces its sends while the train runs | `Pacing`, `agents/roomlerd/src/media_train.rs:304`; `pace_rate`, `crates/vendored/webrtc-sctp/src/association/pacer.rs:279` | the shallow buffer, 8 Mbit/s at 80 ms behind a 20 ms queue, path I (D43): unpaced, the bursts overflowed the queue before any round carried the link, and the low edge read 0.14 to 0.52 |
-| Once the bottleneck queued, the cap binds the association's sends | `Train::pace`, `agents/roomlerd/src/media_train.rs:478`; `Pacer::admit`, `crates/vendored/webrtc-sctp/src/association/pacer.rs:222` | 2 Mbit/s at 20 ms, path I, paced at half the window: the queue peaked at 54.9 ms, over P-e's 50, from bytes handed to SCTP before the cap |
-| The share is the largest whose queue stays within three quarters of P-e's bound, until the cap, and the whole window from then on | `pace_share`, `agents/roomlerd/src/media_train.rs:138`; `PACE_MARGIN`, `:120` | paced at the whole window, P-e broke at 2 Mbit/s and 20 ms (51.6 ms) and at 80 ms at 2 and 8 Mbit/s (104.1 and 90.2 ms); at half of it, at 2 Mbit/s and 20 ms, and the 250 ms push-backs became floors. Held past the cap, a share under the whole window starved 0.4 Mbit/s at 20 ms into a plateau at 0.82, in the model |
+| A plateau needs rounds held by the cap and by no window, and no queue | `PLATEAU_ROUNDS`, `:136` | 0.4 Mbit/s at 20 ms: three messages fill the path and no sample shows a queue, so the train ran to its deadline and wrote 118 KB, over P-f's 64; 2 Mbit/s at 80 ms, path C: rounds held by the congestion window grow one packet a round, and read as a plateau at 0.52 |
+| Four samples over half the least round trip and 50 ms, every one standing, judge the queue before the round ends, and their delivery counts toward the low edge | `ROUND_SAMPLES`, `EARLY_SPAN`, `:75`, `:76`; `run_stands`, `:987` | 0.4 Mbit/s at 250 ms, path I: waiting for the round's end wrote 74.4 KB, over P-f; judged early in any round, 8 Mbit/s at 250 ms stopped on delay at 0.16; over a shorter span and with the round's own delivery left out, 2 Mbit/s at 250 ms stopped at 0.52 and 0.69 |
+| The four are a run of samples in a row: one that does not stand starts it again, and so does one that comes later after the run's newest than its own queue and a message's serialisation, since the link may have idled between them | `extend_run`, `:957` | CI run 44383834538 (below): a dip sank the whole round it fell in, rounds 3 and 4 each took one, and the judgment came in round 5. Under noise, a run that passed over the samples of packets sent below the cap spanned an idle link at 2 Mbit/s and 250 ms and read 0.69, and a run across 148 ms without a SACK read 0.29 at 8 Mbit/s and 250 ms |
+| A round's end judges delay only with four samples | `close_round`, `:1128` | 50 Mbit/s at 20 ms, path C, under noise: one late sample, alone in its round, read as a queue and stopped the train on delay at 0.04 of the link |
+| Once a slow link queued, the train writes no more than what was acknowledged then and its estimate's 700 ms, and a round that budget held is no plateau | `WRITE_SPAN`, `:116`; `write_budget`, `:1034` | CI run 44383834538 (below): at 0.4 Mbit/s and 250 ms the train wrote 85,200 and 64,800 bytes while its judgment waited, over P-f |
+| The write budget counts from what was acknowledged when the cap first applied, on any link, and never moves or turns off | `write_budget`, `agents/roomlerd/src/media_train.rs:1034`; `:697` | 0.4 Mbit/s at 250 ms, path I: counted afresh after a lift, the train wrote 60,000 bytes; at 80 ms on path C, only with a pair, 64,800 under noise, and in the model with two samples to confirm 78,000; moved to a lift that met no queue, 68,400 in the model (P-f: 64,000) |
+| A rate from the spacing of SACKs spans 10 ms and four SACKs at least | `DISPERSION_SPAN`, `DISPERSION_ACKS`, `:61`, `:62` | 2 Mbit/s at 250 ms, path I: over one SACK it read 2.55 Mbit/s on a link that carries 1.95 |
+| The deadline comes 25 ms early, or two step intervals | `DEADLINE_LEAD`, `:120` | 50 Mbit/s at 250 ms, path C: the train ran past 2,500 ms |
+| The first write keeps within the budget | `:657` | a congestion window of 4 MiB (`the_first_write_keeps_within_the_budget`) |
+| The association paces its sends while the train runs | `Pacing`, `agents/roomlerd/src/media_train.rs:340`; `pace_rate`, `crates/vendored/webrtc-sctp/src/association/pacer.rs:279` | the shallow buffer, 8 Mbit/s at 80 ms behind a 20 ms queue, path I (D43): unpaced, the bursts overflowed the queue before any round carried the link, and the low edge read 0.14 to 0.52 |
+| Once the bottleneck queued, the cap binds the association's sends | `Train::pace`, `agents/roomlerd/src/media_train.rs:615`; `Pacer::admit`, `crates/vendored/webrtc-sctp/src/association/pacer.rs:222` | 2 Mbit/s at 20 ms, path I, paced at half the window: the queue peaked at 54.9 ms, over P-e's 50, from bytes handed to SCTP before the cap |
+| The share is the largest whose queue stays within three quarters of P-e's bound, until the cap, and the whole window from then on | `pace_share`, `agents/roomlerd/src/media_train.rs:174`; `PACE_MARGIN`, `:154` | paced at the whole window, P-e broke at 2 Mbit/s and 20 ms (51.6 ms) and at 80 ms at 2 and 8 Mbit/s (104.1 and 90.2 ms); at half of it, at 2 Mbit/s and 20 ms, and the 250 ms push-backs became floors. Held past the cap, a share under the whole window starved 0.4 Mbit/s at 20 ms into a plateau at 0.82, in the model |
+| The cap is on trial: only the sample of a packet sent at or after the step it engaged at judges it. Two that stand 10 ms above the least confirm it; eight that do not lift it, and the greatest sample is the least again | `Hold`, `agents/roomlerd/src/media_train.rs:428`; `judge`, `:818`; `TRIAL_STANDING`, `:88`; `TRIAL_CLEAR`, `:89` | a host stall of 40 ms in the first round (the stall cells, below): it capped 8 Mbit/s at 20 ms on path I into a plateau at 0.10 of the link, the shallow buffer at 0.03 and both viewer's window cells at 0.00, in every run, while the link's queue never passed 2.4 ms. One standing sample: a second stall confirmed a trial at 2 Mbit/s and 80 ms on path C under noise (a plateau at 0.11). Four clear: in the model 0.4 Mbit/s at 80 ms on path I queued 80.2 ms |
+| A round held at a cap on trial is no plateau, and on trial the most one step acknowledged keeps its value | `agents/roomlerd/src/media_train.rs:766`, `:702` | the plateau: the stall cells' plateaus above, rounds held at a cap a stall set. The peak: 8 Mbit/s at 20 ms on path I, a stall at 250 ms: the SACKs the stall held came at once, the steps after them wrote twice that, and the queue reached 52.2 ms, over P-e's 50 |
+| The pair is a first sample's whose packet left in the same step as the one ahead of it | `first_paired`, `agents/roomlerd/src/media_train.rs:692`; `pair`, `:1055` | 0.4 Mbit/s at 80 ms, path C, whose first window is paced: a first sample 10.7 ms over the least read 112 kB/s, 2.3 times the link, and the train queued 88.3 ms alone and 111.2 ms with 64,800 bytes under noise (P-e, P-f) |
+| Under a least round trip of 60 ms, a lead shorter than the least round trip is a claim: a delivery more than a quarter above it over a least round trip refutes it, and one within it, the probe's messages out, confirms the cap | `Claim`, `agents/roomlerd/src/media_train.rs:452`; `test_claim`, `:879` | 0.4 Mbit/s at 20 ms, path C: under the cap's queue of 16.7 ms no sample stood 10 ms, the trial lifted, and the climb after it queued 140.1 ms, over P-e's 50. Confirmed untested, the lead was a stall's under noise at 50 Mbit/s and 20 ms on path C (a plateau at 0.01) and at 2 Mbit/s and 20 ms on path I (0.57) |
+| While the claim is open the cap lets out the messages the claimed link serialises in the least round trip and 37.5 ms more | `Claim::probe`, `agents/roomlerd/src/media_train.rs:470`; `CLAIM_QUEUE`, `:104` | a 12 ms lead at a least round trip of 48 ms: one message more than 50 ms holds read 1.25 times the claim on a link four times faster, and confirmed it (`a_faster_link_refutes_the_claim_on_every_short_path`); in the model 8 Mbit/s at 50 ms with a 20 ms stall stopped on a plateau at 0.05 |
+| A delivery rate spans the sends of its bytes where they took longer than its acknowledgements | `sent_at`, `agents/roomlerd/src/media_train.rs:929`; `span`, `:943` | 8 Mbit/s at 20 ms, path I, a stall at 250 ms: the SACKs it held read 3.9 MB/s over their own span on a 1 MB/s link, and the train stopped on delay at 2.25 of the link (P-a) |
 
-**The reading** (`Reading`, `agents/roomlerd/src/media_train.rs:238`):
+**The reading** (`Reading`, `agents/roomlerd/src/media_train.rs:274`):
 
 | Field | Means |
 |---|---|
@@ -2121,7 +2134,7 @@ before the cells ran, the rest by a cell below that failed without them:
 | `stop`, `floor_only` | why it stopped; `floor_only` is true for every stop but `delay`, `plateau` and `loss`, and then the low edge is only a floor |
 | `unit` | `SctpPayloadBps`: bits a second of SCTP payload, without SCTP's headers or anything beneath them |
 | `rounds` | the rounds closed |
-| `written_bytes`, `wire_bytes` | the payload written, and the SCTP packets that carry it once each: 28 bytes of common and DATA chunk header a message (`PACKET_OVERHEAD`, `:111`). What DTLS, UDP, IP and a relay add beneath is the carrier's |
+| `written_bytes`, `wire_bytes` | the payload written, and the SCTP packets that carry it once each: 28 bytes of common and DATA chunk header a message (`PACKET_OVERHEAD`, `:144`). What DTLS, UDP, IP and a relay add beneath is the carrier's |
 | `min_rtt` | the least acknowledgement delay seen |
 | `ssthresh_at_start` | the slow start threshold at the first write, which says the open path (below) |
 | `fast_retransmits`, `t3_expiries` | the loss events during the train |
@@ -2142,7 +2155,7 @@ and at 8 Mbit/s with 20 ms. At 2 Mbit/s and 80 ms and at 8 Mbit/s and 20 ms that
 floor at the link's rate, ended by the deadline and the budget. Everywhere else it reads
 a floor below the link, and the floor is the association's own ramp, not the path's: a
 session that opens on path C cannot send faster at first either. The ignored
-measurement `path_c_ramp_to_the_link_rate` (`agents/roomlerd/src/media_train.rs:1661`)
+measurement `path_c_ramp_to_the_link_rate` (`agents/roomlerd/src/media_train.rs:2052`)
 keeps 16 messages waiting and records when the last round trip, of 200 ms at least,
 first carried 80 % of the link's payload rate:
 
@@ -2193,14 +2206,14 @@ device's sessions by answer (`docs/production-mongo-reads.md` §8a).
 
 **The properties and their cells.** Each cell opens two in-process associations of the
 vendored SCTP over `media_delivery`'s shaped link (`shaped`,
-`agents/roomlerd/src/media_delivery.rs:5178`; `pair_opened`, `:5317`, by either path,
-`OpenPath`, `:5302`), steps the machine every millisecond, writes what it asks, and
+`agents/roomlerd/src/media_delivery.rs:5178`; `pair_opened`, `:5435`, by either path,
+`OpenPath`, `:5420`), steps the machine every millisecond, writes what it asks, and
 after the stop waits for every byte written to be acknowledged. A grid cell's link
 serialises each direction at its rate, adds half the round trip to every packet, and
 queues up to a second, deeper than anything the train can fill (`Cell::grid`,
-`agents/roomlerd/src/media_train.rs:950`). The shaper records the longest any packet of
+`agents/roomlerd/src/media_train.rs:1259`). The shaper records the longest any packet of
 the agent's waited for the wire (`peak_wait`, `agents/roomlerd/src/media_delivery.rs:4983`)
-and its tail drops (`:4988`). `broken` (`agents/roomlerd/src/media_train.rs:1264`) checks
+and its tail drops (`:4988`). `broken` (`agents/roomlerd/src/media_train.rs:1596`) checks
 every cell; it also checks that `floor_only` matches the stop, and that the slow start
 threshold at the first write is 0 on path C and not 0 on path I.
 
@@ -2209,13 +2222,15 @@ threshold at the first write is 0 on path C and not 0 on path I.
 | **P-a** | a push-back stop's low edge is within 20 % of the link's payload rate | every cell | 0.89 to 1.07 of the link at every push-back stop of the grid, and 0.95 to 1.03 in the noise cells. RED in the shallow buffer cell on path I | 0.90 to 1.07 at every push-back stop of the grid but one: in one run, 8 Mbit/s at 20 ms on path I read a plateau at 0.32 after a stall capped it (below). 0.98 to 1.02 in the noise cell at 2 Mbit/s. The shallow buffer cell on path I green: 0.84 to 1.02 over ten runs |
 | **P-b** | a budget, deadline or ready stop is a floor, at most 20 % above that rate | every cell | floors from 0.00 to 1.06 of the link | floors from 0.00 to 1.05 |
 | **P-c** | no high edge below the low edge | every cell, and `a_high_edge_below_the_low_edge_or_on_a_floor_is_never_reported` | 14 high edges in the grid, all on path I (2 Mbit/s at 80 and 250 ms, 8 Mbit/s at 20 and 80 ms), at 1.05 to 2.00 times their low edges, and 5 in the noise cell at 2 Mbit/s on path I, at 1.25 to 1.88 | none in the grid: a paced round is offered little more than it delivers. Two in the noise cell at 2 Mbit/s on path I, at 1.15 and 1.21 |
-| **P-d** | no delay stop while every round's least queueing delay is under 10 ms; a link with room ends on budget or deadline | every cell (a delay stop where no packet of the agent's waited 10 ms), the room cells at 50 Mbit/s and 250 ms (`room_is_not_push_back`, `:1587`), and `a_round_under_ten_ms_above_the_least_is_no_delay_stop` | a packet waited 21.5 ms or more in every cell that stopped on delay; the room cells ended on `budget` (path I) and `deadline` (path C) | a packet waited 19.3 ms or more in every cell that stopped on delay; the room cells ended on `budget` (path I) and `deadline` (path C), and the named one on path I twice in five runs on `deadline` at 0.02, after a stall capped it |
+| **P-d** | no delay stop while every round's least queueing delay is under 10 ms; a link with room ends on budget or deadline | every cell (a delay stop where no packet of the daemon's waited 10 ms), the room cells at 50 Mbit/s and 250 ms (`room_is_not_push_back`, `:1978`), and `a_round_under_ten_ms_above_the_least_is_no_delay_stop` | a packet waited 21.5 ms or more in every cell that stopped on delay; the room cells ended on `budget` (path I) and `deadline` (path C) | a packet waited 19.3 ms or more in every cell that stopped on delay; the room cells ended on `budget` (path I) and `deadline` (path C), and the named one on path I twice in five runs on `deadline` at 0.02, after a stall capped it |
 | **P-e** | a peak queue of at most the round trip or 50 ms, whichever is longer, at most 512 KiB written, at most 2.5 s, and everything written acknowledged | every cell | peak queues up to 190.6 ms at 250 ms (202.1 ms in a noise cell), 74.2 ms at 80 ms and 49.1 ms at 20 ms; 523,200 bytes; 2,478 ms (2,485 ms in a noise cell) | peak queues up to 187.9 ms at 250 ms (172.8 ms in a noise cell), 68.2 ms at 80 ms and 49.1 ms at 20 ms; 523,200 bytes; 2,477 ms (2,479 ms in a noise cell) |
 | **P-f** | at 0.4 Mbit/s, at most 64 KB written | the six 0.4 Mbit/s cells and the two 0.4 Mbit/s noise cells | 44,400 bytes at most (250 ms, both paths, and under noise), where it was 61,200 before the write budget | 43,200 bytes at most (80 ms, path C), and 39,600 under noise |
-| **P-g** | a first frame ready at 0.3 s ends the train with a floor | four cells, 8 Mbit/s at 80 and 250 ms on both paths (`ready_is_a_floor`, `:1621`) | `ready` at 300 to 302 ms, a floor every time | `ready` at 300 to 307 ms, a floor in all twenty |
+| **P-g** | a first frame ready at 0.3 s ends the train with a floor | four cells, 8 Mbit/s at 80 and 250 ms on both paths (`ready_is_a_floor`, `:2012`) | `ready` at 300 to 302 ms, a floor every time | `ready` at 300 to 307 ms, a floor in all twenty |
 
 At 0.4 Mbit/s and 20 ms the 49.1 ms is SCTP's own initial window: three packets go at
-once, and the third waits two serialisations of 24.6 ms.
+once, and the third waits two serialisations of 24.6 ms. The paced column is 4a-3b's
+rule; with the cap on trial (4a-3c, below) the grid read the same in two runs alone, and
+what the trial moved is in its own tables.
 
 **The grid.** The low edge as a share of the link's payload rate (the link's rate times
 1,200 / 1,228): the stop, the mean and the range, and the highest peak queue. Unpaced over
@@ -2272,8 +2287,8 @@ too. Where a peak queue moved more than 15 % with the same stop, it moved as far
 runs of the same build (46.5 and 39.8 ms at 2 Mbit/s and 20 ms on path I), or by under one
 packet's serialisation (24.6 ms at 0.4 Mbit/s, 0.19 ms at 50 Mbit/s).
 
-**A stall caps a paced train early.** In the remaining run, five path I cells capped early. The
-cap starts at the first sample 10 ms above the least (`sample`, `:649`). In the trace at
+**A stall capped a paced train early (4a-3b).** In the remaining run, five path I cells capped
+early. The cap started at the first sample 10 ms above the least, and held from then on. In the trace at
 8 Mbit/s and 20 ms that sample sat 31.8 ms above the least while the link's queue never
 passed 9.2 ms in the whole cell, and in the viewer's window cell (below) 37 ms above it with
 no queue at all: the delay was the box's, not the link's. The cap, set from the estimate of
@@ -2282,20 +2297,330 @@ the runs that read the link capped with 61,200 to 146,400: a plateau at 0.32 (P-
 and deadlines at 0.85, 0.32 and 0.11. At 2 Mbit/s and 80 ms the train still read the link
 (1.00). The unpaced train has the same rule and the same failure under noise (a plateau at
 0.21 and 0.26, below). Pacing gives it longer to strike: a paced train grows 1.4 to 1.8
-times a round where slow start doubles, so its estimate stays small for more rounds.
+times a round where slow start doubles, so its estimate stays small for more rounds. The cap
+on trial (4a-3c, below) is the answer.
 
 | Named cell | Path I | Path C |
 |---|---|---|
-| A shallow buffer: 8 Mbit/s, 80 ms, a queue of 20 ms (`shallow`, `agents/roomlerd/src/media_train.rs:1496`) | paced: `loss` at 1.00 in five runs of five of the code as merged, and 0.84 to 1.02 over ten with E-pace-3's. Unpaced RED: `loss` in every run, the low edge 0.14 to 0.52 over twelve | paced: `deadline`, 0.28 to 0.29. Unpaced `deadline`, 0.35 (0.33 to 0.36): congestion avoidance never fills the queue, so nothing is lost |
-| The viewer's window of 64 KiB, at 50 Mbit/s and 80 ms (`peer_window`, `:1555`) | paced: `budget`, 0.12 to 0.13, a floor, in four runs of five; in one, a stall capped it at 255 ms and it read a plateau at 0.00, and failed. Unpaced `budget`, 0.15 (0.14 to 0.16), a floor; the gauges showed the peer's window holding the sender at 149 to 220 steps | paced: `deadline`, 0.05, a floor, in four runs of five; in the same one, a stall capped it at 568 ms and it read a plateau at 0.00, and failed. Unpaced `deadline`, 0.07 (0.07 to 0.08), a floor; held by the window at 118 to 120 steps |
-| A link with room: 50 Mbit/s at 250 ms (P-d) | paced: `budget` at 0.05 in three runs of five, and `deadline` at 0.02 in two, after a stall capped it with no queue on the link. Unpaced `budget` | `deadline` |
-| The first frame ready at 0.3 s: 8 Mbit/s at 80 and 250 ms (P-g) | `ready`, a floor | `ready`, a floor |
+| A shallow buffer: 8 Mbit/s, 80 ms, a queue of 20 ms (`shallow`, `agents/roomlerd/src/media_train.rs:1837`) | paced: `loss` at 1.00 in five runs of five of the code as merged, and 0.84 to 1.02 over ten with E-pace-3's; with the cap on trial, `loss` at 0.86 to 1.02 in five of five. Unpaced RED: `loss` in every run, the low edge 0.14 to 0.52 over twelve | paced: `deadline`, 0.28 to 0.29; on trial, 0.27 to 0.29 in five of five. Unpaced `deadline`, 0.35 (0.33 to 0.36): congestion avoidance never fills the queue, so nothing is lost |
+| The viewer's window of 64 KiB, at 50 Mbit/s and 80 ms (`peer_window`, `:1896`) | paced: `budget`, 0.12 to 0.13, a floor, in four runs of five; in one, a stall capped it at 255 ms and it read a plateau at 0.00, and failed. On trial, `budget` at 0.12 to 0.13 in five of five. Unpaced `budget`, 0.15 (0.14 to 0.16), a floor; the gauges showed the peer's window holding the sender at 149 to 220 steps | paced: `deadline`, 0.05, a floor, in four runs of five; in the same one, a stall capped it at 568 ms and it read a plateau at 0.00, and failed. On trial, `deadline` at 0.05 in five of five. Unpaced `deadline`, 0.07 (0.07 to 0.08), a floor; held by the window at 118 to 120 steps |
+| A link with room: 50 Mbit/s at 250 ms (P-d) | paced: `budget` at 0.05 in three runs of five, and `deadline` at 0.02 in two, after a stall capped it with no queue on the link. On trial, `budget` at 0.05 to 0.08 in five of five. Unpaced `budget` | `deadline`; on trial, at 0.00 in five of five |
+| The first frame ready at 0.3 s: 8 Mbit/s at 80 and 250 ms (P-g) | `ready`, a floor; on trial, at 300 to 302 ms in five of five | `ready`, a floor; on trial, at 300 to 303 ms in five of five |
 
 The viewer's window cells are the stall's widest target. Paced at 80 ms the share is 0.439
 of the window, a round grows 1.37 times, and the train takes about eight rounds to reach
 the peer's 64 KiB where slow start took about four. A round the window holds is never a
 plateau, so the stall has those rounds to start the cap, and once it has, every round is
-held by the cap alone.
+held by the cap alone. On trial, such a cap lifts a round trip and eight samples later,
+and the window holds the train again (below).
+
+**The cap on trial (4a-3c).** A SACK the daemon's scheduler held, and those it held with
+it, sit as far above the least as the stall was long, while the bottleneck's queue does
+not move. A queue holds what the link cannot carry, so it is still there under the packets
+sent after it showed; a stall is over by then. That is the whole rule: a sample engages
+the cap where it did, and only what was sent after it may confirm it, by a queue that
+stands under those packets or, on a short path where the cap's own queue cannot stand, by
+a delivery that matches the rate the cap was set from. Until then the cap is on trial. What
+the train may write is fixed once, by what had been acknowledged when the cap first applied
+and what the estimate carries in 700 ms, so no trial, however it ends, moves P-f's bound.
+Each rule below applies that principle, and each has a cell or a test that fails without
+it. The step's first rule, measured before this one, let one standing sample confirm a
+trial and four clear ones lift it, confirmed a short path's lead untested, and counted the
+write budget afresh at each trial; where it broke, it names the cell:
+
+- **On trial** (`Hold`, `agents/roomlerd/src/media_train.rs:428`; `judge`, `:818`). The
+  cap engages at the first sample 10 ms above the least (`QUEUED`, `:45`), with the same
+  bound, the whole window, the writer's room and the write budget (`cap_applies`, `:633`).
+  Only the sample of a packet sent at or after the step it engaged at judges it (`:847`):
+  a step's time less its sample is when the sampled packet left, to the step. Two samples
+  that stand 10 ms above the least confirm it (`TRIAL_STANDING`, `:88`). Eight that do
+  not, two rounds of `ROUND_SAMPLES` (`TRIAL_CLEAR`, `:89`), lift it: the greatest sample
+  is the least again, the pacer gets the share back, and the next sample 10 ms above the
+  least engages the cap anew. One standing sample, the step's first rule, let a second stall among
+  the samples that judged a trial confirm it: at 2 Mbit/s and 80 ms on path C under the
+  runner's noise, a plateau at 0.11, and in the model at 0.4 Mbit/s and 80 ms on path C,
+  P-a at 0.77 to 0.79 in three seeds. Four clear samples lifted a slow link's trial before
+  its queue stood: in the model at 0.4 Mbit/s and 80 ms on path I the queue then reached
+  80.2 ms (P-e), and at 250 ms the train stopped on its budget at 0.71 where eight read
+  1.00.
+- **A cap on trial is no plateau, and keeps the peak** (`:766`, `:702`). Until it is
+  confirmed, no round counts as held at it, so a cap a stall set never stops the train on a
+  plateau: on 4a-3b's rule the first-round stalls read plateaus at 0.00 to 0.10 (the stall
+  cells, below). On trial the most one step acknowledged keeps its value: the SACKs a stall
+  held come at once, and at 8 Mbit/s and 20 ms on path I, with a stall at 250 ms, the steps
+  after them wrote twice that and the queue reached 52.2 ms, over P-e's 50.
+- **The pair is a back-to-back first sample's** (`first_paired`, `:692`; `pair`,
+  `:1055`). The pair estimate reads the first sample's lead over the least as one
+  message's serialisation, which holds only when the sampled packet and the one ahead of it
+  left the association in one step. Path C's first window is paced, since the handshake
+  gave the pacer a round trip, so its first sample is no pair: at 0.4 Mbit/s and 80 ms on
+  path C the least fell 1.1 ms in the third round, the first sample led it by 10.7 ms where
+  a message serialises in 24.6 ms, the pair read 112 kB/s, 2.3 times the link, and the
+  train queued 88.3 ms alone (P-e), and 111.2 ms with 64,800 bytes written under the noise
+  (P-e and P-f), on the step's first rule and on 4a-3b's alike.
+- **A short path's lead is a claim, put to the test** (`Claim`, `:452`; `test_claim`,
+  `:879`). Under a least round trip of 60 ms (`QUEUE_FLOOR` and `QUEUED`) the cap leaves a
+  queue of a third of 50 ms, 16.7 ms, less than one message at 0.4 Mbit/s (24.6 ms), so no
+  sample of a slow link's own queue stands 10 ms there: without the claim, 0.4 Mbit/s at
+  20 ms on path C lifted its trial and queued 140.1 ms, over P-e's 50. There a lead shorter
+  than the least round trip claims a link that serialises a message in the lead. From the
+  first sample that judges the trial, over a least round trip, a delivery more than a
+  quarter above the claim refutes it (`:889`): the link is faster and the lead was a stall.
+  One within it, once the probe's messages were out, confirms the cap (`:892`). The step's first
+  rule confirmed the lead untested, and under the runner's noise it read a stall as a slow
+  link's pair at 50 Mbit/s and 20 ms on path C (a plateau at 0.01) and at 2 Mbit/s and
+  20 ms on path I (0.57).
+- **The probe fills the least round trip** (`Claim::probe`, `:470`; `CLAIM_QUEUE`,
+  `:104`; `cap`, `:1110`). While a claim is open the cap lets out at least the messages the
+  claimed link serialises in the least round trip and 37.5 ms more, three quarters of P-e's
+  50 ms, and three at least. On a faster link they come back within a round trip and the
+  writer's reply, and read more than a quarter over the claim for every lead under about
+  37.5 ms less a quarter of the least round trip. A probe of one message more than the
+  claim's link serialises in 50 ms ignored the round trip: at a least round trip of 48 ms a
+  12 ms stall's five messages read 1.25 times the claim, not more, and the trial was
+  confirmed on a link four times faster (`a_faster_link_refutes_the_claim_on_every_short_path`,
+  red on it from 48 to 59 ms); in the model a 20 ms stall in the first round at 8 Mbit/s
+  and 50 ms then stopped the train on a plateau at 0.05, where the probe by the least round
+  trip reads 1.03, and over 19,528 short fast runs with stalls of 12 to 25 ms the property
+  breaks fell from 2,662 to 1,654.
+- **No delivery reads faster than its bytes were sent** (`sent_at`, `:929`; `span`,
+  `:943`). The train records when the association first sent each byte, to the step, and
+  a delivery rate spans its acknowledgements or the sends of the same bytes, whichever
+  took longer, as draft-cheng-iccrg-delivery-rate-estimation takes it. A stall releases
+  the SACKs it held together, and over their own span the bytes read 3.9 MB/s on a 1 MB/s
+  link at 8 Mbit/s and 20 ms, and the train stopped on delay at 2.25 of the link. The rule
+  holds for the spacing of SACKs, a round's delivery and a run's.
+- **The write budget is set once** (`write_budget`, `:1034`; `:697`; `WRITE_SPAN`,
+  `:116`). The train writes no more than what had been acknowledged when the cap first
+  applied, on trial or not, and what the estimate carries in 700 ms. Where it counts from
+  never moves, and it holds from then on whenever there is an estimate: with a pair or
+  without, on trial, confirmed or lifted. 4a-3b's budget applied only at a confirmed cap
+  with a pair. On trial that budget counted afresh after each lift: at 0.4 Mbit/s and
+  250 ms on path I the train wrote 60,000 bytes on the step's first rule, and with two samples to
+  confirm the model wrote 78,000 at 80 ms on path C, whose first round has no pair (P-f:
+  64,000).
+
+**P-f by construction.** What the train writes is at most A + e · 700 ms, A the bytes
+acknowledged when the cap first applied and e the estimate. At 0.4 Mbit/s the cap first
+applies with 4,800 to 6,000 bytes acknowledged on path I, from the pair in the first
+round, and on path C, whose climb is paced from its first window, with 6,000 at 20 ms and
+18,000 to 19,200 at 80 and 250 ms (the model, quiet and 60 seeds of its noise in each
+0.4 Mbit/s cell). The link's own rate carries 35,000 bytes in 700 ms, so P-f's 64,000
+holds for an estimate up to 1.66 times the link on path I and at 20 ms on path C, and
+1.28 times at 80 and 250 ms on path C, however many trials lift. Run alone, the train
+wrote 48,000 bytes at most, at 80 ms on path C where the trial lifted (two runs
+of seven), and 39,600 to 40,800 at 250 ms on path I (the grid twice, and the five
+0.4 Mbit/s cells at 20 to 250 ms five times more).
+
+**A lift refunds nothing.** A trial in which no sample stood met no queue: the cap set
+what was out, and the link took all of it. A form of this rule read that as a
+measurement of the cap, not of the link, and counted the budget again from the lift. That
+counts a stall twice on a slow link. At 0.4 Mbit/s and 80 ms on path C a 40 ms stall at
+850 ms engaged a trial at 22 to 36 kB/s, under the link's rate while path C still climbs;
+its three to four messages met no queue, eight clear samples lifted it at 1,490 ms, and
+counted from there the train wrote 68,400 bytes, and 75,600 under the runner's noise (the
+model). The bound counts A once, so a refund can only keep within it by taking from the
+estimate's share, and the refunds that did that gave the stall cells nothing. Ranked in the
+model on the off-grid set at 0.4 Mbit/s (both paths, round trips of 20 to 250 ms, quiet,
+ten seeds and 40 ms stalls every 50 ms: 1,322 runs), the stall sweep (stalls of 20, 40 and
+50 ms every 10 ms on the four stall links: 1,614 runs), the twelve stall placements and the
+grid under 30 seeds of two noise levels (1,440 runs), with 4a-3b's rule beside them, the
+baseline that a break is new against:
+
+| Lift | Off the grid at 0.4 Mbit/s: breaks (P-f) | Off the grid: new breaks (P-f) | Stall sweep: breaks | Stall placements held | Noise: breaks (new) |
+|---|---|---|---|---|---|
+| 4a-3b's rule: no trial, so nothing lifts; the budget only at a cap with a pair | 222 (46) | the baseline | 486 | 7 of 12 | 58 (the baseline) |
+| Counted again from the lift, when no sample stood, with a probe of one message more than the claim serialises in 50 ms (the build with the refund) | 73 (48) | 34 (12) | 62 | 12 of 12 | 10 (6) |
+| Counted again from the lift, when no sample stood (a form of this rule) | 72 (48) | 33 (12) | 62 | 12 of 12 | 10 (6) |
+| Again, but never above A + 1.6 times the best estimate's 700 ms | 67 (44) | 29 (8) | 62 | 12 of 12 | 10 (5) |
+| Moved by one round's want at most | 53 (35) | 16 (0) | 223 | 10 of 12 | 9 (4) |
+| **Not moved (this rule)** | 47 (35) | **10 (0)** | 331 | 9 of 12 | 9 (4) |
+
+Property breaks rank first, so the budget never moves. The stall sweep's cost is the
+first-round stall on a fast link (found and standing, below). Every P-f break of this rule
+off the grid is one 4a-3b's rule has too, at 120 and 160 ms on path C (found and standing,
+below). A placement holds when it breaks no property and keeps its unstalled run's reading:
+its loss stop, and 0.8 of its low edge.
+
+**The margin stands.** The trial adds no lag where the cap engages: the same sample
+engages it, with the same bound, pace and write budget, so the queue at the cap that
+`pace_share` derives is the same, and `PACE_MARGIN` stays a quarter. A lift lets the climb
+go on under the share, and the cap that engages next is the law's.
+
+**The stall cells.** The cells' harness stalls the daemon's side of the link (`HostStall`,
+`agents/roomlerd/src/media_delivery.rs:5200`; `shaped_stalled`, `:5230`): from a chosen
+moment, for 40 ms, nothing the link delivers reaches the train, and then the first packet
+held arrives at the stall's end and the rest 5 ms after it, as a scheduler that was busy
+reads them. The link's own queue never moves. That is what the production run's traces
+show: a sample 31.8 and 37 ms over the least, while the link's queue stood at 9.2 ms at
+most and at none. Twelve cells put the stall in the first round, mid-climb, and just
+before a true queue caps (or, where the window holds the train, before the stop), in four
+cells: 8 Mbit/s at 20 ms on path I, the shallow buffer on path I, and both viewer's window
+cells. Each must read as its cell does without the stall, on P-a and P-e, in five runs of
+five. Run alone, each five times, on 4a-3b's rule and on this one:
+
+| Cell, the stall at | Without the stall | 4a-3b's rule | This rule |
+|---|---|---|---|
+| 8 Mbit/s, 20 ms, path I: the first round (0 ms) | `delay` at 1.00 to 1.03, 34.9 to 35.1 ms | `plateau` at 0.10, capped at 89 to 117 ms with 2.4 ms of queue at most: P-a broken in five of five | `delay` at 1.00 to 1.07, 37.4 to 41.5 ms |
+| mid-climb (150 ms) |  | `delay` at 1.02 to 1.06, 21.4 to 23.7 ms | `delay` at 0.99 to 1.05, 36.9 to 43.1 ms |
+| before the cap (250 ms) |  | `delay` at 0.98 to 1.75, a peak queue of 111.1 to 163.9 ms: P-e broken in five of five, and P-a in one | `delay` at 0.99 to 1.08, 20.2 to 25.4 ms |
+| The shallow buffer, path I: the first round (0 ms) | `loss` at 0.86 to 1.02 | `plateau` at 0.03, capped at 209 to 213 ms: P-a and the loss stop broken in five of five | `budget` at 0.03, a floor, before the buffer lost a packet: the loss stop broken in five of five |
+| mid-climb (600 ms) |  | `loss` at 0.80 to 0.98: P-a broken in one | `loss` at 0.98 to 0.99 in four; `budget` at 1.01 in one, the train's 512 KiB written: the loss stop broken in one of five |
+| before the cap (1,100 ms) |  | `budget` at 0.65 to 0.88: no loss stop in five of five | `loss` at 0.87 to 0.90 |
+| The viewer's window, path I: the first round (0 ms) | `budget` at 0.12 to 0.13 | `plateau` at 0.00, capped at 207 to 236 ms: P-a broken in five of five | `budget` at 0.00, a floor, before the window held the sender: broken in five of five |
+| mid-climb (600 ms) |  | `budget` at 0.12 | `budget` at 0.12 |
+| before the stop (1,100 ms) |  | `budget` at 0.12 to 0.13 | `budget` at 0.12 to 0.13 |
+| The viewer's window, path C: the first round (300 ms) | `deadline` at 0.05 | `plateau` at 0.00, capped at 569 to 579 ms: P-a broken in five of five | `budget` at 0.00, a floor, after the window held the sender |
+| mid-climb (1,200 ms) |  | `deadline` at 0.05 | `budget` at 0.04 in four; `deadline` at 0.04 in one |
+| before the stop (2,300 ms) |  | `deadline` at 0.04 to 0.05 | `deadline` at 0.04 to 0.05 |
+
+On 4a-3b's rule six cells broke in every run and a seventh in one of five. Five read as
+their cells do: there the stall's cap engaged near what the link or the peer's window
+already held the train to. On this rule nine held in five runs of five. Two broke in
+every run, both stalled in the first round on path I: the train stopped on its budget, a
+floor, at 0.00 of the link behind the viewer's window and at 0.03 behind the shallow
+buffer, before the window ever held the sender or the buffer lost a packet, which is what
+those cells check (found, and standing, below). 4a-3b's rule read plateaus there at the
+same shares. The window cell on path C, stalled in its first round, stopped the same way
+at 0.00, after the window had held the sender, so it holds: without the stall it reads a
+floor as well, its deadline at 0.05. The third, the shallow buffer stalled mid-climb,
+failed its cell's check in one run of five, with P-a and P-e held: the train wrote its
+512 KiB (D38) and stopped on `budget` at 1.01 of the link before SCTP's fast retransmit
+had reported the loss. The stall's trial lifted, and the round trip and eight samples
+that took put the train's stops at 1,311 to 1,357 ms, where the cell without the stall
+stops at 1,228 to 1,238 ms with 488,400 bytes written at most; the four runs that stopped
+on `loss` had written 502,800 to 517,200. A rule whose trial lifts runs that race in this
+cell; on 4a-3b's rule the cell broke P-a in one run of five.
+
+A lifted trial costs time. With the stall in the first round, 8 Mbit/s at 20 ms stopped
+at 535 to 602 ms where its cell stops at 359 to 370: the trial holds the train at the cap
+of the stall's moment for a round trip and eight samples, and the climb then goes on from
+where it was. Mid-climb and before the cap the cost was at most 130 ms.
+
+**What else the rule moved.** Run alone twice, and four times in
+`grid_under_noise` (five seeds of every grid cell, 480 runs), the grid read as on 4a-3b's
+rule but for these cells (production: the three runs of 4a-3b's rule, the first of them
+the one a stall capped early):
+
+| Cell | 4a-3b's rule, production | This rule, alone | This rule, under noise |
+|---|---|---|---|
+| 8 Mbit/s, 20 ms, path I | `plateau` 0.32 (a stall), `delay` 1.00 to 1.02 | `delay` 1.00 to 1.03, 34.9 to 35.1 ms | `delay` 0.96 to 1.08 in twenty of twenty |
+| 8 Mbit/s, 80 ms, path I | `deadline` 0.32 (a stall), `delay` 1.00 | `delay` 1.01 to 1.02, 59.8 to 60.0 ms | `delay` 0.95 to 1.04 in sixteen; `budget` 0.93 to 1.02 in four, the train's 512 KiB written, one of them with a queue of 87.0 ms: P-e broken |
+| 2 Mbit/s, 250 ms, path I | `deadline` 0.85 (a stall), `delay` 0.98 | `delay` 0.99 to 1.00, 180.5 to 191.2 ms | `delay` 0.97 to 1.03 in thirteen; `deadline` 0.53 to 0.85, a floor, in seven |
+| 8 Mbit/s, 250 ms, path I | `deadline` 0.11 (a stall), `budget` 0.51 | `budget` 0.47 to 0.49 | `deadline` 0.04 to 0.51, a floor, in sixteen; `budget` 0.01 to 0.37, a floor, in four |
+| 0.4 Mbit/s, 80 ms, path C | `plateau` 0.90 to 0.91, 31.9 to 33.0 ms | `plateau` 0.90, 32.7 ms, in one run; `budget` 0.90, a floor, with 48,000 bytes, in the other | `budget` 0.86 to 0.88, a floor, with 46,800 to 48,000 bytes, in twelve; `plateau` 0.81 to 1.01 in eight, with 56,400 bytes at most |
+
+- **The cells a stall capped in production** read their links alone, and under noise as
+  4a-3b's rule reads them there, floors at 250 ms among them, but for one P-e break at
+  80 ms (below).
+- **0.4 Mbit/s at 250 ms on path I** reads as on 4a-3b's rule, `budget` at 0.81 with
+  39,600 bytes, a floor. Its first trial, which the pair's lead engaged in the first
+  round, lifted: the train's window was under the 11 messages the path holds, so no
+  packet met a queue. The write budget, counted from that first cap, then held the climb,
+  and a second trial engaged before the budget stopped it. The step's first rule counted
+  the budget afresh after the lift and read the link there with 60,000 bytes, 4,000 under
+  P-f's bound.
+- **0.4 Mbit/s at 80 ms on path C** stops at 0.87 to 0.90 of the link on either side of
+  its trial, in the grid's two runs and five more runs of the 0.4 Mbit/s cells, all alone.
+  Where the trial was confirmed, at 1,257 to 1,262 ms in five of those seven runs, the
+  train read its plateau at 0.87 to 0.90; where it lifted, in the other two, the estimate
+  it engaged at was the paced climb's, under the link's, so the cap left no queue that
+  stood 10 ms, and the write budget, counted from that first cap, was spent before a
+  second trial: `budget` at 0.90, a floor, with 48,000 bytes. The low edge is 4a-3b's
+  either way; what changes is that a lifted trial reads it as a floor.
+- **Under noise the rule broke seven runs of 480**, in four passes that each shared the
+  host with other builds (its CPU at 37, 84, 57 and 88 % on average): none in the first,
+  one in the second, four in the third and two in the fourth, every one under a seed that
+  held in other passes. The noise is seeded, so what differed between the passes is the
+  host's own scheduling; these are not traced. At 0.4 Mbit/s and 80 ms on path I, under
+  seeds 1 and 5, and at 2 Mbit/s and 20 ms on path C, under seed 2, a trial was confirmed
+  and the train stopped on plateaus at 0.68, 0.72 and 0.48 (P-a). At 50 Mbit/s and 20 ms
+  on path C, under seed 4, a claim was confirmed at 0.02 and 0.03 in two passes (P-a),
+  which 4a-3b's rule broke too. At 0.4 Mbit/s and 20 ms on path C, under seed 5, a
+  confirmed claim's trial queued 66.3 ms (P-e), the kind of break the model found for the
+  probe on short slow paths under noise (below). At 8 Mbit/s and 80 ms on path I, under
+  seed 3, the trial lifted, a second engaged, and the train wrote D38's 512 KiB at 0.97 of
+  the link with a queue of 87.0 ms over a least round trip of 83.9 (P-e). On 4a-3b's rule
+  two passes broke five runs, and four of them held on this rule in all four: P-a at
+  8 Mbit/s and 80 ms on path C (a plateau at 0.08), P-e and P-f at 0.4 Mbit/s and 80 ms
+  on path C (134.5 ms, with 70,800 bytes), P-a there under another seed (0.77), and P-e
+  at 8 Mbit/s and 80 ms on path I under seed 5 (95.5 ms, at 512 KiB). Under the noise the
+  train wrote 56,400 bytes at most at 0.4 Mbit/s.
+- **On a quiet host the rule broke none.** To read those passes apart from the builds
+  beside them, 4a-3b's rule, this rule and the build with the refund (the table above)
+  were compiled from one tree with one harness and took turns at `grid_under_noise`, in
+  rounds whose order rotated. A pass began after two minutes with no build on the host and
+  was sampled for one every 5 s, and a round counted only if no pass of it saw one. Four
+  of six rounds saw one; the passes of the two that counted ran at 34 to 47 % of the
+  host's CPU on average. In their 240 runs a rule, this rule broke none, the build with
+  the refund three and 4a-3b's rule seven: P-a at 50 Mbit/s and 250 ms on path I under
+  seeds 3 and 5 (plateaus at 0.00), at 8 Mbit/s and 80 ms on path C under seed 3 (0.06)
+  and at 50 Mbit/s and 20 ms on path C under seed 4 (0.02), and P-e at 2 Mbit/s and
+  20 ms on path I under seed 4 in both rounds (64.9 and 52.7 ms) and at 0.4 Mbit/s and
+  80 ms on path C under seed 3 (85.7 ms). None of the seven runs this rule broke in the
+  passes above broke in the two rounds. So by the verdict fixed before them (no more
+  breaks than 4a-3b's rule, and none in two passes that 4a-3b's rule held in all) the
+  rule breaks nothing new under the runner's noise. Three of the four other rounds lost a
+  pass of 4a-3b's rule to a build after this rule's pass, which then counts for nothing.
+  In two of those passes P-a broke at 8 Mbit/s and 20 ms on path C under seed 4 in both
+  and seed 5 in one, and at 50 Mbit/s there under seed 4 in one, and P-e at 2 Mbit/s and
+  20 ms on path I under seed 4 in one (64.1 ms), as on 4a-3b's rule in both counted
+  rounds. In each P-a break a first-round stall's lead of 11 to 18 ms engaged a claim,
+  its probe of three to five messages came back no more than a quarter faster than the
+  claim, which confirmed it, and the train stopped on a plateau at 0.09 to 0.15 of the
+  link (0.02 at 50 Mbit/s): the probe read SCTP's pace, not the link's (found and
+  standing, below). 4a-3b's rule broke the first of these at the same 0.09 in a pass
+  sampled too sparsely to count, its pair reading an 11.1 ms lead as the link, and the
+  last in round 2.
+
+**Found, and standing.**
+
+- **A first-round stall on a fast link with a long round trip ends on a floor.** At
+  50 Mbit/s behind the viewer's window, and at 8 Mbit/s behind the shallow buffer, both at
+  80 ms on path I, a stall at 0 ms holds the first SACK 40 ms. It acknowledges the whole
+  first window, whose packets left back to back, so the pair reads one message in the
+  stall's 40.6 ms, 29.6 kB/s, and engages a trial at a cap of three messages. A cap that
+  small delivers exactly what it claims: with SACKs of two packets each sample is of a
+  packet one message behind the least's, so none can stand, and the eight that lift the
+  trial come one a round trip. The budget, sized by the same estimate, is spent before
+  they do, and the train stops on it with a floor: `budget` at 0.00 behind the window
+  and at 0.03 behind the shallow buffer, after 24,000 to 26,400 bytes and 892 to 924 ms,
+  in five runs of five. On 4a-3b's rule both read plateaus at 0.00 and 0.03 in every
+  run. A lift that moved the budget cured them and broke P-f's bound (above). A pair's
+  lead put to the test by delivery on every path, as a short path's claim is, would
+  refute this one in a round trip; its probe must fill a quarter more than the least
+  round trip and the writer's reply, which on a link slower than the claim queues a
+  quarter of the round trip. That is not built here.
+- **On a short fast path a stall longer than the probe can refute still confirms a
+  claim.** The probe reads a faster link more than a quarter over the claim for leads up
+  to about 37.5 ms less a quarter of the least round trip and 1.25 times the writer's
+  reply, 13 ms at 50 ms in the model. Over 19,528 model runs at 2 to 50 Mbit/s and least
+  round trips of 30 to 55 ms, with stalls of 12 to 25 ms, 1,654 break a property, against
+  3,670 on 4a-3b's rule. A probe sized from the claim cannot serve both a faster link,
+  which needs more messages out, and a slower one, on which each extra message is queue:
+  over 1,600 model runs of short slow paths under noise, the breaks new against 4a-3b's
+  rule went from 21 to 25 with the probe by the least round trip, the four more all P-e. An
+  incremental test, a probe that grows until the delivery answers, is the next derivation.
+- **A short path's probe reads SCTP's pace, not the link's.** The bound in the item above
+  is `CLAIM_QUEUE`'s derivation (`agents/roomlerd/src/media_train.rs:91-103`), which has a
+  probe of k messages come back within the least round trip R and the writer's reply d.
+  The receiver acknowledges two packets a SACK, so a probe of three keeps its third out
+  until the cap lets a partner follow it after the next SACK, and SCTP's congestion
+  window, 4,380 bytes when the trial engaged, held part of a probe of five pending. In
+  three of the four P-a breaks under the runner's noise (above), the test then counted
+  one SACK, 2,400 bytes, 27 to 30 ms after its count began: two messages, which read
+  2L/(R + d) of a lead L's claim. So the test refutes a lead only above 1.25(R + d)/2, 17 to
+  19 ms over those round trips, and a stall's shorter lead confirms its claim however fast
+  the link: there 17.7, 16.1 and 11.1 ms. In the fourth, a probe of four came back whole
+  28.1 ms after its count began, but 3,600 of its bytes had waited in SCTP's window when
+  the trial engaged, and over their sends (`span`, `:943`) the delivery read within a
+  quarter of the claim. A pair's lead put to the test by delivery on every path (the first
+  item) needs a probe sized by what SCTP lets out and acknowledges in the round trip the
+  test reads, not by what the cap allows.
+- **P-f at 0.4 Mbit/s on path C at 120 and 160 ms breaks on every rule, 4a-3b's
+  included** (the model, off the grid): the first cap comes at 1.3 to 1.9 s, with about
+  47 KB already acknowledged, so the budget's sum passes 64 KB at the link's own rate. It
+  comes before this step.
 
 **The shallow buffer: green paced, and a measurement (D43, D44).** At 8 Mbit/s and 80 ms
 with a queue of 20 ms, the unpaced train failed P-a on path I in every run: it stopped on
@@ -2309,7 +2634,7 @@ burst, not from what was in flight. Paced (above), a flight leaves spread over i
 trip, the queue builds only once a round carries more than the link, and the round before
 the loss carries the link: 1.00 in each of five runs of the code as merged, and 0.84 to
 1.02 over ten with E-pace-3's. The cell stays ignored, as a measurement
-(`agents/roomlerd/src/media_train.rs:1529`): it ends on a push-back, whose low edge a busy
+(`agents/roomlerd/src/media_train.rs:1870`): it ends on a push-back, whose low edge a busy
 runner moves, and its least reading so far sits 0.04 above P-a's bound.
 
 **Under a busy runner's noise.** CI run 44383834538, on PR #4034, broke P-f in the
@@ -2345,12 +2670,12 @@ A few milliseconds of noise moved the judgment one SACK later and spent them. Th
 budget (above) is the rule that holds however late the judgment comes, and the run of
 samples in a row lets a dip start the count again instead of sinking a round.
 
-The cells' noise (`runner_noise`, `agents/roomlerd/src/media_train.rs:1434`) is 2 ms of
+The cells' noise (`runner_noise`, `agents/roomlerd/src/media_train.rs:1775`) is 2 ms of
 jitter on every packet each way and on every step of the writer, and a stall of up to
 20 ms about every half second on each of the three. Four standing cells run under it
-(`noisy!`, `:1443`, seeds 1 to 4): 0.4 and 2 Mbit/s at 250 ms on both paths,
+(`noisy!`, `:1784`, seeds 1 to 4): 0.4 and 2 Mbit/s at 250 ms on both paths,
 where a judgment that comes late writes the most. The ignored measurement
-`grid_under_noise` (`:1471`) runs the 24 grid cells under five seeds each. It has not run
+`grid_under_noise` (`:1812`) runs the 24 grid cells under five seeds each. It has not run
 paced. In its two runs on these rules before the pacer, P-f held in all 240 runs, at 44,400 bytes at most, and the four
 standing cells' links broke nothing under any seed. Three runs broke another property,
 each in a cell the write budget does not touch:
@@ -2401,13 +2726,13 @@ session the train's receiver is the browser's SCTP, which shares none of this co
   SCTP.
 
 **The tests** (`cargo test -p roomlerd --lib -- media_train`). The cells run in real
-time and one at a time (`TURN`, `agents/roomlerd/src/media_train.rs:929`), and ask
+time and one at a time (`TURN`, `agents/roomlerd/src/media_train.rs:1235`), and ask
 Windows for 1 ms timers. Windows 11 stops honouring that request from a background
 process after a few seconds: on the dev box a probe's 1 ms sleeps took 15.4 ms from its
 sixth second on, and two module runs broke seven and nine cells, every 20 ms cell
 reading a least round trip of 30 to 60 ms with the steps 15.6 ms apart. So each cell
 first takes the timer resolution out of the power throttling's hands
-(`keep_timer_resolution`, `:1114`), as Microsoft documents it for a process that needs
+(`keep_timer_resolution`, `:1436`), as Microsoft documents it for a process that needs
 its timers. In five runs on a Windows box the cells took 75.7 to 76.4 s, 12.5 s of it
 the four noise cells. Paced, the 24 grid cells and the four noise cells took 61.8 to
 63.5 s in four runs, and the nine named cells 16.0 to 19.0 s in five. On the rule before
@@ -2420,15 +2745,26 @@ write budget, one of six runs of the whole lib suite on the dev box still broke 
 the quiet grid cell at 8 Mbit/s and 80 ms, and three of 240 noisy runs broke P-a or P-e.
 Each break went through the rate estimate, whose limits stand as found (above). So
 `cargo test` runs only what timing cannot flip:
-- the twenty-one machine tests, which drive the rules on readings made up by hand;
+- the thirty-eight machine tests, which drive the rules on readings made up by hand;
 - the nine named cells, which ended on a floor (`budget`, `deadline` or `ready`) and broke
   nothing in eleven unpaced runs, six of them inside the loaded lib suite. Paced, each run
   alone, they held in four runs of five; in the fifth the two viewer's window cells
-  failed, when a stall started the cap (above);
+  failed, when a stall started the cap (above). With the cap on trial they held in five
+  runs of five (the cap on trial, above);
 - the pacer's own tests in the fork, in the `vendored-sctp` job (`docs/tunnels.md`).
 
-The 24 grid cells and the four noise cells are ignored. They are run alone before a
-change to the train merges, and their numbers are recorded here:
+The stall cells stay measurements. Timing can flip each one that 4a-3b's rule fails and
+this one holds: after the stall, two SACKs that a busy runner delivers 10 ms late among
+the eight samples that judge the trial confirm it, as one late SACK capped the window
+cells in the production run of 4a-3b. The cheapest that timing cannot flip, the path I
+window cell with a stall mid-climb, reads a floor whatever the trial does, since the
+peer's window holds the train there; it read the same floor on 4a-3b's rule, so in CI it
+would gate nothing. The gate for the trial is the machine tests, which drive it on
+readings made up by hand: nineteen of them fail on 4a-3b's rule, and each of the rule's
+mechanisms, undone alone, turns at least one of them red.
+
+The 24 grid cells, the four noise cells and the twelve stall cells are ignored. They are
+run alone before a change to the train merges, and their numbers are recorded here:
 
 ```
 cargo test -p roomlerd --lib media_train::cells -- --ignored --skip shallow_buffer_stops_on_loss --skip grid_under_noise --skip ramp
@@ -2440,9 +2776,10 @@ cargo test -p roomlerd --lib media_train::cells -- --ignored --skip shallow_buff
 | `cells::path_{i,c}_{0_4,2}_mbps_250_ms_under_noise` | ignored, a measurement (D44): the four noise cells, a busy runner's seeded noise on the slow links at 250 ms |
 | `cells::path_c_a_shallow_buffer_reads_a_floor_or_stops_on_loss`, `cells::path_{i,c}_a_peer_window_limit_is_a_floor`, `cells::path_{i,c}_a_link_with_room_ends_on_budget_or_deadline`, `cells::path_{i,c}_a_window_of_0_3_s_at_{80,250}_ms_reads_a_floor` | the named cells, run by `cargo test` |
 | `cells::path_i_a_shallow_buffer_stops_on_loss` | ignored, a measurement (D44): D43's cell, green paced, run with `--ignored` |
+| `cells::path_i_8_mbps_20_ms_stalls_{in_the_first_round,mid_climb,before_the_cap}`, `cells::path_i_a_shallow_buffer_stalls_{in_the_first_round,mid_climb,before_the_cap}`, `cells::path_{i,c}_a_peer_window_stalls_{in_the_first_round,mid_climb,before_the_stop}` | ignored, a measurement (D44): the twelve stall cells, each a cell above with a host stall of 40 ms; each must read as its cell does without it |
 | `cells::grid_under_noise` | ignored: the 24 grid cells under five seeds of the noise, about four minutes, run with `--ignored --nocapture`; it fails when any run breaks a property, as three of 240 did (above) |
 | `cells::path_c_ramp_to_the_link_rate` | ignored: the ramp, about 40 s, run with `--ignored --nocapture` |
-| `machine::*` | twenty-one tests of the machine alone, on readings made up by hand: the first write and its budget, round 1's window, a stopped train's answer, the floors, the train's own losses, the deadline, the budget, a delay stop at a round's end and none in a round of fewer than four samples, P-d's edge, the high edge, a run of samples that stands, one that a sample or a silence starts again, a spent write budget, a fast link without one, and the pacing: the share, the largest whose queue keeps within three quarters of P-e's bound; the pace, which follows the least round trip and then the cap; its end on every stop; and the switch, off once the writer stops, ends or is dropped |
+| `machine::*` | thirty-eight tests of the machine alone, on readings made up by hand: the cap's trial (a stalled sample never caps; a second stall never confirms a trial; a true queue caps within the derived lag and is confirmed; a queue that stands in one sample of four confirms it; a sample exactly 10 ms above the least confirms; a stall that ends at the trial's edge lifts it; a round held on trial is no plateau; a stall's released SACKs read no faster than their bytes were sent; a slow link's pair engages the cap in the first round, and a paced first sample is no pair; on a short path a lead is a claim, which the delivery confirms once the probe was out and refutes when the link is faster, on every short path, while the probe holds the cap), the first write and its budget, round 1's window, a stopped train's answer, the floors, the train's own losses, the deadline, the budget, a delay stop at a round's end and none in a round of fewer than four samples, P-d's edge, the high edge, a run of samples that stands, one that a sample or a silence starts again, the write budget (a spent one holds the writer and ends on a floor; it counts from the first cap and never turns off; a lifted trial never moves it; it holds P-f at 0.4 Mbit/s), and the pacing: the share, the largest whose queue keeps within three quarters of P-e's bound; the pace, which follows the least round trip and then the cap; its end on every stop; and the switch, off once the writer stops, ends or is dropped |
 | `association::pacer::pacer_test::*`, `test_pacer_*`, `test_assoc_pacer_the_write_loop_wakes_for_the_chunk_it_held` (the fork: `cargo test --manifest-path crates/vendored/webrtc-sctp/Cargo.toml --lib pacer`, seeded as `docs/tunnels.md` says) | the pacer: twelve tests of it alone (off, before a round trip, the share in slow start, the whole window above the threshold, the least round trip, the 2 ms and 17 ms spans, the cap, the two wakes, the tokens, a switch of no association); three of the association's send path with it (nothing held when off or before a round trip; the round trip from a SACK, and new data held; the cap holds new data, and a retransmission never waits); and one of the write loop, which wakes for a chunk the pacer held (`crates/vendored/webrtc-sctp/src/association/association_test.rs:3668`) |
 
 ## Path numbers and their provenance (FR-148 P0) — how each was obtained, and how old it is
@@ -4796,7 +5133,7 @@ word (`d50`), beside the law before D50 (`d48`: the same `Pipe` passed no clock,
 `Pipe::set_unclocked`, `agents/roomlerd/src/encode/pipe.rs:595`), B2 as built (`c`) and rules
 1 to 3 alone (`rr+bm0+u90+l`), and prints each fall of the product's fold: its time, the
 push-back, and the floor before and after (`print_drop`,
-`agents/roomlerd/src/media_delivery.rs:7259`). Every fold reads the same run, so each
+`agents/roomlerd/src/media_delivery.rs:7377`). Every fold reads the same run, so each
 comparison with `d48` is paired: "fixed" is a run off the bar under `d48` and on it under
 `d50`, "broke" the reverse, "moved" any change of the end floor or capacity. The bar and its
 count are D48's ([above](#a-path-that-drops-who-bound-the-sample-d48)): the budget writers
@@ -4937,17 +5274,17 @@ flowchart LR
 ```
 
 **The closed loop (B4c).** `media_delivery::shaped_link::tcp_shape::closed_loop`
-(`agents/roomlerd/src/media_delivery.rs:9428`) runs the VP9-444 pump's own loop on a relay
+(`agents/roomlerd/src/media_delivery.rs:9546`) runs the VP9-444 pump's own loop on a relay
 session: the pump's gate and its 2 ms retry, a 30 fps capture, the real governor (its
 AIMD, fps cap, age loop, link loop and drain), and an encoder that spends its target over
 the gap between the pts it is handed (`encode::charge`), as libvpx's one-pass CBR does,
 against a viewer that reports as the browser does. The path is B3T's: 2 Mbit/s on the wire, of which SCTP's
 payload gets E_sat = 0.8137, behind a 512 KiB first hop as the relay's socket holds on
 TURN over TCP (`HOP`), with the relay's stalls on the agent's direction (`RELAY_STALLS`,
-`:9478`), deltas of at most 40 kB (`DELTA_MOST`, `:9464`) and an 800 kB opening key
-(`OPENING_KEY`, `:9471`). `run_loop` (`:10276`) runs one arm, `read` (`:10387`) and `gate`
-(`:10692`) read it, and `print_gate` (`:10951`) prints the trail the lab reads by
-heartbeat. The cell (`:11017`) runs `off` for 90 s, then `on` for 240 s. `off` must fill
+`:9596`), deltas of at most 40 kB (`DELTA_MOST`, `:9582`) and an 800 kB opening key
+(`OPENING_KEY`, `:9589`). `run_loop` (`:10394`) runs one arm, `read` (`:10505`) and `gate`
+(`:10810`) read it, and `print_gate` (`:11069`) prints the trail the lab reads by
+heartbeat. The cell (`:11135`) runs `off` for 90 s, then `on` for 240 s. `off` must fill
 at least 0.95 of the payload over a standing queue of more than 500 ms. For B4, `on`,
 from the prior's crossing of the band or else over its last 60 s, had to fill at least
 0.92 of the payload and 0.95 of `off`, with the fps divisor at 2 or more in at most a
@@ -5326,30 +5663,30 @@ encoder is never handed.
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:4324` (the send task's count), `:4338` and `:4366` (each frame taken, each chunk released), `:4421` (the pair), `:4540` (the gate's count), `:4559` (the step), `:5254` (the watermark), `:5289` (`on_handed`), `:5306` (a full channel) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:7344` (the send task's count), `:7365` and `:7420` (each frame taken, each chunk released), `:7755` (the pair), `:8150` (the gate's count, the ledger beside the channel), `:8225` (the step), `:9944` (`on_handed`), `:9970` (a full channel) |
 | the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3538` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2165` (its echo), `:2754` (its check) |
-| the harness's outages and reads | `agents/roomlerd/src/media_delivery.rs:4912` (`Outages`), `:5131` (`out_direction`), `:7608` (`outaged`), `:8758` (`print_releases`), `:8818` (`recoveries`), `:8974` (`stalls_against_today`), `:9203` (`outages_against_today`) |
+| the harness's outages and reads | `agents/roomlerd/src/media_delivery.rs:4912` (`Outages`), `:5131` (`out_direction`), `:7726` (`outaged`), `:8876` (`print_releases`), `:8936` (`recoveries`), `:9092` (`stalls_against_today`), `:9321` (`outages_against_today`) |
 | B2's view of the budget | `agents/roomlerd/src/media_inflight.rs:625` (`Over`), `:868` (`over`), `:925` (`held_each`), `:820` (`still_after`), `:833` (`take_mark`), `:738` (the mark in `step`), `:1873` (`Shadow::take_mark`); the opening: `:644` (`Over::opening`), `:897` (its reading in `over`), `:734` (the first measured rate, in `step`), `:1175` (the rate's provenance, in `rate_at`), `:986` (a new association's opening, in `on_new_association`) |
 | B2's push-backs | `agents/roomlerd/src/media_delivery.rs:255` (`SamplePushBack`), `:277` (`Burst`), `:321` (`BURST`), `:331` (`settle`), `:412` (`push_back_of`), `:454` (P3, with the opening's), `:903` (`Budget::over` at a sample's close), `:756` (`heartbeat`, the hand-off), `:789` (`due_read`), `:799` (`on_mark`), `:1043` (`on_frame`, the mark) |
 | the shadow model and the memory | `agents/roomlerd/src/encode/pipe.rs:295` (`STALL_WINDOWS`), `:518` (`observe_sample_capacity`), `:537` (`note_stall`), `:938` (`PushedBy`), `:1016` (`PathModel::sample_pushed_back`); `agents/roomlerd/src/encode/governor.rs:1636` (the window's take), `:2359` (`on_sample_push_back`), `:2370` (`note_path_stall`); `agents/roomlerd/src/encode/pair_memory.rs:1071` (`sample_pushed_back_in`) |
-| the harness's B2 | `agents/roomlerd/src/media_delivery.rs:6583` (`handed`), `:6625` (`model_fold`), `:6900` (`print_b2`); the opening rules: `:6433` (`Open`), `:6451` (`OPENS`), `:6476` (`holds_over`), `:6501` (`opening_of`) |
+| the harness's B2 | `agents/roomlerd/src/media_delivery.rs:6701` (`handed`), `:6743` (`model_fold`), `:7018` (`print_b2`); the opening rules: `:6551` (`Open`), `:6569` (`OPENS`), `:6594` (`holds_over`), `:6619` (`opening_of`) |
 | B3's gate | `agents/roomlerd/src/media_inflight.rs:1507` (`Pass`), `:1535` (`Pass::shuts`), `:1558` (`decreases`), `:1573` (`sheds`), `:1738` (`Shadow::gate`), `:1761` (`gate_with`), `:1797` (`acts_on`), `:1804` (`acting`), `:1824` (`shut`), `:1835` (`shed`), `:1630` (`for_pump`, with no warning), `:839` (`Budget::stalled`), `:851` (`note_acted_hold`), `:299` (`WindowReport::acted`) |
 | B3's sampler | `agents/roomlerd/src/media_delivery.rs:1150` (`DeliverySampler::gate`), `:1212` (`gated`: the stall mark and the mode line), `:1232` (`shuts`), `:1246` (`on_skip`), `:1259` (`sheds`), `:1043` (`on_frame`, which reads nothing while the budget acts), `:1131` (`note_gate`), `:1382` (`say_budget_mode`), `:1454` (the fields) |
 | B3 in the pumps | the VP9-444 pump: `agents/roomlerd/src/peer.rs:4536` (the budget's gate), `:4537` (the capacity gate), `:4550` (the decrease), `:4555` (the 2 ms sleep), `:5241` (the watermark arm); the FFmpeg pump: `:8094` (today's byte gate), `:8121` (FR-70's check of it), `:8135` (the budget's gate), `:8136` (the capacity gate), `:8154` (the fps pause), `:8176` (FR-35's stuck timer), `:8194` (the grace), `:8196` (the decrease) |
-| the harness's B3 | `agents/roomlerd/src/media_delivery.rs:5874` (`Budgeted::On`), `:6017` (`Core::On`), `:7819` (its writer), `:7516` (`TcpRun::acted`), `:8919` (`turned_on`), `:9348` (`print_b3`), `:9389` (the cell) |
+| the harness's B3 | `agents/roomlerd/src/media_delivery.rs:5992` (`Budgeted::On`), `:6135` (`Core::On`), `:7937` (its writer), `:7634` (`TcpRun::acted`), `:9037` (`turned_on`), `:9466` (`print_b3`), `:9507` (the cell) |
 | D48's sample rules | `agents/roomlerd/src/media_delivery.rs:442` (`sample_read_of`: rule 1's re-read, rule 4's ramp), `:264` (`SampleRead`), `:412` (`push_back_of`), `:789` (`due_read`), `:779` (the heartbeat's hand-off); `agents/roomlerd/src/media_inflight.rs:651` (`Over::ramp`), `:655` (`Over::rate`), `:954` (`ramp_sized`), `:759` (the mask, in `step`), `:529` (`whole_grains`), `:925` (`held_each`), `:104` (`HELD_SHARE_PERCENT`); `agents/roomlerd/src/encode/governor.rs:2380` (`on_sample_ruled`) |
 | D48's window rules | `agents/roomlerd/src/media_delivery.rs:342` (`path_rate`), `:1101` (`DeliverySampler::note_path_rate`); `agents/roomlerd/src/media_inflight.rs:913` (`Budget::loss`), `:979` (its sum across associations); `agents/roomlerd/src/encode/governor.rs:2393` (`note_path_rate`), `:1855` (the link loop's push-back); `agents/roomlerd/src/encode/pipe.rs:202` (`PathRate`), `:267` (`WindowRule`), `:284` (`HOLE_TENTHS`), `:621` (`close_window`), `:332` (`observe_delivered_in`), `:417` (`observe_capacity_in`), `:435` (`observe_link_capacity_in`) |
 | D48's line field | `agents/roomlerd/src/encode/pipe.rs:231` (`Ruled`), `:601` (`note_ruled`), `:607` (`ruled`), `:1254` (`PathView::model_ruled`); `agents/roomlerd/src/media_delivery.rs:1507` (`RuledShown`), `:1561` (the field) |
-| the harness's D48 | `agents/roomlerd/src/media_delivery.rs:6529` (`Rules`, the folds), `:6569` (`RULES`), `:6666` (`fold_with`), `:6632` (`path_rate_at`), `:6130` (`Step::ramp_held`), `:7259` (`print_drop`), `:7069` (`print_held`) |
+| the harness's D48 | `agents/roomlerd/src/media_delivery.rs:6647` (`Rules`, the folds), `:6687` (`RULES`), `:6784` (`fold_with`), `:6750` (`path_rate_at`), `:6248` (`Step::ramp_held`), `:7377` (`print_drop`), `:7187` (`print_held`) |
 | D50's fall event | `agents/roomlerd/src/encode/pipe.rs:890` (`PathModel`: `run`, `fell`), `:1059` (`under_floor`: the event, the level and the run), `:1024` (`sample_pushed_back_clocked`), `:1124` (`pushed_back_clocked`), `:1163` (`raise`, which closes a run), `:148` (`CAPACITY_TTL`); the clock: `:580` (`Pipe::clock`), `:477-478` (`capacity_in`), `:528-529` (`observe_sample_capacity`); the memory's calls, with no clock: `agents/roomlerd/src/encode/pair_memory.rs:1047-1048` |
 | D50's line field | `agents/roomlerd/src/encode/pipe.rs:916` (`Fall`), `:1082` (`PathModel::fell`), `:1257` (`PathView::model_fell`); `agents/roomlerd/src/encode/governor.rs:2349` (`path_view`); `agents/roomlerd/src/media_delivery.rs:1520` (`FellShown`), `:1564` (the field) |
-| the harness's D50 | `agents/roomlerd/src/media_delivery.rs:6537` (`Rules::D50`, the product's fold), `:6563` (`Rules::clocked`), `:6677` (the law before D50 for the other folds: `Pipe::set_unclocked`, `agents/roomlerd/src/encode/pipe.rs:595`), `agents/roomlerd/src/media_delivery.rs:6717` and `:6821` (a fall marked at a sample's hand-off and at a window's push-back), `:6418` (`ModelFold::falls`), `:7259` (`print_drop`: the `D50 falls` and `D50 fall` lines) |
+| the harness's D50 | `agents/roomlerd/src/media_delivery.rs:6655` (`Rules::D50`, the product's fold), `:6681` (`Rules::clocked`), `:6795` (the law before D50 for the other folds: `Pipe::set_unclocked`, `agents/roomlerd/src/encode/pipe.rs:595`), `agents/roomlerd/src/media_delivery.rs:6835` and `:6939` (a fall marked at a sample's hand-off and at a window's push-back), `:6536` (`ModelFold::falls`), `:7377` (`print_drop`: the `D50 falls` and `D50 fall` lines) |
 | B4's owners (D51) | `agents/roomlerd/src/media_inflight.rs:1558` (`Pass::decreases`), `:1567` (`Pass::hears_hold`), `:811` (`Budget::held_lately`); `agents/roomlerd/src/media_delivery.rs:1246` (`on_skip`), `:1101` (`note_path_rate`), `:359` (`envelope_ms`), `:372` (`Largest`); `agents/roomlerd/src/encode/governor.rs:69` (`GateSkip`), `:1073` (`on_budget_hold`), `:1208` (the budget's ceiling), `:2445` (`sent_bps`), `:1770` (the envelope); `agents/roomlerd/src/encode/viewer_rate.rs:779` (`observe_within`); `agents/roomlerd/src/encode/aimd.rs:152` (`CeilingSource::Budget`) |
-| the harness's B4c | `agents/roomlerd/src/media_delivery.rs:9428` (`closed_loop`), `:10276` (`run_loop`), `:10387` (`read`), `:10692` (`gate`), `:10951` (`print_gate`), `:11017` (the cell) |
+| the harness's B4c | `agents/roomlerd/src/media_delivery.rs:9546` (`closed_loop`), `:10394` (`run_loop`), `:10505` (`read`), `:10810` (`gate`), `:11069` (`print_gate`), `:11135` (the cell) |
 | B4f's and B4g's charge (D51) | `agents/roomlerd/src/encode/charge.rs:30` (`Stamp`), `:52` (`refed_pts`, #3472's rule, moved from `encode::libvpx`), `:68` (`Gate`), `:82` (`charge`), `:115` (`GateClock`), `:125` (`skipped`), `:130` (`passed`), `:141` (`paused`, FR-148), `:149` (`take`); `agents/roomlerd/src/encode/governor.rs:2430` (`charge_interval`); `agents/roomlerd/src/encode/thread.rs:81` (`EncoderOps::encode_charged`), `:121` (`Cmd::Encode`, which carries the gate), `:238` (`EncoderThread::encode_charged`), `:316` (the encode arm of the thread's `serve`), `:427` (`EncoderHandle::encode_charged`); `agents/roomlerd/src/encode/libvpx.rs:168` (`last_pts`), `:649` (`encode_at`), `:727` (the charge in `encode_at`), `:755` (the stamp kept after an encode), `:844` (`encode_charged`); `agents/roomlerd/src/peer.rs:4060` (`gate_clock`), `:4539` (a pass the gate skipped), `:4558` (the pass it let through), `:4989` (a drain pause, FR-148), `:5069` (the hand-off before the encode), `:5074` (`encode_charged`), `:5275` (the wire's stamp, untouched) |
 | B4g's source of the measured reading | `agents/roomlerd/src/encode/pipe.rs:966` (`MeasuredBy`), `:987` (`word_of`), `:1230` (`PathView::measured_by`); `agents/roomlerd/src/encode/governor.rs:2475` (`measured_tagged`), `:2333` (in `path_view`); `agents/roomlerd/src/media_delivery.rs:1545` (the line's field) |
 | C11's reading | `agents/roomlerd/src/media_inflight.rs:811` (`Budget::held_lately`), `:607` (`own`), `:994` (`forget_reading`), `:963` (`reset_least`), `:972` (`on_new_association`), `:1180` (`own` in `rate_at`), `:381` (`Figure::from`) |
-| the harness's B4f and B4g | `agents/roomlerd/src/media_delivery.rs:10071` (the encoder model's charge), `:9900` (its gate clock), `:9917` and `:9942` (a pass skipped, a pass let through), `:10040` (a drain pause, FR-148), `:10067` (the take), `:9500` (`SLOW_CAPTURE`), `:11053` (C6s), `:9748` (the bar's marks in `Pumped`), `:9755` (each encode's gated and charged time), `:10837` (`Bar`), `:10858` (`settled_from`), `:10862` (`bar`), `:10911` (`bar_words`), `:10951` (`print_gate`, which carries the bar), `:11017` (the cell) |
+| the harness's B4f and B4g | `agents/roomlerd/src/media_delivery.rs:10189` (the encoder model's charge), `:10018` (its gate clock), `:10035` and `:10060` (a pass skipped, a pass let through), `:10158` (a drain pause, FR-148), `:10185` (the take), `:9618` (`SLOW_CAPTURE`), `:11171` (C6s), `:9866` (the bar's marks in `Pumped`), `:9873` (each encode's gated and charged time), `:10955` (`Bar`), `:10976` (`settled_from`), `:10980` (`bar`), `:11029` (`bar_words`), `:11069` (`print_gate`, which carries the bar), `:11135` (the cell) |
 | the send wait (FR-148) | `agents/roomlerd/src/media_inflight.rs:1392` (`SendWait`), `:1402` (`sent`), `:1411` (`take`), `:1423` (`max_ms`), `:1431` (`SendWaitWindow`), `:1440` (`ms`), `:1456` (`SendWaitSince`), `:1464` (`avg_ms`); `agents/roomlerd/src/media_delivery.rs:678` (the sampler's field), `:1303` (`send_wait`); the VP9-444 pump: `agents/roomlerd/src/peer.rs:4299` (the channel, each frame with its hand-off instant), `:4325` (the send task's handle), `:4377` (a frame that reached the wire), `:5286` (the hand-off), `:5369` (the heartbeat's take); the FFmpeg pump: `:7144` and `:7171` (the sender window's and the direct gate's places), `:7336` (the send task's handle), `:7437` (a frame that reached the wire), `:8069` (the direct gate's read), `:9293` and `:9298` (the sender window's), `:10048` (the heartbeat's take) |
-| the harness's send wait | `agents/roomlerd/src/media_delivery.rs:9836` (the channel), `:9841` (the send task's handle), `:9874` (a frame that reached the wire), `:10115` (the heartbeat's take, every 30 frames), `:9758` (`Pumped::send_waits`), `:10853` (the bar's figures) |
+| the harness's send wait | `agents/roomlerd/src/media_delivery.rs:9954` (the channel), `:9959` (the send task's handle), `:9992` (a frame that reached the wire), `:10233` (the heartbeat's take, every 30 frames), `:9876` (`Pumped::send_waits`), `:10971` (the bar's figures) |
 
 ### The tests
 

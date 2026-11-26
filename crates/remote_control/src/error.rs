@@ -4,10 +4,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("agent {0} not online")]
+    #[error("device {0} not online")]
     AgentOffline(String),
 
-    #[error("agent {0} not found")]
+    #[error("device {0} not found")]
     AgentNotFound(String),
 
     #[error("session {0} not found")]
@@ -28,7 +28,7 @@ pub enum Error {
     #[error("invalid signaling message: {0}")]
     BadMessage(&'static str),
 
-    #[error("agent capacity exceeded")]
+    #[error("device session capacity exceeded")]
     AgentBusy,
 
     /// FR-115 P3 — the organization already runs as many remote sessions at
@@ -51,7 +51,7 @@ pub enum Error {
     /// Surfaced as `412 Precondition Failed`, never as a hang: a pre-feature
     /// agent drops the unknown tag in its debug branch, so pushing anyway
     /// would leave the caller waiting out its whole deadline for silence.
-    #[error("device {0} runs an agent without Fleet-RPC support")]
+    #[error("device {0} runs a roomlerd version without Fleet-RPC support")]
     ExecUnsupported(String),
 
     /// Fleet RPC — the device accepted the request but produced no result
@@ -74,3 +74,45 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    /// FR-133 P2e: a person reads these. The hub's `rc:error` carries the
+    /// Display as its `message` (the web app maps the code to its own words,
+    /// but `roomler exec`, the device console and the tunnel's `unreachable:
+    /// {e}` print the text), so each names the device or `roomlerd`, never an
+    /// "agent". The variant names and the error codes are wire identities and
+    /// stay.
+    #[test]
+    fn the_errors_a_person_reads_say_device_not_agent() {
+        let id = "65f0c0ffee0000000000abcd".to_string();
+        let cases = [
+            (
+                Error::AgentOffline(id.clone()),
+                format!("device {id} not online"),
+            ),
+            (
+                Error::AgentNotFound(id.clone()),
+                format!("device {id} not found"),
+            ),
+            (
+                Error::AgentBusy,
+                "device session capacity exceeded".to_string(),
+            ),
+            (
+                Error::ExecUnsupported(id.clone()),
+                format!("device {id} runs a roomlerd version without Fleet-RPC support"),
+            ),
+        ];
+        for (err, want) in cases {
+            let text = err.to_string();
+            assert_eq!(text, want);
+            assert!(
+                !text.to_ascii_lowercase().contains("agent"),
+                "{text:?} says agent"
+            );
+        }
+    }
+}

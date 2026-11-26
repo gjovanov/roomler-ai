@@ -165,7 +165,7 @@ pub async fn join_org(
     // instead — and never mint a token that cannot be consumed.
     if !agent.capabilities.multi_org.iter().any(|c| c == "join") {
         return Err(ApiError::BadRequest(format!(
-            "{} runs agent {} which predates remote org-join. Update the device \
+            "{} runs roomlerd {} which predates remote org-join. Update the device \
              (or enroll it at the keyboard with `roomler enroll --label …`).",
             agent.name,
             agent.reported_version().unwrap_or("(unknown version)")

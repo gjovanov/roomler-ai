@@ -360,7 +360,7 @@ async fn admit(
         Err(_) => {
             return Response::builder()
                 .status(400)
-                .body("Invalid agent ID".into())
+                .body("Invalid device ID".into())
                 .unwrap();
         }
     };

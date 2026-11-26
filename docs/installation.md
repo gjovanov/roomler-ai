@@ -891,7 +891,7 @@ Details worth knowing:
   inherited entries counted, and a `.prev` beside a config inherited no right for
   another account to change it (`machine_tree.rs:691`). It repairs the attempt
   record either way, and what was not closed stays refused at every start and
-  tick, until an elevated save writes a closed tree. A config that was not the
+  tick, until an elevated save writes a closed tree. An elevated save whose config does not load takes the `.prev` beside it only where a start would, by the same rule: from one a start refuses it recovers nothing, and it says so in one line (#4453, `crates/agent-core/src/config.rs:3853`). Whatever the config's state, an elevated save sets aside a `.prev` a start would not take, as `config.toml.prev.set-aside` beside it (`-1` to `-9` when that name is taken), a name no reader loads, and says `machine tree: a config.toml.prev that a start would not take is set aside`; one it cannot move stays at its name, keeping the entries it was found with as its own, and where neither can be done the save stops, naming the file and what to do (`crates/agent-core/src/machine_tree.rs:3184`). A config that was not the
   machine's is never run, never folded into (below), and `roomlerd re-enroll`
   and `roomlerd org` refuse it with nothing sent. Such a device stays without
   SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd
@@ -1937,7 +1937,7 @@ One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1441`). It gives the role to `service install` and
 `service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
 and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
-(`agents/roomlerd/src/app.rs:8054`) reads every custom action with an `ExeCommand` in both WiX
+(`agents/roomlerd/src/app.rs:8068`) reads every custom action with an `ExeCommand` in both WiX
 files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
 installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
 
@@ -1973,8 +1973,8 @@ step shows what it always showed (`crates/agent-core/src/logging.rs:2089`). A da
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2132`). The Windows lane runs the module
 beside `stderr_capture` (`.github/workflows/ci.yml:1966`). In `roomlerd`,
-`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8148`) and
-`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8181`)
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8162`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8195`)
 pin the role per command and the end line of a failure.
 
 ### Where a step on the service account finds its folders (#3702)
@@ -2066,7 +2066,7 @@ profile, or the machine's data folder) or is reached through a link below it (`k
   daemon, which runs unelevated, merges at its next start, so the merge never runs above the
   integrity level of the folder owner's own processes. When the token cannot be read, the merge
   is left too (`DataMerge`, `crates/agent-core/src/appdirs.rs:1543`;
-  `agents/roomlerd/src/app.rs:7772`). A data folder whose NEW folder is not there still moves by
+  `agents/roomlerd/src/app.rs:7786`). A data folder whose NEW folder is not there still moves by
   one rename.
 - Every run writes a note that names what it moved, what it kept beside, and what it left for
   the next start (`crates/agent-core/src/appdirs.rs:1656`).
@@ -3716,8 +3716,8 @@ sequenceDiagram
 | Side of the race | Since #3080 | Where |
 |---|---|---|
 | **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:1644`, `:1593`; `crates/tunnel-core/src/child.rs:86` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:450`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:1384` |
-| **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:450`, `crates/tunnel-core/src/overlay/netstate.rs:1253`, `macos_supervisor.rs:1384` |
+| **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:963` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
 `route -n monitor` child by its PID, after checking that its parent PID is the
@@ -3953,7 +3953,7 @@ each log line are in [the helper's gate](#macos-the-root-update-helpers-gate-fr-
 | reads | the root half over `/var/run/roomler/roomler.sock`, kept only when root serves it; the console person's half through `roomlerd one-row-home live-work`, started as that person (FR-147's child: its check of itself first, no file read or written, one bounded line back) |
 | keeps | the budget in `update-defers.json` beside `update-attempt` in root's log folder (`{"v":1,"defers":3,"next_due":…}`, 0600, read strictly), so a reboot keeps the count. Only a due cycle counts: a wake inside a chain never does |
 | waits | in place after a defer: it reads again when `next_due` comes, or at a wake at most once a minute, and exits on the opt-out, a manual install, SIGTERM, or after 8 h awake. SIGTERM also ends a check or a download in progress, without installing |
-| skips the wait | an operator's push to the root half's row: over everything. A push to the person's row, or their "Apply update" (a `roomlerd self-update` as that person, which records the ask in the daemon behind their own socket): over their own sessions and the root half's remote-control sessions, never over its SSH connections, runs, transfers or recording, or its network transition |
+| skips the wait | an operator's push to the root half's row: over everything. A push to the person's row, or their "Apply update" (a `roomlerd self-update` as that person, which records the ask in the daemon behind their own socket): over their own sessions and the root half's remote-control sessions, never over its SSH connections, runs, transfers or recording, its network transition, or a root half it could not read. An ask the root half held lapses after 10 minutes, and the update then waits for both halves. What the command prints is in [the helper's gate](#macos-the-root-update-helpers-gate-fr-151) |
 | kill switch | `sudo touch /etc/roomler/install-over-live-work`: it installs with no reading, as before FR-151 |
 
 - **What the log says.** Each defer: `auto-updater: deferring — live work a
@@ -4009,7 +4009,7 @@ flowchart TD
 | start | holds `update-helper.lock` (`flock`) beside the budget, so one helper runs at a time. The opt-out and the 5-min install-storm cooldown end the run before the feed is asked | `mac_gate::run`, `updater.rs:4559-4573`; `take_lock`, `:4840`; `cycle`, `:4629-4644` |
 | the probe | asks the release feed before it reads a half. Up to date resets the budget, and a failed probe keeps it; either ends the run | `updater.rs:4648-4671`; `budget_after_probe`, `agents/roomlerd/src/helper_gate.rs:355` |
 | the readings | `live_work` from the root half, over `/var/run/roomler/roomler.sock` and kept only when root serves it, then from the console person's half, through FR-147's child `roomlerd one-row-home live-work`, which asks the daemon behind that person's own socket. Each answer is bounded at 5 s, and the child at 30 s | `read_halves`, `updater.rs:4777`; `read_root_half`, `:4787`; `read_persons_half`, `:4805`; `ASK_TIMEOUT`, `helper_gate.rs:50`; the child's verb, `agents/roomlerd/src/one_row_home.rs:21`; `CHILD_DEADLINE`, `agents/roomlerd/src/one_row.rs:1214` |
-| the arm | a fresh ask recorded by the root half (a push to its row) forces over both halves. One recorded by the person's half (a push to their row, or their "Apply update") forces over everything their half serves and the root half's remote-control sessions, never over the root half's SSH connections, runs, transfers, recording or network transition, or a root half it could not read. A wake inside a chain installs only when nothing is live, and never counts. A due cycle takes #3429's rule, with each half it could not read as one unit of live work | `helper_arm`, `helper_gate.rs:205`; `ASK_FRESH` (10 min), `:48`; `Budget::due`, `:178`; `periodic_gate`, `updater.rs:3796` |
+| the arm | a fresh ask recorded by the root half (a push to its row) forces over both halves. One recorded by the person's half (a push to their row, or their "Apply update") forces over everything their half serves and the root half's remote-control sessions, never over the root half's SSH connections, runs, transfers, recording or network transition, or a root half it could not read. A wake inside a chain installs only when nothing is live, and never counts. A due cycle takes #3429's rule, with each half it could not read as one unit of live work. An ask the root half held lapses: it is fresh for 10 minutes, and the recheck after a defer for live work comes an hour later, so that cycle and the ones after it are a plain wake's, the person's own work included (#4423) | `helper_arm`, `helper_gate.rs:205`; `ASK_FRESH` (10 min), `:48`; `Budget::due`, `:178`; `periodic_gate`, `updater.rs:3796`; `TRANSFER_DEFER_RECHECK` (1 h), `:77` |
 | the second reading | after the download, unless the arm was forced: work that came meanwhile drops the download, on the same budget | `second_arm`, `helper_gate.rs:277`; `updater.rs:4729-4755` |
 | the budget | `update-defers.json` in root's log folder: 0600, at most 4 KiB, parsed strictly, written as a new file and renamed over. It resets just before `installer(8)` runs | `read_budget`, `updater.rs:4862`; `write_budget`, `:4892`; `Budget::parse`, `helper_gate.rs:152`; `budget_for`, `:450` |
 | the wait | after a defer, a look every 5 s, in this order: SIGTERM, the opt-out, the kill switch, its own program, 8 h awake, the due time, a wake at least 60 s after the last cycle | the loop, `updater.rs:4581-4624`; `next_step`, `helper_gate.rs:420`; `TICK`, `:52`; `AWAKE_CEILING`, `:56`; `UPDATE_HELPER_MIN_GAP`, `updater.rs:295` |
@@ -4027,6 +4027,34 @@ Macs on 2026-11-24 ([field log](fr/FR-151-mac-update-waits-for-live-work.md#fiel
 | two rows, supervised (FR-43 P2) | both. The root daemon's registry holds its own row's sessions (`agents/roomlerd/src/rc_sessions.rs:10-13`) | as two rows. A worker's own transfer or recording outside a session is not read | no cell named it |
 | one row (FR-43 P3, FR-141) | the root half, and the person's own socket, which the root daemon's GUI worker serves (`agents/roomlerd/src/consent_relay.rs:6-11`) | once both are idle; at once on a push, which only the root half takes; on the person's click, over their own desktop's sessions, as on two rows | yes: F1b, F2 at the recheck, F6 |
 | auto-update off (`/etc/roomler/disable-auto-update`) | nothing | never: postinstall removes the helper (`agents/roomlerd/packaging/macos/postinstall:789-833`), and a waiting one exits within 5 s of the marker | F7 started a run with it: the run exited |
+
+**What `roomlerd self-update` says (#4423).** The person's ask is a `roomlerd
+self-update` run as the console person. The companion's "Install update" runs it
+and shows what it prints in the Updates card (`cmd_apply_update`,
+`agents/roomler-desktop/src/commands.rs:2401`). Once it has woken the helper, it
+prints one line about what the helper does with the ask, and that depends on
+whether the Mac has a root half. The helper's own reading of that half is out of
+a person's reach: `/var/run/roomler` is root's alone, and the person socket never
+serves `live_work`. So the command looks where a person may. It connects to the
+person socket root serves them (`/var/run/roomler-person/<uid>.sock`, FR-97 P2g),
+keeps the connection only when root serves it, sends nothing, and gives up after
+500 ms: the evidence of a root half that `roomler status` reads
+(`macos_root_half_serves_me`, `crates/localapi/src/lib.rs:5879-5892`). The look is
+`root_half_seen` (`agents/roomlerd/src/helper_gate.rs:491-507`), the call is in
+`self_update_cmd` (`agents/roomlerd/src/app.rs:6623-6644`), and the lines are
+`ask_recorded_says` and `NO_ASK_SAYS` (`helper_gate.rs:518-546`):
+
+| The ask | What the look finds | The line | Why it holds |
+|---|---|---|---|
+| recorded | root serves the person socket: two rows, or one row | `Your ask is recorded: the update installs now over every remote-control session, and over every SSH connection, run, transfer and recording your own roomlerd serves, unless this Mac's root daemon serves an SSH connection, a run, a transfer or a recording, does not answer, or saw its network move in the last 10 minutes. In that case it installs when nothing on this Mac is in use, or within about seven hours if something still is.` | the ask skips the wait only when the root half answers, serves nothing beyond remote-control sessions, and saw no network move. Otherwise the ask lapses after 10 minutes, and the update waits as on a plain wake, the person's own work included, until the force after 7 counted defers. The line names what the root half serves, so it holds whatever the helper then reads of it |
+| recorded | no socket, or one nobody serves: a per-user Mac | `Your ask is recorded: the update installs now over every remote-control session, and over every SSH connection, run, transfer and recording your own roomlerd serves.` | the helper reads the root half `not_running`, so the ask forces at once, over the SSH session the command was typed in too. A wake is read within 60 s, while the ask is fresh |
+| recorded | anything else: a server that is not root, another error, or no answer within 500 ms | the per-user line | the narrower promise: it names no wait the helper may not keep |
+| not recorded: nobody serves the person's own socket, or its daemon is older than FR-151 | no look | `The update installs when nothing on this Mac is in use, or within about seven hours if something still is.` | a plain wake: #3429's rule on both halves, on every Mac, until the force |
+
+A root half that runs but serves this person no socket (`ROOMLERD_PERSON_SOCKET=0`,
+or a person who is not at the console) reads as none. The line then says the
+update installs now while the helper waits: it can be wrong toward an install
+that comes later, never toward a wait the helper does not keep.
 
 **Its log lines**, in `/var/log/roomler/update.log`:
 
@@ -4077,7 +4105,7 @@ Macs on 2026-11-24 ([field log](fr/FR-151-mac-update-waits-for-live-work.md#fiel
   `updater.rs:4599-4607`). So leaving it alone costs one 5 s look at most, and
   the next run is the new program's. No field cell has run such an install
   during a chain: this is the code's reading, and the unit cell C16
-  (`next_wake_spaces_wakes_and_exits_on_markers`, `helper_gate.rs:737`) holds
+  (`next_wake_spaces_wakes_and_exits_on_markers`, `helper_gate.rs:825`) holds
   the step.
 
 #### A command the SYSTEM service runs (#4244)

@@ -576,7 +576,7 @@ impl AuthService {
     pub fn verify_agent_token(&self, token: &str) -> Result<AgentClaims, AuthError> {
         let claims = self.decode_any::<AgentClaims>(token, &self.validation())?;
         if claims.token_type != TokenType::Agent {
-            return Err(AuthError::InvalidToken("Not an agent token".to_string()));
+            return Err(AuthError::InvalidToken("Not a device credential".into()));
         }
         Ok(claims)
     }
@@ -589,7 +589,7 @@ impl AuthService {
     pub fn verify_agent_token_for_renewal(&self, token: &str) -> Result<AgentClaims, AuthError> {
         let claims = self.decode_any::<AgentClaims>(token, &self.renewal_validation())?;
         if claims.token_type != TokenType::Agent {
-            return Err(AuthError::InvalidToken("Not an agent token".to_string()));
+            return Err(AuthError::InvalidToken("Not a device credential".into()));
         }
         Self::within_renewal_grace(claims.exp, Utc::now().timestamp())?;
         Ok(claims)
@@ -672,7 +672,7 @@ impl AuthService {
         let claims = self.decode_any::<AgentServiceClaims>(token, &self.validation())?;
         if claims.token_type != TokenType::AgentService {
             return Err(AuthError::InvalidToken(
-                "Not an agent service token".to_string(),
+                "Not a device service credential".to_string(),
             ));
         }
         Ok(claims)
@@ -1587,5 +1587,48 @@ mod tests {
             b64(claims.to_string()),
         );
         assert!(s.verify_agent_token(&forged).is_err());
+    }
+
+    /// FR-133 P2e: a device-authed route answers a credential of the wrong
+    /// kind with these words in its 401 body, so they name the device, never
+    /// an "agent". `TokenType::Agent` and the audiences are wire identities
+    /// and stay. A service credential parses as an agent token's claims (it
+    /// only adds `anchor_id`), so it reaches the type check; the reverse needs
+    /// a token with an `anchor_id` and another type, built here.
+    #[test]
+    fn a_wrong_kind_of_device_credential_is_named_as_such() {
+        let s = svc();
+        let (agent, tenant) = (ObjectId::new(), ObjectId::new());
+        let service = s
+            .mint_agent_service_token(agent, tenant, "anchor-1")
+            .unwrap();
+        for err in [
+            s.verify_agent_token(&service).unwrap_err(),
+            s.verify_agent_token_for_renewal(&service).unwrap_err(),
+        ] {
+            match err {
+                AuthError::InvalidToken(m) => assert_eq!(m, "Not a device credential"),
+                other => panic!("{other:?}"),
+            }
+        }
+        let now = Utc::now().timestamp();
+        let not_a_service = encode(
+            &s.header(),
+            &AgentServiceClaims {
+                sub: agent.to_hex(),
+                tenant_id: tenant.to_hex(),
+                anchor_id: "anchor-1".to_string(),
+                iat: now,
+                exp: now + 60,
+                iss: "roomler-ai-test".to_string(),
+                token_type: TokenType::Agent,
+            },
+            &s.signing.encoding,
+        )
+        .unwrap();
+        match s.verify_agent_service_token(&not_a_service).unwrap_err() {
+            AuthError::InvalidToken(m) => assert_eq!(m, "Not a device service credential"),
+            other => panic!("{other:?}"),
+        }
     }
 }
