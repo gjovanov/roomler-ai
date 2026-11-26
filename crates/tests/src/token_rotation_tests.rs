@@ -466,3 +466,29 @@ async fn a_row_without_a_generation_field_rotates_from_zero() {
     assert_eq!(token_generation(&new), 1);
     assert_eq!(int(&agent_row(&app, &agent_id).await, "token_gen"), Some(1));
 }
+
+/// The commit's filter takes the repository's live predicate,
+/// `deleted_at: null`, which matches a live row with or without the field
+/// (#1821). A live row that has no `deleted_at` field rotates like any other.
+#[tokio::test]
+async fn a_live_row_without_a_deleted_at_field_rotates() {
+    let app = spawn_on().await;
+    let seeded = app.seed_tenant("fr155nodel").await;
+    let (agent_id, token) = enroll(&app, &seeded, "m-fr155-nodel").await;
+    app.db
+        .collection::<Document>("agents")
+        .update_one(
+            doc! { "_id": oid(&agent_id) },
+            doc! { "$unset": { "deleted_at": "" } },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !agent_row(&app, &agent_id).await.contains_key("deleted_at"),
+        "the row has no deleted_at field"
+    );
+
+    let new = answered_token(rotate(&app, &token, &rotation_key(60)).await).await;
+    assert_eq!(token_generation(&new), 1);
+    assert_eq!(int(&agent_row(&app, &agent_id).await, "token_gen"), Some(1));
+}
