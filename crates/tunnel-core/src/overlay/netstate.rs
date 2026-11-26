@@ -482,11 +482,25 @@ async fn monitor(
 /// one. `monitor` keeps the OS registration alive for exactly as long as this
 /// runs.
 async fn run_monitor(
+    raw_rx: mpsc::UnboundedReceiver<(RawSignal, String)>,
+    snap_tx: watch::Sender<Arc<NetSnapshot>>,
+    delta_tx: broadcast::Sender<NetDelta>,
+    prev: Arc<NetSnapshot>,
+    sampler: fn() -> NetSnapshot,
+) {
+    let stop = stop_mark().subscribe();
+    run_monitor_until(raw_rx, snap_tx, delta_tx, prev, sampler, stop).await
+}
+
+/// [`run_monitor`], with the stop mark it reads passed in. A test stands in
+/// its own, because the process's mark is never cleared.
+async fn run_monitor_until(
     mut raw_rx: mpsc::UnboundedReceiver<(RawSignal, String)>,
     snap_tx: watch::Sender<Arc<NetSnapshot>>,
     delta_tx: broadcast::Sender<NetDelta>,
     mut prev: Arc<NetSnapshot>,
     sampler: fn() -> NetSnapshot,
+    stop: watch::Receiver<bool>,
 ) {
     let quiet = debounce();
     let mut last_major_pub: Option<tokio::time::Instant> = None;
@@ -494,9 +508,7 @@ async fn run_monitor(
     let mut last_network_major_pub: Option<tokio::time::Instant> = None;
     loop {
         let Some((first, _detail)) = raw_rx.recv().await else {
-            warn!(
-                "netstate: OS backend channel closed — monitor stopping (subscribers degrade to timers)"
-            );
+            feed_closed(*stop.borrow(), false);
             return;
         };
         let mut saw_addr = first == RawSignal::Addr;
@@ -514,7 +526,7 @@ async fn run_monitor(
                     }
                 }
                 Ok(None) => {
-                    warn!("netstate: OS backend channel closed mid-burst — monitor stopping");
+                    feed_closed(*stop.borrow(), true);
                     return;
                 }
                 Err(_) => break, // quiet period elapsed
@@ -604,6 +616,30 @@ async fn run_monitor(
             }
         }
         prev = next;
+    }
+}
+
+/// #4435 — the monitor's feed closed, and the monitor stops. At the process's
+/// stop that is the stop's own doing, and one line at INFO says so: the unix
+/// backend's supervisor ends its reader, the feed's only sender, once it has
+/// read the stop mark (`STOP_GRACE`), and the runtime's shutdown, which drops
+/// that reader too, comes after the daemon's run loop has marked the stop
+/// ([`note_stopping`]). So the mark is set before the close can be seen, and
+/// this reads it after. While the process runs, a closed feed is a failure,
+/// and subscribers fall back to their timers: the WARN, in its words as
+/// before, so a grep for it still finds it.
+fn feed_closed(stopping: bool, mid_burst: bool) {
+    if stopping {
+        info!(
+            mid_burst,
+            "netstate: the network monitor stops with the process (#4435)"
+        );
+    } else if mid_burst {
+        warn!("netstate: OS backend channel closed mid-burst — monitor stopping");
+    } else {
+        warn!(
+            "netstate: OS backend channel closed — monitor stopping (subscribers degrade to timers)"
+        );
     }
 }
 
@@ -1383,7 +1419,9 @@ mod backend {
 /// arm of its run loop's `select!` does, before its teardown (`app.rs`,
 /// `note_stopping`), and the route monitor's supervisor then reads its child's
 /// exit as the stop's: one line at INFO, nothing respawned (the unix backend's
-/// `STOP_GRACE`). Windows has no monitor child and reads nothing here.
+/// `STOP_GRACE`). Windows has no monitor child. #4435 — the network monitor
+/// reads the mark too, on every OS, when its feed closes ([`feed_closed`]):
+/// INFO at a stop, the WARN while the process runs.
 ///
 /// ⚠️ Never cleared: it assumes that every arm it is called from ends the
 /// process, as each does today. A future in-process re-run of the daemon would
@@ -1896,11 +1934,9 @@ sockaddrs: <DST,GATEWAY>
 
     /// Every line at INFO and above that THIS thread logs while the guard
     /// lives. A `#[tokio::test]` runs the supervisor on the test's own thread.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[derive(Clone, Default)]
     struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl std::io::Write for Logs {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
@@ -1911,7 +1947,6 @@ sockaddrs: <DST,GATEWAY>
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
         type Writer = Logs;
         fn make_writer(&'a self) -> Logs {
@@ -1919,7 +1954,6 @@ sockaddrs: <DST,GATEWAY>
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl Logs {
         fn start() -> (Self, tracing::subscriber::DefaultGuard) {
             let logs = Self::default();
@@ -1931,13 +1965,19 @@ sockaddrs: <DST,GATEWAY>
             (logs, tracing::subscriber::set_default(subscriber))
         }
 
-        /// The supervisor's lines about a monitor exit, at `level`.
-        fn exits(&self, level: &str) -> Vec<String> {
+        /// The lines at `level` that say `needle`.
+        fn lines(&self, level: &str, needle: &str) -> Vec<String> {
             String::from_utf8_lossy(&self.0.lock().unwrap())
                 .lines()
-                .filter(|l| l.contains(level) && l.contains("the OS route monitor exited"))
+                .filter(|l| l.contains(level) && l.contains(needle))
                 .map(str::to_string)
                 .collect()
+        }
+
+        /// The supervisor's lines about a monitor exit, at `level`.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        fn exits(&self, level: &str) -> Vec<String> {
+            self.lines(level, "the OS route monitor exited")
         }
     }
 
@@ -2069,6 +2109,140 @@ sockaddrs: <DST,GATEWAY>
             "a death under a running process is not a stop"
         );
         drop(guard);
+    }
+
+    /// #4435 — the monitor with its feed already closed, under a stand-in stop
+    /// mark that reads `stopping`. With `burst`, one signal is queued first, so
+    /// the close is seen inside that burst's quiet window. The sampler is never
+    /// reached. What the monitor logged.
+    async fn a_closed_feed(stopping: bool, burst: bool) -> Logs {
+        let (logs, _logs) = Logs::start();
+        let (_stop_tx, stop_rx) = watch::channel(stopping);
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+        let (snap_tx, _snap_rx) = watch::channel(Arc::new(NetSnapshot::default()));
+        let (delta_tx, _deltas) = broadcast::channel(16);
+        if burst {
+            raw_tx.send((RawSignal::Route, String::new())).unwrap();
+        }
+        drop(raw_tx);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_monitor_until(
+                raw_rx,
+                snap_tx,
+                delta_tx,
+                Arc::new(NetSnapshot::default()),
+                NetSnapshot::default,
+                stop_rx,
+            ),
+        )
+        .await
+        .expect("a monitor whose feed has closed returns at once");
+        logs
+    }
+
+    /// #4435 (AC1) — a feed that closes as the process stops is the stop's,
+    /// not a failure: no WARN, and one line at INFO, with a burst open or not.
+    /// Master's lines WARN in both.
+    #[tokio::test]
+    async fn a_feed_closed_as_the_process_stops_logs_info_and_no_warn() {
+        let mut wrong = Vec::new();
+        for burst in [false, true] {
+            let logs = a_closed_feed(true, burst).await;
+            let warn = logs.lines("WARN", "netstate:");
+            let info = logs.lines("INFO", "the network monitor stops with the process");
+            if !(warn.is_empty() && info.len() == 1) {
+                wrong.push(format!("burst={burst}: warn={warn:?} info={info:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "a stop is not a failure: {wrong:#?}");
+    }
+
+    /// #4435 (AC2) — a feed that closes while the process runs is a failure,
+    /// and subscribers fall back to their timers: one WARN, in its words as
+    /// before, and nothing at INFO.
+    #[tokio::test]
+    async fn a_feed_closed_while_the_process_runs_warns() {
+        for (burst, words) in [
+            (
+                false,
+                "netstate: OS backend channel closed — monitor stopping (subscribers degrade to timers)",
+            ),
+            (
+                true,
+                "netstate: OS backend channel closed mid-burst — monitor stopping",
+            ),
+        ] {
+            let logs = a_closed_feed(false, burst).await;
+            let warn = logs.lines("WARN", "netstate:");
+            assert!(
+                warn.len() == 1 && warn[0].ends_with(words),
+                "a failure keeps its WARN (burst={burst}): {warn:?}"
+            );
+            println!("#4435 AC2: {}", warn[0]);
+            assert_eq!(
+                logs.lines("INFO", "netstate:"),
+                Vec::<String>::new(),
+                "a close under a running process is not a stop (burst={burst})"
+            );
+        }
+    }
+
+    /// #4435 — the field's stop, end to end: the route monitor's child ends
+    /// as the process stops, in either order against the mark (#4382's
+    /// cells), its supervisor ends, and with it the feed's only sender; the
+    /// network monitor then stops by itself, with no WARN from netstate and
+    /// one line at INFO. Master's lines WARN "OS backend channel closed" here.
+    /// The two cells' names say `monitor_child`, so the macOS lane's
+    /// supervisor step (`-- monitor_child`) runs them too.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn the_network_monitor_at_a_stop(mark_first: bool) {
+        let (first, max) = (Duration::from_millis(400), Duration::from_millis(1600));
+        let (logs, _logs) = Logs::start();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel();
+        let guard = backend::supervise_until(waiting_monitor, raw_tx, first, max, stop_rx.clone())
+            .expect("the first spawn must succeed");
+        let pid = next_monitor_pid(&mut raw_rx).await;
+        let (snap_tx, _snap_rx) = watch::channel(Arc::new(NetSnapshot::default()));
+        let (delta_tx, _deltas) = broadcast::channel(16);
+        let monitor = tokio::spawn(run_monitor_until(
+            raw_rx,
+            snap_tx,
+            delta_tx,
+            Arc::new(NetSnapshot::default()),
+            NetSnapshot::default,
+            stop_rx,
+        ));
+        if mark_first {
+            stop_tx.send_replace(true);
+            sigterm(pid);
+        } else {
+            sigterm(pid);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stop_tx.send_replace(true);
+        }
+        let ended = tokio::time::timeout(4 * max, monitor).await;
+        let warn = logs.lines("WARN", "netstate:");
+        let info = logs.lines("INFO", "the network monitor stops with the process");
+        assert!(
+            matches!(ended, Ok(Ok(()))) && warn.is_empty() && info.len() == 1,
+            "the network monitor at a stop (mark_first={mark_first}): ended={ended:?} \
+             warn={warn:?} info={info:?}"
+        );
+        drop(guard);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_monitor_child_ended_after_the_mark_ends_the_network_monitor_with_no_warn() {
+        the_network_monitor_at_a_stop(true).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_monitor_child_ended_just_before_the_mark_ends_the_network_monitor_with_no_warn() {
+        the_network_monitor_at_a_stop(false).await;
     }
 
     /// The sampler runs on the host without privileges and produces a
