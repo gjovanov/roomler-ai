@@ -86,9 +86,17 @@ and needs those lookups to accept both names.
       (Found 2026-10-31: roomlerd ships no `.rpm` at all, so `dnf info roomlerd` has nothing
       to show; only the companion ships one, and its `summary` never said "agent".) **Met
       (2026-11-03, 0.4.197):** read with `apt show` on a Linux device (the log below).
-- [ ] **AC5** — Every page, progress line and Done text of the released wizard, every companion
+- [x] **AC5** — Every page, progress line and Done text of the released wizard, every companion
       page and the web app's person-facing strings contain no "agent" outside the allowlist
-      (asserted by tests, then by P4's guard).
+      (asserted by tests, then by P4's guard). **Met (2026-11-26):** the wizard of
+      setup-v0.4.238 and the companion of agent-v0.4.238, read from the released Windows exes'
+      bytes, GREEN: the front end each one embeds, extracted and read by P4's guard, holds 0 hits
+      outside the allowlist, and the reworded Rust phrases read the new words only. The releases before
+      their rewording read RED, 8 and 3 hits (setup-v0.4.196, agent-v0.4.233)
+      ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7179148587));
+      the web app's share, P2b (#4314), read GREEN on production's served bundle after its roll
+      ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7096073584));
+      and P4's guard (#4412) reads the wizard and the companion at 0.
 - [x] **AC5b** — The daemon's notifications, the text the daemon writes for the web viewer, and
       the CLI and LocalAPI output contain no "agent" outside the allowlist (asserted by tests,
       then by P4's guard). **Met (2026-11-25):** P2a (#4307) read after publication in
@@ -240,3 +248,4 @@ now fails the guard.
 | 2026-11-03 | released 0.4.197 `.deb`, a Linux device, read-only through `roomler exec` | ✅ **AC4.** `apt show roomlerd` and `dpkg -s roomlerd`, version `0.4.197-1`: `Description: Roomler daemon (roomlerd): remote desktop, private WireGuard mesh and tunnels`, and the extended description opens "Roomler Daemon". Neither holds the word. Before P1 the package said "Roomler AI remote-control agent — runs on the controlled host, connects to the Roomler API." (the source at `00c264cc6^`). `Provides: roomler-agent` and `Replaces: …, roomler-agent` remain in the same output: those are the retired package's identity, and the criterion is about the summary. |
 | 2026-11-23 | `hosted-20261123-a238604`, production's served web app | ✅ **P2b.** The served bundle, read by chunk for 7 sampled strings ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7096073584)): before the roll (entry `index-CXJcFygu.js`, 08:31Z) every old string was there and no new one; after it (entry `index-CNJBMpkJ.js`, 08:46Z) no old string and every new one. This is the web app's share of AC5, which stays open (the companion ships in 0.4.234, and P4's guard is not built). |
 | 2026-11-25 | `hosted-20261125-236a9f7`, production's running server, after the roll | ✅ **P2d, and AC5b's last piece** ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7157059067)). The four reworded gate reasons are in the running binary and the gate's old cross-tenant phrase is at 0; the three other old phrases there come only from the server's own surface (the 60), which is outside AC5b. With P2a (0.4.234) and P2c (0.4.236) read GREEN and P4's guard at 0 hits for the daemon, AC5b is met and ticked. |
+| 2026-11-26 | released Windows exes: the wizard of setup-v0.4.196 and setup-v0.4.238, the companion of agent-v0.4.233 and agent-v0.4.238, read as bytes (nothing run) | ✅ **AC5** ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7179148587)). Each app's embedded front end (Tauri's brotli assets, found through the PE image's asset table) was extracted; on 0.4.238 the wizard's `app.js` and `styles.css` match its source byte for byte, CRLFs aside. P4's guard, from master `046fb2d9f`, run over the extracted files: the wizard 8 hits on 0.4.196 and 0 on 0.4.238, the companion 3 on 0.4.233 and 0 on 0.4.238. The wizard's run-time "Resolved tag" progress line and its raw-tag Done text are gone on 0.4.238, which shows a version. In the raw exe, the companion's four reworded Rust phrases read old 1, new 0 on 0.4.233 and old 0, new 1 on 0.4.238, and the wizard's Rust warning that said "the Agent token file" reads 1, then 0; unchanged phrases are the controls. With the web app's P2b read above, AC5 is met and ticked. |
