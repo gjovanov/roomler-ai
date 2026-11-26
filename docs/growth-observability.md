@@ -1524,7 +1524,7 @@ sequenceDiagram
     W->>W: verify — refused (401) BEFORE the body is parsed
     W->>SE: insert {_id: evt_…} — a duplicate is a retry: skip
     W->>BE: one of the six kinds → a row (invoice amounts, plan, seats, period)
-    W->>T: plan · billing status (unchanged behaviour)
+    W->>T: plan · billing status (a first invoice's failed payment changes nothing)
     Note over W,SE: a processing failure removes the stripe_events marker,<br/>so Stripe's retry is processed, not skipped
     BF->>ST: GET /v1/invoices?status=paid (read-only, ≤ 100 pages)
     BF->>BE: invoice_paid rows, source: backfill — an invoice already on record is left as it was
@@ -1532,7 +1532,7 @@ sequenceDiagram
 
 ### The six kinds — `billing_events`
 
-[`process`, stripe.rs:1248](../crates/services/src/stripe.rs) records every billing kind
+[`process`, stripe.rs:1310](../crates/services/src/stripe.rs) records every billing kind
 before the tenant-state updates it always made; [`parse`, billing.rs:340](../crates/services/src/billing.rs)
 reads Stripe's objects for both API versions in the field (the classic shape and the
 2025-03-31 "basil" one, which moved `invoice.subscription` under `parent`, a line's
@@ -1543,14 +1543,14 @@ items).
 |---|---|---|
 | `customer.subscription.created` | `subscription_created` | plan (from the price id), seats (items' quantities), period, `status` — **no amount** (`null`, never 0) |
 | `customer.subscription.updated` | `subscription_updated` | the same, after the change — a seat change shows here |
-| `customer.subscription.deleted` | `subscription_deleted` | `ts` = `ended_at` — MRR is 0 from then |
-| `invoice.paid` | `invoice_paid` | `amount_cents` = `amount_paid` (what was billed, after coupons, before tax); `recurring_cents` = the subscription lines that are **not prorations**, after discounts ([`recurring_of`, billing.rs:188](../crates/services/src/billing.rs)); seats, period, interval; `ts` = `paid_at` |
-| `invoice.payment_failed` | `invoice_payment_failed` | `amount_cents` = `amount_due` |
+| `customer.subscription.deleted` | `subscription_deleted` | `ts` = `ended_at` — MRR is 0 from then, unless the subscription expired `incomplete`: it never paid, so it ends nothing ([`OrgBilling::of`, billing.rs:486](../crates/services/src/billing.rs), #4432) |
+| `invoice.paid` | `invoice_paid` | `amount_cents` = `amount_paid` (what was billed, after coupons, before tax); `recurring_cents` = the subscription lines that are **not prorations**, after discounts ([`recurring_of`, billing.rs:190](../crates/services/src/billing.rs)); seats, period, interval; `ts` = `paid_at` |
+| `invoice.payment_failed` | `invoice_payment_failed` | `amount_cents` = `amount_due`; one row per failed attempt, the attempts of a card waiting on 3-D Secure included (the counts take only an invoice never paid, [below](#billed-mrr-and-the-months)) |
 | `customer.subscription.trial_will_end` | `trial_will_end` | the trial's end |
 
-- **The org** ([`tenant_for`, stripe.rs:1070](../crates/services/src/stripe.rs)): the
+- **The org** ([`tenant_for`, stripe.rs:1101](../crates/services/src/stripe.rs)): the
   `tenant_id` the checkout stamps on the **subscription's** metadata (from P4,
-  `subscription_data[metadata]`, [stripe.rs:395](../crates/services/src/stripe.rs)), else the
+  `subscription_data[metadata]`, [stripe.rs:425](../crates/services/src/stripe.rs)), else the
   org whose `billing.customer_id` / `billing.subscription_id` the object names. An object that
   names no org here is logged with its ids and not recorded — revenue nobody can be credited
   with is not a row.
@@ -1573,28 +1573,37 @@ flowchart LR
 
 | Figure | Definition | Where |
 |---|---|---|
-| billed MRR at t | the recurring part of the org's newest paid invoice whose period covers t, normalised by the price's interval (a yearly invoice ÷ 12), 0 once a deletion at or before t came after that period began | [`OrgBilling::mrr_at`, billing.rs:498](../crates/services/src/billing.rs) |
+| billed MRR at t | the recurring part of the org's newest paid invoice whose period covers t, normalised by the price's interval (a yearly invoice ÷ 12), 0 once a deletion at or before t came after that period began. A subscription that expired `incomplete` is no deletion here: a checkout abandoned at 3-D Secure and paid on the retry keeps the retry's MRR when Stripe expires the abandoned one a day later | [`OrgBilling::mrr_at`, billing.rs:543](../crates/services/src/billing.rs) |
 | paying orgs | orgs with billed MRR > 0 | same |
-| new / expansion / contraction / churned | per month and currency, each org's MRR at the month's end against the end of the month before: from 0 = new, to 0 = churned, up = expansion, down = contraction | [`movements`, billing.rs:548](../crates/services/src/billing.rs) |
-| `paid_since` | the org's first invoice paid with an amount above 0 — also the funnel's **paid** step | [`OrgBilling::of`, billing.rs:446](../crates/services/src/billing.rs) |
-| trial → paid | trials started in the range (a `trialing` subscription or `trial_will_end`) and how many paid since | [`trial_to_paid`, billing.rs:948](../crates/services/src/billing.rs) |
+| new / expansion / contraction / churned | per month and currency, each org's MRR at the month's end against the end of the month before: from 0 = new, to 0 = churned, up = expansion, down = contraction | [`movements`, billing.rs:593](../crates/services/src/billing.rs) |
+| `paid_since` | the org's first invoice paid with an amount above 0 — also the funnel's **paid** step | [`OrgBilling::of`, billing.rs:486](../crates/services/src/billing.rs) |
+| trial → paid | trials started in the range (a `trialing` subscription or `trial_will_end`) and how many paid since | [`trial_to_paid`, billing.rs:993](../crates/services/src/billing.rs) |
 | invoices and billed cash | invoices paid in the month and every line they billed, prorations included — cash beside the MRR | `movements` |
+| failed payments | the `invoice_payment_failed` rows of an invoice **never paid**: no `invoice_paid` row with the same invoice id (`stripe_id`), at any time. A card that needs 3-D Secure fails once per attempt and then pays; those attempts are no failure (#4432: prod's first purchase read 3 failures beside 1 paid invoice). Each failed attempt of an unpaid invoice counts | [`unpaid_failures`, billing.rs:1014](../crates/services/src/billing.rs) |
 
 - ⚠️ **Billed, so a seat change moves MRR when an invoice bills it.** The proration invoice
   in between is cash (`billed_cents`), not MRR; the renewal that bills the new seat count is
   the expansion. A dunning gap (a renewal not paid yet) reads as 0 until the payment lands,
   and the live view corrects the history once it does.
-- **The record** ([`record_start`, billing.rs:758](../crates/services/src/billing.rs)): before
+- **The record** ([`record_start`, billing.rs:803](../crates/services/src/billing.rs)): before
   the first billing row (any org — or the first frozen month, whichever is older) nothing was
   recorded, so a month that ended before it is `on_record: false` — *not measured*, never a
-  month of zero revenue — and is never frozen ([`on_record`, billing.rs:750](../crates/services/src/billing.rs)).
+  month of zero revenue — and is never frozen ([`on_record`, billing.rs:795](../crates/services/src/billing.rs)).
   With no row at all, billed revenue is `not_measured` everywhere.
 - **Frozen once closed.** The nightly org-daily job ([`freeze_billing_months`, org_daily.rs:510](../crates/api/src/growth/org_daily.rs))
   writes every closed month of the last 13 that ended at least 3 days ago (Stripe retries a
   webhook for three days) and lies on the record into `growth_daily`, internal orgs left out,
   and marks it in `growth_pulls` (`billing:YYYY-MM-01`). A frozen month is never rewritten —
   except by the backfill, for the months it touched — so purging an org later does not
-  rewrite last year's MRR ([`freeze_closed_months`, billing.rs:840](../crates/services/src/billing.rs)).
+  rewrite last year's MRR ([`freeze_closed_months`, billing.rs:885](../crates/services/src/billing.rs)).
+- **A failed payment is judged against the whole record**, in the revenue view's totals
+  ([`range_totals`, revenue.rs:466](../crates/api/src/growth/revenue.rs)) and the digest
+  ([`billed_figures`, digest.rs:2093](../crates/api/src/growth/digest.rs)) alike: a payment
+  after the range or the day still clears a failure inside it. A frozen month holds no
+  failure count, so a late payment contradicts nothing frozen. A digest is computed once its
+  day has closed: a failure whose invoice is paid only later stays in that day's digest until
+  the day is recomputed (`POST …/digest/run?day=&send=false` refreshes it in place and mails
+  nothing).
 
 ### Upgrade intent: plan-limit collisions
 
@@ -1620,7 +1629,7 @@ the last 30 days' cost, **only** where both exist in the same currency
 ### The revenue view
 
 `GET /api/admin/growth/revenue?since=YYYY-MM&until=YYYY-MM&include_internal`
-([`get_revenue`, revenue.rs:721](../crates/api/src/growth/revenue.rs)) — platform admins only,
+([`get_revenue`, revenue.rs:728](../crates/api/src/growth/revenue.rs)) — platform admins only,
 **404** otherwise and when `growth.enabled = false`. Months, both inclusive; the default is the
 12 months ending with the current one, at most 36, never before 2020-01, never past the
 current month.
@@ -1629,8 +1638,8 @@ current month.
 |---|---|---|
 | `billed.record` | `since` (the record's start), `last_event_at`, `backfilled_at` (absent = the backfill never ran, so figures start at the webhook), `rows`, `truncated` | — |
 | `billed.now` | billed MRR and paying orgs, per currency, at the request | `saas` not mounted; nothing on record |
-| `billed.months` | one block per month: `frozen`, `partial` (the open month), `on_record`, and per currency the movements, invoices and billed cash ([`month_blocks`, revenue.rs:503](../crates/api/src/growth/revenue.rs)) | a month before the record: `on_record: false` |
-| `billed.totals` | the range's invoices paid, billed cash per currency, first payments, failed payments, cancellations | as `billed` |
+| `billed.months` | one block per month: `frozen`, `partial` (the open month), `on_record`, and per currency the movements, invoices and billed cash ([`month_blocks`, revenue.rs:507](../crates/api/src/growth/revenue.rs)) | a month before the record: `on_record: false` |
+| `billed.totals` | the range's invoices paid, billed cash per currency, first payments, failed payments (of invoices never paid), cancellations | as `billed` |
 | `billed.trial_to_paid` | trials started in the range, converted, and the rate from n = 30 | as `billed` |
 | `billed.by_channel` | per owner's acquisition channel and currency: paying now, MRR now, first payments, churned, trials → paid ([`channel_rows`, revenue.rs:399](../crates/api/src/growth/revenue.rs)) | as `billed` |
 | `estimate` | the list-price MRR over every live org, `estimate: true` | — |
@@ -1658,11 +1667,11 @@ current month.
 - **The org timeline** gains `plan_history` (the org's billing rows, newest 200) and a
   `first_paid` milestone ([orgs.rs:667](../crates/api/src/growth/orgs.rs)).
 - **In the digest**, the revenue section gains `billed` — MRR at the day's end per currency;
-  the day's (and 7/28 days') invoices, billed cash, failed payments, first payments,
-  cancellations and trials; `record_since` and `backfilled`
-  ([`billed_figures`, digest.rs:2089](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
+  the day's (and 7/28 days') invoices, billed cash, failed payments (of invoices never
+  paid), first payments, cancellations and trials; `record_since` and `backfilled`
+  ([`billed_figures`, digest.rs:2093](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
   the windows' collisions and the orgs that hit hardest
-  ([`upgrade_intent_section`, digest.rs:2184](../crates/api/src/growth/digest.rs)). The
+  ([`upgrade_intent_section`, digest.rs:2188](../crates/api/src/growth/digest.rs)). The
   estimate keeps its line and its label.
 - The SPA's `/observability/growth` gains a **Revenue** tab
   ([`GrowthRevenue.vue`](../ui/src/components/growth/GrowthRevenue.vue)); the Overview's funnel
@@ -1671,11 +1680,11 @@ current month.
 ### The backfill — operator-run, once
 
 `POST /api/admin/growth/billing/backfill?since=YYYY-MM-DD` (`saas`,
-[`backfill`, saas stripe.rs:277](../crates/modules/saas/src/stripe.rs)) — platform admins only,
+[`backfill`, saas stripe.rs:291](../crates/modules/saas/src/stripe.rs)) — platform admins only,
 404 otherwise and with growth off. It reads Stripe's **paid** invoices (created since `since`
 when given; 100 a page, at most 100 pages) into `invoice_paid` rows with `source: backfill`
-([`backfill_paid_invoices`, stripe.rs:777](../crates/services/src/stripe.rs)), then refreezes the
-closed months those invoices touch ([`refreeze`, saas stripe.rs:330](../crates/modules/saas/src/stripe.rs))
+([`backfill_paid_invoices`, stripe.rs:808](../crates/services/src/stripe.rs)), then refreezes the
+closed months those invoices touch ([`refreeze`, saas stripe.rs:344](../crates/modules/saas/src/stripe.rs))
 and leaves a `growth_pulls` marker (`billing_backfill:YYYY-MM-DD`) the views read. It only
 reads Stripe. Idempotent: an invoice already on record (the webhook's, or an earlier run's) is
 counted under `already` and left as it was; one naming no org here under `no_org`.

@@ -2084,8 +2084,12 @@ pub fn no_billing_record(
 
 /// P4 — the billed figures of the windows, pure over `billing_events`
 /// rows (exclusions already applied): MRR at the day's end per currency,
-/// and every count by the instant it happened. `record_since` and
-/// `backfilled` are the caller's (they read the whole record).
+/// and every count by the instant it happened; a failed payment only for an
+/// invoice never paid, judged over every row ([`unpaid_failures`], #4432).
+/// `record_since` and `backfilled` are the caller's (they read the whole
+/// record).
+///
+/// [`unpaid_failures`]: roomler_ai_services::billing::unpaid_failures
 pub fn billed_figures(
     rows: &[roomler_ai_services::dao::billing_event::BillingEvent],
     w: &Windows,
@@ -2143,7 +2147,7 @@ pub fn billed_figures(
             .filter(|(_, f)| *f != Figure::default())
             .map(|(currency, cents)| CurrencyBilled { currency, cents })
             .collect(),
-        payment_failures: w.count(times(BillingKind::InvoicePaymentFailed)),
+        payment_failures: w.count(billing::unpaid_failures(rows).map(|r| r.ts.timestamp_millis())),
         new_paying_orgs: w.count(orgs.values().filter_map(|o| o.paid_since)),
         cancellations: w.count(times(BillingKind::SubscriptionDeleted)),
         trials_started: w.count(orgs.values().filter_map(|o| o.trial_started)),

@@ -168,7 +168,7 @@ pub async fn anchor(
             roomler_ai_services::dao::base::DaoError::NotFound => {
                 ApiError::NotFound("No such device in this organization".to_string())
             }
-            other => ApiError::Internal(format!("agent lookup: {other}")),
+            other => ApiError::Internal(format!("device lookup: {other}")),
         })?;
     if !matches!(agent.os, OsKind::Windows) {
         return Err(ApiError::BadRequest(

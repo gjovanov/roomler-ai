@@ -407,7 +407,7 @@ pub async fn dispatch_controller_rc(
             let _ = controller_tx.try_send(ServerMsg::Error {
                 session_id: None,
                 code: "agent_on_other_pod".to_string(),
-                message: "agent is homed on another pod; re-dial and retry".to_string(),
+                message: "device is homed on another pod; re-dial and retry".to_string(),
                 open_nonce: None,
             });
             return true;
