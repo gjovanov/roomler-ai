@@ -1573,3 +1573,73 @@ mod tests {
         assert!(!applied.needs_restart.contains(&"exec_enabled"));
     }
 }
+
+/// #3353 — P1c on a device whose start could not mint its SSH host key: the
+/// file keeps the owner's `ssh_enabled`, and this process runs SSH off.
+#[cfg(all(test, feature = "ssh-server"))]
+mod failed_mint_tests {
+    use super::*;
+
+    /// A start whose mint failed, up to the crash bookkeeping's save: the
+    /// config it runs on, from a file whose owner turned SSH on.
+    fn a_start_whose_mint_failed(path: &PathBuf) -> crate::config::AgentConfig {
+        let mut owners = crate::config::test_fixture();
+        owners.ssh_enabled = true;
+        owners.ssh_host_key = None;
+        crate::config::save(path, &owners).unwrap();
+
+        let mut cfg = crate::config::load(path).unwrap();
+        let mut writes = crate::config::StartupWrites::after_load(path);
+        let mint = crate::ssh_mint::at_start(
+            &mut cfg,
+            || Err(anyhow::anyhow!("no entropy")),
+            |c| writes.save(c),
+        );
+        assert_eq!(mint, crate::ssh_mint::Mint::OffThisRun);
+        crate::config::mark_run_starting(&mut cfg);
+        writes.save(&cfg).unwrap();
+        cfg
+    }
+
+    fn services_on(path: &PathBuf) -> RemoteConfigServices {
+        RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        )
+    }
+
+    /// AC 5, the constraint from P1c: a pushed `ssh_enabled = true` finds the
+    /// owner's `true` in the file and nothing to write, and it waits on a
+    /// restart, because this process runs SSH off. Reported `applied`, it
+    /// would tell the dashboard SSH is on while no server runs until the
+    /// daemon restarts. A reconnect reads the same.
+    #[tokio::test]
+    async fn after_a_failed_mint_a_pushed_ssh_enabled_waits_on_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = a_start_whose_mint_failed(&path);
+        let svc = services_on(&path).running_on(&cfg);
+        let push = DesiredConfig {
+            ssh_enabled: Some(true),
+            ..Default::default()
+        };
+
+        let applied = svc.apply(&push).await.unwrap();
+        assert!(
+            !applied.wrote,
+            "the file already holds the owner's true, so the push writes nothing: {applied:?}"
+        );
+        assert_eq!(
+            applied.needs_restart,
+            vec!["ssh_enabled"],
+            "SSH is off in this run, so the push waits on a restart: {applied:?}"
+        );
+        assert!(!applied.live.contains(&"ssh_enabled"));
+        assert!(!applied.is_noop());
+
+        let reconnect = svc.apply(&push).await.unwrap();
+        assert_eq!(reconnect.needs_restart, vec!["ssh_enabled"]);
+    }
+}
