@@ -455,7 +455,7 @@ pub async fn enroll_agent(
 
     let agent_id = agent
         .id
-        .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
     // FR-104 — which token enrolled this device, so an `anchor: true` token
     // can anchor exactly this one afterwards. Best-effort: a failure here
     // costs only that second use (the anchor then needs a fresh token).
@@ -568,7 +568,7 @@ async fn enroll_row(
                 refuse_live_ephemeral(&live, true)?;
                 let id = live
                     .id
-                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                    .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
                 match state
                     .agents
                     .rehydrate(id, &body.machine_name, body.os, &program, install.as_ref())
@@ -583,7 +583,7 @@ async fn enroll_row(
             Some(removed) => {
                 let id = removed
                     .id
-                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                    .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
                 if let Err(e) = state
                     .hooks
                     .agent_revived(tid, id, &removed.machine_id)
@@ -786,7 +786,7 @@ async fn enroll_agent_ephemeral(
     };
     let agent_id = agent
         .id
-        .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
 
     // Control 4 — the per-use audit row: the record that outlives the device
     // row (which will hard-delete). Best-effort — the atomic claim above is
@@ -2217,8 +2217,8 @@ pub(crate) fn release_ord(v: &str) -> Option<(u64, u64, u64, u64)> {
 fn pin_downgrade(pin: &str, agent_version: &str) -> Option<String> {
     match (release_ord(pin), release_ord(agent_version)) {
         (Some(p), Some(c)) if p < c => Some(format!(
-            "pin {pin} is older than the agent's current {agent_version} — a stale pin \
-             would DOWNGRADE this device; pass force=true to do it deliberately"
+            "pin {pin} is older than this device's daemon version {agent_version} — a stale \
+             pin would DOWNGRADE this device; pass force=true to do it deliberately"
         )),
         _ => None,
     }
@@ -3220,5 +3220,26 @@ mod access_policy_view_tests {
         let mut wrong = problems("every field set", every_field);
         wrong.extend(problems("the default", AccessPolicy::default()));
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}
+
+/// FR-133 P2e: one device's 409 shows this reason to the person who pinned
+/// (the bulk push shows its own words for the `pin_downgrade` code), so it
+/// names the device's daemon version, never "the agent's". A tag pin carries
+/// `agent-v`, the release tags' own spelling and an identity, so the test pins
+/// bare versions.
+#[cfg(test)]
+mod pin_downgrade_words_tests {
+    use super::pin_downgrade;
+
+    #[test]
+    fn the_downgrade_refusal_names_the_daemon_version() {
+        let reason = pin_downgrade("0.4.200", "0.4.237").expect("a downgrade");
+        assert_eq!(
+            reason,
+            "pin 0.4.200 is older than this device's daemon version 0.4.237 — a stale pin \
+             would DOWNGRADE this device; pass force=true to do it deliberately"
+        );
+        assert!(!reason.to_ascii_lowercase().contains("agent"), "{reason}");
     }
 }

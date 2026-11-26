@@ -166,7 +166,7 @@ flowchart LR
 | The refresh | `crates/modules/network/src/relay_allowance.rs:278`, every 60 s (`:47`) | every pod's own copy of the set. An absent or unreadable set is an empty one, so a stopped job, a Redis outage and the kill switch all fail open |
 | The bucket on the API pods | `crates/modules/network/src/derp.rs:693` | a bulk frame of a network in the set takes tokens (`relay_allowance.rs:86`). Without one it is dropped, and the TCP inside the tunnel settles at the rate |
 | The bucket on the PoPs | `crates/derp-relay/src/main.rs:154`, the set arriving on `POST /stats` (`:684`) | the same bucket, fed by the set the API signs and pushes on its `/stats` poll (`crates/core/src/relay_load.rs:219`). It goes only to endpoints whose last `/stats` reported an `allowance` (`:156`). A PoP that holds no set throttles nothing |
-| The mesh leaves TURN (P4c-1) | `crates/modules/network/src/overlay.rs:2871` (`turn_withheld`, behind `crates/config/src/settings.rs:392`), the relay request (`overlay.rs:1203`, decided by `:2878` `keeps_pair_on_derp`), the warm creds (`:210`), the verdict (`:2815`), and the re-stamp (`:1603` `refan_networks`, from `crates/modules/network/src/relay_allowance.rs:208`) | an over-allowance org's overlay pair gets no TURN grant and a DERP verdict, and a node too old for verdicts gets a forced-DERP pin. Only a pair with a DERP floor at both ends: any other keeps its grant, since withholding it would refuse the pair. An org relay still wins. When the set changes, the network's pairs are re-stamped at once, and an agent from 0.4.175 on moves a pair already riding TURN onto DERP while it is live, once a probe over `/derp` proves the peer can be reached there; a peer that cannot be keeps the pair on TURN. One end on 0.4.175 is enough, since an older peer follows it onto DERP; a pair whose two ends are both older keeps TURN until it re-establishes (#2820: `stamp_to_derp` in `crates/tunnel-core/src/overlay/relay_link.rs`, and `docs/overlay-nat-traversal.md`, *Phase D*). The stamp opens a node's `/derp` when it has none, and a pair with an end that reports it cannot hold `/derp` (`derp_mux_failed`) keeps its grant and its capability verdict, so the pin never parks a pair on a floor one end cannot reach (#2992: the report kept per node for 30 min, `overlay.rs:2908` `DERP_REPORT_MEMORY`, `:2914` `note_derp_report`, read by the relay request and the verdict, `:2894` `pair_pinned_to_derp`; the agent's half in `docs/overlay-communication.md`, *Lazy connection*) |
+| The mesh leaves TURN (P4c-1) | `crates/modules/network/src/overlay.rs:2871` (`turn_withheld`, behind `crates/config/src/settings.rs:392`), the relay request (`crates/modules/network/src/overlay.rs:1208`, decided by `:2883` `keeps_pair_on_derp`), the warm creds (`:215`), the verdict (`:2820`), and the re-stamp (`:1603` `refan_networks`, from `crates/modules/network/src/relay_allowance.rs:208`) | an over-allowance org's overlay pair gets no TURN grant and a DERP verdict, and a node too old for verdicts gets a forced-DERP pin. Only a pair with a DERP floor at both ends: any other keeps its grant, since withholding it would refuse the pair. An org relay still wins. When the set changes, the network's pairs are re-stamped at once, and an agent from 0.4.175 on moves a pair already riding TURN onto DERP while it is live, once a probe over `/derp` proves the peer can be reached there; a peer that cannot be keeps the pair on TURN. One end on 0.4.175 is enough, since an older peer follows it onto DERP; a pair whose two ends are both older keeps TURN until it re-establishes (#2820: `stamp_to_derp` in `crates/tunnel-core/src/overlay/relay_link.rs`, and `docs/overlay-nat-traversal.md`, *Phase D*). The stamp opens a node's `/derp` when it has none, and a pair with an end that reports it cannot hold `/derp` (`derp_mux_failed`) keeps its grant and its capability verdict, so the pin never parks a pair on a floor one end cannot reach (#2992: the report kept per node for 30 min, `crates/modules/network/src/overlay.rs:2908` `DERP_REPORT_MEMORY`, `:2919` `note_derp_report`, read by the relay request and the verdict, `:2899` `pair_pinned_to_derp`; the agent's half in `docs/overlay-communication.md`, *Lazy connection*) |
 | What the org sees | `crates/api/src/routes/cost.rs:531` (`relay_quota`), on `GET /api/tenant/{tid}/stats/resources` | `quota.relay`: used, allowance, rate, `enforced`, `throttled`, and `counts_turn` (P4c-0) |
 | TURN bytes per org (P4b) | the cluster's collector `crates/modules/network/src/turn_usage.rs:124`, the PoP pull `crates/core/src/relay_load.rs:314`, both booking through `crates/core/src/turn_bytes.rs:86`; the username from `crates/remote_control/src/turn_creds.rs:387` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. A PoP keeps its coturn's totals for an hour and the API pulls them (P4b-2), with a request the PoP checks against the ticket key. With `count_turn` they count toward the allowance (P4c-0) |
 
@@ -195,7 +195,8 @@ sequenceDiagram
     participant API as roomler (saas)
     participant S as Stripe
     UI->>API: POST /api/stripe/checkout {plan, interval, currency}
-    API->>API: refuse a currency not on sale · refuse a 2nd subscription (409)
+    API->>API: refuse a currency not on sale · refuse a 2nd live subscription (409)
+    API->>API: refuse a plan below one set outside billing (409 plan_managed)
     API->>S: Checkout Session, quantity = seats
     S-->>API: customer.subscription.created / .updated (webhook)
     API->>API: tenants.billing ← plan, status, seats, interval, currency
@@ -207,20 +208,63 @@ sequenceDiagram
 ```
 
 A seat is a member who accepted; a pending invite is not one. Checkout bills
-`quantity = seats` (`crates/services/src/stripe.rs:291`); the reconcile keeps it equal to the member count
-(`crates/services/src/stripe.rs:558`, spawned by `crates/modules/saas/src/stripe.rs:173`); a plan change moves the existing
-subscription's item instead of starting a second one (`crates/services/src/stripe.rs:447`).
+`quantity = seats` (`crates/services/src/stripe.rs:307`); the reconcile keeps it equal to the member count
+(`crates/services/src/stripe.rs:588`, spawned by `crates/modules/saas/src/stripe.rs:187`); a plan change moves the existing
+subscription's item instead of starting a second one (`crates/services/src/stripe.rs:477`).
+
+**A checkout never lowers a plan set outside billing** (#4433). An org can hold a plan that no
+subscription bills: one Roomler granted by hand, such as Enterprise, which `GET /api/stripe/plans`
+never lists. A paid checkout writes the plan it sold (`checkout.session.completed`,
+`crates/services/src/stripe.rs:1324`), so an Enterprise org that bought Pro would have dropped to Pro.
+While an org has no live subscription, checkout refuses a plan that ranks strictly below the org's
+own (`Plan::rank`, Free < Pro < Business < Enterprise, `crates/db/src/models/tenant.rs:688`): 409 with
+`error: "plan_managed"` (`crates/modules/saas/src/stripe.rs:128`). The check sits beside the
+subscription check, before the Price is read and before a customer is created or recorded
+(`crates/services/src/stripe.rs:344`), so a refused checkout calls no Stripe API and writes nothing.
+The org's own plan or a higher one still checks out, a Free org is unchanged, and a subscribed org is
+still refused as already subscribed. Nothing is migrated: the refusal at checkout is the guard.
+
+The org's billing status follows Stripe's **subscription**; the webhook
+(`crates/services/src/stripe.rs:1310`) writes it like this:
+
+| Stripe event | What it writes on the org |
+|---|---|
+| `customer.subscription.created` / `.updated` | status, period end, cancel flag, seats, interval, currency, and the plan its price names while it bills (`crates/services/src/stripe.rs:1188`). The org is the one holding the subscription, else the one named on its metadata, unless that org holds another subscription and either this one has ended (`canceled`, `incomplete_expired`) or the one held bills (`crates/services/src/stripe.rs:1590`) |
+| `checkout.session.completed` | the plan bought, the subscription, the customer, `active` |
+| `customer.subscription.deleted` | Free and `canceled`, only on the org holding that subscription |
+| `invoice.payment_failed` | a renewal: `past_due` at once, whether or not the subscription's own update follows. The **first** invoice (`billing_reason: subscription_create`): nothing (`crates/services/src/stripe.rs:1474`) |
+| `invoice.paid` | nothing; the subscription's own update makes it `active` |
+
+A card that needs 3-D Secure, as most EU cards do under PSD2, fails the first invoice once
+per authentication attempt before it pays, and the subscription stays `incomplete` until it
+does. Until #4432 each of those failures marked the org past due, which counts as
+subscribed: the first real purchase read `past_due` for 16 minutes, and a buyer who
+abandoned the authentication was refused a new checkout (409) until Stripe expired the
+subscription, about a day later. An abandoned checkout now leaves the org on Free with an
+`incomplete` subscription, which does not bill (`crates/services/src/stripe.rs:1565`:
+active, trialing or past due), so a new checkout is accepted at once. The retry is a
+second subscription, and when Stripe expires the abandoned one, its end never lands on the
+org that pays for the retry. A renewal that fails still marks the org past due, and a
+past-due org still cannot start a second checkout.
 
 The billing page's current-plan card reads the org's billing from `GET /api/stripe/summary`
-alone (`crates/services/src/stripe.rs:594`, MANAGE_TENANT): the status, the period end,
+alone (`crates/services/src/stripe.rs:624`, MANAGE_TENANT): the status, the period end,
 "Cancels at period end", and "Manage Subscription" (Stripe's portal: cancel, card, invoices)
-from `has_billing_account`, a non-empty customer id (`crates/services/src/stripe.rs:1459`).
+from `has_billing_account`, a non-empty customer id (`crates/services/src/stripe.rs:1602`).
 The ids themselves never reach the browser. `GET /api/tenant`, which every member reads,
 carries no billing (`crates/api/src/routes/tenant.rs:16`); until #4431 the card read it from
 there, so a paying org saw none of the four. A member without MANAGE_TENANT is refused the
-summary and sees none of them. The status shows only while it describes a subscription
-(`ui/src/views/billing/BillingView.vue:317`): a checkout's start records the customer with
-an `active` status before any subscription exists, and an abandoned checkout leaves it there.
+summary and sees none of them. The status shows only while the org is subscribed
+(`ui/src/views/billing/BillingView.vue:344`): without a live subscription the stored status
+describes none the org has. A checkout's start records `active` before any subscription
+exists, an abandoned one leaves `incomplete`, and an ended one `canceled` (#4432).
+
+The summary's `plan_managed` says the plan was set outside billing: above Free, with no live
+subscription (`crates/services/src/stripe.rs:1612`). The page then offers no checkout below the
+plan (that card reads "Included in your plan", `ui/src/views/billing/BillingView.vue:195`), and the
+current-plan card says Roomler set the plan and to contact Roomler to change it. A page older than
+the plan that still gets the 409 says the same and reads the summary again
+(`ui/src/views/billing/BillingView.vue:528`).
 
 | Setting | Effect | Default |
 |---|---|---|

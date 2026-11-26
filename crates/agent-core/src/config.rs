@@ -3848,18 +3848,18 @@ pub fn read_merge_base(path: &PathBuf) -> MergeBase {
 
 /// #3609 — [`read_merge_base`] at the machine-global location: the repair and
 /// the check before anything is folded (`machine_tree::may_fold`), and the
-/// checked `.prev` ([`load_private_prev`]).
+/// `.prev` only where a start would take it ([`copy_beside_the_config`]).
 #[cfg(windows)]
 fn machine_merge_base(
     path: &PathBuf,
     tree: &crate::machine_tree::MachineTree,
     switches: crate::machine_tree::Switches,
 ) -> MergeBase {
-    merge_base(
-        path,
-        || crate::machine_tree::may_fold(tree, switches),
-        |prev| load_private_prev(prev),
-    )
+    // #4453 — a `.prev` beside a config that does not load is taken or
+    // refused as a start takes or refuses it, by what it inherits as found
+    // (`machine_tree::copy_inherits_as_found`).
+    let copy = copy_beside_the_config(tree);
+    merge_base(path, || crate::machine_tree::may_fold(tree, switches), copy)
 }
 
 /// The merge base at `path`. `private` says, once the file is known to be
@@ -4682,7 +4682,7 @@ fn save_with_base(path: &PathBuf, base: Base<'_>, cfg: &AgentConfig, kept: Kept)
     // replaced W4(c)'s four `icacls` steps (#3073, #3291): it runs in-process,
     // and on a chain already as it should be it changes nothing.
     #[cfg(windows)]
-    let machine = machine_tree_of(path);
+    let machine = machine_tree_for_a_save(path).map_err(anyhow::Error::msg)?;
     #[cfg(windows)]
     if let Some(tree) = &machine
         && crate::machine_tree::Switches::from_env().repair
@@ -4905,7 +4905,7 @@ pub fn machine_config_as_found(path: &std::path::Path) -> Result<()> {
 /// there was nothing to take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
 #[cfg(windows)]
 pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, String> {
-    let Some(tree) = machine_tree_of(path) else {
+    let Some(tree) = machine_tree_for_a_save(path)? else {
         return Ok(false);
     };
     if !crate::machine_tree::Switches::from_env().repair {
@@ -4930,7 +4930,7 @@ pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, 
 /// take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
 #[cfg(windows)]
 pub fn take_machine_parent(path: &std::path::Path) -> std::result::Result<bool, String> {
-    let Some(tree) = machine_tree_of(path) else {
+    let Some(tree) = machine_tree_for_a_save(path)? else {
         return Ok(false);
     };
     if !crate::machine_tree::Switches::from_env().repair {
@@ -5279,6 +5279,57 @@ fn note_machine_copy(tree: &crate::machine_tree::MachineTree, copy: &Result<Agen
         }
         *last = why;
     }
+}
+
+/// #4453 — what an elevated save recovers a machine config that does not load
+/// from ([`machine_merge_base`]): the `.prev` beside it, taken or refused as a
+/// start takes or refuses it. It is taken only when what it inherits was the
+/// machine's as found (`machine_tree::copy_inherits_as_found`, the rule a start
+/// applies to a copy beside its config), and then through
+/// [`load_private_prev`], as before. One that was not is said in one line, and
+/// nothing is recovered from it: the writer writes a fresh config, as for any
+/// `.prev` it does not take.
+#[cfg(windows)]
+fn copy_beside_the_config(
+    tree: &crate::machine_tree::MachineTree,
+) -> impl FnOnce(&PathBuf) -> Result<AgentConfig> {
+    use crate::machine_tree::Refusal;
+    let config = tree.config();
+    let refused = match crate::machine_tree::copy_inherits_as_found(tree) {
+        Ok(()) | Err(Refusal::Absent) => None,
+        Err(Refusal::NotPrivate(why)) => Some(why),
+    };
+    move |prev: &PathBuf| match refused {
+        None => load_private_prev(prev),
+        Some(why) => {
+            tracing::warn!(
+                config = %config.display(),
+                reason = %why,
+                "config: the machine config does not load, and the copy beside it is not taken, \
+                 as a start does not take it: what it inherits was not the machine's as found"
+            );
+            anyhow::bail!("{why}")
+        }
+    }
+}
+
+/// #4453 — [`machine_tree_of`] for an elevated save at `path` ([`save_with_base`],
+/// [`take_machine_folder`], [`take_machine_parent`]), which also sets aside a
+/// `.prev` beside the config that a start would not take
+/// (`machine_tree::set_aside_a_copy_a_start_refuses`). As every change the
+/// machine tree makes, it is off with `ROOMLERD_MACHINE_TREE_REPAIR=0`. `Err`
+/// names the file and what to do when it is neither moved nor kept as found.
+#[cfg(windows)]
+fn machine_tree_for_a_save(
+    path: &std::path::Path,
+) -> std::result::Result<Option<crate::machine_tree::MachineTree>, String> {
+    let tree = machine_tree_of(path);
+    if let Some(tree) = &tree
+        && crate::machine_tree::Switches::from_env().repair
+    {
+        crate::machine_tree::set_aside_a_copy_a_start_refuses(tree)?;
+    }
+    Ok(tree)
 }
 
 fn derive_ws_url(http_url: &str) -> String {
@@ -8175,6 +8226,309 @@ tenant_id = "tid2"
                 ),
                 other => panic!("{other:?}"),
             }
+        }
+
+        /// #4453 — what an elevated save finds at the machine path, beside the
+        /// copy (`.prev`): the cases a start and the save take or refuse alike
+        /// ([`an_elevated_save_takes_the_copy_only_where_a_start_takes_it`]).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Beside {
+            /// A config that loads, beside a copy that inherits, from the
+            /// parent through the folder, an entry giving Users write.
+            ConfigThatLoads,
+            /// No config, beside a copy a start restores (#4176).
+            NoConfigACopyAStartRestores,
+            /// No config, beside a copy that inherits, with the folder, an
+            /// entry giving Users write: a start does not restore it.
+            NoConfigACopyAStartRefuses,
+            /// From here on, a config that does not load, beside: a copy as an
+            /// elevated save leaves it.
+            SealedCopy,
+            /// A copy that inherits, from an inherit-only entry of the folder's
+            /// own, an entry giving an administrator's own account (this
+            /// elevated process's) write.
+            CopyInheritsAnAdministratorsWrite,
+            /// A copy that inherits, from the parent through the folder, an
+            /// entry giving Users write that applies to neither of them: the
+            /// parent, the folder, the config and the keys were closed as found.
+            CopyInheritsWrite,
+            /// A copy that inherits an entry giving Users write from an
+            /// inherit-only entry of the folder's own.
+            CopyInheritsWriteFromTheFolder,
+            /// A copy another account owns.
+            CopyAnotherAccountOwns,
+        }
+
+        /// What a start runs on.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Runs {
+            TheConfig,
+            TheCopy,
+            /// No machine config: the host waits, or the worker's load fails.
+            Nothing,
+        }
+
+        /// What an elevated save's merge base folds the enrollment into.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Folds {
+            /// No config there: a fresh config, whatever the copy holds.
+            Absent,
+            TheConfig,
+            /// A config that does not load, recovered from its copy.
+            TheCopy,
+            /// A config that does not load, and no copy taken: a fresh config.
+            NothingRecovered,
+            /// A config that is set aside.
+            NotPrivate,
+        }
+
+        impl Beside {
+            const ALL: [Beside; 8] = [
+                Beside::ConfigThatLoads,
+                Beside::NoConfigACopyAStartRestores,
+                Beside::NoConfigACopyAStartRefuses,
+                Beside::SealedCopy,
+                Beside::CopyInheritsAnAdministratorsWrite,
+                Beside::CopyInheritsWrite,
+                Beside::CopyInheritsWriteFromTheFolder,
+                Beside::CopyAnotherAccountOwns,
+            ];
+
+            /// What a start runs on, and what the save folds into. Beside a
+            /// config that does not load, they take or refuse the same copy.
+            fn want(self) -> (Runs, Folds) {
+                match self {
+                    Beside::ConfigThatLoads => (Runs::TheConfig, Folds::TheConfig),
+                    Beside::NoConfigACopyAStartRestores => (Runs::TheCopy, Folds::Absent),
+                    Beside::NoConfigACopyAStartRefuses => (Runs::Nothing, Folds::Absent),
+                    Beside::SealedCopy | Beside::CopyInheritsAnAdministratorsWrite => {
+                        (Runs::TheCopy, Folds::TheCopy)
+                    }
+                    Beside::CopyInheritsWrite
+                    | Beside::CopyInheritsWriteFromTheFolder
+                    | Beside::CopyAnotherAccountOwns => (Runs::Nothing, Folds::NothingRecovered),
+                }
+            }
+
+            /// Whether the save says, in one line, that the copy is not taken
+            /// because it was not the machine's as found.
+            fn said(self) -> bool {
+                matches!(
+                    self,
+                    Beside::CopyInheritsWrite | Beside::CopyInheritsWriteFromTheFolder
+                )
+            }
+        }
+
+        const THE_CONFIG: &str = "the config";
+        const THE_COPY: &str = "the copy";
+        /// The save's line for a copy it does not take by the as-found rule.
+        const NOT_TAKEN: &str = "the copy beside it is not taken";
+
+        /// An enrolled config named `name` (its `machine_name`), as text.
+        fn enrolled(name: &str) -> String {
+            let mut cfg = test_fixture();
+            cfg.machine_name = name.into();
+            toml::to_string(&cfg).unwrap()
+        }
+
+        /// A machine tree under `root` shaped as `case` says, from
+        /// `machine_tree::test_support`'s trees. The texts are written into
+        /// the files those made, so each keeps its owner and DACL.
+        fn tree_beside(root: &std::path::Path, case: Beside) -> MachineTree {
+            let tree = match case {
+                Beside::NoConfigACopyAStartRestores => {
+                    missing_config(root, MissingConfig::Restorable)
+                }
+                Beside::NoConfigACopyAStartRefuses => {
+                    missing_config(root, MissingConfig::WriteOnTheParentWithoutReplace)
+                }
+                Beside::ConfigThatLoads | Beside::CopyInheritsWrite => {
+                    config_present(root, ConfigPresent::CopyInheritsWrite)
+                }
+                _ => config_present(root, ConfigPresent::Sealed),
+            };
+            std::fs::write(tree.prev(), enrolled(THE_COPY)).unwrap();
+            match case {
+                Beside::NoConfigACopyAStartRestores | Beside::NoConfigACopyAStartRefuses => {}
+                Beside::ConfigThatLoads => {
+                    std::fs::write(tree.config(), enrolled(THE_CONFIG)).unwrap()
+                }
+                _ => std::fs::write(tree.config(), "agent_token = \"broken\n").unwrap(),
+            }
+            match case {
+                Beside::CopyInheritsAnAdministratorsWrite => inherits_from_the_folder(&tree, &me()),
+                Beside::CopyInheritsWriteFromTheFolder => inherits_from_the_folder(&tree, USERS),
+                Beside::CopyAnotherAccountOwns => assert!(icacls(
+                    &tree.prev(),
+                    &["/setowner", &format!("*{}", other_account())]
+                )),
+                _ => {}
+            }
+            tree
+        }
+
+        /// The folder given an inherit-only entry of its own that gives `sid`
+        /// write on the files it holds, and the copy set to inherit all it
+        /// holds.
+        fn inherits_from_the_folder(tree: &MachineTree, sid: &str) {
+            assert!(icacls(
+                tree.folder(),
+                &["/grant", &format!("*{sid}:(OI)(IO)(W)")]
+            ));
+            assert!(icacls(&tree.prev(), &["/reset"]), "the copy inherits");
+        }
+
+        /// What a start runs on in `tree`: the service host's question at its
+        /// tick, then the SYSTEM worker's ladder's at its start (each the
+        /// repair, then the check); with no config, the copy a start restores
+        /// (#4176); then the worker's load.
+        fn a_start(tree: &MachineTree) -> Runs {
+            use crate::machine_tree::{Refusal, private_machine_config};
+            stand_in(tree);
+            let _host_tick = private_machine_config(tree, Switches::ON);
+            let starts = match private_machine_config(tree, Switches::ON) {
+                Ok(()) => true,
+                Err(Refusal::Absent) => previous_copy(&tree.config()) == PreviousCopy::Enrolled,
+                Err(Refusal::NotPrivate(_)) => false,
+            };
+            match starts.then(|| load(&tree.config())) {
+                Some(Ok(cfg)) if cfg.machine_name == THE_CONFIG => Runs::TheConfig,
+                Some(Ok(cfg)) if cfg.machine_name == THE_COPY => Runs::TheCopy,
+                Some(Ok(cfg)) => panic!("a start ran {}", cfg.machine_name),
+                Some(Err(_)) | None => Runs::Nothing,
+            }
+        }
+
+        /// What an elevated save in `tree` folds into: its merge base.
+        fn a_save(tree: &MachineTree) -> Folds {
+            match base(tree) {
+                MergeBase::Absent => Folds::Absent,
+                MergeBase::Loaded(cfg) if cfg.machine_name == THE_CONFIG => Folds::TheConfig,
+                MergeBase::Unreadable {
+                    recovered: Some(cfg),
+                    ..
+                } if cfg.machine_name == THE_COPY => Folds::TheCopy,
+                MergeBase::Unreadable {
+                    recovered: None, ..
+                } => Folds::NothingRecovered,
+                MergeBase::NotPrivate { .. } => Folds::NotPrivate,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// #4453 — an elevated save whose machine config does not load takes
+        /// the copy beside it only where a start takes it, and says in one
+        /// line when the copy was not the machine's as found. Each case is
+        /// built twice, alike: one tree for a start, one for the save. Beside
+        /// a config that loads, and with no config (a start restores the copy,
+        /// a save writes a fresh config, #4176), the save is as before.
+        #[test]
+        fn an_elevated_save_takes_the_copy_only_where_a_start_takes_it() {
+            if !elevated_or_skip("an elevated save beside a copy") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in Beside::ALL {
+                let root = tempfile::tempdir().unwrap();
+                let runs = a_start(&tree_beside(root.path(), case));
+                let root = tempfile::tempdir().unwrap();
+                let tree = tree_beside(root.path(), case);
+                let (said, guard) = captured();
+                let folds = a_save(&tree);
+                drop(guard);
+                if (runs, folds) != case.want() {
+                    wrong.push(format!(
+                        "{case:?}: a start runs {runs:?} and the save folds into {folds:?}, \
+                         want {:?}",
+                        case.want()
+                    ));
+                }
+                let lines = said.text().matches(NOT_TAKEN).count();
+                if lines != usize::from(case.said()) {
+                    wrong.push(format!("{case:?}: {lines} lines say the copy is not taken"));
+                }
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// #4453 — the name beside it that a `.prev` a start would not take is
+        /// set aside under. No reader loads it.
+        const SET_ASIDE: &str = "config.toml.prev.set-aside";
+
+        /// Where the copy a start refuses is in `tree` once a save has run: set
+        /// aside with what it held, and no longer at its name.
+        fn set_aside_in(tree: &MachineTree, case: Beside, wrong: &mut Vec<String>) {
+            let aside = tree.folder().join(SET_ASIDE);
+            if tree.prev().exists() {
+                wrong.push(format!(
+                    "{case:?}: the copy a start refuses is still at its name"
+                ));
+            } else if std::fs::read_to_string(&aside).ok() != Some(enrolled(THE_COPY)) {
+                wrong.push(format!(
+                    "{case:?}: the copy a start refuses is not at {SET_ASIDE}"
+                ));
+            }
+        }
+
+        /// #4453 — an elevated save's read of its merge base sets aside a
+        /// `.prev` that a start would not take, beside a config that loads and
+        /// beside one that does not.
+        #[test]
+        fn an_elevated_saves_read_sets_aside_a_copy_a_start_refuses() {
+            if !elevated_or_skip("an elevated save's read beside a copy a start refuses") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in [
+                Beside::ConfigThatLoads,
+                Beside::CopyInheritsWrite,
+                Beside::CopyInheritsWriteFromTheFolder,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let tree = tree_beside(root.path(), case);
+                let _ = base(&tree);
+                set_aside_in(&tree, case, &mut wrong);
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// #4453 — an elevated save that stops with its config not written has
+        /// set aside a `.prev` that a start would not take: beside a config
+        /// that loads, beside one that does not load, and, writing a fresh
+        /// config, with no config. The save's own temp file cannot be made: a
+        /// folder that holds a file has its name.
+        #[test]
+        fn an_elevated_save_that_stops_sets_aside_a_copy_a_start_refuses() {
+            if !elevated_or_skip("an elevated save that stops, beside a copy a start refuses") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in [
+                Beside::ConfigThatLoads,
+                Beside::CopyInheritsWrite,
+                Beside::NoConfigACopyAStartRefuses,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let tree = tree_beside(root.path(), case);
+                stand_in(&tree);
+                let temp = tree
+                    .config()
+                    .with_extension(format!("toml.tmp.{}", std::process::id()));
+                std::fs::create_dir(&temp).unwrap();
+                std::fs::write(temp.join("held"), "").unwrap();
+                let mut cfg = test_fixture();
+                cfg.machine_name = "the save".into();
+                let saved = match case {
+                    Beside::NoConfigACopyAStartRefuses => save_fresh(&tree.config(), &cfg),
+                    _ => save(&tree.config(), &cfg),
+                };
+                if saved.is_ok() {
+                    wrong.push(format!("{case:?}: the save did not stop"));
+                }
+                set_aside_in(&tree, case, &mut wrong);
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
         }
     }
 

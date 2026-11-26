@@ -845,7 +845,7 @@ async fn load_agent(
     agent_id: &str,
 ) -> Result<Agent, ApiError> {
     let aid = ObjectId::parse_str(agent_id)
-        .map_err(|_| ApiError::BadRequest("Invalid agent id".into()))?;
+        .map_err(|_| ApiError::BadRequest("Invalid device id".into()))?;
     // LIVE: the session target and the policy write both come through here,
     // and neither has a meaning for a removed device (#1821).
     state
@@ -853,7 +853,7 @@ async fn load_agent(
         .agents
         .find_live_in_tenant(tenant_id, aid)
         .await
-        .map_err(|_| ApiError::NotFound("Agent not found".into()))
+        .map_err(|_| ApiError::NotFound("Device not found".into()))
 }
 
 async fn http_caller(state: &NetworkState, auth: &AuthUser) -> Caller {
@@ -979,7 +979,7 @@ pub async fn set_policy(
     // is how the default reached Linux devices in the first place (#1557).
     if console_user_unsupported(body.account_mode, agent.os, &agent.capabilities) {
         return Err(ApiError::BadRequest(
-            "this device's agent cannot run SSH sessions as the person at its screen: update \
+            "this device's daemon cannot run SSH sessions as the person at its screen: update \
              it, or name a local account instead"
                 .into(),
         ));
@@ -992,7 +992,7 @@ pub async fn set_policy(
     // to remove, so the server must not be able to recreate it per-device.
     if consent_mode_would_be_ignored(&agent.capabilities, body.consent_mode) {
         return Err(ApiError::BadRequest(format!(
-            "this device's agent does not honour consent_mode yet (needs the P5d agent); \
+            "this device's daemon does not honour consent_mode yet (needs the P5d daemon); \
              it would accept `{:?}` and ignore it. Update the device, or set `auto`.",
             body.consent_mode.unwrap_or(ConsentMode::Auto)
         )));

@@ -457,6 +457,94 @@ pub fn budget_for(arm: &HelperArm, budget: Budget) -> Budget {
     }
 }
 
+/// #4423 — how long `roomlerd self-update`, run as a person, looks for the
+/// root half ([`root_half_seen`]): the bound `roomler status` gives the same
+/// look (`localapi::other_daemon_socket`), so a wedged root half costs the
+/// command half a second.
+pub const ROOT_HALF_LOOK: Duration = Duration::from_millis(500);
+
+/// #4423 — what a person on a Mac can see of the root half, when `roomlerd
+/// self-update` says what the helper will do with their ask. The helper reads
+/// the root half over the system socket, whose folder refuses a person (0700
+/// root), and asks it `live_work`, which the person socket never serves. What
+/// a person may see is whether root serves them the person socket it keeps for
+/// the console person (FR-97 P2g, `localapi::own_person_socket_path`): the
+/// same process, and the evidence of a root half `roomler status` reads
+/// (`localapi::other_daemon_socket`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootHalfSeen {
+    /// Root serves this person's socket: a two-row or a one-row Mac.
+    Runs,
+    /// No socket, or one nobody serves: no root half serves this person, as on
+    /// a per-user Mac. The helper's `not_running`, read the same way.
+    NotRunning,
+    /// Anything else: a server that is not root, any other error, or no
+    /// answer within the bound.
+    Unread,
+}
+
+/// #4423 — the person's look at the root half. `connect` connects and sends
+/// nothing (the seam, as [`crate::one_row_home::read_live_work`]'s: the real
+/// one is the person socket, kept only when root serves it), within `bound`.
+/// It reads as the helper reads its own connect: `ENOENT` and `ECONNREFUSED`
+/// are not running, and anything else that is not a connection is unread.
+pub async fn root_half_seen<F>(connect: F, bound: Duration) -> RootHalfSeen
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    match tokio::time::timeout(bound, connect).await {
+        Ok(Ok(())) => RootHalfSeen::Runs,
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            RootHalfSeen::NotRunning
+        }
+        Ok(Err(_)) | Err(_) => RootHalfSeen::Unread,
+    }
+}
+
+/// #4423 — the line `roomlerd self-update`, run as a person on a Mac, prints
+/// once the daemon behind their own socket recorded their ask: what
+/// [`helper_arm`] does with that ask on this Mac, by what the person could see
+/// of the root half. With none, the ask installs at once over everything. With
+/// one, it does too, unless the root half serves more than remote-control
+/// sessions (`root_beyond_sessions`): then the ask lapses with [`ASK_FRESH`],
+/// before the hour's recheck, and the update waits as for a plain wake
+/// ([`NO_ASK_SAYS`]). A look that failed says the narrower line, which names
+/// no wait: never a wait the helper may not keep.
+pub fn ask_recorded_says(root: RootHalfSeen) -> &'static str {
+    match root {
+        RootHalfSeen::Runs => ASK_WAITS_FOR_THE_ROOT_HALF,
+        RootHalfSeen::NotRunning | RootHalfSeen::Unread => ASK_INSTALLS_NOW,
+    }
+}
+
+/// #4423 — [`ask_recorded_says`] with no root half to wait for, and the
+/// narrower promise.
+const ASK_INSTALLS_NOW: &str = "Your ask is recorded: the update installs now over every \
+     remote-control session, and over every SSH connection, run, transfer and recording your \
+     own roomlerd serves.";
+
+/// #4423 — [`ask_recorded_says`] on a Mac with a root half: two rows, or one
+/// row. The line is conditional on what the root half serves, so it holds
+/// whatever the helper then reads of it.
+const ASK_WAITS_FOR_THE_ROOT_HALF: &str = "Your ask is recorded: the update installs now over \
+     every remote-control session, and over every SSH connection, run, transfer and recording \
+     your own roomlerd serves, unless this Mac's root daemon serves an SSH connection, a run, a \
+     transfer or a recording, does not answer, or saw its network move in the last 10 minutes. \
+     In that case it installs when nothing on this Mac is in use, or within about seven hours \
+     if something still is.";
+
+/// #4423 — the line `roomlerd self-update`, run as a person on a Mac, prints
+/// when no ask was recorded: the wake is a plain one, and [`helper_arm`]
+/// takes #3429's rule on both halves, on every shape, until the force after
+/// seven counted defers an hour apart.
+pub const NO_ASK_SAYS: &str = "The update installs when nothing on this Mac is in use, or \
+     within about seven hours if something still is.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,6 +1023,175 @@ mod tests {
         assert_eq!(
             what_it_cuts(&Reading::Older, &idle()),
             "the root half, unread (older)"
+        );
+    }
+
+    /// The line on a per-user Mac when the person's ask is recorded, and when
+    /// the look at the root half failed. No word is read from the constants:
+    /// a change to the words shows here.
+    const INSTALLS_NOW: &str = "Your ask is recorded: the update installs now over every \
+         remote-control session, and over every SSH connection, run, transfer and recording \
+         your own roomlerd serves.";
+
+    /// #4423 — a per-user Mac: no root half serves the person, the helper
+    /// reads the root half `not_running`, and the ask installs at once over
+    /// everything the person's own daemon serves, SSH connections and runs
+    /// included, inside a chain or not. The helper's behaviour first, then
+    /// the words.
+    #[test]
+    fn self_update_on_a_per_user_mac_says_it_installs_now() {
+        let ask = answered(1, 1, 1, 1, false, Some(3));
+        for budget in [Budget::RESET, chain(3, NOW + 100)] {
+            assert_eq!(
+                helper_arm(&Reading::NotRunning, &ask, budget, NOW),
+                forced(
+                    "1 remote-control session(s), 1 SSH connection(s), 1 exec run(s), \
+                     1 transfer(s) or recording"
+                ),
+                "{budget:?}"
+            );
+        }
+        assert_eq!(ask_recorded_says(RootHalfSeen::NotRunning), INSTALLS_NOW);
+    }
+
+    /// #4423 — a Mac with a root half (two rows, or one row): the ask
+    /// installs over every remote-control session and over what the person's
+    /// own daemon serves, unless the root half serves an SSH connection, a
+    /// run, a transfer or a recording, is unread, or saw its network move.
+    /// Then the ask lapses before the hour's recheck, and the update waits as
+    /// for a plain wake, the person's own work included, until the force.
+    /// The helper's behaviour first, then the words.
+    #[test]
+    fn self_update_on_a_mac_with_a_root_half_says_what_it_waits_for() {
+        let ask = answered(1, 1, 1, 1, false, Some(3));
+        assert!(
+            matches!(
+                helper_arm(&session(), &ask, Budget::RESET, NOW),
+                HelperArm::Install { forced: true, .. }
+            ),
+            "the root half's session alone is installed over"
+        );
+        let waited_for = [
+            answered(0, 1, 0, 0, false, None),
+            answered(0, 0, 1, 0, false, None),
+            answered(0, 0, 0, 1, false, None),
+            answered(0, 0, 0, 0, true, None),
+            Reading::Older,
+            Reading::NoAnswer,
+        ];
+        for root in waited_for {
+            assert!(
+                matches!(
+                    helper_arm(&root, &ask, Budget::RESET, NOW),
+                    HelperArm::Defer { counted: true, .. }
+                ),
+                "{root:?}"
+            );
+            assert!(
+                matches!(
+                    helper_arm(&root, &ask, chain(MAX_CONSECUTIVE_DEFERS, NOW), NOW),
+                    HelperArm::Install { forced: true, .. }
+                ),
+                "the budget's force, {root:?}"
+            );
+        }
+        // In that case: at the hour's recheck the ask has lapsed, so the
+        // person's own SSH connection holds the update once the root half's
+        // work is gone, and a Mac with nothing live installs.
+        let lapsed = |ssh| answered(0, ssh, 0, 0, false, Some(TRANSFER_DEFER_RECHECK.as_secs()));
+        assert_eq!(
+            helper_arm(&idle(), &lapsed(1), chain(1, NOW), NOW),
+            counted(2, NOW + HOUR)
+        );
+        assert_eq!(
+            helper_arm(&idle(), &lapsed(0), chain(1, NOW), NOW),
+            installs()
+        );
+        assert_eq!(
+            ask_recorded_says(RootHalfSeen::Runs),
+            "Your ask is recorded: the update installs now over every remote-control session, \
+             and over every SSH connection, run, transfer and recording your own roomlerd \
+             serves, unless this Mac's root daemon serves an SSH connection, a run, a transfer \
+             or a recording, does not answer, or saw its network move in the last 10 minutes. \
+             In that case it installs when nothing on this Mac is in use, or within about seven \
+             hours if something still is."
+        );
+    }
+
+    /// #4423 — a root half the person could not read: the line is the
+    /// narrower promise, the per-user Mac's, which promises no wait the
+    /// helper may not keep.
+    #[test]
+    fn self_update_with_the_root_half_unread_promises_no_wait() {
+        assert_eq!(ask_recorded_says(RootHalfSeen::Unread), INSTALLS_NOW);
+    }
+
+    /// #4423 — no ask recorded: a plain wake, which waits for both halves on
+    /// #3429's budget, true on every shape; the force after seven counted
+    /// defers ends that wait.
+    #[test]
+    fn self_update_with_no_ask_says_when_the_wait_ends() {
+        assert_eq!(
+            NO_ASK_SAYS,
+            "The update installs when nothing on this Mac is in use, or within about seven \
+             hours if something still is."
+        );
+    }
+
+    /// #4423 — the numbers the lines name are the budget's: seven hourly
+    /// counted defers before the force, and R5b's 10-minute window. "Now"
+    /// holds because a wake is read within a minute, while the ask is fresh;
+    /// "in that case" holds because the hour's recheck comes after it lapsed.
+    #[test]
+    fn the_lines_name_the_budgets_numbers() {
+        assert_eq!(
+            u64::from(MAX_CONSECUTIVE_DEFERS) * TRANSFER_DEFER_RECHECK.as_secs(),
+            7 * HOUR
+        );
+        assert_eq!(
+            crate::updater::NET_TRANSITION_WINDOW,
+            Duration::from_secs(600)
+        );
+        assert!(UPDATE_HELPER_MIN_GAP < ASK_FRESH);
+        assert!(TRANSFER_DEFER_RECHECK > ASK_FRESH);
+    }
+
+    /// #4423 — the person's look at the root half reads as the helper's own
+    /// connect: a connection is a root half that runs; no socket, or one
+    /// nobody serves, is none; a server that is not root (refused as
+    /// `PermissionDenied`), or any other error, is unread.
+    #[tokio::test]
+    async fn a_persons_look_at_the_root_half_reads_as_the_helpers() {
+        use std::io::{Error, ErrorKind};
+        let look = |r: std::io::Result<()>| root_half_seen(std::future::ready(r), ROOT_HALF_LOOK);
+        assert_eq!(look(Ok(())).await, RootHalfSeen::Runs);
+        for kind in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
+            assert_eq!(
+                look(Err(Error::from(kind))).await,
+                RootHalfSeen::NotRunning,
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                look(Err(Error::from(kind))).await,
+                RootHalfSeen::Unread,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// #4423 — a root half that never answers the look is unread within the
+    /// bound (paused clock).
+    #[tokio::test(start_paused = true)]
+    async fn a_look_with_no_answer_is_unread() {
+        assert_eq!(
+            root_half_seen(std::future::pending(), ROOT_HALF_LOOK).await,
+            RootHalfSeen::Unread
         );
     }
 }

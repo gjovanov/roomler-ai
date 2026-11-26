@@ -157,11 +157,43 @@ describe('the current-plan card (#4431)', () => {
     expect(shown(w)).toEqual({ status: false, cancels: false, periodEnd: false, manage: true })
   })
 
-  it('shows an ended subscription in warning, with Manage Subscription for its invoices', async () => {
+  it('shows an ended subscription no status, with Manage Subscription for its invoices', async () => {
+    // #4432: the org is back on Free, so `canceled` is no subscription it has.
     const w = await mountWith({ ...free, status: 'canceled', has_billing_account: true })
-    const chip = w.get('[data-testid="billing-status"]')
-    expect(chip.text()).toBe('canceled')
-    expect(chip.classes()).toContain('text-warning')
-    expect(w.find('[data-testid="manage-subscription"]').exists()).toBe(true)
+    expect(shown(w)).toEqual({ status: false, cancels: false, periodEnd: false, manage: true })
+  })
+})
+
+// #4432 — a checkout abandoned at 3-D Secure leaves the org on Free with an
+// `incomplete` subscription, as an ended one leaves it `canceled`: neither is
+// a subscription the org has. The chip shows only while the summary says
+// `subscribed` (active, trialing or past due).
+describe('the status chip (#4432)', () => {
+  const chip = (w: Awaited<ReturnType<typeof mountWith>>) => {
+    const c = w.find('[data-testid="billing-status"]')
+    if (!c.exists()) return null
+    const classes = c.classes()
+    return { text: c.text(), success: classes.includes('text-success'), warning: classes.includes('text-warning') }
+  }
+  const subscribed = { ...cancelling, cancel_at_period_end: false }
+
+  it('is hidden while not subscribed, incomplete after an abandoned 3-D Secure checkout', async () => {
+    const w = await mountWith({ ...free, status: 'incomplete', has_billing_account: true })
+    expect(chip(w)).toBeNull()
+  })
+
+  it('is hidden while not subscribed, active as the start of a checkout records it', async () => {
+    const w = await mountWith({ ...free, status: 'active', has_billing_account: true })
+    expect(chip(w)).toBeNull()
+  })
+
+  it('warns while subscribed and past due', async () => {
+    const w = await mountWith({ ...subscribed, status: 'past_due' })
+    expect(chip(w)).toEqual({ text: 'past_due', success: false, warning: true })
+  })
+
+  it('shows success while subscribed and active', async () => {
+    const w = await mountWith(subscribed)
+    expect(chip(w)).toEqual({ text: 'active', success: true, warning: false })
   })
 })

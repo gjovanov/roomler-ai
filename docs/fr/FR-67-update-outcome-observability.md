@@ -92,7 +92,7 @@ It was the first design, and it was refuted:
   file — see 3), and `.output()` with no timeout on the daemon's exit path is a
   genuine fleet-freeze mode.
 - **The config kill switch is inert against that mode**: config changes are
-  `restart_required` (`docs/remote-config.md:225-239`), and the failure being
+  `restart_required` (`docs/remote-config.md:474-497`), and the failure being
   guarded blocks the very exit a restart needs.
 - **It would create a failure mode that cannot exist today**: with the watcher
   surviving, PID reuse on the daemon's freed pid makes `kill(pid,0)` keep
@@ -188,7 +188,7 @@ sequenceDiagram
 |---|---|
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:471`); `UpdateRefusal` and `update_refusal()` (`:691`, `:1376`) |
 | Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5629`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3356`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3327`), else `self` |
-| Stamped at **every** announcement | `stub_caps` (`signaling.rs:7278`, `:7294`) |
+| Stamped at **every** announcement | `stub_caps` (`agents/roomlerd/src/signaling.rs:7278`, `:7294`) |
 | Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:2271`): a 409 on one device (`:2325`), a `refused` row with its `refused_code` in a bulk (`:2466`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 

@@ -72,9 +72,9 @@ fn refusal_reason_parts(deleted: bool, status: AgentStatus) -> Option<&'static s
         // Deletion wins over status: the cascade tombstones the row without
         // necessarily rewriting `status`, so an Online-looking tombstone must
         // still refuse.
-        Some("agent has been deleted")
+        Some("device has been deleted")
     } else if matches!(status, AgentStatus::Quarantined) {
-        Some("agent is quarantined")
+        Some("device is quarantined")
     } else {
         None
     }
@@ -457,7 +457,7 @@ async fn accepted_agent(
                 tracing::info!(%agent_id, %tenant_id, "refusing agent-authed request: row gone");
                 ApiError::Unauthorized("no such device".to_string())
             }
-            other => ApiError::Internal(format!("agent lookup: {other}")),
+            other => ApiError::Internal(format!("device lookup: {other}")),
         })?;
 
     if let Some(reason) = refusal_reason(&agent) {
@@ -733,7 +733,7 @@ mod tests {
     fn a_quarantined_agent_is_refused() {
         assert_eq!(
             refusal_reason_parts(false, AgentStatus::Quarantined),
-            Some("agent is quarantined")
+            Some("device is quarantined")
         );
     }
 
@@ -747,7 +747,7 @@ mod tests {
         ] {
             assert_eq!(
                 refusal_reason_parts(true, status),
-                Some("agent has been deleted"),
+                Some("device has been deleted"),
                 "a tombstoned row must refuse regardless of {status:?}"
             );
         }

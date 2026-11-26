@@ -3,6 +3,7 @@
 use roomler_ai_api::{build_router, state, state::AppState};
 use roomler_ai_config::{DEFAULT_FRONTEND_URL, Settings};
 use roomler_ai_db::{connect, indexes::ensure_indexes};
+use std::io::IsTerminal;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -21,6 +22,12 @@ async fn main() -> anyhow::Result<()> {
     // counted and reported below. The guard lives as long as `main`.
     let (log_writer, _log_guard) = roomler_ai_api::logging::nonblocking(std::io::stdout());
     let dropped_log_lines = log_writer.error_counter();
+    // #4402 — colour codes only on a terminal: in a pod, stdout is a pipe and
+    // the node stored the codes with every line (`logging::colour`).
+    let log_colour = roomler_ai_api::logging::colour(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    );
     tracing_subscriber::registry()
         // ⚠️ The bare `warn` at the front is load-bearing, and it is the whole
         // point of this list's shape. Without it an `EnvFilter` built only from
@@ -64,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
                 .into()
             }),
         )
-        .with(tracing_subscriber::fmt::layer().with_writer(log_writer))
+        .with(roomler_ai_api::logging::layer(log_writer, log_colour))
         .init();
     roomler_ai_api::logging::report_dropped_lines(dropped_log_lines);
 

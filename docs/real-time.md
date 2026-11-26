@@ -511,7 +511,7 @@ sequenceDiagram
   withdrawal reached keeps its call.
 - **The log, read by hand.** Each line has one wording, and most an `alert` field: a handle
   for a person reading the pod logs, on which nothing files or pages. Count them with
-  `grep -F` on ANSI-stripped text:
+  `grep -F` on plain text (strip the colour codes from a log older than #4402's roll first):
 
   | Line (its wording, and what it carries) | `alert` | Expected | A count above that means | Seen firing in |
   |---|---|---|---|---|
@@ -918,7 +918,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
-| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1297`), `RETIRED_RC_TAG_FAMILIES` (`:1326`), `RETIRED_USER_WS_NAMESPACES` (`:1331`) and `RETIRED_MODULE_IDS` (`:1335`), locked by `retired_rpc_verbs_are_never_reused` (`:8601`), `retired_wire_families_and_module_ids_are_never_reused` (`:8670`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5321`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1297`), `RETIRED_RC_TAG_FAMILIES` (`:1326`), `RETIRED_USER_WS_NAMESPACES` (`:1331`) and `RETIRED_MODULE_IDS` (`:1335`), locked by `retired_rpc_verbs_are_never_reused` (`:8601`), `retired_wire_families_and_module_ids_are_never_reused` (`:8670`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `crates/remote_control/src/signaling.rs:5321`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 
@@ -1118,7 +1118,8 @@ how it ended on its own warn line, `agent opened WS without rc:agent.hello — c
 with the same `cause`, `code`, `reason`, `kind` and `error`. Before #3517 that line read
 `other=None` for every end.
 
-**The grep.** Pod logs are ANSI-coloured, so strip the codes first. Tenant affinity pins
+**The grep.** Since #4402 a pod's log is plain text; a log written before that roll carries
+ANSI colour codes, which the `sed` below strips (on plain text it changes nothing). Tenant affinity pins
 each socket to one pod, so read every pod. Select the pods by their label. A name match
 such as `grep roomler2-` also catches the `roomler2-prepull-*` pods of FR-28's pre-pull
 DaemonSet (`.github/workflows/promote.yml:46`), which carry `app=roomler2-prepull` and
@@ -1143,7 +1144,12 @@ overlay fan-out, one for each inserted row and one for each WS message sent or r
 Since #4402 they write at TRACE, except a request's finished line for a 4xx, a 5xx or an
 answer of 1 s or more (`crates/api/src/request_log.rs:32`), and a fan-out pass writes one
 `overlay: delta fanned out` line with its counts (`crates/modules/network/src/overlay.rs:2250`).
-For an older window, read the rotated files through the kubelet's log proxy. The newest rotated
+The other part of the size was colour codes. The server coloured every line whatever its output
+was, and in the first hour after that change the codes were 41 % of the busier pod's bytes. It
+now colours only when stdout is a terminal and `NO_COLOR` is unset or empty
+(`crates/api/src/logging.rs:58`, asked once at start in `crates/api/src/main.rs:27`). In a
+container stdout is a pipe, so the node stores plain text, with the same words, levels, targets
+and fields as before. For an older window, read the rotated files through the kubelet's log proxy. The newest rotated
 file is plain text and the older ones are gzipped, and each line there carries the CRI
 prefix `<ts> stdout F`:
 

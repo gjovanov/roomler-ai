@@ -167,12 +167,12 @@ pub async fn ingest_agent(
     // an identity the row check never saw.
     if agent.tenant_id.to_hex() != tenant_id {
         return Err(ApiError::Forbidden(
-            "tenant_id in route does not match agent JWT".to_string(),
+            "tenant_id in route does not match the device credential".to_string(),
         ));
     }
     if agent.agent_id.to_hex() != agent_id {
         return Err(ApiError::Forbidden(
-            "agent_id in route does not match agent JWT".to_string(),
+            "agent_id in route does not match the device credential".to_string(),
         ));
     }
 
@@ -180,7 +180,7 @@ pub async fn ingest_agent(
     // authed route below.
     if payload.source == LogSource::Browser {
         return Err(ApiError::Validation(
-            "browser source not accepted on agent-authed route".to_string(),
+            "browser source not accepted on a device-authed route".to_string(),
         ));
     }
 

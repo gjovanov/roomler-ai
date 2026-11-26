@@ -1307,7 +1307,7 @@ match this node`), and an org-relay grant that needs them is refused.
   (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5881`, `:5917`,
   `:5929`). After the child exits, the supervisor waits out the first part of
   the backoff, at most 1 s (`STOP_GRACE`,
-  `crates/tunnel-core/src/overlay/netstate.rs:1241`), before it says anything:
+  `crates/tunnel-core/src/overlay/netstate.rs:1277`), before it says anything:
 
   | The child exits | Logged | Respawned |
   |---|---|---|
@@ -1327,12 +1327,33 @@ match this node`), and an org-relay grant that needs them is refused.
   one respawn, whose child the process's exit then ends (`kill_on_drop`). The
   packaged units' `RUST_LOG=roomlerd=info,warn` drops tunnel-core's INFO, so
   on such a host a stop logs nothing from the monitor at all.
+
+  **The network monitor reads the same mark** (#4435). The supervisor's
+  reader task holds the feed's only sender, so once the supervisor ends at a
+  stop, the feed closes, and netstate's network monitor, which reads it,
+  stops with it, as it always did. That close used to be a WARN, `OS backend
+  channel closed — monitor stopping (subscribers degrade to timers)` or its
+  `mid-burst` twin, so a restart still logged one WARN from netstate. When
+  its feed closes, the network monitor now reads the mark (`feed_closed`,
+  `crates/tunnel-core/src/overlay/netstate.rs:631`), on every OS:
+
+  | The feed closes | Logged |
+  |---|---|
+  | as the process stops | one INFO, `the network monitor stops with the process (#4435)` |
+  | while the process runs | the WARN, in its words as before: subscribers fall back to their timers |
+
+  The mark is set before the close can be seen: the supervisor ends at a stop
+  only once it has read the mark, and the runtime's shutdown, which drops the
+  reader too, comes after the arm that set it. An exit that takes none of
+  those arms sets no mark, so a close seen on such an exit is still the WARN.
+  On a packaged host, a stop that meets the grace now logs nothing from
+  netstate at all.
 * **The sample after a burst runs on the blocking pool** (#3018). It is two
   to six `route -n get` processes on macOS (~2.5 ms each on an idle Mac),
   `ip route get` on Linux, and on Windows a route-table read that can also
   repair a LAN route (`lan_repair`). It used to run inline on a tokio worker,
   so every burst of a carrier flap held a worker for the whole sample. It now
-  runs under `spawn_blocking` (`crates/tunnel-core/src/overlay/netstate.rs:529`),
+  runs under `spawn_blocking` (`crates/tunnel-core/src/overlay/netstate.rs:541`),
   the monitor's log lines carry `sample_ms`, and a sample over 1 s is a WARN.
   A sample that panics still stops the monitor, as it did inline: the panic
   hook records one crash, and a sampler that panicked on every burst would
@@ -1580,7 +1601,7 @@ interface holds would be refused, and a refused add still reaches every
 routing-socket listener (measured on the runner: `RTM_ADD: Add Route: …
 errno 17`). The daemon's route monitor counts an `RTM_ADD` whatever its errno
 (`classify_bsd_monitor_line`,
-`crates/tunnel-core/src/overlay/netstate.rs:962`), so a wave that retried the
+`crates/tunnel-core/src/overlay/netstate.rs:998`), so a wave that retried the
 add would start the next wave every time.
 
 * **Every wave decides again.** The route guard's wave runs
@@ -1607,7 +1628,7 @@ add would start the next wave every time.
   what the lookup found and what `route` complained about.
 * **A wave that finds the table as decided writes nothing.** Its reads are the
   interface list and two `route -n get` lookups, and the monitor does not count
-  a lookup (`RTM_GET`, `netstate.rs:970`), so a steady state does not start
+  a lookup (`RTM_GET`, `netstate.rs:1006`), so a steady state does not start
   the next wave. On a Mac, `roomler status`'s `pulled=` does not climb with
   `tick=` (the ⚠️ note above).
 * **What a withhold leaves.** The address stays its own peer with its own host

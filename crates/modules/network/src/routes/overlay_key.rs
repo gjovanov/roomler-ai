@@ -82,7 +82,7 @@ impl KeyRotationDenyReason {
                  to land (or fail) before ordering another"
             }
             Self::AgentUnsupported => {
-                "this device's agent predates overlay-key rotation (needs 0.4.25 or later) — \
+                "this device's daemon predates overlay-key rotation (needs 0.4.25 or later) — \
                  push an update first, then rotate"
             }
         }
@@ -602,5 +602,28 @@ mod tests {
             KeyRotationDenyReason::AgentUnsupported.wire(),
             "agent_unsupported"
         );
+    }
+
+    /// FR-133 P2e: the web app shows a 409's message on the rotate button
+    /// (`rotateOverlayKey`), so the reason names the device's daemon, never an
+    /// "agent". The wire code above (`agent_unsupported`) is an identity and
+    /// stays.
+    #[test]
+    fn the_rotation_refusal_names_the_daemon() {
+        assert_eq!(
+            KeyRotationDenyReason::AgentUnsupported.message(),
+            "this device's daemon predates overlay-key rotation (needs 0.4.25 or later) — \
+             push an update first, then rotate"
+        );
+        for r in [
+            KeyRotationDenyReason::RateLimited,
+            KeyRotationDenyReason::AgentUnsupported,
+        ] {
+            assert!(
+                !r.message().to_ascii_lowercase().contains("agent"),
+                "{}",
+                r.message()
+            );
+        }
     }
 }

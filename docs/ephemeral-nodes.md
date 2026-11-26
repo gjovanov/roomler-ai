@@ -329,7 +329,7 @@ and `ephemeral` (`updater::RunRow`, taken at
 `agents/roomlerd/src/app.rs:4766`). On an OS stop the gate
 (`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
 unchanged) reads the run's own `ephemeral`, and the removal targets the run's
-own row (`updater::stop_removal`, `:5085-5114`, at
+own row (`updater::stop_removal`, `:5150-5179`, at
 `agents/roomlerd/src/app.rs:6027-6055`):
 
 | The file at the stop | The stop removes |
