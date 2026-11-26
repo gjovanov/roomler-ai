@@ -30,14 +30,14 @@ into a terminal, not into a chat room, and mint a fresh one if it goes astray.
 :::steps
 1. The installer fetches the release manifest and downloads the artifact **through your server's own origin** rather than from GitHub — so a corporate allow-list only has to trust one hostname.
 2. It verifies the download: a checksum everywhere, plus a **publisher signature** on Windows and a **GPG signature** on Linux and macOS.
-3. It installs the agent and registers the service or task.
-4. It posts the token together with a **machine identity**, and receives back a device id and a long-lived agent credential, which are written to the agent's config file.
-5. The agent opens its control connection, and the machine appears under **Devices**.
+3. It installs the daemon (`roomlerd`) and registers the service or task.
+4. It posts the token together with a **machine identity**, and receives back a device id and a long-lived device credential, which are written to the daemon's config file.
+5. The daemon opens its control connection, and the machine appears under **Devices**.
 :::
 
 ## Machine identity, and why re-installing is safe
 
-The agent derives a **stable machine identity** from the hardware, and the pair
+The daemon derives a **stable machine identity** from the hardware, and the pair
 *(organization, machine)* is unique. Re-running an installer on a machine that is
 already enrolled therefore **reuses its existing device row** rather than
 creating a second one.
@@ -48,7 +48,7 @@ list of ghost devices, and the machine keeps its name and its network address.
 ## Removing a device is final
 
 Deleting a device in the dashboard does three things at once: it revokes the
-agent credential, releases the machine's mesh address back to the pool, and
+device credential, releases the machine's mesh address back to the pool, and
 tells every other node to forget it.
 
 :::warning A removed device does not get its old address back
@@ -72,7 +72,7 @@ follow the primary organization only. [Multi-org](/docs/network/multi-org/)
 covers the whole model.
 
 :::warning Joining a second organization needs a restart
-The new organization's connection does not start until the agent restarts. Until
+The new organization's connection does not start until the daemon restarts. Until
 then the device looks enrolled but never comes online in the new workspace.
 :::
 
@@ -85,7 +85,7 @@ returning one. See [ephemeral nodes](/docs/network/ephemeral-nodes/).
 
 ## Where the credential lives
 
-The agent writes its credential into `config.toml`:
+The daemon writes its credential into `config.toml`:
 
 | Platform | Path |
 |---|---|
@@ -96,7 +96,7 @@ The agent writes its credential into `config.toml`:
 | macOS (root half) | `/etc/roomler/config.toml` |
 
 :::danger This file is a credential store
-It holds the agent token and, if SSH is enabled, the SSH host private key. It is
+It holds the device credential and, if SSH is enabled, the SSH host private key. It is
 written with restrictive permissions and the machine-global directory is
 explicitly hardened at install time. Do not copy it between machines — the
 identity is meant to be per-machine, and a shared credential defeats the audit

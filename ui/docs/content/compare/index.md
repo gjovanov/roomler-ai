@@ -6,7 +6,7 @@ order: 0
 ---
 
 Roomler occupies two categories at once — a browser-based remote desktop **and**
-a WireGuard-style overlay network, on one agent, one identity and one server you
+a WireGuard-style overlay network, on one daemon, one identity and one server you
 can host yourself. So the honest comparison is rarely against a single product.
 It is against the **stack** most people assemble.
 
@@ -24,10 +24,10 @@ Every one of those products is **better than Roomler at the thing it was built
 for**. They have more years, more users, more platforms and more polish in their
 own lane, and each page below says exactly where — first, before anything else.
 
-What none of them does is **both lanes on one agent**.
+What none of them does is **both lanes in one daemon**.
 
 :::warning Running two products is not the same as running one that does both
-If you run Tailscale *and* RustDesk you are running two agents, two control
+If you run Tailscale *and* RustDesk you are running two daemons, two control
 planes, two identity systems and two audit trails on every machine — and the
 remote-desktop half has no idea the mesh exists.
 

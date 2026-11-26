@@ -15,7 +15,7 @@ unhelpful here: a missing capture grant almost never produces an error.
 |---|---|
 | Wallpaper, no windows or menu bar | macOS **Screen Recording** grant missing |
 | Screen fine, clicks and keys do nothing | macOS **Accessibility** grant (**Device Control and Data Access** on macOS 27), or a Linux keyboard-layout problem |
-| Frozen at a lock screen or UAC prompt | Windows agent not in system service mode |
+| Frozen at a lock screen or UAC prompt | Windows daemon not in system service mode |
 | Completely black, a reconnect fixes it | A capture handle that came up empty |
 | Black on a headless Linux box | No session to capture |
 
@@ -57,7 +57,7 @@ then freezes on the last frame, re-install with `-Role daemon-system`.
 :::
 
 There is a second, rarer case: a capture handle bound during the transition
-between locked and unlocked can return empty frames indefinitely. The agent
+between locked and unlocked can return empty frames indefinitely. The daemon
 detects a stream that has delivered nothing and rebuilds it — so a permanently
 black screen that a reconnect fixes was almost certainly this.
 
@@ -73,7 +73,7 @@ black screen that a reconnect fixes was almost certainly this.
 
 - **A screensaver or a blanked display** on the far end. Move the mouse in the session.
 - **A machine with no display attached** and no virtual display configured.
-- **A GPU driver that fell over.** The agent's capability probe runs in a separate process specifically so a driver fault cannot take the agent with it — but the machine may still need a reboot.
+- **A GPU driver that fell over.** The daemon's capability probe runs in a separate process specifically so a driver fault cannot take the daemon with it — but the machine may still need a reboot.
 
 ## Confirming from the far side
 
@@ -81,5 +81,5 @@ black screen that a reconnect fixes was almost certainly this.
 roomler status
 ```
 
-The agent reports its capture state, so you can tell "no permission" from "no
+The daemon reports its capture state, so you can tell "no permission" from "no
 display" from "working, but the screen really is black" without guessing.

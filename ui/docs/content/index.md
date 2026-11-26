@@ -1,13 +1,13 @@
 ---
 title: Roomler documentation
-description: Remote desktop in a browser tab, a private WireGuard-style mesh network, and team chat and video — one agent, on Windows, macOS and Linux.
+description: Remote desktop in a browser tab, a private WireGuard-style mesh network, and team chat and video — one daemon, on Windows, macOS and Linux.
 tags: [overview, getting-started, remote-desktop, mesh, self-hosting]
 hero: hero-mesh.svg
 heroAlt: Machines joined in a direct encrypted mesh with stable private addresses, crossing NATs and firewalls
 order: 0
 ---
 
-Roomler is **three products on one small daemon**. You install **one agent per
+Roomler is **three products on one small daemon**. You install **one daemon, `roomlerd`, per
 machine**; everything else happens in a browser tab.
 
 :::badges

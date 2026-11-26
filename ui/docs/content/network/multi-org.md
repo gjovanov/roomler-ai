@@ -11,13 +11,13 @@ some rules worth knowing before you rely on it.
 
 ## One daemon, not several installs
 
-:::danger Do not install a second copy of the agent
-It is the intuitive answer and it does not work. The agent owns things that are
+:::danger Do not install a second copy of roomlerd
+It is the intuitive answer and it does not work. The daemon owns things that are
 **global to the machine**: one network adapter with a fixed name, one local
 control socket, one set of routing and firewall state, one updater. A second
 install fights the first over all of them.
 
-One agent, several enrollments, is the supported shape.
+One daemon, several enrollments, is the supported shape.
 :::
 
 ## Primary and secondary
@@ -53,13 +53,13 @@ public key.
 Mint an enrollment token in the second workspace and enroll the machine again.
 
 :::danger A restart is required, and nothing tells you
-Joining a second organization does **not** start its connection until the agent
+Joining a second organization does **not** start its connection until the daemon
 restarts. Until then the device looks enrolled in the dashboard and simply never
 comes online.
 
 The tell: in the new workspace the device's last-seen time never advances past
 its creation time, while the same machine is plainly online elsewhere. If you see
-that, restart the agent.
+that, restart the daemon.
 :::
 
 ## Checking which organizations are live
@@ -90,7 +90,7 @@ organization.
 
 ## Platform limits
 
-- **macOS**: each organization gets its own network adapter, as on Windows and Linux (verified on macOS 15). Like the mesh itself on a Mac, it runs in the agent's system half, which runs as root.
+- **macOS**: each organization gets its own network adapter, as on Windows and Linux (verified on macOS 15). Like the mesh itself on a Mac, it runs in the daemon's system half, which runs as root.
 - **Exit node** roles are primary-organization only. A second organization can use userspace networking (`netstack`) through its own SOCKS5 port.
 
 ## Removing one

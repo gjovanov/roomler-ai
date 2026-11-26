@@ -58,13 +58,13 @@ machine's screen**, unless its owner chose another folder (the desktop app's
 numbered copy instead of replacing it.
 
 :::tip Nobody at the screen
-On a machine whose agent runs as a system service, on Windows or on Linux, file
+On a machine whose daemon runs as a system service, on Windows or on Linux, file
 transfer acts as the person signed in at the screen: a file you send belongs to
 them, exactly as if they had saved it themselves, and you can pull back or
 browse only what they may open. With nobody signed in at the screen, pulling
 back and browsing are refused, and the session says why. On Windows sending is
 refused too; on Linux the file lands in the service's own Downloads folder,
-`/root/Downloads` (older agents used `/tmp`), where only the service may read
+`/root/Downloads` (older versions used `/tmp`), where only the service may read
 it, never in a folder you chose or the one the machine's owner set. If the person at the screen signs out while you pull back a folder,
 the download stops and says why. If the machine cannot tell who is at the
 screen just then, the session says so: try again.
@@ -87,8 +87,8 @@ better options:
 ## Limits worth knowing
 
 - **A file is not a clipboard item.** Copying a file object in the remote file manager does not carry the file — drag it, or use the transfer panel.
-- **An image copied on a Linux machine under Wayland waits to be fetched.** A Windows host notices copied images by itself, and so does a Linux desktop on X11 with a per-user install (from agent 0.4.148) and a Mac (from agent 0.4.154); elsewhere text still follows you automatically, and the clipboard button brings an image across.
-- **A Linux machine whose agent runs as a system service outside any desktop session has no clipboard to share.** Its clipboard buttons stay greyed, with the reason in their tooltip.
-- **A Mac sends the computer's sound from agent 0.4.161.** An older Mac sends none, which surprises people expecting a full session mirror; the receive-audio toggle says so.
+- **An image copied on a Linux machine under Wayland waits to be fetched.** A Windows host notices copied images by itself, and so does a Linux desktop on X11 with a per-user install (from roomlerd 0.4.148) and a Mac (from roomlerd 0.4.154); elsewhere text still follows you automatically, and the clipboard button brings an image across.
+- **A Linux machine whose daemon runs as a system service outside any desktop session has no clipboard to share.** Its clipboard buttons stay greyed, with the reason in their tooltip.
+- **A Mac sends the computer's sound from roomlerd 0.4.161.** An older Mac sends none, which surprises people expecting a full session mirror; the receive-audio toggle says so.
 - **The Ctrl+Alt+Del button reaches the Windows lock screen only where Windows allows it.** A Windows machine that runs Roomler as a service, and whose "software Secure Attention Sequence" policy lets services send it, gets the real Ctrl+Alt+Del: it reaches the lock and sign-in screens. Elsewhere the button types the three keys. Those reach the programs on the desktop but not the lock or sign-in screen, and the button's tooltip says which condition is missing. On Linux the desktop decides what the keys do: GNOME and KDE offer to log out. A Mac gives the keys no meaning, so the button is not shown there.
 - **SFTP against a Windows target** runs as the session's account. On a Windows machine that runs Roomler as a service, a session set to the person signed in at the console transfers files as that person: the transfer starts in their home folder, and an upload belongs to them.

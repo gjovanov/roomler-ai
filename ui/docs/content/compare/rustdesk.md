@@ -25,7 +25,7 @@ RustDesk solves exactly that, and solves it well.
 
 RustDesk gives you a screen. Roomler gives you a screen **and** the machine, on
 a stable private address with a name — so a port forward, a database connection
-or an SSH session needs no second product and no second agent.
+or an SSH session needs no second product and no second install.
 
 That is the whole difference in one sentence: after a RustDesk session you still
 cannot reach the machine's services.
@@ -38,8 +38,8 @@ control — a client's laptop, a locked-down desktop, a borrowed computer.
 
 ### Licensing is settled and written down
 
-The server is AGPL-3.0, the agent MPL-2.0, and the split is documented with what
-it means if you intend to offer the product as a service. The agent's licence is
+The server is AGPL-3.0, the daemon MPL-2.0, and the split is documented with what
+it means if you intend to offer the product as a service. The daemon's licence is
 deliberately chosen so that a managed-service provider can ship it.
 
 ### Supply-chain hygiene as a shipped property
@@ -76,5 +76,5 @@ independent default-deny gates on the powerful ones and every decision audited.
 2. **You want the most proven remote-desktop stack** → RustDesk.
 3. **You want the machine reachable, not just visible** → Roomler.
 4. **You are supporting people on machines you do not control** → Roomler; there is nothing for them to install.
-5. **You need one agent, one identity and one audit trail** → Roomler.
+5. **You need one daemon, one identity and one audit trail** → Roomler.
 :::

@@ -29,7 +29,7 @@ join a machine to your organization. Paste it into a terminal, not into a chat
 room, and mint a fresh one if it goes astray.
 :::
 
-## 3 · Install the agent
+## 3 · Install the daemon
 
 Pick your operating system. The graphical installer and the one-line form do the
 same thing: the wizard just asks the questions instead of taking flags. That
@@ -48,7 +48,7 @@ Back in **Devices**, the machine appears within a few seconds.
 
 | Status | What it means |
 |---|---|
-| **Online** | The server holds a live socket to the agent. Everything works. |
+| **Online** | The server holds a live socket to the daemon. Everything works. |
 | **Stale** | The device is heartbeating, but no server holds its live socket. It self-heals, usually inside about two minutes. |
 | **Offline** | No heartbeat. The machine is off, asleep, or has no route to the server. |
 
@@ -75,7 +75,7 @@ command.
 
 ## 6 · Join it to the private network
 
-Remote desktop works on its own, but the same agent can also put the machine on
+Remote desktop works on its own, but the same daemon can also put the machine on
 your **private mesh**, giving it a stable address and a name that other enrolled
 machines can reach directly — no port forwarding, no public exposure.
 

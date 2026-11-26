@@ -33,7 +33,7 @@ This is an operating-system problem, and the answer differs per platform.
 
 :::os
 @windows
-Install with the **Machine — system** service mode. The agent then runs as a
+Install with the **Machine — system** service mode. The daemon then runs as a
 Windows service under `LocalSystem` and can reach the secure desktop — the lock
 screen, UAC prompts, and the login screen before anyone has signed in.
 
@@ -63,10 +63,10 @@ shows the desktop of the person signed in at the screen by itself, while that
 session is unlocked and the person can be told who is viewing. It never shows
 the login screen or a locked screen on its own. To reach those too, switch
 screen capture and input on in the device's configuration (`drm_capture` and
-`uinput`): the agent then reads whatever the screen shows, the login screen
+`uinput`): the daemon then reads whatever the screen shows, the login screen
 included, which is the Linux counterpart of the Windows system mode.
 
-**A headless machine** — enable the agent's virtual-display mode in its
+**A headless machine** — enable the daemon's virtual-display mode in its
 configuration. The machine then has a screen to capture, so *View screen* drops
 you into a live console instead of failing.
 
@@ -78,7 +78,7 @@ systemd.
 ## 3 · Reach it when the mesh is what is broken
 
 Screen sharing is the wrong tool when a machine is unreachable *because*
-something is broken. Two alternatives ride the agent's existing control
+something is broken. Two alternatives ride the daemon's existing control
 connection rather than the mesh — which is exactly what you want when the mesh
 is the problem:
 
