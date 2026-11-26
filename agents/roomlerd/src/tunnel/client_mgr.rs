@@ -60,7 +60,7 @@ use tunnel_core::driver::{
 };
 use tunnel_core::flow_listener::{FlowListener, HoldPolicy};
 use tunnel_core::forward::SessionThroughput;
-use tunnel_core::localapi::{FlowInfo, FlowKind};
+use tunnel_core::localapi::{FlowInfo, FlowKind, RouteDescriptor};
 use tunnel_core::signaling_link::{TunnelSignalingSink, TunnelSignalingSource};
 use tunnel_core::transport::{TRANSPORT_QUIC_DERP_V1, TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
@@ -139,7 +139,40 @@ struct FlowHandle {
     /// Requested transport word (`auto` / `quic` / `webrtc`) — shown until a
     /// session negotiates a concrete one.
     requested: String,
+    /// #1035 — the declared route this flow was created for; `None` for an
+    /// ad-hoc flow (`roomler forward` / `roomler socks5`).
+    route: Option<RouteTag>,
     live: Arc<FlowLive>,
+}
+
+/// #1035 — the declared route a flow was created for: the descriptor it was
+/// built from, and the route's generation at the time. The route reconciler
+/// reads it back ([`TunnelClientHub::flow_routes`]) to find a flow its map
+/// lost: it adopts such a flow only when the route still declares exactly
+/// this descriptor, and stops it otherwise. Never on the wire: `roomler
+/// flows` reads as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTag {
+    pub descriptor: RouteDescriptor,
+    pub generation: u64,
+}
+
+/// #1035 — one registered flow, as the route reconciler reads the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowRoute {
+    pub flow_id: String,
+    pub local: u16,
+    /// The route the flow was created for; `None` for an ad-hoc flow.
+    pub route: Option<RouteTag>,
+    /// Its supervisor stopped on a permanent failure.
+    pub fatal: bool,
+}
+
+/// The number in a flow id (`fl-12` → 12), so flows sort oldest first.
+fn flow_number(id: &str) -> u64 {
+    id.strip_prefix("fl-")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Live per-flow cells, shared between the supervisor (writes `status` +
@@ -370,6 +403,20 @@ impl TunnelClientHub {
         transport: &str,
         start_transport: &str,
     ) -> std::result::Result<String, String> {
+        self.create_forward_for(node, local, remote, transport, start_transport, None)
+            .await
+    }
+
+    /// [`Self::create_forward`] for the flow of `route` (`None`: ad-hoc).
+    async fn create_forward_for(
+        &self,
+        node: &str,
+        local: u16,
+        remote: &str,
+        transport: &str,
+        start_transport: &str,
+        route: Option<RouteTag>,
+    ) -> std::result::Result<String, String> {
         let agent_id = parse_node(node)?;
         let (host, port) = parse_host_port(remote).map_err(|e| e.to_string())?;
         let pref = parse_transport(transport);
@@ -385,6 +432,7 @@ impl TunnelClientHub {
             Target::Static { host, port },
             pref,
             start,
+            route,
         );
         info!(flow = %id, %node, local, %remote, ?pref, start, "created daemon forward");
         Ok(id)
@@ -397,6 +445,17 @@ impl TunnelClientHub {
         node: &str,
         local: u16,
         transport: &str,
+    ) -> std::result::Result<String, String> {
+        self.create_socks5_for(node, local, transport, None).await
+    }
+
+    /// [`Self::create_socks5`] for the flow of `route` (`None`: ad-hoc).
+    async fn create_socks5_for(
+        &self,
+        node: &str,
+        local: u16,
+        transport: &str,
+        route: Option<RouteTag>,
     ) -> std::result::Result<String, String> {
         let agent_id = parse_node(node)?;
         let pref = parse_transport(transport);
@@ -412,9 +471,64 @@ impl TunnelClientHub {
             // SOCKS5 has no start-transport lever (the FR-86 P2 field test drives
             // a static forward); it always starts on the normal ladder.
             None,
+            route,
         );
         info!(flow = %id, %node, local, ?pref, "created daemon socks5 listener");
         Ok(id)
+    }
+
+    /// #1035 — create the flow of a declared route, tagged with the route
+    /// it is for ([`RouteTag`]). The validation and the supervision are an
+    /// ad-hoc forward's or SOCKS5 listener's.
+    pub async fn create_route_flow(&self, tag: RouteTag) -> std::result::Result<String, String> {
+        let route = tag.descriptor.clone();
+        match route.kind {
+            FlowKind::Forward => {
+                let remote = route.remote.unwrap_or_default();
+                self.create_forward_for(
+                    &route.node,
+                    route.local,
+                    &remote,
+                    &route.transport,
+                    "",
+                    Some(tag),
+                )
+                .await
+            }
+            FlowKind::Socks5 => {
+                self.create_socks5_for(&route.node, route.local, &route.transport, Some(tag))
+                    .await
+            }
+        }
+    }
+
+    /// #1035 — every registered flow with the route it was created for,
+    /// oldest first: the route reconciler's view of the registry.
+    pub fn flow_routes(&self) -> Vec<FlowRoute> {
+        let flows = self.inner.flows.lock().unwrap();
+        let mut out: Vec<FlowRoute> = flows
+            .iter()
+            .map(|(id, h)| FlowRoute {
+                flow_id: id.clone(),
+                local: h.local,
+                route: h.route.clone(),
+                fatal: h.live.fatal.lock().unwrap().is_some(),
+            })
+            .collect();
+        out.sort_by_key(|f| flow_number(&f.flow_id));
+        out
+    }
+
+    /// #1035 — one registered flow's [`FlowRoute`]; `None` for an unknown id.
+    pub fn flow_route(&self, id: &str) -> Option<FlowRoute> {
+        let flows = self.inner.flows.lock().unwrap();
+        let h = flows.get(id)?;
+        Some(FlowRoute {
+            flow_id: id.to_string(),
+            local: h.local,
+            route: h.route.clone(),
+            fatal: h.live.fatal.lock().unwrap().is_some(),
+        })
     }
 
     /// Whether a flow with this id is registered (P6 — the route
@@ -529,6 +643,8 @@ impl TunnelClientHub {
         // FR-86 P2 — force the FIRST session's transport (a below-best carrier
         // for the field test); `None` = the normal ladder.
         start_transport: Option<&'static str>,
+        // #1035 — the declared route the flow is for; `None` = ad-hoc.
+        route: Option<RouteTag>,
     ) -> String {
         let id = format!("fl-{}", self.inner.seq.fetch_add(1, Ordering::Relaxed));
         let live = Arc::new(FlowLive::default());
@@ -551,6 +667,7 @@ impl TunnelClientHub {
                 target: target_disp,
                 node,
                 requested: transport_word(pref).to_string(),
+                route,
                 live,
             },
         );
@@ -2202,6 +2319,7 @@ mod tests {
                 target: Some("db:5432".into()),
                 node: "0123456789abcdef01234567".into(),
                 requested: "auto".into(),
+                route: None,
                 live: live.clone(),
             },
         );
@@ -2293,6 +2411,7 @@ mod tests {
                 target: None,
                 node: "0123456789abcdef01234567".into(),
                 requested: "auto".into(),
+                route: None,
                 live: live.clone(),
             },
         );
@@ -2469,6 +2588,7 @@ mod tests {
                 target: None,
                 node: node.into(),
                 requested: "auto".into(),
+                route: None,
                 live,
             }
         };
