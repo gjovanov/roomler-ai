@@ -891,7 +891,7 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
     }
     match &s.quality.crashes {
         Measured::Value(c) => {
-            out.push(Line("Agent crashes".into(), fig(&c.total)));
+            out.push(Line("Daemon crashes".into(), fig(&c.total)));
             out.push(Line(
                 "Device-days (devices online)".into(),
                 fig(&c.device_days),
@@ -902,7 +902,7 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
             ));
             if !c.by_agent_version.is_empty() {
                 out.push(Table(
-                    vec!["Agent version".into(), "Crashes".into()],
+                    vec!["Daemon version".into(), "Crashes".into()],
                     c.by_agent_version
                         .iter()
                         .map(|k| vec![k.key.clone(), k.count.to_string()])
@@ -910,13 +910,13 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
                 ));
             }
         }
-        Measured::NotMeasured(n) => out.push(Line("Agent crashes".into(), not_measured(n))),
+        Measured::NotMeasured(n) => out.push(Line("Daemon crashes".into(), not_measured(n))),
     }
     // P9a — the day by agent version, from the frozen rows.
     match &s.quality.by_agent_version {
         Measured::Value(rows) if !rows.is_empty() => out.push(Table(
             vec![
-                "Agent version".into(),
+                "Daemon version".into(),
                 "Requested".into(),
                 "Active".into(),
                 "Never active".into(),
@@ -951,7 +951,7 @@ pub fn blocks(doc: &DigestDoc, s: &Sections) -> Vec<Block> {
         Measured::Value(_) => out.push(Note(
             "No session, crash or online device on record for the day, by version.".into(),
         )),
-        Measured::NotMeasured(n) => out.push(Line("By agent version".into(), not_measured(n))),
+        Measured::NotMeasured(n) => out.push(Line("By daemon version".into(), not_measured(n))),
     }
     // P9b — what people answered the post-session prompt.
     match &s.quality.ratings {
@@ -1889,7 +1889,7 @@ fn version_lines(out: &mut Vec<Block>, v: &VersionQuality) {
             "not measured — no frozen day with its connect records still complete".into(),
         )),
     }
-    out.push(Line("Agent crashes".into(), opt_count(v.crashes)));
+    out.push(Line("Daemon crashes".into(), opt_count(v.crashes)));
     out.push(Line(
         "Device-days (devices online)".into(),
         opt_count(v.device_days),
@@ -1921,7 +1921,7 @@ fn quality_blocks(out: &mut Vec<Block>, q: &QualityReport) {
     if !q.by_agent_version.is_empty() {
         out.push(Table(
             vec![
-                "Agent version".into(),
+                "Daemon version".into(),
                 "Requested".into(),
                 "Active".into(),
                 "Never active".into(),
@@ -3017,5 +3017,65 @@ mod tests {
             html.contains("&lt;b&gt;Acme&lt;/b&gt;"),
             "an org name is text"
         );
+    }
+
+    /// FR-133 P2e: the operator reads the crash and version figures in the
+    /// daily and weekly mails (no parser reads them), so their labels name
+    /// the daemon, never an "agent". The fields (`by_agent_version`, a crash
+    /// payload's `agentVersion`) are identities and stay. The weekly labels
+    /// are the same words, counted in the source.
+    #[test]
+    fn the_crash_and_version_labels_name_the_daemon() {
+        use crate::growth::digest::{Crashes, VersionDayRow};
+        let (doc, mut s) = sample();
+        let text = render_text(&doc, &s);
+        assert!(text.contains("Daemon crashes: not measured"), "{text}");
+        assert!(text.contains("By daemon version: not measured"), "{text}");
+
+        s.quality.crashes = Measured::Value(Crashes {
+            total: Figure {
+                day: 2,
+                d7: 3,
+                d28: 5,
+            },
+            by_agent_version: vec![KeyCount {
+                key: "0.4.237".into(),
+                count: 2,
+            }],
+            device_days: Figure::default(),
+            per_100_device_days: RateFigure::default(),
+        });
+        s.quality.by_agent_version = Measured::Value(vec![VersionDayRow {
+            agent_version: "0.4.237".into(),
+            requested: 4,
+            reached_active: 3,
+            not_reached: 1,
+            failures: 0,
+            ttff_n: None,
+            ttff_p50_ms: None,
+            ttff_p90_ms: None,
+            crashes: Some(2),
+            device_days: Some(9),
+        }]);
+        let text = render_text(&doc, &s);
+        assert!(text.contains("Daemon crashes: 2 (7d 3 · 28d 5)"), "{text}");
+        assert!(text.contains("  Daemon version | Crashes\n"), "{text}");
+        assert!(
+            text.contains("  Daemon version | Requested | Active"),
+            "{text}"
+        );
+        for old in ["Agent crashes", "Agent version", "By agent version"] {
+            assert!(!text.contains(old), "{old} in {text}");
+        }
+
+        let src = include_str!("render.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("the tests module")];
+        for (label, n) in [
+            ("\"Daemon crashes\"", 3),
+            ("\"Daemon version\"", 3),
+            ("\"By daemon version\"", 1),
+        ] {
+            assert_eq!(code.matches(label).count(), n, "{label}");
+        }
     }
 }
