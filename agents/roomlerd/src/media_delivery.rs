@@ -5189,6 +5189,124 @@ pub(crate) mod shaped_link {
         shaped_dropping(bps, one_way, queue, 0, Some(noise))
     }
 
+    /// FR-148 4a-3c — a stall on the agent's host, as a loaded runner makes
+    /// one: the link goes on, and what it delivers to the agent waits. It
+    /// starts when the first packet for the agent due at or after `from` is
+    /// due, and lasts `len`: that packet reaches the agent at its end, and
+    /// the others due in it [`STALL_GAP`] later, so the writer steps between
+    /// them, as the late SACKs of a loaded runner came one by one. Only what
+    /// the agent reads waits: the bottleneck's queue never moves for it.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct HostStall {
+        pub(crate) from: Instant,
+        pub(crate) len: Duration,
+    }
+
+    /// How long after the first packet a [`HostStall`] held the others reach
+    /// the agent.
+    const STALL_GAP: Duration = Duration::from_millis(5);
+
+    /// Where a cell arms its stall once its clock starts, and where the link
+    /// says when the stall began.
+    #[derive(Debug, Default)]
+    pub(crate) struct StallSlot {
+        armed: StdMutex<Option<HostStall>>,
+        began: StdMutex<Option<Instant>>,
+    }
+
+    impl StallSlot {
+        pub(crate) fn arm(&self, stall: HostStall) {
+            *self.armed.lock().unwrap() = Some(stall);
+        }
+
+        /// When the stall began, once it has.
+        pub(crate) fn began(&self) -> Option<Instant> {
+            *self.began.lock().unwrap()
+        }
+    }
+
+    /// As [`shaped`], with the [`HostStall`] `slot` arms on what reaches the
+    /// agent's end.
+    pub(crate) fn shaped_stalled(
+        bps: u64,
+        one_way: Duration,
+        queue: Duration,
+        slot: Arc<StallSlot>,
+    ) -> (ShapedConn, ShapedConn) {
+        let (a_out, b_inbox) = direction(bps, one_way, queue, 0, None);
+        let (b_out, a_inbox) = stalled_direction(bps, one_way, queue, slot);
+        let (a, b): (SocketAddr, SocketAddr) = (
+            "10.0.0.1:5000".parse().unwrap(),
+            "10.0.0.2:5000".parse().unwrap(),
+        );
+        (
+            ShapedConn {
+                out: a_out,
+                inbox: Mutex::new(a_inbox),
+                local: a,
+                remote: b,
+            },
+            ShapedConn {
+                out: b_out,
+                inbox: Mutex::new(b_inbox),
+                local: b,
+                remote: a,
+            },
+        )
+    }
+
+    /// One direction's delivery, held by the stall `slot` arms.
+    fn stalled_direction(
+        bps: u64,
+        one_way: Duration,
+        queue: Duration,
+        slot: Arc<StallSlot>,
+    ) -> (Shaper, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (due_tx, mut due_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+        let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            // The stall's end once it began, and the packets it held.
+            let mut stall: Option<(Instant, u32)> = None;
+            while let Some((due, p)) = due_rx.recv().await {
+                let armed = *slot.armed.lock().unwrap();
+                let due = match armed {
+                    Some(s) if due >= s.from => {
+                        let (end, held) = stall.get_or_insert_with(|| {
+                            *slot.began.lock().unwrap() = Some(due);
+                            (due + s.len, 0)
+                        });
+                        if due < *end {
+                            *held += 1;
+                            if *held == 1 { *end } else { *end + STALL_GAP }
+                        } else {
+                            due
+                        }
+                    }
+                    _ => due,
+                };
+                tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                if inbox_tx.send(p).is_err() {
+                    break;
+                }
+            }
+        });
+        let shaper = Shaper {
+            bps,
+            one_way,
+            queue,
+            next_free: StdMutex::new(Instant::now()),
+            due: due_tx,
+            drop_every: 0,
+            full_packets: AtomicU64::new(0),
+            peak_wait_ns: AtomicU64::new(0),
+            tail_drops: AtomicU64::new(0),
+            outages: None,
+            step: None,
+            hop: None,
+        };
+        (shaper, inbox_rx)
+    }
+
     fn shaped_dropping(
         bps: u64,
         one_way: Duration,

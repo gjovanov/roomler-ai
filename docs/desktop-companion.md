@@ -3855,9 +3855,12 @@ sequenceDiagram
 **Install update** queues the root update helper (FR-27). Since FR-151 that click is also the
 person's own ask: `roomlerd self-update`, run as them, records it in the daemon behind their own
 socket (`ask_for_update`) before it wakes the helper. The update then installs at once over what
-their own half serves and the root half's remote-control sessions, and still waits for the root
-half's SSH connections, runs, transfers and recordings
-([installation.md](installation.md#macos-the-root-update-helpers-gate-fr-151)).
+their own half serves and the root half's remote-control sessions, unless the root half serves an
+SSH connection, a run, a transfer or a recording, does not answer, or its network just moved.
+Then the ask lapses, and the update waits for both halves as on any other wake. The card shows
+the line the command prints, which says which of these this Mac has: on a per-user Mac, that the
+update installs at once (#4423,
+[installation.md](installation.md#macos-the-root-update-helpers-gate-fr-151)).
 
 ### 13.2 A tray too old for its daemon (Windows, #3781)
 
