@@ -348,7 +348,7 @@ give.
 A tunnel policy names who may reach which `host:port` through which of the org's
 devices, so writing one is granting access. Every `…/tunnel-policy` route needs
 **`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
-(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:810`; the
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:811`; the
 overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:157`).
 The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
 roles do not.
@@ -1037,11 +1037,11 @@ A single-use enrollment token and an FR-51 ephemeral key act for the admin who m
 them (the token's `sub`, the key's `created_by`): the device they enroll is that
 person's, and an anchor records them as `anchored_by`. So every use asks again what the
 mint asked, whether that person holds `MANAGE_AGENTS` in the credential's org
-(`issuer_may_enroll`, `crates/modules/fleet/src/agent.rs:160`, the mint's own
+(`issuer_may_enroll`, `crates/modules/fleet/src/agent.rs:164`, the mint's own
 `require_permission`, which nobody outside the org passes):
 
 - **Both doors ask it**: `POST /api/agent/enroll`, for a token and a key alike
-  (`crates/modules/fleet/src/agent.rs:379`), and `POST /api/agent/anchor`
+  (`crates/modules/fleet/src/agent.rs:383`), and `POST /api/agent/anchor`
   (`crates/modules/fleet/src/exec_service.rs:151`). They ask after the archived-org
   gate and before the token's spend or the key's claim
   ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)). A token a
