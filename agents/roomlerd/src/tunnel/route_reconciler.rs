@@ -98,6 +98,22 @@ struct Inner {
     kick: Notify,
     /// Monotonic source for generated route ids (`route-N`).
     seq: std::sync::atomic::AtomicU64,
+    /// Test seam (#1035): parks the next create between the hub's answer and
+    /// the pass's commit.
+    #[cfg(test)]
+    gate: StdMutex<Option<CreateGate>>,
+    /// Test seam (#1035): the creates the passes have asked the hub for.
+    #[cfg(test)]
+    creates: std::sync::atomic::AtomicU32,
+}
+
+/// Test seam (#1035): a test lands a verb inside a create's await with it.
+/// `reached` gets the hub's answer, and the pass commits once `release`
+/// fires (or its sender is dropped).
+#[cfg(test)]
+struct CreateGate {
+    reached: tokio::sync::oneshot::Sender<Result<String, String>>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl RouteReconciler {
@@ -118,6 +134,10 @@ impl RouteReconciler {
                 runtime: StdMutex::new(HashMap::new()),
                 kick: Notify::new(),
                 seq: std::sync::atomic::AtomicU64::new(1),
+                #[cfg(test)]
+                gate: StdMutex::new(None),
+                #[cfg(test)]
+                creates: std::sync::atomic::AtomicU32::new(0),
             }),
         }
     }
@@ -288,6 +308,10 @@ impl RouteReconciler {
                         .insert(route.id.clone(), RouteRuntime::Failed { reason });
                 }
                 Action::Create => {
+                    #[cfg(test)]
+                    self.inner
+                        .creates
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let result = match route.kind {
                         FlowKind::Forward => {
                             let remote = route.remote.clone().unwrap_or_default();
@@ -309,6 +333,8 @@ impl RouteReconciler {
                                 .await
                         }
                     };
+                    #[cfg(test)]
+                    self.park_at_test_gate(&result).await;
                     let mut runtime = self.inner.runtime.lock().unwrap();
                     match result {
                         Ok(flow_id) => {
@@ -321,7 +347,8 @@ impl RouteReconciler {
                             // minutes: say WHO holds it (off the reconcile
                             // pass; the lookup reads tables and /proc).
                             if super::port_holder::note_failure(&route.id, &message) {
-                                let (route_id, port) = (route.id.clone(), route.local);
+                                let (this, route_id, port) =
+                                    (self.clone(), route.id.clone(), route.local);
                                 tokio::spawn(async move {
                                     if let Ok(holder) = tokio::task::spawn_blocking(move || {
                                         super::port_holder::lookup(port)
@@ -331,7 +358,7 @@ impl RouteReconciler {
                                         warn!(
                                             route = %route_id,
                                             port,
-                                            holder = %super::port_holder::describe(&holder),
+                                            holder = %this.holder_line(port, &holder),
                                             "route still cannot bind its local port"
                                         );
                                     }
@@ -602,6 +629,24 @@ impl RouteReconciler {
         crate::config::save(&self.inner.config_path, &cfg)
             .map_err(|e| format!("could not persist routes: {e:#}"))?;
         Ok(())
+    }
+
+    /// FR-84 D6 / #1035 — the log line's worth of who holds `_port`, a port a
+    /// declared route has been refused for [`super::port_holder::STUCK_AFTER`].
+    fn holder_line(&self, _port: u16, holder: &super::port_holder::Holder) -> String {
+        super::port_holder::describe(holder)
+    }
+
+    /// Test seam (#1035): hand a gated test the hub's answer, then wait until
+    /// it lets the pass commit. The gate's lock is a statement temporary,
+    /// never held across the await.
+    #[cfg(test)]
+    async fn park_at_test_gate(&self, result: &Result<String, String>) {
+        let gate = self.inner.gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.reached.send(result.clone());
+            let _ = gate.release.await;
+        }
     }
 }
 
@@ -1142,5 +1187,399 @@ mod tests {
         // …re-enable → fresh Pending (Failed cleared).
         assert!(r.set_enabled("a", true).await.unwrap());
         assert_eq!(r.list()[0].state, RouteState::Pending { flow_id: None });
+    }
+
+    // ---- #1035: one writer owns the route→flow map --------------------------
+
+    use crate::tunnel::port_holder::Holder;
+
+    /// Poll `cond` every 5 ms until it holds, for at most 5 s. The test
+    /// runtime has one thread, so a spawned verb or a flow's supervisor runs
+    /// only while the test waits here.
+    async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Something listens on `port`: a bind of it fails.
+    fn port_is_held(port: u16) -> bool {
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+    }
+
+    /// The ids of the hub's flows, in order.
+    fn hub_flows(r: &RouteReconciler) -> Vec<String> {
+        r.inner
+            .hub
+            .flows_snapshot()
+            .into_iter()
+            .map(|f| f.id)
+            .collect()
+    }
+
+    /// The creates the passes have asked the hub for.
+    fn creates(r: &RouteReconciler) -> u32 {
+        r.inner.creates.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drop the map's handle to a route's flow, the way #1035's races did:
+    /// the hub keeps the flow and its port, and nothing maps it back.
+    fn lose_the_handle(r: &RouteReconciler, id: &str) {
+        let lost = r.inner.runtime.lock().unwrap().remove(id);
+        assert!(
+            matches!(lost, Some(RouteRuntime::Live { .. })),
+            "route {id} held no flow to lose"
+        );
+    }
+
+    /// Park the next pass's create after the hub's answer. Returns where that
+    /// answer arrives, and the sender that lets the pass commit.
+    fn gate_next_create(
+        r: &RouteReconciler,
+    ) -> (
+        tokio::sync::oneshot::Receiver<Result<String, String>>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release) = tokio::sync::oneshot::channel();
+        *r.inner.gate.lock().unwrap() = Some(CreateGate { reached, release });
+        (reached_rx, release_tx)
+    }
+
+    /// One pass on a task of its own, so it can park at a gate the test holds.
+    fn spawn_pass(r: &RouteReconciler) -> tokio::task::JoinHandle<()> {
+        let r = r.clone();
+        tokio::spawn(async move {
+            r.reconcile_pass().await;
+        })
+    }
+
+    /// #1035, the field case (agent 0.4.189). `route enable` writes the flag,
+    /// then awaits the config save under the daemon-wide config lock (0.67 to
+    /// 1.47 s on the field host). A pass inside that window creates the
+    /// route's flow, and the route must end on THAT flow with no second
+    /// create. Before the fix the verb then inserted a fresh entry over the
+    /// pass's `Live`: the hub kept the flow and its port, and every later
+    /// create read `backoff … 10048` until the daemon restarted.
+    #[tokio::test]
+    async fn a_reenable_that_a_pass_overtakes_keeps_the_passs_flow() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, false)]);
+        let held = r.inner.cfg_lock.lock().await;
+        let enable = tokio::spawn({
+            let r = r.clone();
+            async move { r.set_enabled("a", true).await }
+        });
+        eventually("the enable is declared", || r.list()[0].route.enabled).await;
+        r.reconcile_pass().await;
+        let f1 = route_flow(&r, "a");
+        eventually("the pass's flow holds its port", || port_is_held(p)).await;
+        drop(held);
+        assert_eq!(enable.await.unwrap(), Ok(true));
+        r.reconcile_pass().await;
+
+        let state = r.list()[0].state.clone();
+        assert_eq!(
+            state.flow_id(),
+            Some(f1.as_str()),
+            "the route lost the pass's flow: {state:?}"
+        );
+        assert_eq!(hub_flows(&r), vec![f1], "one flow, and the route holds it");
+        assert_eq!(creates(&r), 1, "a second create ran");
+    }
+
+    /// #1035 — enabling a route that is already enabled and live keeps its
+    /// flow, with no race at all. Before the fix the verb put a fresh entry
+    /// over `Live`, and the next create found the port held by the flow the
+    /// route had just lost.
+    #[tokio::test]
+    async fn an_enable_of_a_live_route_keeps_its_flow() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let f1 = route_flow(&r, "a");
+        eventually("the flow holds its port", || port_is_held(p)).await;
+        assert!(r.set_enabled("a", true).await.unwrap());
+        r.reconcile_pass().await;
+
+        let state = r.list()[0].state.clone();
+        assert_eq!(
+            state.flow_id(),
+            Some(f1.as_str()),
+            "the enable cost the route its flow: {state:?}"
+        );
+        assert_eq!(hub_flows(&r), vec![f1]);
+        assert_eq!(creates(&r), 1, "a second create ran");
+    }
+
+    /// #1035 — a disable landing inside a create's await. Once the pass is
+    /// done the map and the hub agree: a disabled route has no flow. Before
+    /// the fix the verb removed a `Pending` entry and stopped nothing, and the
+    /// pass then recorded `Live` for a disabled route.
+    #[tokio::test]
+    async fn a_disable_inside_a_create_leaves_no_flow() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        let (reached, release) = gate_next_create(&r);
+        let pass = spawn_pass(&r);
+        let f1 = reached.await.unwrap().expect("the hub created the flow");
+        assert!(r.set_enabled("a", false).await.unwrap());
+        release.send(()).unwrap();
+        pass.await.unwrap();
+
+        assert_eq!(r.list()[0].state, RouteState::Disabled);
+        assert!(
+            !r.inner.hub.has_flow(&f1),
+            "the pass kept a flow for a disabled route"
+        );
+        assert_eq!(hub_flows(&r), Vec::<String>::new());
+        assert!(
+            !matches!(
+                r.inner.runtime.lock().unwrap().get("a"),
+                Some(RouteRuntime::Live { .. })
+            ),
+            "the map holds a flow for a disabled route"
+        );
+
+        // Enabled again, the route comes back on exactly one flow: its own.
+        assert!(r.set_enabled("a", true).await.unwrap());
+        eventually("the stopped flow let go of the port", || !port_is_held(p)).await;
+        r.reconcile_pass().await;
+        let f2 = route_flow(&r, "a");
+        assert_eq!(hub_flows(&r), vec![f2]);
+    }
+
+    /// #1035 — a replace landing inside a create's await: the route ends on a
+    /// flow for the new descriptor only. Before the fix the pass recorded
+    /// `Live` for the flow it had built from the OLD descriptor, and every
+    /// later pass saw a live flow and left the route serving its old shape.
+    #[tokio::test]
+    async fn a_replace_inside_a_create_keeps_only_the_new_descriptors_flow() {
+        let [p1, p2] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p1, true)]);
+        let (reached, release) = gate_next_create(&r);
+        let pass = spawn_pass(&r);
+        let f1 = reached.await.unwrap().expect("the hub created the flow");
+        r.replace(desc("a", p2, true)).await.unwrap();
+        release.send(()).unwrap();
+        pass.await.unwrap();
+        r.reconcile_pass().await;
+
+        let f2 = route_flow(&r, "a");
+        assert_ne!(f1, f2, "the route kept the flow of its old descriptor");
+        let flows = r.inner.hub.flows_snapshot();
+        assert_eq!(
+            flows.len(),
+            1,
+            "a flow for the new descriptor only: {flows:?}"
+        );
+        assert_eq!(flows[0].id, f2);
+        assert_eq!(flows[0].local_addr, format!("127.0.0.1:{p2}"));
+    }
+
+    /// #1035 — a flow the map lost, of a route since removed: the next pass
+    /// stops it. Before the fix `route rm` stopped only a flow its entry held,
+    /// so a lost flow outlived its route and kept the port until a restart.
+    #[tokio::test]
+    async fn a_lost_flow_of_a_removed_route_is_stopped() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let f1 = route_flow(&r, "a");
+        lose_the_handle(&r, "a");
+        assert!(r.remove("a").await.unwrap());
+        r.reconcile_pass().await;
+
+        assert!(
+            !r.inner.hub.has_flow(&f1),
+            "the lost flow outlived its route"
+        );
+        assert_eq!(hub_flows(&r), Vec::<String>::new());
+    }
+
+    /// #1035 — the same for a route since disabled: `route disable` could not
+    /// stop a lost flow either.
+    #[tokio::test]
+    async fn a_lost_flow_of_a_disabled_route_is_stopped() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let f1 = route_flow(&r, "a");
+        lose_the_handle(&r, "a");
+        assert!(r.set_enabled("a", false).await.unwrap());
+        r.reconcile_pass().await;
+
+        assert_eq!(r.list()[0].state, RouteState::Disabled);
+        assert!(
+            !r.inner.hub.has_flow(&f1),
+            "the lost flow outlived its route's disable"
+        );
+        assert_eq!(hub_flows(&r), Vec::<String>::new());
+    }
+
+    /// #1035 — a lost flow built from exactly the declared descriptor is
+    /// adopted, not rebuilt: one pass, no second create, no 10048. Before the
+    /// fix the pass found no entry, created again, and the create found the
+    /// port held by the flow the route had lost.
+    #[tokio::test]
+    async fn a_lost_flow_matching_its_route_is_adopted() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let f1 = route_flow(&r, "a");
+        eventually("the flow holds its port", || port_is_held(p)).await;
+        lose_the_handle(&r, "a");
+        r.reconcile_pass().await;
+
+        let state = r.list()[0].state.clone();
+        assert_eq!(
+            state.flow_id(),
+            Some(f1.as_str()),
+            "the lost flow was not adopted: {state:?}"
+        );
+        assert_eq!(hub_flows(&r), vec![f1]);
+        assert_eq!(creates(&r), 1, "a second create ran");
+    }
+
+    /// #1035 — a lost flow built from an older descriptor of its route is
+    /// stopped, never adopted, and the route ends on one flow for its new
+    /// shape.
+    #[tokio::test]
+    async fn a_lost_flow_of_an_older_descriptor_is_stopped_not_adopted() {
+        let [p1, p2] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p1, true)]);
+        r.reconcile_pass().await;
+        let f1 = route_flow(&r, "a");
+        lose_the_handle(&r, "a");
+        r.replace(desc("a", p2, true)).await.unwrap();
+        r.reconcile_pass().await;
+
+        let f2 = route_flow(&r, "a");
+        assert_ne!(f1, f2);
+        let flows = r.inner.hub.flows_snapshot();
+        assert_eq!(
+            flows.len(),
+            1,
+            "the lost flow of the old descriptor survived: {flows:?}"
+        );
+        assert_eq!(flows[0].id, f2);
+        assert_eq!(flows[0].local_addr, format!("127.0.0.1:{p2}"));
+    }
+
+    /// #1035 — the port-holder line names the lost flow and its route. Before
+    /// the fix it read "a listener no flow owns": a flow did own the listener,
+    /// and the route had lost the flow.
+    #[tokio::test]
+    async fn the_port_holder_line_names_the_lost_flow_and_its_route() {
+        let [p] = free_ports();
+        let mut route = desc("corp-socks", p, true);
+        route.kind = FlowKind::Socks5;
+        route.remote = None;
+        let (r, _dir) = reconciler(vec![route]);
+        r.reconcile_pass().await;
+        let f1 = route_flow(&r, "corp-socks");
+        lose_the_handle(&r, "corp-socks");
+
+        let line = r.holder_line(
+            p,
+            &Holder::ThisDaemon {
+                pid: std::process::id(),
+            },
+        );
+        assert!(
+            line.contains(&f1) && line.contains("corp-socks") && line.contains("lost"),
+            "{line}"
+        );
+        assert!(!line.contains("no flow owns"), "{line}");
+    }
+
+    /// #1035 — the line tells this daemon's other flows apart: another
+    /// route's flow serving on the port (two enabled routes declare it), and
+    /// an ad-hoc flow no route declares. Any other holder reads as before.
+    #[tokio::test]
+    async fn the_port_holder_line_names_a_serving_or_an_ad_hoc_flow() {
+        let [p, q] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let fa = route_flow(&r, "a");
+        let me = Holder::ThisDaemon {
+            pid: std::process::id(),
+        };
+
+        let serving = r.holder_line(p, &me);
+        assert!(
+            serving.contains(&fa) && serving.contains("serves route a"),
+            "{serving}"
+        );
+        assert!(!serving.contains("lost"), "{serving}");
+
+        let ad_hoc = r
+            .inner
+            .hub
+            .create_forward("aabbccddeeff001122334455", q, "db:5432", "", "")
+            .await
+            .unwrap();
+        let line = r.holder_line(q, &me);
+        assert!(
+            line.contains(&ad_hoc) && line.contains("no route"),
+            "{line}"
+        );
+
+        let foreign = Holder::Alive {
+            pid: 11,
+            image: Some("proxy.exe".into()),
+        };
+        assert_eq!(
+            r.holder_line(p, &foreign),
+            crate::tunnel::port_holder::describe(&foreign)
+        );
+    }
+
+    /// #1035 — with one writer the verbs no longer touch the map, and their
+    /// answers still reflect the world: each verb answers after the pass that
+    /// applies its change. `route rm` promises to stop the route's flow, and
+    /// the fleet's watchdogs read `flows` right after a verb.
+    #[tokio::test]
+    async fn a_verb_answers_after_the_pass_that_applies_it() {
+        let [p1, p2] = free_ports();
+        let (r, _dir) = reconciler(vec![]);
+        // Kept alive for the whole test: the task stops when it reads `true`.
+        let (_stop, stop_rx) = watch::channel(false);
+        r.spawn(stop_rx);
+
+        r.add(desc("a", p1, true)).await.unwrap();
+        let f1 = route_flow(&r, "a");
+
+        r.replace(desc("a", p2, true)).await.unwrap();
+        assert!(
+            !r.inner.hub.has_flow(&f1),
+            "replace answered before the old flow was stopped"
+        );
+        let f2 = route_flow(&r, "a");
+        let flows = r.inner.hub.flows_snapshot();
+        assert_eq!(flows.len(), 1, "{flows:?}");
+        assert_eq!(flows[0].local_addr, format!("127.0.0.1:{p2}"));
+
+        assert!(r.set_enabled("a", false).await.unwrap());
+        assert!(
+            !r.inner.hub.has_flow(&f2),
+            "disable answered before the flow was stopped"
+        );
+        eventually("the stopped flow let go of the port", || !port_is_held(p2)).await;
+        assert!(r.set_enabled("a", true).await.unwrap());
+        let f3 = route_flow(&r, "a");
+        assert_eq!(hub_flows(&r), vec![f3]);
+
+        assert!(r.remove("a").await.unwrap());
+        assert_eq!(
+            hub_flows(&r),
+            Vec::<String>::new(),
+            "rm answered before the route's flow was stopped"
+        );
     }
 }
