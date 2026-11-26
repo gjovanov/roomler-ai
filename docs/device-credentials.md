@@ -91,7 +91,7 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328), and comes back as that holder's: its new token acts for them.
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1328`; tunnel clients `crates/services/src/dao/tunnel_client.rs:369`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1353`; tunnel clients `crates/services/src/dao/tunnel_client.rs:369`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
@@ -117,7 +117,7 @@ The row comes back, but not what the removed device was allowed. Before #3627 a 
 |---|---|
 | none | a new device (`AgentDao::create`), after the plan cap |
 | live: a device nobody removed (a lost token, a reinstall, `roomlerd re-enroll`) | refreshes it (`AgentDao::rehydrate`): os, version, the name unless an admin renamed it, the install method if the request says. **Everything it was allowed stays** |
-| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:341`) |
+| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:345`) |
 
 What a revive keeps, and nothing else:
 
