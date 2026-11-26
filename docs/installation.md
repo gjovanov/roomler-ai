@@ -1453,9 +1453,9 @@ flowchart TD
 
 The pick is `Pick::fate` (`agents/roomlerd/src/install_cleanup.rs:827`). The file a process
 was started from is the first entry of its module list, which a rename does not change, else its
-image now (`read_named`, `agents/roomlerd/src/win_service/companion_procs.rs:356`). Each stop
+image now (`read_named`, `agents/roomlerd/src/win_service/companion_procs.rs:357`). Each stop
 reads the process again through the handle that ends it, so a pid another process took after the
-list is never ended (`terminate_checked`, `agents/roomlerd/src/win_service/companion_procs.rs:394`).
+list is never ended (`terminate_checked`, `agents/roomlerd/src/win_service/companion_procs.rs:395`).
 
 **Why this order.** Until a task is deleted, something can start it again: its one-shot
 triggers 60, 180 and 600 s after each registration, its logon and boot triggers, and

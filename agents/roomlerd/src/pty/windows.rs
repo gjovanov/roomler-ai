@@ -1001,15 +1001,19 @@ mod tests {
     /// daemon. An ordinary run has no stand-in to play, and passes.
     #[test]
     fn the_stand_in_daemon() {
-        use crate::exec::session_lifetime::{exit_when_told, stand_in_args, starts_a_child_then};
+        use crate::exec::session_lifetime::{
+            PTY_UP, RUNTIME_BUILT, exit_when_told, said, stand_in_args, starts_a_child_then, up,
+        };
 
-        let Some((_, dir)) = stand_in_args() else {
+        let Some((mode, dir)) = stand_in_args() else {
             return;
         };
+        up(&mode);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
+        said(RUNTIME_BUILT);
         let _in_the_runtime = rt.enter();
         let pty = PtyProcess::spawn(
             Some(&starts_a_child_then(&dir, "Start-Sleep -Seconds 300")),
@@ -1018,6 +1022,7 @@ mod tests {
             &crate::exec::RunAs::Daemon,
         )
         .expect("a conpty session");
+        said(PTY_UP);
         std::mem::forget(pty);
         exit_when_told(&dir);
     }
@@ -1027,9 +1032,10 @@ mod tests {
     /// one; `exec::session_lifetime` holds the one-shot's.
     #[test]
     fn a_shell_and_what_it_started_end_with_the_daemon() {
-        use crate::exec::session_lifetime::{GONE_WITHIN, StandIn};
+        use crate::exec::session_lifetime::{GONE_WITHIN, StandIn, Turn};
 
-        let daemon = StandIn::start("pty::windows::tests::the_stand_in_daemon", "pty");
+        let turn = Turn::wait();
+        let daemon = StandIn::start(&turn, "pty::windows::tests::the_stand_in_daemon", "pty");
         let processes = daemon.wait_for_its_processes();
         daemon.exit();
         for (what, p) in ["the shell", "what it started"].iter().zip(&processes) {
