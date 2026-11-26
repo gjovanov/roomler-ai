@@ -1503,10 +1503,11 @@ pub async fn ws_upgrade_agent(
         && let Some(reason) = crate::auth_agent::generation_refusal(
             claims.generation,
             row.token_gen,
+            crate::auth_agent::generation_from_rotation(row),
             state.settings.rc.token_generation_check,
         )
     {
-        info!(%agent_id, reason, row_gen = row.token_gen, "refusing agent WS: token predates the device's removal");
+        info!(%agent_id, reason, row_gen = row.token_gen, "refusing agent WS: token of another generation");
         return Response::builder()
             .status(401)
             .body("Unauthorized (agent)".into())

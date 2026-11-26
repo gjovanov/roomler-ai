@@ -7,6 +7,7 @@ use mongodb::Database;
 use roomler_ai_remote_control::models::{
     AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, EnrollingProgram,
     ExecAnchor, ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, SshPolicy,
+    TokenRotation,
 };
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
@@ -163,10 +164,11 @@ impl AgentDao {
             // first hello.
             peer_auth_key: String::new(),
             agent_token_hash,
-            // FR-103 — a new row starts at generation 0; only a removal
-            // advances it.
+            // FR-103 — a new row starts at generation 0; a removal and a
+            // token rotation (FR-155) advance it.
             token_gen: 0,
             token_exp: None,
+            token_rotation: None,
             status: AgentStatus::Offline,
             last_seen_at: now,
             last_presence: None,
@@ -1344,6 +1346,60 @@ impl AgentDao {
             .update_by_id(
                 agent_id,
                 doc! { "$set": { "token_exp": DateTime::from_millis(exp_unix.saturating_mul(1000)) } },
+            )
+            .await
+    }
+
+    /// FR-155 — commit one token rotation, as ONE conditional update: the row
+    /// moves from generation `from_gen` to `from_gen + 1` and records the
+    /// rotation (`token_rotation`) and the new token's `exp`, only when it is
+    /// at `from_gen`, live, not quarantined, and its last rotation is absent
+    /// or earlier than `last_rotation_before`. One rotation per generation: a
+    /// committed rotation leaves the row at `from_gen + 1`, which a filter at
+    /// `from_gen` does not match. The last condition is the once-an-hour
+    /// ceiling, so it needs no state of its own. `false` when nothing matched;
+    /// the caller reads the row again to say why.
+    ///
+    /// `deleted_at: null` is the live predicate, null or absent, as in every
+    /// live reader of this collection (`BaseDao::find_by_id_in_tenant`); a
+    /// tombstone carries a date. A row from before FR-103 has no `token_gen`
+    /// field, which the model reads as 0, so generation 0 also matches the
+    /// absent field, and `$inc` then writes 1.
+    pub async fn rotate_token(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        from_gen: u32,
+        rotation: &TokenRotation,
+        last_rotation_before: DateTime,
+        token_exp_unix: i64,
+    ) -> DaoResult<bool> {
+        let generation = if from_gen == 0 {
+            bson::Bson::Document(doc! { "$in": [0_i64, bson::Bson::Null] })
+        } else {
+            bson::Bson::Int64(i64::from(from_gen))
+        };
+        let filter = doc! {
+            "_id": agent_id,
+            "tenant_id": tenant_id,
+            "token_gen": generation,
+            "deleted_at": null,
+            "status": { "$ne": "quarantined" },
+            "$or": [
+                { "token_rotation.at": { "$exists": false } },
+                { "token_rotation.at": { "$lt": last_rotation_before } },
+            ],
+        };
+        self.base
+            .update_one(
+                filter,
+                doc! {
+                    "$inc": { "token_gen": 1 },
+                    "$set": {
+                        "token_rotation": bson::to_bson(rotation)?,
+                        "token_exp": DateTime::from_millis(token_exp_unix.saturating_mul(1000)),
+                    },
+                },
             )
             .await
     }

@@ -2164,6 +2164,7 @@ pub fn ws_upgrade_tunnel_client(
         if let Some(reason) = roomler_ai_mod_fleet::auth_agent::generation_refusal(
             token_gen,
             client.token_gen,
+            false, // a tunnel client does not rotate (FR-155)
             state.fleet.settings.rc.token_generation_check,
         ) {
             info!(%tunnel_client_id, reason, row_gen = client.token_gen, "tunnel-client token predates its removal; refusing WS with rc:tunnel.revoked");

@@ -32,7 +32,7 @@ use axum::{
     http::{header, request::Parts},
 };
 use bson::oid::ObjectId;
-use roomler_ai_remote_control::models::{Agent, AgentStatus};
+use roomler_ai_remote_control::models::{Agent, AgentStatus, TokenRotation};
 
 use axum::extract::FromRef;
 
@@ -80,22 +80,187 @@ fn refusal_reason_parts(deleted: bool, status: AgentStatus) -> Option<&'static s
     }
 }
 
-/// FR-103: the single definition of "this token predates the device's
-/// removal". `Some(reason)` refuses. A removal bumps the row's `token_gen`
-/// (`AgentDao::soft_delete`, `TunnelClientDao::soft_delete`), and enrollment
-/// and renewal mint at the current value, so a token whose `gen` is not the
-/// row's was minted before a removal. Shared with the socket, DERP and the
-/// tunnel-client paths, as [`refusal_reason`] is.
+/// FR-103: the single definition of "this token is not of the row's
+/// generation". `Some(reason)` refuses. A removal bumps the row's `token_gen`
+/// (`AgentDao::soft_delete`, `TunnelClientDao::soft_delete`), and so does an
+/// agent's token rotation (FR-155, `AgentDao::rotate_token`). Enrollment,
+/// renewal and rotation mint at the current value, so a token whose `gen` is
+/// not the row's was minted before a removal or a rotation. Shared with the
+/// socket, DERP and the tunnel-client paths, as [`refusal_reason`] is.
 ///
-/// Every row that was never removed is at 0, and so is every pre-FR-103 token
-/// (no `gen` claim), so before any removal this refuses nothing. `enforced`
+/// Every row never removed or rotated is at 0, and so is every pre-FR-103
+/// token (no `gen` claim), so before either this refuses nothing. `enforced`
 /// is `rc.token_generation_check`, the kill switch.
 ///
-/// Callers check [`refusal_reason`] FIRST, so a removed device still hears
-/// that it was deleted (its typed goodbye) rather than this.
-pub fn generation_refusal(claims_gen: u32, row_gen: u32, enforced: bool) -> Option<&'static str> {
-    (enforced && claims_gen != row_gen)
-        .then_some("this credential was issued before the device was removed; re-enroll it")
+/// FR-155 Q2: `rotated` says the row's generation came from a rotation
+/// ([`generation_from_rotation`]). A token below it is then refused in the
+/// rotation's words, so neither the device nor a reader of the log looks for
+/// a removal that never happened. A tunnel client does not rotate and passes
+/// `false`.
+///
+/// Callers check [`refusal_reason`] FIRST, so a removed device hears that it
+/// was deleted (its typed goodbye) rather than this.
+pub fn generation_refusal(
+    claims_gen: u32,
+    row_gen: u32,
+    rotated: bool,
+    enforced: bool,
+) -> Option<&'static str> {
+    if !enforced || claims_gen == row_gen {
+        return None;
+    }
+    Some(if rotated && claims_gen < row_gen {
+        "this credential was issued before the device's token rotation; use the token it issued"
+    } else {
+        "this credential was issued before the device was removed; re-enroll it"
+    })
+}
+
+/// FR-155: whether the row's generation came from a token rotation, i.e. its
+/// last rotation made it. A removal after a rotation advances the generation
+/// past the one the rotation made. What the agent callers pass to
+/// [`generation_refusal`].
+pub fn generation_from_rotation(agent: &Agent) -> bool {
+    rotation_made_generation(agent.token_gen, agent.token_rotation.as_ref())
+}
+
+/// The rule over the two fields it reads, split out for the tests the same
+/// way [`refusal_reason_parts`] is.
+fn rotation_made_generation(row_gen: u32, last_rotation: Option<&TokenRotation>) -> bool {
+    last_rotation.is_some_and(|r| r.generation == row_gen)
+}
+
+/// FR-155: who calls `POST /api/agent/self/rotate`, read from the token alone
+/// ([`authenticate_for_rotation`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RotationCaller {
+    pub agent_id: ObjectId,
+    pub tenant_id: ObjectId,
+    /// The token's `gen` claim.
+    pub generation: u32,
+    /// The token's `exp`, unix seconds.
+    pub exp: i64,
+}
+
+/// FR-155: the rotation route's own admission path, beside
+/// [`authenticate_for_renewal`]. This half reads the token alone: a bearer
+/// of the agent audience with our signature, and `exp` enforced as on every
+/// route but renewal (an expired token renews first). It does NOT compare
+/// the generation: a call asking again for the answer to a rotation presents
+/// a token one below the row's, which [`generation_refusal`] refuses
+/// everywhere else. The route then reads the row (tombstone included, so a
+/// removed device is told so), applies [`refusal_reason`] and then
+/// [`rotation_admission`], and audits each decision.
+pub fn authenticate_for_rotation(
+    fleet: &FleetState,
+    headers: &axum::http::HeaderMap,
+) -> Result<RotationCaller, ApiError> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+    let claims = fleet
+        .auth
+        .verify_agent_token(token)
+        .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
+    let agent_id = ObjectId::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Unauthorized("invalid agent_id in claims".to_string()))?;
+    let tenant_id = ObjectId::parse_str(&claims.tenant_id)
+        .map_err(|_| ApiError::Unauthorized("invalid tenant_id in claims".to_string()))?;
+    Ok(RotationCaller {
+        agent_id,
+        tenant_id,
+        generation: claims.generation,
+        exp: claims.exp,
+    })
+}
+
+/// FR-155: what [`rotation_admission`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationAdmission {
+    /// The token is of the row's generation: a first call, which the
+    /// conditional update decides (`AgentDao::rotate_token`).
+    First,
+    /// The answer to the row's last rotation, asked again with its rotation
+    /// key: minted at the row's generation, and nothing else changes.
+    Replay,
+    Refused(RotationRefusal),
+}
+
+/// FR-155: why the rotation route refuses a token of a row it accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationRefusal {
+    /// The token's `exp` has passed: it renews first.
+    Expired,
+    /// The token is neither of the row's generation nor of the one the row's
+    /// last rotation replaced.
+    Generation,
+    /// The token is of the generation the last rotation replaced, but the
+    /// rotation key is not that rotation's.
+    RotationKey,
+}
+
+impl RotationRefusal {
+    /// The audit row's reason.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Generation => "generation",
+            Self::RotationKey => "rotation_key",
+        }
+    }
+
+    /// What the device is told, with a 401.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Expired => "this token has expired; renew it, then rotate",
+            Self::Generation => "this token is not of a generation this device can rotate from",
+            Self::RotationKey => "the rotation key is not the one of the device's last rotation",
+        }
+    }
+}
+
+/// FR-155: the rotation route's admission, over the token's generation and
+/// `exp`, the row [`refusal_reason`] accepted (its generation and its last
+/// rotation), and the sha256 of the rotation key the call sent. `exp` first,
+/// with no extension. Then exactly one of:
+/// - the token's generation is the row's: a first call;
+/// - it is one below the row's, the row's last rotation made the row's
+///   generation, and the key hashes to that rotation's: the answer to that
+///   rotation, asked again.
+///
+/// Nothing else is admitted.
+pub fn rotation_admission(
+    token_gen: u32,
+    token_exp: i64,
+    now: i64,
+    row_gen: u32,
+    last_rotation: Option<&TokenRotation>,
+    key_sha256: &str,
+) -> RotationAdmission {
+    if token_exp <= now {
+        return RotationAdmission::Refused(RotationRefusal::Expired);
+    }
+    if token_gen == row_gen {
+        return RotationAdmission::First;
+    }
+    match last_rotation {
+        Some(last)
+            if row_gen.checked_sub(1) == Some(token_gen)
+                && rotation_made_generation(row_gen, last_rotation) =>
+        {
+            if same_bytes(last.key_sha256.as_bytes(), key_sha256.as_bytes()) {
+                RotationAdmission::Replay
+            } else {
+                RotationAdmission::Refused(RotationRefusal::RotationKey)
+            }
+        }
+        _ => RotationAdmission::Refused(RotationRefusal::Generation),
+    }
+}
+
+/// Equal, in time that does not depend on where two inputs of one length
+/// differ.
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The bearer token from an `Authorization` header, or `None` if it is
@@ -304,11 +469,16 @@ async fn accepted_agent(
 
     // FR-103 — after the row check, so a removed device hears "deleted".
     if let Some(reason) = generation.and_then(|g| {
-        generation_refusal(g, agent.token_gen, fleet.settings.rc.token_generation_check)
+        generation_refusal(
+            g,
+            agent.token_gen,
+            generation_from_rotation(&agent),
+            fleet.settings.rc.token_generation_check,
+        )
     }) {
         tracing::info!(
             %agent_id, %tenant_id, reason, row_gen = agent.token_gen,
-            "refusing agent-authed request: token predates the device's removal"
+            "refusing agent-authed request: token of another generation"
         );
         return Err(ApiError::Unauthorized(reason.to_string()));
     }

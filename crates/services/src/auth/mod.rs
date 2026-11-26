@@ -537,9 +537,9 @@ impl AuthService {
         self.mint_agent_token(agent_id, tenant_id, generation, override_ttl_secs)
     }
 
-    /// FR-103 — a fresh agent token for a device that renews the one it holds
-    /// (`POST /api/agent/self/renew`), at the row's generation. Renewal only:
-    /// an enrollment mints through [`Self::issue_agent_token`].
+    /// FR-103 — a fresh agent token at the row's generation, for a renewal
+    /// (`POST /api/agent/self/renew`) and a token rotation (FR-155, `/rotate`).
+    /// An enrollment mints through [`Self::issue_agent_token`].
     pub fn renew_agent_token(
         &self,
         agent_id: ObjectId,
