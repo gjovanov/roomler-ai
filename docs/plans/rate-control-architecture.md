@@ -79,8 +79,10 @@ the coarsen gate (:2423–2426).
 `*_nvenc`, `*_qsv`; Rebuild for `*_amf`, `*_videotoolbox`); keep `supports_dynamic_bitrate()` (:2520)
 = `InPlace` so no pump call site changes. QSV in-place arm writes **`bit_rate = target;
 rc_max_rate = target; rc_buffer_size = target × hrd_pct/100`** (CBR: TargetKbps must move with
-MaxKbps). Fix the existing NVENC bug: :1615 writes `rc_buffer_size = target` while the open sized it
-`maxrate × hrd_pct/100` (:297) — store `hrd_pct` on the struct. Dead-band: InPlace applies raw
+MaxKbps). Fix the existing NVENC bug: the in-place arm wrote `rc_buffer_size = target` while the open
+sized it `maxrate × hrd_pct/100` (:297) — store `hrd_pct` on the struct. (Shipped in A1: the
+`hrd_pct` field, `agents/roomlerd/src/encode/ffmpeg/encoder.rs:738`, sizes both in-place arms through
+`encode::inplace_rate_bufsize` at `:3036`, which keeps the 1× write while the flag is off.) Dead-band: InPlace applies raw
 targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `encoder_inplace_rate`
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
 (six places: `config_surface.rs` KEYS near :1547 / get :2177 / set :2769; `config.rs` field :1298,
@@ -115,7 +117,8 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 | A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7309–7327, 7706–7799`; `encoder.rs:2560–2770`; `aimd.rs:495–544`; `encode/mod.rs:514–525` | VT measured or kept on the settle rule |
 | A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence): **done in #4061** (2026-11-19), the mirror-only hook deleted | `governor.rs:1386–1390`; `peer.rs:4826` | — (#3472 measured the divergence as a defect) |
 
-Stays: dims/chroma/backend rebuilds (:5749–5813), FlipTracker rebuild (:5112–5136), error ladder,
+Stays: dims/chroma/backend rebuilds (now the inline open that `encode::plan::frame_step` decides,
+`agents/roomlerd/src/peer.rs:8884–8895`, opened at `:8975`), FlipTracker rebuild (`:7773–7818`), error ladder,
 `kf_gate` (kf_policy.rs), `send_epoch` for those rebuilds.
 
 **Acceptance:** encoder tracks the target within one frame of an apply (bytes-per-frame ratio ≈ 1.0
@@ -180,7 +183,7 @@ floor + 150 ms`, `idr_count`, `pauses_on_direct == 0`. **Trace-replay fixtures**
 2-s heartbeat: `t_s,target_bps,frames_encoded_d,bytes_d,bytes_inflight,goodput_bps,viewer_age_ms,
 viewer_age_floor_ms,rx_bps,queue_ms,link_congested,drains,constrained,w,h,fps`) extracted by
 `scripts/rc-trace-extract.py` from `agent_logs` (`list_for_agent(?session_id=…)`,
-`routes/agent_log.rs:208`) into `agents/roomlerd/tests/fixtures/ratectl/`; ground truth per window =
+`crates/modules/fleet/src/agent_log.rs:249`) into `agents/roomlerd/tests/fixtures/ratectl/`; ground truth per window =
 `rx_bps` when `queue_ms > 0`, else goodput, else hold; assertions = over-drive integral
 `Σ max(0, target − 1.1×pipe)` ≤ budget and recovery ≤ N windows per stall. Four fixtures: **airport
 hotspot** (goodput 65–395 k, target climbing → ≤ 1.1×pipe within 5 s, never climbs while age is
@@ -256,7 +259,7 @@ brings the old `100.65.0.5 ↔ 100.65.0.6` pair back.
 
 **C2 — #1237, the sibling route war (independent; do first).** Two facts from the design pass:
 each per-org adapter already holds a **narrowed** on-link `/(96+plen)` v6 address
-(`overlay.rs:690–692` → `tun.rs:4143–4158`), but `defend_self_route` (`tun.rs:3136–3153`) evicts and
+(`agents/roomlerd/src/overlay.rs:686–688` → `tun.rs:4143–4158`), but `defend_self_route` (`tun.rs:3136–3153`) evicts and
 asserts the **whole /96** on every adapter — the damage is the route-change notification storm, not
 a routing hole; and the same missing notion of "own adapters" makes `non_overlay_v4_addrs`
 (`tun.rs:2984–2999`) count the sibling's address as a foreign CGNAT address, so the primary's
@@ -264,9 +267,12 @@ a routing hole; and the same missing notion of "own adapters" makes `non_overlay
 - Own-adapter registry in tunnel-core (`tun.rs` `mod system`: `OWN_TUNS: Mutex<BTreeMap<luid,
   if_name>>`, registered at the end of `SystemTun::up_with`, deregistered in a new `Drop`;
   `is_own_luid`/`own_if_names`; alias belt `IF_NAME`, `IF_NAME-*` for a second process).
-- Exempt own LUIDs in `evict_competing_v4/v6` (:677, :863), `evict_foreign_in_block_v4` (:751),
-  `foreign_in_block_fp` (:813); exclude own if_names in `non_overlay_v4_addrs`; `evict_warn` gains
-  `competitor_alias`.
+- Exempt own LUIDs in `evict_competing_v4/v6` (`crates/tunnel-core/src/overlay/tun.rs:3318`,
+  `:3534`), `evict_foreign_in_block_v4` (`:3412`), `foreign_in_block_fp` (`:3476`); exclude own
+  if_names in `non_overlay_v4_addrs`; `evict_warn` gains `competitor_alias`. (Shipped: the three
+  eviction helpers ask `route_belongs_to_us` (`:5382`) where they compared `!= ours`,
+  `foreign_in_block_fp` asks `adapter_is_ours` (FR-68 C2(a)), `non_overlay_v4_addrs` (`:6218`) counts
+  every roomler adapter as its own, and the eviction warn carries `competitor_alias` (`:3238`).)
 - Nobody asserts the whole /96: defend `derive_overlay_v6(connected_v4.net)` masked to
   `v6_onlink_plen` (byte-identical for legacy single-org; longest-prefix still beats AnyConnect's
   mirrored /96); WARN at org bring-up when two orgs' blocks overlap. Linux/macOS have no
