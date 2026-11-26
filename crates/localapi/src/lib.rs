@@ -5112,6 +5112,19 @@ pub fn no_per_user_socket_note() -> Option<String> {
     None
 }
 
+/// #3937 — the "not running" words for a client running as `euid` that
+/// found no socket at `tried`, in place of the plain line, or `None` to keep
+/// that line.
+///
+/// RED stub: master's words, for the tests to fail on.
+pub fn not_running_words_for(
+    euid: u32,
+    _sudo_user: Option<&str>,
+    _tried: &std::path::Path,
+) -> Option<String> {
+    (euid == 0).then(|| "roomler daemon not running (is the service started?)".to_string())
+}
+
 /// Bind the daemon's control socket, preferring the SYSTEM path.
 ///
 /// Which path is right depends on whether this process is privileged, and
@@ -13488,6 +13501,94 @@ mod tests {
         // Control: a per-user daemon with its own runtime dir serves there.
         let own: std::path::PathBuf = "/run/user/1000/roomler.sock".into();
         assert_eq!(unix_endpoints(system, false, Some(own.clone())), vec![own]);
+    }
+
+    /// #3937 — root's "not running" line with the account `sudo` ran for.
+    const ROOT_NOT_RUNNING_ALICE: &str = "roomler daemon not running: no socket at \
+        /var/run/roomler/roomler.sock, the system daemon's; a per-user daemon, if this host \
+        runs one, answers only its own account: run this as alice, without `sudo`";
+
+    /// #3937 — root's "not running" line when no account can be named.
+    const ROOT_NOT_RUNNING_NO_NAME: &str = "roomler daemon not running: no socket at \
+        /var/run/roomler/roomler.sock, the system daemon's; a per-user daemon, if this host \
+        runs one, answers only its own account: run this as that account, without `sudo`";
+
+    /// #3937 — under `sudo`, the line names the socket root tried (the
+    /// system daemon's), drops "is the service started?", says that a
+    /// per-user daemon answers only its own account, and names the account
+    /// `sudo` ran for. Linux and macOS take the same words.
+    #[test]
+    fn not_running_under_sudo_names_the_socket_and_the_account() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        assert_eq!(
+            not_running_words_for(0, Some("alice"), system).as_deref(),
+            Some(ROOT_NOT_RUNNING_ALICE)
+        );
+        // Every character of the portable set is printed as it is.
+        let line = not_running_words_for(0, Some("_svc.deploy-2"), system).unwrap();
+        assert!(
+            line.ends_with("run this as _svc.deploy-2, without `sudo`"),
+            "{line}"
+        );
+        // The socket named is the one that was tried.
+        let line = not_running_words_for(0, Some("alice"), std::path::Path::new("/x/y.sock"));
+        assert!(
+            line.as_deref()
+                .is_some_and(|l| l.contains("no socket at /x/y.sock, the system daemon's;")),
+            "{line:?}"
+        );
+    }
+
+    /// #3937 — root with no `SUDO_USER` (`su`, a root login, cron) hears the
+    /// same words, naming no account.
+    #[test]
+    fn not_running_for_root_without_sudo_user_names_no_account() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        assert_eq!(
+            not_running_words_for(0, None, system).as_deref(),
+            Some(ROOT_NOT_RUNNING_NO_NAME)
+        );
+    }
+
+    /// #3937 — a `SUDO_USER` outside the POSIX portable user names
+    /// (`A-Za-z0-9._-`, never `-` first) is never printed, not even in part:
+    /// the words then name no account.
+    #[test]
+    fn not_running_never_prints_a_sudo_user_outside_the_portable_set() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        for odd in [
+            "",
+            "-alice",
+            "alice bob",
+            "alice\u{1b}[2J",
+            "alice\nError: forged",
+            "../alice",
+            "ålice",
+            "alice$",
+            "al:ice",
+        ] {
+            assert_eq!(
+                not_running_words_for(0, Some(odd), system).as_deref(),
+                Some(ROOT_NOT_RUNNING_NO_NAME),
+                "{odd:?}"
+            );
+        }
+    }
+
+    /// #3937 — every account but root keeps the line it had: `None` here,
+    /// whatever `SUDO_USER` holds.
+    #[test]
+    fn not_running_words_of_every_other_account_are_unchanged() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        for euid in [1, 501, 1000, 65534, u32::MAX] {
+            for sudo_user in [None, Some("alice")] {
+                assert_eq!(
+                    not_running_words_for(euid, sudo_user, system),
+                    None,
+                    "uid {euid}, SUDO_USER {sudo_user:?}"
+                );
+            }
+        }
     }
 
     /// A directory for one test's sockets: this account's, 0700.
