@@ -24,7 +24,7 @@ roomler status    # which server does it think it belongs to?
 
 ### It cannot reach the server
 
-The agent needs outbound HTTPS and no inbound ports. From the machine:
+The daemon needs outbound HTTPS and no inbound ports. From the machine:
 
 ```bash
 curl -sI https://roomler.ai/health
@@ -95,7 +95,7 @@ reports **inactive**. Check `pgrep` and `roomler peers` before restarting
 anything.
 :::
 
-**A restart loop.** Look for **two** enabled units trying to run the same agent.
+**A restart loop.** Look for **two** enabled units trying to run the same daemon.
 The tell is a service perpetually in an auto-restarting sub-state.
 
 **Manual package install seemed to do nothing.** `dpkg -i` replaces the file

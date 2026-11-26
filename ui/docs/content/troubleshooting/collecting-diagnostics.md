@@ -36,9 +36,9 @@ For one machine on its own:
 roomler diag host
 ```
 
-:::tip Diagnostics live in the CLI, not in the agent
+:::tip Diagnostics live in the CLI, not in the daemon
 Which means a new probe reaches you in a CLI update rather than requiring a
-fleet-wide agent rollout. If someone asks you to run a `diag` subcommand you do
+fleet-wide daemon rollout. If someone asks you to run a `diag` subcommand you do
 not have, update the CLI.
 :::
 
@@ -78,7 +78,7 @@ for a reproduction, not for permanent operation.
 ## What to redact before sharing
 
 :::danger Logs and config can contain credentials
-- **`config.toml` holds the agent token** and, with SSH enabled, the SSH host private key. Do not paste it.
+- **`config.toml` holds the device credential** and, with SSH enabled, the SSH host private key. Do not paste it.
 - **Enrollment tokens** may appear in shell history and installer output.
 - **Log lines can contain a credential.** Command output is redacted before it leaves a machine, but a log you export by hand has had no such pass.
 

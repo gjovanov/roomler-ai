@@ -9,7 +9,7 @@ order: 1
 
 | State | Means | Usually |
 |---|---|---|
-| **Online** | The server holds a live socket to the agent | Fine |
+| **Online** | The server holds a live socket to the daemon | Fine |
 | **Stale** | The machine is heartbeating, but no server holds its live socket | Self-heals in about two minutes |
 | **Offline** | No heartbeat at all | The machine is off, asleep, or has no route out |
 
@@ -25,7 +25,7 @@ re-established its connection yet. Give it two minutes before doing anything.
 Sleeping laptops show offline. So do machines that were shut down. Start here
 before anything technical.
 
-### 2 · Is the agent running?
+### 2 · Is the daemon running?
 
 :::os
 @windows
@@ -57,7 +57,7 @@ first — restarting on the basis of that reading can take a working machine dow
 
 ### 3 · Can it reach the server?
 
-The agent needs outbound HTTPS. It does **not** need any inbound port.
+The daemon needs outbound HTTPS. It does **not** need any inbound port.
 
 ```bash
 curl -sI https://roomler.ai/health
@@ -68,7 +68,7 @@ one — proxy, firewall, DNS or captive portal.
 
 ### 4 · Has the device been removed?
 
-A device deleted in the dashboard has had its credential revoked. The agent will
+A device deleted in the dashboard has had its credential revoked. The daemon will
 run and never come online. Re-enroll it with a fresh token.
 
 :::warning It will come back with a NEW address
@@ -78,7 +78,7 @@ fresh one. Anything pinned to the old address needs updating.
 
 ### 5 · Did an update go wrong?
 
-The agent rolls back a version that crash-loops. If the machine reports a
+The daemon rolls back a version that crash-loops. If the machine reports a
 crash-loop warning:
 
 ```bash
@@ -103,7 +103,7 @@ Restart the service explicitly after a manual install.
 ### 7 · Two service definitions
 
 If a machine restarts in a loop, check for **two** enabled units trying to run
-the same agent. The tell is a service that is perpetually in an
+the same daemon. The tell is a service that is perpetually in an
 auto-restarting sub-state while looking green at a glance.
 
 ## Green in the list, but remote control says the device is unavailable
@@ -113,5 +113,5 @@ live socket. A machine whose connection is half-open — something in the middle
 still answering keepalives after the far end went away — shows **green** and
 still refuses a session.
 
-Recent agents detect this themselves and reconnect within about two minutes. If
-it persists, restart the agent.
+A recent roomlerd detects this itself and reconnects within about two minutes. If
+it persists, restart the daemon.
