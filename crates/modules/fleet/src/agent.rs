@@ -1035,7 +1035,7 @@ pub async fn self_rotate(
             audit.record("refused", Some("row_gone"), None).await;
             return Err(ApiError::Unauthorized("no such device".to_string()).into());
         }
-        Err(e) => return Err(ApiError::Internal(format!("agent lookup: {e}")).into()),
+        Err(e) => return Err(ApiError::Internal(format!("device lookup: {e}")).into()),
     };
     if let Some(reason) = crate::auth_agent::refusal_reason(&agent) {
         let code = if agent.deleted_at.is_some() {
@@ -1162,7 +1162,7 @@ pub async fn self_rotate(
             audit.record("refused", Some("row_gone"), None).await;
             return Err(ApiError::Unauthorized("no such device".to_string()).into());
         }
-        Err(e) => return Err(ApiError::Internal(format!("agent lookup: {e}")).into()),
+        Err(e) => return Err(ApiError::Internal(format!("device lookup: {e}")).into()),
     };
     if let Some(reason) = crate::auth_agent::refusal_reason(&row) {
         let code = if row.deleted_at.is_some() {
