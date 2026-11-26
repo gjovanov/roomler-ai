@@ -17,7 +17,7 @@
 //! cost regardless of uptime.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -138,7 +138,13 @@ pub fn init() -> Option<PathBuf> {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let stderr = console_layer(std::io::stderr, true); // as before #3938: coloured, whatever the stream is
+    // #3938 — coloured only when stderr is a terminal and NO_COLOR is unset or
+    // empty: started at login, the tray's stderr is a file, the journal or nothing.
+    let colour = roomler_node_core::logging::colour(
+        std::io::stderr().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    );
+    let stderr = console_layer(std::io::stderr, colour);
     let path = default_path();
     let file = path
         .as_ref()
@@ -167,11 +173,11 @@ pub fn init() -> Option<PathBuf> {
 }
 
 /// #3938 — the stderr layer [`init`] installs: the companion's lines with no
-/// target, written into `writer`. `colour` is not read yet: the layer keeps
-/// the library's default and colours whatever `writer` is.
+/// target, written into `writer`, coloured only when `colour` says so
+/// (`roomler_node_core::logging::colour`, asked of stderr).
 fn console_layer<S, W>(
     writer: W,
-    _colour: bool,
+    colour: bool,
 ) -> tracing_subscriber::fmt::Layer<
     S,
     tracing_subscriber::fmt::format::DefaultFields,
@@ -185,6 +191,7 @@ where
     tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_writer(writer)
+        .with_ansi(colour)
 }
 
 #[cfg(test)]
@@ -332,6 +339,20 @@ mod tests {
             assert!(
                 line.contains("peers=3"),
                 "the field reads as before: {line:?}"
+            );
+        }
+
+        /// A terminal keeps its colour: the codes are there, around the same text.
+        #[test]
+        fn a_stderr_line_with_colour_holds_escape_codes() {
+            let line = written(true);
+            assert!(
+                line.contains("a companion line with a field"),
+                "the event is written: {line:?}"
+            );
+            assert!(
+                line.contains('\x1b'),
+                "a terminal gets colour codes: {line:?}"
             );
         }
     }

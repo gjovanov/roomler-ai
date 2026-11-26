@@ -210,7 +210,7 @@ pub fn init() {
 
     let env_filter = filter();
 
-    let ansi = true; // as before #3938: coloured, whatever the stream is
+    let ansi = stdout_colour(); // #3938: a terminal, and NO_COLOR unset or empty
 
     // rc.58 — log-upload layer. Captures every tracing event into an
     // mpsc channel; `main.rs` claims the receiver via
@@ -1187,13 +1187,37 @@ fn format_panic(
     buf
 }
 
+/// #3938 — whether a console's log lines are coloured: only when the stream they
+/// are written to is a terminal and `NO_COLOR` is unset or empty. A pipe, a file,
+/// the journal or a service's absent console stores plain text, with the same
+/// words, levels and fields. Each caller asks its own stream once, at start.
+///
+/// Used by the daemon ([`init`], stdout), the companion (stderr) and the Setup
+/// wizard (stderr, through `roomlerd::logging`). The same rule, word for word,
+/// lives in three other homes, each with this table test: the server
+/// (`crates/api/src/logging.rs`), the DERP relay (`crates/derp-relay/src/main.rs`)
+/// and the CLI (`agents/roomler-cli/src/cli.rs`). No crate that a console rule
+/// belongs in is shared by all five.
+pub fn colour(stream_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stream_is_terminal && no_color.is_none_or(std::ffi::OsStr::is_empty)
+}
+
+/// #3938 — [`colour`] asked of this process's stdout, the stream [`init`]'s
+/// console layer writes.
+fn stdout_colour() -> bool {
+    use std::io::IsTerminal;
+    colour(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    )
+}
+
 /// #3938 — the console layer [`init`] installs, in both of its branches: the
-/// daemon's lines in the compact format with no target, written into
-/// `writer`. `colour` is not read yet: the layer keeps the library's default
-/// and colours whatever `writer` is.
+/// daemon's lines in the compact format with no target, written into `writer`,
+/// coloured only when `colour` says so ([`stdout_colour`]).
 fn console_layer<S, W>(
     writer: W,
-    _colour: bool,
+    colour: bool,
 ) -> fmt::Layer<S, fmt::format::DefaultFields, fmt::format::Format<fmt::format::Compact>, W>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -1203,6 +1227,7 @@ where
         .with_target(false)
         .compact()
         .with_writer(writer)
+        .with_ansi(colour)
 }
 
 #[cfg(test)]
@@ -2572,6 +2597,48 @@ mod tests {
         #[test]
         fn a_console_line_beside_a_log_file_without_colour_holds_no_escape_byte() {
             plain("a log file", &beside_a_log_file(false));
+        }
+
+        /// A terminal keeps its colour: the codes are there, around the same text.
+        #[test]
+        fn a_console_line_with_colour_holds_escape_codes() {
+            for (branch, line) in [
+                ("no log file", on_stdout(true)),
+                ("a log file", beside_a_log_file(true)),
+            ] {
+                assert!(
+                    line.contains("a console line with a field"),
+                    "{branch}: the event is written: {line:?}"
+                );
+                assert!(
+                    line.contains('\x1b'),
+                    "{branch}: a terminal gets colour codes: {line:?}"
+                );
+            }
+        }
+
+        /// The server's table, word for word (`crates/api/src/logging.rs`): colour
+        /// only on a terminal, and never under a non-empty `NO_COLOR`.
+        #[test]
+        fn colour_only_on_a_terminal_and_never_under_no_color() {
+            use std::ffi::OsStr;
+            let cases: [(bool, Option<&str>, bool); 8] = [
+                (true, None, true),
+                (true, Some(""), true),
+                (true, Some("1"), false),
+                (true, Some("0"), false),
+                (false, None, false),
+                (false, Some(""), false),
+                (false, Some("1"), false),
+                (false, Some("0"), false),
+            ];
+            for (terminal, no_color, want) in cases {
+                assert_eq!(
+                    colour(terminal, no_color.map(OsStr::new)),
+                    want,
+                    "terminal={terminal} NO_COLOR={no_color:?}"
+                );
+            }
         }
     }
 }

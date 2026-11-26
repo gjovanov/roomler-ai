@@ -572,7 +572,7 @@ async fn main() {
     log_subscriber(
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         std::io::stdout,
-        true, // as before #3938: coloured, whatever the stream is
+        stdout_colour(), // #3938: a terminal, and NO_COLOR unset or empty
     )
     .init();
 
@@ -1127,13 +1127,38 @@ fn forward_frame(
     }
 }
 
+/// #3938 — whether the relay's log lines are coloured: only when stdout is a
+/// terminal and `NO_COLOR` is unset or empty. Under a service manager or a
+/// container runtime stdout is a pipe, so the host stores plain text, with the
+/// same words, levels, targets and fields.
+///
+/// The same rule, word for word, lives in three other homes, each with this
+/// table test: the server (`crates/api/src/logging.rs`), the daemon, companion
+/// and Setup wizard (`roomler_node_core::logging::colour`,
+/// `crates/agent-core/src/logging.rs`) and the CLI
+/// (`agents/roomler-cli/src/cli.rs`). The relay's one Roomler dependency is the
+/// wire crate (`roomler-ai-remote-control`), no home for a console rule, so it
+/// keeps this copy.
+fn colour(stdout_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stdout_is_terminal && no_color.is_none_or(std::ffi::OsStr::is_empty)
+}
+
+/// #3938 — [`colour`] asked of this process's stdout, once, at start.
+fn stdout_colour() -> bool {
+    use std::io::IsTerminal;
+    colour(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    )
+}
+
 /// #3938 — the relay's log, as `main` installs it: `filter`, then every line
-/// into `writer`, in the library's full format. `colour` is not read yet: the
-/// log keeps the library's default and colours whatever `writer` is.
+/// into `writer`, in the library's full format, coloured only when `colour`
+/// says so ([`stdout_colour`]).
 fn log_subscriber<W>(
     filter: tracing_subscriber::EnvFilter,
     writer: W,
-    _colour: bool,
+    colour: bool,
 ) -> tracing_subscriber::fmt::SubscriberBuilder<
     tracing_subscriber::fmt::format::DefaultFields,
     tracing_subscriber::fmt::format::Format,
@@ -1146,6 +1171,7 @@ where
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(writer)
+        .with_ansi(colour)
 }
 
 #[cfg(test)]
@@ -2200,6 +2226,44 @@ mod tests {
                 line.contains("peers=3"),
                 "the field reads as before: {line:?}"
             );
+        }
+
+        /// A terminal keeps its colour: the codes are there, around the same text.
+        #[test]
+        fn a_log_line_with_colour_holds_escape_codes() {
+            let line = written(true);
+            assert!(
+                line.contains("a relay line with a field"),
+                "the event is written: {line:?}"
+            );
+            assert!(
+                line.contains('\x1b'),
+                "a terminal gets colour codes: {line:?}"
+            );
+        }
+
+        /// The server's table, word for word (`crates/api/src/logging.rs`): colour
+        /// only on a terminal, and never under a non-empty `NO_COLOR`.
+        #[test]
+        fn colour_only_on_a_terminal_and_never_under_no_color() {
+            use std::ffi::OsStr;
+            let cases: [(bool, Option<&str>, bool); 8] = [
+                (true, None, true),
+                (true, Some(""), true),
+                (true, Some("1"), false),
+                (true, Some("0"), false),
+                (false, None, false),
+                (false, Some(""), false),
+                (false, Some("1"), false),
+                (false, Some("0"), false),
+            ];
+            for (terminal, no_color, want) in cases {
+                assert_eq!(
+                    colour(terminal, no_color.map(OsStr::new)),
+                    want,
+                    "terminal={terminal} NO_COLOR={no_color:?}"
+                );
+            }
         }
     }
 }

@@ -821,16 +821,16 @@ fn daemon_exe(origin: Origin) -> Option<PathBuf> {
     Some(PathBuf::from(name))
 }
 
-/// The standalone CLI's log subscriber: `env_filter`, then #3656's cap
+/// The CLI's log subscriber: `env_filter`, then #3656's cap
 /// (`upgrade_auth::may_log`). tungstenite writes the tunnel token's upgrade
 /// request at TRACE, `Authorization` header included, and no `RUST_LOG` may
-/// reach those lines. An embedded `roomlerd cli` logs through the daemon's
-/// subscriber, which carries the same cap. #3938: the lines go into `writer`;
-/// `colour` is not read yet, so they are coloured whatever `writer` is.
+/// reach those lines. An embedded `roomlerd cli` logs through this subscriber
+/// too: it runs before the daemon would set up its own log. #3938: the lines go
+/// into `writer`, coloured only when `colour` says so ([`stdout_colour`]).
 fn log_subscriber<W>(
     env_filter: tracing_subscriber::EnvFilter,
     writer: W,
-    _colour: bool,
+    colour: bool,
 ) -> impl tracing::Subscriber + Send + Sync + 'static
 where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
@@ -839,6 +839,7 @@ where
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(writer)
+        .with_ansi(colour)
         .finish()
         .with(tracing_subscriber::filter::filter_fn(
             roomler_ai_remote_control::upgrade_auth::may_log,
@@ -856,11 +857,11 @@ pub async fn run() -> Result<()> {
 /// of a second 22 MiB binary that is ~92 % the same crates. `args` follows the
 /// usual convention — element 0 is the program name.
 ///
-/// Logging init is `try_init` (not `init`) precisely because of that embedded
-/// caller: `roomlerd` has already installed a global subscriber by the time it
-/// reaches this dispatch, and `init()` PANICS on a second install. Ignoring an
-/// `Err` here means "someone else already set logging up", which is exactly
-/// right for both callers.
+/// Logging init is `try_init`, not `init`, which PANICS on a second install.
+/// `roomlerd` dispatches its embedded caller here before its own
+/// `logging::init` (`embedded_cli_args` in its `app.rs`), so in both callers
+/// this is the first install today; an `Err` would mean "someone else already
+/// set logging up", which is right for both.
 pub async fn run_from<I, T>(args: I, origin: Origin) -> Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -882,7 +883,7 @@ where
     let _ = tracing_subscriber::util::SubscriberInitExt::try_init(log_subscriber(
         env_filter,
         std::io::stdout,
-        true, // as before #3938: coloured, whatever the stream is
+        stdout_colour(), // #3938: a terminal, and NO_COLOR unset or empty
     ));
 
     let cli = Cli::parse_from(args);
@@ -1266,6 +1267,31 @@ fn hostname_lossy() -> String {
     {
         "unknown".to_string()
     }
+}
+
+/// #3938 — whether the CLI's log lines are coloured: only when stdout is a
+/// terminal and `NO_COLOR` is unset or empty. A script that captures `roomler`
+/// or `roomlerd cli`, or a pipe into `grep`, gets plain text, with the same
+/// words, levels, targets and fields.
+///
+/// The same rule, word for word, lives in three other homes, each with this
+/// table test: the server (`crates/api/src/logging.rs`), the daemon, companion
+/// and Setup wizard (`roomler_node_core::logging::colour`,
+/// `crates/agent-core/src/logging.rs`) and the DERP relay
+/// (`crates/derp-relay/src/main.rs`). The CLI does not depend on
+/// `roomler-node-core`, and its other Roomler crates (tunnel-core, the wire
+/// crate) are no home for a console rule, so it keeps this copy.
+fn colour(stdout_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stdout_is_terminal && no_color.is_none_or(std::ffi::OsStr::is_empty)
+}
+
+/// #3938 — [`colour`] asked of this process's stdout, once, at start.
+fn stdout_colour() -> bool {
+    use std::io::IsTerminal;
+    colour(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -1849,6 +1875,44 @@ mod tests {
                 line.contains("peers=3"),
                 "the field reads as before: {line:?}"
             );
+        }
+
+        /// A terminal keeps its colour: the codes are there, around the same text.
+        #[test]
+        fn a_log_line_with_colour_holds_escape_codes() {
+            let line = written(true);
+            assert!(
+                line.contains("a CLI line with a field"),
+                "the event is written: {line:?}"
+            );
+            assert!(
+                line.contains('\x1b'),
+                "a terminal gets colour codes: {line:?}"
+            );
+        }
+
+        /// The server's table, word for word (`crates/api/src/logging.rs`): colour
+        /// only on a terminal, and never under a non-empty `NO_COLOR`.
+        #[test]
+        fn colour_only_on_a_terminal_and_never_under_no_color() {
+            use std::ffi::OsStr;
+            let cases: [(bool, Option<&str>, bool); 8] = [
+                (true, None, true),
+                (true, Some(""), true),
+                (true, Some("1"), false),
+                (true, Some("0"), false),
+                (false, None, false),
+                (false, Some(""), false),
+                (false, Some("1"), false),
+                (false, Some("0"), false),
+            ];
+            for (terminal, no_color, want) in cases {
+                assert_eq!(
+                    colour(terminal, no_color.map(OsStr::new)),
+                    want,
+                    "terminal={terminal} NO_COLOR={no_color:?}"
+                );
+            }
         }
     }
 }
