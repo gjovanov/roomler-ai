@@ -3570,7 +3570,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   has an enrollment SYSTEM may run, the service host keeps its worker on the waiting arm: the signed-in person's
   own enrollment, as that person. A machine config that went missing beside its `config.toml.prev` ends that
   wait only when the copy passes every check the config itself would, as found and as it is, and holds an
-  enrollment ([`read_machine_copy`, `machine_tree.rs:1135`](../crates/agent-core/src/machine_tree.rs#L1135)).
+  enrollment ([`read_machine_copy`, `machine_tree.rs:1175`](../crates/agent-core/src/machine_tree.rs#L1175)).
   While only the copy is there, the repair leaves the tree as it found it unless the copy, the machine folder and
   its keys were the machine's as found. The order is the SYSTEM worker's ladder: the machine config, then the
   SYSTEM profile's own config, then the copy. The host asks that function third
@@ -3580,7 +3580,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   and logs why once.
 - **On a machine-wide install the keys share the machine config's check** (#3609). `peer-auth\` and each
   `<tenant>.json` and `<tenant>.controllers.json` the daemon loads are repaired to SYSTEM and Administrators
-  alone and checked with the config ([`repair`, `machine_tree.rs:630`](../crates/agent-core/src/machine_tree.rs#L630)),
+  alone and checked with the config ([`repair`, `machine_tree.rs:640`](../crates/agent-core/src/machine_tree.rs#L640)),
   so a key file another account owns keeps the service from running that enrollment as SYSTEM until it is
   fixed. Any other file in the folder (a backup, a temporary file) is neither repaired nor checked. #3666:
   outside a save the repair seals the keys folder and a key file only when they, with the rest of the tree, were the
@@ -3605,7 +3605,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   | the first seal, per run | reads the folder as found, then seals it: a folder and key file Administrators or SYSTEM own are sealed in place, the key kept byte for byte, so no browser warns |
   | | a folder or key file another account owns is never used: moved aside by handle (the folder as `peer-auth.moved-<unix>`, a file as `peer-auth.<name>.not-sealed-<UTC>` in the config folder), nothing deleted, and a new key made, which each browser that knew the old one warns about once. Where a policy gives an elevated process's files to its person (the "object creator" default owner), the first seal makes a new key |
   | | a browser-key file is kept only when its folder and the file were closed to every other account as found; otherwise it is moved aside, and each browser reads `unknown` once more |
-  | every read after it | judged with [`verdict`, `machine_tree.rs:201`](../crates/agent-core/src/machine_tree.rs#L201) on the handle it reads through: a key file another account can change is not offered (the hello carries none, so the viewer shows **Unverified**), and a browser-key file another account can change is not read |
+  | every read after it | judged with [`verdict`, `machine_tree.rs:204`](../crates/agent-core/src/machine_tree.rs#L204) on the handle it reads through: a key file another account can change is not offered (the hello carries none, so the viewer shows **Unverified**), and a browser-key file another account can change is not read |
   | a config folder that cannot be held as itself | redirected to a share, or reached through a link: the key is kept as before, no browser key is read or kept, and that is said once |
   | a run neither elevated nor SYSTEM | a per-user install: nothing is sealed or changed. At a folder an elevated run sealed it offers no key, deletes nothing, and says once why and what to do: start it elevated again, or an administrator moves the folder away (a new key, one warning per browser) |
   | `ROOMLERD_PEER_AUTH_SEAL=0` | read from the service's `Environment` value only ([`seal_enabled_in`, `peer_auth.rs:956`](../agents/roomlerd/src/peer_auth.rs#L956)), never the process's environment or the config: the switch is the service's, set where only an administrator sets it. Off keeps the behaviour from before, said once |

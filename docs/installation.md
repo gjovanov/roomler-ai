@@ -596,8 +596,8 @@ So removing `config.toml` alone does not make a device forget its enrollment: re
 restores its missing machine config the same way (#4176), with one rule more: only from a copy that passes every check the config itself
 would. That is the machine tree's check, and the rule that `%PROGRAMDATA%\roomler`, the machine folder and the copy were the machine's
 as found (#3609, #3666, [below](#windows)), read through one function
-(`crates/agent-core/src/machine_tree.rs:1135`). While only the copy is there, the repair leaves the tree as it found it unless the
-copy, the machine folder and its keys were the machine's as found, inherited entries counted (`machine_tree.rs:691`). The service host
+(`crates/agent-core/src/machine_tree.rs:1175`). While only the copy is there, the repair leaves the tree as it found it unless the
+copy, the machine folder and its keys were the machine's as found, inherited entries counted (`machine_tree.rs:705`). The service host
 asks that function after the machine config and the SYSTEM profile's own config, the order of the worker's ladder
 (`agents/roomlerd/src/win_service/supervisor.rs:990`), so a SYSTEM-profile config that opens runs, and nothing is restored. For a copy
 that passes, it starts the SYSTEM worker, whose start restores the file as above: written from the bytes the check judged, and put in
@@ -858,7 +858,13 @@ Details worth knowing:
     anything is cut to read and execute (Explorer adds one, full control, for
     the account that confirms its folder-access prompt), except in a tree the
     as-found rule leaves as found (below). What it inherits from `%PROGRAMDATA%`
-    stays, so an attended host's daemon still stages received files below it;
+    stays, so an attended host's daemon still stages received files below it.
+    Outside a save, the repair changes `%PROGRAMDATA%\roomler` only once the
+    machine folder holds a machine config, or the copy of a missing one, that
+    was the machine's as found. With neither, it changes nothing but the
+    attempt record until an elevated save of the machine config, and when that
+    leaves such an entry, or an administrator's own account as the owner (the
+    last item), the service log says so once (#4485);
   - the machine folder, once it holds a machine config that was the
     machine's as found (below), becomes Administrators', with SYSTEM and
     Administrators alone; the config gets the same, `.prev` and the keys only
@@ -889,9 +895,10 @@ Details worth knowing:
   the tree as it found it, a replace right on `%PROGRAMDATA%\roomler` included,
   unless that file, the folder and its keys were the machine's as found,
   inherited entries counted, and a `.prev` beside a config inherited no right for
-  another account to change it (`machine_tree.rs:691`). It repairs the attempt
-  record either way, and what was not closed stays refused at every start and
-  tick, until an elevated save writes a closed tree. An elevated save whose config does not load takes the `.prev` beside it only where a start would, by the same rule: from one a start refuses it recovers nothing, and it says so in one line (#4453, `crates/agent-core/src/config.rs:3881`). Whatever the config's state, an elevated save sets aside a `.prev` a start would not take, as `config.toml.prev.set-aside` beside it (`-1` to `-9` when that name is taken), a name no reader loads, and says `machine tree: a config.toml.prev that a start would not take is set aside`; one it cannot move stays at its name, keeping the entries it was found with as its own, and where neither can be done the save stops, naming the file and what to do (`crates/agent-core/src/machine_tree.rs:3184`). A config that was not the
+  another account to change it (`machine_tree.rs:705`). With neither file, it
+  leaves the tree as it is (above, #4485). It repairs the attempt
+  record in every case, and what was not closed stays refused at every start and
+  tick, until an elevated save writes a closed tree. An elevated save whose config does not load takes the `.prev` beside it only where a start would, by the same rule: from one a start refuses it recovers nothing, and it says so in one line (#4453, `crates/agent-core/src/config.rs:3881`). Whatever the config's state, an elevated save sets aside a `.prev` a start would not take, as `config.toml.prev.set-aside` beside it (`-1` to `-9` when that name is taken), a name no reader loads, and says `machine tree: a config.toml.prev that a start would not take is set aside`; one it cannot move stays at its name, keeping the entries it was found with as its own, and where neither can be done the save stops, naming the file and what to do (`crates/agent-core/src/machine_tree.rs:3224`). A config that was not the
   machine's is never run, never folded into (below), and `roomlerd re-enroll`
   and `roomlerd org` refuse it with nothing sent. Such a device stays without
   SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd
@@ -936,12 +943,12 @@ Details worth knowing:
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
   again for that owner, so the entry `%PROGRAMDATA%` hands whoever made it
-  names Administrators (`machine_tree.rs:958`). A link is refused, never taken
+  names Administrators (`machine_tree.rs:998`). A link is refused, never taken
   over. What that person made below them stays theirs. Setup also seals
   `%PROGRAMDATA%\roomler` (rc.52), by path, so only once it is a plain folder
   that belongs to Administrators. And with `roomlerd adopt-enrollment` they carry an
   existing machine config over only when it is private to the computer's
-  administrators once the repair has run (`machine_tree.rs:1252`), and was the
+  administrators once the repair has run (`machine_tree.rs:1292`), and was the
   machine's as found before it (#3666; Setup reads it before it seals
   `%PROGRAMDATA%\roomler`): one that is not is set aside, and a fresh one is
   written in its place, keeping no `.prev` and no key this build does not know
