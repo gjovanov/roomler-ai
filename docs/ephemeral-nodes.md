@@ -263,15 +263,15 @@ with its row. A fold into a second organization never takes an ephemeral
 answer ([below](#a-second-organization-is-never-ephemeral-4352)).
 
 The answer is the row's nature (`EnrollResponse::ephemeral`,
-`crates/modules/fleet/src/agent.rs:333-337`, answered at `:493`), and a row's
+`crates/modules/fleet/src/agent.rs:337-341`, answered at `:497`), and a row's
 nature is fixed when the row is made:
 
 | The enrollment | The row it gets | The answer, and so the file |
 |---|---|---|
 | An ephemeral key | a new row, always: the key path is create-only, and a known machine id is a 409 | ephemeral |
 | A standard token, and the machine id has no live row | a new device: a new row, or a removed permanent row brought back as one (`revive`). A removed ephemeral row left nothing | permanent |
-| A standard token, and the machine id's row is live and permanent | that row, refreshed (`rehydrate`, `crates/services/src/dao/agent.rs:267-307`) | permanent |
-| A standard token, and the machine id's row is live and **ephemeral** | none: **409**, decided before the single-use token is spent, as the plan cap is (#4352: `refuse_live_ephemeral`, `crates/modules/fleet/src/agent.rs:638-652`, at `:404-406`, and again in every later round of `enroll_row`, `:564`) | nothing; the file is not written |
+| A standard token, and the machine id's row is live and permanent | that row, refreshed (`rehydrate`, `crates/services/src/dao/agent.rs:273-313`) | permanent |
+| A standard token, and the machine id's row is live and **ephemeral** | none: **409**, decided before the single-use token is spent, as the plan cap is (#4352: `refuse_live_ephemeral`, `crates/modules/fleet/src/agent.rs:642-656`, at `:408-410`, and again in every later round of `enroll_row`, `:568`) | nothing; the file is not written |
 
 A re-enrollment keeps the config's machine id
 (`agents/roomlerd/src/app.rs:2925-2932`), so the live row is the one it finds.

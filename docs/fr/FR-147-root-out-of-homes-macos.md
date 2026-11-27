@@ -258,7 +258,7 @@ and `--revert`'s after its own plan.
 Each line ends with the way on: remove the row on the Devices page, then enroll that half again with a key that is
 not ephemeral. The same file serves. Since #4331 an enrollment that folds into a file keeps the file's settings and
 takes `ephemeral` from the server's answer, which is the row's (`preserve_operator_config`,
-`crates/agent-core/src/enrollment.rs:1049-1062`; the answer, `crates/modules/fleet/src/agent.rs:493`). The row goes
+`crates/agent-core/src/enrollment.rs:1049-1062`; the answer, `crates/modules/fleet/src/agent.rs:497`). The row goes
 first because a live ephemeral row stays ephemeral when a standard token enrolls over it (`OVER_EPHEMERAL`,
 `one_row.rs:723`; [`ephemeral-nodes.md`](../ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)). Until
 #4331 the way on was a new config, since a fold kept the old file's flag. The line before #4312 also offered

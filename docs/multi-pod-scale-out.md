@@ -347,7 +347,7 @@ connection that one lost packet only delays. No number refuses boot (a value tha
 fails the settings load, as it does for every number setting): a pod that will not start holds a
 roll. Both at 0 is the crate's default `ConnectionManager` with no outer timeout and no
 replacement, restored by a setting on the deployment and a restart, with no new image
-(`crates/config/src/settings.rs:1335-1347`). The boot line `Redis Pub/Sub publisher connected`
+(`crates/config/src/settings.rs:1346-1358`). The boot line `Redis Pub/Sub publisher connected`
 names the bounds in use, `response_timeout_ms` and `connection_timeout_ms` (0 is no bound), and
 `addr`, Redis's host and port (`crates/core/src/ws/redis_pubsub.rs:465-479`).
 
@@ -427,7 +427,7 @@ whatever its cause, and what heals a write applied behind a lost reply, or one t
 | Pod bus (`bus.rs:233`, `:336`) | PUBLISH | a request fails before its deadline starts; a lost reply is a deadline at the requester | handlers are idempotent |
 | Cross-pod RC relay (`crates/modules/remote/src/relay.rs:714`, `:524`) | bus requests `rc.conn_alive`, `rc.cmd` | "unknown": the janitor keeps the proxy and asks again at the next sweep; a frame that cannot be relayed is dropped with a warn, the route is kept, and the viewer's own timers recover the setup. A hang-up is dropped the same way, and its session then ends at the socket's close or by the device's own end, as before #4042 ([above](#a-viewers-hang-up-across-pods-4042)). A deadline, or the owner's answer (`alive: false`; a NACK, which to a relayed frame is also the owner's refusal of that one frame), still reaps a proxy or forgets a route. A deadline says only that the owner did not answer: after a Redis lost without a reset, it can be this pod's own deaf bus subscriber, until its probe finds it deaf ([the subscriptions](#the-subscriptions-3952): at most 45 s once the command connection answers) | nothing is written |
 | Session slots (`crates/core/src/cluster/session_slots.rs:209`, `:263`, `:346`, `:366`) | Lua claim, renew pipeline, keep, release | a claim error, or a set full only by stale leases Redis did not let go (`crates/modules/remote/src/slots.rs:206-210`), lets the session proceed uncounted (fails open, as the code intends); a keep is tried again 1, 2, 4, 8, 16 s apart while its lease can still exist (`keep_retrying`, `session_slots.rs:417`); renew and release log | a lease lapses in 90 s; a keep only lengthens a live lease, so trying it again is harmless |
-| Reads with a shorter bound of their own (`crates/modules/fleet/src/agent.rs:2147`, `crates/modules/remote/src/resume.rs:610`, `extauth.rs:305`, `rejoin.rs:360`, `controller.rs:293`, `dead_rows.rs:365`, `crates/modules/network/src/tunnel.rs:607`) | GET, MGET | their own bound fires first, as before | — |
+| Reads with a shorter bound of their own (`crates/modules/fleet/src/agent.rs:2529`, `crates/modules/remote/src/resume.rs:610`, `extauth.rs:305`, `rejoin.rs:360`, `controller.rs:293`, `dead_rows.rs:365`, `crates/modules/network/src/tunnel.rs:607`) | GET, MGET | their own bound fires first, as before | — |
 
 Paths that wait more than one bound, because they await Redis once per item: a call start (two
 commands per member, `notify.rs:270`), a post with mentions (two per mention), a member's removal
