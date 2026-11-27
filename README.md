@@ -191,8 +191,8 @@ machine when you travel.
 </p>
 
 The team layer is built in, not bolted on: organized rooms with threaded chat,
-reactions, mentions and file sharing, plus HD video calls with screen sharing and
-recordings — on the same server and the same accounts as everything above. If
+reactions, mentions and file sharing, plus HD video calls with screen sharing —
+on the same server and the same accounts as everything above. If
 your team already lives here to reach its machines, meetings and chat come free.
 
 <!-- Same GitHub limitation as the demo above, and worse here: this file is
@@ -204,7 +204,7 @@ your team already lives here to reach its machines, meetings and chat come free.
 | In detail | |
 |---|---|
 | **Rooms & chat** | Hierarchical room tree (text + voice/video), threaded messages, reactions, custom emoji, @mentions (TipTap editor), pins, embeds, typing indicators, presence |
-| **Video conferencing** | [mediasoup](https://mediasoup.org/) WebRTC SFU, per-room calls, multiple producers/consumers, in-call chat, recordings |
+| **Video conferencing** | [mediasoup](https://mediasoup.org/) WebRTC SFU, per-room calls, multiple producers/consumers, in-call chat |
 | **Multi-tenancy** | Organizations with plans + Stripe billing, roles & permissions, invite links / email / batch invites, OAuth (Google, Facebook, GitHub, LinkedIn, Microsoft) |
 | **Files** | Versioned + multipart uploads (S3/MinIO), cloud sync (Google Drive, OneDrive, Dropbox), AI document recognition (Claude vision) |
 | **Search & export** | Global full-text search (Ctrl+K), XLSX + PDF conversation export, background task pipeline |

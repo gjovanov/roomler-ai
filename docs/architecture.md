@@ -25,7 +25,7 @@ flowchart TB
     subgraph data["Data & infra"]
         MONGO[("MongoDB")]
         REDIS[("Redis<br/>pub/sub fan-out")]
-        S3[("MinIO / S3<br/>files · recordings")]
+        S3[("MinIO / S3<br/>files")]
         TURN["coturn<br/>TURN/STUN"]
         POP["derp-relay PoPs<br/>(standalone, DB-free)"]
     end
