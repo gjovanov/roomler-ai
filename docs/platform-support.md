@@ -110,7 +110,7 @@ flowchart LR
 | Clipboard: a copied image reaches the viewer by itself | ✅ | ✅ an X11 session with a per-user install, through XFixes' selection events (FR-97 P3e-3a, from 0.4.148) · ❌ Wayland and a system install: on request only, said as `not-watched` | ✅ from 0.4.154, through the pasteboard's change count (FR-97 P2e-1); before it, on request only | image watching rides Windows' clipboard sequence number, on X11 the change gate (`agents/roomlerd/src/clipboard.rs:1319`, `:1846`), on a Mac the change count (`agents/roomlerd/src/clipboard.rs:1452`); `docs/remote-control.md`, the watcher on X11 and on a Mac |
 | Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:4419-4423` |
 | An idle desktop costs little CPU | ✅ dirty regions | ✅ X11 damage; Wayland's compositor sends frames on change; the DRM arm skips an unchanged frame | ❌ every frame is a full frame | `Damage::Unknown` (`agents/roomlerd/src/capture/scrap_backend.rs:642`); `docs/wayland.md` |
-| The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:3294-3297`) |
+| The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:3297-3300`) |
 | Privacy mode (the curtain) | ✅ Windows 10 2004 and later | ❌ | ⛔ | `docs/privacy-mode.md`, Platforms; §8 |
 | Lock the computer when the last session ends | ✅ | ✅ `loginctl lock-session` | ❌ no mechanism yet: an end that should lock logs that it could not | `docs/privacy-mode.md`, lock on end |
 
@@ -132,7 +132,7 @@ flow, and the consent chain's fallbacks.
 | Exit node: DNS goes through the exit | ✅ | 🟡 systemd-resolved only, else `DNS NOT steered` | ✅ | the same steer, with a catch-all domain |
 | The host firewall admits the mesh | ✅ the daemon's Defender rule, and WFP | 🟡 firewalld and ufw left to the owner, and reported | ❌ the Application Firewall is left alone | carriers pass a host firewall by conntrack; only services on the overlay address need an allow (D13, `crates/tunnel-core/src/overlay/hostfw.rs:3-8`) |
 | LAN-direct egress pin; repair of the LAN's own route | ✅ | ❌ | ❌ | out of scope until a field case asks for it (FR-97 §7); `crates/tunnel-core/src/overlay/lan_repair.rs:3-7` |
-| Who holds a busy port | ✅ | ✅ | ✅ `lsof` | `agents/roomlerd/src/tunnel/port_holder.rs:315-329` |
+| Who holds a busy port | ✅ | ✅ | ✅ `lsof` | `agents/roomlerd/src/tunnel/port_holder.rs:355-369` |
 
 At parity on all three: TUN bring-up; v4 and v6 ULA addressing; route-change subscriptions;
 PathMonitor; every carrier (disco, direct, netcheck, relays, DERP, QUIC); org relay serving
