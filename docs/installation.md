@@ -3571,7 +3571,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5822`).
+(`crates/localapi/src/lib.rs:5882`).
 
 On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
 the console user's `roomler …` is the screen worker the root daemon starts for
@@ -4047,7 +4047,7 @@ serves `live_work`. So the command looks where a person may. It connects to the
 person socket root serves them (`/var/run/roomler-person/<uid>.sock`, FR-97 P2g),
 keeps the connection only when root serves it, sends nothing, and gives up after
 500 ms: the evidence of a root half that `roomler status` reads
-(`macos_root_half_serves_me`, `crates/localapi/src/lib.rs:5879-5892`). The look is
+(`macos_root_half_serves_me`, `crates/localapi/src/lib.rs:5939-5952`). The look is
 `root_half_seen` (`agents/roomlerd/src/helper_gate.rs:491-507`), the call is in
 `self_update_cmd` (`agents/roomlerd/src/app.rs:6623-6644`), and the lines are
 `ask_recorded_says` and `NO_ASK_SAYS` (`helper_gate.rs:518-546`):

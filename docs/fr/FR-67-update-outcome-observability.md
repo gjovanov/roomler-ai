@@ -127,7 +127,7 @@ flowchart LR
 | The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:2130`), its pure half `summarize` (`:2149`) |
 | The startup line and its level | `log_at_startup` (`:1829`), `startup_level` (`:1813`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4471`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:1143`) |
-| The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2961`), printed under `version` (`:2562`) |
+| The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2974`), printed under `version` (`:2575`) |
 
 - ⚠️ **Read on every answer, never cached at startup.** On Windows the MSI
   starts the new service while the watcher is still waiting on msiexec, so

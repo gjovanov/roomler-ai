@@ -625,7 +625,7 @@ does instead:
   `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
   or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
 - `roomler status` prints it only when the firewall limits what a mesh peer
-  reaches ([`localclient.rs:3218`](../agents/roomler-cli/src/localclient.rs#L3218)):
+  reaches ([`localclient.rs:3231`](../agents/roomler-cli/src/localclient.rs#L3231)):
 
   ```text
     host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
@@ -1831,7 +1831,7 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   longer lists its peers as live.
 - **What reads it.** `roomler peers` prints the rows as it always did, then one
   line per org whose socket is down and which columns are live
-  (`control_down_lines`, `agents/roomler-cli/src/localclient.rs:3387`):
+  (`control_down_lines`, `agents/roomler-cli/src/localclient.rs:3400`):
 
   ```
     control plane unreachable (lost 12m ago): peers listed from what this device's mesh still holds.
