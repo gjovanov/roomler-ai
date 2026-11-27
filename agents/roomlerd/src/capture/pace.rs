@@ -69,6 +69,11 @@ pub fn rtp_capture_wait_enabled() -> bool {
 ///
 /// [`ScreenCapture::next_frame`]: super::ScreenCapture::next_frame
 pub fn dc_capture_wait(paths: &crate::media_paths::MediaPaths) -> bool {
+    // Off, the default: the hold is not read either, so such a pump starts
+    // with no read it did not make before.
+    if !paths.is_new(crate::media_paths::MediaPath::CaptureWait) {
+        return false;
+    }
     let held = dc_held_back(cfg!(target_os = "macos"), gpu_frames_at_open());
     dc_capture_wait_on(paths, held)
 }
