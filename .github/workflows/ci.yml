@@ -1853,7 +1853,7 @@ jobs:
         # step above runs only the utun tests, so on a Mac, the platform of `route -n monitor`
         # and of CLOCK_MONOTONIC's sleep, nothing ran them. The same build as the step above,
         # run as the normal user: the cells start `sh` stand-ins, never `route`.
-        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib -- monitor_child liveness:: --test-threads=1 --nocapture
+        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib -- monitor_child liveness::tests --test-threads=1 --nocapture
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
