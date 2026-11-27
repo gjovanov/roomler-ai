@@ -266,7 +266,11 @@ one more"), and conflating them would mark every tenant exactly at its limit as 
       FR chose not to gate, so it has no `Limit` variant. Every other comparison goes
       through `Limit::describe`. Whether that exception satisfies this line is an
       operator call.*
-- [ ] Adding a field to `PlanLimits` fails to compile until it is classified in `Limit`.
+- [x] Adding a field to `PlanLimits` fails to compile until it is classified in `Limit`.
+      *True since [#4508](https://github.com/gjovanov/roomler-ai/pull/4508) (2026-11-27,
+      #3336): `quota::field_classes` destructures every field with no `..`, and a scratch
+      field fails with E0027 `pattern does not mention field` there (the RED is in the PR).
+      The note below is the 2026-09-25 finding it fixes.*
       *⚠️ Not true, and never was (2026-09-25). `Limit::describe`'s exhaustive match
       covers `Limit`'s VARIANTS, not `PlanLimits`' FIELDS: two fields —
       `overlay_mesh`, `max_message_history` — have never had a variant (deliberately,
