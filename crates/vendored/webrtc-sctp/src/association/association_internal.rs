@@ -2746,3 +2746,19 @@ impl AssociationInternal {
         self.pending_queue = Arc::new(PendingQueue::with_limit(bytes));
     }
 }
+
+impl AssociationInternal {
+    /// roomler (FR-148 P4b): the streams marked deadline-limited
+    /// (`mark_deadline_stream`), in ascending order. A read: it marks and
+    /// clears nothing.
+    pub(crate) fn deadline_streams(&self) -> Vec<u16> {
+        let mut marked: Vec<u16> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.deadline.load(Ordering::SeqCst))
+            .map(|(&id, _)| id)
+            .collect();
+        marked.sort_unstable();
+        marked
+    }
+}
