@@ -79,7 +79,7 @@ pub mod ws;
 
 pub use agent_socket::{
     AgentCtx, AgentMsgHandler, AgentResume, AgentSocketHooks, AgentSocketLifecycle,
-    AgentSocketRegistry,
+    AgentSocketRegistry, ServerEnded,
 };
 pub use capabilities::{Capabilities, TenantCtx};
 pub use error::ApiError;
