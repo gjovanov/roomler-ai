@@ -1023,3 +1023,35 @@ async fn test_deadline_a_mark_needs_its_stream() {
         "marking again is a no-op"
     );
 }
+
+// roomler (FR-148 P4b): the read of the marks names the stream marked and
+// no other, on the end that marked it.
+#[tokio::test]
+async fn test_deadline_streams_names_the_stream_marked_and_no_other() {
+    let mut twin = Twin::new().await;
+    assert!(twin.agent.deadline_streams().is_empty(), "no stream yet");
+    let _control = twin.open(CONTROL, false, ReliabilityType::Reliable, 0);
+    let _video = twin.open(VIDEO, true, ReliabilityType::Rexmit, 0);
+    assert!(
+        twin.agent.deadline_streams().is_empty(),
+        "opened, never marked"
+    );
+    assert!(
+        !twin.agent.mark_deadline_stream(VIDEO + 2),
+        "no such stream"
+    );
+    assert!(
+        twin.agent.deadline_streams().is_empty(),
+        "a refusal marks nothing"
+    );
+    assert!(twin.agent.mark_deadline_stream(VIDEO));
+    assert_eq!(twin.agent.deadline_streams(), [VIDEO]);
+    assert!(twin.agent.mark_deadline_stream(VIDEO));
+    assert_eq!(twin.agent.deadline_streams(), [VIDEO], "marked once");
+    assert!(twin.agent.mark_deadline_stream(CONTROL));
+    assert_eq!(twin.agent.deadline_streams(), [CONTROL, VIDEO], "in order");
+    assert!(
+        twin.viewer.deadline_streams().is_empty(),
+        "the far end marked nothing"
+    );
+}

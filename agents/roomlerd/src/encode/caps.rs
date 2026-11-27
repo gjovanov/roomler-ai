@@ -4532,6 +4532,10 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         // no business in the probe child. `stub_caps` fills it from the
         // daemon's own refresher at every announcement.
         desktop: None,
+        // FR-157 — `None` HERE too: whether the screen worker is attached is
+        // the daemon's live word (its delegation channel and its supervisor),
+        // never the probe child's.
+        gui_worker: None,
         // FR-101 P2b — `None` HERE for the same reason: the owner's floor is
         // live config, and `stub_caps` fills it at every announcement.
         session_policy: None,

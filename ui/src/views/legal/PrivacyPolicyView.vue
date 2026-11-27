@@ -62,9 +62,9 @@
 
           <h3 class="text-h6 font-weight-bold mb-2">2.5 Call Recordings</h3>
           <p class="text-body-1 legal-muted mb-4">
-            If recording is enabled for a video or audio call, the recording
-            is stored on our servers. Recordings are only created when explicitly initiated by an authorized
-            participant, and all participants are notified when recording begins.
+            We do not record video or audio calls, and no recording of a call is stored on our servers. A
+            recording of a remote computer's screen is made on that computer, and we never receive it, just as
+            we never receive the rest of a remote-desktop session (section 3).
           </p>
 
           <h3 class="text-h6 font-weight-bold mb-2">2.6 Sign-In Provider Data</h3>
@@ -79,8 +79,8 @@
           <h3 class="text-h6 font-weight-bold mb-2">2.7 Conferencing Data</h3>
           <p class="text-body-1 legal-muted mb-4">
             During video and audio calls, your media streams are routed through our media server for delivery to
-            other participants. They are processed in real time and are <strong>not stored</strong> unless
-            recording has been explicitly enabled for the call. Connection metadata (IP addresses, codec
+            other participants. They are processed in real time and are <strong>not stored</strong>: calls
+            are not recorded (section 2.5). Connection metadata (IP addresses, codec
             information, bandwidth statistics) may be temporarily logged for quality monitoring and
             troubleshooting.
           </p>
@@ -303,7 +303,7 @@
             terminal would mean shipping whatever an operator typed into it — passwords included — off the
             machine, which is precisely the property this design exists to avoid. What we do keep is the
             <em>metadata</em> in sections 2.9 and 2.10: that a session happened, between whom, and when. Chat
-            messages, uploaded files and call recordings are different — those are stored on our servers, as
+            messages and uploaded files are different — those are stored on our servers, as
             described above, because delivering them is what the collaboration features do.
           </p>
         </section>
@@ -332,7 +332,6 @@
             <li class="mb-1">Deliver chat messages, files, and video/audio streams to the intended recipients</li>
             <li class="mb-1">Establish connections between your devices and route them over the private network</li>
             <li class="mb-1">Enforce the access rules you configure, and give you an audit trail of who reached what</li>
-            <li class="mb-1">Process call recordings when recording is enabled</li>
             <li class="mb-1">Process payments and manage subscription billing</li>
             <li class="mb-1">Send service-related communications (e.g., account verification, security alerts)</li>
             <li class="mb-1">Learn which of our channels bring people to Roomler, counted per channel (section 2.16)</li>
@@ -362,7 +361,7 @@
           </p>
           <ul class="text-body-1 legal-muted ml-6 mb-2">
             <li class="mb-1">Chat message history is retained according to your workspace plan limits.</li>
-            <li class="mb-1">Files are retained until deleted by you or a workspace administrator; call recordings according to your workspace settings.</li>
+            <li class="mb-1">Files are retained until deleted by you or a workspace administrator.</li>
             <li class="mb-1">Access and audit records — the audit trail of remote sessions, command execution, SSH decisions and device-reported activity — are deleted automatically <strong>90 days</strong> after they are written.</li>
             <li class="mb-1">The record of a remote-desktop session itself — who controlled which device, when, for how long, its connection quality and the kind of network path it used — is deleted automatically <strong>25 months</strong> after the session began. Daily counts derived from these records name no one and are kept.</li>
             <li class="mb-1">Short-lived operational data such as connection diagnostics is deleted automatically on a shorter cycle, typically <strong>7 days</strong>. Crash reports (2.11) are deleted automatically <strong>30 days</strong> after we receive them.</li>

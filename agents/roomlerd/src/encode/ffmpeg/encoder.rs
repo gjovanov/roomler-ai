@@ -4927,6 +4927,10 @@ mod tests {
             tail: usize,
         }
         /// The open's own log lines (the option tier it opened at), printed.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+        )]
         fn logged<T>(open: impl FnOnce() -> T) -> T {
             let subscriber = tracing_subscriber::fmt()
                 .with_target(false)

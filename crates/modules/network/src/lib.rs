@@ -64,6 +64,7 @@ pub mod overlay;
 pub mod relay_allowance;
 pub mod ssh_grant_acks;
 pub mod tunnel;
+pub mod tunnel_enrollment;
 pub mod turn_usage;
 pub mod routes {
     pub mod agent_ssh;
@@ -725,6 +726,17 @@ impl Module for NetworkState {
                 pre_ops: Vec::new(),
                 indexes: vec![
                     index_unique(bson::doc! { "tenant_id": 1, "machine_id": 1 }),
+                    // FR-159 — the id an install keeps on its machine: one row
+                    // per install. Partial on a STRING value, because a row
+                    // no FR-159 client has claimed holds none, and many such
+                    // rows coexist. Like the `machine_id` index it covers
+                    // removed rows: a removed client is revived in place, so
+                    // the `deleted_at` partial of the overlay indexes does not
+                    // apply. `$type`, never `{instance_id: null}`.
+                    index_unique_partial(
+                        bson::doc! { "tenant_id": 1, "instance_id": 1 },
+                        bson::doc! { "instance_id": { "$type": "string" } },
+                    ),
                     index(bson::doc! { "tenant_id": 1, "status": 1 }),
                     index(bson::doc! { "owner_user_id": 1 }),
                 ],

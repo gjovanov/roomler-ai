@@ -243,10 +243,22 @@ pub fn record_update_attempt() -> bool {
     let Some(p) = update_attempt_marker_path() else {
         return false;
     };
+    let stamp = format!("{}\n", chrono::Utc::now().to_rfc3339());
+    // FR-145 P2 — in a process that holds its `service-logs`, by handle.
+    #[cfg(windows)]
+    if let Some((held, name)) = crate::logging::held_logs::held_file(&p) {
+        return match held.write_file(name, stamp.as_bytes()) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+                false
+            }
+        };
+    }
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+    match std::fs::write(&p, stamp) {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
@@ -4402,12 +4414,12 @@ pub async fn run_update_helper(stop: impl std::future::Future<Output = ()>) -> a
     // job, and a `systemctl stop` during the Linux gate's sleep finds the file
     // already gone and does not re-trigger the path unit.
     #[cfg(target_os = "macos")]
-    {
-        // launchd WatchPaths is edge-triggered and ThrottleInterval spaces
-        // relaunches, so macOS needs no in-helper gate. `remove_file` never
-        // follows a symlink, so a planted link is unlinked, not dereferenced.
-        let _ = std::fs::remove_file(update_trigger_path());
-    }
+    let wake = {
+        // The helper keeps its own file at the wake path and reads a wake as a
+        // change to it, so its own consume no longer starts launchd again;
+        // anything else at the path is replaced once (#4372, `helper_gate::wake`).
+        crate::helper_gate::wake::settle(std::path::Path::new(update_trigger_path()), euid)
+    };
     #[cfg(target_os = "linux")]
     {
         match consume_wake(std::path::Path::new(LINUX_UPDATE_TRIGGER)) {
@@ -4506,7 +4518,7 @@ pub async fn run_update_helper(stop: impl std::future::Future<Output = ()>) -> a
     // first, and waits in place for live work to end.
     #[cfg(target_os = "macos")]
     {
-        mac_gate::run(stop).await
+        mac_gate::run(stop, wake).await
     }
     #[cfg(target_os = "linux")]
     {
@@ -4539,6 +4551,7 @@ pub async fn run_update_helper(stop: impl std::future::Future<Output = ()>) -> a
 #[cfg(target_os = "macos")]
 mod mac_gate {
     use super::*;
+    use crate::helper_gate::wake::Watch;
     use crate::helper_gate::{self as gate, Budget, HelperArm, Observed, ProbeSaid, Reading, Step};
     use std::future::Future;
     use std::io::{Read as _, Write as _};
@@ -4556,7 +4569,7 @@ mod mac_gate {
     }
 
     /// The helper's cycles, and its wait between them.
-    pub(super) async fn run(stop: impl Future<Output = ()>) -> anyhow::Result<()> {
+    pub(super) async fn run(stop: impl Future<Output = ()>, mut wake: Watch) -> anyhow::Result<()> {
         tokio::pin!(stop);
         let dir = crate::logging::log_dir();
         let _lock = match dir.as_deref().map(take_lock) {
@@ -4576,7 +4589,6 @@ mod mac_gate {
         let started = std::time::Instant::now();
         let exe = std::env::current_exe().ok();
         let program = exe.as_deref().and_then(program_id);
-        let wake = Path::new(update_trigger_path());
         let mut stopped = false;
         loop {
             match cycle(&mut budget, path.as_deref(), &mut stop).await? {
@@ -4593,7 +4605,7 @@ mod mac_gate {
                         && exe.as_deref().and_then(program_id) != program,
                     awake: started.elapsed(),
                     now: unix_now(),
-                    wake: std::fs::symlink_metadata(wake).is_ok(),
+                    wake: wake.look(),
                     since_cycle: last_cycle.elapsed(),
                 };
                 match gate::next_step(&seen, budget) {
@@ -4607,10 +4619,10 @@ mod mac_gate {
                         return Ok(());
                     }
                     Step::InstallOverAll | Step::Cycle => {
-                        if seen.wake {
-                            // Consumed unread, as at the start of a run.
-                            let _ = std::fs::remove_file(wake);
-                        }
+                        // The wake file stays as it is: the baseline becomes
+                        // this tick's read, so a write made during the cycle
+                        // is the next tick's wake.
+                        wake.cycled();
                         break;
                     }
                     Step::Wait(rest) => {
@@ -9498,6 +9510,35 @@ mod tests {
             );
             assert!(!is_transport_failure(&e), "not even attempted: {text}");
         }
+    }
+
+    /// FR-145 P2 (AC3) — a process that holds its `service-logs` writes the
+    /// update-attempt marker there by handle. With the folder swapped for a
+    /// junction, it lands in a sealed `service-logs` made again and nothing
+    /// where the junction leads, and the cooldown reads it. At its seam it goes
+    /// by path. In a child, elevated.
+    #[cfg(windows)]
+    #[test]
+    fn the_update_attempt_marker_goes_by_handle_below_the_held_folder() {
+        use roomler_node_core::logging::held_logs::test_fixture::{
+            CHECKED, Case, child, parent, swap_for_junction,
+        };
+        let Some(Case { dir, elsewhere, .. }) = child(true) else {
+            let root = tempfile::tempdir().unwrap();
+            let case = "the_update_attempt_marker_goes_by_handle_below_the_held_folder";
+            return parent(module_path!(), case, root.path());
+        };
+        swap_for_junction(&dir, &elsewhere);
+        assert!(super::record_update_attempt(), "the marker is written");
+        assert!(
+            std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "the marker went where the junction leads"
+        );
+        assert!(dir.join("update-attempt").is_file());
+        assert!(super::recent_update_attempt(
+            std::time::Duration::from_secs(60)
+        ));
+        println!("{CHECKED}");
     }
 }
 // RETIRED-NAME-ANCHOR-END

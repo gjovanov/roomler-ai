@@ -222,7 +222,9 @@ pub fn maybe_intercept(
     use tunnel_core::overlay::split_tun::{SplitTun, warn_if_os_listener};
     use tunnel_core::overlay::tun::TunIo;
 
-    if !cfg.ssh_enabled {
+    // #3353 — the run's own value: off when its start could not make or save
+    // the host key, whatever the owner's `ssh_enabled` says.
+    if !cfg.ssh_on_this_run() {
         return inner;
     }
     let port = cfg.effective_ssh_port();
@@ -318,7 +320,7 @@ pub fn maybe_intercept(
     cfg: &crate::config::AgentConfig,
     _services: SessionServices,
 ) -> tunnel_core::overlay::runtime::TunFactory {
-    if cfg.ssh_enabled {
+    if cfg.ssh_on_this_run() {
         warn!(
             "ssh_enabled is set but this build lacks the `overlay-netstack` feature — \
              SSH is NOT being served on the overlay address"
@@ -7422,6 +7424,10 @@ mod tests {
     // refused. Each case reads the line `Ctx::build` writes, level first.
 
     /// What `f` logs, as the daemon's log file writes it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn logged(f: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);

@@ -59,9 +59,9 @@
 //!   Administrators, their owners and nothing else ([`adopt_machine_folder`],
 //!   [`adopt_machine_parent`], which derives what the parent inherits again for
 //!   its new owner); the repair never takes over an entry another account owns.
-//!   And an elevated writer folds a new
-//!   enrollment only into a config that passes the check after the repair
-//!   ([`may_fold`]); any other is replaced by a fresh one.
+//!   Setup then seals the parent through one handle ([`seal_machine_parent`]).
+//!   An elevated writer folds a new enrollment only into a config that passes
+//!   the check after the repair ([`may_fold`]); any other is replaced by a fresh one.
 //!
 //! - **[`HeldPath`]** (FR-145, the child module [`held`]) is how a process
 //!   running as SYSTEM, or elevated, acts below the machine's folders: every
@@ -69,9 +69,9 @@
 //!   its final path checked; what it makes sealed from creation; what it
 //!   writes made fresh and renamed into place by handle; a removal deleting
 //!   what the same walk opened. #3737's readers ([`PrivateFolder`]) walk the
-//!   same way. The crash records, the install clean-up (FR-145 P1) and the
-//!   daemon's key files in `peer-auth` (#3956: as R leaves them) use it;
-//!   the service logs and the other SYSTEM writers follow in P2 and P3.
+//!   same way. The crash records, the install clean-up (FR-145 P1), the key
+//!   files in `peer-auth` (#3956: as R leaves them) and a role process's
+//!   `service-logs` (P2) use it; the other SYSTEM writers follow in P3.
 //!
 //! Kill switches, read from the process environment only (the service's
 //! `Environment` block), never from the config: `ROOMLERD_MACHINE_TREE_REPAIR=0`
@@ -357,6 +357,84 @@ pub fn parent_cut(sd: &Sd, spare: impl Fn(&Ace) -> bool) -> Option<Vec<Ace>> {
         plan.push(ace.clone());
     }
     cut.then_some(plan)
+}
+
+/// #4488 — the DACL Setup's seal writes on the parent ([`seal_machine_parent`]),
+/// planned from what it holds before anything is written: the DACL that the
+/// two `icacls` runs it replaced left (`/setowner *S-1-5-32-544`, then
+/// `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F /grant:r *S-1-5-32-544:(OI)(CI)F`,
+/// measured on 51 parents). Its own entries, in their order; the inherited ones
+/// go. For SYSTEM, then Administrators, among its entries that hand down to
+/// folders and files and say nothing more (exactly `(OI)(CI)`): each deny up to
+/// the first allow is dropped, and that allow becomes full control in place.
+/// With no such allow, a full-control `(OI)(CI)` allow goes before the first
+/// allow whose flags hold both `OI` and `CI`, or at the end. Then an entry the
+/// same as one before it is dropped. A NULL DACL has no entries of its own.
+///
+/// `Err` for an entry of its own that the writer cannot write back: a kind that
+/// is neither an allow nor a deny, or flags other than `OI`, `CI`, `NP` and
+/// `IO`. Left as found; the check refuses such a kind on the parent ([`verdict`]).
+pub fn parent_seal(sd: &Sd) -> Result<Vec<Ace>, String> {
+    const OICI: u8 = OBJECT_INHERIT | CONTAINER_INHERIT;
+    /// `NO_PROPAGATE_INHERIT_ACE`.
+    const NO_PROPAGATE: u8 = 0x4;
+    let mut plan = Vec::new();
+    for ace in sd
+        .dacl
+        .iter()
+        .flatten()
+        .filter(|a| a.flags & INHERITED == 0)
+    {
+        if ace.kind != ACE_ALLOW && ace.kind != ACE_DENY {
+            return Err(format!(
+                "carries an access rule of a kind the seal cannot write back (type {})",
+                ace.kind
+            ));
+        }
+        if ace.flags & !(OICI | NO_PROPAGATE | INHERIT_ONLY) != 0 {
+            return Err(format!(
+                "carries an access rule with flags the seal cannot write back (0x{:02x})",
+                ace.flags
+            ));
+        }
+        plan.push(ace.clone());
+    }
+    for sid in [SYSTEM, ADMINISTRATORS] {
+        let full = Ace {
+            kind: ACE_ALLOW,
+            flags: OICI,
+            mask: FULL,
+            sid: sid.to_string(),
+        };
+        let mut at = 0;
+        let mut granted = false;
+        while at < plan.len() {
+            if plan[at].sid == sid && plan[at].flags == OICI {
+                if plan[at].kind == ACE_DENY {
+                    plan.remove(at);
+                    continue;
+                }
+                plan[at] = full.clone();
+                granted = true;
+                break;
+            }
+            at += 1;
+        }
+        if !granted {
+            let before = plan
+                .iter()
+                .position(|a| a.kind == ACE_ALLOW && a.flags & OICI == OICI)
+                .unwrap_or(plan.len());
+            plan.insert(before, full);
+        }
+    }
+    let mut kept: Vec<Ace> = Vec::with_capacity(plan.len());
+    for ace in plan {
+        if !kept.contains(&ace) {
+            kept.push(ace);
+        }
+    }
+    Ok(kept)
 }
 
 /// Whether `sid` is an account of this computer: its account domain
@@ -1026,6 +1104,48 @@ pub fn adopt_machine_parent(tree: &MachineTree) -> Result<bool, String> {
         win::set_sd(&entry.file, false, Some((&own, false))).map_err(taking)?;
     }
     Ok(true)
+}
+
+/// #4488 — Setup's seal of the parent, `%ProgramData%\roomler`, after its take
+/// ([`adopt_machine_parent`]): through one handle to it, opened without
+/// following a link, on which it is judged a plain folder. Its DACL is read
+/// and the seal planned ([`parent_seal`]) before anything is written; then
+/// Administrators become its owner, and then the planned DACL, protected, is
+/// written in one call (#3073: the owner first). No step after the check names
+/// the folder by path: a privileged process acts on the machine's folders
+/// through a handle it holds (FR-145). The folder and what it holds end as the
+/// two `icacls` runs this replaced left them. SYSTEM and Administrators are
+/// written as their well-known SIDs, never by name: Windows localises the
+/// names (`Administratoren`).
+///
+/// `Err` names the parent and why. Nothing is written when it is not there, is
+/// not a plain folder, holds an entry the seal cannot write back, or when this
+/// process may not change its owner and DACL (no privilege is turned on for
+/// it). The daemon never calls this.
+#[cfg(windows)]
+pub fn seal_machine_parent(parent: &Path) -> Result<(), String> {
+    let Some(entry) = win::open(parent, win::Kind::Dir, false, true)? else {
+        return Err(format!("{} is not there", parent.display()));
+    };
+    let sd = win::read_sd(&entry.file)
+        .map_err(|e| format!("{}: reading its security: {e}", parent.display()))?;
+    let dacl = parent_seal(&sd)
+        .map_err(|why| format!("{} {why}, so it keeps its permissions", parent.display()))?;
+    win::can_write(&dacl, true).map_err(|e| {
+        format!(
+            "{}: its DACL cannot be written ({e}), so it keeps its permissions",
+            parent.display()
+        )
+    })?;
+    if !entry.writable {
+        return Err(format!(
+            "{} is not sealed: this process may not change its owner and permissions",
+            parent.display()
+        ));
+    }
+    let sealing = |e: std::io::Error| format!("{}: sealing it: {e}", parent.display());
+    win::set_sd(&entry.file, true, None).map_err(sealing)?;
+    win::set_sd(&entry.file, false, Some((&dacl, true))).map_err(sealing)
 }
 
 /// W for the attempt record: [`seal_new_file`] with [`record_aces`], so Users
@@ -2114,13 +2234,9 @@ mod win {
         set_sd(file, take, dacl)
     }
 
-    /// [`write_sd`]'s one call: the owner (when `take`) and `dacl` together,
-    /// both or neither.
-    pub(super) fn set_sd(
-        file: &std::fs::File,
-        take: bool,
-        dacl: Option<(&[Ace], bool)>,
-    ) -> std::io::Result<()> {
+    /// [`set_sd`]'s descriptor in SDDL: Administrators as the owner when
+    /// `take`, and `dacl`.
+    fn sd_sddl(take: bool, dacl: Option<(&[Ace], bool)>) -> std::io::Result<String> {
         let mut sddl = String::new();
         if take {
             sddl.push_str("O:BA");
@@ -2131,7 +2247,23 @@ mod win {
                 sddl.push_str(&ace_sddl(ace)?);
             }
         }
-        let sd = Descriptor::from_sddl(&sddl)?;
+        Ok(sddl)
+    }
+
+    /// #4488 — whether [`set_sd`] can write `dacl`: its descriptor is made as
+    /// that call makes it, and nothing is written.
+    pub(super) fn can_write(dacl: &[Ace], protected: bool) -> std::io::Result<()> {
+        Descriptor::from_sddl(&sd_sddl(false, Some((dacl, protected)))?).map(drop)
+    }
+
+    /// [`write_sd`]'s one call: the owner (when `take`) and `dacl` together,
+    /// both or neither.
+    pub(super) fn set_sd(
+        file: &std::fs::File,
+        take: bool,
+        dacl: Option<(&[Ace], bool)>,
+    ) -> std::io::Result<()> {
+        let sd = Descriptor::from_sddl(&sd_sddl(take, dacl)?)?;
         let mut info = 0;
         let mut owner: PSID = std::ptr::null_mut();
         let mut acl: *mut ACL = std::ptr::null_mut();
@@ -2806,11 +2938,22 @@ pub mod test_support {
 
     /// Give `path` exactly the DACL `sddl` (`D:…`), by name.
     pub fn set_dacl(path: &Path, sddl: &str) {
+        write_dacl(path, sddl, true);
+    }
+
+    /// #4488 — give `path` the entries of its own in `sddl` (`D:…`), by name,
+    /// and what the folder above it hands down after them.
+    pub fn set_own_entries(path: &Path, sddl: &str) {
+        write_dacl(path, sddl, false);
+    }
+
+    fn write_dacl(path: &Path, sddl: &str, protected: bool) {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
         };
         use windows_sys::Win32::Security::{
             ACL, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+            UNPROTECTED_DACL_SECURITY_INFORMATION,
         };
         let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -2831,12 +2974,17 @@ pub mod test_support {
         let ok = unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted) };
         assert_ne!(ok, 0, "the DACL of {sddl}");
         let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let protection = if protected {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
         // SAFETY: a NUL-terminated path; `acl` lives in `sd` until it is freed.
         let rc = unsafe {
             SetNamedSecurityInfoW(
                 wide_path.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION | protection,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 acl,
@@ -3768,6 +3916,353 @@ mod tests {
         );
         let plan = parent_cut(&sd(ADMINISTRATORS, true, aces), |_| false).expect("a cut");
         assert!(!plan.contains(&delete_child), "{plan:?}");
+    }
+
+    /// #4488 — the parents measured against the two `icacls` runs Setup's seal
+    /// replaced: each parent's entries of its own as read before, and the DACL
+    /// `icacls` left (`None`: a NULL DACL). In SDDL, `XA` a conditional allow.
+    /// Y1 was R6 measured again; the four parents of the seal's end-shape cell
+    /// in `roomler-setup` are C1, C2, C8 and C1 again.
+    const SEAL_SHAPES: [(&str, Option<&str>, &str); 50] = [
+        ("C1", Some(""), "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)"),
+        (
+            "C2",
+            Some("(A;OICI;FA;;;BG)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)",
+        ),
+        (
+            "C3",
+            Some("(A;;FA;;;SY)(A;OICI;0x1200a9;;;BA)"),
+            "(A;;FA;;;SY)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+        ),
+        (
+            "C4",
+            Some("(D;OICI;0x40000;;;BG)(D;;0x2;;;SY)(A;OICI;FA;;;BG)"),
+            "(D;OICI;0x40000;;;BG)(D;;0x2;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)",
+        ),
+        (
+            "C5",
+            Some("(A;OICI;FA;;;BG)(A;OICI;0x1200a9;;;BU)(A;OICI;FA;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;BG)(A;OICI;0x1200a9;;;BU)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "C6",
+            Some("(A;;FA;;;BG)(A;OICIIO;GA;;;BG)(A;;FA;;;SY)(A;OICIIO;GA;;;SY)"),
+            "(A;;FA;;;BG)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;GA;;;BG)(A;;FA;;;SY)(A;OICIIO;GA;;;SY)",
+        ),
+        (
+            "C7",
+            Some("(A;OICIIO;FA;;;CO)(A;OICI;0x1200a9;;;BU)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;FA;;;CO)(A;OICI;0x1200a9;;;BU)",
+        ),
+        (
+            "C8",
+            Some("(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+            "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+        ),
+        (
+            "C9",
+            Some("(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BG)"),
+            "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BG)",
+        ),
+        (
+            "C10",
+            Some("(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)",
+        ),
+        (
+            "R1",
+            Some("(A;OI;FA;;;BG)(A;CI;FA;;;BU)"),
+            "(A;OI;FA;;;BG)(A;CI;FA;;;BU)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "R2",
+            Some("(A;OICINP;FA;;;BG)(A;OIIO;FA;;;BU)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICINP;FA;;;BG)(A;OIIO;FA;;;BU)",
+        ),
+        (
+            "R3",
+            Some("(A;;FA;;;BG)(A;OICI;FA;;;BU)"),
+            "(A;;FA;;;BG)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)",
+        ),
+        (
+            "R4",
+            Some("(A;OICI;FA;;;BG)(D;OICI;0x40000;;;BU)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)(D;OICI;0x40000;;;BU)",
+        ),
+        (
+            "R5",
+            Some("(D;OICI;0x40000;;;SY)(A;OICI;FA;;;BG)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)",
+        ),
+        (
+            "R6",
+            Some("(A;OICI;0x1200a9;;;SY)(A;OICI;FA;;;BG)(A;OICI;0x120116;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)(A;OICI;0x120116;;;SY)",
+        ),
+        (
+            "R7",
+            Some("(A;CI;FA;;;BG)(A;OI;FA;;;BU)(A;OICI;FA;;;BG)"),
+            "(A;CI;FA;;;BG)(A;OI;FA;;;BU)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)",
+        ),
+        (
+            "R8",
+            Some("(A;CI;FA;;;SY)(A;OI;FA;;;BA)"),
+            "(A;CI;FA;;;SY)(A;OI;FA;;;BA)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "R9",
+            Some("(D;OICI;0x40000;;;BG)"),
+            "(D;OICI;0x40000;;;BG)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "R10",
+            Some("(A;OICI;FA;;;BA)(A;OICI;FA;;;BG)(A;;FA;;;SY)"),
+            "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BG)(A;;FA;;;SY)",
+        ),
+        (
+            "X1",
+            Some("(A;OICI;FA;;;BU)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)",
+        ),
+        (
+            "X2",
+            Some("(A;;FA;;;BG)(A;OICI;FA;;;BU)"),
+            "(A;;FA;;;BG)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)",
+        ),
+        (
+            "X3",
+            Some("(A;CIIO;FA;;;BG)(A;OICI;FA;;;BU)"),
+            "(A;CIIO;FA;;;BG)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)",
+        ),
+        (
+            "X4",
+            Some("(A;OIIO;FA;;;BG)(A;OICI;FA;;;BU)"),
+            "(A;OIIO;FA;;;BG)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)",
+        ),
+        (
+            "X5",
+            Some("(A;CINP;FA;;;BG)(A;OICI;FA;;;BU)"),
+            "(A;CINP;FA;;;BG)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)",
+        ),
+        ("X6", None, "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)"),
+        ("X7", Some("(XA;OICI;FA;;;WD)"), "refused"),
+        ("X8", Some("(A;OICI;FA;;;BG)(XA;OICI;FA;;;WD)"), "refused"),
+        (
+            "X9",
+            Some("(D;OICI;0x40000;;;SY)(A;OICI;FA;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        ("X10", Some(""), "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)"),
+        (
+            "Y2",
+            Some("(A;OICI;FA;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "Y3",
+            Some("(A;OICI;0x1200a9;;;SY)(A;OICI;0x120116;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x120116;;;SY)",
+        ),
+        (
+            "Y4",
+            Some("(D;OICI;0x40000;;;SY)(A;OICI;FA;;;BG)(A;OICI;FA;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;BG)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "Y5",
+            Some("(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)",
+        ),
+        (
+            "Y6",
+            Some("(D;OICI;0x40000;;;SY)(A;OICI;0x1200a9;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "Y7",
+            Some("(A;OICI;0x1200a9;;;SY)(D;OICI;0x40000;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(D;OICI;0x40000;;;SY)",
+        ),
+        (
+            "Y8",
+            Some("(D;OICI;0x40000;;;SY)(D;OICI;0x2;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "Y9",
+            Some("(A;OI;FA;;;SY)(A;OICI;0x1200a9;;;SY)"),
+            "(A;OI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "Y11",
+            Some("(A;OICI;0x1200a9;;;BA)(A;OICI;0x1200a9;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "Y12",
+            Some("(A;OICI;0x120116;;;SY)(A;OICI;FA;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "Y13",
+            Some("(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)(A;OICI;0x1200a9;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)(A;OICI;0x1200a9;;;SY)",
+        ),
+        (
+            "Y14",
+            Some("(A;OICI;0x1200a9;;;SY)(A;OICI;FA;;;BG)(A;OICI;FA;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)",
+        ),
+        (
+            "Y15",
+            Some("(D;OICI;0x1200a9;;;SY)(A;OICI;FA;;;BG)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)",
+        ),
+        (
+            "Y16",
+            Some("(D;OICI;FA;;;SY)(A;OICI;FA;;;BG)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)",
+        ),
+        (
+            "Z1",
+            Some("(A;CIIO;FA;;;BG)(A;OICIIO;FA;;;BU)"),
+            "(A;CIIO;FA;;;BG)(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;FA;;;BU)",
+        ),
+        (
+            "Z3",
+            Some("(A;OICINPIO;FA;;;BG)(A;OICI;FA;;;BU)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICINPIO;FA;;;BG)(A;OICI;FA;;;BU)",
+        ),
+        (
+            "Z4",
+            Some("(A;OICI;FA;;;WD)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;FA;;;WD)",
+        ),
+        (
+            "Z6",
+            Some("(D;OICI;0x40000;;;SY)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+        ),
+        (
+            "Z7",
+            Some("(A;OICINP;FA;;;SY)(A;OICI;FA;;;BU)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICINP;FA;;;SY)(A;OICI;FA;;;BU)",
+        ),
+        (
+            "Z8",
+            Some("(A;OICIIO;FA;;;SY)(A;OICI;FA;;;BU)"),
+            "(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;FA;;;SY)(A;OICI;FA;;;BU)",
+        ),
+    ];
+
+    /// The ACEs of an SDDL DACL body, `(A;OICI;FA;;;SY)` each, as `read_sd`
+    /// reads them: `XA` by its type alone, as an entry of a kind it does not
+    /// read further.
+    fn sddl_aces(text: &str) -> Vec<Ace> {
+        text.split_terminator(')')
+            .map(|one| {
+                let f: Vec<&str> = one.strip_prefix('(').expect(one).split(';').collect();
+                let kind = match f[0] {
+                    "A" => ACE_ALLOW,
+                    "D" => ACE_DENY,
+                    "XA" => return ace(9, OICI, 0, ""),
+                    other => panic!("{other}"),
+                };
+                let flags = f[1].as_bytes().chunks(2).fold(0, |flags, word| {
+                    flags
+                        | match word {
+                            b"OI" => OBJECT_INHERIT,
+                            b"CI" => CONTAINER_INHERIT,
+                            b"NP" => 0x4,
+                            b"IO" => INHERIT_ONLY,
+                            other => panic!("{other:?}"),
+                        }
+                });
+                let mask = match f[2] {
+                    "FA" => FULL,
+                    "GA" => 0x1000_0000,
+                    hex => u32::from_str_radix(hex.trim_start_matches("0x"), 16).expect(hex),
+                };
+                let sid = match f[5] {
+                    "SY" => SYSTEM,
+                    "BA" => ADMINISTRATORS,
+                    "BG" => "S-1-5-32-546",
+                    "BU" => USERS,
+                    "WD" => "S-1-1-0",
+                    "CO" => CREATOR_OWNER,
+                    other => panic!("{other}"),
+                };
+                ace(kind, flags, mask, sid)
+            })
+            .collect()
+    }
+
+    /// #4488 — the DACL Setup's seal plans for the parent is the one the two
+    /// `icacls` runs it replaced left, on every parent measured: the parent's
+    /// own entries, read as found, with what it inherits from `%ProgramData%`
+    /// after them, which goes. An entry of its own that the writer cannot write
+    /// back is a refusal that names it, an inherited one is not.
+    #[test]
+    fn the_parents_seal_plans_what_the_two_icacls_runs_left() {
+        let inherited: Vec<Ace> = [
+            ace(ACE_ALLOW, OICI, FULL, SYSTEM),
+            ace(ACE_ALLOW, OICI, FULL, ADMINISTRATORS),
+            ace(ACE_ALLOW, OICI | INHERIT_ONLY, FULL, CREATOR_OWNER),
+            ace(ACE_ALLOW, OICI, READ_EXECUTE, USERS),
+            ace(ACE_ALLOW, CONTAINER_INHERIT, 0x116, USERS),
+        ]
+        .into_iter()
+        .map(|a| Ace {
+            flags: a.flags | INHERITED,
+            ..a
+        })
+        .collect();
+        for (name, own, sealed) in SEAL_SHAPES {
+            // C8, C9 and X10 were found protected, inheriting nothing.
+            let found = match own {
+                None => Sd {
+                    owner: ADMINISTRATORS.into(),
+                    protected: true,
+                    dacl: None,
+                },
+                Some(own) if ["C8", "C9", "X10"].contains(&name) => {
+                    sd(ADMINISTRATORS, true, sddl_aces(own))
+                }
+                Some(own) => {
+                    let mut aces = sddl_aces(own);
+                    aces.extend(inherited.iter().cloned());
+                    sd(ADMINISTRATORS, false, aces)
+                }
+            };
+            let plan = parent_seal(&found);
+            if sealed == "refused" {
+                let why = plan.expect_err(name);
+                assert!(why.contains("(type 9)"), "{name}: {why}");
+            } else {
+                assert_eq!(plan, Ok(sddl_aces(sealed)), "{name}");
+            }
+        }
+
+        let mut odd = sd(ADMINISTRATORS, false, sealed_aces(OICI));
+        odd.dacl.as_mut().unwrap()[1].flags |= 0x40;
+        let why = parent_seal(&odd).expect_err("an audit flag on an allow");
+        assert!(why.contains("flags"), "{why}");
+        let mut object = sd(ADMINISTRATORS, false, sealed_aces(OICI));
+        object.dacl.as_mut().unwrap().push(ace(5, OICI, 0, ""));
+        let why = parent_seal(&object).expect_err("an object allow");
+        assert!(why.contains("(type 5)"), "{why}");
+        let mut handed_down = sd(ADMINISTRATORS, false, inherited.clone());
+        handed_down
+            .dacl
+            .as_mut()
+            .unwrap()
+            .push(ace(9, OICI | INHERITED, 0, ""));
+        assert_eq!(
+            parent_seal(&handed_down),
+            Ok(sddl_aces("(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)")),
+            "an inherited entry goes, whatever its kind"
+        );
     }
 
     #[cfg(windows)]
@@ -4983,6 +5478,173 @@ mod tests {
             assert!(why.contains("elevated prompt"), "and what to do: {why}");
             assert_eq!(std::fs::read_to_string(tree.prev()).unwrap(), "the copy");
             assert_eq!(read(&tree.prev(), win::Kind::File).dacl, None);
+        }
+
+        /// #4488 — the parents [`SEAL_SHAPES`] was measured on, as they were
+        /// made: each one's entries of its own, set by name, inheriting the
+        /// rest (`D:P`: inheriting nothing; `None`: a NULL DACL). X10, a
+        /// protected DACL with no entry, is not here: it gives Administrators
+        /// no right to change the owner, and the seal turns no privilege on.
+        const SEAL_MADE: [(&str, Option<&str>); 49] = [
+            ("C1", Some("D:")),
+            ("C2", Some("D:(A;OICI;FA;;;BG)")),
+            ("C3", Some("D:(A;;FA;;;SY)(A;OICI;0x1200a9;;;BA)")),
+            ("C4", Some("D:(D;OICI;WD;;;BG)(D;;DC;;;SY)(A;OICI;FA;;;BG)")),
+            (
+                "C5",
+                Some("D:(A;OICI;FA;;;BG)(A;OICI;0x1200a9;;;BU)(A;OICI;FA;;;SY)"),
+            ),
+            ("C6", Some("D:(A;OICI;GA;;;BG)(A;OICI;GA;;;SY)")),
+            ("C7", Some("D:(A;OICIIO;FA;;;CO)(A;OICI;0x1200a9;;;BU)")),
+            ("C8", Some("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")),
+            (
+                "C9",
+                Some("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BG)"),
+            ),
+            ("C10", Some("D:(A;OICI;FA;;;SY)(A;OICI;FA;;;BU)")),
+            ("R1", Some("D:(A;OI;FA;;;BG)(A;CI;FA;;;BU)")),
+            ("R2", Some("D:(A;OICINP;FA;;;BG)(A;OIIO;FA;;;BU)")),
+            ("R3", Some("D:(A;;FA;;;BG)(A;OICI;FA;;;BU)")),
+            ("R4", Some("D:(A;OICI;FA;;;BG)(D;OICI;WD;;;BU)")),
+            ("R5", Some("D:(D;OICI;WD;;;SY)(A;OICI;FA;;;BG)")),
+            (
+                "R6",
+                Some("D:(A;OICI;0x1200a9;;;SY)(A;OICI;FA;;;BG)(A;OICI;0x120116;;;SY)"),
+            ),
+            ("R7", Some("D:(A;CI;FA;;;BG)(A;OI;FA;;;BU)(A;OICI;FA;;;BG)")),
+            ("R8", Some("D:(A;CI;FA;;;SY)(A;OI;FA;;;BA)")),
+            ("R9", Some("D:(D;OICI;WD;;;BG)")),
+            (
+                "R10",
+                Some("D:(A;OICI;FA;;;BA)(A;OICI;FA;;;BG)(A;;FA;;;SY)"),
+            ),
+            ("X1", Some("D:(A;IO;FA;;;BG)(A;OICI;FA;;;BU)")),
+            ("X2", Some("D:(A;NP;FA;;;BG)(A;OICI;FA;;;BU)")),
+            ("X3", Some("D:(A;CIIO;FA;;;BG)(A;OICI;FA;;;BU)")),
+            ("X4", Some("D:(A;OIIO;FA;;;BG)(A;OICI;FA;;;BU)")),
+            ("X5", Some("D:(A;CINP;FA;;;BG)(A;OICI;FA;;;BU)")),
+            ("X6", None),
+            ("X7", Some("D:(XA;OICI;FA;;;WD;(Member_of {SID(BA)}))")),
+            (
+                "X8",
+                Some("D:(A;OICI;FA;;;BG)(XA;OICI;FA;;;WD;(Member_of {SID(BA)}))"),
+            ),
+            ("X9", Some("D:(D;OICI;WD;;;SY)(A;OICI;FA;;;SY)")),
+            ("Y2", Some("D:(A;OICI;FA;;;SY)(A;OICI;FA;;;SY)")),
+            ("Y3", Some("D:(A;OICI;0x1200a9;;;SY)(A;OICI;0x120116;;;SY)")),
+            (
+                "Y4",
+                Some("D:(D;OICI;0x40000;;;SY)(A;OICI;FA;;;BG)(A;OICI;FA;;;SY)"),
+            ),
+            (
+                "Y5",
+                Some("D:(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)(A;OICI;FA;;;SY)"),
+            ),
+            ("Y6", Some("D:(D;OICI;0x40000;;;SY)(A;OICI;0x1200a9;;;SY)")),
+            ("Y7", Some("D:(A;OICI;0x1200a9;;;SY)(D;OICI;0x40000;;;SY)")),
+            ("Y8", Some("D:(D;OICI;0x40000;;;SY)(D;OICI;0x2;;;SY)")),
+            ("Y9", Some("D:(A;OI;FA;;;SY)(A;OICI;0x1200a9;;;SY)")),
+            (
+                "Y11",
+                Some("D:(A;OICI;0x1200a9;;;BA)(A;OICI;0x1200a9;;;SY)"),
+            ),
+            ("Y12", Some("D:(A;OICI;0x120116;;;SY)(A;OICI;FA;;;SY)")),
+            (
+                "Y13",
+                Some("D:(A;OICI;FA;;;SY)(A;OICI;FA;;;BG)(A;OICI;0x1200a9;;;SY)"),
+            ),
+            (
+                "Y14",
+                Some("D:(A;OICI;0x1200a9;;;SY)(A;OICI;FA;;;BG)(A;OICI;FA;;;SY)"),
+            ),
+            ("Y15", Some("D:(D;OICI;0x1200a9;;;SY)(A;OICI;FA;;;BG)")),
+            ("Y16", Some("D:(D;OICI;FA;;;SY)(A;OICI;FA;;;BG)")),
+            ("Z1", Some("D:(A;CIIO;FA;;;BG)(A;OICIIO;FA;;;BU)")),
+            ("Z3", Some("D:(A;OICINPIO;FA;;;BG)(A;OICI;FA;;;BU)")),
+            ("Z4", Some("D:(A;OICI;FA;;;WD)")),
+            ("Z6", Some("D:(D;OICI;0x40000;;;SY)")),
+            ("Z7", Some("D:(A;OICINP;FA;;;SY)(A;OICI;FA;;;BU)")),
+            ("Z8", Some("D:(A;OICIIO;FA;;;SY)(A;OICI;FA;;;BU)")),
+        ];
+
+        /// One twin for [`the_parents_seal_leaves_what_the_two_icacls_runs_left`]:
+        /// a parent below a `%ProgramData%` stand-in under `root`, made as
+        /// `made` says, Administrators', with a folder in it holding a file and
+        /// a file beside that folder, each inheriting all it holds.
+        fn seal_twin(root: &Path, made: Option<&str>) -> [PathBuf; 4] {
+            std::fs::create_dir(root).unwrap();
+            let parent = program_data(root).join("roomler");
+            let folder = parent.join("roomler");
+            std::fs::create_dir_all(&folder).unwrap();
+            let config = folder.join("config.toml");
+            let record = parent.join("last-system-context-attempt.json");
+            std::fs::write(&config, b"x").unwrap();
+            std::fs::write(&record, b"{}").unwrap();
+            assert!(icacls(&parent, &["/reset", "/T"]), "{}", parent.display());
+            assert!(icacls(&parent, &["/setowner", "*S-1-5-32-544"]));
+            match made {
+                None => set_dacl(&parent, "D:NO_ACCESS_CONTROL"),
+                Some(dacl) if dacl.starts_with("D:P") => set_dacl(&parent, dacl),
+                Some(dacl) => set_own_entries(&parent, dacl),
+            }
+            [parent, folder, config, record]
+        }
+
+        /// #4488 — Setup's seal through its one handle, against the two
+        /// `icacls` runs it replaced, on twin parents made alike for each shape
+        /// [`SEAL_SHAPES`] was measured on: one twin sealed by `icacls`, the
+        /// other by [`seal_machine_parent`]. The parent ends Administrators',
+        /// protected, with the DACL [`parent_seal`] planned from what it held,
+        /// and it, the folder in it, the file in that and the file beside it
+        /// read the same on both twins, owner and DACL. A parent with a
+        /// conditional entry is refused, and all four are left as they were.
+        #[test]
+        fn the_parents_seal_leaves_what_the_two_icacls_runs_left() {
+            if !elevated_or_skip("the parent's seal against icacls") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            for (name, made) in SEAL_MADE {
+                let by_icacls = seal_twin(&root.path().join(format!("{name}-icacls")), made);
+                let by_handle = seal_twin(&root.path().join(format!("{name}-handle")), made);
+                let found = read(&by_handle[0], win::Kind::Dir);
+                let before: Vec<String> = by_handle.iter().map(|e| sddl(e)).collect();
+                let Ok(plan) = parent_seal(&found) else {
+                    let why = seal_machine_parent(&by_handle[0]).expect_err(name);
+                    assert!(why.contains("(type 9)"), "{name}: {why}");
+                    let after: Vec<String> = by_handle.iter().map(|e| sddl(e)).collect();
+                    assert_eq!(after, before, "{name}: left as it was");
+                    continue;
+                };
+                assert!(icacls(&by_icacls[0], &["/setowner", "*S-1-5-32-544"]));
+                assert!(icacls(
+                    &by_icacls[0],
+                    &[
+                        "/inheritance:r",
+                        "/grant:r",
+                        "*S-1-5-18:(OI)(CI)F",
+                        "/grant:r",
+                        "*S-1-5-32-544:(OI)(CI)F"
+                    ]
+                ));
+                assert_eq!(seal_machine_parent(&by_handle[0]), Ok(()), "{name}");
+                let sealed = read(&by_handle[0], win::Kind::Dir);
+                assert_eq!(sealed.owner, ADMINISTRATORS, "{name}");
+                assert!(sealed.protected, "{name}");
+                assert_eq!(
+                    sealed.dacl,
+                    Some(plan),
+                    "{name}: the plan is what is written"
+                );
+                for (icacls_left, handle_left) in by_icacls.iter().zip(&by_handle) {
+                    assert_eq!(
+                        sddl(handle_left),
+                        sddl(icacls_left),
+                        "{name}: {} as icacls left it",
+                        handle_left.display()
+                    );
+                }
+            }
         }
 
         /// Put this process where the daemon is: SeBackup, SeRestore and

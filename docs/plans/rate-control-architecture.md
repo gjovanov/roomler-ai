@@ -87,7 +87,7 @@ targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `enc
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
 (six places: `config_surface.rs` KEYS near :1547 / get :2177 / set :2769; `config.rs` field :1298,
 default :1996, `env_bridge_bools` :2122 array 72→73; `enrollment.rs:280`; parity test :1935).
-Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:10175–10370`) with
+Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:10165–10360`) with
 `rate_mode`; read `idr_count` against `keyframe_requests` (`session_telemetry.rs:30`). A startup
 `probe_and_cache_rate_reconfig` (like `VP9_QSV_IDR_VERDICT`, encoder.rs:73): open 640×480, change
 rate once, count key flags — per host, per codec, OnceLock; a driver table is not evidence.
@@ -104,7 +104,7 @@ Windows by injecting `PATCHES` into the copied portfile's `vcpkg_from_github(` (
 technique :84–146). Drift gate: each builder writes `ROOMLER-PATCHES.txt` (sha256 per patch) into
 the asset and `release-agent.yml`'s three fetch steps (:415–436, :1567–1569, :2821–2829) assert it
 matches `.github/ffmpeg-patches/*`. `const NVENC_RECONFIG_FORCES_IDR: bool` flips to false in the
-asset-bump PR; the pump's `held_increase` arm (`peer.rs:9524–9527`) keys on it.
+asset-bump PR; the pump's `held_increase` arm (`peer.rs:9521–9524`) keys on it.
 
 **A3 — VideoToolbox / AMF.** From A0 on a Mac: patch 0002 + `InPlace`, or keep `Rebuild` on a
 simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same rule.
@@ -114,11 +114,11 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 | PR | delete | anchors | precondition |
 |---|---|---|---|
 | A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:5148, 5091–5098, 6480–6527, 6538–6574, 6644–6649`; `encode/mod.rs:428–485` | A0 pass on QSV, switch ON one release |
-| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7309–7327, 7706–7799`; `encoder.rs:2560–2770`; `aimd.rs:495–544`; `encode/mod.rs:514–525` | VT measured or kept on the settle rule |
+| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7309–7327, 7700–7793`; `encoder.rs:2560–2770`; `aimd.rs:495–544`; `encode/mod.rs:514–525` | VT measured or kept on the settle rule |
 | A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence): **done in #4061** (2026-11-19), the mirror-only hook deleted | `governor.rs:1386–1390`; `peer.rs:4826` | — (#3472 measured the divergence as a defect) |
 
 Stays: dims/chroma/backend rebuilds (now the inline open that `encode::plan::frame_step` decides,
-`agents/roomlerd/src/peer.rs:8884–8895`, opened at `:8975`), FlipTracker rebuild (`:7773–7818`), error ladder,
+`agents/roomlerd/src/peer.rs:8878–8889`, opened at `:8969`), FlipTracker rebuild (`:7767–7812`), error ladder,
 `kf_gate` (kf_policy.rs), `send_epoch` for those rebuilds.
 
 **Acceptance:** encoder tracks the target within one frame of an apply (bytes-per-frame ratio ≈ 1.0
@@ -141,7 +141,7 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:2498–2611`, parser `peer.rs:11194–11267`): `frames_lost`
+`decodeStatWireMessage` `useRemoteControl.ts:2498–2611`, parser `peer.rs:11197–11270`): `frames_lost`
 (chunk gaps, already in `rc-dc-worker.ts:459`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:106–145` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of
@@ -197,7 +197,7 @@ observe-only), fed at the live positions (`pre_encode_tick` entry :1090 → `obs
 floor/ceiling resolve :1359 → `set_domain`; `on_backpressure_skip` :1036, `on_send_overflow` :1383,
 `note_send_stall` :1412 → events; `tick_viewer_window` after the unpacks :1507/:1518/:1525 →
 `fold_window`); `pre_encode_tick` grows `bytes_inflight, queue_budget` at both pumps
-(`peer.rs:9495`, `:5044`). Heartbeat adds `shadow_target_bps, shadow_state, shadow_measured_bps,
+(`peer.rs:9492`, `:5044`). Heartbeat adds `shadow_target_bps, shadow_state, shadow_measured_bps,
 shadow_disagree_pct, shadow_pauses, shadow_reason`. `scripts/rc-shadow-report.py` reads a week of
 `agent_logs` by session and reports per `PathClass`: disagreement p50/p90 and its sign in
 elevated-age vs clean windows. **Flip criterion:** ≥ 20 constrained + 20 direct sessions, shadow
@@ -270,8 +270,8 @@ a routing hole; and the same missing notion of "own adapters" makes `non_overlay
 - Exempt own LUIDs in `evict_competing_v4/v6` (`crates/tunnel-core/src/overlay/tun.rs:3318`,
   `:3534`), `evict_foreign_in_block_v4` (`:3412`), `foreign_in_block_fp` (`:3476`); exclude own
   if_names in `non_overlay_v4_addrs`; `evict_warn` gains `competitor_alias`. (Shipped: the three
-  eviction helpers ask `route_belongs_to_us` (`:5382`) where they compared `!= ours`,
-  `foreign_in_block_fp` asks `adapter_is_ours` (FR-68 C2(a)), `non_overlay_v4_addrs` (`:6218`) counts
+  eviction helpers ask `route_belongs_to_us` (`:5386`) where they compared `!= ours`,
+  `foreign_in_block_fp` asks `adapter_is_ours` (FR-68 C2(a)), `non_overlay_v4_addrs` (`:6222`) counts
   every roomler adapter as its own, and the eviction warn carries `competitor_alias` (`:3238`).)
 - Nobody asserts the whole /96: defend `derive_overlay_v6(connected_v4.net)` masked to
   `v6_onlink_plen` (byte-identical for legacy single-org; longest-prefix still beats AnyConnect's

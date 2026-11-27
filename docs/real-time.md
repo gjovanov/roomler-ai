@@ -57,7 +57,7 @@ The shared rules live in `crates/remote_control/src/upgrade_auth.rs`.
 
 From 0.4.210 every native dial puts its credential in an `Authorization: Bearer`
 header whose value is marked sensitive: the daemon's control socket
-(`agents/roomlerd/src/signaling.rs:1868`), its central and regional DERP sockets
+(`agents/roomlerd/src/signaling.rs:1874`), its central and regional DERP sockets
 (`agents/roomlerd/src/derp.rs:424`) and the CLI's tunnel-client socket. The URL
 names the role and the tenant only. The rule is one function in each client
 (`agents/roomlerd/src/ws_connect.rs:224`, `agents/roomler-cli/src/forward.rs:442`):
@@ -84,8 +84,8 @@ tungstenite writes a client's whole upgrade request at TRACE, the `Authorization
 line included, and marking the value sensitive does not reach that line. The
 daemon's and the CLI's subscribers drop those lines whatever `RUST_LOG` asks
 (`upgrade_auth::may_log`, `crates/remote_control/src/upgrade_auth.rs:243`), with a
-global `filter_fn` beside the `EnvFilter` (`crates/agent-core/src/logging.rs:403`,
-`agents/roomler-cli/src/cli.rs:829`). Not a directive, on purpose: a fixed
+global `filter_fn` beside the `EnvFilter` (`crates/agent-core/src/logging.rs:464`,
+`agents/roomler-cli/src/cli.rs:834`). Not a directive, on purpose: a fixed
 `tungstenite=debug` would raise those crates above the default `warn`, and any
 target directive loses to a span-scoped one such as `[org]=trace`, which
 `EnvFilter` lets win.
@@ -918,7 +918,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
-| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1297`), `RETIRED_RC_TAG_FAMILIES` (`:1326`), `RETIRED_USER_WS_NAMESPACES` (`:1331`) and `RETIRED_MODULE_IDS` (`:1335`), locked by `retired_rpc_verbs_are_never_reused` (`:8601`), `retired_wire_families_and_module_ids_are_never_reused` (`:8670`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `crates/remote_control/src/signaling.rs:5321`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1305`), `RETIRED_RC_TAG_FAMILIES` (`:1334`), `RETIRED_USER_WS_NAMESPACES` (`:1339`) and `RETIRED_MODULE_IDS` (`:1343`), locked by `retired_rpc_verbs_are_never_reused` (`:8658`), `retired_wire_families_and_module_ids_are_never_reused` (`:8727`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `crates/remote_control/src/signaling.rs:5321`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 
@@ -1027,9 +1027,9 @@ UDP-blocked:
 - A `401` on upgrade (after [the one query-form redial](#how-the-daemon-and-the-cli-dial-3656)
   where that applies) is not fatal. It closes the sessions the agent kept, and
   FR-103 looks for a newer token in the config file, else renews this one, and
-  retries once (`agents/roomlerd/src/signaling.rs:1337`). Otherwise the agent
+  retries once (`agents/roomlerd/src/signaling.rs:1343`). Otherwise the agent
   waits 30 s, 60 s, 5 min, then an hour between tries
-  (`agents/roomlerd/src/signaling.rs:1651`), and the third refusal in a row raises
+  (`agents/roomlerd/src/signaling.rs:1657`), and the third refusal in a row raises
   the re-enrollment prompt on the primary org.
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially
@@ -1040,14 +1040,14 @@ UDP-blocked:
 ### How an agent socket ended (#3517)
 
 Every end of a registered agent socket leaves one line on the pod that held it, at the
-end of its teardown (`crates/modules/fleet/src/socket.rs:1083-1095`), and its `cause`
+end of its teardown (`crates/modules/fleet/src/socket.rs:1102-1114`), and its `cause`
 says how the socket ended:
 
 ```
 INFO roomler_ai_mod_fleet::socket: remote-control agent WS disconnected agent_id=… cause=error kind=eof error="…"
 ```
 
-Each exit of the read loop (`socket.rs:534`) breaks with a `SocketEnd`
+Each exit of the read loop (`socket.rs:553`) breaks with a `SocketEnd`
 (`crates/modules/fleet/src/socket_end.rs:25`), so an exit added later does not compile
 until it names its cause. `cause` is always on the line. Every other field appears only
 with the cause it belongs to, so the line never carries a field that means nothing for
@@ -1070,24 +1070,25 @@ flowchart LR
 | `cause` | its fields | what ended the socket |
 |---|---|---|
 | `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
-| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2330`) |
+| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2336`) |
 | `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
-| `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:556`). The check runs on a tick, so `elapsed_s` reads past the deadline |
+| `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:575`). The check runs on a tick, so `elapsed_s` reads past the deadline |
 | `cancelled` | `by` | the Hub cancelled the loop; `by` below |
 | `sleep` | — | the device said it is going to sleep (FR-55 P4). Its daemon sends a close frame next, which the loop never reads |
 | `stream_end` | — | the stream ended with neither a frame nor an error. tokio-tungstenite ends it that way only after a close or an error, and the loop leaves on both first, so this is not expected |
 
 `by`, for `cause=cancelled`. Each trigger records itself just before its notify
-(`AgentCancel`, `crates/modules/fleet/src/hub.rs:217`), with the notify call itself
+(`AgentCancel`, `crates/modules/fleet/src/hub.rs:222`), with the notify call itself
 unchanged. The cancel arm's own line, `agent connection cancelled by Hub; exiting
 read-loop`, carries the same `by`.
 
 | `by` | the trigger |
 |---|---|
-| `replaced` | a newer connection for the same agent registered (`Hub::register_agent`, `hub.rs:1103`): a reconnect that beat the old socket's teardown, or two daemons on one identity |
-| `idle_nudge` | the idle nudge cycled an idle agent, so its reconnect re-hashes through the LB (`Hub::nudge_agent_if_idle`, `hub.rs:1332`) |
-| `renumber` | an overlay renumber (`Hub::cycle_agent_ws`, `hub.rs:1360`) |
-| `shutdown` | this pod's graceful shutdown (`Hub::cancel_all_agents`, `hub.rs:1375`) |
+| `replaced` | a newer connection for the same agent registered (`Hub::register_agent`, `hub.rs:1132`): a reconnect that beat the old socket's teardown, or two daemons on one identity |
+| `idle_nudge` | the idle nudge cycled an idle agent, so its reconnect re-hashes through the LB (`Hub::nudge_agent_if_idle`, `hub.rs:1361`) |
+| `renumber` | an overlay renumber (`Hub::cycle_agent_ws`, `hub.rs:1389`) |
+| `shutdown` | this pod's graceful shutdown (`Hub::cancel_all_agents`, `hub.rs:1404`) |
+| `rotated` | the device's token rotated (FR-155), and this connection was admitted below the new generation (`Hub::end_below_generation`, `crates/modules/fleet/src/hub/rotation.rs:163`): on the pod the rotation reached, or on another through the control channel's `end_below_generation` (`ctrl.rs:284`). Nothing is sent to the device first |
 | `unknown` | a cancel with no trigger recorded. Nothing fires one today |
 
 `kind`, for `cause=error` (`error_kind`, `socket_end.rs:138`):
@@ -1113,7 +1114,7 @@ pins. If axum moves to another one, every error reads `other`, and the loopback 
 `socket::tests::a_dropped_tcp_leg_reads_eof` fails first.
 
 **Before the hello.** A socket that ends before its `rc:agent.hello` registered nothing,
-so it gets no disconnect line. The hello wait (`read_next_rc`, `socket.rs:1295`) says
+so it gets no disconnect line. The hello wait (`read_next_rc`, `socket.rs:1314`) says
 how it ended on its own warn line, `agent opened WS without rc:agent.hello — closing`,
 with the same `cause`, `code`, `reason`, `kind` and `error`. Before #3517 that line read
 `other=None` for every end.

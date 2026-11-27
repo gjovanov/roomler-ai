@@ -281,7 +281,7 @@ pub(crate) fn now_unix() -> u64 {
 
 /// Read the file and accept it only under `key`, fresh enough.
 pub(crate) fn load_matching(path: &Path, key: &CacheKey, now_unix: u64) -> Result<CacheFile, Miss> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match read_cache(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Miss::NoFile),
         Err(e) => return Err(Miss::Unreadable(e.to_string())),
@@ -311,9 +311,35 @@ pub(crate) fn load_matching(path: &Path, key: &CacheKey, now_unix: u64) -> Resul
     Ok(file)
 }
 
+/// The cache's text. FR-145 P2: in a process that holds its `service-logs`,
+/// read below the held folder, never through a link nor from a file of more
+/// than one name; by path elsewhere.
+fn read_cache(path: &Path) -> std::io::Result<String> {
+    #[cfg(windows)]
+    if let Some((held, name)) = crate::logging::held_logs::held_file(path) {
+        let bytes = held
+            .read_file(name, MAX_HELD_READ)?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        return String::from_utf8(bytes).map_err(std::io::Error::other);
+    }
+    std::fs::read_to_string(path)
+}
+
+/// The most of the cache a read below the held folder takes: far above any
+/// real one.
+#[cfg(windows)]
+const MAX_HELD_READ: u64 = 4 * 1024 * 1024;
+
 /// Atomic: write a sibling temp file, then rename over the target, so a crash
 /// mid-write leaves the previous cache (or none) rather than half a file.
+/// FR-145 P2: in a process that holds its `service-logs`, the same by handle:
+/// a fresh file below the held folder, renamed onto the name.
 pub(crate) fn store(path: &Path, file: &CacheFile) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if let Some((held, name)) = crate::logging::held_logs::held_file(path) {
+        let json = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
+        return held.write_file(name, &json);
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -595,5 +621,43 @@ mod tests {
         }
         unsafe { tunnel_core::env::test_env::set("CAPS_CACHE", "1") };
         assert!(enabled());
+    }
+
+    /// FR-145 P2 (AC3) — a process that holds its `service-logs` writes the
+    /// cache and reads it below that folder by handle. With the folder swapped
+    /// for a junction, the store lands in a sealed `service-logs` made again
+    /// and nothing where the junction leads; a cache where a junction leads is
+    /// never read. At its seam the cache goes by path. In a child, elevated.
+    #[cfg(windows)]
+    #[test]
+    fn the_cache_goes_by_handle_below_the_held_folder() {
+        use roomler_node_core::logging::held_logs::test_fixture::{
+            CHECKED, Case, child, parent, swap_for_junction,
+        };
+        let Some(Case { dir, elsewhere, .. }) = child(true) else {
+            let root = tempfile::tempdir().unwrap();
+            let case = "the_cache_goes_by_handle_below_the_held_folder";
+            return parent(module_path!(), case, root.path());
+        };
+        let empty = |d: &Path| std::fs::read_dir(d).unwrap().next().is_none();
+        let at = path().expect("the held folder");
+        assert_eq!(at, dir.join(FILE_NAME));
+        let file = CacheFile::new(key(), 1_000, 3986, hw_caps(), None);
+        swap_for_junction(&dir, &elsewhere);
+        store(&at, &file).unwrap();
+        assert!(empty(&elsewhere), "stored where the junction leads");
+        assert!(load_matching(&at, &key(), 1_060).is_ok(), "read back");
+
+        swap_for_junction(&dir, &elsewhere);
+        std::fs::write(
+            elsewhere.join(FILE_NAME),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(load_matching(&at, &key(), 1_060), Err(Miss::NoFile)),
+            "read where the junction leads"
+        );
+        println!("{CHECKED}");
     }
 }

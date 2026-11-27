@@ -237,7 +237,7 @@ shows on the admin row and in `roomler status`, where the probe's reason does.
 | The failed setup is reverted first, off the select loop, and its retry starts only once the revert has finished | `runtime.rs:2970` (the retry arm), `pending_revert` | WinNAT skips an identical prefix and pf reuses the anchor's name: a retry over a half-reverted setup would stack rules that one revert cannot undo |
 | A retry waits 30 s · 2ⁿ, at most 30 min, minus up to 20 % jitter, and runs only while the offer is withdrawn | `nat_retry_delay` `nat.rs:369` | A host that keeps failing costs one setup per half hour, and a fleet does not retry in step |
 | A re-join goes out only when the routes, the failing step or the IPv6 statement change; a new reason text alone never sends one | `OfferTracker::on_setup` `nat.rs:450` | A command's stderr can differ from run to run, and every join rehydrates the node's row |
-| Every re-join is followed by what the server's rehydrate wipes: srflx (the keepalive task's own advert, else the startup snapshot), the relayed endpoint union, and a fresh netcheck | `rejoin_plan` `runtime.rs:4682`, shared with the control-WS Reattach (which sends no netcheck) | A join is an update on the server, and its rehydrate clears srflx, the NAT type, the dialer bit, the relayed endpoints and the measured capability vector |
+| Every re-join is followed by what the server's rehydrate wipes: srflx (the keepalive task's own advert, else the startup snapshot), the relayed endpoint union, and a fresh netcheck | `rejoin_plan` `runtime.rs:4684`, shared with the control-WS Reattach (which sends no netcheck) | A join is an update on the server, and its rehydrate clears srflx, the NAT type, the dialer bit, the relayed endpoints and the measured capability vector |
 | `ROOMLERD_ROUTE_OFFER_UNPROBED=1` keeps the offer whatever the setup did: no withdrawal, no retry, the partial setup kept | `OfferTracker::new` | The probe's own kill switch now covers the setup too |
 
 ### The exit states whether it serves IPv6
@@ -252,7 +252,7 @@ shows on the admin row and in `roomler status`, where the probe's reason does.
 | Any node with `ROOMLERD_EXIT_V6_STATEMENT=0` | absent | |
 
 The field rides `rc:overlay.join` (`crates/remote_control/src/signaling.rs:1716`),
-is stored on the node's row as sent (`crates/remote_control/src/models.rs:7368`;
+is stored on the node's row as sent (`crates/remote_control/src/models.rs:7425`;
 the rehydrate `$unset`s it for a join that states nothing,
 `crates/services/src/dao/overlay_node.rs:362`), and reaches every client in its
 netmap peer (`signaling.rs:4088`, `to_netmap_peer`
@@ -343,7 +343,7 @@ shows in `roomler status` (`… DNS steered` / `DNS NOT steered`).
 `process::exit` bypasses Rust's `Drop`, so the paths that hard-exit (watchdog
 stall, a fatal goodbye, a duplicate-instance loser, `roomlerd self-update` run
 by hand) never run RAII teardown. An auto-update is not one of them: it shuts
-the daemon down gracefully (`agents/roomlerd/src/updater.rs:3471`). Three sync,
+the daemon down gracefully (`agents/roomlerd/src/updater.rs:3483`). Three sync,
 context-free purges — `overlay::tun::purge_split_default()`,
 `overlay::tun::purge_stale_peer_routes()` and `overlay::dns::purge_exit_dns()`
 — are folded, with the host ledger's ([below](#exit-client-pins-fr-97-p0e)),
@@ -366,15 +366,15 @@ TUN, and the end of a generation that logs it tells the two cases apart:
 
 | Line | Logged by | Means |
 |---|---|---|
-| `overlay: boot reconcile — dropped stale routes left by a previous generation …` | a start (`agents/roomlerd/src/lib.rs:441`) | the process before it never purged them: it crashed, was killed or lost power, or its purge failed |
-| `overlay: exit purge — dropped the overlay's routes from its TUN …` | an exit (`agents/roomlerd/src/lib.rs:398`) | routine: an exit drops the routes it leaves, so none black-holes while no daemon runs |
+| `overlay: boot reconcile — dropped stale routes left by a previous generation …` | a start (`agents/roomlerd/src/lib.rs:449`) | the process before it never purged them: it crashed, was killed or lost power, or its purge failed |
+| `overlay: exit purge — dropped the overlay's routes from its TUN …` | an exit (`agents/roomlerd/src/lib.rs:406`) | routine: an exit drops the routes it leaves, so none black-holes while no daemon runs |
 
 Older agents log the boot line at both ends, so on them an update's own exit
 reads like a stale-route find.
 
 On Linux it finds prefix routes only. It lists `ip route show dev <tun>` and
 keeps the first fields that carry a length
-(`crates/tunnel-core/src/overlay/tun.rs:7867`), and iproute2 prints a host route
+(`crates/tunnel-core/src/overlay/tun.rs:7871`), and iproute2 prints a host route
 without its `/32`. The per-peer routes need no purge there, because the TUN is
 not persistent (`persist off`): the kernel removes it, and every route on it,
 when its last descriptor closes. So a Linux exit logs the exit line only when
@@ -407,7 +407,7 @@ purge finishes on a thread of its own.
 The last two rows say any Normal-priority child waits this way, so the bound
 alone does not get such a start to its probe. The next children on that path
 were the four `icacls` steps of the config save every start makes for its crash
-bookkeeping (`agents/roomlerd/src/app.rs:4485`). A save now reads the
+bookkeeping (`agents/roomlerd/src/app.rs:4439`). A save now reads the
 directory's owner and DACL in-process and runs the steps only when they would
 change something
 ([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
@@ -446,13 +446,13 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:408`, `:424`, called at `agents/roomlerd/src/app.rs:4393` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
+| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:416`, `:432`, called at `agents/roomlerd/src/app.rs:4347` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
 | Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:889` (`purge_exit_dns_within`), `:1272` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
 | Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:625` (`run_cmd`), `:1314` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
 | A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:1256` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
 | With no thread to run it on, the purge runs inline and unbounded, as before | `crates/tunnel-core/src/overlay/dns.rs:1296` | The purge is load-bearing and the bound is not |
 | The purge's child has null stdio | `crates/tunnel-core/src/overlay/dns.rs:835` | A child that outlives its waiter must not hold pipes to it |
-| The route purges stay synchronous | `agents/roomlerd/src/lib.rs:424` | They are typed IP Helper calls, with no child to wait for |
+| The route purges stay synchronous | `agents/roomlerd/src/lib.rs:432` | They are typed IP Helper calls, with no child to wait for |
 
 What the bound leaves as it was:
 
@@ -513,14 +513,14 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The two watchdog exits wait for the DNS purge for `EXIT_DNS_PURGE_WAIT`, 5 s | `agents/roomlerd/src/lib.rs:460`, `:494`, called at `agents/roomlerd/src/watchdog.rs:749`, `:842` | Unloaded, the purge ends in under 2 s, so an unloaded exit still finishes it |
+| The two watchdog exits wait for the DNS purge for `EXIT_DNS_PURGE_WAIT`, 5 s | `agents/roomlerd/src/lib.rs:468`, `:502`, called at `agents/roomlerd/src/watchdog.rs:749`, `:842` | Unloaded, the purge ends in under 2 s, so an unloaded exit still finishes it |
 | A purge still running at the bound is recorded and left running, never killed | `crates/tunnel-core/src/overlay/dns.rs:923` (`purge_exit_dns_before_exit`), `:1074` (`hand_over`) | If nothing comes back on the host, it still removes the rule |
 | If the record cannot be written, the exit waits with no bound, as before | `crates/tunnel-core/src/overlay/dns.rs:923` | The bound is only safe with the handoff |
 | The record lives below `HKLM\SOFTWARE`, beside the host ledger, never in a file | `crates/tunnel-core/src/overlay/dns.rs:994`, `crates/tunnel-core/src/overlay/host_ledger.rs:405` | Any account may create a file under `%ProgramData%`, and a planted record would hold the SYSTEM daemon's DNS changes for a process of the planter's |
-| A start counts every live entry in flight before its own purge | `crates/tunnel-core/src/overlay/dns.rs:954` (`adopt_handed_over_purges`), called at `agents/roomlerd/src/lib.rs:427` | None of its DNS changes can come before the old purge ends, so the old purge cannot delete a steer the start makes |
+| A start counts every live entry in flight before its own purge | `crates/tunnel-core/src/overlay/dns.rs:954` (`adopt_handed_over_purges`), called at `agents/roomlerd/src/lib.rs:435` | None of its DNS changes can come before the old purge ends, so the old purge cannot delete a steer the start makes |
 | An entry is live only if its pid runs and was created when the entry says | `crates/tunnel-core/src/overlay/dns.rs:1043` (`open_running`) | A pid is reused; an ended process stays openable while a handle to it is held |
 | The live entries stay in the record, the newest 16 | `crates/tunnel-core/src/overlay/dns.rs:954`, `:996` | A second stall before the first purge ends hands both over |
-| `ROOMLERD_EXIT_PURGE_WAIT_S=0` waits with no bound | `agents/roomlerd/src/lib.rs:465` | The kill switch |
+| `ROOMLERD_EXIT_PURGE_WAIT_S=0` waits with no bound | `agents/roomlerd/src/lib.rs:473` | The kill switch |
 
 What it leaves as it was:
 
@@ -703,10 +703,10 @@ sequenceDiagram
 
 | Step | Where | What it guards against |
 |---|---|---|
-| Capture the uplink per family, re-read before every pin | `tun.rs:6127`, `current_uplink` `tun.rs:8630`, `bsd_default_uplink` `tun.rs:359` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
-| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:405`, `bsd_pin_row` `tun.rs:441`, `bsd_pin_holds` `tun.rs:454`, `bsd_table` `tun.rs:8115` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
-| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:7125` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
-| Re-check the pins | `stale_host_exemptions` `tun.rs:7213`, the gate `route_guard.rs:784` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
+| Capture the uplink per family, re-read before every pin | `tun.rs:6131`, `current_uplink` `tun.rs:8634`, `bsd_default_uplink` `tun.rs:359` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
+| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:405`, `bsd_pin_row` `tun.rs:441`, `bsd_pin_holds` `tun.rs:454`, `bsd_table` `tun.rs:8119` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
+| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:7129` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
+| Re-check the pins | `stale_host_exemptions` `tun.rs:7217`, the gate `route_guard.rs:784` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
 | A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:784` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
 | One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:576`, `exemption_withheld_reason` `route_guard.rs:588` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
 

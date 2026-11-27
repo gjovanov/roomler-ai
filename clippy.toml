@@ -64,4 +64,32 @@ await-holding-invalid-types = [
 # are not covered.
 disallowed-methods = [
     { path = "roomler_ai_services::dao::base::BaseDao::find_any_by_id_in_tenant", reason = "the tombstone-inclusive lookup: call it only from a named DAO reader that says why it must see a removed row, under #[expect] (root clippy.toml, #3327)" },
+
+    # A console line is coloured only on a terminal (#3938, docs/installation.md).
+    #
+    # tracing-subscriber's fmt layer never asks what its writer is. Left to
+    # itself it colours every line unless `NO_COLOR` holds a value, so a pipe, a
+    # file, the journal and every script's capture of a Roomler binary stored
+    # the escape codes. A console layer takes
+    # `with_ansi(colour(<its stream>.is_terminal(), NO_COLOR))` from one of the
+    # rule's four homes: the server (`crates/api/src/logging.rs`), the daemon,
+    # the companion and the Setup wizard (`roomler_node_core::logging::colour`),
+    # and a copy each in the DERP relay and the CLI. Every place that starts a
+    # fmt layer or subscriber carries
+    # `#[expect(clippy::disallowed_methods, reason = "...")]` saying which it
+    # is: a console under the rule, a file or a buffer (never coloured), or a
+    # test's capture. A new console that skips the rule fails clippy instead of
+    # shipping escape codes into a pipe.
+    #
+    # ⚠️ This catches a call of these constructors, not every way to start one:
+    # the `Default` impls of `fmt::Layer`, `fmt::Subscriber` and
+    # `fmt::SubscriberBuilder` are not covered. A path can name only the
+    # trait's `default`, which would forbid every type's.
+    { path = "tracing_subscriber::fmt::fmt", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
+    { path = "tracing_subscriber::fmt::layer", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
+    { path = "tracing_subscriber::fmt::Layer::new", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
+    { path = "tracing_subscriber::fmt::Subscriber::builder", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
+    { path = "tracing_subscriber::fmt::Subscriber::new", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
+    { path = "tracing_subscriber::fmt::init", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
+    { path = "tracing_subscriber::fmt::try_init", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
 ]

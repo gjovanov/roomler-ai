@@ -280,7 +280,7 @@ flowchart LR
 | Bake + default | `Dockerfile:155` (`COPY`), `Dockerfile:161` (`ENV`) | The image names its own database; the deployment sets nothing |
 | Load | `crates/core/src/user_analytics.rs:100` | Logs `geoip database loaded` with the database's type and build date, or warns once and degrades. An **empty** value is an explicit off, with no warning |
 | Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:264` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
-| Payload | `crates/api/src/routes/stats.rs:1298` | `geoip_database`: the loaded database's own `database_type`, or `null` |
+| Payload | `crates/api/src/routes/stats.rs:1364` | `geoip_database`: the loaded database's own `database_type`, or `null` |
 | Credit | `ui/src/utils/geoipCredit.ts:35`, `ObservabilityView.vue:369` | "IP Geolocation by DB-IP" linking <https://db-ip.com> under the Countries table, shown only when the server reports a DB-IP database |
 
 **The licence.** DB-IP licenses the Lite database under
@@ -349,6 +349,7 @@ nesting), loaded via the `config` crate. The ones that matter first:
 | `ROOMLER__MEDIASOUP__ANNOUNCED_IP_MAP` | `<node_ip>=<public_ip>,…` — per-pod announced IP resolution for multi-node clusters |
 | `ROOMLER__STRIPE__*` / `ROOMLER__CLAUDE__*` / `ROOMLER__S3__*` / SMTP / OAuth | Integrations |
 | `ROOMLER__STATS__GEOIP_MMDB` | The country database for the user analytics. **The image already sets it** to the DB-IP database it carries; set it only to use your own `.mmdb`, or to empty to turn lookups off. See [the country database](#the-country-database-the-image-carries-1896) |
+| `ROOMLER__RC__GUI_WORKER_READ` | Whether the server reads a Mac's screen-worker word ([FR-157](fr/FR-157-screen-worker-on-the-row.md), `capabilities.gui_worker`): the `gui_workers` counts in the org and platform overviews, the device list's `?gui_worker=` filter and the word in the device list's rows ([api.md](api.md)). `false`, the default: the overviews carry no `gui_workers`, the rows leave the word out and the filter is answered 400 with this switch's name, so nothing a response says changes. The word is stored either way ([`settings.rs:1128`](../crates/config/src/settings.rs#L1128)). It stays off until FR-157's field cells read green |
 | `ROOMLER__RC__SESSION_RESUME_SECS` | How long a live remote session may outlive its device's control socket, in seconds: 0 (the default) is off, and at most 120 s is announced. Only devices in the resume scope are told it. See [a roll and a live remote session](#a-roll-and-a-live-remote-session-fr-138) |
 
 Rate limiting (per-IP governor + per-account brute-force gate) and JWT TTLs are
@@ -536,6 +537,9 @@ The multi-pod design is settled and documented in
     The regional PoPs leave it unset and serve every network. Set but empty or
     malformed, the relay refuses to start
     ([`scripts/relay-pop/README.md`](../scripts/relay-pop/README.md)).
+  - Its log lines are coloured only when stdout is a terminal (#3938), so what a
+    PoP's container or a unit's journal stores is plain text
+    ([installation.md](installation.md#console-lines-colour-only-on-a-terminal-3938)).
 
 ## Cluster hosts: the media DNAT and the host's own mesh node
 

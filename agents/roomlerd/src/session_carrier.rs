@@ -23,8 +23,23 @@
 //! | … and the overlay says something else — tunnel, blocked, offline, a relay kind this build does not know, the peer unknown, LocalAPI not answering | `unknown` — **never direct**: `Carrier::is_direct()` reads any new tier as direct, which is the trap this table exists to avoid |
 //! | a `relay` candidate at a loopback or overlay address — the device's own fast TURN (`rc_local_turn`), not the far coturn | `turn_local` |
 //! | a `relay` candidate anywhere else — coturn | `turn` |
-//! | host · srflx · prflx on both sides | `direct` |
+//! | a `prflx` remote that is the far end's relay ([`RemoteRelay::Signalled`], #3259) | `turn_local` or `turn`, by the two rows above |
+//! | host · srflx · prflx on both sides, no prflx shown to be a relay | `direct` |
 //! | a candidate type webrtc-rs could not name | `unknown` |
+//!
+//! A prflx remote is learnt from a check that came from an address no
+//! candidate the far end signalled had named yet. When that address is the
+//! far end's TURN relay, its candidate can arrive after the check, and the
+//! ICE agent keeps the prflx selected beside it. Such a remote counts as the
+//! relay only when the agent holds a relay candidate the far end signalled
+//! at its exact address, port and transport ([`remote_relay_of`]). A prflx nothing
+//! shows to be a relay stays `direct`, since a direct session behind a
+//! symmetric NAT learns its peer as prflx too. So does one whose read of the
+//! held candidates did not finish (past its budget, or with no ICE agent):
+//! that read shows nothing. A read on a task of its own waits
+//! [`REMOTE_READ_BUDGET`] at most, and one on a pump's own path waits for
+//! nothing. The read decides from what the agent holds at the read, never
+//! from timing.
 //!
 //! ⚠️ Read **after a short settle**, not at the instant of `Connected`:
 //! Chrome nominates a relay pair first and renominates to the host pair a
@@ -45,6 +60,15 @@
 //! It is a log field only: no wire carries it and the server stores
 //! nothing of it.
 //!
+//! #3259 adds one more, `remote_relay` ([`RemoteRelay`]), last on the line:
+//! `signalled` when the nominated pair's remote is the far end's relay by a
+//! candidate the far end signalled (a `relay` remote, or a `prflx` remote at
+//! the exact address, port and transport of one), `unknown` when the agent
+//! cannot say (a `prflx` remote whose read did not finish, or a remote whose
+//! type webrtc-rs could not name), and `none` otherwise. A field read
+//! keys a relayed session on it with the carrier, whatever `remote_typ`
+//! says. It is a log field only, as `relay_transport` is.
+//!
 //! FR-148 P4 step 2, phase B of D49: under `rc_carrier_rank = route` a
 //! selection change after the opening writes one line, `session carrier
 //! moved` ([`follow_moves`]): the carrier before and after, in this
@@ -61,6 +85,7 @@ use std::time::Duration;
 
 use bson::oid::ObjectId;
 use tracing::{debug, info};
+use webrtc::ice::agent::agent_stats::CandidateStats;
 use webrtc::ice::url::{ProtoType, SchemeType};
 use webrtc::ice_transport::RTCIceTransport;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
@@ -82,11 +107,23 @@ pub const LOCALAPI_BUDGET: Duration = Duration::from_millis(400);
 /// its selection again after the opening, for the moved line. A log line's
 /// latency, not the media's.
 pub const MOVE_TICK: Duration = Duration::from_secs(1);
+/// #3259: how long a read of the selected pair on a task of its own waits
+/// for the remote candidates the ICE agent holds: [`observe`]'s reads and
+/// [`follow`]'s under `route`. A read on a pump's own path waits for nothing
+/// ([`Duration::ZERO`]): the deadline lane's `Lane::read`, at the pump's
+/// start and at each transport re-check, and the path memory's
+/// `model_open`, at the pump's open. The path memory is a shadow, and a
+/// shadow's read never puts a wait on the live path. The read takes
+/// microseconds, and neither lock it takes is held across I/O once the agent
+/// is made. A read that would wait past its budget reads
+/// [`RemoteRelay::Unknown`], and the pair's carrier stays `direct`.
+pub const REMOTE_READ_BUDGET: Duration = Duration::from_millis(250);
 
 /// What a session rides. The wire spelling is [`SessionCarrier::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionCarrier {
-    /// host · srflx · prflx, not over the overlay.
+    /// host · srflx · prflx, not over the overlay, and no prflx shown to be
+    /// the far end's relay.
     Direct,
     /// A coturn allocation.
     Turn,
@@ -159,13 +196,155 @@ impl From<webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType> for Ca
     }
 }
 
-/// The nominated pair, the four facts the rule reads.
+/// The nominated pair, the five facts the rule reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairView {
     pub local_kind: CandidateKind,
     pub remote_kind: CandidateKind,
     pub local_addr: String,
     pub remote_addr: String,
+    /// #3259: whether the remote is the far end's relay, by a candidate the
+    /// far end signalled ([`remote_relay_of`]).
+    pub remote_relay: RemoteRelay,
+}
+
+/// #3259 — whether the nominated pair's remote is the far end's relay, by a
+/// candidate the far end signalled. The carrier line names it last
+/// (`remote_relay`).
+///
+/// A remote whose type is `relay` is one by construction: the ICE agent
+/// gives a remote that type only from a candidate the far end signalled. A
+/// `prflx` remote is learnt from a check whose source no signalled candidate
+/// had named yet. When that source is the far end's TURN relay, its
+/// candidate can come after the check, and the ICE agent keeps the prflx
+/// selected beside it. Packets from a TURN allocation's relayed address and
+/// port come from that relay alone, so such a remote is the far end's relay
+/// exactly when the agent holds a relay candidate the far end signalled at
+/// the prflx's address and port, over the prflx's transport.
+///
+/// | The nominated pair's remote | Recorded |
+/// |---|---|
+/// | a `relay` candidate | `signalled` |
+/// | a `prflx` candidate at the exact address, port and transport of a `relay` candidate the far end signalled | `signalled` |
+/// | a `prflx` candidate whose read of the held candidates did not finish: past its budget ([`REMOTE_READ_BUDGET`] on a task of its own, none on a pump's path), or with no ICE agent | `unknown` |
+/// | a type webrtc-rs could not name | `unknown` |
+/// | anything else: host, srflx, a prflx no signalled relay is at (a direct session behind a symmetric NAT learns its peer this way) | `none` |
+///
+/// Only a `prflx` remote reads the held candidates; every other remote reads
+/// by its type alone. `none` says that no relay candidate the far end
+/// signalled is at the remote, so a read that did not finish says `unknown`,
+/// never `none`, as [`RelayTransport::Unknown`] does where the agent cannot
+/// say. Neither `none` nor `unknown` shows a relay, so the carrier stays
+/// what the candidate types give. Held facts, never timing: a relay
+/// candidate that arrives later changes the next read, not one before it.
+/// The spellings are a field read's vocabulary: never rename one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemoteRelay {
+    /// Nothing the agent holds shows the remote to be the far end's relay.
+    NotShown,
+    /// The remote is the far end's relay, by a candidate it signalled.
+    Signalled,
+    /// The agent cannot say: its read did not finish, or the remote's type
+    /// has no name.
+    Unknown,
+}
+
+impl RemoteRelay {
+    /// Every value, for a test that must cover each.
+    pub const ALL: [RemoteRelay; 3] = [
+        RemoteRelay::NotShown,
+        RemoteRelay::Signalled,
+        RemoteRelay::Unknown,
+    ];
+
+    /// The carrier line's spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteRelay::NotShown => "none",
+            RemoteRelay::Signalled => "signalled",
+            RemoteRelay::Unknown => "unknown",
+        }
+    }
+}
+
+/// The transport a candidate names, as the remote relay's rule compares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateTransport {
+    Udp,
+    Tcp,
+}
+
+impl CandidateTransport {
+    /// A candidate's protocol as webrtc-rs names it; `None` for neither.
+    fn of_protocol(protocol: webrtc::ice_transport::ice_protocol::RTCIceProtocol) -> Option<Self> {
+        use webrtc::ice_transport::ice_protocol::RTCIceProtocol as P;
+        match protocol {
+            P::Udp => Some(CandidateTransport::Udp),
+            P::Tcp => Some(CandidateTransport::Tcp),
+            P::Unspecified => None,
+        }
+    }
+
+    /// An ICE network type's transport; `None` for an unspecified one.
+    fn of_network(network: webrtc::ice::network_type::NetworkType) -> Option<Self> {
+        if network.is_udp() {
+            Some(CandidateTransport::Udp)
+        } else if network.is_tcp() {
+            Some(CandidateTransport::Tcp)
+        } else {
+            None
+        }
+    }
+}
+
+/// A relay candidate the far end signalled that the ICE agent holds: its
+/// relayed address, its port and its transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldRelay {
+    pub addr: String,
+    pub port: u16,
+    pub transport: CandidateTransport,
+}
+
+/// The remote relay's rule: the remote's type, address, port and transport
+/// (`None` when it names neither), and the relay candidates the far end
+/// signalled that the ICE agent holds, `None` when they could not be read
+/// (a read past its budget, or no ICE agent). Only a `prflx`
+/// remote looks at them. Addresses compare as IP addresses, an IPv4-mapped
+/// IPv6 address as its IPv4 one, and an address that is not one matches
+/// nothing; ports compare as numbers.
+pub fn remote_relay_of(
+    remote: CandidateKind,
+    addr: &str,
+    port: u16,
+    transport: Option<CandidateTransport>,
+    signalled_relays: Option<&[HeldRelay]>,
+) -> RemoteRelay {
+    let as_ip = |a: &str| {
+        a.parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| ip.to_canonical())
+    };
+    match remote {
+        CandidateKind::Relay => RemoteRelay::Signalled,
+        CandidateKind::Prflx => {
+            let Some(held) = signalled_relays else {
+                return RemoteRelay::Unknown;
+            };
+            match (as_ip(addr), transport) {
+                (Some(at), Some(transport))
+                    if held.iter().any(|r| {
+                        r.port == port && r.transport == transport && as_ip(&r.addr) == Some(at)
+                    }) =>
+                {
+                    RemoteRelay::Signalled
+                }
+                _ => RemoteRelay::NotShown,
+            }
+        }
+        CandidateKind::Host | CandidateKind::Srflx => RemoteRelay::NotShown,
+        CandidateKind::Unspecified => RemoteRelay::Unknown,
+    }
 }
 
 /// What the overlay runtime says about the peer behind an overlay address
@@ -215,11 +394,19 @@ pub fn carrier_on(
             Some(OverlayPath::Other(_)) | None => SessionCarrier::Unknown,
         };
     }
-    for (kind, addr) in [
-        (pair.local_kind, pair.local_addr.as_str()),
-        (pair.remote_kind, pair.remote_addr.as_str()),
+    // #3259: a prflx remote shown to be the far end's relay takes a relay
+    // remote's address rule.
+    let remote_is_relay = pair.remote_kind == CandidateKind::Relay
+        || (pair.remote_kind == CandidateKind::Prflx
+            && pair.remote_relay == RemoteRelay::Signalled);
+    for (relay, addr) in [
+        (
+            pair.local_kind == CandidateKind::Relay,
+            pair.local_addr.as_str(),
+        ),
+        (remote_is_relay, pair.remote_addr.as_str()),
     ] {
-        if kind == CandidateKind::Relay {
+        if relay {
             return if crate::encode::relay_addr_is_fast_local(addr) {
                 SessionCarrier::TurnLocal
             } else {
@@ -318,24 +505,27 @@ pub fn relay_transport_of(
 pub(crate) type Nominated = (PairView, RelayTransport, Option<bool>);
 
 /// The selected pair as read once: its two candidates, ports included, what
-/// carries the agent's relay for it, and, under `route` alone, whether the
-/// ICE agent reads it as riding the mesh (`None` under every other value).
+/// carries the agent's relay for it, under `route` alone whether the ICE
+/// agent reads it as riding the mesh (`None` under every other value), and
+/// whether its remote is the far end's relay (#3259).
 #[derive(Debug, Clone, PartialEq)]
 struct Selection {
     local: RTCIceCandidate,
     remote: RTCIceCandidate,
     relay: RelayTransport,
     rides: Option<bool>,
+    remote_relay: RemoteRelay,
 }
 
 impl Selection {
-    /// The four facts the carrier rule reads.
+    /// The five facts the carrier rule reads.
     fn view(&self) -> PairView {
         PairView {
             local_kind: self.local.typ.into(),
             remote_kind: self.remote.typ.into(),
             local_addr: self.local.address.clone(),
             remote_addr: self.remote.address.clone(),
+            remote_relay: self.remote_relay,
         }
     }
 
@@ -359,28 +549,89 @@ impl Selection {
     }
 }
 
-/// The selected pair, read once: `None` while nothing is selected.
-async fn selection(ice: &RTCIceTransport) -> Option<Selection> {
+/// The selected pair, read once: `None` while nothing is selected. A prflx
+/// remote's read of the held candidates waits `budget` at most: 250 ms or
+/// nothing, by where it runs ([`REMOTE_READ_BUDGET`]).
+async fn selection(ice: &RTCIceTransport, budget: Duration) -> Option<Selection> {
     let pair = ice.get_selected_candidate_pair().await?;
     let (local, remote) = (pair.local().clone(), pair.remote().clone());
     let relay = relay_transport_of(local.typ.into(), pair.local_relay_transport());
     let rides = ice.route_read(&pair).await.map(|read| read.rides_the_mesh);
+    // #3259: only a prflx remote reads the relays the far end signalled.
+    // Every other remote reads by its type alone, with no read at all.
+    let kind = CandidateKind::from(remote.typ);
+    let held = if kind == CandidateKind::Prflx {
+        signalled_relays(ice, budget).await
+    } else {
+        None
+    };
+    let remote_relay = remote_relay_of(
+        kind,
+        &remote.address,
+        remote.port,
+        CandidateTransport::of_protocol(remote.protocol),
+        held.as_deref(),
+    );
     Some(Selection {
         local,
         remote,
         relay,
         rides,
+        remote_relay,
     })
 }
 
-/// The selected pair, polled every 100 ms for up to `wait`.
-async fn nominated(pc: &RTCPeerConnection, wait: Duration) -> Option<Selection> {
+/// #3259 — the relay candidates the far end signalled that the ICE agent
+/// holds, read within `budget`; `None` when the read did not finish within
+/// it, or found no ICE agent. The ICE agent lists every remote candidate it
+/// holds (`RTCIceTransport::remote_candidates_stats`, a patch of the
+/// vendored webrtc): a prflx it learnt, and a relay candidate at the same
+/// address beside it. A read that does not finish holds up nothing: the
+/// remote reads `unknown`, and the carrier stays `direct`.
+async fn signalled_relays(ice: &RTCIceTransport, budget: Duration) -> Option<Vec<HeldRelay>> {
+    relays_within(ice.remote_candidates_stats(), budget).await
+}
+
+/// [`signalled_relays`] over its read, which a cell drives: the relay
+/// candidates in what `read` returns within `budget`, `None` when it returns
+/// `None` or does not return within it. A zero budget polls the read once
+/// and waits for nothing, so a read that would wait reads `None` at once.
+/// That poll runs outside the task's coop budget, so a pump that spent its
+/// budget still reads what a free lock holds. Any other budget waits for the
+/// read that long at most ([`REMOTE_READ_BUDGET`]).
+async fn relays_within(
+    read: impl Future<Output = Option<Vec<CandidateStats>>>,
+    budget: Duration,
+) -> Option<Vec<HeldRelay>> {
+    use webrtc::ice::candidate::CandidateType;
+    let held = if budget.is_zero() {
+        futures::FutureExt::now_or_never(tokio::task::coop::unconstrained(read)).flatten()
+    } else {
+        tokio::time::timeout(budget, read).await.ok().flatten()
+    }?;
+    Some(
+        held.into_iter()
+            .filter(|c| c.candidate_type == CandidateType::Relay)
+            .filter_map(|c| {
+                Some(HeldRelay {
+                    transport: CandidateTransport::of_network(c.network_type)?,
+                    addr: c.ip,
+                    port: c.port,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The selected pair, polled every 100 ms for up to `wait`; a prflx remote's
+/// read of the held candidates waits `budget` at most.
+async fn nominated(pc: &RTCPeerConnection, wait: Duration, budget: Duration) -> Option<Selection> {
     let sctp = pc.sctp();
     let dtls = sctp.transport();
     let ice = dtls.ice_transport();
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        if let Some(selected) = selection(ice).await {
+        if let Some(selected) = selection(ice, budget).await {
             return Some(selected);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -390,9 +641,15 @@ async fn nominated(pc: &RTCPeerConnection, wait: Duration) -> Option<Selection> 
     }
 }
 
-/// The nominated pair, polled every 100 ms for up to `wait`.
-pub(crate) async fn nominated_pair(pc: &RTCPeerConnection, wait: Duration) -> Option<Nominated> {
-    nominated(pc, wait).await.map(|s| s.nominated())
+/// The nominated pair, polled every 100 ms for up to `wait`; a prflx remote's
+/// read of the held candidates waits `budget` at most: [`REMOTE_READ_BUDGET`]
+/// on a task of its own, [`Duration::ZERO`] on a pump's own path (#3259).
+pub(crate) async fn nominated_pair(
+    pc: &RTCPeerConnection,
+    wait: Duration,
+    budget: Duration,
+) -> Option<Nominated> {
+    nominated(pc, wait, budget).await.map(|s| s.nominated())
 }
 
 /// What the overlay says about `remote_addr`'s peer, within
@@ -428,7 +685,7 @@ pub async fn observe(
     pc: &Arc<RTCPeerConnection>,
     session_id: bson::oid::ObjectId,
 ) -> SessionCarrier {
-    let Some(first) = nominated(pc, NOMINATION_WAIT).await else {
+    let Some(first) = nominated(pc, NOMINATION_WAIT, REMOTE_READ_BUDGET).await else {
         debug!(%session_id, "session carrier: no nominated pair within the wait — unknown");
         return SessionCarrier::Unknown;
     };
@@ -436,7 +693,7 @@ pub async fn observe(
         tokio::spawn(follow(Arc::downgrade(pc), session_id, first.clone()));
     }
     tokio::time::sleep(SETTLE).await;
-    let (pair, relay, rides) = nominated_pair(pc, Duration::from_millis(500))
+    let (pair, relay, rides) = nominated_pair(pc, Duration::from_millis(500), REMOTE_READ_BUDGET)
         .await
         .unwrap_or_else(|| first.nominated());
     // FR-148 P4 step 2: under `route` the agent's read decides; otherwise the
@@ -471,6 +728,7 @@ fn emit(
         remote_typ = ?pair.remote_kind,
         remote_addr = %pair.remote_addr,
         overlay = ?overlay,
+        remote_relay = pair.remote_relay.as_str(),
         "session carrier recorded (FR-102 P9c)"
     );
 }
@@ -505,7 +763,11 @@ async fn follow(pc: Weak<RTCPeerConnection>, session_id: ObjectId, opening: Sele
             }
             let sctp = pc.sctp();
             let dtls = sctp.transport();
-            Seen::Pair(selection(dtls.ice_transport()).await.map(Box::new))
+            Seen::Pair(
+                selection(dtls.ice_transport(), REMOTE_READ_BUDGET)
+                    .await
+                    .map(Box::new),
+            )
         }
     };
     let overlay = |remote_addr: String| async move { overlay_path(&remote_addr).await };
@@ -517,7 +779,11 @@ async fn follow(pc: Weak<RTCPeerConnection>, session_id: ObjectId, opening: Sele
 /// carrier it moves from is the last pair's, the one it moves to the new
 /// pair's, each by [`carrier_on`] with the agent's read and, for a pair on the
 /// mesh, what `overlay` says of its remote's peer at the move; then one
-/// `session carrier moved` line ([`emit_moved`]). It ends when the session
+/// `session carrier moved` line ([`emit_moved`]). A read of the same pair
+/// off the mesh that shows its remote to be the far end's relay where the
+/// last read did not (#3259) writes nothing and becomes the last pair, so a
+/// later move's `from` names that relay; a read that says `unknown` changes
+/// nothing. It ends when the session
 /// does, or when the agent reads no route for a pair, and never starts
 /// without one for `opening`. Returns how many moves it named.
 async fn follow_moves<R, RF, O, OF>(
@@ -547,6 +813,20 @@ where
             Seen::Pair(Some(next)) => *next,
         };
         if next.same_pair(&last) {
+            // #3259: the same pair, read again, can show its remote to be the
+            // far end's relay where an earlier read could not (the relay's
+            // candidate came after the check). A later move's `from` then
+            // names the carrier by the newer read. A read that could not say
+            // (`unknown`) knows less than the last one, so it changes
+            // nothing. On the mesh the overlay names the carrier, and the
+            // newer read changes nothing.
+            if next.remote_relay != last.remote_relay
+                && next.remote_relay != RemoteRelay::Unknown
+                && next.rides == Some(false)
+            {
+                last_carrier = last_carrier.map(|_| carrier_on(&next.view(), false, None));
+                last = next;
+            }
             continue;
         }
         let (Some(was_on_the_mesh), Some(on_the_mesh)) = (last.rides, next.rides) else {
@@ -618,6 +898,21 @@ mod tests {
             remote_kind: remote,
             local_addr: local_addr.into(),
             remote_addr: remote_addr.into(),
+            remote_relay: RemoteRelay::NotShown,
+        }
+    }
+
+    /// [`pair`], its remote shown to be the far end's relay or not.
+    fn pair_with(
+        local: CandidateKind,
+        local_addr: &str,
+        remote: CandidateKind,
+        remote_addr: &str,
+        remote_relay: RemoteRelay,
+    ) -> PairView {
+        PairView {
+            remote_relay,
+            ..pair(local, local_addr, remote, remote_addr)
         }
     }
 
@@ -802,6 +1097,189 @@ mod tests {
         );
     }
 
+    /// #3259 — a prflx remote shown to be the far end's relay reads as a
+    /// relay remote does: `turn`, or `turn_local` at a loopback or overlay
+    /// address. A prflx nothing shows to be a relay stays `direct`, the
+    /// field is read for a prflx remote alone, the agent's own relay is read
+    /// first as on a relay-to-relay pair, and an overlay remote still takes
+    /// the overlay's word.
+    #[test]
+    fn a_prflx_remote_shown_to_be_the_far_ends_relay_reads_as_that_relay() {
+        use CandidateKind::{Host, Prflx, Relay, Srflx};
+        use RemoteRelay::{NotShown, Signalled};
+        for (p, want) in [
+            (
+                pair_with(Host, "192.168.1.9", Prflx, "203.0.113.7", Signalled),
+                SessionCarrier::Turn,
+            ),
+            (
+                pair_with(Srflx, "198.51.100.4", Prflx, "203.0.113.7", Signalled),
+                SessionCarrier::Turn,
+            ),
+            (
+                pair_with(Host, "127.0.0.1", Prflx, "127.0.0.1", Signalled),
+                SessionCarrier::TurnLocal,
+            ),
+            (
+                pair_with(Host, "::1", Prflx, "::1", Signalled),
+                SessionCarrier::TurnLocal,
+            ),
+            // A direct session behind a symmetric NAT learns its peer as
+            // prflx too: nothing shows a relay, and it stays direct.
+            (
+                pair_with(Host, "192.168.1.9", Prflx, "203.0.113.7", NotShown),
+                SessionCarrier::Direct,
+            ),
+            // The field is read for a prflx remote alone.
+            (
+                pair_with(Host, "192.168.1.9", Host, "203.0.113.7", Signalled),
+                SessionCarrier::Direct,
+            ),
+            (
+                pair_with(Host, "192.168.1.9", Srflx, "203.0.113.7", Signalled),
+                SessionCarrier::Direct,
+            ),
+            // A relay remote reads by its type, whatever the field says.
+            (
+                pair_with(Host, "192.168.1.9", Relay, "203.0.113.7", NotShown),
+                SessionCarrier::Turn,
+            ),
+            // The agent's own relay is read first.
+            (
+                pair_with(Relay, "203.0.113.9", Prflx, "127.0.0.1", Signalled),
+                SessionCarrier::Turn,
+            ),
+            (
+                pair_with(Relay, "127.0.0.1", Prflx, "203.0.113.7", Signalled),
+                SessionCarrier::TurnLocal,
+            ),
+        ] {
+            assert_eq!(carrier_of(&p, None), want, "{p:?}");
+        }
+        let mesh = pair_with(Host, "100.64.0.9", Prflx, "100.64.0.7", Signalled);
+        assert_eq!(
+            carrier_of(&mesh, Some(&OverlayPath::Direct)),
+            SessionCarrier::OverlayDirect
+        );
+        assert_eq!(carrier_of(&mesh, None), SessionCarrier::Unknown);
+    }
+
+    /// #3259 — the remote relay's rule: a relay remote is the far end's
+    /// relay by construction; a prflx remote is one only at the exact
+    /// address, port and transport of a relay candidate the far end
+    /// signalled, and is `unknown` when those could not be read; a remote
+    /// whose type has no name is `unknown`; nothing else is a relay.
+    #[test]
+    fn a_remote_is_the_far_ends_relay_only_by_a_candidate_it_signalled() {
+        use CandidateKind::{Host, Prflx, Relay, Srflx, Unspecified};
+        use CandidateTransport::{Tcp, Udp};
+        use RemoteRelay::{NotShown, Signalled, Unknown};
+        let relay = |addr: &str, port, transport| HeldRelay {
+            addr: addr.to_owned(),
+            port,
+            transport,
+        };
+        let held = [
+            relay("203.0.113.7", 49170, Udp),
+            relay("2001:db8::7", 3479, Udp),
+        ];
+        let held = Some(&held[..]);
+        let none: Option<&[HeldRelay]> = Some(&[]);
+        for (kind, addr, port, transport, relays, want) in [
+            (Relay, "203.0.113.7", 49170, Some(Udp), none, Signalled),
+            (Relay, "198.51.100.9", 7001, None, held, Signalled),
+            // A relay remote reads no candidates, so an unread list is no
+            // matter to it.
+            (Relay, "203.0.113.7", 49170, Some(Udp), None, Signalled),
+            (Prflx, "203.0.113.7", 49170, Some(Udp), held, Signalled),
+            (Prflx, "2001:db8::7", 3479, Some(Udp), held, Signalled),
+            // An IPv4-mapped IPv6 address is its IPv4 one.
+            (
+                Prflx,
+                "::ffff:203.0.113.7",
+                49170,
+                Some(Udp),
+                held,
+                Signalled,
+            ),
+            // A UDP relay's relayed address shows a UDP prflx, never a TCP
+            // one, and a prflx that names no transport matches nothing.
+            (Prflx, "203.0.113.7", 49170, Some(Tcp), held, NotShown),
+            (Prflx, "203.0.113.7", 49170, None, held, NotShown),
+            // No relay the far end signalled: a prflx is no relay.
+            (Prflx, "203.0.113.7", 49170, Some(Udp), none, NotShown),
+            // Another allocation on the same relay server is another relay.
+            (Prflx, "203.0.113.7", 49171, Some(Udp), held, NotShown),
+            // An address that is no IP address matches nothing.
+            (Prflx, "a1b2.local", 49170, Some(Udp), held, NotShown),
+            // A read that did not finish knows nothing: never `none`.
+            (Prflx, "203.0.113.7", 49170, Some(Udp), None, Unknown),
+            (Prflx, "198.51.100.9", 50000, Some(Udp), None, Unknown),
+            // Only a prflx is learnt from a check; a host or srflx remote at
+            // a relay's address is what the far end said it is, read or not.
+            (Host, "203.0.113.7", 49170, Some(Udp), held, NotShown),
+            (Srflx, "203.0.113.7", 49170, Some(Udp), held, NotShown),
+            (Host, "203.0.113.7", 49170, Some(Udp), None, NotShown),
+            (Srflx, "203.0.113.7", 49170, Some(Udp), None, NotShown),
+            // A type webrtc-rs could not name: the agent cannot say.
+            (Unspecified, "203.0.113.7", 49170, Some(Udp), held, Unknown),
+            (Unspecified, "203.0.113.7", 49170, Some(Udp), None, Unknown),
+        ] {
+            assert_eq!(
+                remote_relay_of(kind, addr, port, transport, relays),
+                want,
+                "{kind:?} {addr}:{port} {transport:?} {relays:?}"
+            );
+        }
+        // A TCP relay candidate shows a TCP prflx.
+        let tcp = [relay("203.0.113.7", 49170, Tcp)];
+        assert_eq!(
+            remote_relay_of(Prflx, "203.0.113.7", 49170, Some(Tcp), Some(&tcp)),
+            Signalled
+        );
+        assert_eq!(
+            remote_relay_of(Prflx, "203.0.113.7", 49170, Some(Udp), Some(&tcp)),
+            NotShown
+        );
+    }
+
+    /// #3259 — the transports the rule compares, from webrtc-rs's names: a
+    /// candidate's protocol, and the ICE network type a held relay is kept
+    /// under.
+    #[test]
+    fn candidate_transports_read_from_webrtc() {
+        use webrtc::ice::network_type::NetworkType as N;
+        use webrtc::ice_transport::ice_protocol::RTCIceProtocol as P;
+        assert_eq!(
+            CandidateTransport::of_protocol(P::Udp),
+            Some(CandidateTransport::Udp)
+        );
+        assert_eq!(
+            CandidateTransport::of_protocol(P::Tcp),
+            Some(CandidateTransport::Tcp)
+        );
+        assert_eq!(CandidateTransport::of_protocol(P::Unspecified), None);
+        for (n, want) in [
+            (N::Udp4, Some(CandidateTransport::Udp)),
+            (N::Udp6, Some(CandidateTransport::Udp)),
+            (N::Tcp4, Some(CandidateTransport::Tcp)),
+            (N::Tcp6, Some(CandidateTransport::Tcp)),
+            (N::Unspecified, None),
+        ] {
+            assert_eq!(CandidateTransport::of_network(n), want, "{n:?}");
+        }
+    }
+
+    /// #3259 — the remote relay's spellings: locked, one per value, all
+    /// distinct.
+    #[test]
+    fn the_remote_relay_spellings_are_locked_and_distinct() {
+        let spellings: Vec<&str> = RemoteRelay::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(spellings, ["none", "signalled", "unknown"]);
+        let distinct: std::collections::HashSet<&str> = spellings.iter().copied().collect();
+        assert_eq!(distinct.len(), RemoteRelay::ALL.len());
+    }
+
     #[test]
     fn candidate_kinds_map_one_to_one_from_webrtc() {
         use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType as T;
@@ -887,6 +1365,10 @@ mod tests {
 
     /// What `f` logs, as the daemon's log file writes it (`roomler_node_core::
     /// logging::init`'s file layer: time, level, message, fields; no target).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn logged(f: impl FnOnce()) -> String {
         use std::sync::{Arc, Mutex};
         #[derive(Clone, Default)]
@@ -916,7 +1398,7 @@ mod tests {
 
     /// FR-148 P0 — the carrier line's field names and their order, which a
     /// field read greps for (`scripts/rc-path-report.cjs`): the relay
-    /// transport follows the carrier.
+    /// transport follows the carrier, and #3259's remote relay comes last.
     #[test]
     fn the_carrier_line_names_its_fields() {
         let sid = bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap();
@@ -939,6 +1421,7 @@ mod tests {
             "remote_typ=Srflx",
             "remote_addr=198.51.100.5",
             "overlay=None",
+            "remote_relay=\"none\"",
         ] {
             let at = rest
                 .find(want)
@@ -946,6 +1429,30 @@ mod tests {
             rest = &rest[at + want.len()..];
         }
         assert_eq!(out.lines().count(), 1, "{out:?}");
+        // #3259: a prflx remote shown to be the far end's relay keeps its
+        // `remote_typ` and says why it is read as one.
+        let p = pair_with(
+            CandidateKind::Host,
+            "192.0.2.10",
+            CandidateKind::Prflx,
+            "198.51.100.5",
+            RemoteRelay::Signalled,
+        );
+        let out = logged(|| emit(sid, carrier_of(&p, None), &p, RelayTransport::NoRelay, None));
+        let mut rest = out.as_str();
+        for want in [
+            "carrier=\"turn\"",
+            "relay_transport=\"none\"",
+            "local_typ=Host",
+            "remote_typ=Prflx",
+            "remote_addr=198.51.100.5",
+            "remote_relay=\"signalled\"",
+        ] {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+            rest = &rest[at + want.len()..];
+        }
     }
 
     /// The credentials the loopback TURN server takes.
@@ -985,16 +1492,9 @@ mod tests {
         std::sync::Arc::new(api.new_peer_connection(config).await.unwrap())
     }
 
-    /// FR-148 P0 — through the vendored webrtc-ice and webrtc: a session on
-    /// the agent's own TURN allocation over UDP reads `udp`, from the pair
-    /// the carrier line reads.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg_attr(
-        windows,
-        ignore = "its TURN client socket, which webrtc-ice binds on 0.0.0.0, raises a firewall prompt on Windows (#4500)"
-    )]
-    async fn a_pair_on_the_agents_udp_relay_names_its_transport() {
-        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+    /// A TURN server on loopback over UDP, which hands out its relays on
+    /// loopback, and its port.
+    async fn loopback_turn() -> (webrtc::turn::server::Server, u16) {
         use webrtc::turn;
         let listener =
             std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1016,6 +1516,20 @@ mod tests {
         })
         .await
         .unwrap();
+        (server, port)
+    }
+
+    /// FR-148 P0 — through the vendored webrtc-ice and webrtc: a session on
+    /// the agent's own TURN allocation over UDP reads `udp`, from the pair
+    /// the carrier line reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(
+        windows,
+        ignore = "its TURN client socket, which webrtc-ice binds on 0.0.0.0, raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_pair_on_the_agents_udp_relay_names_its_transport() {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        let (server, port) = loopback_turn().await;
         let viewer = relayed_peer(port).await;
         let agent = relayed_peer(port).await;
         let (tx, mut connected) = tokio::sync::mpsc::channel::<()>(1);
@@ -1041,7 +1555,7 @@ mod tests {
         let answer = agent.local_description().await.unwrap();
         viewer.set_remote_description(answer).await.unwrap();
         let up = tokio::time::timeout(Duration::from_secs(15), connected.recv()).await;
-        let read = nominated_pair(&agent, Duration::from_secs(5)).await;
+        let read = nominated_pair(&agent, Duration::from_secs(5), REMOTE_READ_BUDGET).await;
         // A peer must be closed: dropping one frees none of its sockets.
         for pc in [&agent, &viewer] {
             let _ = pc.close().await;
@@ -1052,6 +1566,282 @@ mod tests {
         assert_eq!(view.local_kind, CandidateKind::Relay, "{view:?}");
         assert_eq!(relay, RelayTransport::Udp, "{view:?}");
         assert_eq!(rides, None, "no rank: the agent reads no route");
+        // #3259: a relay remote is the far end's relay by construction.
+        assert_eq!(view.remote_kind, CandidateKind::Relay, "{view:?}");
+        assert_eq!(view.remote_relay, RemoteRelay::Signalled, "{view:?}");
+    }
+
+    /// A peer that gathers host candidates on loopback alone and asks no
+    /// server: the agent's end of a pair whose far end is relayed.
+    async fn host_peer() -> std::sync::Arc<RTCPeerConnection> {
+        use webrtc::api::setting_engine::SettingEngine;
+        use webrtc::ice::mdns::MulticastDnsMode;
+        use webrtc::ice::network_type::NetworkType;
+        let mut setting = SettingEngine::default();
+        setting.set_include_loopback_candidate(true);
+        setting.set_ip_filter(Box::new(|ip: std::net::IpAddr| ip.is_loopback()));
+        setting.set_network_types(vec![NetworkType::Udp4]);
+        setting.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        let api = webrtc::api::APIBuilder::new()
+            .with_setting_engine(setting)
+            .build();
+        std::sync::Arc::new(api.new_peer_connection(Default::default()).await.unwrap())
+    }
+
+    /// #3259 — a read of the held candidates that cannot finish says
+    /// `unknown`, never `none`. With no ICE agent, before one is made and
+    /// after close, the accessor reads nothing and makes no agent, so a prflx
+    /// remote reads `unknown`, and the pair's carrier stays `direct`. A read
+    /// that finishes and finds no relay candidate says `none`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_with_no_ice_agent_reads_unknown_and_the_carrier_stays_direct() {
+        use CandidateKind::{Host, Prflx};
+        let agent = host_peer().await;
+        let dtls = agent.sctp().transport();
+        let ice = dtls.ice_transport();
+        let at_a_prflx = |held: Option<Vec<HeldRelay>>| {
+            remote_relay_of(
+                Prflx,
+                "203.0.113.7",
+                49170,
+                Some(CandidateTransport::Udp),
+                held.as_deref(),
+            )
+        };
+        // No agent yet: nothing is read, and the read makes no agent.
+        assert!(ice.remote_candidates_stats().await.is_none());
+        assert_eq!(signalled_relays(ice, REMOTE_READ_BUDGET).await, None);
+        assert_eq!(
+            at_a_prflx(signalled_relays(ice, REMOTE_READ_BUDGET).await),
+            RemoteRelay::Unknown
+        );
+        // The offer makes the agent: the read finishes and holds no relay.
+        agent.create_data_channel("carrier", None).await.unwrap();
+        let offer = agent.create_offer(None).await.unwrap();
+        agent.set_local_description(offer).await.unwrap();
+        let held = signalled_relays(ice, REMOTE_READ_BUDGET).await;
+        assert_eq!(held, Some(Vec::new()));
+        assert_eq!(at_a_prflx(held), RemoteRelay::NotShown);
+        // After close the agent is gone.
+        agent.close().await.unwrap();
+        assert!(ice.remote_candidates_stats().await.is_none());
+        let gone = at_a_prflx(signalled_relays(ice, REMOTE_READ_BUDGET).await);
+        assert_eq!(gone, RemoteRelay::Unknown);
+        // `unknown` shows no relay: the label is what the types give.
+        let view = pair_with(Host, "192.168.1.10", Prflx, "203.0.113.7", gone);
+        assert_eq!(carrier_of(&view, None), SessionCarrier::Direct);
+        assert_eq!(carrier_on(&view, false, None), SessionCarrier::Direct);
+    }
+
+    /// #3259 — the read's wait. A read on a pump's own path (`Lane::read`,
+    /// `model_open`) waits for nothing, and one on a task of its own
+    /// (`observe`, `follow`) waits [`REMOTE_READ_BUDGET`] at most. With the
+    /// lock the read takes free, either read answers at once, and the
+    /// zero-wait read does in a task that spent its coop budget too. With the
+    /// lock held, the zero-wait read returns at once and the bounded read
+    /// after its bound, and each reads `unknown`, so the carrier stays
+    /// `direct`.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_would_wait_reads_unknown_at_once_on_a_pumps_path() {
+        use CandidateKind::{Host, Prflx};
+        use webrtc::ice::candidate::CandidateType;
+        use webrtc::ice::network_type::NetworkType;
+        /// What the ICE agent's list gives, behind a lock as its own is.
+        async fn read(
+            candidates: &tokio::sync::Mutex<Vec<CandidateStats>>,
+        ) -> Option<Vec<CandidateStats>> {
+            Some(candidates.lock().await.clone())
+        }
+        let candidates = tokio::sync::Mutex::new(vec![CandidateStats {
+            network_type: NetworkType::Udp4,
+            ip: "203.0.113.7".to_owned(),
+            port: 49170,
+            candidate_type: CandidateType::Relay,
+            ..Default::default()
+        }]);
+        let at_a_prflx = |held: Option<Vec<HeldRelay>>| {
+            remote_relay_of(
+                Prflx,
+                "203.0.113.7",
+                49170,
+                Some(CandidateTransport::Udp),
+                held.as_deref(),
+            )
+        };
+        // The lock is free: either read answers, and neither waits.
+        for budget in [Duration::ZERO, REMOTE_READ_BUDGET] {
+            let start = tokio::time::Instant::now();
+            let held = relays_within(read(&candidates), budget).await;
+            assert_eq!(start.elapsed(), Duration::ZERO, "{budget:?}");
+            assert_eq!(at_a_prflx(held), RemoteRelay::Signalled, "{budget:?}");
+        }
+        // A pump that spent its coop budget: the zero-wait read polls outside
+        // it, so a free lock still answers.
+        for _ in 0..1024 {
+            if !tokio::task::coop::has_budget_remaining() {
+                break;
+            }
+            let _ = futures::FutureExt::now_or_never(tokio::task::coop::consume_budget());
+        }
+        assert!(!tokio::task::coop::has_budget_remaining(), "not spent");
+        let spent = relays_within(read(&candidates), Duration::ZERO).await;
+        assert_eq!(at_a_prflx(spent), RemoteRelay::Signalled);
+        // The lock is held: the read would wait.
+        let _held = candidates.lock().await;
+        let start = tokio::time::Instant::now();
+        let zero = relays_within(read(&candidates), Duration::ZERO).await;
+        assert_eq!(start.elapsed(), Duration::ZERO, "the pump's read waited");
+        assert_eq!(zero, None);
+        let start = tokio::time::Instant::now();
+        let bounded = relays_within(read(&candidates), REMOTE_READ_BUDGET).await;
+        let waited = start.elapsed();
+        assert!(
+            (REMOTE_READ_BUDGET..REMOTE_READ_BUDGET + Duration::from_millis(2)).contains(&waited),
+            "{waited:?}"
+        );
+        assert_eq!(bounded, None);
+        for unread in [zero, bounded] {
+            let unknown = at_a_prflx(unread);
+            assert_eq!(unknown, RemoteRelay::Unknown);
+            let view = pair_with(Host, "192.168.1.10", Prflx, "203.0.113.7", unknown);
+            assert_eq!(carrier_of(&view, None), SessionCarrier::Direct);
+        }
+    }
+
+    /// An SDP without its candidates, and its candidate lines as a trickle
+    /// sends them (`candidate:…`).
+    fn without_candidates(sdp: &str) -> (String, Vec<String>) {
+        let (mut kept, mut candidates) = (String::new(), Vec::new());
+        for line in sdp.split_inclusive('\n') {
+            match line.trim_end().strip_prefix("a=") {
+                Some(c) if c.starts_with("candidate:") => candidates.push(c.to_owned()),
+                Some("end-of-candidates") => {}
+                _ => kept.push_str(line),
+            }
+        }
+        (kept, candidates)
+    }
+
+    /// #3259 — a relay learnt as peer-reflexive. The viewer's first check
+    /// reaches the agent through the viewer's relay before the agent holds
+    /// the relay's candidate, so webrtc-ice names the remote `Prflx`. The
+    /// candidate the viewer then trickles is kept beside it (`equal` compares
+    /// the type) and the selection keeps the prflx (`find_remote_candidate`
+    /// returns the first match): the agent holds a relay at exactly the
+    /// selected remote's address and port. The carrier reads the far end's
+    /// relay, `turn_local` on this loopback relay by the address rule a
+    /// signalled relay remote takes, and FR-148's two readers follow the
+    /// label: `class_of` gives `unknown`, since the agent's own candidate is
+    /// no relay, and the path memory keys the pair by the relay's word.
+    /// Before the candidate came nothing showed a relay, and the same pair
+    /// read `direct`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_learnt_as_prflx_before_its_candidate_reads_as_the_relay() {
+        use crate::media_deadline::{CarrierClass, class_of};
+        use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+        let (server, port) = loopback_turn().await;
+        let viewer = relayed_peer(port).await;
+        let agent = host_peer().await;
+        let (tx, mut connected) = tokio::sync::mpsc::channel::<()>(1);
+        agent.on_peer_connection_state_change(Box::new(move |s| {
+            if s == RTCPeerConnectionState::Connected {
+                let _ = tx.try_send(());
+            }
+            Box::pin(async {})
+        }));
+        let _channel = viewer.create_data_channel("video", None).await.unwrap();
+        let offer = viewer.create_offer(None).await.unwrap();
+        let mut gathered = viewer.gathering_complete_promise().await;
+        viewer.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let offer = viewer.local_description().await.unwrap();
+        // The viewer's candidates are held back: they reach the agent only
+        // once the pair is up, after the check that taught it the prflx.
+        let (offer, relays) = without_candidates(&offer.sdp);
+        agent
+            .set_remote_description(RTCSessionDescription::offer(offer).unwrap())
+            .await
+            .unwrap();
+        let answer = agent.create_answer(None).await.unwrap();
+        let mut gathered = agent.gathering_complete_promise().await;
+        agent.set_local_description(answer).await.unwrap();
+        let _ = gathered.recv().await;
+        let answer = agent.local_description().await.unwrap();
+        viewer.set_remote_description(answer).await.unwrap();
+        let up = tokio::time::timeout(Duration::from_secs(15), connected.recv()).await;
+        let learnt = nominated_pair(&agent, Duration::from_secs(5), REMOTE_READ_BUDGET).await;
+        let mut trickled = Vec::new();
+        for candidate in &relays {
+            let init = RTCIceCandidateInit {
+                candidate: candidate.clone(),
+                ..Default::default()
+            };
+            trickled.push(
+                agent
+                    .add_ice_candidate(init)
+                    .await
+                    .map_err(|e| e.to_string()),
+            );
+        }
+        // The ICE agent adds a trickled candidate on a task of its own: read
+        // the pair until its carrier is no longer direct, 3 s at most.
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        let read = loop {
+            let read = nominated_pair(&agent, Duration::from_secs(1), REMOTE_READ_BUDGET).await;
+            let moved = read
+                .as_ref()
+                .is_some_and(|(view, _, _)| carrier_of(view, None) != SessionCarrier::Direct);
+            if moved || tokio::time::Instant::now() >= until {
+                break read;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        // A peer must be closed: dropping one frees none of its sockets.
+        for pc in [&agent, &viewer] {
+            let _ = pc.close().await;
+        }
+        let _ = server.close().await;
+        assert!(up.is_ok(), "the relayed pair did not connect in 15 s");
+        assert!(!relays.is_empty(), "the viewer gathered no relay candidate");
+        assert!(trickled.iter().all(Result::is_ok), "{trickled:?}");
+        let (learnt, _, _) = learnt.expect("no nominated pair before the trickle");
+        assert_eq!(
+            (learnt.local_kind, learnt.remote_kind),
+            (CandidateKind::Host, CandidateKind::Prflx),
+            "{learnt:?}"
+        );
+        assert_eq!(learnt.remote_relay, RemoteRelay::NotShown, "{learnt:?}");
+        assert_eq!(
+            carrier_of(&learnt, None),
+            SessionCarrier::Direct,
+            "{learnt:?}"
+        );
+        let (view, relay, rides) = read.expect("no nominated pair after the trickle");
+        assert_eq!(
+            (view.local_kind, view.remote_kind),
+            (CandidateKind::Host, CandidateKind::Prflx),
+            "{view:?}"
+        );
+        assert_eq!(view.remote_relay, RemoteRelay::Signalled, "{view:?}");
+        assert_eq!(relay, RelayTransport::NoRelay, "{view:?}");
+        assert_eq!(rides, None, "no rank: the agent reads no route");
+        assert_eq!(
+            carrier_of(&view, None),
+            SessionCarrier::TurnLocal,
+            "{view:?}"
+        );
+        assert_eq!(
+            class_of(&view, relay, false, None),
+            CarrierClass::Unknown,
+            "{view:?}"
+        );
+        assert_eq!(
+            crate::encode::pair_memory::carrier_word(carrier_of(&view, None), None).as_deref(),
+            Some("turn_local"),
+            "{view:?}"
+        );
     }
 
     /// FR-148 P4 step 2 (A2): under `route` the carrier record reads the ICE
@@ -1196,6 +1986,14 @@ mod tests {
             remote: candidate(remote_typ, remote_addr, remote_port),
             relay,
             rides,
+            // As read with no relay candidate held: a relay remote only.
+            remote_relay: remote_relay_of(
+                remote_typ.into(),
+                remote_addr,
+                remote_port,
+                None,
+                Some(&[]),
+            ),
         }
     }
 
@@ -1342,6 +2140,61 @@ mod tests {
                 assert!(line.contains(&want), "{want} in {line}");
             }
         }
+    }
+
+    /// #3259 — a relay remote reads `signalled` as the pair is read, and its
+    /// carrier is the one it read before the field.
+    #[test]
+    fn a_relay_remote_reads_signalled_and_keeps_its_carrier() {
+        let s = selected(
+            (T::Host, "192.168.1.10", 5000),
+            (T::Relay, "198.51.100.9", 7001),
+            RelayTransport::NoRelay,
+            None,
+        );
+        let view = s.view();
+        assert_eq!(view.remote_relay, RemoteRelay::Signalled, "{view:?}");
+        assert_eq!(carrier_of(&view, None), SessionCarrier::Turn, "{view:?}");
+        let before = PairView {
+            remote_relay: RemoteRelay::NotShown,
+            ..view.clone()
+        };
+        assert_eq!(carrier_of(&before, None), carrier_of(&view, None));
+    }
+
+    /// #3259 — under `route`, the same pair read again with its remote shown
+    /// to be the far end's relay writes no line, and the next move's `from`
+    /// names that relay, not the opening read's `direct`. A read after it
+    /// that cannot say (`unknown`) does not undo it.
+    #[test]
+    fn a_pair_whose_relay_shows_after_the_opening_moves_from_that_relay() {
+        let learnt = selected(
+            (T::Host, "192.168.1.10", 5000),
+            (T::Prflx, "203.0.113.7", 49170),
+            RelayTransport::NoRelay,
+            Some(false),
+        );
+        assert_eq!(learnt.remote_relay, RemoteRelay::NotShown);
+        let shown = Selection {
+            remote_relay: RemoteRelay::Signalled,
+            ..learnt.clone()
+        };
+        let unread = Selection {
+            remote_relay: RemoteRelay::Unknown,
+            ..learnt.clone()
+        };
+        let script = vec![
+            seen(learnt.clone()),
+            seen(shown),
+            seen(unread),
+            seen(native()),
+        ];
+        let (moves, reads, out) = followed(learnt, script);
+        assert_eq!((moves, reads), (1, 5), "{out}");
+        assert!(
+            out.contains("from=\"turn\" to=\"direct\" route=native"),
+            "{out}"
+        );
     }
 
     /// Two sockets at one address are two pairs: a move between them is a move.

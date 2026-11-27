@@ -668,9 +668,9 @@ async fn run_install_inner(
     // rc.52: for the SystemContext flavour, lock down %PROGRAMDATA%\roomler\
     // with an inheritable SYSTEM+Administrators DACL before the config is
     // written, here when this process writes it (the step does the same). #3609:
-    // the parent is taken for Administrators by handle first, so the seal,
-    // which names it by path, finds a plain folder that is Administrators' (a
-    // person's daemon may have made it). #3666: only once the config was read
+    // the parent is taken for Administrators by handle first (a person's daemon
+    // may have made it); #4488: then sealed through one handle to it, the one
+    // that judged it a plain folder. #3666: only once the config was read
     // as found (`writer.prepare`): sealed first, a parent another account made
     // would read as the machine's, and a sealed folder moved into it would be
     // folded. Best-effort: a failure is said, and the install goes on.
@@ -1691,104 +1691,6 @@ fn flavour_parts(role: Role) -> Result<(WindowsInstallFlavour, bool), String> {
                 .to_string(),
         ),
     }
-}
-
-/// rc.52: apply a restrictive, inheritable DACL to the machine-global
-/// config directory so the Agent-JWT-bearing `config.toml` (and the
-/// crash sidecars under `crashes\`) are readable only by SYSTEM +
-/// Administrators. `%PROGRAMDATA%` is world-readable by default — a
-/// non-admin local user could otherwise read the long-lived agent
-/// token and impersonate the host to the Roomler server.
-///
-/// `config_path` is `…\roomler\<segment>\config.toml` (the
-/// segment is whatever `appdirs::app_segment` picked); we harden its
-/// grandparent `…\roomler\` so that segment, `crashes\`, and
-/// every future child inherit the ACL — the directory-inheritance
-/// pattern (one `icacls` at install time) rather than a per-file ACL
-/// that has a create→ACL TOCTOU and gets re-widened by every later
-/// plain `config::save`. The directory is created first (icacls
-/// needs an existing target).
-///
-/// Well-known SIDs are used instead of the names `SYSTEM` /
-/// `Administrators` because those are localised on non-English
-/// Windows (`Administratoren`, etc.) and a name-based grant would
-/// fail there. `*S-1-5-18` = LocalSystem, `*S-1-5-32-544` =
-/// Administrators.
-#[cfg(target_os = "windows")]
-pub(crate) fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
-    let roomler_dir = config_path
-        .parent() // …\roomler\<segment>
-        .and_then(|p| p.parent()) // …\roomler
-        .ok_or_else(|| {
-            format!(
-                "machine-global config path {} has no grandparent dir to harden",
-                config_path.display()
-            )
-        })?;
-    std::fs::create_dir_all(roomler_dir)
-        .map_err(|e| format!("create {}: {e}", roomler_dir.display()))?;
-    // #3609 — `icacls` names the folder by path, and would follow a junction
-    // or a symbolic link there to whatever it leads to: such a parent is left
-    // for the service's check to refuse.
-    if is_a_link(roomler_dir) {
-        return Err(format!(
-            "{} is a link (a junction or a symbolic link), not a plain folder",
-            roomler_dir.display()
-        ));
-    }
-    // #3073 — the owner first. Only the owner keeps WRITE_DAC once
-    // `/inheritance:r` has removed every ACE, so a directory someone else
-    // owns (the daemon hardening it later runs as SYSTEM) must belong to
-    // Administrators before inheritance goes. Abort rather than strip it
-    // from a directory we could not take.
-    //
-    // ⚠️ Then ONE call drops inheritance and grants: icacls writes the new
-    // DACL once, so each child inherits SYSTEM and Administrators while it
-    // still holds the ACEs that let them in. Split into two calls
-    // (inheritance first), a child someone else owns comes out with an
-    // empty DACL — measured on the daemon's copy in 0.4.185, which now
-    // grants before it drops inheritance (`roomler_node_core::config`).
-    let owner = std::process::Command::new(roomlerd::appdirs::system32_tool("icacls.exe"))
-        .arg(roomler_dir)
-        .arg("/setowner")
-        .arg("*S-1-5-32-544")
-        .output()
-        .map_err(|e| format!("spawn icacls: {e}"))?;
-    if !owner.status.success() {
-        return Err(format!(
-            "icacls /setowner exited {}: {}",
-            owner.status,
-            String::from_utf8_lossy(&owner.stderr).trim()
-        ));
-    }
-    let output = std::process::Command::new(roomlerd::appdirs::system32_tool("icacls.exe"))
-        .arg(roomler_dir)
-        .arg("/inheritance:r")
-        .arg("/grant:r")
-        .arg("*S-1-5-18:(OI)(CI)F")
-        .arg("/grant:r")
-        .arg("*S-1-5-32-544:(OI)(CI)F")
-        .output()
-        .map_err(|e| format!("spawn icacls: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "icacls exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
-/// Is `path` itself a reparse point (a junction, a symbolic link)? Read without
-/// following it. One that cannot be read is not called a link: what follows
-/// fails on it by itself.
-#[cfg(target_os = "windows")]
-fn is_a_link(path: &std::path::Path) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
-    const REPARSE_POINT: u32 = 0x400;
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_attributes() & REPARSE_POINT != 0)
 }
 
 /// Projection of [`roomlerd::win_service::system_context_attempt::Attempt`]

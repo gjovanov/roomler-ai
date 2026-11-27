@@ -1173,6 +1173,10 @@ mod tests {
     /// it prints and every line it logs scanned. The user code and the page
     /// are shown; the device code and the token appear nowhere.
     #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     async fn the_flow_prints_the_code_and_never_a_secret() {
         // A second live dispatcher, held for the whole test. With exactly
         // one registered, tracing-core rebuilds a NEW callsite's interest

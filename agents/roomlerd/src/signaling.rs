@@ -1009,9 +1009,11 @@ pub async fn run(
     // and a secondary's only on a one-row Mac's daemon
     // (`Delegation::for_secondary`).
     mut delegation: crate::delegate::Delegation,
-    // `mut` for exactly one reason: FR-40 key rotation swaps the overlay
-    // secret in this snapshot between two connections (see
-    // `ConnectError::KeyRotated`). Nothing else writes it after start.
+    // `mut` for two reasons: FR-40 key rotation swaps the overlay secret in
+    // this snapshot between two connections (see `ConnectError::KeyRotated`),
+    // and #3353's run state is put on it once, at the top
+    // (`RemoteConfigServices::carry_run_state`). Nothing else writes it after
+    // start.
     mut cfg: AgentConfig,
     encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -1040,6 +1042,10 @@ pub async fn run(
     // daemon reach the loop that actually owns that session.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) -> Result<()> {
+    // #3353 — this loop serves SSH only where the rest of the process does. A
+    // config reloaded from the file (a runtime org join) holds the owner's
+    // `ssh_enabled` and not that this run's start could not mint the host key.
+    remote_cfg.carry_run_state(&mut cfg);
     // #2551 — the encoder capability probe runs at the process's first
     // `caps::detect()` (memoized after). That used to be the hello's, inside
     // `connect_once` with the pump already counting. On a probe-cache miss
@@ -1956,7 +1962,7 @@ async fn connect_once(
     // the hello reads its words.
     let announcer = Announcer {
         agent_id: &cfg.agent_id,
-        ssh_enabled: cfg.ssh_enabled,
+        ssh_enabled: cfg.ssh_on_this_run(),
         multi_org_tun: cfg.overlay_multi_org,
         is_primary: ctx.is_primary,
         survive,
@@ -6139,12 +6145,9 @@ async fn handle_server_msg(
                 // it with its own credential, and that claim is the server's
                 // acknowledgement; the worker only rings, and can refuse.
                 use roomler_ai_remote_control::models::SshGrantRefusal;
-                let refusal = if !agent_cfg.ssh_enabled {
+                let refusal = if !agent_cfg.ssh_on_this_run() {
                     // The person's half: their worker carries the port.
-                    Some((
-                        SshGrantRefusal::SshDisabled,
-                        "ssh_enabled is off on this device",
-                    ))
+                    Some((SshGrantRefusal::SshDisabled, ssh_off_why(agent_cfg)))
                 } else if crate::ssh_service::disabled() {
                     Some((
                         SshGrantRefusal::Other,
@@ -6205,10 +6208,11 @@ async fn handle_server_msg(
                 );
             } else {
                 use roomler_ai_remote_control::models::SshGrantRefusal;
-                let refused = if !agent_cfg.ssh_enabled {
+                let refused = if !agent_cfg.ssh_on_this_run() {
                     warn!(
                         %grant_id, ?caller,
-                        "rc:ssh.grant refused — ssh_enabled is off on this device"
+                        "rc:ssh.grant refused — {}",
+                        ssh_off_why(agent_cfg)
                     );
                     Some(SshGrantRefusal::SshDisabled)
                 } else {
@@ -7019,6 +7023,19 @@ fn ssh_host_pubkey_for(_cfg: &crate::config::AgentConfig) -> String {
     String::new()
 }
 
+/// #3353 — why this run refuses an SSH grant as `SshDisabled`: the person's
+/// `ssh_enabled` is off, or this run's start could not make or save the host
+/// key. The wire says the same either way, as it did before; the log says
+/// which, since only the second heals at the next start.
+#[cfg(feature = "ssh-server")]
+fn ssh_off_why(cfg: &crate::config::AgentConfig) -> &'static str {
+    if cfg.ssh_enabled {
+        "SSH is off for this run: its start could not make or save the host key"
+    } else {
+        "ssh_enabled is off on this device"
+    }
+}
+
 fn detect_os() -> OsKind {
     match std::env::consts::OS {
         "linux" => OsKind::Linux,
@@ -7111,7 +7128,9 @@ struct Announced {
 struct Announcer<'a> {
     /// The device this connection is, for `exec-system` and `ssh-system`.
     agent_id: &'a str,
-    /// The person's `ssh_enabled`, for `ssh-system`.
+    /// The person's `ssh_enabled` as this run has it, for `ssh-system`: off
+    /// when the start could not mint the host key (#3353,
+    /// [`AgentConfig::ssh_on_this_run`]), since this worker then carries no port.
     ssh_enabled: bool,
     /// `overlay_multi_org`, for [`stub_caps`]' `tun`.
     multi_org_tun: bool,
@@ -8608,6 +8627,10 @@ mod tests {
     }
 
     impl Logged {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+        )]
         fn start() -> Self {
             let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
             let writer = LogBuf(buf.clone());

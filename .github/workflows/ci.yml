@@ -324,7 +324,7 @@ jobs:
         run: bash scripts/revendor-scrap.sh --check
 
       # Same invariant for the webrtc-sctp fork (its deltas are listed in
-      # crates/vendored/webrtc-sctp/Cargo.toml; its tests: vendored-sctp).
+      # crates/vendored/webrtc-sctp/Cargo.toml; its tests: vendored-tests).
       - name: Vendored webrtc-sctp drift check
         run: bash scripts/revendor-webrtc-sctp.sh --check
 
@@ -2257,7 +2257,7 @@ jobs:
       # the whole workflow file fails to load), and no ` #` in a name.
       - name: "The machine tree is repaired and checked, the anchor key's check, and the machine folder by handle (#3073, #3609, #3737, FR-145)"
         if: ${{ !cancelled() }}
-        run: cargo test -p roomler-node-core --lib -- machine_tree::tests machine_key::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make config::tests::machine_merge_base config::tests::machine_copy crash_recorder::tests machine_tree::held::tests --nocapture
+        run: cargo test -p roomler-node-core --lib -- machine_tree::tests machine_key::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make config::tests::machine_merge_base config::tests::machine_copy crash_recorder::tests machine_tree::held::tests logging::held_logs::tests --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.
@@ -3161,34 +3161,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: bash scripts/install-sh-output-check.sh --shell bash3.2
 
-  vendored-sctp:
-    # #3755 — the webrtc-sctp fork's own tests, which ran in no lane: the fork
-    # is not a workspace member, so no `cargo test` here builds them, and the
-    # drift check in rust-lint compares text only. The workspace's Cargo.lock
-    # seeds the fork's standalone build, so the tests run against the versions
-    # the agent ships with (a write cut short leans on tokio's semaphore); a
-    # build of its own would take the newest. `fuzz_artifact_test` reads
-    # fuzz/artifacts, which the crates.io package does not ship. Not in the
-    # `rust` aggregator's needs: these upstream tests have never run in CI, so
-    # this job earns a record of its own before it can turn "Rust checks" red.
-    #
-    # Appended after the last job, so no line a doc anchors moved.
-    name: Vendored webrtc-sctp tests
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-      - name: Test the fork against the workspace's pinned versions
-        run: |
-          cp Cargo.lock crates/vendored/webrtc-sctp/Cargo.lock
-          cargo test --manifest-path crates/vendored/webrtc-sctp/Cargo.toml --lib -- --skip fuzz_artifact_test
-
   job-steps-ended:
     # #3810 — the installer smoke's Windows job is re-run once, as attempt 2,
     # when it ended without every step reporting an end, if no guard of the
@@ -3211,31 +3183,149 @@ jobs:
       - name: Run the decision on every case
         run: bash scripts/job-steps-ended-test.sh
 
-  vendored-ice:
-    # FR-148 P4 — the webrtc-ice fork's own tests, which ran in no lane: the
-    # fork is not a workspace member, so no `cargo test` here builds them, and
-    # the drift check in rust-lint compares text only. Since P4 the fork holds
-    # the carrier rank, and agent_carrier_rank_test.rs is its only proof: the
-    # candidates' priorities, the pair order, the follow gate and the checks
-    # after the first selection, against a real TURN server on vnet. Seeded
-    # from the workspace's Cargo.lock, as vendored-sctp is. The upstream mDNS
-    # cells are skipped: the fork's patch never touches mDNS, and one of them
-    # hung for minutes on a Windows box (measured 2026-11-17). Not in the
-    # `rust` aggregator's needs, for vendored-sctp's reason.
+  vendored-tests:
+    # #4503 — the vendored forks' own tests, one entry per crate under
+    # crates/vendored/ that has a Cargo.toml. A fork carries roomler's
+    # patches, and its own tests are what guard them, yet no fork is a
+    # workspace member, so no other `cargo test` in this file builds one, and
+    # the drift checks in rust-lint compare text only. The next job,
+    # vendored-lanes-audit, fails a fork with no entry and an entry with no
+    # fork.
     #
-    # Appended after the last job, so no line a doc anchors moved.
-    name: Vendored webrtc-ice tests
+    # Each entry seeds the fork's standalone build with the workspace's
+    # Cargo.lock, so the fork is tested against the versions the agent ships
+    # with (a write cut short leans on tokio's semaphore); a build of its own
+    # would take the newest. `patches` are the other forks in its graph, given
+    # as the workspace's [patch.crates-io] gives them: the webrtc fork calls
+    # their patched API and does not compile against crates.io's copies.
+    # `args` go to cargo. `skip` names tests exactly (`--exact`), with their
+    # reason above them.
+    #
+    # The webrtc-sctp and webrtc-ice entries were the jobs vendored-sctp
+    # (#3755) and vendored-ice (FR-148 P4), and their checks keep their names.
+    # Not in the `rust` aggregator's needs: four entries have never run in CI,
+    # so each earns a record of its own before it can turn "Rust checks" red.
+    # A red entry is still a red check.
+    #
+    # Appended after the last job. The two jobs it replaced were taken out,
+    # and the one doc anchor on them (docs/tunnels.md) now points here.
+    name: Vendored ${{ matrix.crate }} tests
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
+    # #3352: the Windows entry's steps stop at their first failing command
+    # (scripts/windows-shell-guard.sh).
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # Each fork's result is its own: a red entry cancels no other.
+      fail-fast: false
+      matrix:
+        include:
+          - crate: rtp
+            runner: ubuntu-latest
+            timeout: 15
+            args: --lib
+          # No tests of its own. The entry builds the X11 arm, patched too, as
+          # a test binary, which links libxcb, and runs none, so a test added
+          # to the fork runs from its first PR. The macOS and DXGI arms
+          # compile in the macOS and Windows jobs.
+          - crate: scrap
+            runner: ubuntu-latest
+            timeout: 15
+            system-deps: ci-linux-system-deps
+            args: --lib
+          - crate: webrtc
+            runner: ubuntu-latest
+            timeout: 15
+            patches: webrtc-sctp webrtc-ice rtp
+            args: --lib
+          # Since FR-148 P4 the fork holds the carrier rank, and
+          # agent_carrier_rank_test.rs is its only proof: the candidates'
+          # priorities, the pair order, the follow gate and the checks after
+          # the first selection, against a real TURN server on vnet.
+          - crate: webrtc-ice
+            runner: ubuntu-latest
+            timeout: 15
+            args: --lib
+            # The four upstream mDNS cells, skipped since FR-148 P4: one of
+            # them hung for minutes on a Windows box (measured 2026-11-17).
+            # The patch leaves src/mdns/ alone, but the two connection cells
+            # resolve the other agent's `.local` names, the path #1740
+            # patched.
+            skip: >-
+              mdns::mdns_test::test_generate_multicast_dnsname
+              mdns::mdns_test::test_multicast_dns_mixed_connection
+              mdns::mdns_test::test_multicast_dns_only_connection
+              mdns::mdns_test::test_multicast_dns_static_host_name
+          - crate: webrtc-sctp
+            runner: ubuntu-latest
+            timeout: 15
+            args: --lib
+            # Both read fuzz/artifacts, which the crates.io package does not
+            # ship, so they fail on any checkout.
+            skip: >-
+              fuzz_artifact_test::packet_crash_artifacts
+              fuzz_artifact_test::param_crash_artifacts
+          # Windows only. `--all-features` is the set the agent ships (tun
+          # asks for panic_on_unsent_packets, async, enable_inner_logging and
+          # winreg) and verify_binary_signature, which the fork's one test
+          # needs: it checks the publisher's signature on the bundled
+          # wintun/bin/amd64/wintun.dll, with no driver, no admin and no network
+          # (WTD_REVOKE_NONE). No test of the fork's covers its patch (an
+          # adapter's drop leaves the NetworkList entries alone).
+          - crate: wintun-bindings
+            runner: windows-latest
+            timeout: 15
+            args: --lib --all-features
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
+      - name: System packages — GTK/WebKit + libvpx/xcb/alsa sets (cached apt, verified)
+        if: ${{ matrix.system-deps == 'ci-linux-system-deps' }}
+        uses: ./.github/actions/ci-linux-system-deps
       - name: Test the fork against the workspace's pinned versions
+        env:
+          CRATE: ${{ matrix.crate }}
+          PATCHES: ${{ matrix.patches }}
+          ARGS: ${{ matrix.args }}
+          SKIP: ${{ matrix.skip }}
         run: |
-          cp Cargo.lock crates/vendored/webrtc-ice/Cargo.lock
-          cargo test --manifest-path crates/vendored/webrtc-ice/Cargo.toml --lib -- --skip mdns::
+          cp Cargo.lock "crates/vendored/$CRATE/Cargo.lock"
+          patch=()
+          for p in $PATCHES; do patch+=(--config "patch.crates-io.$p.path=\"crates/vendored/$p\""); done
+          skip=()
+          for s in $SKIP; do skip+=(--skip "$s"); done
+          # $ARGS unquoted: each word is one argument to cargo.
+          cargo test --manifest-path "crates/vendored/$CRATE/Cargo.toml" "${patch[@]}" $ARGS -- --exact "${skip[@]}"
+
+  vendored-lanes-audit:
+    # #4503 — every vendored fork has an entry in the matrix above, and every
+    # entry names a fork: scripts/vendored-lanes-audit.sh says what it reads.
+    # A fork joins the tree by hand (its directory, and a line in each of the
+    # root Cargo.toml's `exclude` and [patch.crates-io]), and nothing there
+    # asks for a lane, so a fork could join with its own tests run nowhere.
+    # The job takes seconds, so it runs on every pull request, docs-only ones
+    # too, with no `needs`: a failed `changes` job cannot skip it. It is a job
+    # of its own, not a step of rust-lint, because a step there would move
+    # every line below it that a doc anchors. The self-test runs first, so a
+    # green job means the audit caught every planted fault on this runner's
+    # awk.
+    #
+    # Appended after the last job.
+    name: Every vendored fork has a test lane (#4503)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the audit catches what it says (planted faults)
+        run: bash scripts/vendored-lanes-audit.sh --selftest
+      - name: Every fork has one entry, and every entry names a fork
+        run: bash scripts/vendored-lanes-audit.sh

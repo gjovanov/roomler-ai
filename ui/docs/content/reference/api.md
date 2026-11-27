@@ -67,7 +67,7 @@ grant out of existence.
 | `auth`, `oauth`, `user` | Sign-in, registration, profile |
 | `tenant`, `member`, `role`, `invite` | Organizations, membership, permissions |
 | `room`, `message`, `reaction`, `file` | Chat and files |
-| `recording`, `export`, `search` | Call recordings, exports, search |
+| `recording`, `export`, `search` | Call-recording rows (metadata only: nothing records the call), exports, search |
 | `agent`, `session`, `turn` | Devices, remote sessions, relay credentials |
 | `notification`, `push` | Notifications |
 | `health` | Liveness and readiness |
