@@ -710,7 +710,7 @@ never have measured, and an unmeasured capability is `None`, never `false` (`Cap
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:144-146`.
 It does: the name is the one this network's netmap gives the relay node
-(`crates/tunnel-core/src/overlay/runtime.rs:3305`, `:4487`), and the netmap takes it from that
+(`crates/tunnel-core/src/overlay/runtime.rs:3305`, `:4489`), and the netmap takes it from that
 network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:3187-3191`). A
 relay node missing from the map shows as its node id in hex.
 

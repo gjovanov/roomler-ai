@@ -16,9 +16,9 @@
 //! | a REMOTE candidate on a mesh address, when the controller's browser runs on an overlay node; the agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN no matter which candidates the agent offered | [`RcOverlay::keeps_remote_candidate`] on every trickled candidate, [`RcOverlay::strip_sdp`] on the offer |
 //! | an ICE SERVER on a mesh address — the loopback-TURN relay the Hub appends for a corp controller | [`RcOverlay::ice_servers`] (the Hub also withholds it) |
 //!
-//! "Overlay address" is exact: the blocks this daemon's overlay routes
-//! ([`tunnel_core::overlay_footprint`]) and the derived-v6 ULA — never the
-//! whole CGNAT `/10`, which LTE modems, cloud VPCs and other meshes use too.
+//! "Overlay address" is exact: the blocks this daemon's overlay routes as they stand when a
+//! filter judges the address (#3359, [`tunnel_core::overlay_footprint`]), and the derived-v6
+//! ULA — never the whole CGNAT `/10`, which LTE modems, cloud VPCs and other meshes use too.
 //!
 //! On, nothing is filtered beyond the name rule: the behaviour from before
 //! the switch existed.
@@ -69,8 +69,8 @@ pub struct RcOverlay {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<IpAddr>,
     /// The overlay's v4 blocks, snapshotted by the DAEMON when the session is
-    /// requested. Carried rather than re-read so a delegated session's GUI
-    /// worker, which runs no overlay of its own, filters the same addresses.
+    /// requested. Carried so a delegated session's GUI worker filters by them
+    /// too; the filters read them unioned with the footprint ([`Self::blocks`]).
     /// In rank mode they are carried when the mesh is allowed too: the rank
     /// needs them to know a mesh address.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -424,7 +424,7 @@ impl RcOverlay {
     }
 
     fn blocks(&self, ip: IpAddr) -> bool {
-        (!self.allow && footprint::is_overlay_addr(&self.v4_nets, ip)) || self.exclude.contains(&ip)
+        (!self.allow && self.is_overlay_now(ip)) || self.exclude.contains(&ip)
     }
 
     /// Nothing to filter at all: `on`, or an `auto` session that rides the
@@ -811,6 +811,43 @@ fn url_host_ip(url: &str) -> Option<IpAddr> {
         hostport.rsplit_once(':').map_or(hostport, |(h, _)| h)
     };
     host.parse().ok()
+}
+
+/// #3359 — the footprint as it stands, for the four filters.
+impl RcOverlay {
+    /// Is `ip` an overlay address for this session's filters
+    /// ([`Self::blocks`])? By the footprint AS IT STANDS when the filter
+    /// judges the address ([`footprint::is_overlay_addr_now`]), unioned with
+    /// the copy the session carried (`v4_nets`, all a delegated worker held
+    /// before the daemon's first push). A session requested before the first
+    /// netmap carries an empty copy for its whole life, and still filters by
+    /// every block recorded after it. The footprint only grows, so a later
+    /// judgement can only keep more out, and neither side is ever the CGNAT
+    /// `/10`.
+    ///
+    /// ⚠️ Called from the ICE agent's gather (the `SettingEngine` IP filter):
+    /// the registry's lock is a std one, never held across an `.await`.
+    fn is_overlay_now(&self, ip: IpAddr) -> bool {
+        footprint::is_overlay_addr(&self.v4_nets, ip) || footprint::is_overlay_addr_now(ip)
+    }
+
+    /// The v4 blocks this session's filters judge by, counted for its
+    /// `rc ICE` line (`overlay_blocks`): kept off the mesh, the footprint as
+    /// it stands now unioned with the session's copy; allowed, the copy, as
+    /// before (empty, or the carrier rank's blocks). The footprint only
+    /// grows, so the gather that follows can only hold more.
+    pub fn overlay_blocks(&self) -> usize {
+        if self.allow {
+            return self.v4_nets.len();
+        }
+        let mut held = footprint::v4_nets();
+        for net in &self.v4_nets {
+            if !held.contains(net) {
+                held.push(*net);
+            }
+        }
+        held.len()
+    }
 }
 
 /// #3359 — what each of a session's four filters does with `addr`, in order:

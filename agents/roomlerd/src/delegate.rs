@@ -143,10 +143,10 @@ pub enum DelegateFrame {
     /// those resolve the device's `rc_overlay` against the worker's footprint.
     /// Empty, it read the `utunN` address as foreign, and a session meant to
     /// stay off the overlay offered it as a host candidate (field, 0.4.122:
-    /// `overlay_blocks=0`). Sent after [`DelegateFrame::Attached`] and again
-    /// with a [`DelegateFrame::Pong`] whenever the set has grown; the worker
-    /// adds what it is told, since the registry only grows. An older worker
-    /// skips the frame, as every reader here skips what it does not know.
+    /// `overlay_blocks=0`). Sent after [`DelegateFrame::Attached`], the moment
+    /// the set grows and ahead of any frame queued after it grew (#3359), and
+    /// behind a [`DelegateFrame::Pong`]; the worker adds what it is told. An
+    /// older worker skips the frame, as every reader here skips what it does not know.
     OverlayFootprint {
         v4_nets: Vec<(std::net::Ipv4Addr, u8)>,
     },
@@ -2158,6 +2158,10 @@ impl DelegateHost {
         )
         .await?;
         // #1882 — the worker's OWN sessions need the overlay's blocks too.
+        // #3359 — subscribed BEFORE the first read, so a block recorded
+        // between the two still wakes the push in the loop below.
+        let mut grown = tunnel_core::overlay_footprint::grown();
+        let mut hears_growth = true;
         let mut footprint_sent = Vec::new();
         if let Some(frame) = self.footprint_update(&mut footprint_sent) {
             write_frame(&mut wr, &frame).await?;
@@ -2180,9 +2184,31 @@ impl DelegateHost {
         let mut lines = crate::line_limit::Lines::new(BufReader::new(rd), DELEGATE_LINE_MAX);
         loop {
             let line = tokio::select! {
+                // #3359 — the footprint grew: the worker hears it now, not
+                // with its next ping, so its sessions filter by the block
+                // from the moment the daemon has it.
+                changed = grown.changed(), if hears_growth => {
+                    if changed.is_err() {
+                        // The sender is a process-wide static and never
+                        // closes. Should it, the ping-time check below still
+                        // pushes, and this arm stops waking for nothing.
+                        hears_growth = false;
+                    } else if let Some(frame) = self.footprint_update(&mut footprint_sent) {
+                        write_frame(&mut wr, &frame).await?;
+                    }
+                    continue;
+                }
                 queued = to_worker_rx.recv() => {
                     match queued {
                         Some(frame) => {
+                            // #3359 — whichever arm woke first, a block the
+                            // daemon recorded before this frame was queued
+                            // goes out AHEAD of it. The worker reads its
+                            // channel in order, so an offer never reaches it
+                            // ahead of a footprint the daemon already had.
+                            if let Some(update) = self.footprint_update(&mut footprint_sent) {
+                                write_frame(&mut wr, &update).await?;
+                            }
                             write_frame(&mut wr, &frame).await?;
                             continue;
                         }
@@ -2200,9 +2226,10 @@ impl DelegateHost {
             match serde_json::from_str::<DelegateFrame>(&line) {
                 Ok(DelegateFrame::Ping) => {
                     write_frame(&mut wr, &DelegateFrame::Pong).await?;
-                    // #1882 — a grown footprint rides the worker's own liveness
-                    // cadence: the overlay may join well after the worker
-                    // attached, and this loop has no timer of its own.
+                    // #1882 — and behind the pong, a grown footprint that no
+                    // growth signal announced (#3359 pushes the daemon's own
+                    // at once, above): a source other than the process's
+                    // footprint is read only here.
                     if let Some(frame) = self.footprint_update(&mut footprint_sent) {
                         write_frame(&mut wr, &frame).await?;
                     }
@@ -2944,6 +2971,7 @@ pub(crate) mod tests {
     /// #1882 — the daemon tells an attached worker the overlay's blocks: right
     /// after `attached`, and again after a `pong` once they have grown — never
     /// twice for the same set, so liveness does not turn into a broadcast.
+    /// (#3359's push at the moment of growth has cells of its own below.)
     #[tokio::test]
     async fn the_daemon_pushes_its_overlay_footprint_to_the_worker() {
         let a = (std::net::Ipv4Addr::new(100, 65, 4, 0), 22);
@@ -2983,13 +3011,22 @@ pub(crate) mod tests {
         // next ping's pong would otherwise come second).
         cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
         assert!(matches!(next(&mut lines).await, DelegateFrame::Pong));
-        // Grown: the next ping's pong carries the new set behind it.
+        // Grown: the next ping's pong carries the new set behind it. #3359 —
+        // or the set goes out ahead of the pong: another test that records a
+        // block in this process wakes the push, which then reads this source
+        // too. Either order, the grown set exactly once.
         TEST_FOOTPRINT.lock().unwrap().push(b);
         cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
-        assert!(matches!(next(&mut lines).await, DelegateFrame::Pong));
-        match next(&mut lines).await {
-            DelegateFrame::OverlayFootprint { v4_nets } => assert_eq!(v4_nets, [a, b]),
-            other => panic!("expected the grown footprint, got {other:?}"),
+        let (mut ponged, mut grown) = (false, false);
+        while !(ponged && grown) {
+            match next(&mut lines).await {
+                DelegateFrame::Pong if !ponged => ponged = true,
+                DelegateFrame::OverlayFootprint { v4_nets } if !grown => {
+                    assert_eq!(v4_nets, [a, b]);
+                    grown = true;
+                }
+                other => panic!("expected the pong and the grown footprint, got {other:?}"),
+            }
         }
 
         // ⚠️ Both halves: the daemon sees EOF only when the whole client

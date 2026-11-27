@@ -2192,6 +2192,12 @@ impl OverlayRuntime {
             }
         };
 
+        // #3359 — the org's blocks are recorded HERE, from the netmap, before
+        // the TUN factory below gives the adapter its overlay address: a
+        // remote-desktop session requested in between filters by them.
+        let nat_cidrs = org_blocks(&network);
+        crate::overlay_footprint::note_v4_nets(&nat_cidrs);
+
         let Ok(self_v4) = self_ip.parse::<Ipv4Addr>() else {
             warn!(%self_ip, "overlay: server sent a non-IPv4 self_ip; aborting runtime");
             return;
@@ -2248,16 +2254,10 @@ impl OverlayRuntime {
         // `cidrs` is empty from a pre-P5d server, and then this is exactly the
         // single `network.cidr` it always was. It is also a one-element list
         // for every org that has not grown — so the commands issued are
-        // byte-identical on every deployment that exists today.
-        let nat_cidrs: Vec<String> = if network.cidrs.is_empty() {
-            vec![network.cidr.clone()]
-        } else {
-            network.cidrs.clone()
-        };
+        // byte-identical on every deployment that exists today (`org_blocks`).
         // #1882 — the same blocks are what reaches this process THROUGH the
         // mesh; remote desktop's ICE reads them to keep a session off the
-        // overlay when the device asks it to.
-        crate::overlay_footprint::note_v4_nets(&nat_cidrs);
+        // overlay when the device asks it to (#3359: recorded above).
         // #3562 — the setup's outcome decides the offer: a failed one
         // withdraws it (re-sent to the server at once) and the loop retries it
         // with a backoff; an exit whose own IPv6 NAT came up says so. It serves
@@ -4193,6 +4193,8 @@ impl OverlayRuntime {
                                 "overlay: re-join returned a different identity/network — exiting for a clean rebuild");
                             break;
                         }
+                        // #3359 — a block the org has grown since is recorded too.
+                        crate::overlay_footprint::note_v4_nets(&org_blocks(&new_network));
                         #[cfg(test)]
                         {
                             let stall = TEST_NETMAP_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -4716,6 +4718,17 @@ fn log_offer_change(t: &super::nat::OfferTracker) {
             "overlay: route offer WITHDRAWN (no /0, no subnet route advertised): the exit setup failed; it is retried with a backoff"),
         None => info!(routes = ?t.offer().routes, exit_serves_v6 = ?t.exit_serves_v6(),
             "overlay: route offer follows the exit setup"),
+    }
+}
+
+/// FR-47 P5e — every v4 block of the org a netmap names: its `cidrs`, or the
+/// single `cidr` a pre-P5d server sends. What the NAT covers, and (#3359)
+/// what the footprint records from each netmap.
+fn org_blocks(network: &OverlayNetworkInfo) -> Vec<String> {
+    if network.cidrs.is_empty() {
+        vec![network.cidr.clone()]
+    } else {
+        network.cidrs.clone()
     }
 }
 
