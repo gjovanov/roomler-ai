@@ -1040,14 +1040,14 @@ UDP-blocked:
 ### How an agent socket ended (#3517)
 
 Every end of a registered agent socket leaves one line on the pod that held it, at the
-end of its teardown (`crates/modules/fleet/src/socket.rs:1083-1095`), and its `cause`
+end of its teardown (`crates/modules/fleet/src/socket.rs:1102-1114`), and its `cause`
 says how the socket ended:
 
 ```
 INFO roomler_ai_mod_fleet::socket: remote-control agent WS disconnected agent_id=… cause=error kind=eof error="…"
 ```
 
-Each exit of the read loop (`socket.rs:534`) breaks with a `SocketEnd`
+Each exit of the read loop (`socket.rs:553`) breaks with a `SocketEnd`
 (`crates/modules/fleet/src/socket_end.rs:25`), so an exit added later does not compile
 until it names its cause. `cause` is always on the line. Every other field appears only
 with the cause it belongs to, so the line never carries a field that means nothing for
@@ -1072,22 +1072,23 @@ flowchart LR
 | `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
 | `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2336`) |
 | `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
-| `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:556`). The check runs on a tick, so `elapsed_s` reads past the deadline |
+| `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:575`). The check runs on a tick, so `elapsed_s` reads past the deadline |
 | `cancelled` | `by` | the Hub cancelled the loop; `by` below |
 | `sleep` | — | the device said it is going to sleep (FR-55 P4). Its daemon sends a close frame next, which the loop never reads |
 | `stream_end` | — | the stream ended with neither a frame nor an error. tokio-tungstenite ends it that way only after a close or an error, and the loop leaves on both first, so this is not expected |
 
 `by`, for `cause=cancelled`. Each trigger records itself just before its notify
-(`AgentCancel`, `crates/modules/fleet/src/hub.rs:217`), with the notify call itself
+(`AgentCancel`, `crates/modules/fleet/src/hub.rs:222`), with the notify call itself
 unchanged. The cancel arm's own line, `agent connection cancelled by Hub; exiting
 read-loop`, carries the same `by`.
 
 | `by` | the trigger |
 |---|---|
-| `replaced` | a newer connection for the same agent registered (`Hub::register_agent`, `hub.rs:1103`): a reconnect that beat the old socket's teardown, or two daemons on one identity |
-| `idle_nudge` | the idle nudge cycled an idle agent, so its reconnect re-hashes through the LB (`Hub::nudge_agent_if_idle`, `hub.rs:1332`) |
-| `renumber` | an overlay renumber (`Hub::cycle_agent_ws`, `hub.rs:1360`) |
-| `shutdown` | this pod's graceful shutdown (`Hub::cancel_all_agents`, `hub.rs:1375`) |
+| `replaced` | a newer connection for the same agent registered (`Hub::register_agent`, `hub.rs:1132`): a reconnect that beat the old socket's teardown, or two daemons on one identity |
+| `idle_nudge` | the idle nudge cycled an idle agent, so its reconnect re-hashes through the LB (`Hub::nudge_agent_if_idle`, `hub.rs:1361`) |
+| `renumber` | an overlay renumber (`Hub::cycle_agent_ws`, `hub.rs:1389`) |
+| `shutdown` | this pod's graceful shutdown (`Hub::cancel_all_agents`, `hub.rs:1404`) |
+| `rotated` | the device's token rotated (FR-155), and this connection was admitted below the new generation (`Hub::end_below_generation`, `crates/modules/fleet/src/hub/rotation.rs:163`): on the pod the rotation reached, or on another through the control channel's `end_below_generation` (`ctrl.rs:284`). Nothing is sent to the device first |
 | `unknown` | a cancel with no trigger recorded. Nothing fires one today |
 
 `kind`, for `cause=error` (`error_kind`, `socket_end.rs:138`):
@@ -1113,7 +1114,7 @@ pins. If axum moves to another one, every error reads `other`, and the loopback 
 `socket::tests::a_dropped_tcp_leg_reads_eof` fails first.
 
 **Before the hello.** A socket that ends before its `rc:agent.hello` registered nothing,
-so it gets no disconnect line. The hello wait (`read_next_rc`, `socket.rs:1295`) says
+so it gets no disconnect line. The hello wait (`read_next_rc`, `socket.rs:1314`) says
 how it ended on its own warn line, `agent opened WS without rc:agent.hello — closing`,
 with the same `cause`, `code`, `reason`, `kind` and `error`. Before #3517 that line read
 `other=None` for every end.

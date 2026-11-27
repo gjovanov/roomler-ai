@@ -422,20 +422,23 @@ async fn an_external_session_is_marked_on_its_row_only_under_a_window() {
     let mut kept = Vec::new();
     for (window, marked) in [(Some(60), true), (None, false)] {
         let (agent_id, tenant_id) = (ObjectId::new(), ObjectId::new());
-        let reg = hub.register_agent_resuming(
-            agent_id,
-            tenant_id,
-            ObjectId::new(),
-            OsKind::Linux,
-            2,
-            true,
-            false,
-            ResumeHello {
-                advertised: true,
-                window,
-                kept: Vec::new(),
-            },
-        );
+        let reg = hub
+            .register_agent_resuming(
+                agent_id,
+                tenant_id,
+                ObjectId::new(),
+                OsKind::Linux,
+                2,
+                true,
+                false,
+                0,
+                ResumeHello {
+                    advertised: true,
+                    window,
+                    kept: Vec::new(),
+                },
+            )
+            .expect("no rotation floor here");
         let (tx, rx) = mpsc::channel(32);
         let sid = hub
             .create_session_full(

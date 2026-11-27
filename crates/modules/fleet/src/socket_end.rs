@@ -241,6 +241,7 @@ mod tests {
         assert_eq!(by(Some(CancelReason::IdleNudge)), Some("idle_nudge"));
         assert_eq!(by(Some(CancelReason::Renumber)), Some("renumber"));
         assert_eq!(by(Some(CancelReason::Shutdown)), Some("shutdown"));
+        assert_eq!(by(Some(CancelReason::Rotated)), Some("rotated"));
         assert_eq!(by(None), Some("unknown"));
     }
 
