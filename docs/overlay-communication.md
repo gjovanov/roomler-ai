@@ -110,7 +110,7 @@ numbers. On `rc:overlay.join` the server looks the machine up by
   capability vector, the warm relay. So a node that joins again mid-session
   (a control-WS Reattach, or an exit whose setup changed its offer, #3562)
   follows the join with what it wiped (`rejoin_plan`,
-  `crates/tunnel-core/src/overlay/runtime.rs:4682`), and an exit's re-offer
+  `crates/tunnel-core/src/overlay/runtime.rs:4684`), and an exit's re-offer
   reaches the admin row and every peer at once
   ([`overlay-exit-nodes.md`](./overlay-exit-nodes.md#the-offer-follows-the-setup-3562)).
 - **no live node** → `allocate_host` pops the head of `free_hosts` (FIFO, so an
@@ -219,7 +219,7 @@ WireGuard device, the TUN and every carrier running, one runtime per tenant
 re-attaches it (`OverlayEvent::Reattach`, `:275`) instead of starting another,
 the runtime joins again, and the full netmap the server answers that join with
 is the reconcile: whatever the runtime still holds that the netmap no longer
-lists is pruned (`crates/tunnel-core/src/overlay/runtime.rs:4221`). What the
+lists is pruned (`crates/tunnel-core/src/overlay/runtime.rs:4223`). What the
 device's own peer list says in between is in
 [§8](#the-peer-list-while-the-control-socket-is-down-4367).
 
@@ -311,7 +311,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:460`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:517`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -617,7 +617,7 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2224`](../crates/tunnel-core/src/overlay/runtime.rs#L2224),
+  ([`runtime.rs:2230`](../crates/tunnel-core/src/overlay/runtime.rs#L2230),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
@@ -625,7 +625,7 @@ does instead:
   `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
   or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
 - `roomler status` prints it only when the firewall limits what a mesh peer
-  reaches ([`localclient.rs:3218`](../agents/roomler-cli/src/localclient.rs#L3218)):
+  reaches ([`localclient.rs:3231`](../agents/roomler-cli/src/localclient.rs#L3231)):
 
   ```text
     host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
@@ -861,10 +861,10 @@ receiving node's line tells `backpressure` and `unrouted`.
 |---|---|---|---|
 | sending node, `DerpConn::send_to` (`crates/tunnel-core/src/transport/derp.rs:307`) | the shared outbound queue already holds 512 frames (`OUTBOUND_QUEUE`, `:55`) | `dropped_full` (`:308`), one count for every conn of the mux | the drop line |
 | sending node, the WS writer (`agents/roomlerd/src/derp.rs:550`) | the frame waited past the age bound (above) | `dropped_stale` (`DerpMux::note_stale_drop`, `crates/tunnel-core/src/transport/derp.rs:456`) | the drop line |
-| relay, both: central `forward_frame` (`crates/modules/network/src/derp.rs:691`), regional (`crates/derp-relay/src/main.rs:1091`) | a bulk frame of an org past its plan's monthly relay (FR-115) | `derp_allowance_shaped_total` | INFO, at most one per network and source per 30 s (central) or per network per 10 s (regional) |
-| central relay only (`crates/modules/network/src/derp.rs:674`, `:709`) | the overlay ACL denies the pair; a tunnel-leg frame over its rate | the ACL drop is not counted; `derp_tunnel_shaped_total` | INFO `derp: dropped a frame the overlay ACL denies`; the shaper's INFO at most one per network and source per 30 s |
-| relay, both: central (`crates/modules/network/src/derp.rs:725`), regional (`crates/derp-relay/src/main.rs:1102`) | no registration for (network, dst) here: the peer is offline, or registered on another pod or relay | `derp_miss_total` | INFO, at most one per network and destination per 30 s; on the central relay also its census line each minute (`crates/modules/network/src/derp.rs:286`) |
-| relay, both: central (`crates/modules/network/src/derp.rs:749`), regional (`crates/derp-relay/src/main.rs:1125`) | the destination's send queue refused it: full (a slow or half-open consumer), or closed by a socket on its way out | `derp_full_total` | WARN, at most one per network and destination per 30 s; the central relay's census line |
+| relay, both: central `forward_frame` (`crates/modules/network/src/derp.rs:693`), regional (`crates/derp-relay/src/main.rs:1091`) | a bulk frame of an org past its plan's monthly relay (FR-115) | `derp_allowance_shaped_total` | INFO, at most one per network and source per 30 s (central) or per network per 10 s (regional) |
+| central relay only (`crates/modules/network/src/derp.rs:676`, `:711`) | the overlay ACL denies the pair; a tunnel-leg frame over its rate | the ACL drop is not counted; `derp_tunnel_shaped_total` | INFO `derp: dropped a frame the overlay ACL denies`; the shaper's INFO at most one per network and source per 30 s |
+| relay, both: central (`crates/modules/network/src/derp.rs:727`), regional (`crates/derp-relay/src/main.rs:1102`) | no registration for (network, dst) here: the peer is offline, or registered on another pod or relay | `derp_miss_total` | INFO, at most one per network and destination per 30 s; on the central relay also its census line each minute (`crates/modules/network/src/derp.rs:286`) |
+| relay, both: central (`crates/modules/network/src/derp.rs:751`), regional (`crates/derp-relay/src/main.rs:1125`) | the destination's send queue refused it: full (a slow or half-open consumer), or closed by a socket on its way out | `derp_full_total` | WARN, at most one per network and destination per 30 s; the central relay's census line |
 | receiving node, `DerpMux::deliver` (`crates/tunnel-core/src/transport/derp.rs:622`) | the mux holds no route for the frame's source | `dropped_unrouted` (`:623`), and `DERP_INBOUND_UNROUTED`; the runtime is told to follow that peer onto DERP | the drop line; `NodeStatus.derp_inbound_drops`, which `roomler status` prints |
 | receiving node, `DerpMux::deliver` (`crates/tunnel-core/src/transport/derp.rs:603`, `:611`) | a routed consumer's queue (256 frames, `INBOUND_QUEUE`, `:80`) is full, or closed since a better tier replaced the carrier | `dropped_backpressure` (`:604`, `:617`), and `DERP_INBOUND_BACKPRESSURE` | the drop line; `NodeStatus.derp_inbound_drops` |
 
@@ -1264,7 +1264,7 @@ match this node`), and an org-relay grant that needs them is refused.
     are said on a target of their own, `tunnel_core::overlay::route_guard`
     (`ROUTE_GUARD_LOG`, `crates/tunnel-core/src/overlay/mod.rs:121`), which
     the daemon's log filter keeps at INFO whatever `RUST_LOG` says
-    (`crates/agent-core/src/logging.rs:472`), as FR-110 does for `sockbuf`
+    (`crates/agent-core/src/logging.rs:529`), as FR-110 does for `sockbuf`
     ([fleet-rpc.md](fleet-rpc.md)). The Linux package's units and the macOS
     package's LaunchAgent set `RUST_LOG=roomlerd=info,warn`, which drops every
     other `tunnel_core` INFO and, until #4380, dropped these two as well; the
@@ -1304,8 +1304,8 @@ match this node`), and an org-relay grant that needs them is refused.
   So the child usually exits before the daemon's run loop has heard the stop,
   and #1867's WARN used to go out on every restart. The daemon now marks its
   stop as the first thing each arm of `run`'s shutdown `select!` does
-  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5881`, `:5917`,
-  `:5929`). After the child exits, the supervisor waits out the first part of
+  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5835`, `:5871`,
+  `:5883`). After the child exits, the supervisor waits out the first part of
   the backoff, at most 1 s (`STOP_GRACE`,
   `crates/tunnel-core/src/overlay/netstate.rs:1277`), before it says anything:
 
@@ -1815,7 +1815,7 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   `overlay::runtime_alive` (`agents/roomlerd/src/overlay.rs:122`): the tenant's
   runtime slot exists and its event channel is open. The daemon builds its
   LocalAPI state only with that probe (`DaemonState::for_daemon`,
-  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5238`); the
+  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5192`); the
   constructor without one is test-only.
 - **The mark** (`PeerInfo::control_down`, `crates/localapi/src/lib.rs:1026`) is
   additive. Its `since_ms` is when this device lost that socket, stamped by the
@@ -1824,14 +1824,14 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   the socket's 80 s receive deadline before. In a kept row `connection`,
   `stalled`, `rtt_ms` and `last_seen_ms` stay live, and `online` is the server's
   word from before the loss, never rewritten. A token refused at the upgrade is
-  kept and marked too: any HTTP 401 there refuses it (`signaling.rs:1874`), and a
+  kept and marked too: any HTTP 401 there refuses it (`signaling.rs:1880`), and a
   middlebox the machine trusts can answer one while the mesh runs on.
 - **Several orgs.** Each org's rows carry their own mark and time: the primary's
   outage no longer hides a secondary's live peers, and a secondary's outage no
   longer lists its peers as live.
 - **What reads it.** `roomler peers` prints the rows as it always did, then one
   line per org whose socket is down and which columns are live
-  (`control_down_lines`, `agents/roomler-cli/src/localclient.rs:3387`):
+  (`control_down_lines`, `agents/roomler-cli/src/localclient.rs:3400`):
 
   ```
     control plane unreachable (lost 12m ago): peers listed from what this device's mesh still holds.

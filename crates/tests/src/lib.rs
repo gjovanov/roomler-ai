@@ -39,6 +39,11 @@ mod conference_view_tests;
 mod export_tests;
 #[cfg(test)]
 mod file_tests;
+/// FR-157 P2 — the server's read of a Mac's screen-worker word: the counts in
+/// both overviews, the device list's filter, and none of it while
+/// `rc.gui_worker_read` is off.
+#[cfg(test)]
+mod gui_worker_tests;
 /// An org membership takes its room memberships with it; an operator step
 /// ends the rows an org membership left before that.
 #[cfg(test)]
@@ -442,6 +447,12 @@ mod tenant_archive_tests;
 /// earlier token (agents and tunnel clients alike).
 #[cfg(test)]
 mod token_renewal_tests;
+/// FR-155 P1a — a device trades its agent token for one of the next
+/// generation: one rotation per generation, an answer that was lost asked for
+/// again with its rotation key, at most one first rotation an hour, the
+/// switches, and the audit.
+#[cfg(test)]
+mod token_rotation_tests;
 /// #1821, #1829 — what a removal leaves behind answers nothing: External
 /// access on a removed device, and an overlay join on the socket it still holds.
 #[cfg(test)]

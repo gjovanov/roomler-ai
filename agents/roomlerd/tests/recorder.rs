@@ -657,6 +657,136 @@ async fn a_slow_free_space_check_costs_the_recording_no_tick() {
     );
 }
 
+/// #3355 — each reader of the free-space probe asks about its own folder: the
+/// start gate and the continue gate about the staging folder the recording is
+/// written in, the stop path's remux about the folder its copy goes to. Only a
+/// probe that records what it was asked can tell: one that answers the same for
+/// every folder passes whatever folder a reader asks about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_free_space_reader_asks_about_its_own_folder() {
+    let dir = scratch();
+    let mut opts = options(dir.path());
+    opts.disk_check_every = Duration::from_millis(100);
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<std::path::PathBuf>::new()));
+    opts.free_space = FreeSpace::new({
+        let asked = asked.clone();
+        move |d: &Path| {
+            asked.lock().unwrap().push(d.to_path_buf());
+            Some(u64::MAX)
+        }
+    });
+    let (staging, dest_dir) = (opts.staging(), opts.dest_dir.clone());
+    let (result, _) = record_for(opts, CounterCapture::new(30), Duration::from_millis(1500)).await;
+    let summary = result.expect("the recording finalizes");
+    assert_eq!(summary.path, Some(dest_dir.join("test.mp4")));
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(
+        asked.first(),
+        Some(&staging),
+        "the start gate asks first, about the staging folder: {asked:#?}"
+    );
+    assert_eq!(
+        asked.iter().filter(|d| **d == dest_dir).count(),
+        1,
+        "the remux asks once, about the destination's folder: {asked:#?}"
+    );
+    let gate = asked.iter().skip(1).filter(|d| **d == staging).count();
+    assert!(
+        gate >= 3,
+        "the continue gate asked about the staging folder {gate} times in 1.5 s: {asked:#?}"
+    );
+    assert_eq!(
+        asked.len(),
+        2 + gate,
+        "every question is one of the three: {asked:#?}"
+    );
+}
+
+/// #3355 — the stop path's remux reads the recorder's own probe, about the
+/// destination's folder. With no room there for its copy it writes none, and the
+/// fragmented file is kept under the final name with every frame in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_with_no_room_for_the_copy_keeps_the_fragmented_file() {
+    let dir = scratch();
+    let mut opts = options(dir.path());
+    let dest_dir = opts.dest_dir.clone();
+    opts.free_space = FreeSpace::new({
+        let dest_dir = dest_dir.clone();
+        move |d: &Path| Some(if d == dest_dir.as_path() { 0 } else { u64::MAX })
+    });
+    let (result, events) =
+        record_for(opts, CounterCapture::new(30), Duration::from_millis(1500)).await;
+    let summary = result.expect("the recording ends with a file");
+    let path = summary.path.expect("the fragmented file is kept");
+    assert_eq!(path, dest_dir.join("test.mp4"));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            RecorderEvent::Stopped {
+                fragmented: true,
+                ..
+            }
+        )),
+        "no room for the copy, so the file stays fragmented: {events:?}"
+    );
+    assert!(
+        !dest_dir.join("test.mp4.remux-tmp").exists(),
+        "no copy was started"
+    );
+    let frames = roomlerd::recording::mp4::read_fragmented(&path)
+        .expect("the kept file is the fragmented recording")
+        .samples(VIDEO_TRACK_ID)
+        .len();
+    assert!(frames >= 15, "the recording is in it ({frames} frames)");
+}
+
+/// #3355 — the probe reads the folder's own file system. `/dev/shm` is a tmpfs,
+/// which `sysinfo`'s mount list leaves out, so a probe that matched the folder
+/// against that list read `/`'s free space for it. `df` asks the folder's own
+/// file system, and so must the probe.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tmpfs_folder_reads_its_own_free_space() {
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        eprintln!("no /dev/shm on this host — skipping");
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("roomler-3355-")
+        .tempdir_in(shm)
+        .expect("a folder in /dev/shm");
+    let df = |p: &Path| -> u64 {
+        let out = std::process::Command::new("df")
+            .args(["-B1", "--output=avail"])
+            .arg(p)
+            .output()
+            .expect("run df");
+        assert!(out.status.success(), "df {}: {out:?}", p.display());
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .last()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("df's answer for {}: {out:?}", p.display()))
+    };
+    let (shm_df, root_df) = (df(dir.path()), df(Path::new("/")));
+    let probe = roomlerd::recording::folder::available_space(dir.path())
+        .expect("the probe answers for a folder that exists");
+    // Free space moves while other processes write; 64 MiB is far inside the
+    // difference between the two file systems that this test tells apart.
+    const SLACK: u64 = 64 << 20;
+    assert!(
+        probe.abs_diff(shm_df) <= SLACK,
+        "the probe read {probe} bytes free in {}, where df reads {shm_df} (and {root_df} for /)",
+        dir.path().display()
+    );
+    if shm_df.abs_diff(root_df) <= 2 * SLACK {
+        eprintln!(
+            "/dev/shm and / have the same room here ({shm_df}, {root_df}), so this run cannot tell them apart"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_frame_refuses_the_start() {
     let dir = scratch();
@@ -1191,6 +1321,10 @@ mod process {
         let dir = scratch();
         let (staging, partial) = a_killed_recorders_partial(dir.path());
         let gone = dir.path().join("unplugged");
+        let want = read_fragmented(&partial)
+            .unwrap()
+            .samples(VIDEO_TRACK_ID)
+            .len();
 
         let done = recorder::reconcile_partials(&staging, &gone);
         assert!(done.is_empty(), "nowhere to put it: {done:?}");
@@ -1199,7 +1333,13 @@ mod process {
         std::fs::create_dir(&gone).unwrap();
         let done = recorder::reconcile_partials(&staging, &gone);
         assert_eq!(done.len(), 1, "and the next start finalizes it");
-        assert!(ProgressiveFile::open(&done[0]).is_ok());
+        // The samples, not only an open: a fragmented file opens too.
+        let n = ProgressiveFile::open(&done[0])
+            .unwrap()
+            .samples(VIDEO_TRACK_ID)
+            .unwrap()
+            .len();
+        assert_eq!(n, want, "a progressive file with every frame");
     }
 
     /// The temp is replaced, never opened: a link standing at its name, as
@@ -1211,11 +1351,114 @@ mod process {
         let theirs = dir.path().join("someone-elses.txt");
         std::fs::write(&theirs, b"someone else's").unwrap();
         std::fs::hard_link(&theirs, remux_temp_of(dir.path(), &partial)).unwrap();
+        let want = read_fragmented(&partial)
+            .unwrap()
+            .samples(VIDEO_TRACK_ID)
+            .len();
 
         let done = recorder::reconcile_partials(&staging, dir.path());
         assert_eq!(done.len(), 1);
         assert_eq!(std::fs::read(&theirs).unwrap(), b"someone else's");
-        assert!(ProgressiveFile::open(&done[0]).is_ok());
+        // The samples, not only an open: a fragmented file opens too.
+        let n = ProgressiveFile::open(&done[0])
+            .unwrap()
+            .samples(VIDEO_TRACK_ID)
+            .unwrap()
+            .len();
+        assert_eq!(n, want, "a progressive file with every frame");
+    }
+
+    /// #3355 — the remux owns its temp name from its first step. A dead remux's
+    /// temp beside a partial that cannot be read goes too: the reconciler puts
+    /// that partial under its final name, and after that no retry ever comes
+    /// for the temp beside it.
+    #[test]
+    fn a_dead_remuxs_temp_beside_an_unreadable_partial_is_removed() {
+        let dir = scratch();
+        let staging = dir.path().join(PARTIAL_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+        let partial = staging.join(format!("unreadable.mp4{PARTIAL_SUFFIX}"));
+        let mut w = FragmentedWriter::create(
+            &partial,
+            VideoTrack {
+                width: W,
+                height: H,
+                fps: 30,
+                color: ColorInfo::BT601_LIMITED,
+            },
+            None,
+        )
+        .unwrap();
+        let idr = [
+            0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0x88,
+        ];
+        w.push_video(0, &idr, true).unwrap();
+        drop(w);
+        // A media box with no fragment header before it: the file cannot be
+        // indexed, and that is not "nothing recoverable", so it is kept.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&partial)
+            .unwrap()
+            .write_all(&[0, 0, 0, 8, b'm', b'd', b'a', b't'])
+            .unwrap();
+        let Err(e) = read_fragmented(&partial) else {
+            panic!("precondition: the partial cannot be indexed");
+        };
+        assert!(
+            !e.is::<roomlerd::recording::mp4::NothingRecoverable>(),
+            "precondition: {e:#}"
+        );
+        let bytes = std::fs::read(&partial).unwrap();
+        let tmp = remux_temp_of(dir.path(), &partial);
+        std::fs::write(&tmp, b"half a remux").unwrap();
+
+        let done = recorder::reconcile_partials(&staging, dir.path());
+        assert_eq!(
+            done,
+            [dir.path().join("unreadable.mp4")],
+            "the partial is kept under its final name"
+        );
+        assert_eq!(std::fs::read(&done[0]).unwrap(), bytes, "as it was");
+        assert!(!tmp.exists(), "the dead remux's temp outlived the partial");
+        assert!(partials_in(&staging).is_empty());
+    }
+
+    /// #3355 — a remux that fails on the stop path logs its whole error chain.
+    /// `%e` printed only the outermost context, so a failed create read "remux
+    /// failed" with no cause. A folder standing at the temp's name makes the
+    /// create fail.
+    #[test]
+    fn a_failed_remux_on_the_stop_path_logs_its_innermost_cause() {
+        let dir = scratch();
+        let mut r = spawn(dir.path());
+        let started = r.wait_for("started", Duration::from_secs(30));
+        let dest = PathBuf::from(started["path"].as_str().expect("the final path"));
+        let mut tmp = dest.file_name().unwrap().to_os_string();
+        tmp.push(".remux-tmp");
+        std::fs::create_dir(dest.with_file_name(tmp)).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        writeln!(r.stdin.as_mut().unwrap(), r#"{{"cmd":"stop"}}"#).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut logged = Vec::new();
+        let stopped = loop {
+            let line = r
+                .lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("no `stopped` event within 30 s");
+            match roomlerd::recording::child::parse_event_line(&line) {
+                Some(v) if v["ev"] == "stopped" => break v,
+                Some(_) => {}
+                None => logged.push(line),
+            }
+        };
+        assert_eq!(stopped["fragmented"], true, "the remux failed: {stopped}");
+        assert!(r.wait_exit(Duration::from_secs(30)).success());
+        let line = logged
+            .iter()
+            .find(|l| l.contains("the remux failed"))
+            .unwrap_or_else(|| panic!("no line says the remux failed: {logged:#?}"));
+        assert!(line.contains("os error"), "the cause is not named: {line}");
     }
 
     /// The other half of the rule above: a partial with no complete fragment

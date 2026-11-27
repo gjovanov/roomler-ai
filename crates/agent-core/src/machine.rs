@@ -44,11 +44,11 @@ pub fn derive_machine_id(config_path: &Path) -> String {
 }
 
 /// OS hostname (POSIX `gethostname` on Unix, `COMPUTERNAME` env var
-/// on Windows). Exposed for `logs_upload.rs` so the agent's uploader
-/// can hash the hostname into `host_id_hash` per the rc.58 plan.
+/// on Windows, then `HOSTNAME`). The log uploader hashes it into
+/// `host_id_hash`, and a crash record names its host with it (#3934).
 pub fn hostname() -> std::io::Result<String> {
-    // `hostname` crate is another dep; keep things simple with `uname -n`
-    // (POSIX) / Windows GetComputerName (via HOSTNAME env var).
+    // No `hostname` crate: gethostname(3) itself on Unix, and on Windows
+    // the `COMPUTERNAME` variable, then `HOSTNAME`.
     #[cfg(unix)]
     {
         // SAFETY: gethostname(3) takes a buffer and writes a NUL-terminated

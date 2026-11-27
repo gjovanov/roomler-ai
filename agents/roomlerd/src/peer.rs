@@ -488,10 +488,9 @@ impl AgentPeer {
         setting.set_interface_filter(Box::new(|name: &str| !is_overlay_iface(name)));
         // #1882 — unless the device lets remote desktop use the overlay, keep
         // its ADDRESSES out of the host candidates too, whatever the interface
-        // is called: the overlay's own blocks and the derived-v6 ULA, never the
-        // whole CGNAT `/10` (the CGNAT caveat above still holds). Remote
-        // candidates and ICE servers get the same rule below and in
-        // `add_remote_candidate`.
+        // is called: the overlay's blocks as they stand when ICE asks (#3359)
+        // and the derived-v6 ULA, never the whole CGNAT `/10`. Remote
+        // candidates and ICE servers get the same rule below and in `add_remote_candidate`.
         if !rc_overlay.allow {
             let keep = rc_overlay.clone();
             setting.set_ip_filter(Box::new(move |ip| keep.keeps_local(ip)));
@@ -510,7 +509,8 @@ impl AgentPeer {
         l0::apply(&mut setting);
         info!(
             session = %session_id,
-            overlay_blocks = rc_overlay.v4_nets.len(),
+            overlay_blocks = rc_overlay.overlay_blocks(),
+            overlay_blocks_carried = rc_overlay.v4_nets.len(),
             srtp_replay_window = transport.replay_window,
             dtls_gcm_only = transport.gcm_only,
             "rc ICE: overlay {}",
@@ -7557,10 +7557,8 @@ async fn media_pump_ffmpeg_dc(
             let open_ms = started.elapsed().as_millis() as u64;
             match handle.await {
                 Ok(Ok(rebuilt)) => {
-                    // FR-70 M3a — the rate the replacement was opened at. The
-                    // shadow judges it and its dims at the controller's next
-                    // tick, as it does an inline open — unless the plan moved
-                    // while it opened, which makes it a stale adoption.
+                    // FR-70 M3a.5 — the shadow judges its dims at the adoption
+                    // and this rate at its first frame's tick (`encode::plan`).
                     let built_rate = rebuilt.maxrate_bps() as u32;
                     let built_fps = rebuilt.fps();
                     if let Some(enc) = encoder.as_mut() {
@@ -7585,7 +7583,7 @@ async fn media_pump_ffmpeg_dc(
                                 }
                                 state.running_at(target_fps);
                             }
-                            log_plan_stale_swap(
+                            log_plan_adoption(
                                 &session_id,
                                 codec_label,
                                 plan_shadow.note_dims_swap_adopted(built_rate, dims, spawned),
@@ -7674,13 +7672,9 @@ async fn media_pump_ffmpeg_dc(
                                 // Stale pre-swap frames yield to the fresh
                                 // IDR, exactly like the sync rebuild path.
                                 send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                // FR-70 M3a — judged at the controller's next
-                                // tick, as an inline open is: re-rated there
-                                // although the plan held is a divergence. A
-                                // plan that moved while it opened (a QSV open
-                                // can outlast two AIMD halvings) makes it a
-                                // stale adoption instead — counted apart, not
-                                // judged.
+                                // FR-70 M3a — its rate is judged at its first
+                                // frame's tick unless the plan moved while it
+                                // opened (a stale adoption, counted apart).
                                 log_plan_stale_swap(
                                     &session_id,
                                     codec_label,
@@ -9145,10 +9139,13 @@ async fn media_pump_ffmpeg_dc(
                     if let Some(state) = fps_state.as_mut() {
                         state.running_at(target_fps);
                     }
-                    // FR-70 M3a — the loop decided this rate and these dims by
-                    // itself; the shadow judges both against the controller's
-                    // next target and the plan after its tick below.
-                    plan_shadow.note_built(open_rate, (w, h));
+                    // FR-70 M3a.5 — dims judged now, the rate at the first
+                    // frame's tick (`encode::plan::Shadow::note_built`).
+                    log_plan_divergences(
+                        &session_id,
+                        codec_label,
+                        plan_shadow.note_built(open, (w, h)),
+                    );
                     // FR-70 M2: this encoder was built for the plan's target
                     // (M3a.4: never the pin's); the capture cap follows it
                     // from here. An inline open also supersedes any
@@ -9651,18 +9648,11 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
         }
-        // FR-70 M3a — the controller has ticked: its target becomes the plan's
-        // `bitrate_bps` (an epoch move, not a divergence), and an encoder the
-        // loop built since the last tick — the inline open above, or a
-        // replacement adopted at the loop top while the plan held — is judged
-        // against it: was it built at the plan's rate and the plan's dims? A
-        // `bitrate` divergence here is an encoder the controller re-rates on
-        // its very next tick. A replacement adopted after the plan moved while
-        // it opened is a stale adoption, counted apart and not judged. M3a.3:
-        // so is a replacement this very tick re-rated within the ceiling the
-        // loop planned the frame at (the controller's own move, one tick after
-        // the adoption), and an inline open built from geometry inputs that
-        // moved since the plan's snapshot is a lag on its dims.
+        // FR-70 M3a — the controller has ticked on a pass that encodes: its
+        // target becomes the plan's `bitrate_bps`, and the rate of an encoder
+        // whose first frame this is gets judged against it; a move since that
+        // rate was decided, within the ceiling, is a stale tick (M3a.5,
+        // `encode::plan::Shadow::after_tick`).
         log_plan_divergences(
             &session_id,
             codec_label,
@@ -10451,11 +10441,24 @@ fn log_plan_stale_swap(
     );
 }
 
-/// FR-70 M3a.3 — log the session's FIRST stale tick: a replacement adopted
-/// while the plan held, whose rate the controller moved on its very next tick
-/// within the ceiling the loop planned the frame at (`spawned_bps` is the
-/// plan's rate at the adoption). Not a divergence; the heartbeat's
-/// `plan_stale_ticks` carries the count.
+/// FR-70 M3a.5 — a dims replacement's adoption: its stale line, or the first
+/// divergence of one built at dims the plan that held does not hold.
+#[cfg(feature = "ffmpeg-encoder")]
+fn log_plan_adoption(
+    session_id: &bson::oid::ObjectId,
+    codec_label: &str,
+    adoption: crate::encode::plan::Adoption,
+) {
+    log_plan_stale_swap(session_id, codec_label, adoption.stale);
+    log_plan_divergences(session_id, codec_label, adoption.diverged);
+}
+
+/// FR-70 M3a.3 — log the session's FIRST stale tick: an encoder whose rate
+/// the controller moved, on the first tick of a pass that encodes, from the
+/// rung its rate was decided under, within the ceiling the loop planned the
+/// frame at (`spawned_bps` is that rung; M3a.5: an inline open that consulted
+/// the controller too, `kind` `open-first-tick`). Not a divergence; the
+/// heartbeat's `plan_stale_ticks` carries the count.
 #[cfg(feature = "ffmpeg-encoder")]
 fn log_plan_stale_tick(
     session_id: &bson::oid::ObjectId,
@@ -10472,7 +10475,7 @@ fn log_plan_stale_tick(
         built_bps = s.built_bps,
         adopted_plan_bps = s.spawned_bps,
         now_bps = s.now_bps,
-        "FR-70 M3a.3: the controller re-rated a replacement on its first tick after the adoption, within the ceiling (the plan's own move a tick on; first time this session)"
+        "FR-70 M3a.3: the controller re-rated an encoder on the tick of its first frame, within the ceiling, after its rate was decided (the plan's own move; first time this session)"
     );
 }
 

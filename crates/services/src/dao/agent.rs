@@ -6,13 +6,17 @@ use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
     AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, EnrollingProgram,
-    ExecAnchor, ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, SshPolicy,
+    ExecAnchor, ExecPolicy, ExternalAccessPolicy, GuiWorkerBrief, InstallInfo, OsKind,
+    PeerRelayPolicy, SshPolicy, TokenRotation,
 };
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
 pub struct AgentDao {
     pub base: BaseDao<Agent>,
+    /// The same rows, read on the primary: the token rotation's reads
+    /// ([`Self::find_any_in_tenant_on_the_primary`]).
+    on_the_primary: BaseDao<Agent>,
 }
 
 /// FR-92 P7 — the slice of the agent row a heartbeat read BEFORE it wrote
@@ -39,6 +43,7 @@ impl AgentDao {
     pub fn new(db: &Database) -> Self {
         Self {
             base: BaseDao::new(db, Agent::COLLECTION),
+            on_the_primary: BaseDao::on_the_primary(db, Agent::COLLECTION),
         }
     }
 
@@ -163,10 +168,11 @@ impl AgentDao {
             // first hello.
             peer_auth_key: String::new(),
             agent_token_hash,
-            // FR-103 — a new row starts at generation 0; only a removal
-            // advances it.
+            // FR-103 — a new row starts at generation 0; a removal and a
+            // token rotation (FR-155) advance it.
             token_gen: 0,
             token_exp: None,
+            token_rotation: None,
             status: AgentStatus::Offline,
             last_seen_at: now,
             last_presence: None,
@@ -413,6 +419,42 @@ impl AgentDao {
             .await
     }
 
+    /// FR-157 P2 — the org's live Macs that are online and whose screen
+    /// worker's word (`capabilities.gui_worker.state`) is `state`, paged and
+    /// ordered like [`Self::list_for_tenant`]. Online is the presence ledger
+    /// (`last_presence`), as the overviews' `gui_workers` counts read it, so
+    /// the filter names what they count online and never a word an offline
+    /// row last said. [`GuiWorkerBrief::UNKNOWN`] names the Macs that sent no
+    /// word, the rows the counts put under it; a word this build has never
+    /// heard of is matched as the word it is.
+    pub async fn list_online_macs_by_gui_worker(
+        &self,
+        tenant_id: ObjectId,
+        state: &str,
+        params: &PaginationParams,
+    ) -> DaoResult<PaginatedResult<Agent>> {
+        let word = if state == GuiWorkerBrief::UNKNOWN {
+            // Absent or null, as `$ifNull` counts it, or the word itself.
+            bson::Bson::Document(doc! { "$in": [bson::Bson::Null, GuiWorkerBrief::UNKNOWN] })
+        } else {
+            bson::Bson::String(state.to_string())
+        };
+        self.base
+            .find_paginated(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "deleted_at": null,
+                    // `OsKind::Macos` on the row.
+                    "os": "macos",
+                    "last_presence": "online",
+                    "capabilities.gui_worker.state": word,
+                },
+                Some(doc! { "created_at": -1, "_id": -1 }),
+                params,
+            )
+            .await
+    }
+
     /// Every non-tombstoned device in the tenant, unpaginated.
     ///
     /// For whole-org operations (archiving revokes them all) rather than UI
@@ -509,6 +551,27 @@ impl AgentDao {
         agent_id: ObjectId,
     ) -> DaoResult<Agent> {
         self.base
+            .find_any_by_id_in_tenant(tenant_id, agent_id)
+            .await
+    }
+
+    /// [`Self::find_any_in_tenant`], read on the primary whatever the
+    /// connection string prefers. For the token rotation (FR-155): its
+    /// admission decides on the row's generation and last rotation as read,
+    /// its update compares against the primary's row ([`Self::rotate_token`]),
+    /// and after an update that matched nothing it reads the row again to say
+    /// why. Each read must see what the primary has applied, which a
+    /// secondary may not have yet.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the token rotation tells a removed device that it was removed, as the revocation checks do"
+    )]
+    pub async fn find_any_in_tenant_on_the_primary(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+    ) -> DaoResult<Agent> {
+        self.on_the_primary
             .find_any_by_id_in_tenant(tenant_id, agent_id)
             .await
     }
@@ -1348,6 +1411,60 @@ impl AgentDao {
             .await
     }
 
+    /// FR-155 — commit one token rotation, as ONE conditional update: the row
+    /// moves from generation `from_gen` to `from_gen + 1` and records the
+    /// rotation (`token_rotation`) and the new token's `exp`, only when it is
+    /// at `from_gen`, live, not quarantined, and its last rotation is absent
+    /// or earlier than `last_rotation_before`. One rotation per generation: a
+    /// committed rotation leaves the row at `from_gen + 1`, which a filter at
+    /// `from_gen` does not match. The last condition is the once-an-hour
+    /// ceiling, so it needs no state of its own. `false` when nothing matched;
+    /// the caller reads the row again to say why.
+    ///
+    /// `deleted_at: null` is the live predicate, null or absent, as in every
+    /// live reader of this collection (`BaseDao::find_by_id_in_tenant`); a
+    /// tombstone carries a date. A row from before FR-103 has no `token_gen`
+    /// field, which the model reads as 0, so generation 0 also matches the
+    /// absent field, and `$inc` then writes 1.
+    pub async fn rotate_token(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        from_gen: u32,
+        rotation: &TokenRotation,
+        last_rotation_before: DateTime,
+        token_exp_unix: i64,
+    ) -> DaoResult<bool> {
+        let generation = if from_gen == 0 {
+            bson::Bson::Document(doc! { "$in": [0_i64, bson::Bson::Null] })
+        } else {
+            bson::Bson::Int64(i64::from(from_gen))
+        };
+        let filter = doc! {
+            "_id": agent_id,
+            "tenant_id": tenant_id,
+            "token_gen": generation,
+            "deleted_at": null,
+            "status": { "$ne": "quarantined" },
+            "$or": [
+                { "token_rotation.at": { "$exists": false } },
+                { "token_rotation.at": { "$lt": last_rotation_before } },
+            ],
+        };
+        self.base
+            .update_one(
+                filter,
+                doc! {
+                    "$inc": { "token_gen": 1 },
+                    "$set": {
+                        "token_rotation": bson::to_bson(rotation)?,
+                        "token_exp": DateTime::from_millis(token_exp_unix.saturating_mul(1000)),
+                    },
+                },
+            )
+            .await
+    }
+
     /// FR-51 — remove an EPHEMERAL row outright. The `(tenant_id, machine_id)`
     /// unique index is not partial on `deleted_at`, so a tombstoned ephemeral
     /// row would reserve its random, never-reused machine_id forever — every
@@ -1435,5 +1552,60 @@ impl AgentDao {
                 doc! { "$set": { "owner_user_id": owner_user_id } },
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mongodb::{
+        Client,
+        options::{ReadPreference, SelectionCriteria},
+    };
+
+    use super::*;
+
+    /// The token rotation decides on the row it reads and writes on a compare
+    /// with it, so its reads go to the primary whatever the connection string
+    /// prefers, while every other reader keeps the handle's preference. The
+    /// driver connects lazily: no server is needed to read where a handle
+    /// reads.
+    #[tokio::test]
+    async fn the_rotation_reads_its_row_on_the_primary() {
+        let client = Client::with_uri_str(
+            "mongodb://127.0.0.1:9/?readPreference=secondaryPreferred&w=majority",
+        )
+        .await
+        .unwrap();
+        let db = client.database("agent_reads");
+        let agents = AgentDao::new(&db);
+
+        // The control: the shared handle prefers a secondary, as the
+        // connection string says.
+        assert!(
+            matches!(
+                agents.base.collection().selection_criteria(),
+                Some(SelectionCriteria::ReadPreference(
+                    ReadPreference::SecondaryPreferred { .. }
+                ))
+            ),
+            "the shared handle reads {:?}",
+            agents.base.collection().selection_criteria()
+        );
+
+        let rotation = agents.on_the_primary.collection();
+        assert_eq!(rotation.name(), Agent::COLLECTION);
+        assert!(
+            matches!(
+                rotation.selection_criteria(),
+                Some(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+            ),
+            "the rotation reads {:?}",
+            rotation.selection_criteria()
+        );
+        assert_eq!(
+            format!("{:?}", rotation.write_concern()),
+            format!("{:?}", db.write_concern()),
+            "the rotation's handle keeps the write concern"
+        );
     }
 }

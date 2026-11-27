@@ -102,7 +102,7 @@ independent default-deny gates with a full audit trail ([fleet-rpc.md](fleet-rpc
 ### A team hub — chat, calls, files
 
 The included pillar: hierarchical rooms (text + voice/video), threads, reactions,
-mentions, per-room calls on the mediasoup SFU, recordings, file library with AI
+mentions, per-room calls on the mediasoup SFU, file library with AI
 document recognition, full-text search. One org = one tenant; roles gate
 everything (see [permission system](#permission-system)).
 

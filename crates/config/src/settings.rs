@@ -1066,6 +1066,16 @@ pub struct RcSettings {
     /// switch if it ever does. Env: `ROOMLER__RC__TOKEN_GENERATION_CHECK`.
     #[serde(default = "default_true")]
     pub token_generation_check: bool,
+    /// FR-155 — serve `POST /api/agent/self/rotate`, where a device trades
+    /// its agent token for one of the next generation. Default **false**
+    /// until the phase that completes the server's half turns it on. `false`
+    /// answers 404 to a first call; a call asking again for the answer to a
+    /// rotation the server has made is answered either way. The route answers
+    /// 404 to every call while `token_generation_check` is off, since a
+    /// rotation that refuses nothing must not be recorded as done.
+    /// Env: `ROOMLER__RC__AGENT_TOKEN_ROTATION`.
+    #[serde(default)]
+    pub agent_token_rotation: bool,
     /// FR-103 — the lifetime of a freshly minted agent or tunnel-client
     /// token, in seconds. Default one year. A test knob: the integration lane
     /// and a throwaway stack shorten it to prove expiry and the renewal grace.
@@ -1106,6 +1116,16 @@ pub struct RcSettings {
     /// it at 120 s. Env: `ROOMLER__RC__SESSION_RESUME_SECS`.
     #[serde(default)]
     pub session_resume_secs: u64,
+    /// FR-157 P2 — read a Mac's screen-worker word (`capabilities.gui_worker`):
+    /// the `gui_workers` counts in the org and platform overviews, the device
+    /// list's `?gui_worker=` filter, and the word in the device list's rows.
+    /// Default **false**: the overviews carry no `gui_workers`, the rows leave
+    /// the word out and the filter is refused with this switch's name, so
+    /// nothing a response says changes. The word is stored with the caps
+    /// either way. P4 turns it on once its field cells read green.
+    /// Env: `ROOMLER__RC__GUI_WORKER_READ`.
+    #[serde(default)]
+    pub gui_worker_read: bool,
 }
 
 fn default_agent_token_ttl_secs() -> u64 {
@@ -1132,11 +1152,13 @@ impl Default for RcSettings {
             ssh_via_service: true,
             token_renewal: true,
             token_generation_check: true,
+            agent_token_rotation: false,
             agent_token_ttl_secs: default_agent_token_ttl_secs(),
             removal_goodbye: true,
             org_session_cap: true,
             session_slots: false,
             session_resume_secs: 0,
+            gui_worker_read: false,
         }
     }
 }
@@ -1639,11 +1661,13 @@ impl Settings {
             .set_default("rc.ssh_via_service", true)?
             .set_default("rc.token_renewal", true)?
             .set_default("rc.token_generation_check", true)?
+            .set_default("rc.agent_token_rotation", false)?
             .set_default("rc.agent_token_ttl_secs", 365 * 24 * 60 * 60)?
             .set_default("rc.removal_goodbye", true)?
             .set_default("rc.org_session_cap", true)?
             .set_default("rc.session_slots", false)?
             .set_default("rc.session_resume_secs", 0)?
+            .set_default("rc.gui_worker_read", false)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

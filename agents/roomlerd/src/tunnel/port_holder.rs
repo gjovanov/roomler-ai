@@ -9,7 +9,9 @@
 //! inherited the sockets from that dead daemon. This names the holder in the
 //! log once a route has been refused its port for [`STUCK_AFTER`], and again
 //! every [`EVERY`] while it stays stuck: this daemon itself, the companion, a
-//! foreign process, or a process that is gone.
+//! foreign process, or a process that is gone. When it is this daemon, the
+//! route reconciler names the tunnel flow on the port and what it is to the
+//! routes ([`describe_flow`]).
 //!
 //! Diagnostics only: nothing here kills, frees or changes anything.
 
@@ -128,6 +130,44 @@ pub fn describe(h: &Holder) -> String {
              its socket (a child that inherited it; #1035)"
         ),
         Holder::Unknown => "holder unknown (no listener found for the port)".to_string(),
+    }
+}
+
+/// #1035 — a flow of this daemon's tunnel hub that holds the port, and what
+/// it is to the declared routes. [`Holder::ThisDaemon`] alone cannot tell
+/// these apart, and its line ("a listener no flow owns") misnamed the field
+/// case: a flow did own the listener, and its route had lost the flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortFlow {
+    /// A route's flow that the route's entry no longer holds.
+    Lost { flow: String, route: String },
+    /// A route's flow that its route holds: another enabled route declares
+    /// the same port.
+    Serving { flow: String, route: String },
+    /// A flow no route declares (`roomler forward` / `roomler socks5`).
+    AdHoc { flow: String },
+}
+
+/// [`describe`], naming the hub flow on the port when this daemon holds it.
+/// Any other holder, or this daemon with no flow on the port, reads as
+/// [`describe`] does.
+pub fn describe_flow(h: &Holder, flow: Option<&PortFlow>) -> String {
+    let (Holder::ThisDaemon { pid }, Some(flow)) = (h, flow) else {
+        return describe(h);
+    };
+    match flow {
+        PortFlow::Lost { flow, route } => format!(
+            "held by this daemon (pid {pid}): flow {flow} of route {route}, which the route \
+             lost — the next reconcile pass adopts or stops it (#1035)"
+        ),
+        PortFlow::Serving { flow, route } => format!(
+            "held by this daemon (pid {pid}): flow {flow}, which serves route {route} — two \
+             enabled routes declare this port; disable or edit one"
+        ),
+        PortFlow::AdHoc { flow } => format!(
+            "held by this daemon (pid {pid}): flow {flow}, which no route declares — an ad-hoc \
+             forward or SOCKS5 listener; `roomler kill {flow}` stops it"
+        ),
     }
 }
 
@@ -472,6 +512,52 @@ mod tests {
         });
         assert!(foreign.starts_with(r"held by C:\Program Files\Proxy\proxy.exe (pid 11)"));
         assert!(describe(&Holder::Gone { pid: 52404 }).contains("no longer exists"));
+    }
+
+    /// #1035 — this daemon's flow on the port is named with what it is to
+    /// the routes; with no flow on the port, or another holder, the line is
+    /// `describe`'s.
+    #[test]
+    fn a_flow_of_this_daemon_is_named_with_what_it_is_to_the_routes() {
+        let me = Holder::ThisDaemon { pid: 7 };
+        let lost = describe_flow(
+            &me,
+            Some(&PortFlow::Lost {
+                flow: "fl-3".into(),
+                route: "corp-socks".into(),
+            }),
+        );
+        assert!(
+            lost.contains("flow fl-3 of route corp-socks") && lost.contains("lost"),
+            "{lost}"
+        );
+        assert!(!lost.contains("no flow owns"), "{lost}");
+        let serving = describe_flow(
+            &me,
+            Some(&PortFlow::Serving {
+                flow: "fl-4".into(),
+                route: "pg".into(),
+            }),
+        );
+        assert!(serving.contains("fl-4, which serves route pg"), "{serving}");
+        let ad_hoc = describe_flow(
+            &me,
+            Some(&PortFlow::AdHoc {
+                flow: "fl-5".into(),
+            }),
+        );
+        assert!(ad_hoc.contains("kill fl-5"), "{ad_hoc}");
+        assert_eq!(describe_flow(&me, None), describe(&me));
+        let foreign = Holder::Gone { pid: 9 };
+        assert_eq!(
+            describe_flow(
+                &foreign,
+                Some(&PortFlow::AdHoc {
+                    flow: "fl-5".into()
+                })
+            ),
+            describe(&foreign)
+        );
     }
 
     /// `lsof -t` (macOS): one PID per line, and the first names the holder.

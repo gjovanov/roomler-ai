@@ -213,6 +213,47 @@ fn diff_lists(what: &str, expected: &[String], actual: &[String], report: &mut S
     }
 }
 
+/// FR-155 P1a (T8) — the composition serves `POST /api/agent/self/rotate`
+/// and plans the `token_rotation_audit` index set, whose rows expire after 90
+/// days, and the committed baseline records both, so the gate above reviews
+/// them.
+#[tokio::test]
+async fn the_composition_includes_the_rotate_route() {
+    let actual = snapshot().await;
+    assert!(
+        actual
+            .routes
+            .iter()
+            .any(|r| r.path == "/api/agent/self/rotate" && r.methods == "POST"),
+        "the rotate route is served"
+    );
+    let sets = actual.indexes["single_block"]
+        .as_array()
+        .expect("the index sets");
+    let audit = sets
+        .iter()
+        .find(|s| s["collection"] == "token_rotation_audit")
+        .expect("the rotation audit's index set");
+    let expires = audit["indexes"]
+        .as_array()
+        .expect("its indexes")
+        .iter()
+        .any(|i| {
+            i["key"] == serde_json::json!({ "at": 1 }) && i["expireAfterSeconds"] == 7_776_000
+        });
+    assert!(expires, "its rows expire after 90 days: {audit}");
+
+    let baseline = std::fs::read_to_string(baseline_path()).expect("the baseline");
+    assert!(
+        baseline.contains("\"/api/agent/self/rotate\""),
+        "the baseline records the route"
+    );
+    assert!(
+        baseline.contains("\"token_rotation_audit\""),
+        "the baseline records the index set"
+    );
+}
+
 /// FR-137 S-B4 — the user socket's retired namespace (`hive:`, FR-90's viewer
 /// and search) has no handler, and no module may claim it again: a tab opened
 /// before Hive was parked gets the socket's unknown-type answer.

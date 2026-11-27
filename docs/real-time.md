@@ -57,7 +57,7 @@ The shared rules live in `crates/remote_control/src/upgrade_auth.rs`.
 
 From 0.4.210 every native dial puts its credential in an `Authorization: Bearer`
 header whose value is marked sensitive: the daemon's control socket
-(`agents/roomlerd/src/signaling.rs:1868`), its central and regional DERP sockets
+(`agents/roomlerd/src/signaling.rs:1874`), its central and regional DERP sockets
 (`agents/roomlerd/src/derp.rs:424`) and the CLI's tunnel-client socket. The URL
 names the role and the tenant only. The rule is one function in each client
 (`agents/roomlerd/src/ws_connect.rs:224`, `agents/roomler-cli/src/forward.rs:442`):
@@ -84,7 +84,7 @@ tungstenite writes a client's whole upgrade request at TRACE, the `Authorization
 line included, and marking the value sensitive does not reach that line. The
 daemon's and the CLI's subscribers drop those lines whatever `RUST_LOG` asks
 (`upgrade_auth::may_log`, `crates/remote_control/src/upgrade_auth.rs:243`), with a
-global `filter_fn` beside the `EnvFilter` (`crates/agent-core/src/logging.rs:403`,
+global `filter_fn` beside the `EnvFilter` (`crates/agent-core/src/logging.rs:460`,
 `agents/roomler-cli/src/cli.rs:829`). Not a directive, on purpose: a fixed
 `tungstenite=debug` would raise those crates above the default `warn`, and any
 target directive loses to a span-scoped one such as `[org]=trace`, which
@@ -918,7 +918,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
-| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1297`), `RETIRED_RC_TAG_FAMILIES` (`:1326`), `RETIRED_USER_WS_NAMESPACES` (`:1331`) and `RETIRED_MODULE_IDS` (`:1335`), locked by `retired_rpc_verbs_are_never_reused` (`:8543`), `retired_wire_families_and_module_ids_are_never_reused` (`:8612`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `crates/remote_control/src/signaling.rs:5321`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1297`), `RETIRED_RC_TAG_FAMILIES` (`:1326`), `RETIRED_USER_WS_NAMESPACES` (`:1331`) and `RETIRED_MODULE_IDS` (`:1335`), locked by `retired_rpc_verbs_are_never_reused` (`:8601`), `retired_wire_families_and_module_ids_are_never_reused` (`:8670`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `crates/remote_control/src/signaling.rs:5321`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 
@@ -1027,9 +1027,9 @@ UDP-blocked:
 - A `401` on upgrade (after [the one query-form redial](#how-the-daemon-and-the-cli-dial-3656)
   where that applies) is not fatal. It closes the sessions the agent kept, and
   FR-103 looks for a newer token in the config file, else renews this one, and
-  retries once (`agents/roomlerd/src/signaling.rs:1337`). Otherwise the agent
+  retries once (`agents/roomlerd/src/signaling.rs:1343`). Otherwise the agent
   waits 30 s, 60 s, 5 min, then an hour between tries
-  (`agents/roomlerd/src/signaling.rs:1651`), and the third refusal in a row raises
+  (`agents/roomlerd/src/signaling.rs:1657`), and the third refusal in a row raises
   the re-enrollment prompt on the primary org.
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially
@@ -1070,7 +1070,7 @@ flowchart LR
 | `cause` | its fields | what ended the socket |
 |---|---|---|
 | `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
-| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2330`) |
+| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2336`) |
 | `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
 | `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:556`). The check runs on a tick, so `elapsed_s` reads past the deadline |
 | `cancelled` | `by` | the Hub cancelled the loop; `by` below |

@@ -332,7 +332,7 @@ keeps the version it is already running.
 | Embedded version vs manifest claim | `artifact_version::verify_artifact_version` | *Which release* are they? | every installable: the `.msi`, and since FR-97 P6a the `.deb`, `.pkg` and tarball |
 
 Before any of them, the asset's name is checked: an asset's name must be a plain file name
-(`plain_file_name`, `agents/roomlerd/src/updater.rs:1579`). Any other name is refused before
+(`plain_file_name`, `agents/roomlerd/src/updater.rs:1591`). Any other name is refused before
 anything is downloaded or written. Where the manifest comes from does not change these gates. The
 update check, the tray refresh, the Linux companion's sync and a pinned release all read it from
 the update feed on roomler.ai (#3818), and a pinned release can also come from GitHub's by-tag
@@ -370,7 +370,7 @@ installed. Measured on 0.4.143 before the fix: a feed offering `agent-v0.4.999`
 with the signed 0.4.142 `.deb` passed the `.asc` gate and was staged for
 install (FR-97 §8). Each format now states its own version inside the signed
 bytes, and the updater refuses when it disagrees with the tag
-(`updater.rs:1546`):
+(`updater.rs:1558`):
 
 | Format | Where the artifact states its version | Read by | Anchor |
 |---|---|---|---|
