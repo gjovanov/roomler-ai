@@ -94,9 +94,23 @@ in **one** place. Same argument the SSH work settled on: *the refusals are the l
 rows, so recording them cannot be per-call-site* (`decide` returns
 `Result<Granted, SshDenyReason>` and `dispatch` records both arms).
 
-`Limit` is an enum and its `match` inside the helper is exhaustive, so adding a fifteenth
-field to `PlanLimits` fails to compile until someone decides whether it is a gate — the same
-structural trick as `RpcCap::wire()`.
+The compiler asks "is this field a gate?" in both directions — the same structural trick
+as `RpcCap::wire()`:
+
+| Direction | Construct | A new … fails to compile until |
+|---|---|---|
+| field → limit | `quota::field_classes` destructures `PlanLimits` with every field named and **no `..`**, binding each to `FieldClass::Gate(Limit::…)` or `FieldClass::NotAGate("<reason>")` | … `PlanLimits` field is classified there |
+| limit → field | `Limit::describe`'s `match` is exhaustive over `Limit`'s variants and reads a `PlanLimits` field in each arm | … `Limit` variant names the field it caps |
+
+The four non-gates and their reasons are data: `overlay_mesh` (on for every plan),
+`relay_bytes_per_month` (a throttle through the relay allowance, never a refusal — FR-115
+D4), `max_message_history` (the retention bound this FR chose not to gate, reported-only)
+and `per_seat` (not a limit: it says which values scale with seats). The unit test
+`every_plan_limits_field_is_classified` checks that the serialized plan matrix's keys are
+exactly the gated fields' `Limit::as_str()` spellings plus those four. ⚠ The check holds
+only while `PlanLimits` stays a plain struct: `#[non_exhaustive]` would force a `..` into the
+destructure and silently switch it off (#3336; until then the paragraph here claimed it of
+`describe`'s match, which covers only the limit → field direction).
 
 ### 3. The mode must not be able to weaken what was already enforced
 
