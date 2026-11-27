@@ -329,6 +329,10 @@ impl RTCSctpTransport {
                 },
                 Arc::clone(&param.setting_engine),
             ));
+            // roomler patch (FR-148 P4b): an accepted channel's id is its stream's, before
+            // any handler sees it. `new`'s placeholder 0 was replaced only by `open()`, which
+            // an accepted channel never runs, so `id()` read 0 for good. Pion passes `ID: &sid`.
+            rtc_dc.id.store(dc.stream_identifier(), Ordering::SeqCst);
 
             if let Some(handler) = &*param.on_data_channel_handler.load() {
                 let mut f = handler.lock().await;
@@ -488,19 +492,39 @@ impl RTCSctpTransport {
     /// `stream_identifier` (a data channel's id) deadline-limited
     /// (`sctp::association::Association::mark_deadline_stream`). Reaches the
     /// association as `gauges` does: a slot held by `stop()` is not waited
-    /// for. False when there is no association, its slot is held, or it has
-    /// no such stream: nothing is marked, and the caller may ask again.
-    pub async fn mark_deadline_stream(&self, stream_identifier: u16) -> bool {
+    /// for. FR-148 P4b — refused, it says why ([`DeadlineMarkRefusal`]): no
+    /// association, its slot held, or no such stream. Nothing is marked, and
+    /// the caller may ask again.
+    pub async fn mark_deadline_stream(
+        &self,
+        stream_identifier: u16,
+    ) -> std::result::Result<(), DeadlineMarkRefusal> {
         let association = {
             let Ok(sctp_association) = self.sctp_association.try_lock() else {
-                return false;
+                return Err(DeadlineMarkRefusal::SlotHeld);
             };
             let Some(association) = sctp_association.as_ref() else {
-                return false;
+                return Err(DeadlineMarkRefusal::NoAssociation);
             };
             Arc::clone(association)
         };
-        association.mark_deadline_stream(stream_identifier).await
+        match association.mark_deadline_stream(stream_identifier).await {
+            true => Ok(()),
+            false => Err(DeadlineMarkRefusal::NoStream),
+        }
+    }
+
+    /// roomler patch (FR-148 P4b): the association's streams marked
+    /// deadline-limited, in ascending order (`Association::deadline_streams`,
+    /// a patch of the vendored webrtc-sctp): a read that marks nothing,
+    /// reached as `mark_deadline_stream` reaches the association. `None` with
+    /// no association, or while its slot is held.
+    pub async fn deadline_streams(&self) -> Option<Vec<u16>> {
+        let association = {
+            let sctp_association = self.sctp_association.try_lock().ok()?;
+            Arc::clone(sctp_association.as_ref()?)
+        };
+        Some(association.deadline_streams().await)
     }
 
     pub(crate) fn data_channels_accepted(&self) -> u32 {
@@ -513,5 +537,29 @@ impl RTCSctpTransport {
 
     pub(crate) fn data_channels_requested(&self) -> u32 {
         self.data_channels_requested.load(Ordering::SeqCst)
+    }
+}
+
+/// roomler patch (FR-148 P4b): why [`RTCSctpTransport::mark_deadline_stream`]
+/// marked nothing. Each is an instant's answer: nothing is marked, and the
+/// caller may ask again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineMarkRefusal {
+    /// The transport has no association: not yet started, or stopped.
+    NoAssociation,
+    /// The association's slot was held at that instant: by `start` storing
+    /// it, by `stop` across its close, or by another caller's brief read.
+    SlotHeld,
+    /// The association has no stream of that identifier.
+    NoStream,
+}
+
+impl std::fmt::Display for DeadlineMarkRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoAssociation => "no_association",
+            Self::SlotHeld => "slot_held",
+            Self::NoStream => "no_stream",
+        })
     }
 }

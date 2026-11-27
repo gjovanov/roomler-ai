@@ -181,7 +181,7 @@ it could not keep one.
 ⚠️ **An ephemeral primary is never swapped out** (#4370). While the primary
 enrollment is ephemeral, `set-primary` refuses, whatever label it is given:
 `promote_org_to_primary` checks it before anything else
-(`crates/agent-core/src/config.rs:2367-2380`), and the file stays as it was,
+(`crates/agent-core/src/config.rs:2385-2398`), and the file stays as it was,
 since `org_cmd` saves only after its arm succeeds
 (`agents/roomlerd/src/app.rs:3612`). The swap would put the ephemeral row
 beside another org, which #4352 rules out. An `[[orgs]]` entry has no
@@ -991,7 +991,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2160-2162`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2178-2180`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:328`). A port that is unset is **picked**:

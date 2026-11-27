@@ -1455,7 +1455,7 @@ of the vendored webrtc-sctp keeps where the events happen:
 The agent reads both without the association's lock (`Association::delivery_clock`,
 `crates/vendored/webrtc-sctp/src/association/mod.rs:649`), through the peer
 connection's SCTP transport (`RTCSctpTransport::delivery_clock`,
-`crates/vendored/webrtc/src/sctp_transport/mod.rs:474`, a patch of the vendored
+`crates/vendored/webrtc/src/sctp_transport/mod.rs:478`, a patch of the vendored
 webrtc). That accessor never waits: `stop()` holds the transport's slot across the
 association's close, so a held slot answers `None` and the sampler keeps the clock it
 already has.
@@ -1585,7 +1585,7 @@ FR-148 P1 it reads three values, `off`, `shadow` (the default) and `on`
 |---|---|
 | the sampler: readings, samples, the line | `agents/roomlerd/src/media_delivery.rs:635` (`DeliverySampler`), `:756` (`heartbeat`), `:878` (`on_reading_with`), `:948` (`take_line`) |
 | the standing queue: the rule, the one take, the reading, the fold | `agents/roomlerd/src/media_delivery.rs:95` (`QUEUED_OVER_MS`), `:117` (`counts`), `:851-860` (`DeliverySampler::observe`, the one take), `:919` (`judge`), `:560` (`Fold::add_queue`) |
-| the gauges | `crates/vendored/webrtc-sctp/src/association/gauges.rs:146` (`Gauges`), `:194` (`take`), `:202` (`peek`); through the transport, `crates/vendored/webrtc/src/sctp_transport/mod.rs:482` (`RTCSctpTransport::gauges`) |
+| the gauges | `crates/vendored/webrtc-sctp/src/association/gauges.rs:146` (`Gauges`), `:194` (`take`), `:202` (`peek`); through the transport, `crates/vendored/webrtc/src/sctp_transport/mod.rs:486` (`RTCSctpTransport::gauges`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:4006` (made), `:5440` (drained, after the heartbeat line) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:6590` (made), `:10372` (drained, after the heartbeat line) |
 | the clock | `crates/vendored/webrtc-sctp/src/association/delivery.rs:93` (`DeliveryClock`), `:101` (`read`) |
@@ -2177,7 +2177,7 @@ The call sits where the pump hands each media message to its send task
 (`agents/roomlerd/src/peer.rs:5285` in the VP9 4:4:4 pump, `:9933` in the FFmpeg one),
 and only its first call reads anything (`DeliverySampler::on_first_write`,
 `agents/roomlerd/src/media_delivery.rs:1012`). It reads the gauges through
-`RTCSctpTransport::gauges` (`crates/vendored/webrtc/src/sctp_transport/mod.rs:482`),
+`RTCSctpTransport::gauges` (`crates/vendored/webrtc/src/sctp_transport/mod.rs:486`),
 which never waits for the transport's slot, with `GaugeReader::peek`
 (`crates/vendored/webrtc-sctp/src/association/gauges.rs:202`), which resets nothing, so
 the least acknowledgement delay stays for the reader that takes it (the fork's test,
@@ -3198,7 +3198,7 @@ pump's 4 s wait), `carrier_unknown`, `no_user`, or `learner_off` (`relay_max_hi_
 
 **Where the viewer's facts come from.** `PairFacts` (`media_pair_memory.rs:61`) is
 registered by session id in `AgentPeer::new`, before the pump starts. The user comes from
-the `rc:request`'s record (`agents/roomlerd/src/signaling.rs:4830`). The srflx addresses
+the `rc:request`'s record (`agents/roomlerd/src/signaling.rs:4836`). The srflx addresses
 are taken from the candidates the viewer trickles (`AgentPeer::add_remote_candidate`), at
 most 16. They are not read through `get_stats`: the vendored ICE agent's accessor is
 crate-private, and a stats read takes the ICE and SCTP locks. **Limit**: a candidate
@@ -3874,7 +3874,7 @@ beside `ROOMLERD_PATH_MODEL` (`media_inflight::mode`,
 With `ROOMLERD_PATH_MODEL=off` the budget stays off whatever its switch says, with one
 INFO line: its fields ride on the `path delivery` line, which `off` does not write. The
 config key is built as `path_model`'s: the field, its env fallback, the key's metadata,
-its echo and its check (`crates/agent-core/src/config.rs:1228`,
+its echo and its check (`crates/agent-core/src/config.rs:1233`,
 `crates/agent-core/src/config_surface.rs:1451`). A set variable wins over the key, any
 value but `off`, `shadow` or `on` is refused at `config set`, and remote config cannot
 set it ([remote-config.md](remote-config.md)). The read is in `media_inflight`, inside
@@ -5662,7 +5662,7 @@ encoder is never handed.
 | the sampler and the line | `agents/roomlerd/src/media_delivery.rs:660` (the field), `:1043` (`on_frame`), `:1121` (`on_pair_check`), `:1131` (`note_gate`), `:1283` (`on_handed`), `:1292` (`pump_count`), `:966` (`report`), `:1409` (`emit`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:4324` (the send task's count), `:4338` and `:4366` (each frame taken, each chunk released), `:4421` (the pair), `:4540` (the gate's count), `:4559` (the step), `:5254` (the watermark), `:5289` (`on_handed`), `:5306` (a full channel) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:7344` (the send task's count), `:7365` and `:7420` (each frame taken, each chunk released), `:7755` (the pair), `:8150` (the gate's count, the ledger beside the channel), `:8225` (the step), `:9944` (`on_handed`), `:9970` (a full channel) |
-| the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3538` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2165` (its echo), `:2754` (its check) |
+| the config key | `crates/agent-core/src/config.rs:1233` (the field), `:3566` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2165` (its echo), `:2754` (its check) |
 | the harness's outages and reads | `agents/roomlerd/src/media_delivery.rs:4916` (`Outages`), `:5135` (`out_direction`), `:7730` (`outaged`), `:8880` (`print_releases`), `:8940` (`recoveries`), `:9096` (`stalls_against_today`), `:9325` (`outages_against_today`) |
 | B2's view of the budget | `agents/roomlerd/src/media_inflight.rs:625` (`Over`), `:868` (`over`), `:925` (`held_each`), `:820` (`still_after`), `:833` (`take_mark`), `:738` (the mark in `step`), `:1873` (`Shadow::take_mark`); the opening: `:644` (`Over::opening`), `:897` (its reading in `over`), `:734` (the first measured rate, in `step`), `:1175` (the rate's provenance, in `rate_at`), `:986` (a new association's opening, in `on_new_association`) |
 | B2's push-backs | `agents/roomlerd/src/media_delivery.rs:255` (`SamplePushBack`), `:277` (`Burst`), `:321` (`BURST`), `:331` (`settle`), `:412` (`push_back_of`), `:454` (P3, with the opening's), `:903` (`Budget::over` at a sample's close), `:756` (`heartbeat`, the hand-off), `:789` (`due_read`), `:799` (`on_mark`), `:1043` (`on_frame`, the mark) |
@@ -5912,7 +5912,7 @@ waits a whole gap after it.
 Unlike the in-flight budget's, this switch acts with `ROOMLERD_PATH_MODEL=off`: only its counts ride
 that line, and its own lines are written either way. The config key is built as `inflight_budget`'s: the
 field, its env fallback, the key's metadata, its echo and its check
-(`crates/agent-core/src/config.rs:1236`, `:3541`; `crates/agent-core/src/config_surface.rs:1459`,
+(`crates/agent-core/src/config.rs:1241`, `:3569`; `crates/agent-core/src/config_surface.rs:1459`,
 `:2166`, `:2756`). A set variable wins over the key, any value but `off`, `shadow` or `on` is refused
 at `config set`, and remote config cannot set it ([remote-config.md](remote-config.md)). The read is
 inside the FR-135 ratchet's media path, so the ratchet counts it (ledger `p4:DEADLINE-1`, which
@@ -5940,7 +5940,7 @@ are a pump's: each data-channel pump's line carries its own send task's (`Counte
 | `kf_owed_granted` | the owed asks granted over the line, at a frame once the gap opened or by a later ask that passed; under `shadow`, the ones `on` would have granted |
 | `kf_gap_ms` | the key frame rule's gap at the line, from the last key frame the send task wrote and the rate the pump last handed the gate (`KeyframeGate::gap`, `agents/roomlerd/src/media_deadline.rs:767`): `Some(500)` before the first key frame or with no rate, `None` for a pump that serves no session's gate. It spaces recovery key frames only while `video_channel` is `video-deadline` (under `shadow`, `on`'s) |
 | `kf_written` | P4b-5a: the key frames the send task wrote whole, `(<video-bytes>, <video-deadline>)`, **from the pump's start**. A key frame counts on the channel it went on once every chunk of it was handed to the stack without error, where the send task's arm tells the lane (`Lane::written`, `agents/roomlerd/src/media_deadline.rs:1619`, called at `peer.rs:4369` and `:7423`); a frame whose send failed counts on neither side. Under `shadow` every key frame counts on `video-bytes`, where `off` writes it |
-| `kf_dropped` | the key frames the lane dropped before the socket, `(<late>, <switching>)`, **from the pump's start**: by D (`drop_late`, `media_deadline.rs:1955`) and while a switch drained or waited for its key frame (`drop_switching`, `:1941`). A dropped key frame is never written, so it is in neither `kf_written` nor `viewer_kf`. `(0, 0)` under `shadow`, whose lane drops nothing: `late_dropped` and `drain_dropped` carry what `on` would have dropped |
+| `kf_dropped` | the key frames the lane dropped before the socket, `(<late>, <switching>)`, **from the pump's start**: by D (`drop_late`, `media_deadline.rs:1978`) and while a switch drained or waited for its key frame (`drop_switching`, `:1964`). A dropped key frame is never written, so it is in neither `kf_written` nor `viewer_kf`. `(0, 0)` under `shadow`, whose lane drops nothing: `late_dropped` and `drain_dropped` carry what `on` would have dropped |
 | `viewer_kf` | the newest counts the viewer reported in `rc:decodestat`'s `kf`: the key frames its assembler completed whole on `video-bytes` and on `video-deadline`, **from the session's start** (`ViewerRelayReport::kf`, `media_deadline.rs:877`). `None` until a report carries them; a viewer whose session is unframed, or older than P4b-5a, sends none |
 
 P4b-4's five counts are the session's, not the pump's: N12's split (`KeyframeSplit`,
