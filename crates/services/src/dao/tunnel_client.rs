@@ -26,6 +26,27 @@ pub enum ReviveScope {
     LiveOrRemoved(ObjectId),
 }
 
+/// What [`TunnelClientDao::claim`] did (FR-159). The update matches only
+/// while the row holds no `instance_id`, so when it matches nothing the row is
+/// read again to tell why.
+#[derive(Debug)]
+pub enum Claim {
+    /// The row held no install and was in scope: revived, and it now holds
+    /// the install's id.
+    Claimed(TunnelClient),
+    /// The same install claimed it first (one config enrolling twice at once,
+    /// with two tokens): revived within the scope, as a row found by that id
+    /// is. Not a new row: the unique index on `instance_id` would refuse it.
+    Revived(TunnelClient),
+    /// Another install claimed it first. Nothing was written: this install
+    /// gets a row of its own.
+    TakenByAnother,
+    /// The row left the scope the route decided (removed since, say), and no
+    /// install holds it. Nothing was written: the route refuses it, as a
+    /// revival that lost its scope is refused.
+    OutOfScope,
+}
+
 impl TunnelClientDao {
     pub fn new(db: &Database) -> Self {
         Self {
@@ -33,6 +54,9 @@ impl TunnelClientDao {
         }
     }
 
+    /// A new row. An FR-159 client passes its `instance_id` as `machine_id`
+    /// too: unique under the `machine_id` index, a value no older client
+    /// sends, and so a row no legacy hash ever finds.
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
@@ -40,6 +64,7 @@ impl TunnelClientDao {
         owner_user_id: ObjectId,
         name: String,
         machine_id: String,
+        instance_id: Option<String>,
         os: OsKind,
         client_version: String,
     ) -> DaoResult<TunnelClient> {
@@ -53,6 +78,7 @@ impl TunnelClientDao {
             tags: Vec::new(),
             name_admin_set: false,
             machine_id,
+            instance_id,
             os,
             client_version,
             status: AgentStatus::Offline,
@@ -80,6 +106,23 @@ impl TunnelClientDao {
             .find_one(doc! {
                 "tenant_id": tenant_id,
                 "machine_id": machine_id,
+            })
+            .await
+    }
+
+    /// FR-159 — the row an install's own id holds, live or removed, as
+    /// [`Self::find_by_tenant_and_machine`] reads the legacy hash: the unique
+    /// `(tenant_id, instance_id)` index covers removed rows too, so a removed
+    /// client is revived in place, never inserted again.
+    pub async fn find_by_tenant_and_instance(
+        &self,
+        tenant_id: ObjectId,
+        instance_id: &str,
+    ) -> DaoResult<Option<TunnelClient>> {
+        self.base
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "instance_id": instance_id,
             })
             .await
     }
@@ -150,6 +193,20 @@ impl TunnelClientDao {
             )
             .await?;
         self.base.find_by_id(client_id).await.map(Some)
+    }
+
+    /// FR-159 — the claim (a stub: the tests come first).
+    pub async fn claim(
+        &self,
+        client_id: ObjectId,
+        instance_id: &str,
+        name: &str,
+        os: OsKind,
+        client_version: &str,
+        scope: ReviveScope,
+    ) -> DaoResult<Claim> {
+        let _ = (client_id, instance_id, name, os, client_version, scope);
+        Ok(Claim::OutOfScope)
     }
 
     pub async fn list_for_tenant(
