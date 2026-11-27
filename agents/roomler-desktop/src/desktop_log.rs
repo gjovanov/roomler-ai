@@ -151,6 +151,10 @@ pub fn init() -> Option<PathBuf> {
         .and_then(|p| CappedFile::open(p.clone(), MAX_BYTES).ok());
     match file {
         Some(f) => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the companion's log file: never coloured (root clippy.toml, #3938)"
+            )]
             let file_layer = fmt::layer()
                 .with_target(false)
                 .with_ansi(false)
@@ -175,6 +179,10 @@ pub fn init() -> Option<PathBuf> {
 /// #3938 — the stderr layer [`init`] installs: the companion's lines with no
 /// target, written into `writer`, coloured only when `colour` says so
 /// (`roomler_node_core::logging::colour`, asked of stderr).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the companion's console: its colour is the caller's, from roomler_node_core::logging::colour (root clippy.toml, #3938)"
+)]
 fn console_layer<S, W>(
     writer: W,
     colour: bool,

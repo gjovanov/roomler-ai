@@ -214,6 +214,10 @@ impl std::io::Write for Captured {
 
 impl Captured {
     /// A subscriber that writes every event, debug and above, here.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn dispatch(&self) -> tracing::Dispatch {
         let sink = self.clone();
         tracing::Dispatch::new(

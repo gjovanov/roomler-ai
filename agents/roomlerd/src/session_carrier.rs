@@ -887,6 +887,10 @@ mod tests {
 
     /// What `f` logs, as the daemon's log file writes it (`roomler_node_core::
     /// logging::init`'s file layer: time, level, message, fields; no target).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn logged(f: impl FnOnce()) -> String {
         use std::sync::{Arc, Mutex};
         #[derive(Clone, Default)]

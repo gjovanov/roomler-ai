@@ -265,6 +265,10 @@ pub fn init() {
         prune_old_logs(d, KEEP_DAYS);
         let (nb, guard) = tracing_appender::non_blocking(appender);
         let _ = GUARD.set(Mutex::new(Some(guard)));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the daemon's log file: never coloured (root clippy.toml, #3938)"
+        )]
         let file = fmt::layer()
             .with_writer(nb)
             .with_target(false)
@@ -1320,6 +1324,10 @@ fn stdout_colour() -> bool {
 /// #3938 — the console layer [`init`] installs, in both of its branches: the
 /// daemon's lines in the compact format with no target, written into `writer`,
 /// coloured only when `colour` says so ([`stdout_colour`]).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the daemon's console: its colour is the caller's, from stdout_colour (root clippy.toml, #3938)"
+)]
 fn console_layer<S, W>(
     writer: W,
     colour: bool,

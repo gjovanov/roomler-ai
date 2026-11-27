@@ -1155,6 +1155,10 @@ fn stdout_colour() -> bool {
 /// #3938 — the relay's log, as `main` installs it: `filter`, then every line
 /// into `writer`, in the library's full format, coloured only when `colour`
 /// says so ([`stdout_colour`]).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the relay's console: its colour is the caller's, from stdout_colour (root clippy.toml, #3938)"
+)]
 fn log_subscriber<W>(
     filter: tracing_subscriber::EnvFilter,
     writer: W,

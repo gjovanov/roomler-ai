@@ -2278,6 +2278,10 @@ mod tests {
     }
 
     /// Run `f` with every WARN+ event captured; return its value and the text.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn capture_warns<T>(f: impl FnOnce() -> T) -> (T, String) {
         let buf = Captured::default();
         let subscriber = tracing_subscriber::fmt()

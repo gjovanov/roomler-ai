@@ -5994,6 +5994,10 @@ machine_name = "devbox"
     }
 
     /// Everything this thread logs while the guard lives, as text.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn captured() -> (Captured, CaptureGuard) {
         use tracing_subscriber::layer::SubscriberExt;
         let second = tracing::Dispatch::new(tracing_subscriber::registry());

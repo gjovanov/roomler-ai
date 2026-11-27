@@ -827,6 +827,10 @@ fn daemon_exe(origin: Origin) -> Option<PathBuf> {
 /// reach those lines. An embedded `roomlerd cli` logs through this subscriber
 /// too: it runs before the daemon would set up its own log. #3938: the lines go
 /// into `writer`, coloured only when `colour` says so ([`stdout_colour`]).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the CLI's console: its colour is the caller's, from stdout_colour (root clippy.toml, #3938)"
+)]
 fn log_subscriber<W>(
     env_filter: tracing_subscriber::EnvFilter,
     writer: W,

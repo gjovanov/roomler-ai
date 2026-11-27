@@ -487,6 +487,10 @@ mod worker_exit_tests {
     use std::path::Path;
 
     /// What `f` logs, as the daemon's log file writes it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn logged(f: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

@@ -61,6 +61,10 @@ fn main() {
     // operator launches manually; persistent logging is the daemon's
     // job, not ours. Operators who want wizard-side logs run from a
     // terminal and observe stderr.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the wizard's console: its colour from roomlerd::logging::colour, asked of stderr (root clippy.toml, #3938)"
+    )]
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

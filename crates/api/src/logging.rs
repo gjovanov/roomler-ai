@@ -62,6 +62,10 @@ pub fn colour(stdout_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 /// The fmt layer that writes the server's log lines into `writer`, coloured
 /// only when `colour` says so (see [`colour`]). The line's text is the same
 /// either way: timestamp, level, target, message and fields.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the server's console: its colour is the caller's, from colour (root clippy.toml, #3938)"
+)]
 pub fn layer<S, W>(writer: W, colour: bool) -> fmt::Layer<S, DefaultFields, Format, W>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
