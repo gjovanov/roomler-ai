@@ -273,7 +273,7 @@ The exit's "no" wins over a missing pin: it is the stable reason, the one an
 operator can act on. A statement that changes under a live client is followed
 at the next reconcile, both ways. The reason reaches `roomler status` through
 `ExitNodeStatus.v6_withheld_reason` (`crates/localapi/src/lib.rs:99`), worded
-by `exit_node_state` (`agents/roomler-cli/src/localclient.rs:3186`); a netstack
+by `exit_node_state` (`agents/roomler-cli/src/localclient.rs:3199`); a netstack
 client states none, since it carries no global IPv6 at all.
 
 ### Deploy order

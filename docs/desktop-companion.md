@@ -580,7 +580,7 @@ sequenceDiagram
   (§5), so the person always knows which daemon answered; the per-user half's own
   `ConfigGet` / `ConfigSet` stay its own file's. The same socket tells the companion, and
   the CLI's `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:5822`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:5882`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -2219,8 +2219,8 @@ sequenceDiagram
   `/var/run/roomler-person/<uid>.sock` (FR-97 P2g). That socket is served for `/dev/console`'s owner alone
   ([`person_socket.rs:435`](../agents/roomlerd/src/person_socket.rs#L435)). It drops every connection whose kernel
   uid is neither that person's nor root's (`person_peer_ok`,
-  [`crates/localapi/src/lib.rs:5281`](../crates/localapi/src/lib.rs#L5281), applied at `:5463`). It is 0600 and the
-  person's, in a folder only root writes (`bind_root_owned`, `:5549`). An answer is taken only after the seat is asked again (#3845).
+  [`crates/localapi/src/lib.rs:5341`](../crates/localapi/src/lib.rs#L5341), applied at `:5523`). It is 0600 and the
+  person's, in a folder only root writes (`bind_root_owned`, `:5609`). An answer is taken only after the seat is asked again (#3845).
   The worker's own socket is 0600 in the person's private temporary folder. Nothing is written anywhere: the root's
   folder stays in root's home.
 - **The floor is every host's.** With the road closed, the app is not the question's surface: no
@@ -2398,7 +2398,7 @@ sequenceDiagram
   only when the kernel's uid for the connection is the socket's own person; root is refused. Nothing is
   written anywhere: the root half keeps the announcement in memory, for the connection's life. The
   person socket holds an idle connection with no deadline (`serve_person_listener`,
-  [`crates/localapi/src/lib.rs:5432`](../crates/localapi/src/lib.rs#L5432)), so a held one does not
+  [`crates/localapi/src/lib.rs:5492`](../crates/localapi/src/lib.rs#L5492)), so a held one does not
   flap and needs no keepalive. It still ends when the seat moves, since the listener aborts every
   connection it holds.
 - **The floor.** The app is not counted when no announcement is live, or when the person socket does
@@ -2760,7 +2760,7 @@ No step of a click said anything, and none had a bound:
 | the page's `decide()` | left early, without a word, while an earlier answer was "on its way" or after the page had let go of the question |
 | the page's words | "Approving…" and "Failed: …" went into the countdown, which repaints every second |
 | the app's `consent_decide` | no line on any outcome |
-| the LocalAPI reply | read with no deadline (`Client::request`, [`crates/localapi/src/lib.rs:6231`](../crates/localapi/src/lib.rs#L6231)) |
+| the LocalAPI reply | read with no deadline (`Client::request`, [`crates/localapi/src/lib.rs:6291`](../crates/localapi/src/lib.rs#L6291)) |
 | the page's read of the questions | a failure read as "no question": the page let go of the question while it stayed on screen |
 
 The answer never reached the daemon: 0.4.221 answers a `ConsentDecide` at once, and logs a
@@ -2983,8 +2983,8 @@ was for the tray (FR-85).
 
 `connect` returns its last endpoint's error, and a running daemon's system socket answers the
 person `PermissionDenied` as well. So the own endpoint decides, asked again when a connect fails
-(`own_endpoint_gone`, [`crates/localapi/src/lib.rs:7037`](../crates/localapi/src/lib.rs#L7037);
-`endpoint_gone`, [`:7060`](../crates/localapi/src/lib.rs#L7060)). Until #3998 a click on
+(`own_endpoint_gone`, [`crates/localapi/src/lib.rs:7097`](../crates/localapi/src/lib.rs#L7097);
+`endpoint_gone`, [`:7120`](../crates/localapi/src/lib.rs#L7120)). Until #3998 a click on
 Approve with the daemon stopped read "Could not reach the device service: Permission denied (os
 error 13)" (the 0.4.224 Linux lab), and on those hosts the tray's red never came down with a
 stopped daemon.
@@ -3640,12 +3640,12 @@ both were measured on 0.4.228 in the lab:
 
 **The listener lives only while its path names it.** A person socket records the socket file
 it bound as its filesystem's device and its inode (`BoundSocket`,
-`crates/localapi/src/lib.rs:5393`). Both are needed: a runtime directory made again is a new
+`crates/localapi/src/lib.rs:5453`). Both are needed: a runtime directory made again is a new
 filesystem, whose inode numbers start over, and whose device number can be one an earlier
 directory had (measured: 54, 53, 54, 53 across three re-logins, root inode 1 each time). Every
 second it looks at its path (`PATH_CHECK`, `agents/roomlerd/src/person_socket.rs:124`). Once
 the path is gone, or names anything else, it stops, and so does every connection it serves
-(`serve_person_socket`, `crates/localapi/src/lib.rs:5323`). The poll serves the person again
+(`serve_person_socket`, `crates/localapi/src/lib.rs:5383`). The poll serves the person again
 at once, at the same path, with no pause (`Ended`, `agents/roomlerd/src/person_socket.rs:654`;
 `follow_the_seat`, `agents/roomlerd/src/person_socket.rs:853`).
 
@@ -3727,8 +3727,8 @@ The tests:
 | `a_removed_socket_file_is_served_again_within_a_look` | `agents/roomlerd/src/person_socket.rs:1769` | the real poll and a real socket (Linux, as the runner): a removed file is served again within a look, with no pause |
 | `a_replaced_socket_file_ends_the_listener_and_a_live_one_is_left_alone` | `agents/roomlerd/src/person_socket.rs:1812` | a stale replacement is cleared and served; a live one ends the listener, is kept and waits out the pause |
 | `a_runtime_directory_not_there_yet_is_tried_again_at_the_next_look` | `agents/roomlerd/src/person_socket.rs:1878` | a missing runtime directory is tried again at each look, said once for each log-in |
-| `a_person_socket_ends_when_its_path_no_longer_names_it` | `crates/localapi/src/lib.rs:12235` | the listener and its way out: unlinked or replaced, it ends with its connection, and removes nothing it did not bind |
-| `the_live_sessions_read_by_the_sockets_person_are_noted_as_theirs` | `crates/localapi/src/lib.rs:12327` | the dispatcher: only the socket's own person's read is noted, never root's nor the daemon's own endpoint's |
+| `a_person_socket_ends_when_its_path_no_longer_names_it` | `crates/localapi/src/lib.rs:12295` | the listener and its way out: unlinked or replaced, it ends with its connection, and removes nothing it did not bind |
+| `the_live_sessions_read_by_the_sockets_person_are_noted_as_theirs` | `crates/localapi/src/lib.rs:12387` | the dispatcher: only the socket's own person's read is noted, never root's nor the daemon's own endpoint's |
 | `a_session_is_told_only_by_a_read_after_its_registration` | `agents/roomlerd/src/rc_sessions.rs:448` | the decision, with a stubbed clock and record (every OS) |
 | `a_companion_that_stops_reading_for_longer_than_the_bound_has_gone_quiet` | `agents/roomlerd/src/rc_sessions.rs:481` | a told session's companion gone quiet |
 | `a_persons_read_is_noted_for_them_and_a_reannounce_keeps_the_registration` | `agents/roomlerd/src/rc_sessions.rs:505` | the record: per person, after the registration, kept across a re-announce |
@@ -3899,7 +3899,7 @@ flowchart TD
 | what status is told | `too_old_to_connect`, `companion.rs:570`; `too_old_here`, `:663`; `too_old_beside`, `:694` | `NodeStatus.companion_too_old` (`crates/localapi/src/lib.rs:510`), read fresh on every answer, because the service host, another process, may have just refreshed the tray. The tray's version is the one the refresh goes by (§13.4, #3908): the marker when it names the daemon's, else the EXE's own. Absent means fine or not applicable, never unknown: a tray whose version neither names is reported without one, and a token or a file the daemon cannot read counts as reportable |
 | the log the hint names | `newest_service_log`, `crates/agent-core/src/logging.rs:1004` | `--source service` reads the service host's `roomlerd-service.log` alone, the newest of its daily files (#3814). It used to take whichever was newer of that and the SystemContext worker's `roomlerd.log` in the same `service-logs` folder. The busier worker's nearly always was, so the hint's own command showed none of the warn lines. The worker's log is `--source daemon`, since the worker answers the verb |
 | whether the retry is off | `retry_off_where_it_runs`, `companion.rs:600`; `sync_enabled_in`, `:623`; `service_sync_enabled`, `:641` | `companion_too_old.retry_off` (#3814): `ROOMLERD_COMPANION_SYNC=0` is set where the retry runs. A daemon that runs the retry itself reads its own environment. So does the SystemContext worker: the service host starts it with the host's own environment. A worker the host starts as the person gets the person's environment, which leaves the service's `Environment` value out, so it reads that value: once a process, because a restart of the service starts a new worker. A value it cannot read, or one that does not name the switch, leaves the retry on |
-| what status says | `tray_lines`, `agents/roomler-cli/src/localclient.rs:2505` | the lines below |
+| what status says | `tray_lines`, `agents/roomler-cli/src/localclient.rs:2518` | the lines below |
 
 `roomler status` on a machine-wide install whose tray is 0.4.212:
 

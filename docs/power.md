@@ -270,8 +270,8 @@ sleep would say hello again and erase the reason.
 
 | surface | field | reads |
 |---|---|---|
-| `roomler status` | `power` ([`lib.rs:221`](../crates/localapi/src/lib.rs#L221)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2477`](../agents/roomler-cli/src/localclient.rs#L2477)) |
-| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3504`](../agents/roomler-cli/src/localclient.rs#L3504)) |
+| `roomler status` | `power` ([`lib.rs:221`](../crates/localapi/src/lib.rs#L221)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2490`](../agents/roomler-cli/src/localclient.rs#L2490)) |
+| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3517`](../agents/roomler-cli/src/localclient.rs#L3517)) |
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
 | the admin agent API | `power`, `sleep` ([`agent.rs:1361`](../crates/modules/fleet/src/agent.rs#L1361)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
