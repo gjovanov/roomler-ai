@@ -4,7 +4,7 @@ use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{AgentStatus, OsKind, TunnelClient};
 
-use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
+use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
 pub struct TunnelClientDao {
     pub base: BaseDao<TunnelClient>,
@@ -152,6 +152,71 @@ impl TunnelClientDao {
         client_version: &str,
         scope: ReviveScope,
     ) -> DaoResult<Option<TunnelClient>> {
+        self.revive(client_id, name, os, client_version, scope, None)
+            .await
+    }
+
+    /// FR-159 — claim a row no install holds yet for the install
+    /// `instance_id`: [`Self::rehydrate`] within `scope`, and the row takes the
+    /// id in the same update, which matches only while the row holds none. It
+    /// never writes `machine_id`, because the row's overlay node is keyed by
+    /// it, and it moves no `token_gen` (D3): the token comes at the row's
+    /// generation, as every re-enrollment's does.
+    ///
+    /// An update that matched nothing is told apart by reading the row again
+    /// ([`Claim`]).
+    pub async fn claim(
+        &self,
+        client_id: ObjectId,
+        instance_id: &str,
+        name: &str,
+        os: OsKind,
+        client_version: &str,
+        scope: ReviveScope,
+    ) -> DaoResult<Claim> {
+        if let Some(row) = self
+            .revive(
+                client_id,
+                name,
+                os,
+                client_version,
+                scope,
+                Some(instance_id),
+            )
+            .await?
+        {
+            return Ok(Claim::Claimed(row));
+        }
+        let held = match self.base.find_by_id(client_id).await {
+            Ok(row) => row.instance_id,
+            Err(DaoError::NotFound) => return Ok(Claim::OutOfScope),
+            Err(e) => return Err(e),
+        };
+        Ok(match held.as_deref() {
+            // The same install claimed it first: the row is this install's,
+            // revived within the scope as a row found by its id is.
+            Some(held) if held == instance_id => self
+                .rehydrate(client_id, name, os, client_version, scope)
+                .await?
+                .map_or(Claim::OutOfScope, Claim::Revived),
+            Some(_) => Claim::TakenByAnother,
+            // No install holds it, so the scope is what no longer held.
+            None => Claim::OutOfScope,
+        })
+    }
+
+    /// The update [`Self::rehydrate`] documents. With `claim`, the row also
+    /// takes that install's id in the same update, which then matches only
+    /// while the row holds none.
+    async fn revive(
+        &self,
+        client_id: ObjectId,
+        name: &str,
+        os: OsKind,
+        client_version: &str,
+        scope: ReviveScope,
+        claim: Option<&str>,
+    ) -> DaoResult<Option<TunnelClient>> {
         let os_bson = bson::to_bson(&os).unwrap_or(bson::Bson::Null);
         let mut set = doc! {
             "os": { "$literal": os_bson },
@@ -159,7 +224,7 @@ impl TunnelClientDao {
             "updated_at": DateTime::now(),
             "deleted_at": bson::Bson::Null,
         };
-        let filter = match scope {
+        let mut filter = match scope {
             // `deleted_at: null` (null OR absent), as every live read here.
             ReviveScope::LiveOwnedBy(owner) => doc! {
                 "_id": client_id,
@@ -177,6 +242,12 @@ impl TunnelClientDao {
                 doc! { "_id": client_id }
             }
         };
+        if let Some(instance_id) = claim {
+            // `null` is null OR absent: an unclaimed row has no field at all
+            // (`skip_serializing_if`), and nothing ever writes it null.
+            filter.insert("instance_id", bson::Bson::Null);
+            set.insert("instance_id", doc! { "$literal": instance_id });
+        }
         let matched = self
             .base
             .collection()
@@ -193,20 +264,6 @@ impl TunnelClientDao {
             )
             .await?;
         self.base.find_by_id(client_id).await.map(Some)
-    }
-
-    /// FR-159 — the claim (a stub: the tests come first).
-    pub async fn claim(
-        &self,
-        client_id: ObjectId,
-        instance_id: &str,
-        name: &str,
-        os: OsKind,
-        client_version: &str,
-        scope: ReviveScope,
-    ) -> DaoResult<Claim> {
-        let _ = (client_id, instance_id, name, os, client_version, scope);
-        Ok(Claim::OutOfScope)
     }
 
     pub async fn list_for_tenant(

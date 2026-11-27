@@ -195,25 +195,81 @@ pub enum Refusal {
     Cap(String),
 }
 
-/// What an enrollment does. A stub: the tests come first, and it answers
-/// every request as an older client's.
+/// What the row an enrollment found is to the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Match<'a> {
+    /// An older client's request (or the switch off), and the row its
+    /// `machine_id` names, whatever install holds it: the path of before.
+    Legacy,
+    /// The row the request's own `instance_id` holds.
+    Install,
+    /// A row with the request's `machine_id` that no install holds yet,
+    /// which the install `own` may claim.
+    Unclaimed { own: &'a str },
+}
+
+/// What an enrollment does, one step at a time. [`Step::Need`] asks for the
+/// scope's answer for the row found ([`Need::Scope`]), or for the cap's for a
+/// row that may be made ([`Need::Cap`]); the route reads it and asks again
+/// with the answer. [`Step::Decided`] is the decision, once every answer it
+/// needs is given: the action after the spend, or the refusal before it.
 pub fn decide<'a>(
     request: InstanceRead<'a>,
     found: &Found<'_>,
     scope: Option<Scope>,
     cap: Option<&Cap>,
 ) -> Step<'a> {
-    let _ = request;
-    let Some(row) = found.by_machine else {
-        return new_row(cap, None);
+    let (by, row, found_as) = match request {
+        InstanceRead::Absent | InstanceRead::Ignored => match found.by_machine {
+            Some(row) => (By::Machine, row, Match::Legacy),
+            None => return new_row(cap, None),
+        },
+        InstanceRead::Used(own) => match (found.by_instance, found.by_machine) {
+            (Some(row), _) => (By::Instance, row, Match::Install),
+            // Read second, and holding this install's id after all: the same
+            // install claimed it between the two reads.
+            (None, Some(row)) if row.instance_id == Some(own) => (By::Machine, row, Match::Install),
+            (None, Some(row)) if row.instance_id.is_none() => {
+                (By::Machine, row, Match::Unclaimed { own })
+            }
+            // Another install's row, or none: a row of its own.
+            (None, _) => return new_row(cap, Some(own)),
+        },
     };
     let Some(scope) = scope else {
-        return Step::Need(Need::Scope(By::Machine));
+        return Step::Need(Need::Scope(by));
     };
-    match scope {
-        Scope::In(scope) => Step::Decided(Ok(Action::Revive { id: row.id, scope })),
-        Scope::SomeoneElses => Step::Decided(Err(Refusal::SomeoneElses)),
-        Scope::Removed => Step::Decided(Err(Refusal::Removed)),
+    match (found_as, scope) {
+        (Match::Unclaimed { own }, Scope::In(scope)) => {
+            // A claim that loses its race to another install becomes a new
+            // row, so the cap is read before the spend for it too. The claim
+            // itself takes no slot.
+            let Some(cap) = cap else {
+                return Step::Need(Need::Cap);
+            };
+            let if_taken = match cap {
+                Cap::Room => IfTaken::Create,
+                Cap::Full(why) => IfTaken::Refuse(Refusal::Cap(why.clone())),
+            };
+            Step::Decided(Ok(Action::Claim {
+                id: row.id,
+                instance_id: own,
+                scope,
+                if_taken,
+            }))
+        }
+        (Match::Legacy | Match::Install, Scope::In(scope)) => {
+            Step::Decided(Ok(Action::Revive { id: row.id, scope }))
+        }
+        // D4: someone else's live row, met by the legacy hash alone, is a
+        // guess that it is this install's. A row of its own, as a new name
+        // always made one.
+        (Match::Unclaimed { own }, Scope::SomeoneElses) => new_row(cap, Some(own)),
+        (Match::Install, Scope::SomeoneElses) => Step::Decided(Err(Refusal::SomeoneElsesInstance)),
+        (Match::Legacy, Scope::SomeoneElses) => Step::Decided(Err(Refusal::SomeoneElses)),
+        // A removed row comes back only through a device manager, by either
+        // id (D4): no row of its own instead.
+        (_, Scope::Removed) => Step::Decided(Err(Refusal::Removed)),
     }
 }
 

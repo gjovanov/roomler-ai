@@ -186,9 +186,14 @@ pub async fn enroll_tunnel_client(
     State(state): State<NetworkState>,
     Json(body): Json<TunnelEnrollRequest>,
 ) -> Result<Json<TunnelEnrollResponse>, ApiError> {
-    // FR-159 — a stub: the tests come first, and every request is read as an
-    // older client's.
-    let read = InstanceRead::Absent;
+    // FR-159 — the request's own id first: a malformed one is refused 400
+    // before anything is read or spent. With the switch off, a request that
+    // carries one is read as an older client's.
+    let read = tunnel_enrollment::read_instance_id(
+        body.instance_id.as_deref(),
+        state.fleet.settings.rc.tunnel_instance_id,
+    )
+    .map_err(|why| ApiError::BadRequest(why.to_string()))?;
 
     let token = state
         .auth
@@ -758,8 +763,11 @@ pub struct UpdateTunnelClientRequest {
 }
 
 /// PUT /api/tenant/{tenant_id}/tunnel-client/{client_id} — rename / relabel a
-/// tunnel client SERVER-side. This is the only in-place rename there is: a
-/// client-side rename derives a fresh machine_id and enrolls a brand-new row.
+/// tunnel client SERVER-side. For an older client this is the only in-place
+/// rename there is: its client-side rename derives a fresh machine_id and
+/// enrolls a brand-new row. An FR-159 client keeps its `instance_id` across a
+/// rename, so its re-enrollment renames its row in place, unless an admin set
+/// the name (`name_admin_set`).
 /// Mirrors `remote_control::update_agent` incl. the overlay/MagicDNS
 /// propagation and the additive response envelope. `MANAGE_AGENTS`, decided
 /// before the client id is parsed or the body read (#4218): a caller without
