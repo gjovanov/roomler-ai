@@ -637,7 +637,7 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `agents/roomlerd/src/files.rs:220-235` (`process_home`) | `BaseDirs`, from `$HOME`: typed as `sudo roomlerd run`, the daemon's active home is the caller's, not root's `/var/root` | read |
 | `agents/roomlerd/src/files.rs:5492-5502` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
 | `agents/roomlerd/src/recording/folder.rs:160-179` (`default_choice`) | `BaseDirs` and `UserDirs`, from `$HOME`: typed as `sudo roomlerd record` (a hidden command, `app.rs:528-529`), it names the caller's Movies folder and makes it when missing (`create_dir_all`, `:265`) | write |
-| `agents/roomler-cli/src/config.rs:87-100` (`default_config_path`) | `ProjectDirs`, from `$HOME`: `sudo roomler enroll`, `forward` and `socks5` without `--config` (and without `--daemon`) run as root and read AND SAVE the caller's tunnel config, `config.toml` in the tunnel CLI's own config folder in the caller's home (the roomler CLI's `default_config_path` defines that path, `agents/roomler-cli/src/config.rs:87-100`; `enroll`: `cli.rs:1220`; `forward` and `socks5` renew a token that is due, `cli.rs:910-912`, `:928-930`, through `save_renewed_token`, `credential.rs:135`, `config.rs:208`). Not established: whether that save leaves the person's file owned by root | write |
+| `agents/roomler-cli/src/config.rs:87-100` (`default_config_path`) | `ProjectDirs`, from `$HOME`: `sudo roomler enroll`, `forward` and `socks5` without `--config` (and without `--daemon`) run as root and read AND SAVE the caller's tunnel config, `config.toml` in the tunnel CLI's own config folder in the caller's home (the roomler CLI's `default_config_path` defines that path, `agents/roomler-cli/src/config.rs:87-100`; `enroll`: `cli.rs:1236`; `forward` and `socks5` renew a token that is due, `cli.rs:926-928`, `:944-946`, through `save_renewed_token`, `credential.rs:135`, `config.rs:208`). Not established: whether that save leaves the person's file owned by root | write |
 
 The source gate (`crates/agent-core/src/folder_gate.rs:279-345`) holds six of these reads as tracked by this FR on
 macOS builds: `process_home`, `default_download_dir`, `unix_lock_path`, `plist_path`, the `roomler` CLI's
@@ -730,9 +730,9 @@ The docs:
 - `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3033`, its sequence at `:3087`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
-- `docs/installation.md`, "Which account each step of the package's script writes as" (`:3312`): one-row's row, and
+- `docs/installation.md`, "Which account each step of the package's script writes as" (`:3320`): one-row's row, and
   what D8 decides.
-- `docs/installation.md`, where the give-up's line is described (`:3369-3460`): what D8 decides, in its place.
+- `docs/installation.md`, where the give-up's line is described (`:3377-3468`): what D8 decides, in its place.
 - `docs/fr/FR-43-macos-single-enrollment.md`: the P3c row (`:76`) points here.
 - The module docs: `one_row.rs:3-64` (the step table) and `one_row_home.rs:3-69`.
 - `docs/README.md`: the `installation.md` row names the rule.

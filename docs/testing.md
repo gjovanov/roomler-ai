@@ -220,7 +220,7 @@ the Windows path. A new spawn on that path is a decision someone writes down in 
 > registered for the capture's life (a `NoSubscriber` will do), so every callsite asks per
 > event; and assert a line the capture must see before one it must not, since a capture that
 > sees nothing passes every absence check. The pattern: `LogCapture::install` in
-> [`extauth_tests.rs:1168`](../crates/tests/src/extauth_tests.rs#L1168).
+> [`extauth_tests.rs:1172`](../crates/tests/src/extauth_tests.rs#L1172).
 
 Flakes fixed on 2026-10-30, and what each one teaches:
 
@@ -281,7 +281,7 @@ and passes.
 
 | Opt-in | Tests | What they do | CI step that sets it |
 |---|---|---|---|
-| `ROOMLERD_TEST_REAL_CLIPBOARD=1` | the clipboard round trip, every OS ([`clipboard.rs:4350`](../agents/roomlerd/src/clipboard.rs#L4350)); the change gate on X11 ([`:2629`](../agents/roomlerd/src/clipboard.rs#L2629), which also needs `ROOMLERD_TEST_X11=1`) and on a Mac ([`:3560`](../agents/roomlerd/src/clipboard.rs#L3560)) | write the clipboard; on X11, take `CLIPBOARD`, which empties it | "The real clipboard on X11", "… on a Mac", "… on Windows" ([`ci.yml:1333`](../.github/workflows/ci.yml#L1333), [`:1682`](../.github/workflows/ci.yml#L1682), [`:2158`](../.github/workflows/ci.yml#L2158)) |
+| `ROOMLERD_TEST_REAL_CLIPBOARD=1` | the clipboard round trip, every OS ([`clipboard.rs:4358`](../agents/roomlerd/src/clipboard.rs#L4358)); the change gate on X11 ([`:2629`](../agents/roomlerd/src/clipboard.rs#L2629), which also needs `ROOMLERD_TEST_X11=1`) and on a Mac ([`:3568`](../agents/roomlerd/src/clipboard.rs#L3568)) | write the clipboard; on X11, take `CLIPBOARD`, which empties it | "The real clipboard on X11", "… on a Mac", "… on Windows" ([`ci.yml:1333`](../.github/workflows/ci.yml#L1333), [`:1682`](../.github/workflows/ci.yml#L1682), [`:2158`](../.github/workflows/ci.yml#L2158)) |
 | `ROOMLERD_TEST_X11=1` | `capture::pointer::x11_tests` ([`pointer.rs:325`](../agents/roomlerd/src/capture/pointer.rs#L325)), `capture::x11_cursor::x11_tests` ([`x11_cursor.rs:422`](../agents/roomlerd/src/capture/x11_cursor.rs#L422)) and `input::layout_x11`'s `x11_real_switch_round_trip` ([`layout_x11.rs:838`](../agents/roomlerd/src/input/layout_x11.rs#L838)), which until #3813 ran on any display they reached; and, from before, `indicator::x11`, `capture::xwayland_probe_tests`, `keep_busy::host_x11` and `virtual_desktop`'s X tests | move the pointer, set the root cursor, replace the layouts with `setxkbmap` and leave `us` behind, send XTest input, put a window up | the Xvfb step, "The recorder's pointer (FR-85 P1d) and keep busy (FR-92 P3) on X11" ([`ci.yml:1224`](../.github/workflows/ci.yml#L1224)) |
 
 - **The gate.** A real-clipboard test calls `clipboard::real_clipboard_opted_in` first
@@ -323,7 +323,7 @@ and passes.
 
 | Lane | What it does |
 |---|---|
-| `ci.yml` | fmt + clippy (`--workspace -D warnings`, which compiles no test code, then `--all-targets` on the audited server crates and every `roomler-ai-mod-*` crate through [`scripts/clippy-audited-crates.sh`](../scripts/clippy-audited-crates.sh), whose module list is read from the workspace, #3594) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the thirteen heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs and the profiles build. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1507`). A push to master always runs everything |
+| `ci.yml` | fmt + clippy (`--workspace -D warnings`, which compiles no test code, then `--all-targets` on the audited server crates and every `roomler-ai-mod-*` crate through [`scripts/clippy-audited-crates.sh`](../scripts/clippy-audited-crates.sh), whose module list is read from the workspace, #3594) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the fourteen heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs, the profiles build and the vendored forks' tests. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1507`). A push to master always runs everything |
 | `installer-smoke.yml` | On a Windows runner: installs, audits and uninstalls the freshly built per-User MSI; upgrades, reinstalls, repairs and uninstalls the per-Machine MSI over its running service, and upgrades it once more while a test process holds `roomlerd.exe` open, failing on any boot-time delete that run leaves of a file in the install folder (the one installer run here that may end 3010, the restart its hold asks for; [`:1533`](../.github/workflows/installer-smoke.yml#L1533), #4196); upgrades the newest released MSIs of both flavours at or below the branch's version to the branch's, so a ref behind the newest release still upgrades (#3774). Every installer run goes through one runner ([`installer-smoke.yml:143`](../.github/workflows/installer-smoke.yml#L143), #3754) that waits for that process alone, fails the step past a 300 s deadline or on any exit but 0, prints the MSI log's `RESTART MANAGER` and held-in-use lines, and saves a process list with image paths and the service logs; a negative control proves the deadline on every run ([`:241`](../.github/workflows/installer-smoke.yml#L241)). Each per-Machine step has a timeout of its own (6 or 10 min, well under the job's 40; [`:1186`](../.github/workflows/installer-smoke.yml#L1186), #3810), so a step that never returns fails by itself and the evidence step runs, which adds the boot time, the System events 1074, 41 and 6008 since the job began and the service's state ([`:1951`](../.github/workflows/installer-smoke.yml#L1951)). A runner that goes away mid-job leaves a step that never reports an end: GitHub closes the job `cancelled` 5 min past its 40 min timeout, with the evidence step still `pending`. When the Windows job does not succeed, a check job on a fresh Ubuntu runner reads it through the API ([`:2910`](../.github/workflows/installer-smoke.yml#L2910), #3810), writes which steps reported an end and which did not, as an error annotation and in its summary, and ends 1. When not every step of attempt 1 reported an end, the workflow `installer-smoke-rerun`, which GitHub runs from the default branch's copy when the smoke run completes, asks GitHub to re-run that one job once, as attempt 2 of the same run, unless one of its guards refuses. Attempt 2 is never re-run by this workflow, and until a re-run replaces the lost job's check the run reads `cancelled` (the flow, the guards and the known limits: [below](#a-lost-windows-job-is-re-run-once-3810)). The per-Machine service is opted out of the live update channel from its first start: `ROOMLERD_AUTO_UPDATE=0` goes into the machine environment, from which each spawn builds the worker's environment ([`:1198`](../.github/workflows/installer-smoke.yml#L1198)), and the step fails if a log of the service says its updater was armed. On a macOS runner: installs the pkg with the live update channel shut by the product's own opt-out marker (`/etc/roomler/disable-auto-update`) until the job's last install, which asserts the update helper is installed by default; every step that runs the bundle's `roomlerd` first checks that its `--version` is the build's (#3774); `roomlerd caps` must report `has_input_permission` and `permissions` consistently, and the hosted image grants both Screen Recording and Accessibility |
 | `deb-bare-image.yml` | On a PR that changes what a `.deb` declares: packages the latest release's binaries with the checkout's control file through the lane's own `cargo deb`, installs them on five bare images on both arches, by apt and by the real `install.sh`, and starts them. A control proves the check still refuses agent-v0.4.190, and for the reason that matters: the package does not start, not a container that could not reach its mirror (#3710). The release lane runs the same script on what it is about to publish (`verify-linux-debs`) — [installation.md](installation.md#what-a-bare-host-needs-3204) |
 | `ci-apt-selftest.yml` | On a PR or a master push that changes the apt helper (`.github/actions/ci-linux-system-deps/`), `apt-seed-install`, `scripts/deb-bare-check.sh`, a release workflow or itself (#3710): the helper's offline tests against stub binaries, shellcheck, and actionlint (pinned) over every workflow that calls the helper, the release workflows included, which no PR runs. Then fault cells on `ubuntu-latest`, `ubuntu-22.04` and `ubuntu-22.04-arm` (healthy, the runner's own resolver dead, every resolver dead, and on arm64 only `ports.ubuntu.com` dead): a functional resolver-fault control on each job's own throwaway runner, which drops DNS answers carrying the Ubuntu mirror names and nothing else, proves the fault took effect before a cell's result counts, and proves at the end that it was hit. Each cell asserts the helper's failover, bounds and single `::error`, a container's resolver before and after the failover, and how `deb-bare-check.sh` reads a dead mirror (exit 3, never a package failure) — [build-caches.md](build-caches.md#5-how-apt-reaches-the-mirrors) |
@@ -337,6 +337,7 @@ and passes.
 | **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast`, about 4,100 tests (4,140 on 2026-11-25; 2,400 when the lane began), one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002). ⚠️ A stall is not a slow start, and no deadline fixes one. Twice, on 2026-11-19 and 11-25, the four `exec::session_lifetime` cells whose PowerShell calls `Start-Process` started within 4 s of each other and all four sat silent to their 120 s deadline, against about 1.5 s green, while a cmd cell beside them passed (#4444). Each such cell now takes a turn (`exec::session_lifetime::Turn`, held by the pty and Roomler SSH quiet-shell cells too), its deadline counts from the turn, and a red says where its chain stopped: the stand-in's start, its runtime, the pty, PowerShell's start, `Start-Process`, or the pid file's write, with the stand-in's own output, its folder and what of it still runs. Since #3813 a step of its own follows the suite with `clipboard` added, so the suite builds and runs as before: the clipboard module without the opt-in, with a sentinel on the runner's clipboard that must survive, then the round trip with it ([above](#tests-that-change-a-real-desktop-3813)) |
 | **The desktop companion on Windows** (#3940, `ci.yml` job `windows-overlay-clippy`, step "The desktop companion on Windows — clippy + unit tests (#3940)", [`ci.yml:2018`](../.github/workflows/ci.yml#L2018)) | `cargo clippy -p roomler-desktop --all-targets -- -D warnings`, then `cargo test -p roomler-desktop --bins`, natively on Windows and with no features, as the release builds the companion. Before it no lane compiled the companion's `#[cfg(windows)]` code: its unit tests ran on Linux (step "Test the desktop companion (roomler-desktop)") and macOS only `cargo check`ed it. So a Windows-only error or lint first showed up in the release build: in the login start (the Run key), the service start's spawn with no inherited handles, the panels' capture exclusion or the machine-wide config path. The step sits beside the setup wizard's, in a job whose cache already holds the wizard's Tauri 2 tree; the companion's adds `tray-icon` and `protocol-asset`. The job's cache cap rose to 11,000 MB with it ([build-caches.md](build-caches.md#4-growth-control-the-accretion-gc)) |
 | **The Windows jobs' shell** (#3352, [`scripts/windows-shell-guard.sh`](../scripts/windows-shell-guard.sh)) | Every `ci.yml` job on a Windows runner runs its `run:` steps in bash, which GitHub starts with `-eo pipefail`, so a step stops at its first failing command. Under the runner's default pwsh the LAST native command decided a step: six steps ran `cargo clippy … -D warnings` and then `cargo test`, and a lint was printed while the step passed with the tests. The default is set per job, because a workflow-wide bash would add `pipefail` to every Linux step. A guard in `rust-lint` fails a Windows job that leaves it out, after it has refused a planted workflow. A step that needs PowerShell says `shell: pwsh` and checks `$LASTEXITCODE` after each native command, which is also the rule in the release and installer workflows, whose Windows steps are PowerShell by design |
+| **The vendored forks' own tests** (#4503, `ci.yml` jobs `vendored-tests` and `vendored-lanes-audit`, [`ci.yml:3186`](../.github/workflows/ci.yml#L3186)) | Each crate under `crates/vendored/` that has a `Cargo.toml`, six forks, runs its own tests in an entry of one matrix job, against the workspace's `Cargo.lock`, and each entry is a check of its own, `Vendored <fork> tests`. It runs on every push to master and every PR that is not docs-only. An audit on every PR fails a fork with no entry and an entry that names no fork. Not yet in the `rust` aggregator's needs — [below](#the-tests-of-the-vendored-forks-4503) |
 
 Known environmental failures (conference specs without forwarded RTC ports,
 mailpit-dependent flows, the containerized-Chromium Google-OAuth redirect test)
@@ -436,6 +437,103 @@ Known limits:
   [`:1975`](../.github/workflows/installer-smoke.yml#L1975)). Take the highest attempt's: the
   plain name holds only what attempt 1 uploaded before it was lost.
 - A re-run runs the real test again, so a failure that comes and goes can pass on attempt 2.
+
+### The tests of the vendored forks (#4503)
+
+Each crate under `crates/vendored/` that has a `Cargo.toml` is an upstream crate that carries
+roomler's patches, and the root `Cargo.toml` puts it in place of the crates.io copy through
+`[patch.crates-io]`. No fork is a workspace member, so no other `cargo test` in `ci.yml` builds
+one, and the drift checks in `rust-lint` compare a fork's text with its `.patch` file, not what
+it does. Until #4503 two of the six forks ran their own tests in CI, in the jobs `vendored-sctp`
+(#3755) and `vendored-ice` (FR-148 P4). The matrix job `vendored-tests`
+([`ci.yml:3186-3305`](../.github/workflows/ci.yml#L3186-L3305)) now runs one entry per fork,
+each a check named `Vendored <fork> tests`, so the two old checks keep their names.
+
+| Fork | Runner | What the entry runs | Skipped, by exact name | Tests, by hand with the entry's command |
+|---|---|---|---|---|
+| `rtp` ([`:3229`](../.github/workflows/ci.yml#L3229)) | ubuntu-latest | `--lib` | none | 68 passed |
+| `scrap` ([`:3237`](../.github/workflows/ci.yml#L3237)) | ubuntu-latest, after the apt sets of `ci-linux-system-deps` | `--lib`. The fork has no tests: the entry builds its X11 arm, patched too, as a test binary, which links libxcb, so a test added to the fork runs from its first PR. The quartz and DXGI arms compile in the macOS and Windows jobs' agent builds | none | 0 |
+| `webrtc` ([`:3242`](../.github/workflows/ci.yml#L3242)) | ubuntu-latest | `--lib`, with the `webrtc-sctp`, `webrtc-ice` and `rtp` forks given as `--config` patches: the fork calls their patched API, and against crates.io's copies it does not compile | none | 149 passed, 1 ignored upstream (`test_rtp_transceiver_stopping`) |
+| `webrtc-ice` ([`:3251`](../.github/workflows/ci.yml#L3251)) | ubuntu-latest | `--lib`. Since FR-148 P4 the fork holds the carrier rank, and `agent_carrier_rank_test.rs` is its only proof | the four `mdns::mdns_test::*` cells, since FR-148 P4: one of them hung for minutes on a Windows box | 134 passed, and `test_udp_mux` failed on a WSL2 host (below) |
+| `webrtc-sctp` ([`:3265`](../.github/workflows/ci.yml#L3265)) | ubuntu-latest | `--lib` | `fuzz_artifact_test::packet_crash_artifacts` and `fuzz_artifact_test::param_crash_artifacts`: both read `fuzz/artifacts`, which the crates.io package does not ship | 181 passed |
+| `wintun-bindings` ([`:3281`](../.github/workflows/ci.yml#L3281)) | windows-latest | `--lib --all-features`: the features the agent ships (`tun` asks for `panic_on_unsent_packets`, `async`, `enable_inner_logging` and `winreg`) and `verify_binary_signature`, which the fork's one test needs. It checks the publisher's signature on the bundled `wintun/bin/amd64/wintun.dll`, with no driver, no admin and no revocation fetch | none | 1 passed, natively on Windows |
+
+**Each entry** names its runner, its timeout (15 minutes each), its `args` to cargo and, where
+it needs them, its `patches` and `system-deps`. Its skips sit in `skip`, one exact test name a
+line, with their reason in a comment above them. The step
+([`ci.yml:3292-3305`](../.github/workflows/ci.yml#L3292-L3305)):
+
+- copies the workspace's `Cargo.lock` into the fork, so the fork's tests run against the
+  versions the agent ships with, where a build of its own would resolve the newest. Cargo keeps
+  the seeded versions of what the fork shares with the agent, and resolves afresh what only the
+  fork's dev-dependencies use (on `webrtc-ice`, `env_logger` brings `jiff` 1.0.3 where the
+  agent has 0.2.38);
+- turns each patch into `--config 'patch.crates-io.<fork>.path="crates/vendored/<fork>"'`,
+  because a standalone build does not read the root's `[patch.crates-io]`;
+- runs `cargo test --manifest-path crates/vendored/<fork>/Cargo.toml`, then the patches, the
+  args and `-- --exact`, with a `--skip` per name. With `--exact` each `--skip` matches one
+  test, where the old jobs' `--skip fuzz_artifact_test` and `--skip mdns::` matched every test
+  whose name holds the text.
+
+The matrix values reach the script through `env`, so the quotes in a patch are bash's.
+`fail-fast: false` keeps a red entry from cancelling the others, and the job runs bash on both
+runners, as [`scripts/windows-shell-guard.sh`](../scripts/windows-shell-guard.sh) requires of a
+job whose matrix names a Windows runner.
+
+**Not in the `rust` aggregator's needs.** Four of the six entries had never run in CI, so each
+earns a record of its own before it can turn "Rust checks" red. Until then a red entry is a red
+check on the pull request that no rule requires. Adding the job to the aggregator's `needs` is a
+follow-up.
+
+**The audit**, [`scripts/vendored-lanes-audit.sh`](../scripts/vendored-lanes-audit.sh), runs in
+the job `vendored-lanes-audit`
+([`ci.yml:3307-3331`](../.github/workflows/ci.yml#L3307-L3331)), check "Every vendored fork has a
+test lane (#4503)". It lists the directories under `crates/vendored/` that hold a `Cargo.toml`
+and the `crate:` of each entry under the job's `matrix:` `include:`, and fails, naming each, on
+a fork with no entry, an entry that names no fork, an entry with no `crate:`, a fork that two
+entries name, and a missing job or list. A fork joins the tree by hand (its directory, a line in
+the root `Cargo.toml`'s `exclude` and one in its `[patch.crates-io]`), and nothing there asks
+for a lane. So the audit runs on every pull request, docs-only ones too, with no `needs`, and a
+failed `changes` job cannot skip it. It is a job of its own because a step in `rust-lint` would
+move every line below it that a doc anchors. It reads `ci.yml` as text, since the dev box has no
+YAML parser: an entry written other than as `- crate: <fork>` with its keys under it is not
+seen, and its fork then fails as one with no entry.
+
+`--selftest` runs first: 18 cells on a throwaway tree and on a copy of the real `ci.yml`. A
+missing entry fails and names the fork, a stray entry fails and names itself, CRLF line ends
+read the same, and a commented-out entry, a list inside an entry or an `include:` outside the
+matrix holds no entry. Each check of the audit, taken out of a copy of the script, turns at
+least one cell red, and the cells pass under mawk and `gawk --posix` alike.
+
+By hand, from the repository's root on Linux or WSL (`wintun-bindings` natively on Windows),
+with an entry's own command:
+
+```bash
+cp Cargo.lock crates/vendored/webrtc/Cargo.lock
+cargo test --manifest-path crates/vendored/webrtc/Cargo.toml \
+  --config 'patch.crates-io.webrtc-sctp.path="crates/vendored/webrtc-sctp"' \
+  --config 'patch.crates-io.webrtc-ice.path="crates/vendored/webrtc-ice"' \
+  --config 'patch.crates-io.rtp.path="crates/vendored/rtp"' \
+  --lib -- --exact
+rm crates/vendored/webrtc/Cargo.lock   # a revendor --check or --regen reads a fork's lock as drift
+bash scripts/vendored-lanes-audit.sh --selftest && bash scripts/vendored-lanes-audit.sh
+```
+
+Known limits:
+
+- `webrtc-ice`'s `udp_mux::udp_mux_test::test_udp_mux` fails on a WSL2 host in mirrored
+  networking mode, alone too. Its three connections are each registered by their first
+  packet, and then only one of them carries its 8 KiB datagrams. It passed in the old
+  `vendored-ice` job on ubuntu-latest, where the entry runs, so it is not skipped.
+- The four mDNS cells that the `webrtc-ice` entry skips pass on Linux, in 2 s or less each. The
+  fork's patch leaves `src/mdns/` alone, but the two connection cells resolve the other agent's
+  `.local` names, the path #1740 patched.
+- No test of `wintun-bindings`' own covers its patch (an adapter's drop leaves the NetworkList
+  entries alone), and `scrap` has no tests: their entries prove that each fork builds as a test
+  binary, and run what it has.
+- `rtp` and `webrtc` have no `.patch` file and no drift check. Their deltas are described in the
+  root `Cargo.toml` and in their own sources (`webrtc`'s in its `Cargo.toml` header).
+- No entry checks how many tests ran: a fork that lost its tests would still pass.
 
 ## The agent-e2e lane (FR-114)
 

@@ -374,7 +374,7 @@ reads like a stale-route find.
 
 On Linux it finds prefix routes only. It lists `ip route show dev <tun>` and
 keeps the first fields that carry a length
-(`crates/tunnel-core/src/overlay/tun.rs:7867`), and iproute2 prints a host route
+(`crates/tunnel-core/src/overlay/tun.rs:7871`), and iproute2 prints a host route
 without its `/32`. The per-peer routes need no purge there, because the TUN is
 not persistent (`persist off`): the kernel removes it, and every route on it,
 when its last descriptor closes. So a Linux exit logs the exit line only when
@@ -703,10 +703,10 @@ sequenceDiagram
 
 | Step | Where | What it guards against |
 |---|---|---|
-| Capture the uplink per family, re-read before every pin | `tun.rs:6127`, `current_uplink` `tun.rs:8630`, `bsd_default_uplink` `tun.rs:359` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
-| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:405`, `bsd_pin_row` `tun.rs:441`, `bsd_pin_holds` `tun.rs:454`, `bsd_table` `tun.rs:8115` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
-| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:7125` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
-| Re-check the pins | `stale_host_exemptions` `tun.rs:7213`, the gate `route_guard.rs:784` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
+| Capture the uplink per family, re-read before every pin | `tun.rs:6131`, `current_uplink` `tun.rs:8634`, `bsd_default_uplink` `tun.rs:359` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
+| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:405`, `bsd_pin_row` `tun.rs:441`, `bsd_pin_holds` `tun.rs:454`, `bsd_table` `tun.rs:8119` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
+| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:7129` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
+| Re-check the pins | `stale_host_exemptions` `tun.rs:7217`, the gate `route_guard.rs:784` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
 | A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:784` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
 | One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:576`, `exemption_withheld_reason` `route_guard.rs:588` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
 

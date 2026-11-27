@@ -17150,6 +17150,10 @@ pub(crate) mod files_log_tests {
     }
 
     impl Logged {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+        )]
         pub(crate) fn start(level: tracing::Level) -> Self {
             #[derive(Clone)]
             struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);

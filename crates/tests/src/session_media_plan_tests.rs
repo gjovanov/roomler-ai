@@ -85,6 +85,10 @@ pub(crate) struct LoggedGuard {
 }
 
 impl Logged {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     pub(crate) fn install(&self) -> LoggedGuard {
         Self::hold(
             tracing_subscriber::fmt()
@@ -98,6 +102,10 @@ impl Logged {
     /// #3952 — as [`Logged::install`], with the server's own DEBUG lines too
     /// (core and the network module), where a subscriber's dropped message
     /// and a probe's miss are logged.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     pub(crate) fn install_debug(&self) -> LoggedGuard {
         Self::hold(
             tracing_subscriber::fmt()
@@ -112,6 +120,10 @@ impl Logged {
 
     /// #4402 — as [`Logged::install`], under `filter` (`EnvFilter`
     /// directives), for a test that reads lines at production's own levels.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     pub(crate) fn install_filter(&self, filter: &str) -> LoggedGuard {
         Self::hold(
             tracing_subscriber::fmt()

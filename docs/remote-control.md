@@ -3145,12 +3145,12 @@ it: there is no hub timer for SSH, and the Windows worker relay waits the window
 
 | Test | Shows |
 |---|---|
-| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:9156`](../agents/roomlerd/src/signaling.rs#L9156)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
-| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:9227`](../agents/roomlerd/src/signaling.rs#L9227)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
-| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:9269`](../agents/roomlerd/src/signaling.rs#L9269)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
-| `an_auto_grant_logs_no_surfaces_going_up_and_is_granted_as_before` ([`:9317`](../agents/roomlerd/src/signaling.rs#L9317)) | #4016: a question that asked no surface logs no "still going up" line, and is granted as before |
-| `only_a_question_decided_while_its_surfaces_go_up_logs_that_they_were` ([`:9367`](../agents/roomlerd/src/signaling.rs#L9367)) | #4016: the line, once, for a question decided while its surfaces go up; none, and the verdict kept, when the verdict came first |
-| `a_question_that_ended_before_its_surfaces_says_so_in_their_line` ([`:9441`](../agents/roomlerd/src/signaling.rs#L9441)) | #4016: a verdict that comes after its question was answered says the question had ended; one that comes while it stands logs the plain line |
+| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:9160`](../agents/roomlerd/src/signaling.rs#L9160)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
+| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:9231`](../agents/roomlerd/src/signaling.rs#L9231)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
+| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:9273`](../agents/roomlerd/src/signaling.rs#L9273)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
+| `an_auto_grant_logs_no_surfaces_going_up_and_is_granted_as_before` ([`:9321`](../agents/roomlerd/src/signaling.rs#L9321)) | #4016: a question that asked no surface logs no "still going up" line, and is granted as before |
+| `only_a_question_decided_while_its_surfaces_go_up_logs_that_they_were` ([`:9371`](../agents/roomlerd/src/signaling.rs#L9371)) | #4016: the line, once, for a question decided while its surfaces go up; none, and the verdict kept, when the verdict came first |
+| `a_question_that_ended_before_its_surfaces_says_so_in_their_line` ([`:9445`](../agents/roomlerd/src/signaling.rs#L9445)) | #4016: a verdict that comes after its question was answered says the question had ended; one that comes while it stands logs the plain line |
 | `a_marker_is_rewritten_only_while_its_question_stands` ([`consent.rs:1253`](../agents/roomlerd/src/consent.rs#L1253)) | the notification's marker rewrite writes nothing for a question that ended |
 
 ⚠️ **A click on a notification's body is not an answer** (FR-93 P6f). GNOME 50
@@ -5422,7 +5422,7 @@ session not yet live, and an external one, end as before FR-138.
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1180`) |
 | each row above | each arm is the loop's one call into the table, and nothing else closes the connection's peers | `every_arm_of_the_connection_ends_through_the_table` (`agents/roomlerd/src/session_table.rs:2438`) |
-| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:9072`) |
+| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:9076`) |
 | an external session (FR-52, D3) | built with no link, so it closes at every exit. The server ends it at the drop and refuses a claim of it | `an_external_session_is_built_without_a_link` (`agents/roomlerd/src/session_table.rs:3351`); `a_delegated_or_external_session_closes_at_a_transient_exit` (`:2513`); `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_claim_of_an_external_session_is_refused` (`crates/tests/src/rc_resume_pd_tests.rs:379`) |
 
 ⚠️ **The rollback floor.** Production has written `session_detached` and `session_resumed` since P3 turned the window
@@ -5604,7 +5604,7 @@ per pump ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a
 | a viewer older than P4b-2 | it opens no `video-deadline`. The pick finds none, the session stays on `video-bytes`, and where the carrier wanted one a line says so once per send task |
 | a `video-bytes` that arrives unordered | an older viewer's retired opt-in (`roomler-rc-unordered-video`, retired by P4b-2). The agent sends on it as today under every value: it acts only on the channel labelled `video-deadline` |
 | an agent older than P4b-3 | it attaches `video-deadline` log-only (the catch-all arm, `peer.rs:1423`), and the viewer's second channel stays one idle stream |
-| a viewer older than P4b-3b | it sends no `relay`, so the agent picks exactly as P4b-3 did. Its lines are P4b-3's but for `tcp_end`, which reads `agent` or `none` as the class is TCP or not (`an_older_viewer_gets_p4b_3_s_picks_and_lines`, `media_deadline.rs:2981`) |
+| a viewer older than P4b-3b | it sends no `relay`, so the agent picks exactly as P4b-3 did. Its lines are P4b-3's but for `tcp_end`, which reads `agent` or `none` as the class is TCP or not (`an_older_viewer_gets_p4b_3_s_picks_and_lines`, `media_deadline.rs:2985`) |
 | an agent older than P4b-3b | it reads `rc:decodestat`'s keys by name, so it ignores `relay`, and every key the message carried before is unchanged (`useRemoteControl.spec.ts` locks it). The session picks by the agent's own end |
 
 **The lines,** each with `session`:
@@ -5670,10 +5670,10 @@ The vendored webrtc's own cells hold the two patches the mark rests on (FR-148 P
 id is its stream, in the handler and once open, on both DTLS roles
 (`data_channel_test::test_data_channel_accepted_id_is_its_stream_when_the_answerer_is_the_dtls_client` and
 `…_dtls_server`), and each refusal comes with its cause on a real pair
-(`sctp_transport_test::test_mark_deadline_stream_says_why_it_refused`). No CI lane runs that crate's
-tests, as `vendored-sctp` runs the SCTP fork's: they run by hand, with `--manifest-path
-crates/vendored/webrtc/Cargo.toml` and the workspace's `[patch.crates-io]` forks (`webrtc-sctp`,
-`webrtc-ice`, `rtp`) given as `--config` patches. The agent's cells above are CI's guard of both.
+(`sctp_transport_test::test_mark_deadline_stream_says_why_it_refused`). CI runs that crate's tests
+in the check "Vendored webrtc tests", with the workspace's `[patch.crates-io]` forks (`webrtc-sctp`,
+`webrtc-ice`, `rtp`) given as `--config` patches ([testing.md](testing.md#the-tests-of-the-vendored-forks-4503)).
+No rule requires that check yet, so the agent's cells above stay the required guard of both.
 
 **The kill switch** is the value `off`, which is also the default: no class is read, no channel
 marked, and every frame goes on `video-bytes` under the send task's next number, as before.
@@ -6750,7 +6750,7 @@ to-activate, so the browser never sees a bait-and-switch.
   answer, ends the dropping, and an accepted one takes its id off the list. A
   chunk or an end for an upload never begun is answered as before, and so is
   everything on the declined (#3757) and FILES-denied channels. Tests:
-  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17689`), over
+  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17693`), over
   a real channel through the production router, and
   `files::refused_begin_tests` (`files.rs:14126`).
   **A refused folder is said, not hidden** (#2930). The agent falls back to
