@@ -681,7 +681,7 @@ to learn what its path carries.
 - The sender's age drop (FR-18's 100 ms bound) did not fire them. Over the same 47 minutes CORPLAP-2 wrote no shed
   line (`overlay derp: shed stale carrier frames`, written at each /derp keepalive tick on which the count moved,
   `agents/roomlerd/src/derp.rs:476-485`) and no /derp lifecycle line, so its sockets to the relay stayed up and
-  their ticks ran. The default filter keeps that line (`roomlerd=info`, `crates/agent-core/src/logging.rs:435`),
+  their ticks ran. The default filter keeps that line (`roomlerd=info`, `crates/agent-core/src/logging.rs:492`),
   and the delivery lines read here came through the same upload. A full outbound queue is ruled out with it: the
   queue holds 512 frames (`crates/tunnel-core/src/transport/derp.rs:55`), so at any rate under about 5,000 frames
   a second its head has waited past the bound whenever it is full, and the writer sheds that head when it next

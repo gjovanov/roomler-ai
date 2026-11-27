@@ -18,10 +18,21 @@ use roomler_ai_db::models::{Plan, PlanEnforcement, PlanLimits};
 
 /// Which advertised limit a check is about.
 ///
-/// The `match` in [`Limit::describe`] is exhaustive, so adding a field to
-/// [`PlanLimits`] fails to compile until someone decides whether it is a gate.
-/// Same structural trick as `RpcCap::wire()` — the compiler asks the question
-/// that review would otherwise have to remember to ask.
+/// The compiler asks both directions of "is this field a gate?", the question
+/// review would otherwise have to remember to ask:
+///
+/// - **Field → limit.** [`field_classes`] destructures [`PlanLimits`]
+///   exhaustively, with no `..`, and binds every field either to the `Limit`
+///   that gates it or to [`FieldClass::NotAGate`] with its reason. A new field
+///   therefore fails to compile there ("pattern does not mention field …")
+///   until someone classifies it.
+/// - **Limit → field.** The `match` in [`Limit::describe`] is exhaustive over
+///   `Limit`'s variants and reads a `PlanLimits` field in each arm, so a new
+///   variant does not compile until it names the field it caps.
+///
+/// Same structural trick as `RpcCap::wire()`. ⚠ It holds only while
+/// `PlanLimits` stays a plain struct: `#[non_exhaustive]` would force a `..`
+/// into the destructure, and the check would silently switch off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
     // ── Established before FR-32: always enforced ───────────────────
@@ -132,6 +143,95 @@ impl Limit {
             ),
         }
     }
+}
+
+/// What one [`PlanLimits`] field is to the quota module (#3336).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldClass {
+    /// Gated through [`check`] by this limit. Its [`Limit::as_str`] is the
+    /// field's name.
+    Gate(Limit),
+    /// Published, but not a gate here, for the reason given.
+    NotAGate(&'static str),
+}
+
+/// Every [`PlanLimits`] field, classified: the field-to-limit half of the
+/// check described on [`Limit`].
+///
+/// ⚠ The destructure names every field and has no `..`, so a field added to
+/// `PlanLimits` fails to compile here ("pattern does not mention field …")
+/// until it is classified. Never add the `..` that error suggests: it switches
+/// the check off. Making the field a [`FieldClass::Gate`] means adding its
+/// `Limit` variant (and the `describe` arm) too; making it
+/// [`FieldClass::NotAGate`] means writing down why. Whether a non-gate should
+/// become a gate is a product decision, not a cleanup.
+///
+/// The list below repeats each name as a string; the unit test
+/// `every_plan_limits_field_is_classified` holds it to the serialized keys.
+///
+/// Every build compiles this (that is the check); only the unit test calls it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn field_classes(limits: &PlanLimits) -> Vec<(&'static str, FieldClass)> {
+    use FieldClass::{Gate, NotAGate};
+    let PlanLimits {
+        max_devices: _,
+        max_tunnel_clients: _,
+        overlay_mesh: _,
+        exit_nodes: _,
+        magic_dns: _,
+        max_concurrent_sessions: _,
+        relay_bytes_per_month: _,
+        max_members: _,
+        max_channels: _,
+        max_message_history: _,
+        storage_bytes: _,
+        video_max_participants: _,
+        meeting_max_minutes: _,
+        cloud_integrations: _,
+        recordings: _,
+        per_seat: _,
+    } = limits;
+    vec![
+        // ── Fleet ────────────────────────────────────────────────────
+        ("max_devices", Gate(Limit::MaxDevices)),
+        ("max_tunnel_clients", Gate(Limit::MaxTunnelClients)),
+        (
+            "overlay_mesh",
+            NotAGate(
+                "on for every plan: the mesh is the product's spine, not something a plan withholds",
+            ),
+        ),
+        ("exit_nodes", Gate(Limit::ExitNodes)),
+        ("magic_dns", Gate(Limit::MagicDns)),
+        (
+            "max_concurrent_sessions",
+            Gate(Limit::MaxConcurrentSessions),
+        ),
+        (
+            "relay_bytes_per_month",
+            NotAGate(
+                "a throttle, never a refusal (FR-115 D4): the relay allowance enforces it, not `check`",
+            ),
+        ),
+        // ── Collaboration ────────────────────────────────────────────
+        ("max_members", Gate(Limit::MaxMembers)),
+        ("max_channels", Gate(Limit::MaxChannels)),
+        (
+            "max_message_history",
+            NotAGate(
+                "a retention bound FR-32 chose not to gate; the plan-compliance report shows it reported-only",
+            ),
+        ),
+        ("storage_bytes", Gate(Limit::StorageBytes)),
+        ("video_max_participants", Gate(Limit::VideoMaxParticipants)),
+        ("meeting_max_minutes", Gate(Limit::MeetingMinutes)),
+        ("cloud_integrations", Gate(Limit::CloudIntegrations)),
+        ("recordings", Gate(Limit::Recordings)),
+        (
+            "per_seat",
+            NotAGate("not a limit: it says which values scale with billed seats"),
+        ),
+    ]
 }
 
 /// A boolean feature as a cap: off means zero allowed, on means uncapped.
@@ -824,5 +924,68 @@ mod tests {
             "video_max_participants"
         );
         assert_eq!(Limit::MeetingMinutes.as_str(), "meeting_max_minutes");
+    }
+
+    /// #3336 — the classification is the plan matrix's own field list: the
+    /// keys `/api/stripe/plans` serializes are exactly the gated fields'
+    /// `Limit::as_str()` spellings plus the non-gates. No key goes
+    /// unclassified, and no `Limit` spelling names a field that is not there.
+    #[test]
+    fn every_plan_limits_field_is_classified() {
+        use std::collections::BTreeSet;
+        for plan in [Plan::Free, Plan::Pro, Plan::Business, Plan::Enterprise] {
+            let limits = plan.limits();
+            let classes = field_classes(&limits);
+
+            let serialized = serde_json::to_value(&limits).expect("PlanLimits serializes");
+            let keys: BTreeSet<&str> = serialized
+                .as_object()
+                .expect("PlanLimits serializes as an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+
+            let mut gated = BTreeSet::new();
+            let mut not_gates = BTreeSet::new();
+            for (field, class) in &classes {
+                match class {
+                    FieldClass::Gate(limit) => {
+                        assert_eq!(
+                            limit.as_str(),
+                            *field,
+                            "{field} is gated by {limit:?}, whose wire name must be the field's"
+                        );
+                        assert!(gated.insert(limit.as_str()), "{limit:?} gates two fields");
+                    }
+                    FieldClass::NotAGate(why) => {
+                        assert!(!why.trim().is_empty(), "{field} needs its reason");
+                        not_gates.insert(*field);
+                    }
+                }
+            }
+
+            let classified: BTreeSet<&str> = gated.union(&not_gates).copied().collect();
+            assert_eq!(
+                classified.len(),
+                classes.len(),
+                "a field is classified twice"
+            );
+            assert_eq!(
+                classified, keys,
+                "{plan:?}: the serialized keys and the classified fields differ"
+            );
+            assert_eq!(
+                not_gates,
+                BTreeSet::from([
+                    "max_message_history",
+                    "overlay_mesh",
+                    "per_seat",
+                    "relay_bytes_per_month",
+                ]),
+                "a field changed sides: that is a product decision, not a cleanup"
+            );
+            // Every `Limit` variant gates exactly one field.
+            assert_eq!(gated.len(), 12, "{gated:?}");
+        }
     }
 }

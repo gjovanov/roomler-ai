@@ -5,13 +5,21 @@
 //! the mesh. Remote desktop is that code today: with a device's `rc_overlay`
 //! off, its ICE keeps every overlay address out of a session.
 //!
-//! **v4** is learned from each runtime as it brings its TUN up — every block
-//! of its org (FR-47 P5e: a peer may sit in another block than this node),
-//! for every org the device is in. It only ever GROWS. A block this process
+//! **v4** is learned from each runtime's netmap — every block of its org
+//! (FR-47 P5e: a peer may sit in another block than this node), for every
+//! org the device is in. #3359: it is recorded when the netmap names the
+//! blocks, BEFORE the runtime calls its TUN factory, so the footprint is
+//! known before the adapter holds an overlay address; a later full netmap
+//! adds a block the org has grown. It only ever GROWS. A block this process
 //! has routed through the mesh stays "overlay" until the process exits, so
 //! there is no window (a WS reconnect, a runtime restart) in which an
 //! overlay address briefly reads as foreign. The cost is a block an org gave
 //! up, which nothing outside the mesh can be using anyway.
+//!
+//! #3359 — a reader judges an address by the footprint AS IT STANDS
+//! ([`is_overlay_addr_now`]), never only by a copy taken earlier, and a
+//! reader that hands the footprint on (the daemon to a macOS GUI worker)
+//! hears each growth at once ([`grown`]).
 //!
 //! **v6** needs no registry: every overlay v6 is derived into Roomler's fixed
 //! ULA `/96` (`fd72:6f6f:6d6c::/96`, `overlay::router::OVERLAY_ULA_V6_CIDR`).
@@ -25,9 +33,18 @@
 //! has no v4 blocks.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
+/// ⚠️ A std mutex, held only inside the synchronous functions below, never
+/// across an `.await`: ICE's IP filter reads it from inside the agent's
+/// gather.
 static V4_NETS: Mutex<Vec<(Ipv4Addr, u8)>> = Mutex::new(Vec::new());
+
+/// #3359 — bumped each time [`V4_NETS`] gains a block, after the registry's
+/// lock is released. Lives for the process, so a receiver never sees it
+/// closed.
+static GROWN: LazyLock<tokio::sync::watch::Sender<u64>> =
+    LazyLock::new(|| tokio::sync::watch::channel(0).0);
 
 /// The fixed `/96` every overlay v6 is derived into. A copy of
 /// `overlay::router`'s pinned hextets (that module is feature-gated); the
@@ -73,6 +90,7 @@ pub fn note_v4_blocks(blocks: &[(Ipv4Addr, u8)]) {
     if blocks.is_empty() {
         return;
     }
+    let mut grew = false;
     if let Ok(mut g) = V4_NETS.lock() {
         for &(addr, plen) in blocks {
             if plen > 32 {
@@ -81,9 +99,22 @@ pub fn note_v4_blocks(blocks: &[(Ipv4Addr, u8)]) {
             let n = (Ipv4Addr::from(u32::from(addr) & prefix_mask(plen)), plen);
             if !g.contains(&n) {
                 g.push(n);
+                grew = true;
             }
         }
     }
+    // #3359 — outside the lock: a woken reader takes it to read the set.
+    if grew {
+        GROWN.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
+/// #3359 — a receiver that wakes each time the footprint gains a block (a
+/// repeat of a known one wakes nobody). It starts with every growth so far
+/// already seen, so subscribe BEFORE reading [`v4_nets`] for the first time,
+/// and nothing recorded in between is missed.
+pub fn grown() -> tokio::sync::watch::Receiver<u64> {
+    GROWN.subscribe()
 }
 
 fn prefix_mask(plen: u8) -> u32 {
@@ -106,6 +137,20 @@ pub fn v4_nets() -> Vec<(Ipv4Addr, u8)> {
 pub fn is_overlay_addr(v4_nets: &[(Ipv4Addr, u8)], ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(v4) => v4_nets.iter().any(|n| v4_in(*n, v4)),
+        IpAddr::V6(v6) => in_overlay_ula(v6),
+    }
+}
+
+/// #3359 — [`is_overlay_addr`] against the footprint as it stands at this
+/// call: every block recorded so far, with no copy. What a filter asks when
+/// it judges an address, so a block recorded after the filter was made
+/// still counts.
+pub fn is_overlay_addr_now(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => V4_NETS
+            .lock()
+            .map(|g| g.iter().any(|n| v4_in(*n, v4)))
+            .unwrap_or(false),
         IpAddr::V6(v6) => in_overlay_ula(v6),
     }
 }
@@ -191,6 +236,25 @@ mod tests {
         let ours = |n: &(Ipv4Addr, u8)| n.0.octets()[..2] == [100, 66];
         assert_eq!(nets.iter().filter(|n| ours(n)).count(), 2);
         assert!(is_overlay_addr(&nets, ip("100.66.5.1")));
+    }
+
+    /// #3359 — a block counts the moment it is recorded: the footprint as it
+    /// stands answers for it with no copy taken, and a reader subscribed
+    /// earlier is woken. (Positive cells only: the runtime's tests record
+    /// the whole `/10` in this process, through their pre-P5d netmap.)
+    #[test]
+    fn a_recorded_block_counts_at_once_and_wakes_a_subscriber() {
+        // Process-global: assert only on a block this test owns.
+        let mut rx = grown();
+        note_v4_nets(&["100.69.28.0/22".to_string()]);
+        assert!(rx.has_changed().unwrap(), "the growth woke the subscriber");
+        rx.borrow_and_update();
+        assert!(is_overlay_addr_now(ip("100.69.28.9")));
+        assert!(is_overlay_addr_now(ip("::ffff:100.69.31.255")), "mapped v4");
+        assert!(v4_nets().contains(&(Ipv4Addr::new(100, 69, 28, 0), 22)));
+        assert!(!is_overlay_addr_now(ip("192.0.2.1")));
+        assert!(is_overlay_addr_now(ip("fd72:6f6f:6d6c::6445:1c09")));
+        assert!(!is_overlay_addr_now(ip("fd00::1")), "a home router's ULA");
     }
 
     /// What a worker is handed: already parsed, but not necessarily masked.

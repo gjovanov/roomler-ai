@@ -110,7 +110,7 @@ numbers. On `rc:overlay.join` the server looks the machine up by
   capability vector, the warm relay. So a node that joins again mid-session
   (a control-WS Reattach, or an exit whose setup changed its offer, #3562)
   follows the join with what it wiped (`rejoin_plan`,
-  `crates/tunnel-core/src/overlay/runtime.rs:4682`), and an exit's re-offer
+  `crates/tunnel-core/src/overlay/runtime.rs:4684`), and an exit's re-offer
   reaches the admin row and every peer at once
   ([`overlay-exit-nodes.md`](./overlay-exit-nodes.md#the-offer-follows-the-setup-3562)).
 - **no live node** → `allocate_host` pops the head of `free_hosts` (FIFO, so an
@@ -219,7 +219,7 @@ WireGuard device, the TUN and every carrier running, one runtime per tenant
 re-attaches it (`OverlayEvent::Reattach`, `:275`) instead of starting another,
 the runtime joins again, and the full netmap the server answers that join with
 is the reconcile: whatever the runtime still holds that the netmap no longer
-lists is pruned (`crates/tunnel-core/src/overlay/runtime.rs:4221`). What the
+lists is pruned (`crates/tunnel-core/src/overlay/runtime.rs:4223`). What the
 device's own peer list says in between is in
 [§8](#the-peer-list-while-the-control-socket-is-down-4367).
 
@@ -311,7 +311,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:460`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:517`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -617,7 +617,7 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2224`](../crates/tunnel-core/src/overlay/runtime.rs#L2224),
+  ([`runtime.rs:2230`](../crates/tunnel-core/src/overlay/runtime.rs#L2230),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
@@ -1264,7 +1264,7 @@ match this node`), and an org-relay grant that needs them is refused.
     are said on a target of their own, `tunnel_core::overlay::route_guard`
     (`ROUTE_GUARD_LOG`, `crates/tunnel-core/src/overlay/mod.rs:121`), which
     the daemon's log filter keeps at INFO whatever `RUST_LOG` says
-    (`crates/agent-core/src/logging.rs:472`), as FR-110 does for `sockbuf`
+    (`crates/agent-core/src/logging.rs:529`), as FR-110 does for `sockbuf`
     ([fleet-rpc.md](fleet-rpc.md)). The Linux package's units and the macOS
     package's LaunchAgent set `RUST_LOG=roomlerd=info,warn`, which drops every
     other `tunnel_core` INFO and, until #4380, dropped these two as well; the
