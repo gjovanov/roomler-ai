@@ -213,14 +213,10 @@ program named by a bare literal or by an expression it has not been told about. 
 the Windows path. A new spawn on that path is a decision someone writes down in its table.
 
 > [!WARNING]
-> **A log assertion in a binary of parallel tests needs two dispatchers** (FR-90 P2i-1). With
-> only one registered, `tracing` caches a callsite's interest from the default of whichever
-> thread reaches it first. A parallel test's thread, with no subscriber, caches `never`, and a
-> capture set on the test's own thread then never sees that line. Keep a second dispatcher
-> registered for the capture's life (a `NoSubscriber` will do), so every callsite asks per
-> event; and assert a line the capture must see before one it must not, since a capture that
-> sees nothing passes every absence check. The pattern: `LogCapture::install` in
-> [`extauth_tests.rs:1172`](../crates/tests/src/extauth_tests.rs#L1172).
+> **A test that reads its own log lines goes through `roomler-log-capture`** (#3403). With one
+> dispatcher registered, a parallel test's thread can make a capture miss a line its own thread
+> logged (FR-90 P2i-1). The helper holds the second dispatcher, and clippy refuses a scoped
+> default anywhere else: [Reading a test's own log lines](#reading-a-tests-own-log-lines-3403).
 
 Flakes fixed on 2026-10-30, and what each one teaches:
 
@@ -292,6 +288,52 @@ Fixed since:
 > cells fail: six read `idle` with an empty id, and the two grace-poll cells say they prove
 > nothing, because the grace looked again first. Set up before it, they pass.
 
+### Reading a test's own log lines (#3403)
+
+A test that asserts on what it logged goes through **one helper**: the crate
+`roomler-log-capture` ([`crates/log-capture/src/lib.rs`](../crates/log-capture/src/lib.rs)), a
+dev-dependency of every crate whose tests capture and of nothing else. No other test code sets a
+scoped default, and clippy refuses one anywhere else (below).
+
+| The test needs | It calls |
+|---|---|
+| a subscriber for one closure, the common case | `roomler_log_capture::with_default(subscriber, f)` |
+| a capture held for as long as it reads: an async test, a capture kept in a struct | `roomler_log_capture::set_default(subscriber)`, which returns a `Scope` |
+| the same, with a `Dispatch` it already holds | `with_dispatch` / `set_dispatch` |
+| a future, captured each time it is polled | `roomler_log_capture::with_default_async(dispatch, fut).await` |
+| the plain-text buffer most captures read | `Captured`, written by `roomler_log_capture::fmt(log.clone())` or `layer(..)`, read with `text()` and `saw(line)` |
+
+**Why one helper.** With only one dispatcher registered, `tracing` caches a callsite's interest
+from the default of whichever thread reaches it first. A parallel test's thread with no subscriber
+caches `never`, and a capture on the test's own thread then never sees that line (FR-90 P2i-1;
+#3317's extauth capture, #4351's timeout lines, the node core's config saves). The fix was copied
+by hand into every capture, a second registered dispatcher beside it, and a capture that forgot it
+lost lines. The helper's `Scope` holds that second dispatcher for the capture's whole life and drops
+its scope first ([`lib.rs:85`](../crates/log-capture/src/lib.rs#L85)). `Dispatch::none()` is
+no second dispatcher, because it never registers: the probe
+([`another_thread_first.rs`](../crates/log-capture/tests/another_thread_first.rs)) turns red with
+it. If a `tracing` upgrade changes how interest is cached, the helper is the one file to change,
+and the probe says whether it must.
+
+**Assert what the capture saw before what it must not.** A capture that holds nothing passes every
+"this line is absent" check. So a test that asserts an absence first asserts a line its own thread
+logged on the same path (`saw`, or a count), then reads the absence from that same text: the
+media-plan test asserts `heard` before `!hz=5000`
+([`session_media_plan_tests.rs:358`](../crates/tests/src/session_media_plan_tests.rs#L358)), and the
+agent-socket test asserts one line found before it reads the absent fields from it
+([`agent_socket_end_tests.rs:64`](../crates/tests/src/agent_socket_end_tests.rs#L64)).
+
+**The lint.** The root `clippy.toml` lists six `disallowed-methods` for the scoped default:
+`tracing::subscriber::{set_default, with_default}`, `tracing::dispatcher::{set_default,
+with_default}`, `tracing::instrument::WithSubscriber::with_subscriber` and
+`tracing_subscriber::util::SubscriberInitExt::set_default`. Only the helper and three production
+callers carry `#[expect]`, each saying why: the clipboard's and enigo's drops on a dead X connection
+(#3918), and the node core's hold of the start's WARN lines until the subscriber exists.
+`WithSubscriber::with_current_subscriber` is left out: it carries the caller's dispatcher into a
+spawned future, which is how production hands a subscriber on, and it is no capture. A
+process-global subscriber (`try_init`, `set_global_default`) is another class, and the lint does
+not cover it.
+
 ### Tests that change a real desktop (#3813)
 
 A native `cargo test` runs on someone's own machine. A unit test that writes the real clipboard,
@@ -345,7 +387,7 @@ and passes.
 
 | Lane | What it does |
 |---|---|
-| `ci.yml` | fmt + clippy (`--workspace -D warnings`, which compiles no test code, then `--all-targets` on the audited server crates and every `roomler-ai-mod-*` crate through [`scripts/clippy-audited-crates.sh`](../scripts/clippy-audited-crates.sh), whose module list is read from the workspace, #3594) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the fourteen heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs, the profiles build and the vendored forks' tests. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1507`). A push to master always runs everything |
+| `ci.yml` | fmt + clippy (`--workspace -D warnings`, which compiles no test code, then `--all-targets` on the audited server crates, the capture helper and the agent-side crates whose tests capture that no other Linux lane lints (#3403), and every `roomler-ai-mod-*` crate through [`scripts/clippy-audited-crates.sh`](../scripts/clippy-audited-crates.sh), whose module list is read from the workspace, #3594) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the fourteen heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs, the profiles build and the vendored forks' tests. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1507`). A push to master always runs everything |
 | `installer-smoke.yml` | On a Windows runner: installs, audits and uninstalls the freshly built per-User MSI; upgrades, reinstalls, repairs and uninstalls the per-Machine MSI over its running service, and upgrades it once more while a test process holds `roomlerd.exe` open, failing on any boot-time delete that run leaves of a file in the install folder (the one installer run here that may end 3010, the restart its hold asks for; [`:1533`](../.github/workflows/installer-smoke.yml#L1533), #4196); upgrades the newest released MSIs of both flavours at or below the branch's version to the branch's, so a ref behind the newest release still upgrades (#3774). Every installer run goes through one runner ([`installer-smoke.yml:143`](../.github/workflows/installer-smoke.yml#L143), #3754) that waits for that process alone, fails the step past a 300 s deadline or on any exit but 0, prints the MSI log's `RESTART MANAGER` and held-in-use lines, and saves a process list with image paths and the service logs; a negative control proves the deadline on every run ([`:241`](../.github/workflows/installer-smoke.yml#L241)). Each per-Machine step has a timeout of its own (6 or 10 min, well under the job's 40; [`:1186`](../.github/workflows/installer-smoke.yml#L1186), #3810), so a step that never returns fails by itself and the evidence step runs, which adds the boot time, the System events 1074, 41 and 6008 since the job began and the service's state ([`:1951`](../.github/workflows/installer-smoke.yml#L1951)). A runner that goes away mid-job leaves a step that never reports an end: GitHub closes the job `cancelled` 5 min past its 40 min timeout, with the evidence step still `pending`. When the Windows job does not succeed, a check job on a fresh Ubuntu runner reads it through the API ([`:2910`](../.github/workflows/installer-smoke.yml#L2910), #3810), writes which steps reported an end and which did not, as an error annotation and in its summary, and ends 1. When not every step of attempt 1 reported an end, the workflow `installer-smoke-rerun`, which GitHub runs from the default branch's copy when the smoke run completes, asks GitHub to re-run that one job once, as attempt 2 of the same run, unless one of its guards refuses. Attempt 2 is never re-run by this workflow, and until a re-run replaces the lost job's check the run reads `cancelled` (the flow, the guards and the known limits: [below](#a-lost-windows-job-is-re-run-once-3810)). The per-Machine service is opted out of the live update channel from its first start: `ROOMLERD_AUTO_UPDATE=0` goes into the machine environment, from which each spawn builds the worker's environment ([`:1198`](../.github/workflows/installer-smoke.yml#L1198)), and the step fails if a log of the service says its updater was armed. On a macOS runner: installs the pkg with the live update channel shut by the product's own opt-out marker (`/etc/roomler/disable-auto-update`) until the job's last install, which asserts the update helper is installed by default; every step that runs the bundle's `roomlerd` first checks that its `--version` is the build's (#3774); `roomlerd caps` must report `has_input_permission` and `permissions` consistently, and the hosted image grants both Screen Recording and Accessibility |
 | `deb-bare-image.yml` | On a PR that changes what a `.deb` declares: packages the latest release's binaries with the checkout's control file through the lane's own `cargo deb`, installs them on five bare images on both arches, by apt and by the real `install.sh`, and starts them. A control proves the check still refuses agent-v0.4.190, and for the reason that matters: the package does not start, not a container that could not reach its mirror (#3710). The release lane runs the same script on what it is about to publish (`verify-linux-debs`) — [installation.md](installation.md#what-a-bare-host-needs-3204) |
 | `ci-apt-selftest.yml` | On a PR or a master push that changes the apt helper (`.github/actions/ci-linux-system-deps/`), `apt-seed-install`, `scripts/deb-bare-check.sh`, a release workflow or itself (#3710): the helper's offline tests against stub binaries, shellcheck, and actionlint (pinned) over every workflow that calls the helper, the release workflows included, which no PR runs. Then fault cells on `ubuntu-latest`, `ubuntu-22.04` and `ubuntu-22.04-arm` (healthy, the runner's own resolver dead, every resolver dead, and on arm64 only `ports.ubuntu.com` dead): a functional resolver-fault control on each job's own throwaway runner, which drops DNS answers carrying the Ubuntu mirror names and nothing else, proves the fault took effect before a cell's result counts, and proves at the end that it was hit. Each cell asserts the helper's failover, bounds and single `::error`, a container's resolver before and after the failover, and how `deb-bare-check.sh` reads a dead mirror (exit 3, never a package failure) — [build-caches.md](build-caches.md#5-how-apt-reaches-the-mirrors) |
