@@ -144,7 +144,7 @@ fn the_prune_goes_by_handle_never_where_a_junction_leads() {
     old(&dir.join("notes.txt"));
     std::fs::write(dir.join(day(1)), b"x").unwrap();
     crate::logging::prune_old_logs(&dir, 14);
-    assert_eq!(names_in(&dir), [day(1), "notes.txt".into()]);
+    assert_eq!(names_in(&dir), ["notes.txt".to_string(), day(1)]);
 
     swap_for_junction(&dir, &elsewhere);
     old(&elsewhere.join("roomlerd.log.2020-09-13"));
