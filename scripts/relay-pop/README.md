@@ -200,8 +200,8 @@ looked for here ([every drop on the relay path](../../docs/overlay-communication
 so a line here matches the nodes' lines and the central relay's. A total counts
 every drop of its cause since the process started, logged or not; a line
 between two others says how many fell between. The two forward drops are
-counted and paced in `ForwardDrops` (`crates/derp-relay/src/main.rs:995`,
-pacing `drop_log_due`, `:1042`); each cause keeps the last line's time for at
+counted and paced in `ForwardDrops` (`crates/derp-relay/src/main.rs:996`,
+pacing `drop_log_due`, `:1043`); each cause keeps the last line's time for at
 most 4,096 network and destination pairs, and a pair past that waits for a
 sweep, at most one a window. A frame shorter than 32 bytes or longer than
 2,048 is still dropped without a count.
