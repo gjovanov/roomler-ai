@@ -7,14 +7,15 @@ name: Test binds
 # tests bind"). The roomlerd lib suite runs under the bind audit in ci.yml's
 # windows-agent-sessions job, which already builds and runs it on Windows.
 # This workflow holds what ci.yml has no lane for:
-#   * the vendored webrtc crate's own tests, which ran in no lane: on Windows
-#     under the bind audit, and on Linux in full, since the three tests that
-#     bind off loopback on purpose (a STUN server on the internet, mDNS) are
-#     ignored on Windows only;
+#   * the vendored webrtc crate's own tests on Windows, under the bind audit.
+#     On Linux they run in full in ci.yml's vendored-tests matrix (its webrtc
+#     entry, #4503), the three that bind off loopback on purpose (a STUN
+#     server on the internet, mDNS) too, since they are ignored on Windows
+#     only. That matrix holds one entry per fork, so this run is a job here;
 #   * the audit report's own cases, on made-up events.
 #
 # Its own workflow, path-filtered to the webrtc forks and the audit's scripts:
-# ci.yml has no path filter, so a job there would run on every PR.
+# a job in ci.yml runs on every PR that is not docs-only.
 on:
   pull_request:
     paths:
@@ -75,20 +76,8 @@ jobs:
       - name: Build the fork's tests
         run: bash scripts/vendored-webrtc-test.sh --no-run
       # GNU `timeout`, by path (Windows has a timeout.exe that only waits):
-      # upstream's mDNS tests have hung for minutes on Windows (ci.yml's
-      # vendored-ice lane), and the report must still run after one.
+      # upstream's mDNS tests have hung for minutes on Windows (why ci.yml's
+      # vendored-tests matrix skips four in its webrtc-ice entry), and the
+      # report must still run after one.
       - name: Run them under the bind audit
         run: bash scripts/test-binds-run.sh 'webrtc-*.exe' /usr/bin/timeout 1200 bash scripts/vendored-webrtc-test.sh
-
-  vendored-webrtc-linux:
-    name: Vendored webrtc tests on Linux, the Windows-ignored ones too
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CARGO_INCREMENTAL: 0
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-      - name: Test the fork against the workspace's pinned versions
-        run: bash scripts/vendored-webrtc-test.sh

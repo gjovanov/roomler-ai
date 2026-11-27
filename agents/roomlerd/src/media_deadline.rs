@@ -3960,21 +3960,20 @@ mod tests {
     impl Ends {
         async fn open(daemon_server: bool) -> Self {
             use webrtc::api::APIBuilder;
-            use webrtc::api::setting_engine::SettingEngine;
             use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
             use webrtc::dtls_transport::dtls_role::DTLSRole;
 
             let session_id = ObjectId::new();
             let session = Session::register(session_id, Arc::new(AtomicBool::new(false)));
-            let mut daemon_setting = SettingEngine::default();
+            // Both ends gather on loopback, with no mDNS socket (#4500).
+            let mut daemon_setting = crate::test_net::setting_engine();
             if daemon_server {
                 daemon_setting
                     .set_answering_dtls_role(DTLSRole::Server)
                     .expect("a DTLS role");
             }
             let viewer_pc = Arc::new(
-                APIBuilder::new()
-                    .build()
+                crate::test_net::api()
                     .new_peer_connection(Default::default())
                     .await
                     .expect("the viewer's peer"),
