@@ -108,7 +108,7 @@ roomler config set display_match auto     # auto (default) | always | never
 - **Read live** at every request ([`display_match.rs:1259`](../agents/roomlerd/src/display_match.rs#L1259)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
-  ([`config.rs:2823`](../crates/agent-core/src/config.rs#L2823) `DisplayMatchPolicy`).
+  ([`config.rs:2850`](../crates/agent-core/src/config.rs#L2850) `DisplayMatchPolicy`).
 
 ## Who is at the screen
 

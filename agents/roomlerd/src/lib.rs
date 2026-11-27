@@ -280,6 +280,10 @@ pub mod sleep_notice;
 /// [`overlay`]: without an overlay there is no address to serve on.
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod ssh;
+/// #3353 — the SSH host key a start mints, and what a start that cannot make
+/// or keep one does. Only a build with the SSH server mints.
+#[cfg(feature = "ssh-server")]
+pub mod ssh_mint;
 /// The ORIGINATING side of Roomler SSH. Ungated on purpose — [`ssh`] needs an
 /// overlay to serve on, but an answer to a request WE sent arrives on the
 /// plain control WS and must be deliverable in every build.

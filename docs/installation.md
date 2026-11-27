@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:4158`, `crates/agent-core/src/config.rs:4591`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:4158`, `crates/agent-core/src/config.rs:4619`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:996`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -576,9 +576,9 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3626`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3711`, `:3719`), and the load fails. Each line is worded for what happened to the live file (below) |
-| `config::read_if_present` (`crates/agent-core/src/config.rs:3750`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
-| `config::load_without_restore` (`crates/agent-core/src/config.rs:5234`, #4379) | the config the macOS supervisor's **enrolled worker** runs on | the load fails as it is: no `config.toml.prev` is read and nothing is written, and that worker ends with exit 78 and its own line (below) |
+| `config::load` (`crates/agent-core/src/config.rs:3654`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3739`, `:3747`), and the load fails. Each line is worded for what happened to the live file (below) |
+| `config::read_if_present` (`crates/agent-core/src/config.rs:3778`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load_without_restore` (`crates/agent-core/src/config.rs:5262`, #4379) | the config the macOS supervisor's **enrolled worker** runs on | the load fails as it is: no `config.toml.prev` is read and nothing is written, and that worker ends with exit 78 and its own line (below) |
 
 A start restores a missing file too (#4157). An enrolled device's start whose `config.toml` is missing but whose `config.toml.prev`
 loads and holds an enrollment takes the single-instance lock, then `load` restores the copy with the *"config missing — RESTORED"*
@@ -626,7 +626,7 @@ host now runs on an older config, and that must never look like a normal boot.
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3664` |
+| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3692` |
 | **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3672` |
 
 "Not there" is read off the read's own error (`not_found`, `:3919`), never off an `exists()`
@@ -642,7 +642,7 @@ copy could not be used).
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3711` |
+| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3739` |
 | **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3719` |
 
 Before #4102 both took the second line, so a device with no config at all, such as one never
@@ -669,9 +669,9 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start, clean stop and end of its own choosing (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2656`, `:2678`), at the clean-run promotion
-(`record_clean_run_at`, `:2665`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4543`). Each save
+`crates/agent-core/src/config.rs:2683`, `:2705`), at the clean-run promotion
+(`record_clean_run_at`, `:2692`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4571`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -898,7 +898,7 @@ Details worth knowing:
   another account to change it (`machine_tree.rs:705`). With neither file, it
   leaves the tree as it is (above, #4485). It repairs the attempt
   record in every case, and what was not closed stays refused at every start and
-  tick, until an elevated save writes a closed tree. An elevated save whose config does not load takes the `.prev` beside it only where a start would, by the same rule: from one a start refuses it recovers nothing, and it says so in one line (#4453, `crates/agent-core/src/config.rs:3853`). Whatever the config's state, an elevated save sets aside a `.prev` a start would not take, as `config.toml.prev.set-aside` beside it (`-1` to `-9` when that name is taken), a name no reader loads, and says `machine tree: a config.toml.prev that a start would not take is set aside`; one it cannot move stays at its name, keeping the entries it was found with as its own, and where neither can be done the save stops, naming the file and what to do (`crates/agent-core/src/machine_tree.rs:3224`). A config that was not the
+  tick, until an elevated save writes a closed tree. An elevated save whose config does not load takes the `.prev` beside it only where a start would, by the same rule: from one a start refuses it recovers nothing, and it says so in one line (#4453, `crates/agent-core/src/config.rs:3881`). Whatever the config's state, an elevated save sets aside a `.prev` a start would not take, as `config.toml.prev.set-aside` beside it (`-1` to `-9` when that name is taken), a name no reader loads, and says `machine tree: a config.toml.prev that a start would not take is set aside`; one it cannot move stays at its name, keeping the entries it was found with as its own, and where neither can be done the save stops, naming the file and what to do (`crates/agent-core/src/machine_tree.rs:3224`). A config that was not the
   machine's is never run, never folded into (below), and `roomlerd re-enroll`
   and `roomlerd org` refuse it with nothing sent. Such a device stays without
   SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd
@@ -938,7 +938,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4907`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4935`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
@@ -1626,7 +1626,7 @@ install's update, which has no service, logs nothing about the switch, #3889),
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6457`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6411`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1695,7 +1695,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6324`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6278`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1948,7 +1948,7 @@ One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1441`). It gives the role to `service install` and
 `service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
 and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
-(`agents/roomlerd/src/app.rs:8068`) reads every custom action with an `ExeCommand` in both WiX
+(`agents/roomlerd/src/app.rs:8022`) reads every custom action with an `ExeCommand` in both WiX
 files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
 installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
 
@@ -1964,7 +1964,7 @@ whole stack with no level, which tracing reads as TRACE in every daemon that kee
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
 `service uninstall --as-service` logs `Companion login start removed.` rather than printing it
-(`agents/roomlerd/src/app.rs:6265`), and its answer stays `Service deregistered`.
+(`agents/roomlerd/src/app.rs:6219`), and its answer stays `Service deregistered`.
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
@@ -1984,8 +1984,8 @@ step shows what it always showed (`crates/agent-core/src/logging.rs:2194`). A da
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2237`). The Windows lane runs the module
 beside `stderr_capture` (`.github/workflows/ci.yml:1966`). In `roomlerd`,
-`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8162`) and
-`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8195`)
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8116`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8149`)
 pin the role per command and the end line of a failure.
 
 ### Where a step on the service account finds its folders (#3702)
@@ -2077,7 +2077,7 @@ profile, or the machine's data folder) or is reached through a link below it (`k
   daemon, which runs unelevated, merges at its next start, so the merge never runs above the
   integrity level of the folder owner's own processes. When the token cannot be read, the merge
   is left too (`DataMerge`, `crates/agent-core/src/appdirs.rs:1543`;
-  `agents/roomlerd/src/app.rs:7786`). A data folder whose NEW folder is not there still moves by
+  `agents/roomlerd/src/app.rs:7740`). A data folder whose NEW folder is not there still moves by
   one rename.
 - Every run writes a note that names what it moved, what it kept beside, and what it left for
   the next start (`crates/agent-core/src/appdirs.rs:1656`).
@@ -2997,8 +2997,8 @@ the stricter of the person's and its own.
 Each org's row says what the worker has told the daemon from the connection's first
 message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
 permissions, what it can record, its Remote Apps words and its audio, and the stricter
-`rc_*` floor ([`signaling.rs:7129`](../agents/roomlerd/src/signaling.rs#L7129)), built
-into the caps by one function ([`:7177`](../agents/roomlerd/src/signaling.rs#L7177)).
+`rc_*` floor ([`signaling.rs:7148`](../agents/roomlerd/src/signaling.rs#L7148)), built
+into the caps by one function ([`:7196`](../agents/roomlerd/src/signaling.rs#L7196)).
 So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
 restarts of the daemon measured in #3992, is on the row at once, rather than the root's
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
@@ -3697,7 +3697,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3743`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2741`).
+back to the version that is running (`crates/agent-core/src/config.rs:2768`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -3936,7 +3936,7 @@ flowchart TD
   The daemon hears the end only once the mesh carries it: within about a
   minute when the session had output in flight, and at the SSH server's
   10-minute inactivity timeout for a quiet one
-  (`agents/roomlerd/src/ssh.rs:664`). So a recheck that the gate would defer
+  (`agents/roomlerd/src/ssh.rs:666`). So a recheck that the gate would defer
   for live work beside a move in the last 10 min holds instead. It runs no
   check, counts no defer, and reads `Busy` again after `OUTAGE_RECHECK_HOLD`,
   the move's own 10 min (`agents/roomlerd/src/updater.rs:3843`; the hold,
@@ -4060,7 +4060,7 @@ keeps the connection only when root serves it, sends nothing, and gives up after
 500 ms: the evidence of a root half that `roomler status` reads
 (`macos_root_half_serves_me`, `crates/localapi/src/lib.rs:5939-5952`). The look is
 `root_half_seen` (`agents/roomlerd/src/helper_gate.rs:491-507`), the call is in
-`self_update_cmd` (`agents/roomlerd/src/app.rs:6623-6644`), and the lines are
+`self_update_cmd` (`agents/roomlerd/src/app.rs:6577-6598`), and the lines are
 `ask_recorded_says` and `NO_ASK_SAYS` (`helper_gate.rs:518-546`):
 
 | The ask | What the look finds | The line | Why it holds |
