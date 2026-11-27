@@ -5458,17 +5458,33 @@ stateDiagram-v2
 | Rule | What the lane does |
 |---|---|
 | the drain rule | once the pick says switch, nothing more is written on the old channel. Every frame that arrives, a key frame too, is dropped whole while the old channel's buffered amount is above 0, that is until each of its chunks was acknowledged, or abandoned and forwarded (P4b-1). Then a key frame is asked through the session's gate, asked again at each frame until an ask passes the gate's 500 ms gap, toward either channel (a switch's own key frame is not recovery, so the key frame rule never spaces it: P4b-4b), and the frames before the key frame are dropped. The wait has no time bound: the switch line says how long it held the video |
-| one `frame_seq` space | a frame written, a frame a switch dropped and a frame D dropped each take the next number, so the viewer reads every drop as a gap and the numbers it receives never repeat (`Lane::write`, `media_deadline.rs:1689`; `drop_switching`, `:1941`; `drop_late`, `:1955`) |
+| one `frame_seq` space | a frame written, a frame a switch dropped and a frame D dropped each take the next number, so the viewer reads every drop as a gap and the numbers it receives never repeat (`Lane::write`, `media_deadline.rs:1689`; `drop_switching`, `:1964`; `drop_late`, `:1978`) |
 | the first pick | at the pump's first frame: no old channel, so no drain and no wait |
 | a channel that closes | the drain of a closed channel is over at once. A switch whose `video-deadline` closed while it waited ends on `video-bytes` at the key frame, and a session on `video-deadline` whose channel closed is picked back onto `video-bytes` |
 | an unframed session | never leaves `video-bytes`: an unframed stream on an unordered channel cannot be put back together |
 
 **The mark.** Under `on`, before the first write on `video-deadline`, the lane marks its SCTP stream
 deadline-limited (`RTCSctpTransport::mark_deadline_stream`,
-`crates/vendored/webrtc/src/sctp_transport/mod.rs:493`, FR-148 P4b-1): once per stream, when the pick
-says switch, before the drain. A refused mark (no association, its slot held, no such stream) switches
-nothing: the session stays on `video-bytes`, one WARN line says so, and the mark is tried again at the
-next key frame (`Lane::mark`, `media_deadline.rs:1914`). `off` and `shadow` never mark.
+`crates/vendored/webrtc/src/sctp_transport/mod.rs:498`, FR-148 P4b-1): once per stream, when the pick
+says switch, before the drain. The stream is the channel's `id()`, which the vendored webrtc's accept
+path sets to the stream the viewer opened the channel on, before the agent's handler sees it (FR-148
+P4b, `sctp_transport/mod.rs:335`). Before P4b every channel the viewer opened read 0 there. With the
+agent the DTLS client, as it answers today, the viewer's streams are odd, so the mark asked for a stream
+the association did not have and was refused. With the viewer the DTLS client, stream 0 is its first
+channel, `input`, which the mark would have marked in `video-deadline`'s place, leaving `video-deadline`'s
+chunks abandoned at their first send.
+
+A refused mark switches nothing: the session stays on `video-bytes`, and the mark is tried again at each
+frame that wants `video-deadline`, key frame or delta, until one is accepted (`Lane::mark`,
+`media_deadline.rs:1926`). A mark accepted between key frames starts the switch, whose own key frame the
+drain rule asks for (P4b-4b). So a refusal holds a switch back at most one frame past the moment its cause
+clears, and from that frame on the session switches as any switch does: `video-bytes`' drain, what is left
+of the gate's 500 ms gap since its last grant, and its key frame's encode, with no ask of the viewer's.
+The refusal names its reason: `no_association` (the transport not started yet, or stopped), `slot_held`
+(the association's slot held at that instant, by its start, its stop or another reader's brief look) or
+`no_stream` (the association has no such stream). Until P4b a refusal was tried again only at the next
+key frame, which the encoder sends only when asked: P4b-5's first `on` runs (0.4.238) stayed on
+`video-bytes` for all of their 240 s. `off` and `shadow` never mark.
 
 **D.** Under `on`, on `video-deadline` only, a frame older than 300 ms at its first write, counted
 from its hand-off to the send task, is dropped whole, and a key frame is asked through the session's
@@ -5515,20 +5531,21 @@ per pump ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a
 | a viewer older than P4b-2 | it opens no `video-deadline`. The pick finds none, the session stays on `video-bytes`, and where the carrier wanted one a line says so once per send task |
 | a `video-bytes` that arrives unordered | an older viewer's retired opt-in (`roomler-rc-unordered-video`, retired by P4b-2). The agent sends on it as today under every value: it acts only on the channel labelled `video-deadline` |
 | an agent older than P4b-3 | it attaches `video-deadline` log-only (the catch-all arm, `peer.rs:1423`), and the viewer's second channel stays one idle stream |
-| a viewer older than P4b-3b | it sends no `relay`, so the agent picks exactly as P4b-3 did. Its lines are P4b-3's but for `tcp_end`, which reads `agent` or `none` as the class is TCP or not (`an_older_viewer_gets_p4b_3_s_picks_and_lines`, `media_deadline.rs:2910`) |
+| a viewer older than P4b-3b | it sends no `relay`, so the agent picks exactly as P4b-3 did. Its lines are P4b-3's but for `tcp_end`, which reads `agent` or `none` as the class is TCP or not (`an_older_viewer_gets_p4b_3_s_picks_and_lines`, `media_deadline.rs:2939`) |
 | an agent older than P4b-3b | it reads `rc:decodestat`'s keys by name, so it ignores `relay`, and every key the message carried before is unchanged (`useRemoteControl.spec.ts` locks it). The session picks by the agent's own end |
 
 **The lines,** each with `session`:
 
 | Line | When |
 |---|---|
-| `video-deadline DC stashed (FR-148 P4b-3)`, with `ordered`, `max_retransmits`, `stream_id` | the viewer's `video-deadline` opened |
+| `video-deadline DC stashed (FR-148 P4b-3)`, with `ordered`, `max_retransmits`, `stream_id` | the viewer's `video-deadline` opened. `stream_id` is the channel's SCTP stream since FR-148 P4b; before, it read 0 for every channel the viewer opened |
 | `video channel: carrier class (FR-148 P4b-3)`, with `from`, `to`, `viewer_relay`, `tcp_end` | a pump's read at its start or a re-check changed the class, the viewer's report or `tcp_end` (`shadow`, `on`). `from` and `to` are the agent's own class, `viewer_relay` the report the read used (`none`, `udp`, `tcp` or `tls`), and `tcp_end` the end that holds the TCP leg. A report repeated unchanged writes nothing |
 | `video channel: none -> <channel> (carrier=<class>, frame_seq=<n>, held_ms=0, dropped=0, tcp_end=<end>)` | a send task's first pick |
 | `video channel: <from> -> <to> (carrier=<class>, frame_seq=<n>, held_ms=<n>, dropped=<n>, tcp_end=<end>)`, with `drained_ms` | a switch completed: `frame_seq` is the key frame's, `held_ms` the time from the pick to it, `dropped` the frames dropped meanwhile, `drained_ms` the time until the old channel read 0. `carrier` is the agent's own class, so a switch the viewer's report made reads `tcp_end=viewer` beside it |
 | `video channel (shadow): …` | the same lines under `shadow`, for what `on` would do |
 | `video channel: the carrier is TCP somewhere and no video-deadline is open; video-bytes (FR-148 P4b-3)`, with `carrier`, `framed`, `tcp_end` | once per send task, when the pick would take `video-deadline` and the session has none |
-| WARN `video channel: video-deadline's stream was not marked; staying on video-bytes, and trying again at the next key frame (FR-148 P4b-3)`, with `stream` | once per send task, at the first refused mark |
+| WARN `video channel: video-deadline's stream was not marked; staying on video-bytes, and trying again at each frame (FR-148 P4b-3)`, with `stream`, `reason` | a refused mark, once per reason in a send task until a mark is accepted. `reason` is `no_association`, `slot_held` or `no_stream`. Before FR-148 P4b the line ended `trying again at the next key frame`, had no `reason`, and came once per send task |
+| `video channel: video-deadline's stream was marked after it was refused; switching to it (FR-148 P4b-3)`, with `stream`, `refused` | a mark accepted after refusals: `refused` counts the tries refused before it |
 
 A switch on the agent's own relay, and one on the viewer's, with made-up values:
 
@@ -5564,7 +5581,10 @@ The counts ride the `path delivery` line ([rate-control.md](rate-control.md#the-
 | `a_switch_drains_the_old_channel_then_waits_for_a_key_frame` | the drain rule: frames, a key frame too, dropped while the old channel holds bytes, then the ask, the drops until a key frame, the key frame on the new channel, and the line; a refused ask asked again; a channel that never drains holds the video, every frame dropped and counted |
 | `one_frame_seq_space_across_a_switch_and_back` | the numbers written rise without a repeat across a switch and back, and the gaps are the frames dropped, each counted |
 | `d_drops_a_late_frame_whole_on_video_deadline_alone` | D: a frame over 300 ms dropped whole on `video-deadline` with its number consumed, counted and a key frame asked; none on `video-bytes`; `shadow` counts and drops nothing |
-| `the_mark_comes_once_under_on_before_the_first_write_on_video_deadline` | one mark per stream, before the first write there, however often the session switches; a refusal keeps `video-bytes` and is tried again at the next key frame |
+| `the_mark_comes_once_under_on_before_the_first_write_on_video_deadline` | one mark per stream, before the first write there, however often the session switches; a refusal keeps `video-bytes` and is tried again at each frame, key frame or delta: accepted at a delta, the switch drops it and asks for its key frame |
+| `a_refused_mark_reaches_video_deadline_with_no_key_frame_unasked` | a mark refused until its cause clears: the next frame, a delta, is marked and starts the switch, which asks for its own key frame (the 500 ms gap, never owed) and writes it on `video-deadline`, with no ask of the viewer's and no key frame dropped; the key frame rule's clock restarts at that key frame |
+| `a_refused_mark_says_why_and_on_which_stream`, `each_reason_is_said_once_until_a_mark_is_accepted` | the WARN line's `reason` and `stream`; each reason said once until a mark is accepted, then the accept's line with `refused`, and a later stream's refusals said again |
+| `the_mark_finds_the_viewer_s_video_deadline_when_the_daemon_is_the_dtls_client`, `the_mark_leaves_stream_0_alone_when_the_viewer_is_the_dtls_client` | a real peer connection on each DTLS role, the viewer opening `input` first as the browser does (on stream 0 when the viewer is the DTLS client): the agent's handler sees the viewer's stream as the id, the session's first key frame goes on `video-deadline`, and that stream is the only one marked (`RTCSctpTransport::deadline_streams`), so stream 0 stays unmarked |
 | `shadow_writes_exactly_off_s_bytes` | over five seeds of 3,000 random frames, carrier changes, a `video-deadline` that comes and goes and a `video-bytes` sometimes missing: `shadow`'s and `off`'s messages, framed as the send task frames them, equal today's send task's in channel, bytes and order |
 | `an_older_viewer_gets_today_s_writes_under_on` | no `video-deadline`, or no framing: under `on` on a TCP carrier, today's writes and one line |
 | `the_gate_passes_one_ask_per_gap` | one ask per 500 ms passes and sets the flag the pumps poll; every ask counted |
@@ -5573,6 +5593,14 @@ The counts ride the `path delivery` line ([rate-control.md](rate-control.md#the-
 
 `media_delivery::tests::the_video_channel_s_counts_close_the_line` and
 `config_enum_pins::video_deadline_declares_every_mode_the_pump_reads` pin the line and the config key.
+The vendored webrtc's own cells hold the two patches the mark rests on (FR-148 P4b): an accepted channel's
+id is its stream, in the handler and once open, on both DTLS roles
+(`data_channel_test::test_data_channel_accepted_id_is_its_stream_when_the_answerer_is_the_dtls_client` and
+`…_dtls_server`), and each refusal comes with its cause on a real pair
+(`sctp_transport_test::test_mark_deadline_stream_says_why_it_refused`). No CI lane runs that crate's
+tests, as `vendored-sctp` runs the SCTP fork's: they run by hand, with `--manifest-path
+crates/vendored/webrtc/Cargo.toml` and the workspace's `[patch.crates-io]` forks (`webrtc-sctp`,
+`webrtc-ice`, `rtp`) given as `--config` patches. The agent's cells above are CI's guard of both.
 
 **The kill switch** is the value `off`, which is also the default: no class is read, no channel
 marked, and every frame goes on `video-bytes` under the send task's next number, as before.

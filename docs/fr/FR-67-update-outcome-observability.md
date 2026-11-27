@@ -57,7 +57,7 @@ wait that should not exist.
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
 (`post_install.rs:369`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:7640`)
+(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:7668`)
 was never wired. So even on Windows — where the staged watcher does produce a
 verdict — nothing surfaces it. **P3 wires it** (2026-10-26): the daemon reads
 the record at startup and on every `roomler status`, see the P3 section below.
