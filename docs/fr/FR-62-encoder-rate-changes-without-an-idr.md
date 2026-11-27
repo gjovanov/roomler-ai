@@ -131,7 +131,7 @@
     WireGuard rekey timeouts and the failed make-before-break probe beside it belong to the
     overlay. The pump sees the overlay only through the carrier this recheck asks for.
   - 🔑 **On this cell the encoder never picks an IDR by itself, so each of the three was
-    forced.** `idr_count` counts every key-flagged packet (`encode/ffmpeg/encoder.rs:2388`).
+    forced.** `idr_count` counts every key-flagged packet (`encode/ffmpeg/encoder.rs:2399`).
     NVENC opens with a 64,800-frame GOP (`:51`, set at `:1905`), over half an hour at this
     session's 31 fps, and with `rc-lookahead=0` and `bf=0` (`:366`–`:367`). Its scene-cut
     I-frames need the lookahead, so they are off. A key frame therefore comes from a force
@@ -161,7 +161,7 @@
     and a second viewer's requests never show on the reading tab. The next read searches the
     agent log for every line in the table right after the session ends, because the log
     listing returns only a device's newest 500 batches
-    (`crates/modules/fleet/src/agent_log.rs:226`).
+    (`crates/modules/fleet/src/agent_log.rs:262`).
 
 - **2026-10-31 22:47Z — the first relayed NVENC read: the cell works, and nothing was tested.**
   CORPLAP-2 on 0.4.191, `hevc_nvenc` 1920×1200, `constrained=true` on all 158 heartbeats over
@@ -202,7 +202,7 @@
     absence of the others.
   - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
     inequality names two sources, and its read counted viewer requests from
-    `PLI/FIR → forcing keyframe` lines, which only the RTP path prints (`peer.rs:843`).
+    `PLI/FIR → forcing keyframe` lines, which only the RTP path prints (`peer.rs:850`).
     Every NVENC HEVC or AV1 session is on the DataChannel, where a viewer asks with
     `rc:keyframe`. The FFmpeg DC pump has these sources (the 2026-11-03 table above is the
     complete list):
@@ -228,7 +228,7 @@
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
     - `target_bps` is `governor.applied_bps()`, the raw target. The encoder runs at the maxrate
       it opened with until the first rung crossing, then at that target's nearest rung
-      (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in `set_bitrate`, `encoder.rs:3012`).
+      (`coarsen_bitrate`, `encode/aimd.rs:527`, applied in `set_bitrate`, `encoder.rs:3024`).
       So the read is against that maxrate ÷ `target_fps` ÷ 8. Against the raw target a
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
@@ -254,7 +254,7 @@
     flip plus one release soak (Sequencing row 5), and every A4 row's precondition is
     unmet: row 1 needs "A0 passes on QSV", which failed; row 2 needs VideoToolbox
     measured, and QSV still needs the ladder; row 3 is marked "a behavioral decision for
-    the post-soak pass" in the code (`encode/governor.rs:1017`). Found on the way:
+    the post-soak pass" in the code (`encode/governor.rs:1254`). Found on the way:
     B3b deletes `aimd.rs` whole, the coarsen ladder included, and the plan predates
     A0-QSV. Whatever replaces the AIMD must carry QSV's rationing forward.
 
