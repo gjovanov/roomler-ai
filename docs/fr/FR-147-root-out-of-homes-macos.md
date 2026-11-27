@@ -231,7 +231,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:3293`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:3308`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:1010`) and `folder_words` (`:1143`), with `r5_words` (`:1189`); `refusals` (`:1623`) says them.
 
 ### Refusals at Plan
@@ -643,7 +643,7 @@ The source gate (`crates/agent-core/src/folder_gate.rs:279-345`) holds six of th
 macOS builds: `process_home`, `default_download_dir`, `unix_lock_path`, `plist_path`, the `roomler` CLI's
 `default_config_path` and `default_choice`. Each is entered by a command typed with `sudo`, which on macOS keeps the
 caller's `HOME`. AC10 asks that none is left. Of the reads an earlier row of this table left undetermined,
-`files.rs:5579-5583` is Linux's `own_home_and_downloads` and `:7909` is a test.
+`files.rs:5579-5583` is Linux's `own_home_and_downloads` and `:7955` is a test.
 
 Not swept: `agents/roomler-setup/src/unix_daemon.rs`, the self-updater, `cleanup-legacy-install`, and fleet exec as
 root.
@@ -727,7 +727,7 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3008`, its sequence at `:3062`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3021`, its sequence at `:3075`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:3273`): one-row's row, and

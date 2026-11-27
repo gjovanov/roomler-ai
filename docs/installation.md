@@ -2701,7 +2701,13 @@ serves it. So `sudo roomler …`, a cron job and a system service, which have no
 dir, go straight to `/var/run/roomler/roomler.sock`. On a **per-user** install the
 daemon's socket is that runtime dir's, and a command run without one (cron, `su`)
 answers `roomler daemon not running` with a note naming `XDG_RUNTIME_DIR`: run it with
-`XDG_RUNTIME_DIR=/run/user/$(id -u)`. A per-user daemon started without a private
+`XDG_RUNTIME_DIR=/run/user/$(id -u)`. Root's line names what it tried instead (#3937,
+`not_running_words_for`, `crates/localapi/src/lib.rs:5128`): `sudo roomler status` on
+such a host answers that there is no socket at `/var/run/roomler/roomler.sock`, the
+system daemon's, and that a per-user daemon answers only its own account, without
+`sudo`. It names the account `sudo` ran for when `SUDO_USER` holds a portable user
+name, and no longer asks whether the service is started: on a per-user install the
+system unit is disabled and has no config. A per-user daemon started without a private
 runtime dir serves no LocalAPI at all and logs `localapi: not served: …` with the
 reason.
 
@@ -3288,7 +3294,9 @@ the **root** half, because the two listen on different LocalAPI sockets
 (`$TMPDIR/roomler/roomler.sock`, in the person's own `/var/folders/…/T`, vs
 `/var/run/roomler/roomler.sock`). A command keeps a socket only when its own account
 or root serves it, and root never looks in a per-user temp folder (#3736). If a
-command reports "daemon not running", you are probably asking the wrong half.
+command reports "daemon not running", you are probably asking the wrong half. Under
+`sudo` the line says so itself (#3937): it names the socket it tried, the root half's,
+and says that a per-user daemon answers only its own account, without `sudo`.
 
 `roomler status` as the signed-in user carries the **root** half's overlay
 address, exit node and MagicDNS (FR-97 P2h lends them to the per-user half, which
@@ -3570,7 +3578,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5822`).
+(`crates/localapi/src/lib.rs:5882`).
 
 On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
 the console user's `roomler …` is the screen worker the root daemon starts for
@@ -4046,7 +4054,7 @@ serves `live_work`. So the command looks where a person may. It connects to the
 person socket root serves them (`/var/run/roomler-person/<uid>.sock`, FR-97 P2g),
 keeps the connection only when root serves it, sends nothing, and gives up after
 500 ms: the evidence of a root half that `roomler status` reads
-(`macos_root_half_serves_me`, `crates/localapi/src/lib.rs:5879-5892`). The look is
+(`macos_root_half_serves_me`, `crates/localapi/src/lib.rs:5939-5952`). The look is
 `root_half_seen` (`agents/roomlerd/src/helper_gate.rs:491-507`), the call is in
 `self_update_cmd` (`agents/roomlerd/src/app.rs:6577-6598`), and the lines are
 `ask_recorded_says` and `NO_ASK_SAYS` (`helper_gate.rs:518-546`):
