@@ -253,7 +253,8 @@ agent's switch is on, the server it last spoke to announced a window, and the se
   refused; with the window at 0 every P0 cell reads as at the pin.
 - [ ] **AC5.** Nothing leaks: a kept peer whose client never returns closes by the window's end, with its socket and
   any TURN allocation (an exit-side socket count before and after, in the lab).
-- [ ] **AC6.** The docs (P6).
+- [ ] **AC6.** Docs (P6): `docs/tunnels.md` gains "What ends a tunnel session", the map with its diagram as it stands
+  after P5, and `docs/README.md` carries its row.
 
 ## 6. The field reads
 
