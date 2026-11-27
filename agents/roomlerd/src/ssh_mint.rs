@@ -34,6 +34,15 @@ pub enum Mint {
 /// verification worthless. Better to serve nothing than to serve a new
 /// identity every restart.
 ///
+/// FATAL for THIS RUN only (#3353). A failure, to make the key or to save it,
+/// sets [`AgentConfig::ssh_off_this_run`], which no save writes, and leaves
+/// `ssh_enabled` as the owner or the pushed document set it. It used to set
+/// `ssh_enabled = false`, and the crash bookkeeping's startup save, a few steps
+/// later, wrote the whole in-memory copy: the next start read that `false` as
+/// the owner's choice and tried no mint, so a device with no pushed document
+/// kept SSH off until someone set the key again. Now the next start tries
+/// again, and every reader in this run takes [`AgentConfig::ssh_on_this_run`].
+///
 /// ⚠️ The condition is "not USABLE", not "absent". A key that is present but
 /// unparseable is the state this guard used to walk straight past, and it is
 /// strictly worse than having none: the daemon refuses to serve SSH (right)
@@ -73,19 +82,24 @@ pub fn at_start(
                 }
                 Err(e) => {
                     cfg.ssh_host_key = None;
-                    cfg.ssh_enabled = false;
+                    cfg.ssh_off_this_run = true;
                     tracing::error!(
                         error = %e,
-                        "ssh: could not persist the host key — SSH stays OFF this run \
-                         rather than serving an identity that changes on every restart"
+                        "ssh: could not save the new host key, so SSH is off for this run \
+                         rather than serving an identity that changes on every restart. \
+                         ssh_enabled stays on in the config, and the next start tries again"
                     );
                     Mint::OffThisRun
                 }
             }
         }
         Err(e) => {
-            cfg.ssh_enabled = false;
-            tracing::error!(error = %e, "ssh: host key generation failed — SSH stays OFF");
+            cfg.ssh_off_this_run = true;
+            tracing::error!(
+                error = %e,
+                "ssh: could not make a host key, so SSH is off for this run. ssh_enabled \
+                 stays on in the config, and the next start tries again"
+            );
             Mint::OffThisRun
         }
     }
@@ -151,6 +165,7 @@ mod tests {
         );
         assert_eq!(tries, 1, "the next start tries the mint again");
         assert_eq!(mint, Mint::Minted);
+        assert!(cfg.ssh_on_this_run(), "and serves SSH");
         let on_disk = config::load(path).unwrap();
         assert!(on_disk.ssh_enabled);
         assert!(
@@ -220,6 +235,8 @@ mod tests {
         let (mut cfg, mut writes) = start(&path);
         let mint = at_start(&mut cfg, no_entropy, |c| writes.save(c));
         assert_eq!(mint, Mint::OffThisRun);
+        assert!(cfg.ssh_enabled, "the owner's value stays in memory too");
+        assert!(!cfg.ssh_on_this_run(), "and this run serves no SSH");
         crash_bookkeeping(&mut cfg, &mut writes);
 
         let on_disk = config::load(&path).unwrap();
@@ -228,6 +245,12 @@ mod tests {
             "a failed mint turned the owner's ssh_enabled off in the file"
         );
         assert!(on_disk.ssh_host_key.is_none());
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("ssh_off_this_run"),
+            "a run's own state is never written"
+        );
         next_start_mints(&path);
     }
 
@@ -279,6 +302,8 @@ mod tests {
             cfg.ssh_host_key.is_none(),
             "a key that was not saved is never served"
         );
+        assert!(cfg.ssh_enabled, "the owner's value stays in memory too");
+        assert!(!cfg.ssh_on_this_run(), "and this run serves no SSH");
         crash_bookkeeping(&mut cfg, &mut writes);
 
         let on_disk = config::load(&path).unwrap();

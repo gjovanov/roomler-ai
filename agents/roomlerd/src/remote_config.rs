@@ -76,7 +76,10 @@ struct RunningKeys {
 impl RunningKeys {
     fn of(cfg: &crate::config::AgentConfig) -> Self {
         Self {
-            ssh_enabled: cfg.ssh_enabled,
+            // #3353 — what the process serves, not the file's value: a start
+            // that could not mint the host key runs SSH off while the file
+            // keeps the owner's `true`, so a pushed `true` waits on a restart.
+            ssh_enabled: cfg.ssh_on_this_run(),
             ssh_authorized_keys: cfg.ssh_authorized_keys.clone(),
             ssh_account_mode: cfg.ssh_account_mode.clone(),
             ssh_port: cfg.ssh_port,
@@ -171,6 +174,10 @@ pub struct RemoteConfigServices {
     lock: crate::config::WriteLock,
     /// FR-132 P1c — what this process started on ([`Self::running_on`]).
     running: Option<Arc<RunningKeys>>,
+    /// #3353 — this run's start could not mint the SSH host key
+    /// (`AgentConfig::ssh_off_this_run`), recorded by [`Self::running_on`] and
+    /// put on every loop's config by [`Self::carry_run_state`].
+    ssh_off_this_run: bool,
     /// The LIVE `exec_enabled`, read by the `rc:rpc.exec` gate. Seeded from
     /// the startup config and the only copy that decides anything.
     exec_enabled: Arc<AtomicBool>,
@@ -246,6 +253,7 @@ impl RemoteConfigServices {
             path,
             lock,
             running: None,
+            ssh_off_this_run: false,
             exec_enabled: Arc::new(AtomicBool::new(exec_enabled)),
             remote_config_enabled: Arc::new(AtomicBool::new(remote_config_enabled)),
             #[cfg(feature = "external-access")]
@@ -331,7 +339,17 @@ impl RemoteConfigServices {
     /// `needs_restart` says only that the file changed.
     pub fn running_on(mut self, cfg: &crate::config::AgentConfig) -> Self {
         self.running = Some(Arc::new(RunningKeys::of(cfg)));
+        self.ssh_off_this_run = cfg.ssh_off_this_run;
         self
+    }
+
+    /// #3353 — put this run's own SSH state on `cfg`, the config a control
+    /// loop is about to run on. A config reloaded from the file (a runtime
+    /// `org join`) holds the owner's `ssh_enabled` and not that this run's
+    /// start could not mint the host key, and the loop on it would serve SSH
+    /// that the rest of the process does not. It can only turn SSH off.
+    pub fn carry_run_state(&self, cfg: &mut crate::config::AgentConfig) {
+        cfg.ssh_off_this_run |= self.ssh_off_this_run;
     }
 
     /// FR-100 P1c — the device's `peer_auth` policy at this moment.
@@ -1641,5 +1659,34 @@ mod failed_mint_tests {
 
         let reconnect = svc.apply(&push).await.unwrap();
         assert_eq!(reconnect.needs_restart, vec!["ssh_enabled"]);
+    }
+
+    /// A loop started on a config reloaded from the file, as a runtime `org
+    /// join` starts one, runs SSH off as the rest of this process does, and
+    /// the config keeps the owner's value. A run whose mint did not fail turns
+    /// nothing off.
+    #[test]
+    fn a_loop_on_a_reloaded_config_runs_ssh_as_this_process_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = a_start_whose_mint_failed(&path);
+        let svc = services_on(&path).running_on(&cfg);
+
+        let mut reloaded = crate::config::load(&path).unwrap();
+        assert!(
+            reloaded.ssh_on_this_run(),
+            "the file holds the owner's true"
+        );
+        svc.carry_run_state(&mut reloaded);
+        assert!(!reloaded.ssh_on_this_run(), "this run serves no SSH");
+        assert!(reloaded.ssh_enabled, "and the owner's value stays");
+
+        let fine = services_on(&path).running_on(&crate::config::load(&path).unwrap());
+        let mut reloaded = crate::config::load(&path).unwrap();
+        fine.carry_run_state(&mut reloaded);
+        assert!(
+            reloaded.ssh_on_this_run(),
+            "a run that did not fail serves SSH"
+        );
     }
 }

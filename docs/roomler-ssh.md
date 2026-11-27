@@ -211,7 +211,12 @@ on a machine-global Windows install, and adds no new secret-at-rest surface. If
 it cannot be persisted, SSH stays **off** for that run rather than serving an
 identity that changes every restart: a host key that rotates on every boot
 trains operators to accept unknown fingerprints, which is exactly the habit that
-makes host verification worthless. The fingerprint is logged at start-up so it
+makes host verification worthless. A failed mint, whether the key cannot be made
+or cannot be saved, keeps SSH off for that run only (#3353): `ssh_enabled` keeps
+its value in the file, the owner's or the pushed document's, and the next start
+tries the mint again, while the failed run serves no SSH, publishes no host key
+and reports a pushed `ssh_enabled = true` as waiting on a restart
+(`agents/roomlerd/src/ssh_mint.rs`). The fingerprint is logged at start-up so it
 can be pinned out of band.
 
 ## 3. What a session can do today

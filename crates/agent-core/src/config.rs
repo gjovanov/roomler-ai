@@ -351,6 +351,11 @@ pub struct AgentConfig {
     /// OS sees them (see `tunnel_core::overlay::split_tun`), so on a host whose
     /// `sshd` already serves that address the in-process server takes over for
     /// peers. The daemon logs a warning when it detects that case at start-up.
+    ///
+    /// The owner's value, or the pushed document's, and nothing else (#3353).
+    /// A start that cannot make or save the host key turns SSH off for its
+    /// own run in [`Self::ssh_off_this_run`] and leaves this as it found it.
+    /// Whether this process serves SSH is [`Self::ssh_on_this_run`].
     #[serde(default)]
     pub ssh_enabled: bool,
 
@@ -1868,6 +1873,19 @@ pub struct AgentConfig {
     #[serde(skip)]
     pub derived_netstack: bool,
 
+    /// #3353 — this run's start could not make the SSH host key, or could not
+    /// save it, so this process serves no SSH whatever [`Self::ssh_enabled`]
+    /// says. Readers take [`Self::ssh_on_this_run`].
+    ///
+    /// `#[serde(skip)]`, as [`Self::derived_org`]: never written to or read
+    /// from disk. So no save in this run turns the owner's `ssh_enabled` off
+    /// in the file, and the next start, which loads `false` here, tries the
+    /// mint again. A config this run reloads from the file does not hold it
+    /// either: the daemon puts it back on such a config before a loop runs on
+    /// it (`RemoteConfigServices::carry_run_state` in `roomlerd`).
+    #[serde(skip)]
+    pub ssh_off_this_run: bool,
+
     /// Phase 3b: this node's persisted WireGuard Curve25519 secret key
     /// (base64). Generated on the first overlay-enabled startup in `main`;
     /// the public key is what the netmap distributes. `None` until then.
@@ -2503,6 +2521,15 @@ impl AgentConfig {
             Some(0) | None => DEFAULT_SSH_PORT,
             Some(p) => p,
         }
+    }
+
+    /// #3353 — whether this process serves SSH: [`Self::ssh_enabled`], unless
+    /// this run's start could not make or save the host key
+    /// ([`Self::ssh_off_this_run`]). Every reader of the SSH gate in the daemon
+    /// reads this, never `ssh_enabled` alone: the interception, the `ssh-system`
+    /// word, the grant gates and what remote configuration reports as running.
+    pub fn ssh_on_this_run(&self) -> bool {
+        self.ssh_enabled && !self.ssh_off_this_run
     }
 }
 
@@ -3172,6 +3199,7 @@ pub fn test_fixture() -> AgentConfig {
         netstack_socks_port: None,
         derived_org: false,
         derived_netstack: false,
+        ssh_off_this_run: false,
         overlay_wg_secret_key: None,
         overlay_wg_key_epoch: 0,
         overlay_advertised_routes: Vec::new(),

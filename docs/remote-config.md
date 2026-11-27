@@ -216,7 +216,10 @@ document manages stays in `needs_restart` until this process runs it. A reconnec
 still writes nothing to disk. A local edit waiting on a restart is left out,
 because this report is about the push. A save back to the value this process runs
 leaves nothing waiting, so it reads `applied` at once, and a restart would change
-nothing.
+nothing. The record is of what the process runs, not of the file: a device whose
+start could not mint its SSH host key runs SSH off while the file keeps the
+owner's `ssh_enabled = true` (#3353), so a pushed `true` waits on a restart there
+and never reads `applied`.
 
 Two limits. A build before P1c, which shipped in 0.4.199, still turns the row to
 `applied` at a reconnect, and no capability word marks the difference, so read the
