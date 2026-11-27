@@ -561,6 +561,12 @@ impl QuicPeer {
         let incoming = self.endpoint.accept().await?;
         Some(incoming.await.context("quic accept handshake"))
     }
+
+    /// Close every connection on this endpoint with the application
+    /// `code` and `reason`, and accept no more ([`quinn::Endpoint::close`]).
+    pub fn close(&self, code: u32, reason: &[u8]) {
+        self.endpoint.close(code.into(), reason);
+    }
 }
 
 impl Transport for QuicPeer {

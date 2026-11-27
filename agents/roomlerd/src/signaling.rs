@@ -3097,7 +3097,7 @@ async fn connect_once(
                         // loop into the watchdog.
                         close_within_budget(peer.close(), sid, "tunnel_remote_gone").await;
                     }
-                    ReapedTunnelPeer::Quic(peer) => peer.close(),
+                    ReapedTunnelPeer::Quic(peer) => reap_quic_peer(&cfg.tenant_id, sid, &peer),
                 }
                 // Tell the server, which relays it to the client if one is
                 // somehow still registered (the server does not clean the
@@ -5610,9 +5610,11 @@ async fn handle_server_msg(
         // rc:tunnel.terminate from the server (relayed from the
         // client or admin-side teardown). Tear down our peer state.
         ServerMsg::TunnelTerminate {
-            session_id, reason, ..
+            session_id,
+            reason,
+            close_connection,
         } => {
-            info!(%session_id, ?reason, "rc:tunnel.terminate — closing peer");
+            info!(%session_id, ?reason, close_connection, "rc:tunnel.terminate — closing peer");
             // #1761 — a setup still in flight for this session: its result,
             // when it lands, is closed rather than inserted.
             if pending_quic_setups.cancel(session_id) {
@@ -5622,11 +5624,7 @@ async fn handle_server_msg(
                 close_within_budget(peer.close(), session_id, "tunnel_terminate").await;
             }
             // The session may instead be on the QUIC data plane.
-            // `AgentQuicPeer::close` is synchronous (aborts the accept
-            // task; the endpoint drops with the last Arc).
-            if let Some(quic_peer) = tunnel_quic_peers.remove(&session_id) {
-                quic_peer.close();
-            }
+            terminate_quic_session(tunnel_quic_peers, tenant_id, session_id, close_connection);
         }
 
         // S1a — operator-triggered forced self-update from the web UI.
@@ -6681,6 +6679,81 @@ async fn close_all_tunnel_quic_peers(tunnel_quic_peers: &mut TunnelQuicPeers) {
     info!(count, "torn down agent QUIC tunnel peers on ws disconnect");
 }
 
+/// Per tenant, the QUIC sessions a terminate or a reap took out of the map
+/// without closing their connection, each by its link for
+/// [`crate::tunnel::quic_peer::ENDED_SESSION_TTL`]: a terminate that asks to
+/// close the connection reaches the session whichever order the frames
+/// arrive in. Process-wide, like [`TUNNEL_QUIC_SURVIVAL`], so a control-WS
+/// reconnect between the two frames keeps it. A kept link holds no
+/// socket.
+static ENDED_QUIC_SESSIONS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::BTreeMap<String, crate::tunnel::quic_peer::EndedQuicSessions>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+/// Keep `link` for `session_id` in [`ENDED_QUIC_SESSIONS`].
+fn keep_ended_quic_session(
+    tenant: &str,
+    session_id: bson::oid::ObjectId,
+    link: crate::tunnel::quic_peer::SessionLink,
+) {
+    ENDED_QUIC_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(tenant.to_string())
+        .or_default()
+        .record(session_id, link);
+}
+
+/// `rc:tunnel.terminate` on the QUIC data plane. One that asks to close the
+/// connection ends the session ([`crate::tunnel::quic_peer::AgentQuicPeer::end`]):
+/// the peer in the map, or else the one an earlier terminate or reap took
+/// out of it ([`ENDED_QUIC_SESSIONS`]). Any other closes the peer, which
+/// stops its accept loop (the endpoint drops with the last `Arc`), and keeps
+/// its link. Returns whether a session was ended.
+fn terminate_quic_session(
+    tunnel_quic_peers: &mut TunnelQuicPeers,
+    tenant: &str,
+    session_id: bson::oid::ObjectId,
+    close_connection: bool,
+) -> bool {
+    let peer = tunnel_quic_peers.remove(&session_id);
+    if close_connection {
+        if let Some(peer) = peer {
+            peer.end();
+            return true;
+        }
+        let ended = ENDED_QUIC_SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(tenant)
+            .is_some_and(|sessions| sessions.end(session_id));
+        if ended {
+            info!(%session_id, "tunnel quic: session ended after an earlier terminate");
+        }
+        return ended;
+    }
+    if let Some(peer) = peer {
+        peer.close();
+        keep_ended_quic_session(tenant, session_id, peer.link());
+    }
+    false
+}
+
+/// #1754 — the reap arm's QUIC half: [`crate::tunnel::quic_peer::AgentQuicPeer::reap`].
+/// A connection still up keeps its link, as after a terminate that does not
+/// ask to close it.
+fn reap_quic_peer(
+    tenant: &str,
+    session_id: bson::oid::ObjectId,
+    peer: &crate::tunnel::quic_peer::AgentQuicPeer,
+) {
+    if !peer.reap() {
+        keep_ended_quic_session(tenant, session_id, peer.link());
+    }
+}
+
 /// R3 — per-tenant stash of QUIC tunnel peers that SURVIVE a transient
 /// control-WS reattach. QUIC flows self-signal over their own streams (no
 /// welded control-WS sender — see `tunnel_core::forward::run_flow_quic`), so
@@ -6710,7 +6783,12 @@ fn tunnel_peers_survive_enabled() -> bool {
 /// Reclaim the tenant's stashed QUIC peers at the start of a control-WS
 /// session. Empty when the flag is off — pre-R3 behaviour byte-identical.
 fn reclaim_survived_quic_peers(tenant: &str) -> TunnelQuicPeers {
-    if !tunnel_peers_survive_enabled() {
+    reclaim_quic_peers(tenant, tunnel_peers_survive_enabled())
+}
+
+/// [`reclaim_survived_quic_peers`], with the R3 gate read by the caller.
+fn reclaim_quic_peers(tenant: &str, survive: bool) -> TunnelQuicPeers {
+    if !survive {
         return HashMap::new();
     }
     let mut map = TUNNEL_QUIC_SURVIVAL
@@ -6718,7 +6796,7 @@ fn reclaim_survived_quic_peers(tenant: &str) -> TunnelQuicPeers {
         .unwrap_or_else(|e| e.into_inner())
         .remove(tenant)
         .unwrap_or_default();
-    drop_parked_quic_corpses(&mut map);
+    drop_parked_quic_corpses(&mut map, tenant);
     if !map.is_empty() {
         info!(
             count = map.len(),
@@ -6733,14 +6811,15 @@ fn reclaim_survived_quic_peers(tenant: &str) -> TunnelQuicPeers {
 /// outage). Such a peer is a corpse: re-adopted into the new session's map,
 /// its endpoint socket and, on the relayed flavours, its TURN allocation
 /// would live until a terminate that a client already gone never sends.
-/// Its own report on the reap channel is answered by an empty map. Returns
-/// how many were dropped.
-fn drop_parked_quic_corpses(map: &mut TunnelQuicPeers) -> usize {
+/// Its own report on the reap channel is answered by an empty map. Each is
+/// reaped as the reap arm does ([`reap_quic_peer`]). Returns how many were
+/// dropped.
+fn drop_parked_quic_corpses(map: &mut TunnelQuicPeers, tenant: &str) -> usize {
     let before = map.len();
     map.retain(|sid, peer| {
         if peer.accept_ended() {
             info!(session_id = %sid, "R3: dropping a parked QUIC tunnel peer whose client left during the reattach (#1754)");
-            peer.close();
+            reap_quic_peer(tenant, *sid, peer);
             false
         } else {
             true
@@ -6755,7 +6834,12 @@ fn drop_parked_quic_corpses(map: &mut TunnelQuicPeers) -> usize {
 /// exits — shutdown and `Goodbye` — call [`close_all_tunnel_quic_peers`]
 /// directly instead (a re-registration or a delete must not keep peers).
 async fn park_survived_quic_peers(tunnel_quic_peers: &mut TunnelQuicPeers, tenant: &str) {
-    if !tunnel_peers_survive_enabled() {
+    park_quic_peers(tunnel_quic_peers, tenant, tunnel_peers_survive_enabled()).await;
+}
+
+/// [`park_survived_quic_peers`], with the R3 gate read by the caller.
+async fn park_quic_peers(tunnel_quic_peers: &mut TunnelQuicPeers, tenant: &str, survive: bool) {
+    if !survive {
         close_all_tunnel_quic_peers(tunnel_quic_peers).await;
         return;
     }
@@ -9040,7 +9124,11 @@ mod tests {
         assert!(!live.accept_ended(), "the live one has not");
 
         let mut map: TunnelQuicPeers = HashMap::from([(live_sid, live), (dead_sid, dead)]);
-        assert_eq!(drop_parked_quic_corpses(&mut map), 1, "one corpse dropped");
+        assert_eq!(
+            drop_parked_quic_corpses(&mut map, &bson::oid::ObjectId::new().to_hex()),
+            1,
+            "one corpse dropped"
+        );
         assert!(map.contains_key(&live_sid), "the live peer is re-adopted");
         assert!(!map.contains_key(&dead_sid), "the corpse is not");
         map[&live_sid].close();
