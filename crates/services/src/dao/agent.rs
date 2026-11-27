@@ -6,8 +6,8 @@ use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
     AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, EnrollingProgram,
-    ExecAnchor, ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, SshPolicy,
-    TokenRotation,
+    ExecAnchor, ExecPolicy, ExternalAccessPolicy, GuiWorkerBrief, InstallInfo, OsKind,
+    PeerRelayPolicy, SshPolicy, TokenRotation,
 };
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
@@ -413,6 +413,42 @@ impl AgentDao {
         self.base
             .find_paginated(
                 doc! { "tenant_id": tenant_id, "deleted_at": null },
+                Some(doc! { "created_at": -1, "_id": -1 }),
+                params,
+            )
+            .await
+    }
+
+    /// FR-157 P2 — the org's live Macs that are online and whose screen
+    /// worker's word (`capabilities.gui_worker.state`) is `state`, paged and
+    /// ordered like [`Self::list_for_tenant`]. Online is the presence ledger
+    /// (`last_presence`), as the overviews' `gui_workers` counts read it, so
+    /// the filter names what they count online and never a word an offline
+    /// row last said. [`GuiWorkerBrief::UNKNOWN`] names the Macs that sent no
+    /// word, the rows the counts put under it; a word this build has never
+    /// heard of is matched as the word it is.
+    pub async fn list_online_macs_by_gui_worker(
+        &self,
+        tenant_id: ObjectId,
+        state: &str,
+        params: &PaginationParams,
+    ) -> DaoResult<PaginatedResult<Agent>> {
+        let word = if state == GuiWorkerBrief::UNKNOWN {
+            // Absent or null, as `$ifNull` counts it, or the word itself.
+            bson::Bson::Document(doc! { "$in": [bson::Bson::Null, GuiWorkerBrief::UNKNOWN] })
+        } else {
+            bson::Bson::String(state.to_string())
+        };
+        self.base
+            .find_paginated(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "deleted_at": null,
+                    // `OsKind::Macos` on the row.
+                    "os": "macos",
+                    "last_presence": "online",
+                    "capabilities.gui_worker.state": word,
+                },
                 Some(doc! { "created_at": -1, "_id": -1 }),
                 params,
             )

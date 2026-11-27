@@ -72,7 +72,7 @@ overridden.
 
 ## Phases
 
-`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; **M3a.1 — stale replacements counted apart, and the shadow's first genuine finding (a dims replacement opened at the old frame's rate), 2026-10-21**, §"M3a.1"; **M3a.2 — that replacement opens at the ceiling of its own dims, 2026-10-21**, §"M3a.2"; **M3a.3 — the week's documented lags and first-tick re-rates counted apart, and two more genuine findings fixed (the flip's open at the old profile's rate, a superseded held target flushed after the controller moved on), 2026-10-28**, §"M3a.3"; **M3a.4: a full rebuild opens at the plan's current size and rate, also while an M2 dims swap is in flight (the 2026-11-18 week's two shapes), 2026-11-19**, §"M3a.4"; M3b not built)
+`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; **M3a.1 — stale replacements counted apart, and the shadow's first genuine finding (a dims replacement opened at the old frame's rate), 2026-10-21**, §"M3a.1"; **M3a.2 — that replacement opens at the ceiling of its own dims, 2026-10-21**, §"M3a.2"; **M3a.3 — the week's documented lags and first-tick re-rates counted apart, and two more genuine findings fixed (the flip's open at the old profile's rate, a superseded held target flushed after the controller moved on), 2026-10-28**, §"M3a.3"; **M3a.4: a full rebuild opens at the plan's current size and rate, also while an M2 dims swap is in flight (the 2026-11-18 week's two shapes), 2026-11-19**, §"M3a.4"; **M3a.5: the shadow judges each build once, against the plan of its own moment, so a build carried past a dropped pass or a stale adoption is no longer judged against a later pass's plan (the 2026-11-27 week's two shapes), 2026-11-27**, §"M3a.5"; M3b not built)
 → `M4` one controller (FR-63 B1/B2) → `M5` the deletions (FR-62 A4 + FR-63 B3) ·
 ~~`T1` transport classification~~ (→ **FR-71 #1362**, 2026-09-05) · `P1` priors decay + visible overrides.
 
@@ -702,6 +702,7 @@ inline one and compared, never read.
 |---|---|---|---|
 | **M3a** | `encode::plan`: the `Plan`, a pure producer, and a frame-cadence shadow comparison in `media_pump_ffmpeg_dc`; heartbeat `plan_divergences` + `plan_epoch` | **none, on purpose** — the shadow changes no decision, takes no await, adds no env read to the frame path, and logs at most seven lines per session; a switch would be the twelfth of the kill switches this FR exists to delete (AC4), guarding nothing | `plan_divergences` reads **zero on every field, fleet-wide**, over a week of sessions on the release carrying it; a non-zero field is a named, measured bug in the plan, fixed before M3b |
 | **M3a.4** | a full rebuild of `media_pump_ffmpeg_dc` opens at the plan's current size and rate, also while an M2 dims swap is in flight: `encode::plan::frame_step` serves, drops or opens for each frame, and an open is at the plan's target, never M2's pin; a keepalive of a capture scaled under a cap since raised waits for a fresh capture, about 1.5 s at most; `encode::plan::open_rate` ticks the controller first on every rebuild. Cells (a) `a_rebuild_racing_a_dims_swap_opens_at_the_plan_s_size_and_rate`, (b) `a_rebuild_through_a_native_geometry_flap_opens_at_the_plan_s_size_and_rate`, (c) `an_inline_open_is_built_at_the_rate_the_plan_holds_when_its_first_frame_encodes`, (d) `a_capture_that_never_reaches_the_plan_s_geometry_still_gets_an_encoder`, §"M3a.4" | none: it changes the size and rate an open takes and removes opens; the alarm is the shadow's own `dims` and `bitrate` fields, which judge every inline open | AC10's week read again on the release that carries it, bounded at both ends with the `remote_sessions` denominator: every `plan_divergences` field zero, and no full rebuild at a size or rate the plan had left |
+| **M3a.5** | the shadow judges each build of `media_pump_ffmpeg_dc` once, against the plan of its own moment: an inline open's dims in its own pass, a dims swap's at its adoption against the plan of the inputs M2 decided it from, and every build's rate at the first tick of a pass that encodes, where a move the controller made since the rate was decided, within the ceiling, is a stale tick for a consulted inline open as for a replacement; every build replaces the record of the one before, a stale adoption too. Cells (e) `a_native_move_through_the_capture_fallback_and_back_reads_zero_at_every_pass`, (f) `a_viewer_resizing_in_fit_mode_reads_zero_at_every_pass`, §"M3a.5" | none: the shadow alone changes, and no decision of the pump moves | AC10's week read again on the release that carries it, as for M3a.4, with each shape driven green there after it fails on the release before |
 
 **The plan** (`agents/roomlerd/src/encode/plan.rs:70`): `bitrate_bps`, `dims`,
 `fps`, `queue_budget_bytes`, `queue_lag_bound_ms`, `epoch` as designed, plus
@@ -916,7 +917,7 @@ every rate move is a background open and a swap):
 **It is not a plan bug.** The loop built that replacement at exactly the plan's
 rate at the moment it decided it: `rebuild_spec(bps)` coarsens the controller's
 applied rate onto the ladder, and `after_tick` folds the same
-`governor.applied_bps()` into the plan (`peer.rs:9669`). What the counter
+`governor.applied_bps()` into the plan (`peer.rs:9659`). What the counter
 measured is the plan MOVING during a build that takes seconds — which is what
 make-before-break is, with one swap in flight and an encoder that cannot re-rate
 in place. M3b's loop, reading the plan, would do the same thing. The check
@@ -941,7 +942,7 @@ viewer's Fit mode and the stage shrunk below the DPR-1.5 native box:
 | 11:03:04 | Priority Balanced → Smoother | `rc:priority updated`; no geometry move on a direct path with the dial's dims caps at their default (off); no divergence |
 
 **The plan held** through that 4 ms open — this is not a stale adoption. The dims
-replacement was opened at `min(last_ceiling, applied)` (`peer.rs:8685`): the
+replacement was opened at `min(last_ceiling, applied)` (`peer.rs:8679`): the
 **old** 1600×900 frame's ceiling and the applied 22.95 M, the 25 M rung. The plan
 already aimed at 1050×590. The controller's first tick after adoption clamped the
 target to the smaller frame's ceiling — 9.87 M, which is 0.43 × 23 M, the pixel
@@ -975,21 +976,21 @@ been lost.
 
 ### The change
 
-- `Shadow::swap_spawn` (`plan.rs:552`) captures the plan's rate and dims when a
+- `Shadow::swap_spawn` (`plan.rs:592`) captures the plan's rate and dims when a
   replacement spawns, and the pump carries it beside the handle: `pending_swap`
-  is now `(handle, spawn)` (`peer.rs:7736`), and `PendingDimsOpen` gains a fifth
+  is now `(handle, spawn)` (`peer.rs:7730`), and `PendingDimsOpen` gains a fifth
   field (`peer.rs:6853`).
-- At adoption, `judge_swap` (`plan.rs:601`, through `note_rate_swap_adopted`
-  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7687` and
-  `:7591`) asks one question: **did the plan move while it opened?**
+- At adoption, `judge_swap` (`plan.rs:641`, through `note_rate_swap_adopted`
+  `:603` and `note_dims_swap_adopted` `:613`, wired at `peer.rs:7681` and
+  `:7589`) asks one question: **did the plan move while it opened?**
   - **It held** — the common case; opens are milliseconds on most backends: the
     replacement is judged exactly as an inline open is, against the
-    controller's first target after adoption (`after_tick`, `plan.rs:527`).
+    controller's first target after adoption (`after_tick`, `plan.rs:567`).
     Re-rated there although the plan did not move is a divergence — the `zeus`
     finding above.
   - **It moved**: a **stale adoption**, counted apart — `plan_stale_swaps` on
-    the heartbeat (`peer.rs:10294`), and the session's first logs once at INFO
-    with its three rates (`log_plan_stale_swap`, `peer.rs:10431`): *`FR-70 M3a: a
+    the heartbeat (`peer.rs:10284`), and the session's first logs once at INFO
+    with its three rates (`log_plan_stale_swap`, `peer.rs:10421`): *`FR-70 M3a: a
     replacement was adopted after the plan moved while it opened (built at the
     plan of its spawn; first time this session)`*. Not judged at the tick. That
     is the lag M4 will trade against an IDR per adoption.
@@ -1007,14 +1008,14 @@ been lost.
   Windows). Both field cases verbatim: the QSV cascade → a stale adoption,
   reported once, no divergence
   (`a_replacement_adopted_after_the_plan_moved_is_stale_not_a_divergence`,
-  `plan.rs:1055`), and the same sequence judged the way M3a first shipped
-  reproduces that field's line — plan `3000000`, inline `12000000` (`:1080`);
+  `plan.rs:1142`), and the same sequence judged the way M3a first shipped
+  reproduces that field's line — plan `3000000`, inline `12000000` (`:1167`);
   the `zeus` dims swap → plan held, judged at the tick → plan `8000000`, inline
   `25000000` (`a_dims_replacement_opened_at_the_old_frame_s_rate_is_a_divergence`,
-  `:1098`). Plus: a replacement built at a plan that held is clean (`:1123`); a
+  `:1185`). Plus: a replacement built at a plan that held is clean (`:1210`); a
   dims replacement is judged on its dims, a moved geometry stales a dims
-  replacement but not a rate one (`:1144`); nothing at the spawn → judged as held
-  (`:1192`); reported once, counted every time (`:1214`).
+  replacement but not a rate one (`:1231`); nothing at the spawn → judged as held
+  (`:1279`); reported once, counted every time (`:1301`).
 - **Negative control 1 — the stale branch.** Every replacement treated as held
   (`moved && false`, marked `NEGATIVE CONTROL 1`) → **FAILED, 3 failed / 17
   passed**: exactly the three stale-branch tests (`None` where the stale report
@@ -1506,6 +1507,167 @@ the old size after the adoption; S1 needs an AMF host at a lock screen with
 nobody at it), and what §"The restarted week" still owes: B3's driven green and
 the two driven moves. M3b does not start before the week holds.
 
+## M3a.5: a build is judged once, against the plan of its own moment (2026-11-27)
+
+Anchors verified against branch `fr70-m3a5` (master `500b556e4` plus this
+change). An anchor marked "master" is to `500b556e4`, before the change. Both
+sessions' releases have master's code at every place cited: `encode/plan.rs`
+has master's lines at `agent-v0.4.229` and `agent-v0.4.237`, `peer.rs` at
+`agent-v0.4.237` is master's, and at `agent-v0.4.229` it has the same code 12
+to 46 lines earlier.
+
+### What the week found
+
+The second week ran from 0.4.228, the first release with M3a.4, to 0.4.238,
+and was read on 2026-11-27: **2 of 150 FFmpeg DC sessions diverged**, in one
+field each. In both, every heartbeat after the divergence read that field
+non-zero until the session ended (173 of an NVENC session's 355 heartbeats, and
+2,094 of a QSV session's 2,177). That is the counter, not the encoder. A count
+only adds (`plan.rs:533`, master), and the heartbeat prints the session's
+counts whole (`peer.rs:10289`, master). Both counts still read 1 at the last
+heartbeat the read holds for each: **each session had one event**, and every
+later frame and build agreed with the plan. Both events were the shadow's own:
+a build judged on a later pass, against a plan that was not its own. **The
+plan was right both times.**
+
+| Shape | What happened | Why (master) |
+|---|---|---|
+| **S1**, an NVENC host over TURN (`av1_nvenc`, 0.4.229) | the primary output changed size: DXGI-direct rebound at 3440x1440, AccessLost came three times, and capture fell back to GDI's virtual screen, 6000x1440. The inline open for the first GDI frame was at the plan's geometry and at the controller's answer, 1,842,375 (the 2 M rung), on a pass that took 1.4 s, most of it in capture, and encoded nothing, while the viewer's frame-rate cap kept one delta frame in three. 136 ms later the shadow logged `bitrate`, plan 1,500,000 against inline 2,000,000. The encoder's first frame was at the 1.5 M rung, the plan's. About 4 s later capture returned to DXGI at 1920x1080, and the encoder reopened there, on the plan | the open's pass ended at the decode-pressure skip (`peer.rs:9402`), after the open and before the controller's tick, so `after_tick` (`plan.rs:696`) did not run on it, and the open's record (`Shadow::built`, `plan.rs:464`) waited. The next pass's tick was an AIMD decrease to 1,565,955, applied in place (`peer.rs:9536`), and `after_tick` then judged the open's 2 M rung against it. An inline open was never exempt (`plan.rs:713`), so the controller's own move read as a divergence. M3a.4's rule held: the open was at the plan's target and geometry, with the controller ticked first, and its first frame came a pass later |
+| **S2**, a QSV host on a direct path (`hevc_qsv`, 0.4.237) | the viewer resized in fit mode: five `rc:resolution` moves in 2.2 s, each an M2 swap that opened in about 200 ms. One move landed between the plan's snapshot and the inline read (M3a.3's lag line, a moved `target`: plan 1294x728, inline 1364x768), and M2 spawned the swap toward 1364x768 on that pass. 216 ms later that swap was adopted as stale, and 53 ms after that the shadow logged `dims`, plan (1364, 768) against inline (1294, 728), the values swapped against the lag line. The live encoder was at 1364x768, the plan's | the swap's spawn record took the plan snapshot's dims (`plan.rs:768-773`), not the dims M2 decided it for from the inline read, so at its adoption the plan seemed to have moved while it opened (`plan.rs:824-831`). The stale path returned without retiring the record (`plan.rs:841-854`) of the swap adopted 280 ms before, to 1294x728. The screen was idle: each pass re-fed a capture scaled under the old cap, which `frame_step` dropped out of M3a.4's keepalive allowance (`peer.rs:8896`) before any tick, so that record waited until the backend captured again. The first tick then judged the replaced encoder's dims against the plan |
+
+**One mechanism in both.** The shadow kept one record of the encoder the loop
+built last, and only the controller's tick retired it (`plan.rs:709`, master).
+Four ways to end a pass come before that tick: `frame_step`'s drop
+(`peer.rs:8896`), the drain (`:9395`), the decode-pressure skip (`:9402`) and
+no encoder (`:9409`), all master. A record carried past one of them, or past a
+stale adoption, which never touched it, was judged on a later pass against that
+pass's plan. S2's scenario reached the same class a second way too: a swap
+adopted while the plan held, whose first tick came after a later swap had been
+spawned, had its dims judged against the later plan.
+
+- **Neither is `m3a4:STALE-1`.** That row is an encoder opened at an old size
+  after the keepalives wait out their allowance. In S2 the wait ended in an
+  adoption, and no encoder opened. The allowance only lengthened the time the
+  record waited.
+- **FR-148 is in neither chain.** S1's decrease was the AIMD's own, and the
+  slow-link floor sat below every rate in it. S2 ran direct (no carrier rank),
+  on a rebuild-bound QSV with no `qsv_rate_mode` line, and its "relay
+  resolution cap engaged" lines all carry the reason `user-pick`: the line
+  logs any effective target other than the user's (`peer.rs:8862-8873`,
+  master), here the fit of the viewer's box and the pin while a swap opens.
+  From 0.4.228 to 0.4.229 the pump changed in two lines, FR-148 D46 B2's
+  shadow path model, and from 0.4.229 to 0.4.237 only in the send gate, the
+  send wait and the reason each target move carries. None of it touches the
+  open, `frame_step`, the drop gates, the tick, `after_tick` or a swap's
+  judgment.
+
+### The change
+
+One rule: **a build is judged once, against the plan of its own moment, and the
+next build replaces its record.**
+
+```mermaid
+flowchart TD
+  B["a build: an inline open, or an adopted replacement"] --> S{"a replacement whose plan moved while it opened?"}
+  S -->|yes| STALE["a stale swap (M3a.1), and no record:<br/>M2 builds toward the plan again"]
+  S -->|no| D["the dims it decided, judged now against the plan it was decided under:<br/>a lag if an input moved (M3a.3), else equal or a dims divergence"]
+  D --> REC["the record: its rate, and the rung its rate was decided at"]
+  REC --> P{"does the pass encode a frame?"}
+  P -->|"no: a drop gate ends it"| W["the record waits"]
+  W --> P
+  W -->|"the next build comes first"| GONE["replaced, never judged:<br/>that encoder served no frame"]
+  P -->|yes| T{"the tick: is the build on the plan's rung?"}
+  T -->|yes| OK["on the plan"]
+  T -->|"no: the controller moved since its rate was decided, within the ceiling"| ST["a stale tick (M3a.3)"]
+  T -->|"no, otherwise"| BR["a bitrate divergence"]
+```
+
+| What | Judged where, against which plan | Why there |
+|---|---|---|
+| an inline open's dims | in its own pass, by `Shadow::note_built` (`plan.rs:721`, called at `peer.rs:9147`), against this pass's plan under M3a.3's lag rule | the open builds from this pass's inline inputs; a later pass's plan is not its own |
+| a dims swap's dims | at its adoption, by `Shadow::note_dims_swap_adopted` (`plan.rs:842`, logged by `log_plan_adoption`, `peer.rs:10447`), against the plan of the inputs M2 decided it from: `Shadow::swap_spawn` (`plan.rs:820`) records the plan's geometry for the inline read's inputs (`plan.rs:309`), not the snapshot's | a target that lands between the snapshot and the inline read is a lag of that pass, counted there. Recorded as the snapshot's dims, it read at the adoption as a plan that moved while the swap opened (S2) |
+| every build's rate | at the first tick of a pass that encodes, by `Shadow::after_tick` (`plan.rs:759`, `peer.rs:9659`), against the rung the controller holds then. A move since the rate was decided, within the frame's ceiling, is a stale tick, for an inline open that consulted the controller (`OpenRate`, `plan.rs:1081`) as for a replacement | that tick is the controller's answer when the encoder's first frame encodes: an in-place encoder takes it before that frame, a rebuild-bound one through a rate swap after it. The controller's own move between the open and that frame is not the loop's decision (S1) |
+| the record | `Shadow::built` (`plan.rs:504`) holds only a rate waiting for its first frame. Every build replaces it, a stale adoption too (`plan.rs:899`) | an encoder replaced before it encoded a frame never served one, and nothing it was built from is the plan's any more |
+
+- **What stays a divergence.** The session's first open, which had no
+  controller to consult, re-rated on its first tick. A rate above the frame's
+  ceiling (M3a.2's `hevc_vaapi` finding). A replacement re-rated on a tick that
+  did not move. A geometry difference whose inputs held, wherever it is read.
+  The counts stay session-cumulative.
+- **The bound.** A counted-apart event leaves nothing for a later pass to
+  judge, so it never becomes a divergence, and the encoder meets the plan
+  again within a bound that does not depend on the session's length. A lag
+  lasts the pass whose input moved: the next snapshot holds that input. A
+  stale dims swap's encoder reaches the plan one replacement later: M2 decides
+  that replacement from the plan on the adoption's own pass, and it opens in
+  the backend's open time (0.2 to 3.6 s on QSV), with nothing judged
+  meanwhile. A stale rate swap, and a stale tick, meet the plan at the next
+  tick: in place at that tick, or through one rate swap on a rebuild-bound
+  backend, which is judged on its own. Every `plan_divergences` field
+  therefore stays at zero through all three.
+- **No kill switch**, for M3a.3's reason: the change is in the shadow alone. No
+  decision of the pump moves, and no env read is added. The pump lost 10 lines
+  (`pump_lines_ffmpeg_dc` 3862 to 3852): two call sites take the new results
+  (`peer.rs:9147`, `:7586`) and four comments shrank.
+- **What it costs, or still does.** A consulted inline open whose first frame
+  comes on a later pass, re-rated within the ceiling, is now counted apart (a
+  stale tick, `kind` `open-first-tick`) instead of judged. ⚠️ Seen, not
+  changed (#4513): the decode-pressure skip can drop the frame a new encoder
+  was opened for. Its gate keeps a forced key frame (`encode/governor.rs:2128-2142`),
+  but `force_keyframe_this_iter` (`peer.rs:9183`) is set by a lock
+  edge, a viewer's ask or the backstop, never by an open, so the gate
+  (`peer.rs:9399`) reads that frame as a delta frame, and the encoder's
+  first output comes a pass or more later. On a rebuild-bound backend S1's
+  shape then costs a second open, which the shadow now counts as a stale
+  tick.
+
+### Verification
+
+- **`encode::plan`, two cells, through M3a.4's rig** (`Rig`,
+  `plan.rs:2070`), extended with what the two shapes need: a drop gate
+  that ends a pass after its frame step and before the tick, a congestion
+  decrease on a tick, a target write that lands between the snapshot and the
+  inline read, a backend that re-rates in place or rebuilds, and each encoder's
+  first encoded frame beside the plan of its pass. `Rig::verdict`
+  (`plan.rs:2305`) reads the rule from a run: every encoder's size
+  and rung equal the plan's when its first frame encodes, every field reads
+  zero at every pass (what a heartbeat would read), and every lag falls on a
+  pass whose input moved.
+
+| cell | holds | red: master's shadow | green |
+|---|---|---|---|
+| (e) `a_native_move_through_the_capture_fallback_and_back_reads_zero_at_every_pass` (`plan.rs:2537`) | an in-place backend at a held rate: the primary output grows from 1920x1080 to 3440x1440, capture falls back to the 6000x1440 virtual screen, the open for it lands on a pass the decode-pressure skip drops, the next tick is a congestion decrease, and capture returns to 1920x1080 | **`bitrate: 1` from pass 92 to the end**, 181 of 272 passes, with no stale tick | every field zero at every pass; 3 opens, each first frame on the plan; the decrease after the dropped pass is 1 stale tick; lags on passes 31, 91 and 213 only, the three native moves |
+| (f) `a_viewer_resizing_in_fit_mode_reads_zero_at_every_pass` (`plan.rs:2582`) | a rebuild-bound backend on an idle screen: five fit-mode boxes from 1510x708 to 1758x830 in about 2.2 s (a pass is one 60 ms keepalive), each an M2 swap that opens in three passes, the third box landing between the snapshot and the inline read | **`dims: 1` from pass 33 to the end**, 118 of 150 passes, after 1 stale adoption | every field zero at every pass, and no stale adoption; first frames at 1258x708, 1364x768, 1440x810 and 1474x830, each the plan's (the swap to 1294x728 was replaced before any capture reached it); the one lag on pass 29, the landing |
+
+The red column ran the two cells and the extended rig against master's
+`Shadow`: master's `encode/plan.rs` with the rig and the cells written to its
+API. Only these two failed, and the other 29 `encode::plan` tests passed,
+M3a.4's four cells among them on the extended rig. Green: all 31. The tests
+that drive the shadow directly take the new signatures and assert what they
+did, each dims read where it is now judged.
+
+- ⚠️ **No unit test reaches the pump's call sites**, as in M3a.4: the cells
+  drive the functions it calls, in its order, and the two call sites compile
+  only with `ffmpeg-encoder`.
+
+### For the gate (AC10)
+
+The week restarts on the release that carries M3a.5, read as §"M3a.3" set it:
+bounded at both ends, with the `remote_sessions` denominator, every
+`plan_divergences` field at zero. A non-zero field is read from its first line,
+not from its heartbeats: a count only adds, so one event reads on every
+heartbeat after it. Read the count at the last heartbeat: the second week read
+one event in each of two sessions, not two sessions whose encoder never met the
+plan again. Owed with it, each shape driven on that release after it fails on
+the last release without it:
+
+| Shape | Host, and what to do | Red, the release before | Green, the release with M3a.5 |
+|---|---|---|---|
+| S1 | a Windows host with DXGI-direct capture and an encoder that re-rates in place (NVENC), with two displays to take S1's path; a session over TURN to a viewer the frame-rate cap holds at a skip divisor above 1 (a slow viewer device). Move the native geometry under the session: change the primary display's resolution, or lock the screen so that capture falls back to GDI's virtual screen, then unlock. The shape needs the open's pass dropped and the next tick to cross a rung, so repeat until it shows | `FFmpeg DC pump: encoder (re)built`, `FFmpeg DC pump: viewer-rate fps cap` lines with `skip_divisor` above 1 and `frames_skipped_decode` rising across the open, then at the next `FFmpeg DC pump set_bitrate (AIMD)` move `FR-70 M3a: the shadow plan diverged ...` with `field="bitrate"`, and `bitrate: 1` from there | `bitrate: 0`, and `plan_stale_ticks` up by one, with the `FR-70 M3a.3: the controller re-rated ...` line naming `kind="open-first-tick"` |
+| S2 | a rebuild-bound host (QSV or AMF), DXGI-direct capture, an idle screen, and the viewer in fit mode on a direct path. Drag the viewer's window through several sizes within about 2 s; repeat until the lag line logs | `FR-70 M3a.3: the plan's geometry lagged ...` with `moved="target"`, then `FR-70 M3a: a replacement was adopted after the plan moved ...` with `kind="dims"`, then `field="dims"` with the plan and inline values swapped against the lag line, and `dims: 1` from there | `dims: 0`; the lag line still logs and `plan_lags` rises, and `plan_stale_swaps` does not count that swap |
+
+M3b does not start before the week holds.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
@@ -1581,7 +1743,14 @@ the two driven moves. M3b does not start before the week holds.
       from 2026-11-11 read 5 of 177 FFmpeg DC sessions with a divergence, all on
       0.4.216 to 0.4.218, every one a full rebuild built at a size or a rate the
       plan had left while an M2 dims swap was in flight or just adopted. Fixed in
-      §"M3a.4"; the week restarts on the release that carries it.)*
+      §"M3a.4"; the week restarts on the release that carries it. 2026-11-27:
+      the second week, 0.4.228 to 0.4.238, read 2 of 150 FFmpeg DC sessions
+      with a divergence, one event in each: a count only adds, so each read
+      non-zero on every heartbeat after its event, and both counts still read 1
+      at the last heartbeat read. Both events were the shadow judging a build
+      on a later pass against a plan that was not its own, and the plan was
+      right in both. Fixed in §"M3a.5"; the week restarts on the release that
+      carries it.)*
 
 ## P1 — as built (2026-09-04, PR #1333)
 
