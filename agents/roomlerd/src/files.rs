@@ -6213,6 +6213,11 @@ mod tests {
     /// which `machine_global_dir()` only resolves to on a host that already
     /// carries the pre-rename tree. Verified broken on a real SYSTEM-mode
     /// Windows host, where that parent does not exist at all.
+    ///
+    /// #4489 — save one refusal, which is by design: on a machine-wide install
+    /// an account that may not open the install's folders is refused them
+    /// (#3669, #3682). The test takes that refusal only where it shows this
+    /// is the case.
     #[tokio::test]
     async fn the_staging_sentinel_resolves_on_the_agent_and_never_errors() {
         let listing = list_dir(STAGING_SENTINEL).await;
@@ -6222,10 +6227,51 @@ mod tests {
             // Staging is transient, so the contract is "always lands somewhere
             // real": the staging dir when an update is in flight, otherwise the
             // machine-global root. Never an error, or the button is useless
-            // except during the seconds an update is running.
-            let listing = listing.expect("the sentinel must always resolve on Windows");
+            // except during the seconds an update is running. The one error it
+            // allows is the refusal below (#4489).
             let root = crate::appdirs::machine_global_dir();
             let root_s = root.to_string_lossy().to_lowercase();
+            let listing = match listing {
+                Ok(listing) => listing,
+                // #4489 — a machine-wide install, tested by an account that may
+                // not open its folders: the root is SYSTEM's and the
+                // Administrators' (`machine_tree`), and so can be its parent,
+                // `%PROGRAMDATA%\roomler`. The sentinel lists as the reader
+                // (#3669): here this test's own account, which is not
+                // LocalSystem and so reads as itself. It lists the staging dir
+                // or the root where this account sees them, else their nearest
+                // existing ancestor, which a sealed parent makes the parent
+                // itself. Without an elevated administrator's rights that
+                // listing is refused by design, and told so (#3682). This arm
+                // takes that refusal only: the folder refused is one of those
+                // three and exists, this test's own read of it is refused, and
+                // the error is that folder's explained refusal, by its kind and
+                // in its words. Any other error fails as it always did. CI's
+                // runners carry no install, so they take the absent-root
+                // branch. None of the three holds the pre-rename segment unless
+                // the root does, so the check after the branches holds here too.
+                Err(refused) => {
+                    let (said, staging) = (format!("{refused}"), reads::staging_root());
+                    let sealed = [Some(staging.as_path()), Some(root.as_path()), root.parent()]
+                        .into_iter()
+                        .flatten()
+                        .any(|folder| {
+                            said == format!(
+                                "{}: {} refused to open it for the account roomlerd runs as",
+                                folder.display(),
+                                reads::THIS_OS
+                            ) && folder.is_dir()
+                                && std::fs::read_dir(folder).is_err_and(|e| {
+                                    e.kind() == std::io::ErrorKind::PermissionDenied
+                                })
+                        });
+                    assert!(
+                        sealed && is_permission_denied(&refused),
+                        "the sentinel must always resolve on Windows: {refused:?}"
+                    );
+                    return;
+                }
+            };
             let got = listing.path.to_lowercase();
             let got = got.trim_start_matches(r"\\?\");
             if root.is_dir() {
