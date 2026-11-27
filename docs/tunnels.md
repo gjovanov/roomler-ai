@@ -508,7 +508,7 @@ kept a task past its baseline in those 90 runs.
 **A close while a channel is still being taken up (#4103).** The SCTP transport takes up each
 channel the browser opens on a task of its own (`accept_data_channels`,
 `crates/vendored/webrtc/src/sctp_transport/mod.rs:246`), and the loop's body awaits the agent's
-`on_data_channel` handler (`:335`), which awaits in turn (`agents/roomlerd/src/peer.rs:1269`).
+`on_data_channel` handler (`:339`), which awaits in turn (`agents/roomlerd/src/peer.rs:1269`).
 Upstream's stop woke that task with one `notify_waiters()`, which wakes only the waiters of that
 instant and stores nothing, and the loop made its next wait after the body. So a stop that came
 while the task was in its body was lost: the task waited for good, holding the association, the
@@ -553,7 +553,7 @@ then shuts the channel's stream (`:455`), which sets `read_shutdown` before its 
 was set. That arm also runs the channel's `on_close` handler, as it did whenever the read
 ended the loop. A close that comes before the channel is stored shuts nothing: the accept
 loop lists the channel and calls the agent's handler before `handle_open`
-(`crates/vendored/webrtc/src/sctp_transport/mod.rs:333-343`). The association's close,
+(`crates/vendored/webrtc/src/sctp_transport/mod.rs:337-347`). The association's close,
 which the peer's close always reaches, then sets the flag on every stream, and ends that
 loop the same way.
 
