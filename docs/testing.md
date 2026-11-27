@@ -402,6 +402,9 @@ given `-OnThisMachine`.
 
 A new test that needs a socket binds `127.0.0.1:0` or `[::1]:0` and builds its peers through
 `test_net`. Where production code binds the socket, its address goes through a `test_net` switch.
+Where production code binds an address the test hands it, the test hands it loopback: the SSH
+interception probes the overlay address its TUN factory is given with a bind and a listen
+(`warn_if_os_listener`), so `ssh_mint`'s `intercepts_ssh` gives it `127.0.0.1`.
 On Linux, `strace -f -e trace=bind,listen` on a test binary lists every bind with its address; run
 directly, outside cargo, the binary needs `CARGO_MANIFEST_DIR`.
 
