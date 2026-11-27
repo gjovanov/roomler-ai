@@ -27,9 +27,9 @@ twice (2026-08-07 and 2026-08-09); the verb existed both times.
 
 **What reaches that log.** The daemon keeps lines by `RUST_LOG` when its environment
 sets one, and otherwise by its default: `roomlerd` and `tunnel_core` at INFO,
-everything else at WARN (`crates/agent-core/src/logging.rs:411`). Either way it then
+everything else at WARN (`crates/agent-core/src/logging.rs:468`). Either way it then
 keeps INFO from two targets that no shipped unit names
-(`crates/agent-core/src/logging.rs:506`, #1928):
+(`crates/agent-core/src/logging.rs:563`, #1928):
 
 | Target | Its INFO lines |
 |---|---|
@@ -42,9 +42,9 @@ directive for the target, for a module under it or for any prefix of its name
 `RUST_LOG=debug` still logs both at DEBUG, and `roomler_localapi=off` keeps the crate
 silent. An empty or wholly invalid `RUST_LOG` is left alone too: `EnvFilter` then
 logs ERROR from every target. Three directives are added whatever the spec says:
-`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:449`),
-`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:460`) and
-`tunnel_core::overlay::route_guard=info` (`crates/agent-core/src/logging.rs:472`), the
+`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:506`),
+`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:517`) and
+`tunnel_core::overlay::route_guard=info` (`crates/agent-core/src/logging.rs:529`), the
 target of the overlay route guard's two INFO lines (#4380,
 [overlay-communication.md §8](overlay-communication.md#8-failure-handling)).
 
@@ -546,7 +546,7 @@ run the command as root:
 | The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:981`](../crates/modules/fleet/src/agent_exec.rs#L981) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:371`](../crates/modules/fleet/src/agent_exec.rs#L371) |
 | The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3235`](../crates/modules/fleet/src/hub.rs#L3235) |
-| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5843`](../agents/roomlerd/src/signaling.rs#L5843) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5849`](../agents/roomlerd/src/signaling.rs#L5849) |
 
 The word is kept per connection, never read from the stored row, for the reason
 `ssh-grant-ack` is: after a rollback the row still promises what the running

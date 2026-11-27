@@ -70,7 +70,7 @@ sequenceDiagram
   - never before the first connect, so a device that cannot reach its server asks it nothing;
   - a random 0–60 s delay spreads a fleet that reconnected at once;
   - after a failure that may pass, it waits a full hour, and reconnects meanwhile do not trigger another try.
-- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:705`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
+- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:723`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
   - A file holding a *different* token was re-enrolled meanwhile, and that token wins.
   - A file naming another device for the enrollment is refused, with nothing written.
   - A save that fails still puts the renewed token in use: the file's token stays valid, so nothing is lost.
@@ -78,7 +78,7 @@ sequenceDiagram
 
 ### On a 401: recover before backing off
 
-When the server refuses the token at the socket (`agents/roomlerd/src/signaling.rs:1337`), the loop tries two things before its back-off ladder:
+When the server refuses the token at the socket (`agents/roomlerd/src/signaling.rs:1343`), the loop tries two things before its back-off ladder:
 
 1. **A newer token in the config file**, matched by server, tenant *and* device id. `roomlerd re-enroll` (or the companion's Re-enroll) wrote it while the daemon ran. Before FR-103 the daemon ignored it until a restart.
 2. **A renewal**, which the server grants up to **90 days past `exp`** (`RENEWAL_GRACE_SECS`, `crates/services/src/auth/mod.rs:116`). On the renew routes only; every other route enforces `exp` as before.
@@ -91,7 +91,7 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328), and comes back as that holder's: its new token acts for them.
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1353`; tunnel clients `crates/services/src/dao/tunnel_client.rs:369`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1389`; tunnel clients `crates/services/src/dao/tunnel_client.rs:483`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
@@ -100,7 +100,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1444` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
 | the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2170` |
-| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:412` |
+| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:575` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
 - **The service credential** has no generation: a removal clears `exec_anchor` (#2133), which ends it.
@@ -146,7 +146,7 @@ The server logs each revive: `enroll: a removed device enrolled again and starts
 
 ### A connected device is told at once (#2267)
 
-A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1304`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1451`).
+A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1304`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1457`).
 
 Before #2267 the kick only took the device out of the hub. The device kept its socket and heard nothing. It learned of its removal at its next connection, after a network change or a pod roll, and on a stable network that could take days. Nothing could be done through that socket, because every action re-checks the row, but the device's own status read "connected" throughout.
 

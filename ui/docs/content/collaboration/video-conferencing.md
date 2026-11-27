@@ -1,6 +1,6 @@
 ---
 title: Video conferencing
-description: HD video calls with screen sharing and recording, built on a selective forwarding unit — and the one networking requirement that catches self-hosters.
+description: HD video calls with screen sharing, built on a selective forwarding unit — and the one networking requirement that catches self-hosters.
 tags: [collaboration, video, calls, webrtc, self-hosting]
 hero: calls.svg
 heroAlt: A video call with several participants and a shared screen

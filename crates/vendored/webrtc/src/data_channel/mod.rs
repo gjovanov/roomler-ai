@@ -97,8 +97,8 @@ pub struct RTCDataChannel {
 impl RTCDataChannel {
     // create the DataChannel object before the networking is set up.
     pub(crate) fn new(params: DataChannelParameters, setting_engine: Arc<SettingEngine>) -> Self {
-        // the id value if non-negotiated doesn't matter, since it will be overwritten
-        // on opening
+        // the id value if non-negotiated is a placeholder, overwritten on opening, or
+        // (roomler patch, FR-148 P4b) by the accept path with the channel's stream
         let id = params.negotiated.unwrap_or(0);
         RTCDataChannel {
             stats_id: format!(

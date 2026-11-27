@@ -20,11 +20,11 @@ use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_mod_fleet::agent::org_accepts_enrollment;
 use roomler_ai_remote_control::models::{
-    AgentStatus, DestinationRule, NodeRef, OsKind, PolicySubject, PolicyTarget,
+    AgentStatus, DestinationRule, NodeRef, OsKind, PolicySubject, PolicyTarget, TunnelClient,
 };
 use roomler_ai_services::auth::SpendPurpose;
 use roomler_ai_services::dao::base::{DaoError, PaginationParams};
-use roomler_ai_services::dao::tunnel_client::ReviveScope;
+use roomler_ai_services::dao::tunnel_client::{Claim, ReviveScope};
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,9 @@ use roomler_core::guards::require_permission;
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
 use crate::NetworkState;
+use crate::tunnel_enrollment::{
+    self, Action, By, Cap, Found, IfTaken, InstanceRead, KeyedBy, Need, Refusal, Scope, Step,
+};
 
 /// 10 minutes — same TTL as the agent enrollment token (see plan
 /// §"Security model"; matches `ENROLLMENT_TTL_SECS` in
@@ -83,10 +86,17 @@ pub async fn issue_tunnel_enrollment_token(
 #[derive(Debug, Deserialize)]
 pub struct TunnelEnrollRequest {
     pub enrollment_token: String,
+    /// The id every server keys a client by: a hash of the client's name and
+    /// its host (`derive_machine_id`). An FR-159 client goes on sending it,
+    /// beside its `instance_id`, so the row it enrolled before is found (D2).
     pub machine_id: String,
     pub machine_name: String,
     pub os: OsKind,
     pub client_version: String,
+    /// FR-159 — the id the install keeps on its machine: 32 lowercase hex.
+    /// Absent, or `null`, from an older client.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +104,10 @@ pub struct TunnelEnrollResponse {
     pub tunnel_client_id: String,
     pub tenant_id: String,
     pub tunnel_client_token: String,
+    /// FR-159 — which id the row is found by again, told only to a request
+    /// that carried an `instance_id` ([`tunnel_enrollment::keyed_by`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyed_by: Option<KeyedBy>,
 }
 
 /// What a re-enrollment of a LIVE tunnel client answers (409) when the
@@ -102,6 +116,16 @@ pub const SOMEONE_ELSES_TUNNEL_CLIENT: &str = "This machine is already enrolled 
      else's tunnel client in this organization. Only its owner, or someone with the Manage \
      devices permission, can enroll it again. Enroll this machine under a different name, or \
      ask an organization administrator.";
+
+/// What a re-enrollment answers (409) when the row the request's own
+/// `instance_id` holds is someone else's live tunnel client (FR-159). The id
+/// is the install's, not its name's, so another name changes nothing: the
+/// sentence says what does.
+pub const SOMEONE_ELSES_TUNNEL_INSTANCE: &str = "This tunnel client is already enrolled as \
+     someone else's in this organization: the id its configuration keeps on this machine names \
+     their client. Only its owner, or someone with the Manage devices permission, can enroll it \
+     again. Enroll from another configuration, or ask the client's owner or an organization \
+     administrator.";
 
 /// What a re-enrollment of a REMOVED tunnel client answers (409) when the
 /// enrollment token was minted for someone without `MANAGE_AGENTS`, its
@@ -119,23 +143,33 @@ pub const ENROLLER_LEFT_THE_ORG: &str = "This enrollment token was issued to som
 
 /// POST /api/tunnel-client/enroll — public (no user JWT);
 /// authenticates via the tunnel-enrollment token and returns a
-/// long-lived TunnelClient JWT. Rehydrates an existing
-/// `(tenant_id, machine_id)` row if one is found (covers soft-deleted
-/// tombstones too — see [`TunnelClientDao::find_by_tenant_and_machine`]).
+/// long-lived TunnelClient JWT. Rehydrates an existing row if one is found
+/// (covers soft-deleted tombstones too — see
+/// [`TunnelClientDao::find_by_tenant_and_machine`]): for an older client, the
+/// row with its `(tenant_id, machine_id)`; for an FR-159 client, the row its
+/// `instance_id` holds, else an unclaimed row with its `machine_id`, which it
+/// claims ([`tunnel_enrollment`]).
 ///
 /// The request carries no user session, so the enrollment acts for the
 /// person the token was minted for (its `sub`): a new row is theirs
 /// (`owner_user_id`), and so is the minted token's owner.
 ///
 /// #3328 — the order is the contract:
+/// 0. FR-159 — an `instance_id` that is not 32 lowercase hex is a 400 while
+///    `rc.tunnel_instance_id` is on: the request's shape, read before the
+///    token, as the body's own parse is;
 /// 1. the token is verified, and comes back unspent;
 /// 2. the archived-org gate (#3042);
 /// 3. the person the token was minted for is still a member of its org
 ///    (403 [`ENROLLER_LEFT_THE_ORG`] otherwise): a tunnel client acts for
 ///    them, and ends with their membership (`crate::membership`);
-/// 4. a known machine id re-enrolls only for its owner, while the client
-///    is live, or for a holder of `MANAGE_AGENTS` ([`revive_scope`], 409
-///    otherwise); a new one meets the plan's tunnel-client cap (403);
+/// 4. the rows, by each id, and what to do with them
+///    ([`tunnel_enrollment::decide`]): a row found again re-enrolls only for
+///    its owner, while the client is live, or for a holder of
+///    `MANAGE_AGENTS` ([`revive_scope`], 409 otherwise); a new row meets the
+///    plan's tunnel-client cap (403). For an FR-159 client that met someone
+///    else's live row by its `machine_id` alone, the new row is its own (D4),
+///    and a claim reads the cap too, for the row a lost race makes;
 /// 5. the token is spent on the used-token ledger: 401 if it was spent
 ///    before, a retryable 503 if the ledger cannot answer;
 /// 6. the row is written; the membership is asked again (a removal that
@@ -145,10 +179,22 @@ pub const ENROLLER_LEFT_THE_ORG: &str = "This enrollment token was issued to som
 ///    client's token is minted from the spent token.
 ///
 /// Every refusal before step 5 leaves the token unspent and writes nothing.
+/// After it, only a race refuses: a row that left the scope decided in step
+/// 4 (409), or a claim lost to another install while the plan was at its cap
+/// (403).
 pub async fn enroll_tunnel_client(
     State(state): State<NetworkState>,
     Json(body): Json<TunnelEnrollRequest>,
 ) -> Result<Json<TunnelEnrollResponse>, ApiError> {
+    // FR-159 — the request's own id first: a malformed one is refused 400
+    // before anything is read or spent. With the switch off, a request that
+    // carries one is read as an older client's.
+    let read = tunnel_enrollment::read_instance_id(
+        body.instance_id.as_deref(),
+        state.fleet.settings.rc.tunnel_instance_id,
+    )
+    .map_err(|why| ApiError::BadRequest(why.to_string()))?;
+
     let token = state
         .auth
         .verify_tunnel_enrollment_token(&body.enrollment_token)?;
@@ -174,71 +220,119 @@ pub async fn enroll_tunnel_client(
         return Err(ApiError::Forbidden(ENROLLER_LEFT_THE_ORG.to_string()));
     }
 
-    let existing = state
-        .tunnel_clients
-        .find_by_tenant_and_machine(tid, &body.machine_id)
-        .await?;
-    let revival = match existing {
-        Some(row) => {
-            let scope = revive_scope(&state, tid, enroller, &row).await?;
-            Some((row, scope))
+    // The rows, by each id, live or removed: the install's own first, and the
+    // legacy hash only when no row holds it. An older client has only the
+    // hash.
+    let by_instance = match read {
+        InstanceRead::Used(instance_id) => {
+            state
+                .tunnel_clients
+                .find_by_tenant_and_instance(tid, instance_id)
+                .await?
         }
+        InstanceRead::Absent | InstanceRead::Ignored => None,
+    };
+    let by_machine = match by_instance {
+        Some(_) => None,
         None => {
-            // S5 — plan tunnel-client cap. Mirrors the device cap in
-            // `enroll_agent`: only NEW rows consume a slot.
-            let tenant = state.tenants.base.find_by_id(tid).await?;
-            let used = state.tunnel_clients.count_active_for_tenant(tid).await?;
-            // FR-32: decision + record in `quota::check`. `MaxTunnelClients` is
-            // an established limit, so it refuses whatever the mode says.
-            // FR-102 P4 — through core, which also counts the collision per org.
-            if let Err(d) =
-                roomler_core::quota::check(&state, &tenant, quota::Limit::MaxTunnelClients, used)
-            {
-                return Err(ApiError::Forbidden(format!(
-                    "Tunnel-client limit reached for the {:?} plan ({} of {} used). \
-                     Upgrade the plan or remove a tunnel client first.",
-                    d.plan, d.used, d.max
-                )));
+            state
+                .tunnel_clients
+                .find_by_tenant_and_machine(tid, &body.machine_id)
+                .await?
+        }
+    };
+    let found = Found {
+        by_instance: by_instance.as_ref().map(found_row).transpose()?,
+        by_machine: by_machine.as_ref().map(found_row).transpose()?,
+    };
+
+    // What to do is one pure function of what was read. It asks for the
+    // scope's answer, and then for the cap's, only when it needs one: an
+    // owner's revival reads neither, and a cap read for a row nobody makes
+    // would count a collision that never happened.
+    let scope = match tunnel_enrollment::decide(read, &found, None, None) {
+        Step::Need(Need::Scope(by)) => {
+            let row = match by {
+                By::Instance => by_instance.as_ref(),
+                By::Machine => by_machine.as_ref(),
             }
-            None
+            .ok_or_else(|| {
+                ApiError::Internal("the enrollment asked the scope of no row".to_string())
+            })?;
+            Some(revive_scope(&state, tid, enroller, row).await?)
+        }
+        _ => None,
+    };
+    let cap = match tunnel_enrollment::decide(read, &found, scope, None) {
+        Step::Need(Need::Cap) => Some(plan_cap(&state, tid).await?),
+        _ => None,
+    };
+    let action = match tunnel_enrollment::decide(read, &found, scope, cap.as_ref()) {
+        Step::Decided(Ok(action)) => action,
+        Step::Decided(Err(refusal)) => {
+            tracing::info!(
+                tenant_id = %tid, %enroller, ?refusal,
+                "tunnel-client: enrollment refused before the spend"
+            );
+            return Err(refused(refusal));
+        }
+        Step::Need(need) => {
+            return Err(ApiError::Internal(format!(
+                "the enrollment's decision still needs {need:?}"
+            )));
         }
     };
 
     // #3328 — the token's one use, after every refusal above and before every
-    // write below. On BOTH branches: a replay against a known machine id would
+    // write below. On EVERY branch: a replay against a known machine id would
     // still mint a fresh year-long token for that client.
     let spent = state
         .used_tokens
         .spend(token, SpendPurpose::TunnelEnroll)
         .await?;
 
-    let client = match revival {
-        Some((row, scope)) => {
-            let id = row
-                .id
-                .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
-            // `None`: the row left the scope decided above in the meantime (an
-            // admin removed it, say). The token is spent by now, but bringing
-            // the client back would undo a removal this enrollment may not
-            // undo, so it is refused like any other.
-            state
-                .tunnel_clients
-                .rehydrate(id, &body.machine_name, body.os, &body.client_version, scope)
-                .await?
-                .ok_or_else(|| ApiError::Conflict(REMOVED_TUNNEL_CLIENT.to_string()))?
-        }
-        None => {
-            state
-                .tunnel_clients
-                .create(
-                    tid,
-                    enroller,
-                    body.machine_name,
-                    body.machine_id,
-                    body.os,
-                    body.client_version,
-                )
-                .await?
+    // `None` from a revival: the row left the scope decided above in the
+    // meantime (an admin removed it, say). The token is spent by now, but
+    // bringing the client back would undo a removal this enrollment may not
+    // undo, so it is refused like any other.
+    let client = match action {
+        Action::Revive { id, scope } => state
+            .tunnel_clients
+            .rehydrate(id, &body.machine_name, body.os, &body.client_version, scope)
+            .await?
+            .ok_or_else(|| ApiError::Conflict(REMOVED_TUNNEL_CLIENT.to_string()))?,
+        Action::Claim {
+            id,
+            instance_id,
+            scope,
+            if_taken,
+        } => match state
+            .tunnel_clients
+            .claim(
+                id,
+                instance_id,
+                &body.machine_name,
+                body.os,
+                &body.client_version,
+                scope,
+            )
+            .await?
+        {
+            Claim::Claimed(row) | Claim::Revived(row) => row,
+            // Another install claimed it first: this one gets a row of its
+            // own, under the cap read before the spend.
+            Claim::TakenByAnother => match if_taken {
+                IfTaken::Create => {
+                    create_row(&state, tid, enroller, &body, Some(instance_id)).await?
+                }
+                IfTaken::Refuse(refusal) => return Err(refused(refusal)),
+            },
+            Claim::OutOfScope => {
+                return Err(ApiError::Conflict(REMOVED_TUNNEL_CLIENT.to_string()));
+            }
+        },
+        Action::Create { instance_id } => {
+            create_row(&state, tid, enroller, &body, instance_id).await?
         }
     };
 
@@ -291,17 +385,20 @@ pub async fn enroll_tunnel_client(
         tunnel_client_id: client_id.to_hex(),
         tenant_id: tid.to_hex(),
         tunnel_client_token,
+        keyed_by: tunnel_enrollment::keyed_by(read),
     }))
 }
 
 /// #3328 — may the person an enrollment token was minted for re-enroll a
-/// machine id that already has a tunnel client in the org? Its owner may,
-/// while the client is live. A holder of `MANAGE_AGENTS` may, live or
-/// removed: a removed client comes back only through one, its owner
+/// tunnel client the org already has, found by either of the request's ids?
+/// Its owner may, while the client is live. A holder of `MANAGE_AGENTS` may,
+/// live or removed: a removed client comes back only through one, its owner
 /// included, and comes back as theirs (the reviver owns it, as its new token
-/// acts for them; a live client keeps its owner). Anyone else is refused 409,
-/// here, before the token is spent, so nothing is written and the token can
-/// still enroll a machine of its own.
+/// acts for them; a live client keeps its owner). Anyone else is out of
+/// scope: [`tunnel_enrollment::decide`] refuses them 409 before the token is
+/// spent, so nothing is written and the token can still enroll a machine of
+/// its own. The one exception is FR-159's D4: an install that met someone
+/// else's LIVE row by the legacy `machine_id` alone gets a row of its own.
 ///
 /// The answer is also the scope the write holds (`ReviveScope`), so a
 /// removal that lands between this read and that write is not undone.
@@ -314,11 +411,11 @@ async fn revive_scope(
     state: &NetworkState,
     tid: ObjectId,
     enroller: ObjectId,
-    row: &roomler_ai_remote_control::models::TunnelClient,
-) -> Result<ReviveScope, ApiError> {
+    row: &TunnelClient,
+) -> Result<Scope, ApiError> {
     let removed = row.deleted_at.is_some();
     if !removed && row.owner_user_id == enroller {
-        return Ok(ReviveScope::LiveOwnedBy(enroller));
+        return Ok(Scope::In(ReviveScope::LiveOwnedBy(enroller)));
     }
     let manages_devices = match state.tenants.get_member_permissions(tid, enroller).await {
         Ok(held) => permissions::has(held, permissions::MANAGE_AGENTS),
@@ -326,20 +423,86 @@ async fn revive_scope(
         Err(e) => return Err(e.into()),
     };
     if manages_devices {
-        return Ok(ReviveScope::LiveOrRemoved(enroller));
+        return Ok(Scope::In(ReviveScope::LiveOrRemoved(enroller)));
     }
     tracing::info!(
         tenant_id = %tid, tunnel_client_id = ?row.id, %enroller, removed,
-        "tunnel-client: re-enrollment refused: not the owner of a live client, and no MANAGE_AGENTS"
+        "tunnel-client: out of the enroller's scope: not the owner of a live client, and no MANAGE_AGENTS"
     );
-    Err(ApiError::Conflict(
-        if removed {
-            REMOVED_TUNNEL_CLIENT
-        } else {
-            SOMEONE_ELSES_TUNNEL_CLIENT
+    Ok(if removed {
+        Scope::Removed
+    } else {
+        Scope::SomeoneElses
+    })
+}
+
+/// S5 — the plan's tunnel-client cap, for a new row. Mirrors the device cap
+/// in `enroll_agent`: only NEW rows consume a slot, so it is read only when
+/// the decision can make one.
+async fn plan_cap(state: &NetworkState, tid: ObjectId) -> Result<Cap, ApiError> {
+    let tenant = state.tenants.base.find_by_id(tid).await?;
+    let used = state.tunnel_clients.count_active_for_tenant(tid).await?;
+    // FR-32: decision + record in `quota::check`. `MaxTunnelClients` is an
+    // established limit, so it refuses whatever the mode says. FR-102 P4 —
+    // through core, which also counts the collision per org.
+    Ok(
+        match roomler_core::quota::check(state, &tenant, quota::Limit::MaxTunnelClients, used) {
+            Ok(()) => Cap::Room,
+            Err(d) => Cap::Full(format!(
+                "Tunnel-client limit reached for the {:?} plan ({} of {} used). \
+                 Upgrade the plan or remove a tunnel client first.",
+                d.plan, d.used, d.max
+            )),
+        },
+    )
+}
+
+/// What the decision reads of a row the route found.
+fn found_row(row: &TunnelClient) -> Result<tunnel_enrollment::Row<'_>, ApiError> {
+    Ok(tunnel_enrollment::Row {
+        id: row
+            .id
+            .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?,
+        instance_id: row.instance_id.as_deref(),
+    })
+}
+
+/// A refusal's answer, with its sentence.
+fn refused(refusal: Refusal) -> ApiError {
+    match refusal {
+        Refusal::SomeoneElses => ApiError::Conflict(SOMEONE_ELSES_TUNNEL_CLIENT.to_string()),
+        Refusal::SomeoneElsesInstance => {
+            ApiError::Conflict(SOMEONE_ELSES_TUNNEL_INSTANCE.to_string())
         }
-        .to_string(),
-    ))
+        Refusal::Removed => ApiError::Conflict(REMOVED_TUNNEL_CLIENT.to_string()),
+        Refusal::Cap(why) => ApiError::Forbidden(why),
+    }
+}
+
+/// A row of its own, the enroller's. An FR-159 client's row takes its
+/// `instance_id` as its `machine_id` too: unique under the `machine_id`
+/// index, and a value no older client sends. An older client's row keeps
+/// the hash it sent.
+async fn create_row(
+    state: &NetworkState,
+    tid: ObjectId,
+    enroller: ObjectId,
+    body: &TunnelEnrollRequest,
+    instance_id: Option<&str>,
+) -> Result<TunnelClient, ApiError> {
+    let machine_id = instance_id.map_or_else(|| body.machine_id.clone(), str::to_string);
+    Ok(state
+        .tunnel_clients
+        .create(
+            tid,
+            enroller,
+            body.machine_name.clone(),
+            machine_id,
+            instance_id.map(str::to_string),
+            body.os,
+            body.client_version.clone(),
+        )
+        .await?)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -600,8 +763,11 @@ pub struct UpdateTunnelClientRequest {
 }
 
 /// PUT /api/tenant/{tenant_id}/tunnel-client/{client_id} — rename / relabel a
-/// tunnel client SERVER-side. This is the only in-place rename there is: a
-/// client-side rename derives a fresh machine_id and enrolls a brand-new row.
+/// tunnel client SERVER-side. For an older client this is the only in-place
+/// rename there is: its client-side rename derives a fresh machine_id and
+/// enrolls a brand-new row. An FR-159 client keeps its `instance_id` across a
+/// rename, so its re-enrollment renames its row in place, unless an admin set
+/// the name (`name_admin_set`).
 /// Mirrors `remote_control::update_agent` incl. the overlay/MagicDNS
 /// propagation and the additive response envelope. `MANAGE_AGENTS`, decided
 /// before the client id is parsed or the body read (#4218): a caller without

@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:11422`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:11425`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -300,7 +300,7 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
 `AgentCaps` behind a `OnceLock`, the process's `ProbeState::first`
 (`agents/roomlerd/src/encode/caps.rs:49`, filled at `:165`); both the hello
-and the FR-43 heartbeat re-announce (`agents/roomlerd/src/signaling.rs:1968`, `:2715`, through one builder, `:7177`)
+and the FR-43 heartbeat re-announce (`agents/roomlerd/src/signaling.rs:1974`, `:2721`, through one builder, `:7196`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
@@ -324,13 +324,13 @@ restart changes it. That is why P6 added a fourth value:
   `compute_caps` advertised `list` on a device whose owner had set
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
-  `caps_cache.rs:332`). `apps` is now assigned in `detect()`, in the daemon,
+  `caps_cache.rs:358`). `apps` is now assigned in `detect()`, in the daemon,
   and the child's struct carries none (`apps_caps`, `caps.rs:4497`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
   entry rode the same default the same way — and is assigned by the same
-  seam (`with_config_lists`, `caps.rs:3095`; `files_caps` `:4824`), which a
+  seam (`with_config_lists`, `caps.rs:3095`; `files_caps` `:4828`), which a
   test locks assignment by assignment: `detect()` itself cannot run in a
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
@@ -398,7 +398,7 @@ Streaming **one application window** instead of the monitor reuses FR-45's
 whole portal pipeline with a single change: `SelectSources(types = WINDOW)`
 (`SOURCE_WINDOW`, `agents/roomlerd/src/capture/portal/screencast.rs:95`) behind
 `ROOMLERD_WINDOW_CAPTURE` (`agents/roomlerd/src/capture/portal/backend.rs:106`,
-config key `window_capture`, `crates/agent-core/src/config.rs:1014`). It is
+config key `window_capture`, `crates/agent-core/src/config.rs:1019`). It is
 **attended by construction**: the portal answers by showing the person at the
 screen a window picker, and nothing agent-side can name a window — GNOME
 refuses the only API that could supply an id, so mutter's `RecordWindow` route
@@ -510,7 +510,7 @@ label    = "Safari"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1211`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:7151`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:7105`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
@@ -525,7 +525,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3750`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3778`),
 not `load`, because `load` self-heals. When the live file is missing or unreadable and
 its `.prev` copy loads, `load` promotes that copy back over it, without the copy's run
 marks (#4157), and logs *RESTORED* or *RECOVERED from the previous good copy* at ERROR.
