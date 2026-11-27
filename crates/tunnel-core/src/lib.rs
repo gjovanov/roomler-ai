@@ -65,6 +65,10 @@ pub mod frozen;
 /// compiling this crate's data plane — webrtc, quinn, turn and rustls are
 /// non-optional here, 285 crates in the default graph.
 pub use roomler_localapi as localapi;
+/// FR-156 P1 — proven liveness: when an SSH connection's client or a tunnel
+/// flow was last heard, on a clock that counts the host's sleep, and the
+/// lists the update gate counts from.
+pub mod liveness;
 pub mod mux;
 /// Overlay L3 data plane (userspace WireGuard mesh) — feature `overlay`.
 #[cfg(feature = "overlay")]

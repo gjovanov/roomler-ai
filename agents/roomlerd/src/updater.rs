@@ -8876,6 +8876,32 @@ mod tests {
         }
     }
 
+    /// FR-156 U1 — #4407's lab case with proven liveness: the move ended the
+    /// session, its client is silent, and the connection is still open on the
+    /// device's side. Once its client was last heard more than 90 s ago it is
+    /// no live work, so the outage recheck beside the move does not hold: it
+    /// takes the transition's own 2-minute recheck, as with no session.
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_recheck_beside_a_move_with_a_silent_connection_never_holds() {
+        use tunnel_core::liveness::{Clock, LiveList};
+        let open = LiveList::new();
+        let _ended_by_the_move = open.join(Clock::tokio());
+        tokio::time::advance(Duration::from_secs(91)).await;
+        let busy = crate::busy::Busy {
+            ssh_connections: crate::busy::ssh_counted(&open, true),
+            net_transition: true,
+            ..crate::busy::Busy::IDLE
+        };
+        assert_eq!(
+            cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, 0, false, false),
+            CycleArm::Gated {
+                decision: DeferDecision::DeferOnce,
+                recheck: NET_DEFER_RECHECK,
+            },
+            "{busy}"
+        );
+    }
+
     // ---- #1755 — a check that failed on the transport retries early ----
 
     /// The schedule climbs 5 → 15 → 60 min and then falls back to the

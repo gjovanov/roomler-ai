@@ -31,7 +31,12 @@ use crate::power::{ActivityCounter, ActivityGuard};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Busy {
     pub rc_sessions: usize,
+    /// FR-156 P1 — the SSH connections whose client was heard within the
+    /// liveness window ([`ssh_counted`]).
     pub ssh_connections: usize,
+    /// FR-156 P1 — the tunnel flows that moved bytes, either way, within the
+    /// liveness window ([`flows_counted`]).
+    pub tunnel_flows: usize,
     /// Fleet RPC commands running in this process (`exec_run`). A command
     /// of an SSH session is its connection's, counted there once.
     pub exec_runs: usize,
@@ -52,6 +57,7 @@ impl Busy {
     pub const IDLE: Busy = Busy {
         rc_sessions: 0,
         ssh_connections: 0,
+        tunnel_flows: 0,
         exec_runs: 0,
         work: 0,
         net_transition: false,
@@ -112,11 +118,34 @@ pub fn now(rc_sessions: &crate::rc_sessions::RcSessionRegistry) -> Busy {
     Busy {
         rc_sessions: rc_sessions.list().len(),
         ssh_connections: ssh_connections(),
+        tunnel_flows: flows_counted(
+            tunnel_core::forward::flows(),
+            tunnel_core::liveness::proof(),
+        ),
         exec_runs: exec_runs(),
         work: crate::updater::active_work(),
         net_transition: crate::updater::net_transition_recent(),
         install_in_flight: crate::updater::update_in_flight(),
     }
+}
+
+/// FR-156 P1 — the SSH connections of `open` a restart would cut: those whose
+/// client was heard within the liveness window
+/// ([`tunnel_core::liveness::WINDOW`]); with `proof` off
+/// (`ROOMLERD_LIVE_WORK_PROOF=0`), every open one, as before.
+pub fn ssh_counted(open: &tunnel_core::liveness::LiveList, proof: bool) -> usize {
+    // FR-156 P1 seam: every open connection, as before.
+    let _ = proof;
+    open.len()
+}
+
+/// FR-156 P1 — the tunnel flows of `listed` a restart would cut: those that
+/// moved bytes, either way, within the liveness window; with `proof` off,
+/// none, as before.
+pub fn flows_counted(listed: &tunnel_core::liveness::LiveList, proof: bool) -> usize {
+    // FR-156 P1 seam: no flow counts, as before.
+    let _ = (listed, proof);
+    0
 }
 
 /// #4244 — what the update gate reads now: [`now`], with the Fleet RPC runs
@@ -196,6 +225,7 @@ mod tests {
         let b = Busy {
             rc_sessions: 1,
             ssh_connections: 2,
+            tunnel_flows: 0,
             exec_runs: 3,
             work: 1,
             net_transition: true,
@@ -222,6 +252,49 @@ mod tests {
         };
         assert!(run.cuttable() && !run.unforceable());
         assert_eq!(run.to_string(), "1 exec run(s)");
+    }
+
+    /// FR-156 B1 — a tunnel flow that moved bytes in the window is work a
+    /// restart cuts: `cuttable_count` includes it, `Display` names it, and a
+    /// flow quiet for longer than the window is not counted. With the switch
+    /// off, none count.
+    #[tokio::test(start_paused = true)]
+    async fn tunnel_flows_are_cut_work() {
+        use tunnel_core::liveness::{Clock, LiveList};
+        let flows = Busy {
+            tunnel_flows: 2,
+            ..Busy::IDLE
+        };
+        assert_eq!(flows.cuttable_count(), 2, "{flows}");
+        assert!(flows.cuttable() && !flows.unforceable());
+        assert_eq!(flows.to_string(), "2 tunnel flow(s)");
+
+        let listed = LiveList::new();
+        let moving = listed.join(Clock::tokio());
+        let _quiet = listed.join(Clock::tokio());
+        tokio::time::advance(std::time::Duration::from_secs(91)).await;
+        moving.stamp().touch();
+        assert_eq!(flows_counted(&listed, true), 1, "the flow that moved bytes");
+        assert_eq!(flows_counted(&listed, false), 0, "the switch is off");
+    }
+
+    /// FR-156 — `ROOMLERD_LIVE_WORK_PROOF=0` gives back what was counted
+    /// before: every open SSH connection, heard or not, and no tunnel flow.
+    #[tokio::test(start_paused = true)]
+    async fn with_the_switch_off_every_open_connection_counts_and_no_flow() {
+        use tunnel_core::liveness::{Clock, LiveList, SWITCH};
+        assert_eq!(
+            format!("{}{SWITCH}", tunnel_core::env::PREFIXES[0]),
+            "ROOMLERD_LIVE_WORK_PROOF"
+        );
+        assert!(!tunnel_core::env::flag_value(Some("0"), true));
+        assert!(tunnel_core::env::flag_value(None, true), "on by default");
+        let open = LiveList::new();
+        let _heard = open.join(Clock::tokio());
+        let _silent = open.join(Clock::tokio());
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        assert_eq!(ssh_counted(&open, false), 2);
+        assert_eq!(flows_counted(&open, false), 0);
     }
 
     fn command(session_owned: bool) -> crate::exec::ExecRequest {

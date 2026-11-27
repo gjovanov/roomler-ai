@@ -100,6 +100,8 @@ impl Reading {
             Reading::Answered(i) => Busy {
                 rc_sessions: i.rc_sessions as usize,
                 ssh_connections: i.ssh_connections as usize,
+                // FR-156 P1 seam: no flow counts, as before.
+                tunnel_flows: 0,
                 exec_runs: i.exec_runs as usize,
                 work: i.work as usize,
                 net_transition: i.net_transition,
@@ -294,6 +296,7 @@ pub fn what_it_cuts(root: &Reading, person: &Reading) -> String {
     let busy = Busy {
         rc_sessions: r.rc_sessions + p.rc_sessions,
         ssh_connections: r.ssh_connections + p.ssh_connections,
+        tunnel_flows: r.tunnel_flows + p.tunnel_flows,
         exec_runs: r.exec_runs + p.exec_runs,
         work: r.work + p.work,
         // R5b reads the root half alone: it owns the overlay and the netstate.
@@ -558,8 +561,17 @@ mod tests {
             ssh_connections: ssh,
             exec_runs: exec,
             work,
+            tunnel_flows: 0,
             net_transition: net,
             ask_age_secs: ask,
+        })
+    }
+    /// A half that answered `flows` tunnel flows, and an ask `ask` old.
+    fn flowing(flows: u32, ask: Option<u64>) -> Reading {
+        Reading::Answered(LiveWorkInfo {
+            tunnel_flows: flows,
+            ask_age_secs: ask,
+            ..LiveWorkInfo::default()
         })
     }
     fn idle() -> Reading {
@@ -985,6 +997,49 @@ mod tests {
                 "{root:?}"
             );
         }
+    }
+
+    /// FR-156 H1 — a tunnel flow that moved bytes in the window, in either
+    /// half, defers as the half's SSH connection does: the root half's, the
+    /// person's as the child carries it, and the person's with the root half
+    /// not running. A person's fresh ask never cuts the root half's flows,
+    /// and the log line names them.
+    #[test]
+    fn a_tunnel_flow_in_either_half_defers() {
+        use crate::one_row_home::{LiveWorkAnswer, LiveWorkCounts};
+        let carried = LiveWorkAnswer::Answered(LiveWorkCounts {
+            rc_sessions: 0,
+            ssh_connections: 0,
+            exec_runs: 0,
+            work: 0,
+            tunnel_flows: 1,
+            net_transition: false,
+            ask_age_secs: None,
+        })
+        .reading();
+        assert_eq!(carried, flowing(1, None), "the child carries the flows");
+        for (root, person) in [
+            (flowing(1, None), idle()),
+            (idle(), carried),
+            (Reading::NotRunning, flowing(1, None)),
+        ] {
+            assert_eq!(
+                helper_arm(&root, &person, Budget::RESET, NOW),
+                counted(1, NOW + HOUR),
+                "{root:?} {person:?}"
+            );
+        }
+        assert!(
+            matches!(
+                helper_arm(&flowing(1, None), &flowing(0, Some(3)), Budget::RESET, NOW),
+                HelperArm::Defer { counted: true, .. }
+            ),
+            "a person's ask cut the root half's flow"
+        );
+        assert_eq!(
+            what_it_cuts(&flowing(2, None), &flowing(1, None)),
+            "3 tunnel flow(s)"
+        );
     }
 
     /// The second reading after the download: a forced arm stands; an idle

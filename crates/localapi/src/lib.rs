@@ -1896,6 +1896,10 @@ pub struct LiveWorkInfo {
     /// File transfers and recordings in progress.
     #[serde(default)]
     pub work: u32,
+    /// FR-156 P1 — tunnel flows that moved bytes, either way, within the
+    /// liveness window (90 s). An older daemon's answer has none.
+    #[serde(default)]
+    pub tunnel_flows: u32,
     /// A network transition in the last 10 minutes (R5b).
     #[serde(default)]
     pub net_transition: bool,
@@ -10441,13 +10445,14 @@ mod tests {
             ssh_connections: 2,
             exec_runs: 3,
             work: 4,
+            tunnel_flows: 6,
             net_transition: true,
             ask_age_secs: Some(5),
         };
         let j = serde_json::to_string(&Response::LiveWork(info)).unwrap();
         assert_eq!(
             j,
-            r#"{"t":"live_work","d":{"rc_sessions":1,"ssh_connections":2,"exec_runs":3,"work":4,"net_transition":true,"ask_age_secs":5}}"#
+            r#"{"t":"live_work","d":{"rc_sessions":1,"ssh_connections":2,"exec_runs":3,"work":4,"tunnel_flows":6,"net_transition":true,"ask_age_secs":5}}"#
         );
         assert_eq!(
             serde_json::from_str::<Response>(&j).unwrap(),
@@ -10473,6 +10478,30 @@ mod tests {
             Response::Error { message } => assert!(message.contains("not served"), "{message}"),
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    /// FR-156 L1 — an answer from a daemon older than FR-156 P1 carries no
+    /// `tunnel_flows` and reads as none; the new field round-trips.
+    #[test]
+    fn live_work_without_tunnel_flows_reads_none() {
+        let older = r#"{"t":"live_work","d":{"rc_sessions":1,"ssh_connections":2,"exec_runs":0,"work":0,"net_transition":false}}"#;
+        match serde_json::from_str::<Response>(older).unwrap() {
+            Response::LiveWork(info) => {
+                assert_eq!(info.tunnel_flows, 0);
+                assert_eq!((info.rc_sessions, info.ssh_connections), (1, 2));
+            }
+            other => panic!("expected live_work, got {other:?}"),
+        }
+        let info = LiveWorkInfo {
+            tunnel_flows: 3,
+            ..LiveWorkInfo::default()
+        };
+        let j = serde_json::to_string(&Response::LiveWork(info)).unwrap();
+        assert!(j.contains(r#""tunnel_flows":3"#), "{j}");
+        assert_eq!(
+            serde_json::from_str::<Response>(&j).unwrap(),
+            Response::LiveWork(info)
+        );
     }
 
     /// FR-151 L2 — neither verb is served on the person socket: the read

@@ -383,6 +383,10 @@ pub struct LiveWorkCounts {
     pub ssh_connections: u32,
     pub exec_runs: u32,
     pub work: u32,
+    /// FR-156 P1 — the person's daemon's tunnel flows that moved bytes in the
+    /// liveness window. Required like every field: the child is root's own
+    /// version (its check of itself), so the two never differ on it.
+    pub tunnel_flows: u32,
     pub net_transition: bool,
     pub ask_age_secs: Option<u64>,
 }
@@ -399,6 +403,7 @@ impl From<tunnel_core::localapi::LiveWorkInfo> for LiveWorkCounts {
             ssh_connections: i.ssh_connections,
             exec_runs: i.exec_runs,
             work: i.work,
+            tunnel_flows: i.tunnel_flows,
             net_transition: i.net_transition,
             ask_age_secs: i.ask_age_secs,
         }
@@ -412,6 +417,7 @@ impl From<LiveWorkCounts> for tunnel_core::localapi::LiveWorkInfo {
             ssh_connections: c.ssh_connections,
             exec_runs: c.exec_runs,
             work: c.work,
+            tunnel_flows: c.tunnel_flows,
             net_transition: c.net_transition,
             ask_age_secs: c.ask_age_secs,
         }
@@ -617,7 +623,13 @@ impl Reply {
             return Err(format!("the reply does not answer `{}` alone", verb.word()));
         }
         if let Some(LiveWorkAnswer::Answered(c)) = reply.live_work {
-            let counts = [c.rc_sessions, c.ssh_connections, c.exec_runs, c.work];
+            let counts = [
+                c.rc_sessions,
+                c.ssh_connections,
+                c.exec_runs,
+                c.work,
+                c.tunnel_flows,
+            ];
             if counts.iter().any(|&n| n > LIVE_WORK_MAX_COUNT)
                 || c.ask_age_secs.is_some_and(|age| age > LIVE_WORK_MAX_AGE)
             {
@@ -2001,6 +2013,7 @@ mod tests {
                 ssh_connections: 0,
                 exec_runs: 1,
                 work: 0,
+                tunnel_flows: 0,
                 net_transition: false,
                 ask_age_secs: Some(9),
             })
@@ -4321,6 +4334,7 @@ mod tests {
             ssh_connections: 1,
             exec_runs: 0,
             work: 3,
+            tunnel_flows: 4,
             net_transition: true,
             ask_age_secs: ask,
         })
@@ -4381,6 +4395,7 @@ mod tests {
             ssh_connections: 1,
             exec_runs: 0,
             work: 3,
+            tunnel_flows: 4,
             net_transition: true,
             ask_age_secs: Some(7),
         };
@@ -4437,6 +4452,7 @@ mod tests {
             ssh_connections: 0,
             exec_runs: 0,
             work: 0,
+            tunnel_flows: LIVE_WORK_MAX_COUNT,
             net_transition: false,
             ask_age_secs: Some(LIVE_WORK_MAX_AGE),
         };
@@ -4455,6 +4471,13 @@ mod tests {
                 "a count over the bound",
                 over(LiveWorkCounts {
                     work: LIVE_WORK_MAX_COUNT + 1,
+                    ..counts
+                }),
+            ),
+            (
+                "flows over the bound",
+                over(LiveWorkCounts {
+                    tunnel_flows: LIVE_WORK_MAX_COUNT + 1,
                     ..counts
                 }),
             ),
