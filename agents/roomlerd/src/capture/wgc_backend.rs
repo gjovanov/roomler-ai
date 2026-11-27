@@ -187,6 +187,20 @@ fn bake_cursor(request: PointerRequest, env_escape_hatch: bool) -> bool {
     request == PointerRequest::InFrame || env_escape_hatch
 }
 
+/// The worker gave no ready-ack within the open's 2 s: it may still be setting
+/// up on a slow host, or be stuck. A type of its own, so that a caller can tell
+/// it from an init that failed (#3355: `the_mta_outlives_a_wgc_worker`).
+#[derive(Debug)]
+struct AckTimeout;
+
+impl std::fmt::Display for AckTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wgc worker didn't ack within 2s")
+    }
+}
+
+impl std::error::Error for AckTimeout {}
+
 impl WgcCapture {
     /// Build a capture bound to the system's primary monitor. Fails
     /// early if D3D11 / WinRT / WGC is unavailable; the caller treats
@@ -274,7 +288,10 @@ impl WgcCapture {
         let size = match ready_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(size)) => size,
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(anyhow!("wgc worker didn't ack within 2s")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(AckTimeout.into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("wgc worker ended without an ack"));
+            }
         };
 
         // FR-98 C1 — read once per open (FR-70: never per frame).
@@ -1149,9 +1166,9 @@ impl Drop for RoUninitializeGuard {
 /// unloads the DLLs it loaded for it, `GraphicsCapture.dll` among them. Whatever
 /// still runs in that module then faults: `0xc0000005` in
 /// `GraphicsCapture.dll_unloaded`. The fault on record (2026-11-02, 0.4.197) was a
-/// recorder child, during its remux, over a moving screen. A recording of 4 s
-/// exits before the worker's 100 ms poll ends, so it never gets that far. In the
-/// daemon it depends on what else holds the MTA when a session's capture ends.
+/// recorder child, during its remux, over a moving screen. A short recording can
+/// exit before its capture thread leaves the apartment. In the daemon it depends on
+/// what else holds the MTA when a session's capture ends.
 fn pin_mta() {
     use windows::Win32::System::Com::CoIncrementMTAUsage;
     static PIN: std::sync::Once = std::sync::Once::new();
@@ -1178,6 +1195,11 @@ mod tests {
     /// with WGC or without, so this needs no display and starts no capture. Not a
     /// null handle: WGC opens a capture on that. The worker sends its failure after
     /// `worker_main` has returned, so by then it has left the apartment.
+    ///
+    /// #3355 — only that failure proves it. An open that gave up waiting for the
+    /// ready-ack leaves the worker wherever it was, perhaps still inside the MTA,
+    /// and the read below would then pass with the pin or without it. So the ack
+    /// timeout fails this test; it never passes it.
     #[test]
     fn the_mta_outlives_a_wgc_worker() {
         use windows::Win32::System::Com::{
@@ -1190,9 +1212,14 @@ mod tests {
             DownscalePolicy::Auto,
             PointerRequest::Separate,
         );
+        let Err(e) = opened else {
+            panic!("no capture opens on a handle that names nothing");
+        };
         assert!(
-            opened.is_err(),
-            "no capture opens on a handle that names nothing"
+            !e.is::<AckTimeout>(),
+            "the open failed by its 2 s ready-ack timeout, not by the failed init this \
+             test needs, so it cannot tell whether the MTA outlived the worker (a host \
+             this slow cannot run it): {e:#}"
         );
         let apartment = std::thread::spawn(|| {
             let mut kind = APTTYPE::default();
