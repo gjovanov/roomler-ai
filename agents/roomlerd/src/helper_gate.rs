@@ -545,6 +545,277 @@ const ASK_WAITS_FOR_THE_ROOT_HALF: &str = "Your ask is recorded: the update inst
 pub const NO_ASK_SAYS: &str = "The update installs when nothing on this Mac is in use, or \
      within about seven hours if something still is.";
 
+/// #4372 — the wake path on a Mac, as the root update helper reads it at the
+/// start of a run and while it waits. The decisions are pure and compiled on
+/// every OS; the reads and writes are unix, and only the Mac's helper calls
+/// them (`updater::run_update_helper`). The content is never read.
+pub mod wake {
+    use std::path::{Path, PathBuf};
+
+    /// The parts of what is at the wake path that a write, a touch, a mode
+    /// change, a new link or a replacement changes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Stamp {
+        pub dev: u64,
+        pub ino: u64,
+        pub size: u64,
+        pub mtime_ns: i128,
+        pub ctime_ns: i128,
+    }
+
+    /// What kind of entry is at the wake path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        File,
+        Folder,
+        /// Neither: a link, or any other kind.
+        Other,
+    }
+
+    /// What `lstat` read at the wake path. Never followed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Entry {
+        pub kind: Kind,
+        pub owner: u32,
+        /// The permission bits, `st_mode & 0o7777`.
+        pub mode: u32,
+        pub links: u64,
+        pub stamp: Stamp,
+    }
+
+    /// The mode of the helper's own file: every local writer can wake it.
+    pub const MODE: u32 = 0o666;
+
+    impl Entry {
+        /// The helper's own file: a regular file of `owner`'s, [`MODE`], one
+        /// link.
+        pub fn is_own(&self, owner: u32) -> bool {
+            self.kind == Kind::File && self.owner == owner && self.mode == MODE && self.links == 1
+        }
+    }
+
+    /// What the run's start does at the wake path, first, before every gate.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StartStep {
+        /// Nothing is there.
+        Nothing,
+        /// Remove what is there, unread.
+        Remove,
+    }
+
+    impl StartStep {
+        /// Whether the step changes the wake path. launchd's `WatchPaths`
+        /// starts the job again for a change the run itself makes there.
+        pub fn changes_path(&self) -> bool {
+            matches!(self, StartStep::Remove)
+        }
+    }
+
+    /// What the start does with what `lstat` found at the wake path. `owner`
+    /// is the uid the helper runs as (root).
+    pub fn start_step(found: &std::io::Result<Option<Entry>>, owner: u32) -> StartStep {
+        let _ = owner;
+        match found {
+            Ok(None) => StartStep::Nothing,
+            Ok(Some(_)) | Err(_) => StartStep::Remove,
+        }
+    }
+
+    /// Whether a waiting helper reads a wake: a wake file is there.
+    pub fn woke(baseline: Option<Stamp>, now: Option<Stamp>) -> bool {
+        let _ = baseline;
+        now.is_some()
+    }
+
+    /// A waiting helper's wake, read each tick ([`Watch::look`]).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Watch {
+        path: PathBuf,
+        baseline: Option<Stamp>,
+        last: Option<Stamp>,
+    }
+
+    impl Watch {
+        /// The wait's view of `path`, from what the run's start left there.
+        pub fn new(path: &Path, baseline: Option<Stamp>) -> Watch {
+            Watch {
+                path: path.to_path_buf(),
+                baseline,
+                last: baseline,
+            }
+        }
+
+        /// The wake path.
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// One tick's read of the wake path: whether it is a wake. The read
+        /// is kept for [`Watch::cycled`].
+        pub fn look_at(&mut self, now: Option<Stamp>) -> bool {
+            self.last = now;
+            woke(self.baseline, now)
+        }
+
+        /// A cycle starts from the tick that decided it: the baseline becomes
+        /// that tick's read, never a read taken after the cycle, so a write
+        /// made during the cycle is the next tick's wake.
+        pub fn cycled(&mut self) {
+            self.baseline = self.last;
+        }
+
+        /// [`Watch::look_at`] with a read of the path now.
+        #[cfg(unix)]
+        pub fn look(&mut self) -> bool {
+            let now = stamp_at(&self.path);
+            self.look_at(now)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Entry {
+        /// The entry `lstat` describes.
+        pub fn of(meta: &std::fs::Metadata) -> Entry {
+            use std::os::unix::fs::MetadataExt as _;
+            let ft = meta.file_type();
+            let kind = if ft.is_file() {
+                Kind::File
+            } else if ft.is_dir() {
+                Kind::Folder
+            } else {
+                Kind::Other
+            };
+            let ns = |secs: i64, nsec: i64| i128::from(secs) * 1_000_000_000 + i128::from(nsec);
+            Entry {
+                kind,
+                owner: meta.uid(),
+                mode: meta.mode() & 0o7777,
+                links: meta.nlink(),
+                stamp: Stamp {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                    size: meta.size(),
+                    mtime_ns: ns(meta.mtime(), meta.mtime_nsec()),
+                    ctime_ns: ns(meta.ctime(), meta.ctime_nsec()),
+                },
+            }
+        }
+    }
+
+    /// What is at `path`, by `lstat`: `None` when nothing is.
+    #[cfg(unix)]
+    pub fn read(path: &Path) -> std::io::Result<Option<Entry>> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => Ok(Some(Entry::of(&meta))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The stamp of what is at `path`; `None` when nothing is, or when it
+    /// cannot be read.
+    #[cfg(unix)]
+    pub fn stamp_at(path: &Path) -> Option<Stamp> {
+        read(path).ok().flatten().map(|entry| entry.stamp)
+    }
+
+    /// The run's start, first, before every gate: removes what is at `path`,
+    /// unread (`remove_file` never follows a link), and returns the wait's
+    /// [`Watch`].
+    #[cfg(unix)]
+    pub fn settle(path: &Path, owner: u32) -> Watch {
+        match start_step(&read(path), owner) {
+            StartStep::Nothing => {}
+            StartStep::Remove => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        Watch::new(path, None)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn stamp(ino: u64) -> Stamp {
+            Stamp {
+                dev: 1,
+                ino,
+                size: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            }
+        }
+
+        /// The helper's own file: root's, [`MODE`], one link.
+        fn own() -> Entry {
+            Entry {
+                kind: Kind::File,
+                owner: 0,
+                mode: MODE,
+                links: 1,
+                stamp: stamp(7),
+            }
+        }
+
+        #[test]
+        fn a_file_where_there_was_none_is_a_wake_and_nothing_is_none() {
+            assert!(woke(None, Some(stamp(1))));
+            assert!(!woke(None, None));
+        }
+
+        #[test]
+        fn the_start_removes_what_is_at_the_wake_path() {
+            assert_eq!(start_step(&Ok(None), 0), StartStep::Nothing);
+            let plain = Entry {
+                mode: 0o644,
+                ..own()
+            };
+            assert_eq!(start_step(&Ok(Some(plain)), 0), StartStep::Remove);
+            let unread = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            assert_eq!(start_step(&unread, 0), StartStep::Remove);
+        }
+
+        /// #4372 — a change the start makes at the path is one more launchd
+        /// run, a minute later, for every wake.
+        #[test]
+        fn the_start_makes_no_change_to_the_helpers_own_file() {
+            assert!(!start_step(&Ok(Some(own())), 0).changes_path());
+        }
+
+        #[test]
+        fn an_unchanged_wake_file_is_no_wake() {
+            assert!(!woke(Some(stamp(7)), Some(stamp(7))));
+        }
+
+        /// After a cycle the baseline is the read of the tick that decided
+        /// it, so a write made during the cycle is the next tick's wake.
+        #[test]
+        fn a_write_during_a_cycle_is_the_next_ticks_wake() {
+            let mut watch = Watch::new(Path::new("/w"), Some(stamp(0)));
+            assert!(watch.look_at(Some(stamp(1))), "a write since the start");
+            watch.cycled();
+            assert!(watch.look_at(Some(stamp(2))), "a write during that cycle");
+            watch.cycled();
+            assert!(!watch.look_at(Some(stamp(2))), "served by the second cycle");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn the_read_never_follows_a_link() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            std::fs::write(&target, b"bytes").unwrap();
+            let wake = dir.path().join("wake");
+            std::os::unix::fs::symlink(&target, &wake).unwrap();
+            let entry = read(&wake).unwrap().unwrap();
+            assert_eq!(entry.kind, Kind::Other);
+            assert_ne!(entry.stamp, read(&target).unwrap().unwrap().stamp);
+            assert_eq!(read(&dir.path().join("nothing")).unwrap(), None);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
