@@ -8741,6 +8741,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "roomler-log-capture"
+version = "0.4.239"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "roomler-msi-ca"
 version = "0.4.239"
 dependencies = [

@@ -13,6 +13,9 @@ members = [
     # (via path dep) the vendored webrtc-ice's gather arm.
     "crates/tcp-turn-conn",
     "crates/roomler-setup-core",
+    # #3403 — the one way a test reads its own log lines (a dev-dependency of
+    # every crate whose tests do; root clippy.toml refuses any other way).
+    "crates/log-capture",
     # Standalone regional DERP relay (one per relay PoP; ticket-authenticated,
     # DB-free — see crates/derp-relay/src/main.rs).
     "crates/derp-relay",

@@ -22,7 +22,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-AUDITED=(roomler-ai-api roomler-ai-services roomler-ai-tests roomler-core)
+# roomler-log-capture (#3403): the capture helper, the one crate allowed to call
+# tracing's scoped-default entry points (root clippy.toml); its probe test is linted too.
+AUDITED=(roomler-ai-api roomler-ai-services roomler-ai-tests roomler-core roomler-log-capture)
 
 if grep -rnE 'items_after_test_module' crates/modules Cargo.toml; then
   echo "::error::a module crate allows clippy::items_after_test_module — move its test module to the end of the file instead (#3594)" >&2

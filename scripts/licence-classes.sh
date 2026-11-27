@@ -56,6 +56,9 @@ CLIENT_PATHS=(
   crates/remote_control
   crates/localapi
   crates/tcp-turn-conn
+  # #3403 — a dev-dependency of server and agent crates alike, so the weaker
+  # side's licence, by the same rule.
+  crates/log-capture
 )
 
 # CLIENT files inside a SERVER path: a single FILE compiled into both the web
