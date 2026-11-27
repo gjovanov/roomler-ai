@@ -1,7 +1,8 @@
 # FR-156: An update never cuts live work by surprise
 
-**Issue:** [#4491](https://github.com/gjovanov/roomler-ai/issues/4491) · **Status:** spec, claimed 2026-11-27; nothing
-built. D1–D9 are open, each with a proposal.
+**Issue:** [#4491](https://github.com/gjovanov/roomler-ai/issues/4491) · **Status:** P1 built ([#4523](https://github.com/gjovanov/roomler-ai/pull/4523)), not yet
+field-verified; P1b–P5 not built. D1 and D5 are ruled (Decisions 9 and 10); D2–D4 and D6–D9 are open, each with a
+proposal.
 **From:** the issue's design, and the operator's rulings of 2026-11-27 on
 [#3429](https://github.com/gjovanov/roomler-ai/issues/3429#issuecomment-7214879318) (the push, the notice, the rejoin)
 and [#4469](https://github.com/gjovanov/roomler-ai/issues/4469#issuecomment-7214882225) (fix the count, in P1). Where
@@ -168,6 +169,35 @@ three places: where it builds a `Busy` from an answer (`Reading::counts`, `helpe
 (`:292-317`; both are full literals, which a new field breaks until they map it), and among the root half's work that
 a person's ask may not cut (`root_beyond_sessions`, `:220-226`). FR-151's ruling stands: the outage recheck on a Mac
 is an uncounted wake.
+
+The person's half reaches the helper through FR-147's child (`roomlerd one-row-home live-work`), whose reply carries
+the counts as `LiveWorkCounts` (`agents/roomlerd/src/one_row_home.rs:379-388`, every field required and unknown ones
+refused). It carries `tunnel_flows` too, bound-checked as the other counts are (`Reply::parse`, `:619-626`); the child
+is root's own version (its check of itself), so the field is required there like the others. Without it, a flow in
+the person's half would never reach the helper.
+
+#### The clock
+
+A liveness age counts the time the host slept (the operator's ruling of 2026-11-27): a laptop that slept for an hour
+heard its client an hour ago, not just now. `std::time::Instant`, which tokio's clock reads outside tests, does not
+promise that. Its documentation says "it is also not specified whether system suspends count as elapsed time or not.
+The behavior varies across platforms and Rust versions" (std 1.95.0, `library/std/src/time.rs`), and it reads
+`CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` on macOS and `QueryPerformanceCounter` on Windows (tokio 1.52.3,
+`src/time/clock.rs`, reads `std::time::Instant::now()` without `test-util`). So every stamp reads one seam,
+`liveness::Clock` (`crates/tunnel-core/src/liveness.rs`), whose host arm is chosen per OS:
+
+| OS | The stamp reads | Counts sleep | Source |
+|---|---|---|---|
+| Linux | `clock_gettime(CLOCK_BOOTTIME)` | yes | clock_gettime(2): `CLOCK_BOOTTIME` is "identical to `CLOCK_MONOTONIC`, except that it also includes any time that the system is suspended" (Linux 2.6.39 on; Rust's floor is 3.2), and `CLOCK_MONOTONIC`, Instant's, "does not count time that the system is suspended" |
+| macOS | `clock_gettime(CLOCK_MONOTONIC)` | yes | Apple's clock_gettime(3): `CLOCK_MONOTONIC` "will continue to increment while the system is asleep", and `CLOCK_UPTIME_RAW`, Instant's, "does not increment while the system is asleep" (macOS 10.12 on, Rust's floor) |
+| Windows | `Instant`, which is `QueryPerformanceCounter` | yes | Microsoft's "Acquiring high-resolution time stamps": QPC counts the ticks "since the Windows operating system was started, including the time when the machine was in a sleep state such as standby, hibernate, or connected standby" |
+| any other | `Instant` | not promised | no clock is chosen where none is documented; no supported device runs one |
+
+The clock is chosen once, at the first stamp. Were the kernel to refuse it (it cannot, on Rust's floor), every stamp
+reads `Instant` instead, which then does not count the host's sleep: no reading mixes two clocks. The seam's other
+arm, `Clock::Tokio`, is tokio's clock from an origin, which a paused test runtime moves: S1, S2, T1 and U1 run on it
+(C2), and C1 checks the host arm against the clock that stops while the host sleeps. A touch is one clock read and one
+relaxed store.
 
 ### One gate, a budget for each path (P2)
 
@@ -389,6 +419,9 @@ GREEN. The wire pins arrive with the types, and each kill-switch cell is green o
 | U1 | `updater::an_outage_recheck_beside_a_move_with_a_silent_connection_never_holds` | #4407's input with the connection unheard for 90 s: `Gated { DeferOnce, 120 s }`, not `Held` |
 | H1 | `helper_gate::a_tunnel_flow_in_either_half_defers` | either half's flow defers, and a person's ask never cuts the root half's |
 | L1 | `crates/localapi`: `live_work_without_tunnel_flows_reads_none` | an older answer parses with 0, and the new fields round-trip |
+| S5 | `ssh::a_connection_leaves_the_registry_however_it_ends` | a connection leaves the registry when its client closes it, and when its task is aborted |
+| C1 | tunnel-core `liveness::the_host_clock_keeps_real_time_and_counts_the_hosts_sleep` | the host clock keeps real time in milliseconds and never runs back; on Linux it reads no less than `CLOCK_MONOTONIC`, on macOS no less than `CLOCK_UPTIME_RAW`: it is the clock that counts the host's sleep (P1 design, "The clock") |
+| C2 | tunnel-core `liveness::a_stamp_on_a_test_clock_ages_with_the_paused_runtime` | the clock's seam: a stamp on a test's clock ages only as a paused runtime moves, which S1, S2, T1 and U1 run on |
 | W1 | `updater::a_push_with_nothing_live_installs_at_once` | `Busy::IDLE`: install, no notice |
 | W2 | `updater::a_push_waits_for_live_work_and_installs_when_it_ends` | a session: wait, a look in 60 s; the next look idle: install |
 | W3 | `updater::a_push_at_its_deadline_notices_then_installs` | a session at the deadline: the notice arm, then the install 60 s later, with the warning |
@@ -452,7 +485,7 @@ rule.
 | Phase | What | Kill switch, or back-out | Status |
 |---|---|---|---|
 | P0 | this spec and its row in `docs/fr/README.md` | none | this pull request |
-| P1 | proven liveness: the keepalives and the read stamp, the connections' registry and its window; the flows' stamps, the process-wide list and the SOCKS front's counting copy; `Busy.tunnel_flows`, `LiveWorkInfo.tunnel_flows` and the helper's mapping; S1–S4, T1–T3, B1, U1, H1, L1 | `ROOMLERD_LIVE_WORK_PROOF=0` | — |
+| P1 | proven liveness: the keepalives and the read stamp, the connections' registry and its window; the flows' stamps, the process-wide list and the SOCKS front's counting copy; `Busy.tunnel_flows`, `LiveWorkInfo.tunnel_flows` and the helper's mapping; S1–S4, T1–T3, B1, U1, H1, L1 | `ROOMLERD_LIVE_WORK_PROOF=0` | PR [#4523](https://github.com/gjovanov/roomler-ai/pull/4523), not yet field-verified |
 | P1b | D4: #4457's hold retired or kept, once F1 is GREEN on Windows and Linux | the hold's own code, kept until then | — |
 | P2 | the push's deadline: the wire, the daemon's push arm, the wedge rule on every path and the cap, the Mac helper's deadline rule, the server's routes and the row's report, the dashboard; W1–W14 | `ROOMLERD_UPDATE_DEADLINE=0`; `rc.update_wait` | — |
 | P3 | the notice and the update end: the arm, the viewer's countdown and its retry rule, the host's surfaces, SSH's line and disconnect with the Windows carry's frame, the Mac's verb, the hub's `update` limit and its announcement; N1–N8 | `ROOMLERD_UPDATE_NOTICE=0`; `rc.update_end` | — |
@@ -518,15 +551,23 @@ The operator's rulings of 2026-11-27, which bind this spec:
    outage recheck on a Mac is an uncounted wake. #4469's lab cell is P1's Mac cell (F2), and #4469 closes with it.
    #4457's hold stays until P1 is field-verified on Windows and Linux, and D4 then decides whether it retires.
 
+The operator's rulings on D1 and D5, of 2026-11-27
+([#4491](https://github.com/gjovanov/roomler-ai/issues/4491#issuecomment-7219804519)):
+
+9. **D1: the liveness window is 90 s.** Both servers' configs take `keepalive_interval: Some(30 s)` and
+   `keepalive_max: 0`, and `inactivity_timeout` stays 600 s. A connection counts while its client was heard within
+   90 s, and a flow while it moved bytes within the same 90 s. A liveness age counts the time the host slept (P1
+   design, "The clock").
+10. **D5: accepted.** The keepalives keep an idle SSH session whose client answers open past 600 s. The 600 s stays a
+    reaper for a dead carrier, and there is no idle-limit setting.
+
 ## Open decisions
 
 | # | Question | Proposal |
 |---|---|---|
-| D1 | the liveness window | 90 s, with a keepalive every 30 s: three keepalives unanswered, which rides out a relay's reconnect (within 10 s) and a path change. The cost: a client silent for longer, such as a laptop lid shut for two minutes, is not waited for |
 | D2 | the push's deadline | 900 s by default. The longest an admin may choose is the periodic budget, 7 h |
 | D3 | consent on the rejoin | no prompt for the same controller within 2 minutes of the cut, and the host's surface says it reconnected |
 | D4 | #4457's hold, once F1 is GREEN | retire it. After P1 a connection counted at the recheck answered within the last 90 s, so the hold only delays a live session's hour by 10 minutes |
-| D5 | the SSH idle lifetime: an answering client keeps an idle session past 600 s | accept it. The 600 s is a reaper for a dead carrier, which stays. The alternative keeps the idle limit: no russh timeout, and the daemon ends a connection after 600 s with no channel data. That would also end the idle sessions of `ServerAliveInterval` clients, which it does not do today |
 | D6 | a ceiling on waiting out a wedge | none: a restart beside a move can lock a machine out. The device's report shows the wait, and the dashboard marks a device that has waited a day |
 | D7 | a per-user Linux daemon that a root helper updates, under a push's deadline | the deadline bounds the replaced-binary watch: it cuts at the deadline, with the notice, never over a wedge |
 | D8 | how the Mac helper asks the person's half to send the notice | a second verb of FR-147's child, beside `live_work` |
