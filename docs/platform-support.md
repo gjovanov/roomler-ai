@@ -24,7 +24,7 @@ other two, or the device says why it cannot, in its hello and on screen.
 
 A capability word in the hello promises that this device serves the feature, on this OS, now.
 What a host cannot keep, the daemon takes out and explains in `AgentCaps.unavailable`, a map
-of feature → `{code, reason}` (`crates/remote_control/src/models.rs:652`, its keys at `:682`).
+of feature → `{code, reason}` (`crates/remote_control/src/models.rs:660`, its keys at `:690`).
 One seam decides it, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:2982`), over
 plain facts about the host, so the decision runs and is tested on every OS. Features with a
 channel of their own say no there: capture as `rc:media-unavailable` (FR-80), input as
@@ -110,7 +110,7 @@ flowchart LR
 | Clipboard: a copied image reaches the viewer by itself | ✅ | ✅ an X11 session with a per-user install, through XFixes' selection events (FR-97 P3e-3a, from 0.4.148) · ❌ Wayland and a system install: on request only, said as `not-watched` | ✅ from 0.4.154, through the pasteboard's change count (FR-97 P2e-1); before it, on request only | image watching rides Windows' clipboard sequence number, on X11 the change gate (`agents/roomlerd/src/clipboard.rs:1319`, `:1846`), on a Mac the change count (`agents/roomlerd/src/clipboard.rs:1452`); `docs/remote-control.md`, the watcher on X11 and on a Mac |
 | Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:4419-4423` |
 | An idle desktop costs little CPU | ✅ dirty regions | ✅ X11 damage; Wayland's compositor sends frames on change; the DRM arm skips an unchanged frame | ❌ every frame is a full frame | `Damage::Unknown` (`agents/roomlerd/src/capture/scrap_backend.rs:642`); `docs/wayland.md` |
-| The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:3294-3297`) |
+| The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:3297-3300`) |
 | Privacy mode (the curtain) | ✅ Windows 10 2004 and later | ❌ | ⛔ | `docs/privacy-mode.md`, Platforms; §8 |
 | Lock the computer when the last session ends | ✅ | ✅ `loginctl lock-session` | ❌ no mechanism yet: an end that should lock logs that it could not | `docs/privacy-mode.md`, lock on end |
 
@@ -132,7 +132,7 @@ flow, and the consent chain's fallbacks.
 | Exit node: DNS goes through the exit | ✅ | 🟡 systemd-resolved only, else `DNS NOT steered` | ✅ | the same steer, with a catch-all domain |
 | The host firewall admits the mesh | ✅ the daemon's Defender rule, and WFP | 🟡 firewalld and ufw left to the owner, and reported | ❌ the Application Firewall is left alone | carriers pass a host firewall by conntrack; only services on the overlay address need an allow (D13, `crates/tunnel-core/src/overlay/hostfw.rs:3-8`) |
 | LAN-direct egress pin; repair of the LAN's own route | ✅ | ❌ | ❌ | out of scope until a field case asks for it (FR-97 §7); `crates/tunnel-core/src/overlay/lan_repair.rs:3-7` |
-| Who holds a busy port | ✅ | ✅ | ✅ `lsof` | `agents/roomlerd/src/tunnel/port_holder.rs:315-329` |
+| Who holds a busy port | ✅ | ✅ | ✅ `lsof` | `agents/roomlerd/src/tunnel/port_holder.rs:355-369` |
 
 At parity on all three: TUN bring-up; v4 and v6 ULA addressing; route-change subscriptions;
 PathMonitor; every carrier (disco, direct, netcheck, relays, DERP, QUIC); org relay serving
@@ -147,7 +147,7 @@ and never outliving the daemon (FR-97 P0e).
 | `exec` and SSH `daemon` mode | 🟡 SYSTEM on a SystemContext install, or once anchored (FR-94); the signed-in person on an attended one | ✅ root | ✅ root on the root half's row | `docs/fleet-rpc.md`, Who runs the command |
 | `console_user`: the person at the screen | 🟡 where SYSTEM serves the session: SystemContext, or the device's service (FR-105); an attended install refuses it, saying why | ✅ logind's seat0 | ✅ the owner of `/dev/console` | refused while nobody is there (`agents/roomlerd/src/exec.rs:900-912`); Windows: `docs/roomler-ssh.md` |
 | `named:<account>` | ⛔ | ✅ | ✅ | §8 |
-| SFTP and `scp` as the signed-in person | 🟡 where OpenSSH's `sftp-server` is installed | ✅ | ✅ | `agents/roomlerd/src/ssh.rs:1287-1291` |
+| SFTP and `scp` as the signed-in person | 🟡 where OpenSSH's `sftp-server` is installed | ✅ | ✅ | `agents/roomlerd/src/ssh.rs:1289-1293` |
 | A session starts in the person's home | ✅ | ✅ | ✅ | `agents/roomlerd/src/exec.rs:893` |
 
 ## 6. The desktop: companion, power, files

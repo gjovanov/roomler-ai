@@ -1,7 +1,8 @@
 # FR-157: A Mac's device row says whether its screen worker is attached, and why not
 
-**Issue:** [#4494](https://github.com/gjovanov/roomler-ai/issues/4494) · **Status:** spec, claimed 2026-11-27, from
-[#3882](https://github.com/gjovanov/roomler-ai/issues/3882); nothing built. D1–D6 are open, each with a recommendation.
+**Issue:** [#4494](https://github.com/gjovanov/roomler-ai/issues/4494) · **Status:** claimed 2026-11-27, from
+[#3882](https://github.com/gjovanov/roomler-ai/issues/3882). P2, the server read, is built behind its switch, which is
+off; nothing else is. D1–D5 were ruled on #4494 on 2026-11-27, as recommended; D6 is open, and is P3's.
 **Builds on:** [FR-43](FR-43-macos-single-enrollment.md) (the one-row Mac: the supervisor, the delegation channel,
 `Status.gui_worker`), [FR-93](FR-93-wayland-out-of-the-box.md) P2b (the `desktop` brief: a claim on the row that the
 server counts)
@@ -10,7 +11,8 @@ server counts)
 the host), [FR-149](FR-149-macos-consent-panel-from-the-session.md) (the session panel on a one-row Mac), #3992, #4043
 and #4059 (the worker's words reach the row at once)
 
-**Anchors:** read on master `ef4cd1ff9` (2026-11-27), in the tree.
+**Anchors:** read on master `ef4cd1ff9` (2026-11-27), in the tree. The ones P2 moved or added were read again on its
+pull request, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516).
 
 ## Goal
 
@@ -69,10 +71,12 @@ host to learn it.
 ### The word: `AgentCaps.gui_worker`
 
 One optional field on `AgentCaps` ([`models.rs:310-311`](../../crates/remote_control/src/models.rs#L310-L311)),
-beside `desktop` ([`models.rs:635-641`](../../crates/remote_control/src/models.rs#L635-L641)), and built the way
-`DesktopBrief` is ([`models.rs:2007-2033`](../../crates/remote_control/src/models.rs#L2007-L2033)): a CLAIM by the
-device, counted by the server, never enforced on. Strings, not enums, for the additive-wire reason: a newer agent's
-state or reason must reach an older reader as a word it can show, not as a parse failure.
+beside `desktop` ([`models.rs:635-641`](../../crates/remote_control/src/models.rs#L635-L641)). P2 built it, the field
+at [`models.rs:642-649`](../../crates/remote_control/src/models.rs#L642-L649) and `GuiWorkerBrief` at
+[`models.rs:2043-2080`](../../crates/remote_control/src/models.rs#L2043-L2080), the way `DesktopBrief` is built
+([`models.rs:2015-2041`](../../crates/remote_control/src/models.rs#L2015-L2041)): a CLAIM by the device, counted by the
+server, never enforced on. Strings, not enums, for the additive-wire reason: a newer agent's state or reason must reach
+an older reader as a word it can show, not as a parse failure.
 
 ```rust
 /// FR-157 — the screen worker this Mac's daemon supervises, as its delegation
@@ -96,7 +100,10 @@ pub struct GuiWorkerBrief {
 
 The names are D4. `permissions` keeps its meaning: `no-gui-session` and the worker's pair still say what a session
 would get, and the new word says why. No existing word changes. The wire spellings are a compatibility surface
-(`.claude/rules/remote-desktop.md`), so the new words are fixed in P1 and only ever added to.
+(`.claude/rules/remote-desktop.md`). By D4's ruling they are fixed when P2 merges, because P2 adds the type the server
+stores, and they are only ever added to: `GuiWorkerBrief::STATES` and `::REASONS`, locked by
+`gui_worker_spellings_are_locked`. `GuiWorkerBrief::UNKNOWN` is the readers' word for a row with no word; no daemon
+sends it.
 
 ### How a Mac's daemon fills it
 
@@ -181,16 +188,16 @@ so the steady state costs nothing. It must also come back down when the worker l
 |---|---|---|
 | older than P1 | any | no `gui_worker` key. Every reader reads its absence as **`unknown`**, never as `attached` or `not-attached`, and the devices list shows nothing, as it does today for an absent `permissions` ([`agentCodecChips.ts:87-94`](../../ui/src/components/admin/agentCodecChips.ts#L87-L94)) |
 | P1 | older than P1 | the older server's `AgentCaps` has no field for the word and accepts unknown fields (no `deny_unknown_fields`, [`models.rs:310-311`](../../crates/remote_control/src/models.rs#L310-L311)), so it drops the word and stores the rest as it does today |
-| P1 | P1, the switch off | stored with the caps ([`dao/agent.rs:571-580`](../../crates/services/src/dao/agent.rs#L571-L580), [`fleet/src/socket.rs:794-799`](../../crates/modules/fleet/src/socket.rs#L794-L799)); no read uses it |
+| P1 | P1, the switch off | stored with the caps ([`dao/agent.rs:607-616`](../../crates/services/src/dao/agent.rs#L607-L616), [`fleet/src/socket.rs:794-799`](../../crates/modules/fleet/src/socket.rs#L794-L799)); no read uses it |
 | P1 | P1, the switch on | read, counted and shown |
 
 ⚠️ A stored word outlives its connection: an offline row keeps the last word it announced. Every read pairs the word
-with presence (`last_presence`, [`models.rs:2407`](../../crates/remote_control/src/models.rs#L2407)), as the desktop
-counts already do ([`stats.rs:351-380`](../../crates/api/src/routes/stats.rs#L351-L380)), so a stale word is never
+with presence (`last_presence`, [`models.rs:2454`](../../crates/remote_control/src/models.rs#L2454)), as the desktop
+counts already do ([`stats.rs:353-382`](../../crates/api/src/routes/stats.rs#L353-L382)), so a stale word is never
 read as current.
 
-The word is a claim by a host that may be compromised, like `desktop`: no session decision, consent check or
-permission reads it.
+The word is a claim by a host that may be compromised, like `desktop`: no session decision, consent check, permission
+or ACL reads it. P2's reads count it and name the rows that carry it, and nothing else.
 
 ### `Status` on the host (D5)
 
@@ -202,22 +209,33 @@ and `reason` as additive fields, from the same function that builds the row's wo
 disagree. `attached`, `permissions` and `one_row` stay, because FR-43's verify reads them
 ([`FR-43-macos-single-enrollment.md:610`](FR-43-macos-single-enrollment.md)). An older CLI ignores the new fields.
 
-### The server read (P2)
+### The server read (P2, built)
 
-- **The counts.** A `gui_worker_breakdown_pipeline` beside `desktop_breakdown_pipeline`
-  ([`stats.rs:351-380`](../../crates/api/src/routes/stats.rs#L351-L380)) groups the live Mac rows (`os: "macos"`,
+- **The counts.** `gui_worker_breakdown_pipeline`
+  ([`stats.rs:384-426`](../../crates/api/src/routes/stats.rs#L384-L426)) sits beside `desktop_breakdown_pipeline`
+  ([`stats.rs:353-382`](../../crates/api/src/routes/stats.rs#L353-L382)) and groups the live Mac rows (`os: "macos"`,
   [`models.rs:12-18`](../../crates/remote_control/src/models.rs#L12-L18)) by `capabilities.gui_worker.state`, `reason`
-  and `one_row`, with a total and an online count. A Mac row with no word is counted as `unknown`, so the counts add up
-  to every Mac and the denominator after a roll comes from the server. They are served as `gui_workers` in the org
-  overview (`GET /api/tenant/{tenant_id}/stats/overview`, [`stats.rs:475-481`](../../crates/api/src/routes/stats.rs#L475-L481),
+  and `one_row`, each group `{state, reason, one_row, total, online}`. A Mac row with no word is counted as `unknown`,
+  with `reason` and `one_row` null, because the row did not say. So the counts add up to every Mac, and the denominator
+  after a roll comes from the server. `online` is `last_presence`, as the desktop counts read it. They are served as
+  `gui_workers` in the org overview (`GET /api/tenant/{tenant_id}/stats/overview`,
+  [`stats.rs:542-556`](../../crates/api/src/routes/stats.rs#L542-L556),
   [`crates/api/src/lib.rs:326`](../../crates/api/src/lib.rs#L326)) and in the platform overview
-  ([`stats.rs:1538-1540`](../../crates/api/src/routes/stats.rs#L1538-L1540)), beside `desktops`.
+  ([`stats.rs:1607-1621`](../../crates/api/src/routes/stats.rs#L1607-L1621)), beside `desktops`, through
+  `gui_workers_if_read` ([`stats.rs:428-440`](../../crates/api/src/routes/stats.rs#L428-L440)).
 - **The names.** The device list (`list_agents`,
-  [`fleet/src/agent.rs:1897-1928`](../../crates/modules/fleet/src/agent.rs#L1897-L1928)) takes a filter on the word's
-  state, for example `?gui_worker=not-attached`, which returns the org's online rows in that state. That is the one
-  read that answers "which online Macs have no attached worker", with their reasons.
-- **The switch off.** The overviews carry no `gui_workers`, the device list leaves the word out of every row, and the
-  filter is refused with a reason that names the switch, so that an unfiltered list is never read as a filtered one.
+  [`fleet/src/agent.rs:1914-1963`](../../crates/modules/fleet/src/agent.rs#L1914-L1963)) takes `?gui_worker=<state>`
+  (`DeviceListFilter`, [`fleet/src/agent.rs:1897-1912`](../../crates/modules/fleet/src/agent.rs#L1897-L1912)) and
+  returns the org's online Macs in that state, paged like the list, through `AgentDao::list_online_macs_by_gui_worker`
+  ([`dao/agent.rs:422-456`](../../crates/services/src/dao/agent.rs#L422-L456)). `unknown` names the online Macs with
+  no word, a word this build has never heard of is matched as the word it is, and an empty one is a 400. The filter is
+  read after the list's tenant guard, so a caller outside the org is refused before it. That is the one read that
+  answers "which online Macs have no attached worker", with their reasons.
+- **The switch off.** The overviews carry no `gui_workers`. `caps_as_served`
+  ([`fleet/src/agent.rs:2696-2711`](../../crates/modules/fleet/src/agent.rs#L2696-L2711)) leaves the word out of every
+  device response: the list's rows, a device's own read and an update's answer. The filter is answered 400
+  `bad_request` with a message that names `ROOMLER__RC__GUI_WORKER_READ`, so that an unfiltered list is never read as a
+  filtered one. The word is still stored with the caps.
 
 ### The devices list (P3)
 
@@ -232,7 +250,7 @@ word is there, and stays silent when it is not. Which reasons warn and which onl
 
 | switch | what it stops | default |
 |---|---|---|
-| `ROOMLER__RC__GUI_WORKER_READ`, a new field of `RcSettings` ([`settings.rs:967`](../../crates/config/src/settings.rs#L967)) | every read of the word: P2's counts and filter, and the word in the device list's response, so P3's chip has nothing to show | off, until P4's cells read green |
+| `ROOMLER__RC__GUI_WORKER_READ`, a new field of `RcSettings` ([`settings.rs:967`](../../crates/config/src/settings.rs#L967), [`:1128`](../../crates/config/src/settings.rs#L1128)) | every read of the word: P2's counts and filter, and the word in the device list's response, so P3's chip has nothing to show | off, until P4's cells read green |
 | none on the agent | P1's word is inert while the server switch is off, and an older server drops it | |
 
 ### The composition baseline
@@ -255,8 +273,9 @@ commit message says why.
 | P1 | every `Action` maps to one `(state, reason)`, and `attached` wins over it | no mapping exists |
 | P1 | a beat on which only the word changed announces caps that carry it | no word in `Announced` |
 | P1 | the `--supervised` worker, and a build for any other OS, announce no word | no word |
-| P1 | caps without the word serialise without the key and parse to `None`; a word with an unknown key inside it parses | no field |
-| P2 | an integration test in `crates/tests`: each state and an absent word counted, the filter's rows, and everything off with the switch | no read |
+| P2, built (the type is P2's) | caps without the word serialise without the key and parse to `None`; a word with an unknown key inside it parses; an older reader parses caps that carry it; the spellings are locked (`gui_worker_wire_shape_is_locked_and_additive`, `an_older_reader_parses_caps_that_carry_the_gui_worker_word`, `gui_worker_spellings_are_locked`, in `crates/remote_control/src/models.rs`) | no field: the stub without its serde attributes put `"gui_worker": null` on every hello |
+| P2, built | a device response leaves the word out while the switch is off, and keeps the rest of its caps (`gui_worker_read_tests`, `crates/modules/fleet/src/agent.rs`) | the stub served the stored caps as they are |
+| P2, built | the integration test, `crates/tests/src/gui_worker_tests.rs` (AC6): with the switch on, each state and an absent word counted in both overviews, online and in total, and the filter's rows; with it off, no `gui_workers`, no word in a row and the filter refused | no read |
 | P3 | Vitest beside `permissionWarnings`' tests ([`agentCodecChips.spec.ts:109`](../../ui/src/__tests__/components/agentCodecChips.spec.ts#L109)): no chip for no word, `unsupervised` or `attached`, and D6's chip for each reason | no chip |
 
 ### Lab cells
@@ -282,7 +301,7 @@ docs; P5 checks that they are whole.
 |---|---|---|---|
 | P0 | the RED read of C1–C4 and the lag's split (C5), on the current release and the current server; no code | none: it reads and changes nothing | not started |
 | P1 | the agent: `AgentCaps.gui_worker` in `crates/remote_control`, filled by a Mac's daemon, in the hello and at once on each attach, detach and change of the supervisor's state; `Status.gui_worker` takes the same `state` and `reason` (D5) | inert while `ROOMLER__RC__GUI_WORKER_READ` is off, and dropped by an older server | not started |
-| P2 | the server: the counts in both overviews, the device list's filter, and the word left out of the list while the switch is off | `ROOMLER__RC__GUI_WORKER_READ`, default off | not started |
+| P2 | the server: the counts in both overviews, the device list's filter, and the word left out of every device response while the switch is off | `ROOMLER__RC__GUI_WORKER_READ`, default off | built, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516) |
 | P3 | the devices list: the chip, in the table and the cards (D6) | the same switch: off, the rows carry no word, so there is no chip | not started |
 | P4 | the field read of C1–C5 on the release with P1 and the server with P2 and P3, with the switch turned on in production (the operator's step); a wrong reading turns it off again, and the default turns on once every cell reads green | the switch | not started |
 | P5 | the docs: the field and its wire name, the chip and its page, the macOS row table, the server read, and the `docs/README.md` rows | none: docs | not started |
@@ -322,6 +341,19 @@ docs; P5 checks that they are whole.
   `docs/README.md`.
 
 ## Open decisions
+
+The operator ruled D1 to D5 on #4494 on 2026-11-27
+([comment](https://github.com/gjovanov/roomler-ai/issues/4494#issuecomment-7216994923)), each as recommended. D6 stays
+open.
+
+| decision | ruling (2026-11-27) |
+|---|---|
+| D1 | as recommended: one field, `gui_worker`, whose name names no OS. In this FR only a Mac's daemon produces it, and every reader treats an absent word as `unknown` on every OS |
+| D2 | as recommended for P1, which waits for P0's reads. P2 does not wait: it reads an absent word as `unknown`, ships with `ROOMLER__RC__GUI_WORKER_READ` off, and while the switch is off it changes nothing a row says, so P0's RED read stays valid after P2 rolls |
+| D3 | as recommended: out of this FR |
+| D4 | as recommended: `gui_worker` on the wire, "screen worker" on screen, the three states and five reasons above. P2 adds the type the server stores, so the spellings are fixed when P2 merges, and after that they are only ever added to |
+| D5 | as recommended; it is P1's |
+| D6 | **open**: P3 rules it with P0's reads in hand |
 
 - **D1, one field for all platforms, or macOS only?** Recommended: one field whose name says no OS, produced only by a
   Mac's daemon in this FR. Only macOS has a supervised worker

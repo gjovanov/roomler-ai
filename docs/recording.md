@@ -1515,8 +1515,8 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:481` (`SessionParams::record`), `agents/roomlerd/src/signaling.rs:4281` (sent AFTER the consent mode is resolved), `agents/roomlerd/src/signaling.rs:3200` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1105`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1961` (`effective_record`), `agents/roomlerd/src/signaling.rs:7147` (`Announcer::now`, which the hello and every heartbeat announce, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| The record context crosses | `delegate.rs:481` (`SessionParams::record`), `agents/roomlerd/src/signaling.rs:4287` (sent AFTER the consent mode is resolved), `agents/roomlerd/src/signaling.rs:3206` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1105`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1961` (`effective_record`), `agents/roomlerd/src/signaling.rs:7166` (`Announcer::now`, which the hello and every heartbeat announce, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
 | An OFF is live | `remote.rs:600` (`subscribe_gates`), `delegate_worker.rs:625-644` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
 | The worker's account of a recording | `delegate.rs:1874` (noted where the grant crosses), `delegate.rs:2603` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:805`). The server bounds it again to a live session of this agent |
 
@@ -1682,9 +1682,9 @@ signals that session and never terminates the channel.
 A recording that a person keeps somewhere synced is theirs to sync. That is why
 the default folder stays out of OneDrive (§4).
 
-The conference module's call recordings are a different feature with its own
-storage. `crates/tests/src/recording_tests.rs` tests those, and
-`remote_recording_tests.rs` tests this one.
+The conference module's call recordings are a different thing: rows only, since
+nothing records a call (#4163). `crates/tests/src/recording_tests.rs` tests
+those rows, and `remote_recording_tests.rs` tests this feature.
 
 ### The microphone is the person's
 

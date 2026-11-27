@@ -485,7 +485,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1419`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1427`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -531,13 +531,13 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:130`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`agents/roomlerd/src/signaling.rs:7152`). A changed brief (a login, a
-logout, the greeter) re-announces the caps on the next heartbeat (`:2687`).
+heartbeat only read that cache (`agents/roomlerd/src/signaling.rs:7171`). A changed brief (a login, a
+logout, the greeter) re-announces the caps on the next heartbeat (`:2693`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
 
 The brief rides `agents.capabilities`, so the device listing returns it with no
-server change. The count is one aggregate (`crates/api/src/routes/stats.rs:357`),
+server change. The count is one aggregate (`crates/api/src/routes/stats.rs:359`),
 grouped by `type` and `capture_arm`, with `total` and `online`:
 
 | route | scope |
@@ -985,7 +985,7 @@ stderr), a thread that follows that stderr, and the wait for `ready`, 5 s at
 most. A keeper the daemon gives up on adds up to 1 s, the wait to collect it
 after its SIGKILL. A Remote Apps launch on the desktop waits for the keeper's
 answer at most 4 s, the start's 3 s and 1 s of slack, on the blocking thread
-that serves the request (`peer.rs:11421`) and outside the daemon's state lock;
+that serves the request (`peer.rs:11424`) and outside the daemon's state lock;
 its write never waits.
 
 **What a person notices.** A program started from a terminal that the
@@ -2198,7 +2198,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:7345`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7299`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2962,7 +2962,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1170-1257`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3293-3303`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3321-3331`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
@@ -3013,7 +3013,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`app.rs:4747-4768`, `watchdog.rs:628`) and it forced
+watchdog's 90 s window (`app.rs:4701-4722`, `watchdog.rs:628`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a

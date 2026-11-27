@@ -1116,6 +1116,27 @@ pub struct RcSettings {
     /// it at 120 s. Env: `ROOMLER__RC__SESSION_RESUME_SECS`.
     #[serde(default)]
     pub session_resume_secs: u64,
+    /// FR-157 P2 — read a Mac's screen-worker word (`capabilities.gui_worker`):
+    /// the `gui_workers` counts in the org and platform overviews, the device
+    /// list's `?gui_worker=` filter, and the word in the device list's rows.
+    /// Default **false**: the overviews carry no `gui_workers`, the rows leave
+    /// the word out and the filter is refused with this switch's name, so
+    /// nothing a response says changes. The word is stored with the caps
+    /// either way. P4 turns it on once its field cells read green.
+    /// Env: `ROOMLER__RC__GUI_WORKER_READ`.
+    #[serde(default)]
+    pub gui_worker_read: bool,
+    /// FR-159 P1 — a tunnel-client enrollment that carries the client's own
+    /// `instance_id` is keyed by it: the row that holds it is revived, else an
+    /// unclaimed row with the request's `machine_id` is claimed once, else the
+    /// client gets a row of its own. Default **true**: a request without the
+    /// field is answered as before, and no client sends it before P2. `false`
+    /// is the kill switch for a P1 fault, not a setting to leave off: every
+    /// request is looked up by `machine_id` alone, no `instance_id` is written,
+    /// and a request that carried one is answered `keyed_by: machine_id`.
+    /// Env: `ROOMLER__RC__TUNNEL_INSTANCE_ID`.
+    #[serde(default = "default_true")]
+    pub tunnel_instance_id: bool,
 }
 
 fn default_agent_token_ttl_secs() -> u64 {
@@ -1148,6 +1169,8 @@ impl Default for RcSettings {
             org_session_cap: true,
             session_slots: false,
             session_resume_secs: 0,
+            gui_worker_read: false,
+            tunnel_instance_id: true,
         }
     }
 }
@@ -1656,6 +1679,8 @@ impl Settings {
             .set_default("rc.org_session_cap", true)?
             .set_default("rc.session_slots", false)?
             .set_default("rc.session_resume_secs", 0)?
+            .set_default("rc.gui_worker_read", false)?
+            .set_default("rc.tunnel_instance_id", true)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

@@ -106,13 +106,13 @@ flowchart TD
 
 Home: `crates/agent-core/src/machine_tree/held.rs`, a child module of `machine_tree.rs` (already 4,000 lines),
 re-exported as `machine_tree::{HeldPath, Seal, Refusal, Why, TreeRemoval}`. It reuses `win::open`,
-`win::open_below`, `win::delete_by_handle`, `win::set_sd` (`machine_tree.rs:2119`) and `sealed_aces`
-(`:550-567`). Windows only.
+`win::open_below`, `win::delete_by_handle`, `win::set_sd` (`machine_tree.rs:2261`) and `sealed_aces`
+(`:628-645`). Windows only.
 
 **As built in P1 (#3758, accepted 2026-11-12):** the module is public, `machine_tree::held`, and the re-export is
 `machine_tree::{HeldEntry, HeldPath, Seal, TreeRemoval, Why}`. The refusal stays
 `machine_tree::held::Refusal`: `machine_tree::Refusal` is already FR-94's, the machine config's refusal
-(`crates/agent-core/src/machine_tree.rs:453`), so the helper's cannot take that name.
+(`crates/agent-core/src/machine_tree.rs:531`), so the helper's cannot take that name.
 
 | Call | What it does |
 |---|---|
@@ -138,8 +138,8 @@ short name, and that is the name a test's lines show.
 
 | `Seal` | Owner and DACL | Used for |
 |---|---|---|
-| `Private` | owner Administrators; protected; SYSTEM and Administrators full control, inherited by what is made below (`sealed_aces`, `machine_tree.rs:550-567`) | the companion's launch marker |
-| `Readable` | `Private`, plus Users read, list and traverse (`0x1200a9`, as `record_aces` gives the attempt record, `machine_tree.rs:569-583`) | `service-logs` and its files, `crashes` (D10), the attempt record, the machine attention file, the presence lock |
+| `Private` | owner Administrators; protected; SYSTEM and Administrators full control, inherited by what is made below (`sealed_aces`, `machine_tree.rs:628-645`) | the companion's launch marker |
+| `Readable` | `Private`, plus Users read, list and traverse (`0x1200a9`, as `record_aces` gives the attempt record, `machine_tree.rs:647-661`) | `service-logs` and its files, `crashes` (D10), the attempt record, the machine attention file, the presence lock |
 
 Notes on the calls:
 
@@ -153,7 +153,7 @@ Notes on the calls:
   the flag did.
 - A held folder is opened with list, traverse, read-attributes, `READ_CONTROL` and `SYNCHRONIZE`; with
   `WRITE_DAC` and `WRITE_OWNER` too when it is a leaf the policy may seal, and `DELETE` when it may be moved aside
-  or removed. #3743's `win::open` asks for `READ_CONTROL` alone (`machine_tree.rs:1721`), so `held.rs` opens its
+  or removed. #3743's `win::open` asks for `READ_CONTROL` alone (`machine_tree.rs:1841`), so `held.rs` opens its
   own handles and wraps them in a `HeldFolder` rather than widening the anchor reader's.
 - **As built in P1 (accepted 2026-11-12), a reader's way through a folder it may not list:** a name that a read walk
   (`walk`, `open_dir`, `below`) passes through, and that the caller may not open with that set, is held with
@@ -172,7 +172,7 @@ Notes on the calls:
   crash record walks three or four components; a log rotation opens one file below a folder already held.
 - A token that may not name Administrators as an owner (an unelevated test) gets `STATUS_INVALID_OWNER`; the helper
   then makes the entry with the protected DACL and the caller as its owner, as `seal_new_file`'s doc already
-  allows (`machine_tree.rs:1436-1446`). SYSTEM and an elevated administrator always get Administrators.
+  allows (`machine_tree.rs:1556-1566`). SYSTEM and an elevated administrator always get Administrators.
   **As built after review, never on a thread that acts as another account:** a thread that holds an
   impersonation token (read from its effective token; a query that fails counts as one) is refused instead, and
   the site logs its one line. A crash recorded on such a thread (a panic inside `as_session_user`, a transfer
@@ -245,7 +245,7 @@ meets a link or is refused, naming the path. `remove_tree` takes `dry_run`: its 
 
 ### P1: #3743's readers (D6)
 
-`PrivateFolder::open` (`machine_tree.rs:1572-1586`) becomes `HeldPath::base(&machine_program_data())` and `walk`,
+`PrivateFolder::open` (`machine_tree.rs:1692-1706`) becomes `HeldPath::base(&machine_program_data())` and `walk`,
 plus its verdict, and the earlier anchor files' deletes (`exec_service.rs:1501-1514`) the same, so their way down
 is by handle too. #3743's elevated tests already cover both.
 
@@ -289,9 +289,9 @@ above).
 | the SystemContext attempt record (`agents/roomlerd/src/win_service/system_context_attempt.rs:151-155`, `:178-197`) | `create_dir_all(parent)`, `create_fresh(tmp)`, `seal_new_record`, `fs::rename` | `HeldPath` on the machine parent, `write_file(.., Seal::Readable)` |
 | the machine attention file (`crates/agent-core/src/notify.rs:113-138`, `:166-177`, `:210-214`, `:234-244`) | `create_dir_all`, `fs::write`, `remove_file` | `write_file` and `remove_file`, `Seal::Readable`; a person's own attention file in their profile is unchanged |
 | the companion's launch marker (`agents/roomlerd/src/companion/launch_once.rs:144-173`, `:177-196`, `:469`) | `create_dir_all`, `create_new`, `remove_file` | `write_file_new` (the first one wins, as `create_new` does today), `remove_file`, `Seal::Private` |
-| the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7717`) reads through the same `HeldPath` (D4) |
-| the machine config's saves (`crates/agent-core/src/config.rs:3984`, `:4754`, `:4957`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
-| the repair's and the adoption's opens (`machine_tree.rs:640-642`, `:962-964`) | `win::open` of the whole path | `HeldPath::walk` |
+| the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7671`) reads through the same `HeldPath` (D4) |
+| the machine config's saves (`crates/agent-core/src/config.rs:4012`, `:4782`, `:5004`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
+| the repair's and the adoption's opens (`machine_tree.rs:718-720`, `:1040-1042`) | `win::open` of the whole path | `HeldPath::walk` |
 | the one-time segment move (`appdirs.rs:873`, `:1133`, `:1156`, `:1261`, `:1379`) | renames and removes by path | per D7 |
 | the gate (D8) | none | a test in `crates/agent-core` that fails on a new `std::fs` create, write, rename or remove of a path built from `machine_global_dir()` or `machine_program_data()` outside `machine_tree::held` |
 
@@ -299,7 +299,7 @@ above).
 
 `ROOMLERD_MACHINE_TREE_HELD=0` (or `false`, `no`, `off`; `ROOMLER_NODE_MACHINE_TREE_HELD` is read too): a third
 field of `Switches`, beside FR-94's `ROOMLERD_MACHINE_TREE_REPAIR` and `ROOMLERD_MACHINE_TREE_CHECK`
-(`machine_tree.rs:373-406`), read through `switched_off("MACHINE_TREE_HELD")` (`:408-413`), from the process
+(`machine_tree.rs:451-484`), read through `switched_off("MACHINE_TREE_HELD")` (`:486-491`), from the process
 environment only (the service's `Environment` block), never from the config.
 
 - Off: the crash recorder (P1), the log writer and the other `service-logs` writers (P2), and the P3 writers write
@@ -319,10 +319,10 @@ them.
 
 - Junctions (`mklink /J`) need no privilege, so most cases run on every Windows lane. A case that needs an owner
   other than the test's own account, Administrators as an owner at creation, or a symbolic link starts with #3743's
-  `test_support::elevated_or_skip` (`machine_tree.rs:2744-2770`): a loud skip locally, a failure in the lane that
+  `test_support::elevated_or_skip` (`machine_tree.rs:2876-2902`): a loud skip locally, a failure in the lane that
   sets `ROOMLERD_TEST_REQUIRE_ELEVATED`.
-- The swap case uses #3743's `test_support::between_check_and_use` (`machine_tree.rs:3058-3060`), run from
-  `HeldPath`'s step loop as `HeldFolder::file` runs it (`:1503-1504`). **As built in P1 (accepted 2026-11-12):**
+- The swap case uses #3743's `test_support::between_check_and_use` (`machine_tree.rs:3206-3208`), run from
+  `HeldPath`'s step loop as `HeldFolder::file` runs it (`:1623-1624`). **As built in P1 (accepted 2026-11-12):**
   the hook runs once, when a walk holds its last name, before the first act below it, and not at every step:
   D6 puts #3743's readers on the walk, and #3743's swap cases (`exec_service`'s
   `the_copy_reads_the_file_of_the_folder_it_checked` and
@@ -400,7 +400,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 
 The docs:
 
-- `docs/installation.md`, the clean-up's row (`docs/installation.md:2005`) and wherever it describes
+- `docs/installation.md`, the clean-up's row (`docs/installation.md:2013`) and wherever it describes
   `cleanup-legacy-install`: every removal acts through the folder it checked and leaves a path with a link on it,
   with a report line; the per-user arm reads the profile the system records for the session's account, and removes
   nothing when none is recorded.
@@ -459,11 +459,11 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - **D4. The presence lock's folder**, which sits directly below `%ProgramData%`, outside the machine folder
   (`peer_presence.rs:83-89`). Options: keep its path, behind `HeldPath`; or move it below the machine folder.
   **Default: keep the path, behind `HeldPath`, in P3.** The leaf policy covers it, and moving it changes what its
-  reader reads (`app.rs:7717`) for no gain.
+  reader reads (`app.rs:7671`) for no gain.
 - **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1694-1696`). Options: in this FR; a design pass of
   its own. **Default: a design pass of its own**, outside this FR: staging has a pipeline of its own, and its
   layout is that pass's to decide.
-- **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1572-1586`; the earlier anchor
+- **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1692-1706`; the earlier anchor
   files' deletes, `exec_service.rs:1501-1514`). Options: the helper's PR; the next one. **Default: the helper's
   PR.** A few lines, and #3743's elevated tests already cover both.
 - **D7. The one-time segment move** (`appdirs.rs:873`, `:1133`, `:1156`, `:1261`, `:1379`). Options: onto a rename by
