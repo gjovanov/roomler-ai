@@ -107,7 +107,10 @@ impl RecordOptions {
 
 /// FR-85 P7 — what answers "how much room is left in this folder?". The real
 /// one is [`folder::available_space`]; a test hands in a slow one, to prove the
-/// paced loop never waits for it.
+/// paced loop never waits for it, or one that records what it was asked.
+/// #3355 — three readers ask it: the start gate and the continue gate about
+/// the staging folder, and the stop path's remux about the folder its copy goes
+/// to.
 #[derive(Clone)]
 pub struct FreeSpace(Arc<FreeSpaceFn>);
 
@@ -849,12 +852,21 @@ pub async fn run_with_audio(
         fragments = stats.fragments,
         "recording: stopped — finalizing"
     );
-    let finalized = tokio::task::block_in_place(|| finalize_into_place(&partial, &dest));
+    // #3355 — the copy's room is the recorder's own probe's answer, about the
+    // folder the copy goes to.
+    let finalized = tokio::task::block_in_place(|| {
+        finalize_into_place(&partial, &dest, |d| opts.free_space.of(d))
+    });
     let (path, fragmented, bytes, duration_ms) = match finalized {
         Ok(s) => (Some(dest.clone()), false, s.bytes, s.duration_ms),
         Err(e) => {
             // Keep what exists: a fragmented MP4 still plays nearly everywhere.
-            tracing::warn!(%e, "recording: the remux failed — keeping the fragmented file");
+            // The whole chain (#3355): `%e` printed only the outermost context,
+            // "remux failed", and never the cause under it.
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "recording: the remux failed — keeping the fragmented file"
+            );
             match std::fs::rename(&partial, &dest) {
                 Ok(()) => (
                     Some(dest.clone()),
@@ -1032,12 +1044,18 @@ impl Drop for PartialLock {
     }
 }
 
-/// Remux `partial` to `dest` and remove the partial on success.
-fn finalize_into_place(partial: &Path, dest: &Path) -> Result<mp4::FinalizeSummary> {
+/// Remux `partial` to `dest` and remove the partial on success. `room` answers
+/// how many bytes the copy may take in `dest`'s folder
+/// ([`mp4::finalize_with_room`]).
+fn finalize_into_place(
+    partial: &Path,
+    dest: &Path,
+    room: impl Fn(&Path) -> Option<u64>,
+) -> Result<mp4::FinalizeSummary> {
     if dest.exists() {
         return Err(anyhow!("{} already exists", dest.display()));
     }
-    let s = mp4::finalize(partial, dest)?;
+    let s = mp4::finalize_with_room(partial, dest, room)?;
     let _ = std::fs::remove_file(partial);
     Ok(s)
 }
@@ -1047,8 +1065,9 @@ fn finalize_into_place(partial: &Path, dest: &Path) -> Result<mp4::FinalizeSumma
 /// finished paths. Only a partial the file itself shows to be empty is removed
 /// ([`mp4::NothingRecoverable`]). One whose remux failed goes under its final
 /// name as it is, the stop path's rule, and stays for the next start only if
-/// that fails too. One whose [`PartialLock`] is held belongs to a live recorder
-/// and is left alone.
+/// that fails too. One whose final name is already taken is not touched: it
+/// stays in staging at this start and at every later one. One whose
+/// [`PartialLock`] is held belongs to a live recorder and is left alone.
 pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(staging) else {
         return Vec::new();
@@ -1081,7 +1100,7 @@ pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
         if dest.exists() {
             continue;
         }
-        let s = match finalize_into_place(&p, &dest) {
+        let s = match finalize_into_place(&p, &dest, folder::available_space) {
             Ok(s) => s,
             Err(e) if e.is::<mp4::NothingRecoverable>() => {
                 tracing::warn!(%e, partial = %p.display(), "recording: an interrupted partial holds nothing recoverable — removing it");

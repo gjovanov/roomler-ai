@@ -148,9 +148,10 @@
 #     the vendored webrtc crate's `RTCSctpTransport::mark_deadline_stream`
 #     reaches it), for the agent's deadline video channel: unordered with
 #     `maxRetransmits: 0`, on carriers that deliver in order (the mesh relay,
-#     TURN over TCP or TLS). Nothing sets the mark yet, and an association
-#     with no marked stream sends what it sent before, byte for byte. Once a
-#     stream is marked, the association:
+#     TURN over TCP or TLS). The agent's lane sets it under `video_deadline`
+#     `on` (FR-148 P4b-3), and an association with no marked stream sends
+#     what it sent before, byte for byte. Once a stream is marked, the
+#     association:
 #     - serves ordered and unordered messages in the order they were written
 #       (each chunk carries the order the pending queue took it in). Upstream
 #       serves the unordered queue first at every message boundary, so video
@@ -173,6 +174,12 @@
 #     written, with and without a mark; one chunk lost and nothing lost;
 #     T3-rtx, marked and not; FORWARD TSNs per SACK under a steady load; four
 #     seeds of random traffic, each the same digest as before).
+#   - src/association/association_internal.rs and src/association/mod.rs
+#     (FR-148 P4b): `Association::deadline_streams`, the streams marked
+#     deadline-limited, in ascending order: a read that marks nothing, so a
+#     caller can say which stream a mark reached (the vendored webrtc crate's
+#     `RTCSctpTransport::deadline_streams` reaches it, and the agent's cells
+#     read it). deadline_test.rs holds its test.
 #   - src/association/pacer.rs, src/association/association_internal.rs and
 #     src/association/mod.rs (FR-148 P0, D43, D64, D65): a pacer, off unless a
 #     writer turns it on (`Association::pacer`, a lock-free `PaceSwitch`).

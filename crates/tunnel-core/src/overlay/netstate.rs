@@ -1955,6 +1955,10 @@ sockaddrs: <DST,GATEWAY>
     }
 
     impl Logs {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+        )]
         fn start() -> (Self, tracing::subscriber::DefaultGuard) {
             let logs = Self::default();
             let subscriber = tracing_subscriber::fmt()

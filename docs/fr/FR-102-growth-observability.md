@@ -335,7 +335,11 @@ sequenceDiagram
   pair and, when it rides the overlay, the overlay runtime's own carrier for the peer (the LocalAPI lookup
   the bitrate probe already makes), and records `direct` · `turn` · `turn_local` · `overlay_direct` ·
   `overlay_turn` · `derp` · `org_relay` · `unknown` (`roomlerd::session_carrier`, a pure mapping tested for
-  every kind). ⚠️ A relay kind the build does not know, an older daemon, a tunnel/blocked/offline peer, or
+  every kind). A `prflx` remote counts as the far end's relay, and records `turn` or `turn_local` as a
+  signalled relay remote does, only when the agent holds a relay candidate the far end signalled at the
+  prflx's exact address, port and transport (#3259: the relay learnt from its first check, before its
+  candidate came); the carrier line says so in `remote_relay`
+  ([remote-control.md §11.9](../remote-control.md#119-the-carrier-a-session-rides-fr-102-p9c)). ⚠️ A relay kind the build does not know, an older daemon, a tunnel/blocked/offline peer, or
   nothing learned is **`unknown`, never `direct`** — the `is_direct()` trap CLAUDE.md warns of, closed. Read
   once after a 2 s settle (Chrome renominates relay→direct a moment after Connected), then additive on every
   `rc:session.stats` (`#[serde(default)]`): an older server ignores it, absent is unknown. Stored on

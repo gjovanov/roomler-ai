@@ -17,7 +17,7 @@
 //! cost regardless of uptime.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -138,13 +138,23 @@ pub fn init() -> Option<PathBuf> {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let stderr = fmt::layer().with_target(false).with_writer(std::io::stderr);
+    // #3938 — coloured only when stderr is a terminal and NO_COLOR is unset or
+    // empty: started at login, the tray's stderr is a file, the journal or nothing.
+    let colour = roomler_node_core::logging::colour(
+        std::io::stderr().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    );
+    let stderr = console_layer(std::io::stderr, colour);
     let path = default_path();
     let file = path
         .as_ref()
         .and_then(|p| CappedFile::open(p.clone(), MAX_BYTES).ok());
     match file {
         Some(f) => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the companion's log file: never coloured (root clippy.toml, #3938)"
+            )]
             let file_layer = fmt::layer()
                 .with_target(false)
                 .with_ansi(false)
@@ -164,6 +174,32 @@ pub fn init() -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// #3938 — the stderr layer [`init`] installs: the companion's lines with no
+/// target, written into `writer`, coloured only when `colour` says so
+/// (`roomler_node_core::logging::colour`, asked of stderr).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the companion's console: its colour is the caller's, from roomler_node_core::logging::colour (root clippy.toml, #3938)"
+)]
+fn console_layer<S, W>(
+    writer: W,
+    colour: bool,
+) -> tracing_subscriber::fmt::Layer<
+    S,
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format,
+    W,
+>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_writer(writer)
+        .with_ansi(colour)
 }
 
 #[cfg(test)]
@@ -249,5 +285,83 @@ mod tests {
             rotated_path(Path::new("C:/x/desktop.log")),
             PathBuf::from("C:/x/desktop.log.1")
         );
+    }
+
+    /// #3938 — the stderr layer's colour. Each test writes one event with a
+    /// field through [`console_layer`], the layer [`init`] installs, into a
+    /// buffer and under a scoped subscriber: the test binary shares its process.
+    mod colour {
+        use super::super::*;
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        /// What the companion's stderr would have received.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// The line [`console_layer`] writes.
+        fn written(colour: bool) -> String {
+            let out = Captured::default();
+            let subscriber =
+                tracing_subscriber::registry().with(console_layer(out.clone(), colour));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(peers = 3, "a companion line with a field");
+            });
+            let bytes = out.0.lock().unwrap().clone();
+            String::from_utf8(bytes).expect("the log is UTF-8")
+        }
+
+        /// With colour off the line holds no ESC byte, and its text is the same.
+        #[test]
+        fn a_stderr_line_without_colour_holds_no_escape_byte() {
+            let line = written(false);
+            assert!(
+                line.contains("a companion line with a field"),
+                "the event is written: {line:?}"
+            );
+            assert!(
+                !line.contains('\x1b'),
+                "no colour code when colour is off: {line:?}"
+            );
+            assert!(
+                line.contains(" INFO "),
+                "the level reads as before: {line:?}"
+            );
+            assert!(
+                line.contains("peers=3"),
+                "the field reads as before: {line:?}"
+            );
+        }
+
+        /// A terminal keeps its colour: the codes are there, around the same text.
+        #[test]
+        fn a_stderr_line_with_colour_holds_escape_codes() {
+            let line = written(true);
+            assert!(
+                line.contains("a companion line with a field"),
+                "the event is written: {line:?}"
+            );
+            assert!(
+                line.contains('\x1b'),
+                "a terminal gets colour codes: {line:?}"
+            );
+        }
     }
 }

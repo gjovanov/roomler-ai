@@ -39,6 +39,11 @@ mod conference_view_tests;
 mod export_tests;
 #[cfg(test)]
 mod file_tests;
+/// FR-157 P2 — the server's read of a Mac's screen-worker word: the counts in
+/// both overviews, the device list's filter, and none of it while
+/// `rc.gui_worker_read` is off.
+#[cfg(test)]
+mod gui_worker_tests;
 /// An org membership takes its room memberships with it; an operator step
 /// ends the rows an org membership left before that.
 #[cfg(test)]

@@ -605,6 +605,10 @@ fn pct(x: Option<f64>) -> String {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a developer's example, never shipped: the library's own colour (root clippy.toml, #3938)"
+    )]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

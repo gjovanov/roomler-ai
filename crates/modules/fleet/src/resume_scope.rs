@@ -454,12 +454,14 @@ mod tests {
                 2,
                 true,
                 false,
+                0,
                 ResumeHello {
                     advertised,
                     window,
                     kept: Vec::new(),
                 },
             )
+            .expect("no rotation floor here")
             .rx
         };
         let told = |rx: &mut tokio::sync::mpsc::Receiver<ServerMsg>| -> Vec<u32> {

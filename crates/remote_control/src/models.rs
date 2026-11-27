@@ -639,6 +639,14 @@ pub struct AgentCaps {
     /// heartbeat when it changes. `None` off Linux and from older agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<DesktopBrief>,
+    /// FR-157 — the screen worker this Mac's daemon supervises, as its
+    /// delegation channel and its supervisor see it. `None` = not reported:
+    /// an agent older than FR-157 P1, the worker itself, and every platform
+    /// but macOS (D1). Every reader reads `None` as
+    /// [`GuiWorkerBrief::UNKNOWN`], never as attached or not. A CLAIM by the
+    /// host, like `desktop`: the server counts it and never enforces on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_worker: Option<GuiWorkerBrief>,
     /// FR-101 P2b — the device's OWN session policy (its owner's `rc_clipboard`,
     /// `rc_files`, `rc_audio`), so the hub can strip what this device will
     /// refuse and say why (`device_policy_off`) instead of the viewer finding
@@ -2030,6 +2038,45 @@ pub struct DesktopBrief {
     /// `full` · `xwayland_only` · `none`: how far a controller's input would
     /// reach (the `rc:input-reach` words).
     pub input_reach: String,
+}
+
+/// FR-157 — whether a Mac's screen worker is attached, and why not, as the
+/// daemon that supervises it says. A CLAIM by the host, counted by the server
+/// and never enforced on, like [`DesktopBrief`]: no session decision, consent
+/// check, permission or ACL reads it. Strings, not enums, for the
+/// additive-wire reason: a newer agent's state or reason must reach an older
+/// reader as a word it can show, not as a parse failure.
+///
+/// The spellings are fixed ([`Self::STATES`], [`Self::REASONS`], locked by
+/// test) and only ever added to.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GuiWorkerBrief {
+    /// `unsupervised` · `attached` · `not-attached`.
+    pub state: String,
+    /// With `not-attached` only: `no-console-user` · `launchd-owns` ·
+    /// `starting` · `gave-up` · `supervisor-off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `macos_one_row` is set in the daemon's config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub one_row: bool,
+}
+
+impl GuiWorkerBrief {
+    /// The states a daemon may send, in wire spelling.
+    pub const STATES: [&'static str; 3] = ["unsupervised", "attached", "not-attached"];
+    /// The reasons a `not-attached` word may carry, in wire spelling.
+    pub const REASONS: [&'static str; 5] = [
+        "no-console-user",
+        "launchd-owns",
+        "starting",
+        "gave-up",
+        "supervisor-off",
+    ];
+    /// The server's word for a row that carries no `gui_worker`: an agent
+    /// older than FR-157 P1, or a platform that sends none. No agent sends
+    /// it.
+    pub const UNKNOWN: &'static str = "unknown";
 }
 
 /// FR-92 P5b — what a device says about its keep busy, on every heartbeat.
@@ -3558,12 +3605,22 @@ pub struct TunnelClient {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     /// True once an admin renamed this client server-side (see
-    /// `Agent::name_admin_set` — same rehydrate-clobber protection; a
-    /// CLIENT-side rename can't rename in place at all, it derives a new
-    /// machine_id and enrolls a new row).
+    /// `Agent::name_admin_set` — same rehydrate-clobber protection). A
+    /// CLIENT-side rename of an older client can't rename in place at all: it
+    /// derives a new machine_id and enrolls a new row. An FR-159 client found
+    /// by its `instance_id` is renamed in place, unless this is set.
     #[serde(default)]
     pub name_admin_set: bool,
+    /// The id an older client sends: a hash of its name and its host
+    /// (`roomler enroll`'s `derive_machine_id`). Written once, at the insert,
+    /// and never after: the client's overlay node is keyed by it. A row an
+    /// FR-159 client creates holds that client's `instance_id` here too.
     pub machine_id: String,
+    /// FR-159 — the id of the install that holds this row: one it made at
+    /// random and keeps on its machine. Absent on a row no FR-159 client has
+    /// claimed, and never cleared. Unique per tenant where it is a string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     pub os: OsKind,
     pub client_version: String,
     pub status: AgentStatus,
@@ -9586,6 +9643,130 @@ mod tests {
         .unwrap();
         assert_eq!(future.capture_arm, "pipewire-direct");
         assert_eq!(future.kind, "mir");
+    }
+
+    /// FR-157 — the screen worker's word. Caps without it carry no key and
+    /// parse to `None`, which every reader reads as `unknown`; a word carries
+    /// `reason` and `one_row` only when it has them; and a newer agent's word,
+    /// with a key, a state or a reason this build has never heard of, still
+    /// parses as words.
+    #[test]
+    fn gui_worker_wire_shape_is_locked_and_additive() {
+        // No word (an agent older than P1, any OS but macOS): nothing on the
+        // wire, and an older agent's caps parse to `None`.
+        let wire = serde_json::to_string(&AgentCaps::default()).unwrap();
+        assert!(!wire.contains("gui_worker"), "{wire}");
+        let old: AgentCaps = serde_json::from_str(
+            r#"{"hw_encoders":[],"codecs":["h264"],"has_input_permission":true,"supports_clipboard":false,"supports_file_transfer":false,"max_simultaneous_sessions":1}"#,
+        )
+        .unwrap();
+        assert!(old.gui_worker.is_none());
+
+        // #3802's state, on the wire and back.
+        let gave_up = GuiWorkerBrief {
+            state: "not-attached".into(),
+            reason: Some("gave-up".into()),
+            one_row: true,
+        };
+        let caps = AgentCaps {
+            gui_worker: Some(gave_up.clone()),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&caps).unwrap();
+        assert_eq!(
+            wire["gui_worker"],
+            serde_json::json!({ "state": "not-attached", "reason": "gave-up", "one_row": true })
+        );
+        let back: AgentCaps = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.gui_worker, Some(gave_up));
+
+        // A healthy two-row Mac: no reason and not one row, so neither key.
+        let two_row = GuiWorkerBrief {
+            state: "unsupervised".into(),
+            reason: None,
+            one_row: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&two_row).unwrap(),
+            serde_json::json!({ "state": "unsupervised" })
+        );
+        let back: GuiWorkerBrief = serde_json::from_str(r#"{"state":"unsupervised"}"#).unwrap();
+        assert_eq!(back, two_row);
+
+        // A newer agent's word: an unknown key inside it, and a state and a
+        // reason this build has never heard of.
+        let future: AgentCaps = serde_json::from_str(
+            r#"{"hw_encoders":[],"codecs":[],"has_input_permission":false,"supports_clipboard":false,"supports_file_transfer":false,"max_simultaneous_sessions":1,"gui_worker":{"state":"paused","reason":"asleep","since":12,"extra":{"a":1}}}"#,
+        )
+        .unwrap();
+        let word = future.gui_worker.expect("the word parses");
+        assert_eq!(word.state, "paused");
+        assert_eq!(word.reason.as_deref(), Some("asleep"));
+        assert!(!word.one_row);
+    }
+
+    /// FR-157 — an older reader. A server built before the word has an
+    /// `AgentCaps` with no field for it, and `AgentCaps` has no
+    /// `deny_unknown_fields`, so it parses caps that carry the word and keeps
+    /// the rest. `OlderCaps` is such a reader; the second half keeps this
+    /// build such a reader for the next word.
+    #[test]
+    fn an_older_reader_parses_caps_that_carry_the_gui_worker_word() {
+        #[derive(Deserialize)]
+        struct OlderCaps {
+            codecs: Vec<String>,
+            #[serde(default)]
+            permissions: Option<Vec<String>>,
+        }
+        let caps = AgentCaps {
+            codecs: vec!["h264".into()],
+            permissions: Some(vec!["no-gui-session".into()]),
+            gui_worker: Some(GuiWorkerBrief {
+                state: "not-attached".into(),
+                reason: Some("no-console-user".into()),
+                one_row: true,
+            }),
+            ..Default::default()
+        };
+        let wire = serde_json::to_string(&caps).unwrap();
+        assert!(wire.contains("\"gui_worker\""), "{wire}");
+        let older: OlderCaps = serde_json::from_str(&wire).expect("an older reader drops the word");
+        assert_eq!(older.codecs, ["h264"]);
+        // `permissions` keeps its meaning: the word says why, not what.
+        assert_eq!(older.permissions, Some(vec!["no-gui-session".to_string()]));
+
+        // This build drops a word it has never heard of the same way.
+        let mut newer = serde_json::to_value(&caps).unwrap();
+        newer["a_later_word"] = serde_json::json!({ "state": "x" });
+        let parsed: AgentCaps = serde_json::from_value(newer).expect("unknown keys are ignored");
+        assert_eq!(parsed.gui_worker, caps.gui_worker);
+    }
+
+    /// WIRE LOCK. FR-157 (D4, ruled 2026-11-27): the states and reasons are
+    /// fixed when the server's read (P2) merges, and only ever added to. A
+    /// renamed word does not fail loudly: every Mac that sends the old one
+    /// reads as a state nobody counts.
+    #[test]
+    fn gui_worker_spellings_are_locked() {
+        assert_eq!(
+            GuiWorkerBrief::STATES,
+            ["unsupervised", "attached", "not-attached"]
+        );
+        assert_eq!(
+            GuiWorkerBrief::REASONS,
+            [
+                "no-console-user",
+                "launchd-owns",
+                "starting",
+                "gave-up",
+                "supervisor-off"
+            ]
+        );
+        assert_eq!(GuiWorkerBrief::UNKNOWN, "unknown");
+        assert!(
+            !GuiWorkerBrief::STATES.contains(&GuiWorkerBrief::UNKNOWN),
+            "`unknown` is the reader's word for no word, never a daemon's"
+        );
     }
 
     #[test]

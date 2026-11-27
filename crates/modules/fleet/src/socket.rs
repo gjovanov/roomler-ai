@@ -49,6 +49,9 @@ pub async fn handle_agent_socket(
     // pre-S6 agent build); direction input when THIS agent originates
     // tunnel opens toward a foreign-homed target.
     dialed_tid: Option<String>,
+    // FR-155 P1b — the token generation the upgrade admitted this
+    // connection under (its `gen` claim).
+    generation: u32,
 ) {
     info!(%agent_id, %tenant_id, "remote-control agent WS connected");
     let conn_established_ms = bson::DateTime::now().timestamp_millis();
@@ -208,7 +211,7 @@ pub async fn handle_agent_socket(
         refused: refused_claims,
         reaped: reaped_at_registration,
         registered_at,
-    } = state.rc_hub.register_agent_resuming(
+    } = match state.rc_hub.register_agent_resuming(
         agent_id,
         tenant_id,
         owner_user_id,
@@ -216,8 +219,24 @@ pub async fn handle_agent_socket(
         max_sessions,
         input_arbiter,
         supports_exec,
+        generation,
         resume,
-    );
+    ) {
+        Ok(registration) => registration,
+        // FR-155 P1b — the upgrade was checked before a rotation committed,
+        // and the connection reached the hub after its sweep: the floor
+        // refuses it, and nothing was registered. The hello's write is left
+        // for the next hello or the presence sweep to replace: a guarded
+        // Offline write here could land after the new generation's hello,
+        // which this one may have followed, and mark a connected device off.
+        Err(refused) => {
+            info!(
+                %agent_id, generation, floor = refused.floor,
+                "refusing agent WS: admitted below the generation a rotation made"
+            );
+            return;
+        }
+    };
     // FR-138 — the window goes out before anything answers a claim, and a
     // claim refused at once (no window, or past the device's capacity) is
     // answered now.
@@ -1514,6 +1533,8 @@ pub async fn ws_upgrade_agent(
             .unwrap();
     }
     let token_exp = claims.exp;
+    // FR-155 P1b — what the hub keeps for the rotation's sweep and floor.
+    let generation = claims.generation;
 
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
@@ -1575,6 +1596,7 @@ pub async fn ws_upgrade_agent(
                 tenant_id,
                 agent.owner_user_id,
                 tid,
+                generation,
             )
             .await;
         })

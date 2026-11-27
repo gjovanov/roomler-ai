@@ -10,7 +10,7 @@
         </router-link>
 
         <h1 class="text-h4 text-md-h3 font-weight-bold mb-2">Terms of Service</h1>
-        <p class="text-body-2 legal-muted mb-8">Last updated: August 2026</p>
+        <p class="text-body-2 legal-muted mb-8">Last updated: November 2026</p>
 
         <section class="mb-8">
           <h2 class="text-h5 font-weight-bold mb-3">1. Introduction and Acceptance</h2>
@@ -178,17 +178,11 @@
 
         <section class="mb-8">
           <h2 class="text-h5 font-weight-bold mb-3">10. Recording Consent</h2>
-          <p class="text-body-1 legal-muted mb-4">
-            Roomler offers call recording features for video and audio conferences.
-            By using these features, you acknowledge and agree to the following:
+          <p class="text-body-1 legal-muted">
+            Roomler does not record video or audio calls. If you record anything yourself, whether a remote
+            computer's screen with Roomler's screen recording or a call or session with any other tool, you are
+            responsible for complying with all applicable laws regarding recording consent in your jurisdiction.
           </p>
-          <ul class="text-body-1 legal-muted ml-6 mb-2">
-            <li class="mb-1">Recording can only be initiated by authorized participants with appropriate workspace permissions</li>
-            <li class="mb-1">All participants in a call will be notified when recording begins</li>
-            <li class="mb-1">By remaining in a call after recording notification, participants consent to being recorded</li>
-            <li class="mb-1">Recordings are stored according to workspace settings and your subscription plan</li>
-            <li class="mb-1">You are responsible for complying with all applicable laws regarding recording consent in your jurisdiction</li>
-          </ul>
         </section>
 
         <section class="mb-8">

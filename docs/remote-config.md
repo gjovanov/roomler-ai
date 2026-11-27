@@ -211,12 +211,15 @@ found the file matching and answered `noop`. A report is last-write-wins, so any
 reconnect turned the row to `applied` while the daemon still ran the old value,
 and a pod roll did that to every such device at once. The server cannot tell a
 reconnect from a restart, so the device does it: the daemon records what it started
-on (`running_on`, `agents/roomlerd/src/remote_config.rs:332`), and a key the pushed
+on (`running_on`, `agents/roomlerd/src/remote_config.rs:340`), and a key the pushed
 document manages stays in `needs_restart` until this process runs it. A reconnect
 still writes nothing to disk. A local edit waiting on a restart is left out,
 because this report is about the push. A save back to the value this process runs
 leaves nothing waiting, so it reads `applied` at once, and a restart would change
-nothing.
+nothing. The record is of what the process runs, not of the file: a device whose
+start could not mint its SSH host key runs SSH off while the file keeps the
+owner's `ssh_enabled = true` (#3353), so a pushed `true` waits on a restart there
+and never reads `applied`.
 
 Two limits. A build before P1c, which shipped in 0.4.199, still turns the row to
 `applied` at a reconnect, and no capability word marks the difference, so read the
@@ -255,7 +258,7 @@ dropped: a body naming one is refused with a 403 and audited as `device_owned_ke
 refusal is a courtesy to the admin who asked. What stops a compromised server is the
 device, whose frame type drops the key whatever a frame carries
 (`a_pushed_external_key_never_reaches_the_device`,
-`agents/roomlerd/src/remote_config.rs:827`).
+`agents/roomlerd/src/remote_config.rs:845`).
 
 **A non-security key on the same surface (FR-77 P3).** `encoder_cells_deny`
 — the cell matrix's denylist, comma-separated `name:chroma` entries or `none`
@@ -304,10 +307,10 @@ key, recording nothing (`pushed_tribool`,
 `crates/modules/fleet/src/remote_config.rs:235`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
-(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3089`), and a test
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3136`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
-keys beside it (`agents/roomlerd/src/remote_config.rs:557`).
+keys beside it (`agents/roomlerd/src/remote_config.rs:575`).
 
 ⚠️ **Not managed is not a revert.** A device keeps what it was pushed last, so
 an `off` is undone by pushing the default, and only then stopping management:
@@ -325,7 +328,7 @@ on the terms of the two other denylists. It needs `MANAGE_AGENTS` alone, because
 it only ever *removes* a GPU form a device would otherwise open. It reports
 `needs_restart`, because the probe reads it once per process and the encoders
 read it through the config fallbacks
-(`agents/roomlerd/src/remote_config.rs:571`). The server passes it on unread
+(`agents/roomlerd/src/remote_config.rs:589`). The server passes it on unread
 (`crates/modules/fleet/src/remote_config.rs:342`): an entry the gate cannot read
 denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
 It exists so that a GPU-input cell can be turned off from the server before any
@@ -346,7 +349,7 @@ cell through (FR-132 P2,
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:9967`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:10148`); a prefix match would refuse the
 kill switch along with the switch. `qsv_rate_mode`, FR-148 P2's switch that opens a QSV encoder off constant bitrate ([encoders.md](encoders.md#qsv-off-constant-bitrate-fr-148-p2)), is not pushable for the same reason: `DesiredConfig` has no such field, and it is not one of `DeviceSwitch`'s keys yet, so a push naming it is dropped unread with the body's other unknown keys and answers 200 having changed nothing. `rc_carrier_rank`, FR-148 P4's switch that ranks a session's mesh candidates below every TURN relay ([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)), is not pushable the same way, and neither is `path_model`, FR-148 P1's switch that lets the path memory open a relayed session ([rate-control.md](rate-control.md#the-switch-d28)), nor `inflight_budget`, FR-148 D46's switch that computes the in-flight budget on the data-channel pumps and, under `on`, lets it hold a relayed session's frames in place of the relay byte gate and the VP9-444 watermark ([rate-control.md](rate-control.md#the-budgets-switch)).
 
 ⚠️ **A push reaches a connected device within seconds, and takes effect at the
@@ -370,7 +373,7 @@ sessions back to code the device already ran, or clears the list back to the
 built-in defaults, and never further, because nothing pushed can turn a path's new
 code on ahead of its default. The server checks the value's shape and refuses a
 spelling no device could read with a 400 (`check_media_path_list`,
-`crates/remote_control/src/models.rs:3113`, called at
+`crates/remote_control/src/models.rs:3160`, called at
 `crates/modules/fleet/src/remote_config.rs:317`), so `media-plan` or `Media_Plan`
 never reads as applied while doing nothing. It does not check the names, which
 belong to the device's build: it stores the value as given
@@ -380,9 +383,9 @@ nothing, and still sits in its file for the release that knows it.
 
 It is **live**, unlike the four before it. Its one read site is each session's
 open (`RemoteConfigServices::media_paths_with`,
-`agents/roomlerd/src/remote_config.rs:278`), so a push applies from the device's
+`agents/roomlerd/src/remote_config.rs:286`), so a push applies from the device's
 next session with no restart, and the device reports it under `live`, never
-`needs_restart` (`agents/roomlerd/src/remote_config.rs:598`). A session never
+`needs_restart` (`agents/roomlerd/src/remote_config.rs:616`). A session never
 changes path mid-flight.
 
 | pushed `rc_media_legacy` | what the device's key becomes |
@@ -401,7 +404,7 @@ opt-in's bargain (§2), and it is why the owner's lasting remedy is the opt-in.
 which a push to the root's row never reaches. So the daemon sends its entries
 along with each session (`SessionParams::media_legacy`,
 `agents/roomlerd/src/delegate.rs:774`, from `media_legacy_for_delegate`,
-`agents/roomlerd/src/remote_config.rs:310`). The worker adds them to its own
+`agents/roomlerd/src/remote_config.rs:318`). The worker adds them to its own
 before it decides the session's paths. Adding legacy entries can only send a path
 back, so this never turns code on, and a daemon older than the field sends
 nothing.
@@ -434,7 +437,7 @@ the plan's `refused`.
 session through the loss of the control socket, is not pushable either.** It
 stays the device's decision, as `ws_flat_redial` and
 `tunnel_peers_survive_reattach` do: `DesiredConfig` has no such field
-(`crates/remote_control/src/models.rs:2919`), and the daemon reads the key when it
+(`crates/remote_control/src/models.rs:2966`), and the daemon reads the key when it
 starts (`crates/agent-core/src/config_surface.rs:726`). A body that names it is
 refused as one naming `rc_media_canary` is: a 403 whose message names this key,
 audited as `device_owned_switch`, by whole name, so a key that only starts like it

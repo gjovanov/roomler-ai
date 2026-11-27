@@ -1009,7 +1009,8 @@ pub struct FinalizeSummary {
 /// at `dest` (written to a temp name beside it, synced, then renamed —
 /// never a half-written `dest`). The source is left in place; the caller
 /// removes it once it has what it needs. The caller also holds the partial's
-/// lock, so a temp already there is a dead remux's and is replaced.
+/// lock, so a temp already there is a dead remux's. It is removed at the first
+/// step, whether or not the partial can be read.
 ///
 /// A copy that cannot fit is not started: running the volume to zero to find
 /// out would stop whatever else writes there, the next recording included.
@@ -1017,11 +1018,23 @@ pub fn finalize(partial: &Path, dest: &Path) -> Result<FinalizeSummary> {
     finalize_with_room(partial, dest, super::folder::available_space)
 }
 
-fn finalize_with_room(
+/// [`finalize`], with `room` answering how many bytes the copy may take in
+/// `dest`'s folder; `None` is "can't tell", and the remux goes ahead. The
+/// recorder's stop path hands in its own probe (#3355).
+pub fn finalize_with_room(
     partial: &Path,
     dest: &Path,
     room: impl Fn(&Path) -> Option<u64>,
 ) -> Result<FinalizeSummary> {
+    // #3355 — the remux owns its temp name from its first step. Removed, never
+    // opened: whatever stands at this name, a link another user planted in a
+    // shared folder included, is not written through. Before the partial is
+    // read, so a dead remux's temp goes even beside a partial that cannot be
+    // read, for which no retry comes once its caller has kept it under `dest`.
+    // And before the room is read: a dead remux's temp is room this copy can
+    // use. A folder at the name is not a file: it stays, and the create fails.
+    let tmp = temp_beside(dest);
+    let _ = std::fs::remove_file(&tmp);
     let index = read_fragmented(partial)?;
     if index.fragments.is_empty() {
         return Err(anyhow::Error::new(NothingRecoverable(format!(
@@ -1079,11 +1092,6 @@ fn finalize_with_room(
         bail!("mp4: moov size changed between passes");
     }
 
-    let tmp = temp_beside(dest);
-    // Removed, never opened: whatever stands at this name, a link another user
-    // planted in a shared folder included, is not written through. And before
-    // the room is read: a dead remux's temp is room this copy can use.
-    let _ = std::fs::remove_file(&tmp);
     let copy = payload_start + payload_total;
     if let Some(free) = dest.parent().and_then(&room)
         && free < copy
@@ -1789,18 +1797,51 @@ mod tests {
         let partial = dir.join("r.mp4.partial");
         write_frames(&partial, 150, 60);
         let dest = dir.join("r.mp4");
+        // #3355 — a probe that records what it was asked: an answer alone
+        // cannot tell which folder the remux asked about.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ask = |d: &Path, answer: Option<u64>| {
+            asked.borrow_mut().push(d.to_path_buf());
+            answer
+        };
         // The room cannot be told: the remux goes ahead, as it always did.
-        let made = finalize_with_room(&partial, &dest, |_| None).unwrap();
+        let made = finalize_with_room(&partial, &dest, |d| ask(d, None)).unwrap();
         std::fs::remove_file(&dest).unwrap();
 
-        let e = finalize_with_room(&partial, &dest, |_| Some(made.bytes - 1)).unwrap_err();
+        let e = finalize_with_room(&partial, &dest, |d| ask(d, Some(made.bytes - 1))).unwrap_err();
         assert!(format!("{e:#}").contains("no room"), "{e:#}");
         assert!(!e.is::<NothingRecoverable>(), "the recording is all there");
         assert!(!dest.exists() && !temp_beside(&dest).exists());
 
         // Exactly enough is enough.
-        finalize_with_room(&partial, &dest, |_| Some(made.bytes)).unwrap();
+        finalize_with_room(&partial, &dest, |d| ask(d, Some(made.bytes))).unwrap();
         assert_eq!(std::fs::metadata(&dest).unwrap().len(), made.bytes);
+        assert_eq!(
+            *asked.borrow(),
+            [dir.clone(), dir.clone(), dir],
+            "each remux asks once, about the folder its copy goes to"
+        );
+    }
+
+    /// #3355 — the remux owns its temp name from its first step: a dead remux's
+    /// temp goes even when the partial cannot be read, and a folder at that
+    /// name is not a file, so it stays.
+    #[test]
+    fn a_dead_remuxs_temp_goes_even_when_the_partial_cannot_be_read() {
+        let dir = scratch("temp-first");
+        let partial = dir.join("r.mp4.partial");
+        std::fs::write(&partial, b"not a recording").unwrap();
+        let dest = dir.join("r.mp4");
+        std::fs::write(temp_beside(&dest), b"half a remux").unwrap();
+        assert!(finalize(&partial, &dest).is_err());
+        assert!(!temp_beside(&dest).exists(), "the dead remux's temp stayed");
+
+        std::fs::create_dir(temp_beside(&dest)).unwrap();
+        std::fs::remove_file(&partial).unwrap();
+        write_frames(&partial, 30, 30);
+        let e = finalize(&partial, &dest).unwrap_err();
+        assert!(temp_beside(&dest).is_dir(), "{e:#}");
+        assert!(!dest.exists(), "{e:#}");
     }
 
     /// A partial that holds nothing says so before anyone asks for room, or a

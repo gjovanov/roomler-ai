@@ -29,6 +29,8 @@
                      a CHECK, never a choice of what gets installed (the
                      helper verifies the release; the install-storm cooldown
                      bounds spam). Since FR-151 it never counts or forces.
+                     The helper keeps its own file there and reads a wake as
+                     a change to it; its own consume starts no second run.
 
   Not KeepAlive: ThrottleInterval guards a crash-looping helper. FR-151: it
   reads both halves' live work before it installs, and after a defer stays

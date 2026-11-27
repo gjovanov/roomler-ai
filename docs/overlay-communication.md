@@ -311,7 +311,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:517`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:521`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -861,10 +861,10 @@ receiving node's line tells `backpressure` and `unrouted`.
 |---|---|---|---|
 | sending node, `DerpConn::send_to` (`crates/tunnel-core/src/transport/derp.rs:307`) | the shared outbound queue already holds 512 frames (`OUTBOUND_QUEUE`, `:55`) | `dropped_full` (`:308`), one count for every conn of the mux | the drop line |
 | sending node, the WS writer (`agents/roomlerd/src/derp.rs:550`) | the frame waited past the age bound (above) | `dropped_stale` (`DerpMux::note_stale_drop`, `crates/tunnel-core/src/transport/derp.rs:456`) | the drop line |
-| relay, both: central `forward_frame` (`crates/modules/network/src/derp.rs:693`), regional (`crates/derp-relay/src/main.rs:1091`) | a bulk frame of an org past its plan's monthly relay (FR-115) | `derp_allowance_shaped_total` | INFO, at most one per network and source per 30 s (central) or per network per 10 s (regional) |
+| relay, both: central `forward_frame` (`crates/modules/network/src/derp.rs:693`), regional (`crates/derp-relay/src/main.rs:1092`) | a bulk frame of an org past its plan's monthly relay (FR-115) | `derp_allowance_shaped_total` | INFO, at most one per network and source per 30 s (central) or per network per 10 s (regional) |
 | central relay only (`crates/modules/network/src/derp.rs:676`, `:711`) | the overlay ACL denies the pair; a tunnel-leg frame over its rate | the ACL drop is not counted; `derp_tunnel_shaped_total` | INFO `derp: dropped a frame the overlay ACL denies`; the shaper's INFO at most one per network and source per 30 s |
-| relay, both: central (`crates/modules/network/src/derp.rs:727`), regional (`crates/derp-relay/src/main.rs:1102`) | no registration for (network, dst) here: the peer is offline, or registered on another pod or relay | `derp_miss_total` | INFO, at most one per network and destination per 30 s; on the central relay also its census line each minute (`crates/modules/network/src/derp.rs:286`) |
-| relay, both: central (`crates/modules/network/src/derp.rs:751`), regional (`crates/derp-relay/src/main.rs:1125`) | the destination's send queue refused it: full (a slow or half-open consumer), or closed by a socket on its way out | `derp_full_total` | WARN, at most one per network and destination per 30 s; the central relay's census line |
+| relay, both: central (`crates/modules/network/src/derp.rs:727`), regional (`crates/derp-relay/src/main.rs:1103`) | no registration for (network, dst) here: the peer is offline, or registered on another pod or relay | `derp_miss_total` | INFO, at most one per network and destination per 30 s; on the central relay also its census line each minute (`crates/modules/network/src/derp.rs:286`) |
+| relay, both: central (`crates/modules/network/src/derp.rs:751`), regional (`crates/derp-relay/src/main.rs:1126`) | the destination's send queue refused it: full (a slow or half-open consumer), or closed by a socket on its way out | `derp_full_total` | WARN, at most one per network and destination per 30 s; the central relay's census line |
 | receiving node, `DerpMux::deliver` (`crates/tunnel-core/src/transport/derp.rs:622`) | the mux holds no route for the frame's source | `dropped_unrouted` (`:623`), and `DERP_INBOUND_UNROUTED`; the runtime is told to follow that peer onto DERP | the drop line; `NodeStatus.derp_inbound_drops`, which `roomler status` prints |
 | receiving node, `DerpMux::deliver` (`crates/tunnel-core/src/transport/derp.rs:603`, `:611`) | a routed consumer's queue (256 frames, `INBOUND_QUEUE`, `:80`) is full, or closed since a better tier replaced the carrier | `dropped_backpressure` (`:604`, `:617`), and `DERP_INBOUND_BACKPRESSURE` | the drop line; `NodeStatus.derp_inbound_drops` |
 
@@ -909,7 +909,7 @@ another pod/relay)"* and *"derp: dropped a frame on a full destination queue
 (slow or half-open consumer)"*, each with `network_id`, `src` and `dst` (each
 key as its first 8 hex characters) and the running total. A regional relay writes
 the same two as *"derp-relay: dropped a frame …"*, with `network`, `src`, `dst`
-and its own totals (`ForwardDrops`, `crates/derp-relay/src/main.rs:995`). It has
+and its own totals (`ForwardDrops`, `crates/derp-relay/src/main.rs:996`). It has
 no periodic census line, so its totals are on these lines alone
 ([the regional relay's doc](../scripts/relay-pop/README.md#the-drop-lines-fr-148-d52)).
 A drop on a relay is in no node's line: a T3 that no node's count explains
@@ -1246,8 +1246,8 @@ match this node`), and an org-relay grant that needs them is refused.
     make an INFO a flood. A holder is named once, when it starts, by one INFO,
     `overlay: another route holds this subnet's prefix …`, whose `holder`
     field is the interface that holds it, or `unnamed` when the OS did not say
-    (Linux and macOS: `say_subnet_held`, `tun.rs:6311`, called from
-    `subnet_restored`, `tun.rs:6265`). It is named again only after our route
+    (Linux and macOS: `say_subnet_held`, `tun.rs:6315`, called from
+    `subnet_restored`, `tun.rs:6269`). It is named again only after our route
     was back in between. On Windows a route that keeps going missing gets
     #1328's WARN and stand-down instead.
   - **Kill switch:** `ROOMLERD_OVERLAY_SUBNET_GUARD=0` (default on,
@@ -1264,7 +1264,7 @@ match this node`), and an org-relay grant that needs them is refused.
     are said on a target of their own, `tunnel_core::overlay::route_guard`
     (`ROUTE_GUARD_LOG`, `crates/tunnel-core/src/overlay/mod.rs:121`), which
     the daemon's log filter keeps at INFO whatever `RUST_LOG` says
-    (`crates/agent-core/src/logging.rs:529`), as FR-110 does for `sockbuf`
+    (`crates/agent-core/src/logging.rs:533`), as FR-110 does for `sockbuf`
     ([fleet-rpc.md](fleet-rpc.md)). The Linux package's units and the macOS
     package's LaunchAgent set `RUST_LOG=roomlerd=info,warn`, which drops every
     other `tunnel_core` INFO and, until #4380, dropped these two as well; the
@@ -1277,9 +1277,9 @@ match this node`), and an org-relay grant that needs them is refused.
 
   | OS | The guard reads | It writes | A route that already holds the prefix |
   |---|---|---|---|
-  | Linux | `ip [-6] route show exact <cidr> dev <if>`, our device only (`linux_subnet_show_args`, `tun.rs:626`; `linux_route_shown`, `tun.rs:8099`) | install's argv with `replace` → `add`, only when ours is not listed (`linux_subnet_restore_writes`, `tun.rs:610`) | holds install's exact key (the prefix at metric 0 in the main table), so it refuses the `add` with EEXIST (`File exists`), the quiet held answer. A refused netlink write is answered to the writer alone, so no route monitor sees it |
-  | macOS | install's exact `route -n get`, read three ways as #4117 reads the utun's block: ours, another interface's, absent (`utun_block_held`, `tun.rs:1188`) | install's `add` alone, never its `delete`, and only when nothing holds the prefix (`bsd_subnet_restore_writes`, `tun.rs:724`; `bsd_subnet_restore`, `tun.rs:8477`) | is never added over. `route` exits 0 when the kernel refuses a write, and the refused add still reaches every routing-socket listener as `RTM_ADD … errno 17`, which the route monitor counts (`classify_bsd_monitor_line`, below), so an add over a holder would arm the next wave, be refused, and arm the one after |
-  | Windows | `winroute::ensure` on our adapter's LUID: the row install makes, on-link at metric 1 (`SystemTun::defend_subnet_route`, `tun.rs:6635`; `ensure`, `tun.rs:3122`) | that row, only when it is missing | is another interface's row, which Windows keys apart from ours, so nothing touches it |
+  | Linux | `ip [-6] route show exact <cidr> dev <if>`, our device only (`linux_subnet_show_args`, `tun.rs:626`; `linux_route_shown`, `tun.rs:8103`) | install's argv with `replace` → `add`, only when ours is not listed (`linux_subnet_restore_writes`, `tun.rs:610`) | holds install's exact key (the prefix at metric 0 in the main table), so it refuses the `add` with EEXIST (`File exists`), the quiet held answer. A refused netlink write is answered to the writer alone, so no route monitor sees it |
+  | macOS | install's exact `route -n get`, read three ways as #4117 reads the utun's block: ours, another interface's, absent (`utun_block_held`, `tun.rs:1188`) | install's `add` alone, never its `delete`, and only when nothing holds the prefix (`bsd_subnet_restore_writes`, `tun.rs:724`; `bsd_subnet_restore`, `tun.rs:8481`) | is never added over. `route` exits 0 when the kernel refuses a write, and the refused add still reaches every routing-socket listener as `RTM_ADD … errno 17`, which the route monitor counts (`classify_bsd_monitor_line`, below), so an add over a holder would arm the next wave, be refused, and arm the one after |
+  | Windows | `winroute::ensure` on our adapter's LUID: the row install makes, on-link at metric 1 (`SystemTun::defend_subnet_route`, `tun.rs:6639`; `ensure`, `tun.rs:3122`) | that row, only when it is missing | is another interface's row, which Windows keys apart from ours, so nothing touches it |
 
   Windows restores through `ensure`, not install's `add_cidr_route`, because
   only `ensure` carries #1328's stand-down: a subnet is a peer-class route, so
@@ -1304,8 +1304,8 @@ match this node`), and an org-relay grant that needs them is refused.
   So the child usually exits before the daemon's run loop has heard the stop,
   and #1867's WARN used to go out on every restart. The daemon now marks its
   stop as the first thing each arm of `run`'s shutdown `select!` does
-  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5881`, `:5917`,
-  `:5929`). After the child exits, the supervisor waits out the first part of
+  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5835`, `:5871`,
+  `:5883`). After the child exits, the supervisor waits out the first part of
   the backoff, at most 1 s (`STOP_GRACE`,
   `crates/tunnel-core/src/overlay/netstate.rs:1277`), before it says anything:
 
@@ -1530,10 +1530,10 @@ guard, above), which is why a mesh with peers kept working.
 
 The bring-up now gives the first address the shape wg-quick gives a utun on
 macOS, routes the block on it while the gate below allows it, and reads both
-back (`shape_utun_v4`, `crates/tunnel-core/src/overlay/tun.rs:8554`, called
-from `up_with` at `tun.rs:5949`). Every route-guard wave then decides the
+back (`shape_utun_v4`, `crates/tunnel-core/src/overlay/tun.rs:8558`, called
+from `up_with` at `tun.rs:5953`). Every route-guard wave then decides the
 block's route again, with the function the bring-up used
-(`decide_utun_block`, `tun.rs:8427`):
+(`decide_utun_block`, `tun.rs:8431`):
 
 ```mermaid
 flowchart TD
@@ -1569,15 +1569,15 @@ fails withholds (`utun_block_gate`, `tun.rs:1106`).
 
 | Input | Read from | Withholds when |
 |---|---|---|
-| Every IPv4 address of every other interface | `getifaddrs`, through the `if-addrs` crate (`bsd_non_overlay_v4_now`, `tun.rs:8373`). Left out: loopback's, this utun's, and those of every utun this daemon created, by the name the kernel gave each one (`own_adapters`; `bsd_non_overlay_v4`, `tun.rs:1255`) | one of them sits inside the block; or the list cannot be read, or does not show this utun |
-| The default gateway | `route -n get -inet default`, read again for every decision (`bsd_default_gateway_v4_now`, `tun.rs:8391`). When the default route has no next hop, as a full-tunnel VPN's interface route has none, the IPv4 uplink the overlay holds for its exit pins (`utun_gate_gateway`, `tun.rs:1139`). The bring-up holds none yet | it sits inside the block; or `route` cannot run |
+| Every IPv4 address of every other interface | `getifaddrs`, through the `if-addrs` crate (`bsd_non_overlay_v4_now`, `tun.rs:8377`). Left out: loopback's, this utun's, and those of every utun this daemon created, by the name the kernel gave each one (`own_adapters`; `bsd_non_overlay_v4`, `tun.rs:1255`) | one of them sits inside the block; or the list cannot be read, or does not show this utun |
+| The default gateway | `route -n get -inet default`, read again for every decision (`bsd_default_gateway_v4_now`, `tun.rs:8395`). When the default route has no next hop, as a full-tunnel VPN's interface route has none, the IPv4 uplink the overlay holds for its exit pins (`utun_gate_gateway`, `tun.rs:1139`). The bring-up holds none yet | it sits inside the block; or `route` cannot run |
 
 "Ours" is never a name prefix: another product's utun is named the same way.
 A sibling org's utun carries an address inside this one's block whenever the
 two blocks nest or are the same (the legacy `/10`), and counting it would
 withhold the block, which is the trap #1237 was on Windows. So `up_with`
 registers each utun as soon as the kernel has named it, before its own
-decision runs (`tun.rs:5947`); the registration at the end of `up_with` stays.
+decision runs (`tun.rs:5951`); the registration at the end of `up_with` stays.
 
 **The decision** (`utun_block_step`, `tun.rs:1233`) takes the gate and the
 block's own lookup (`utun_block_held`, `tun.rs:1188`), and writes at most once:
@@ -1608,7 +1608,7 @@ add would start the next wave every time.
   `defend_block_floor` on every platform
   (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:268`). Windows keeps
   its block floors there; a Mac has none, and its arm is this decision for
-  the utun's block, on the blocking pool (`tun.rs:6691`, `tun.rs:6799`). A
+  the utun's block, on the blocking pool (`tun.rs:6695`, `tun.rs:6803`). A
   Mac that joins a network with an address or a gateway inside the block
   loses the block's route on the next wave, and gets it back on the first wave
   after it leaves. A route something else deleted, such as a VPN that reaps
@@ -1644,7 +1644,7 @@ add would start the next wave every time.
   is its own peer and the block routes on it`. macOS `route` exits 0 when the
   kernel refuses a write (`route: writing to routing socket: File exists`,
   measured), so the read-back decides, never an exit status (`run_bringup`,
-  `tun.rs:8513`).
+  `tun.rs:8517`).
 * **Another product may route the CGNAT range.** Another mesh on the same Mac
   can hold `100.64.0.0/10`. A per-org block is usually narrower than that, so
   its route is added beside the other one and wins by longest prefix. A route
@@ -1663,7 +1663,7 @@ add would start the next wave every time.
 * **Kill switch:** `ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0` leaves the utun as the
   `tun` crate made it, as through 0.4.228, logs `overlay: utun left as
   created`, and no wave decides anything for the block
-  (`utun_block_route_enabled`, `tun.rs:8213`). It is read from the daemon's
+  (`utun_block_route_enabled`, `tun.rs:8217`). It is read from the daemon's
   environment; there is no `config.toml` key.
 
 The `macos_kernel_tests` run as root against a real utun in the CI step `macOS
@@ -1671,17 +1671,17 @@ overlay against a real utun`:
 
 | Test | Asserts |
 |---|---|
-| `the_first_address_is_its_own_peer_and_the_block_routes_on_the_utun` (`tun.rs:10287`) | the shape |
-| `a_block_another_product_holds_is_left_alone_and_the_bring_up_stands` (`tun.rs:10360`) | a route for exactly the block on `lo0` stays there, and the address still gets its shape and its host route |
-| `the_kill_switch_leaves_the_utun_as_the_tun_crate_made_it` (`tun.rs:10446`) | 0.4.228's shape, and no wave routes the block |
-| `a_peer_route_comes_and_goes_beside_the_block_route` (`tun.rs:10498`) | a peer's `/32` beside the block |
-| `an_address_inside_the_block_withholds_the_block_route_at_bring_up` (`tun.rs:10559`) | an `lo0` alias inside the block withholds at the bring-up, with one WARN naming it; the address keeps its shape and its host route |
-| `a_wave_takes_our_block_route_back_while_an_address_sits_inside_and_restores_it` (`tun.rs:10610`) | the alias added after the bring-up: the next wave deletes our route, one WARN for two waves; the alias gone: the next wave routes the block again, one INFO |
-| `a_reaped_block_route_is_restored_by_the_next_wave` (`tun.rs:10674`) | a deleted block route is back after one wave |
-| `a_withhold_never_deletes_another_products_route_for_the_block` (`tun.rs:10721`) | with the block on `lo0` and an address inside it, the wave withholds and the `lo0` route stays |
-| `no_utun_of_ours_withholds_a_siblings_block` (`tun.rs:10840`) | three utuns of ours, one block nested in another and two sharing one, withhold nothing |
-| `a_wave_that_finds_the_block_route_as_decided_writes_nothing` (`tun.rs:10883`) | three waves write nothing under `route -n monitor`, routed and withheld alike |
-| `a_subnet_route_is_restored_when_missing_and_never_added_over_a_holder` (`tun.rs:11076`) | #4279: a deleted subnet route is back after one restore; while `lo0` holds exactly the prefix, three restores write nothing (no `RTM_ADD` under `route -n monitor`, not even a refused one, with a positive control) and name the holder once; the holder gone, the next restore routes it on the utun |
+| `the_first_address_is_its_own_peer_and_the_block_routes_on_the_utun` (`tun.rs:10295`) | the shape |
+| `a_block_another_product_holds_is_left_alone_and_the_bring_up_stands` (`tun.rs:10368`) | a route for exactly the block on `lo0` stays there, and the address still gets its shape and its host route |
+| `the_kill_switch_leaves_the_utun_as_the_tun_crate_made_it` (`tun.rs:10454`) | 0.4.228's shape, and no wave routes the block |
+| `a_peer_route_comes_and_goes_beside_the_block_route` (`tun.rs:10506`) | a peer's `/32` beside the block |
+| `an_address_inside_the_block_withholds_the_block_route_at_bring_up` (`tun.rs:10567`) | an `lo0` alias inside the block withholds at the bring-up, with one WARN naming it; the address keeps its shape and its host route |
+| `a_wave_takes_our_block_route_back_while_an_address_sits_inside_and_restores_it` (`tun.rs:10618`) | the alias added after the bring-up: the next wave deletes our route, one WARN for two waves; the alias gone: the next wave routes the block again, one INFO |
+| `a_reaped_block_route_is_restored_by_the_next_wave` (`tun.rs:10682`) | a deleted block route is back after one wave |
+| `a_withhold_never_deletes_another_products_route_for_the_block` (`tun.rs:10729`) | with the block on `lo0` and an address inside it, the wave withholds and the `lo0` route stays |
+| `no_utun_of_ours_withholds_a_siblings_block` (`tun.rs:10848`) | three utuns of ours, one block nested in another and two sharing one, withhold nothing |
+| `a_wave_that_finds_the_block_route_as_decided_writes_nothing` (`tun.rs:10891`) | three waves write nothing under `route -n monitor`, routed and withheld alike |
+| `a_subnet_route_is_restored_when_missing_and_never_added_over_a_holder` (`tun.rs:11084`) | #4279: a deleted subnet route is back after one restore; while `lo0` holds exactly the prefix, three restores write nothing (no `RTM_ADD` under `route -n monitor`, not even a refused one, with a positive control) and name the holder once; the holder gone, the next restore routes it on the utun |
 
 The parsers, the argv builders, the gate and the decision are pure and tested
 on every platform (`utun_shape_tests`, `tun.rs:1276`; `utun_block_gate_tests`,
@@ -1705,8 +1705,8 @@ The utun's read path now hands such a packet back to the OS. It writes the
 packet back into the same utun, unchanged but for the checksum of an IPv6 TCP
 or UDP packet (below), and the kernel takes it as inbound and delivers it, as
 it delivers a peer's packet (`past_own_packets`,
-`crates/tunnel-core/src/overlay/tun.rs:8336`, called from `read_packet` at
-`tun.rs:6337`). A reply to it is a packet to the same address, so it takes the
+`crates/tunnel-core/src/overlay/tun.rs:8340`, called from `read_packet` at
+`tun.rs:6341`). A reply to it is a packet to the same address, so it takes the
 same way back:
 
 ```mermaid
@@ -1723,7 +1723,7 @@ flowchart TD
 
 | Rule | What the read path does |
 |---|---|
-| Which packets | those whose destination is the utun's own address (`utun_hands_back`, `tun.rs:9399`), read as `Router::dst_of_ip_packet` reads it (`crates/tunnel-core/src/overlay/router.rs:475`): an IPv4 destination, or the IPv4 a derived overlay IPv6 carries. So the node's derived IPv6 is handed back too, and no other IPv6 is |
+| Which packets | those whose destination is the utun's own address (`utun_hands_back`, `tun.rs:9403`), read as `Router::dst_of_ip_packet` reads it (`crates/tunnel-core/src/overlay/router.rs:475`): an IPv4 destination, or the IPv4 a derived overlay IPv6 carries. So the node's derived IPv6 is handed back too, and no other IPv6 is |
 | As it came | no TTL or hop-limit change: the node is not routing it. The one change is the checksum of an IPv6 TCP or UDP packet, finished before the write (below) |
 | Never forwarded | a handed-back packet never reaches the outbound path |
 | A failed write | drops the packet, and it is never written again. The write is the device's own non-blocking one, without the wait for writability that the write of a peer's packet has, so a write the kernel does not take at once fails as well, and a hand-back never holds up the read. A DEBUG line, at most once a minute, reads `overlay: a packet to this node's own overlay address could not be handed back to the OS; dropped`, with the count of failed writes |
@@ -1731,8 +1731,8 @@ flowchart TD
 | Platforms | macOS only. Linux and Windows read as before |
 
 * **The utun's own address** is the one it was brought up with, read once, at
-  the bring-up (`SelfDelivery`, `tun.rs:8241`, from `up_with` at
-  `tun.rs:6176`). It does not change while the utun lives: a runtime whose
+  the bring-up (`SelfDelivery`, `tun.rs:8245`, from `up_with` at
+  `tun.rs:6180`). It does not change while the utun lives: a runtime whose
   netmap names another address exits for a rebuild (`runtime.rs:4188`), and
   the daemon reuses a utun only for the same address. Each utun hands back only
   its own address; a sibling org's utun hands back its own.
@@ -1748,21 +1748,21 @@ flowchart TD
   dropped and counted `with bad checksum`; a TCP connection whose segments
   are written back as they came gets no answer. The hand-back therefore
   computes that checksum again, in full, before the write
-  (`finish_v6_transport_checksum`, `tun.rs:9422`, called at
-  `tun.rs:8341`): an IPv6 packet whose Next Header is TCP or UDP and whose
+  (`finish_v6_transport_checksum`, `tun.rs:9426`, called at
+  `tun.rs:8345`): an IPv6 packet whose Next Header is TCP or UDP and whose
   lengths agree gets it over the pseudo-header and the whole segment with the
   field zeroed, and a UDP checksum of 0 is written as `0xffff`. A complete
   checksum computes to itself, so there is no test for "unfinished". Anything
   else goes back as it came: ICMPv6, whose checksum the kernel computes
   itself, a packet with an extension header, and every IPv4 packet, whose
   checksum macOS finishes (measured).
-* **The count.** `SystemTun::self_delivered` (`tun.rs:8360`) counts the packets
+* **The count.** `SystemTun::self_delivered` (`tun.rs:8364`) counts the packets
   a utun has handed back. The first one logs ONE INFO, `overlay: a packet to
   this node's own overlay address was handed back to the OS; the next ones are
   counted, not logged`. There is no line per packet.
 * **Kill switch:** `ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0` stops the hand-back:
   such a packet is then read like any other and gets no answer, as with #4117
-  alone (`utun_self_delivery_enabled`, `tun.rs:8224`). It is read
+  alone (`utun_self_delivery_enabled`, `tun.rs:8228`). It is read
   once, at the bring-up, which then logs `overlay: packets to this node's own
   overlay address are not handed back to the OS
   (ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0)`. It is independent of
@@ -1775,21 +1775,21 @@ utun in #4117's shape, in the CI step `macOS overlay against a real utun`:
 
 | Test | Asserts |
 |---|---|
-| `a_datagram_to_its_own_address_is_delivered_and_answered` (`tun.rs:11873`) | a UDP datagram the Mac sends to `<self>:53` reaches a socket bound there, and its reply comes back |
-| `a_ping_to_its_own_address_is_answered` (`tun.rs:11912`) | `ping -c 3 -t 5 <self>` gets its 3 answers, two hand-backs per echo |
-| `a_handed_back_packet_is_delivered_once_and_never_read_again` (`tun.rs:11953`) | one datagram is one hand-back and its reply one more; no packet to `<self>` comes out of the read, nothing more comes into the utun in the 2 s after, and one INFO is logged |
-| `the_kill_switch_hands_nothing_back` (`tun.rs:12054`) | switched off, the datagram is read from the utun and never delivered, and the bring-up's INFO says so |
-| `a_datagram_to_its_own_derived_v6_is_delivered_and_answered` (`tun.rs:12124`) | the same datagram to the derived IPv6 reaches a socket bound to `[<self v6>]:53`, and its reply comes back. The route macOS answers for the address, and what `ping6 -c 3` to it gets, are printed |
-| `a_handed_back_v6_datagram_is_delivered_once_and_never_read_again` (`tun.rs:12205`) | for that datagram, one hand-back and one more for its reply; no packet to the address comes out of the read, and nothing more comes into the utun in the 2 s after |
-| `measure_what_the_utun_reads_for_a_datagram_to_its_own_derived_v6` (`tun.rs:12278`) | with the hand-back off: the checksum of that datagram as the utun reads it, beside the IPv4 one's, and whether macOS delivers it when it is written back in as read, with its checksum finished, or from a peer's derived address. Printed; it asserts only that both datagrams are read |
-| `the_resolver_on_its_own_address_answers_a_lookup_from_the_mac` (`tun.rs:12358`) | the overlay's resolver, bound to `<self>:53` as the runtime binds it, answers a lookup the Mac sends it |
-| `a_tcp_connection_to_its_own_derived_v6_carries_bytes_both_ways` (`tun.rs:12512`) | a TCP connection from the Mac to a listener on the derived IPv6 carries a few bytes each way, and its segments are handed back. How much of a 64 KiB write arrives within 3 s is printed |
-| `a_tcp_connection_to_its_own_address_carries_bytes_both_ways` (`tun.rs:12542`) | the same over the IPv4 address, as a control |
+| `a_datagram_to_its_own_address_is_delivered_and_answered` (`tun.rs:11881`) | a UDP datagram the Mac sends to `<self>:53` reaches a socket bound there, and its reply comes back |
+| `a_ping_to_its_own_address_is_answered` (`tun.rs:11920`) | `ping -c 3 -t 5 <self>` gets its 3 answers, two hand-backs per echo |
+| `a_handed_back_packet_is_delivered_once_and_never_read_again` (`tun.rs:11961`) | one datagram is one hand-back and its reply one more; no packet to `<self>` comes out of the read, nothing more comes into the utun in the 2 s after, and one INFO is logged |
+| `the_kill_switch_hands_nothing_back` (`tun.rs:12062`) | switched off, the datagram is read from the utun and never delivered, and the bring-up's INFO says so |
+| `a_datagram_to_its_own_derived_v6_is_delivered_and_answered` (`tun.rs:12132`) | the same datagram to the derived IPv6 reaches a socket bound to `[<self v6>]:53`, and its reply comes back. The route macOS answers for the address, and what `ping6 -c 3` to it gets, are printed |
+| `a_handed_back_v6_datagram_is_delivered_once_and_never_read_again` (`tun.rs:12213`) | for that datagram, one hand-back and one more for its reply; no packet to the address comes out of the read, and nothing more comes into the utun in the 2 s after |
+| `measure_what_the_utun_reads_for_a_datagram_to_its_own_derived_v6` (`tun.rs:12286`) | with the hand-back off: the checksum of that datagram as the utun reads it, beside the IPv4 one's, and whether macOS delivers it when it is written back in as read, with its checksum finished, or from a peer's derived address. Printed; it asserts only that both datagrams are read |
+| `the_resolver_on_its_own_address_answers_a_lookup_from_the_mac` (`tun.rs:12366`) | the overlay's resolver, bound to `<self>:53` as the runtime binds it, answers a lookup the Mac sends it |
+| `a_tcp_connection_to_its_own_derived_v6_carries_bytes_both_ways` (`tun.rs:12520`) | a TCP connection from the Mac to a listener on the derived IPv6 carries a few bytes each way, and its segments are handed back. How much of a 64 KiB write arrives within 3 s is printed |
+| `a_tcp_connection_to_its_own_address_carries_bytes_both_ways` (`tun.rs:12550`) | the same over the IPv4 address, as a control |
 
 The rules are pure and tested on every platform: the hand-back's
-(`utun_self_delivery_tests`, `tun.rs:9471`), and the checksum's, against
+(`utun_self_delivery_tests`, `tun.rs:9475`), and the checksum's, against
 checksums the tests compute another way (`v6_transport_checksum_tests`,
-`tun.rs:9588`).
+`tun.rs:9592`).
 
 ### The peer list while the control socket is down (#4367)
 
@@ -1815,7 +1815,7 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   `overlay::runtime_alive` (`agents/roomlerd/src/overlay.rs:122`): the tenant's
   runtime slot exists and its event channel is open. The daemon builds its
   LocalAPI state only with that probe (`DaemonState::for_daemon`,
-  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5238`); the
+  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5192`); the
   constructor without one is test-only.
 - **The mark** (`PeerInfo::control_down`, `crates/localapi/src/lib.rs:1026`) is
   additive. Its `since_ms` is when this device lost that socket, stamped by the
@@ -1824,7 +1824,7 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   the socket's 80 s receive deadline before. In a kept row `connection`,
   `stalled`, `rtt_ms` and `last_seen_ms` stay live, and `online` is the server's
   word from before the loss, never rewritten. A token refused at the upgrade is
-  kept and marked too: any HTTP 401 there refuses it (`signaling.rs:1874`), and a
+  kept and marked too: any HTTP 401 there refuses it (`signaling.rs:1880`), and a
   middlebox the machine trusts can answer one while the mesh runs on.
 - **Several orgs.** Each org's rows carry their own mark and time: the primary's
   outage no longer hides a secondary's live peers, and a secondary's outage no

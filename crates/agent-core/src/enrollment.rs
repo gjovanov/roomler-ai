@@ -623,6 +623,8 @@ fn fresh_config(issued: Issued) -> AgentConfig {
         netstack_socks_port: None,
         derived_org: false,
         derived_netstack: false,
+        // #3353: a run-local outcome, never on disk; a new enrollment has none.
+        ssh_off_this_run: false,
         overlay_wg_secret_key: None,
         overlay_wg_key_epoch: 0,
         // Phase 1: no advertised subnet routes until the operator configures them.

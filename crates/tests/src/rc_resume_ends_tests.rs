@@ -76,20 +76,26 @@ pub(crate) fn claiming_connection(
     kept: Vec<ObjectId>,
 ) -> (AgentCtx, mpsc::Receiver<ServerMsg>) {
     let window = u32::try_from(WINDOW).unwrap();
-    let reg = app.state.fleet().rc_hub.register_agent_resuming(
-        agent_id,
-        tenant_id,
-        owner_user_id,
-        OsKind::Linux,
-        2,
-        true,
-        false,
-        ResumeHello {
-            advertised: true,
-            window: Some(window),
-            kept,
-        },
-    );
+    let reg = app
+        .state
+        .fleet()
+        .rc_hub
+        .register_agent_resuming(
+            agent_id,
+            tenant_id,
+            owner_user_id,
+            OsKind::Linux,
+            2,
+            true,
+            false,
+            0,
+            ResumeHello {
+                advertised: true,
+                window: Some(window),
+                kept,
+            },
+        )
+        .expect("no rotation floor here");
     let ctx = AgentCtx {
         conn_id: uuid::Uuid::new_v4().to_string(),
         agent_id,

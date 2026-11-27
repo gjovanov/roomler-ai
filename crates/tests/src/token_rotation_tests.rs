@@ -16,10 +16,13 @@
 //! off until the phase that completes the server's half), except where a
 //! cell is about the switch.
 
+use crate::agent_presence_tests::connect_agent;
+use crate::agent_removal_tests::{Heard, listen, still_served, wait_registered};
 use crate::fixtures::test_app::TestApp;
-use crate::token_renewal_tests::{enroll, forge_agent_token, self_devices};
+use crate::token_renewal_tests::{enroll, forge_agent_token, renew, self_devices, upgrade_status};
 use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 const ROTATE: &str = "/api/agent/self/rotate";
 const AUDIT: &str = "token_rotation_audit";
@@ -159,9 +162,11 @@ fn decision(d: &str, reason: Option<&str>) -> (String, Option<String>) {
     (d.to_string(), reason.map(str::to_string))
 }
 
-/// T1 (its first half): a rotation answers a token of the next generation,
-/// the row moves to it, and a token of the generation before is refused on
-/// the HTTP routes with the rotation's own words.
+/// T1: a rotation answers a token of the next generation, the row moves to
+/// it, and a token of the generation before is refused on the HTTP routes
+/// with the rotation's own words (P1a). The agent socket's upgrade and a DERP
+/// dial admit the new token and answer 401 to the one before, and a renewal
+/// with the one before is refused after the commit (P1b).
 #[tokio::test]
 async fn a_rotation_issues_the_next_generation() {
     let app = spawn_on().await;
@@ -196,6 +201,33 @@ async fn a_rotation_issues_the_next_generation() {
     assert_eq!(rows[0].get_str("client_ip").unwrap(), "127.0.0.1");
     assert_eq!(int(&rows[0], "gen_from"), Some(0));
     assert_eq!(int(&rows[0], "gen_to"), Some(1));
+
+    // P1b — every other place an agent token is checked.
+    assert_eq!(
+        upgrade_status(&app, "/ws", &new).await,
+        101,
+        "the agent socket admits the new token"
+    );
+    assert_eq!(
+        upgrade_status(&app, "/ws", &old).await,
+        401,
+        "the agent socket refuses the one before"
+    );
+    assert_eq!(
+        upgrade_status(&app, "/derp", &new).await,
+        101,
+        "a DERP dial admits the new token"
+    );
+    assert_eq!(
+        upgrade_status(&app, "/derp", &old).await,
+        401,
+        "a DERP dial refuses the one before"
+    );
+    assert_eq!(
+        renew(&app, &old).await.status(),
+        401,
+        "a renewal with the one before, after the commit"
+    );
 }
 
 /// T2: an answer that was lost is asked for again with the same token and
@@ -680,4 +712,116 @@ async fn a_token_whose_row_is_gone_does_not_rotate() {
     );
     assert_eq!(int(&rows[0], "gen_from"), Some(0));
     assert!(!rows[0].contains_key("gen_to"), "{}", rows[0]);
+}
+
+/// The socket ended with no goodbye: the commit tells the device nothing on
+/// it (`AgentDeleted` would stop the daemon), and the device that rotated is
+/// already connecting with the new token.
+fn assert_ended(heard: Heard, place: &str) {
+    match heard {
+        Heard::Closed => {}
+        other => panic!(
+            "{place}: a rotation ends the device's socket of the generation before \
+             within 5 s, with no goodbye; heard {other:?}"
+        ),
+    }
+}
+
+/// T4 (its P1b half): the commit ends the device's agent socket admitted
+/// below the new generation within 5 s, on the pod the rotation reached and,
+/// through the control channel, on any other. A socket opened at the new
+/// generation survives the rotation's envelope arriving late. P1c adds the
+/// DERP registration.
+#[tokio::test]
+async fn a_rotation_ends_the_connections_of_earlier_generations() {
+    let (a, b) = TestApp::spawn_pair(|s| s.rc.agent_token_rotation = true).await;
+    let seeded = a.seed_tenant("fr155ends").await;
+
+    // The pod the rotation reaches holds the socket.
+    let (here, old) = enroll(&a, &seeded, "m-fr155-ends-here").await;
+    let mut socket = connect_agent(&a, &old).await;
+    let here_id = wait_registered(&a, &here).await;
+    let new = answered_token(rotate(&a, &old, &rotation_key(110)).await).await;
+    assert_ended(
+        listen(&mut socket, Duration::from_secs(5)).await,
+        "on the pod the rotation reached",
+    );
+    assert!(
+        !a.state.fleet().rc_hub.is_agent_online(here_id),
+        "out of the hub"
+    );
+
+    // A socket at the new generation, then the rotation's envelope, late.
+    let mut fresh = connect_agent(&a, &new).await;
+    wait_registered(&a, &here).await;
+    a.state.modules.apply_rc_ctrl(&json!({
+        "class": "rc",
+        "evt": "end_below_generation",
+        "agent_id": here,
+        "tenant_id": seeded.tenant_id.to_string(),
+        "generation": token_generation(&new),
+    }));
+    assert!(
+        still_served(&mut fresh).await,
+        "a late envelope ends nothing at the new generation"
+    );
+    assert!(a.state.fleet().rc_hub.is_agent_online(here_id));
+
+    if a.state.redis_pubsub.is_none() {
+        eprintln!("skipping the second pod: no Redis available");
+        return;
+    }
+    // Another pod holds the socket.
+    let (there, old) = enroll(&a, &seeded, "m-fr155-ends-there").await;
+    let mut socket = connect_agent(&b, &old).await;
+    let there_id = wait_registered(&b, &there).await;
+    assert!(
+        !a.state.fleet().rc_hub.is_agent_online(there_id),
+        "the socket is on the second pod only"
+    );
+    let _ = answered_token(rotate(&a, &old, &rotation_key(111)).await).await;
+    assert_ended(
+        listen(&mut socket, Duration::from_secs(5)).await,
+        "on another pod",
+    );
+    assert!(!b.state.fleet().rc_hub.is_agent_online(there_id));
+}
+
+/// With `rc.agent_token_rotation` off, its default, a first call is answered
+/// 404 and ends nothing: the device's socket stays served on the pod the call
+/// reached and on another, and a new socket of the same generation registers,
+/// so no floor was kept.
+#[tokio::test]
+async fn a_rotation_switched_off_ends_no_connection() {
+    let (a, b) = TestApp::spawn_pair(|_| {}).await;
+    let seeded = a.seed_tenant("fr155offends").await;
+
+    let (here, token) = enroll(&a, &seeded, "m-fr155-off-here").await;
+    let mut socket = connect_agent(&a, &token).await;
+    wait_registered(&a, &here).await;
+    assert_eq!(rotate(&a, &token, &rotation_key(120)).await.status(), 404);
+    assert!(still_served(&mut socket).await, "the socket stays served");
+    // The same generation again: it registers, and displaces the first.
+    let mut again = connect_agent(&a, &token).await;
+    match listen(&mut socket, Duration::from_secs(5)).await {
+        Heard::Goodbye(v) => assert_eq!(v["reason"], "replaced_by_newer_connection", "{v}"),
+        other => panic!(
+            "a second socket of the same generation registers and displaces the \
+             first; heard {other:?}"
+        ),
+    }
+    assert!(still_served(&mut again).await, "no floor refused it");
+
+    if a.state.redis_pubsub.is_none() {
+        eprintln!("skipping the second pod: no Redis available");
+        return;
+    }
+    let (there, token) = enroll(&a, &seeded, "m-fr155-off-there").await;
+    let mut socket = connect_agent(&b, &token).await;
+    wait_registered(&b, &there).await;
+    assert_eq!(rotate(&a, &token, &rotation_key(121)).await.status(), 404);
+    assert!(
+        still_served(&mut socket).await,
+        "nothing reached the second pod"
+    );
 }

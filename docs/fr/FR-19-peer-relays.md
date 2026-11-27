@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2163`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:3411`).
+(`agents/roomlerd/src/signaling.rs:3417`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -410,7 +410,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
 claimed four default-deny gates; there are three. `OverlayAclMode` derives `#[default] Off`
-(`crates/remote_control/src/models.rs:1910`), documented as *"every node sees every peer…
+(`crates/remote_control/src/models.rs:1918`), documented as *"every node sees every peer…
 The default, so enabling the feature never breaks a live mesh"*; `Warn` *"ship[s] the
 permissive netmap"*; and `CLAUDE.md`'s own open-issues list records that **nothing has ever
 run under `enforce` in the field**. Tailscale's `cap/relay` is an *affirmative grant*; a
@@ -739,7 +739,7 @@ Verified against `origin/master`, 2026-08-28.
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3263`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3291`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 
@@ -941,8 +941,8 @@ kill switch. That is what makes E2E-3 executable before P2.
 
 New module `crates/tests/src/peer_relay_tests.rs`. Model on
 `crates/tests/src/relay_region_tests.rs:49` (40 lines; `TestApp::spawn_with_settings`,
-`fixtures/test_app.rs:207`, with both a REST and an in-process `app.state` assertion). For a
-two-pod topology copy `cluster_tests.rs:1485` via `spawn_pair` (`test_app.rs:179`).
+`fixtures/test_app.rs:211`, with both a REST and an in-process `app.state` assertion). For a
+two-pod topology copy `cluster_tests.rs:1485` via `spawn_pair` (`test_app.rs:183`).
 
 Server-decision tests — all implementable as described: `mint_refused_when_mode_off`,
 `mint_refused_without_relay_grant`, `mint_refused_cross_tenant` (404-shaped: leaks neither
@@ -970,7 +970,7 @@ every P2/P4 PR would skip this lane entirely. The workflow's own comment says to
 this: *"If a new crate becomes part of what these tests drive, add it here."* Add both paths
 in the same PR as `peer_relay_tests.rs`.
 ⚠️ Set `RUST_LOG` — the harness installs a subscriber only when it is set
-(`fixtures/test_app.rs:67`) — and use `--nocapture`.
+(`fixtures/test_app.rs:71`) — and use `--nocapture`.
 
 ### 10c. E2E on the real fleet — mars, zeus, jupiter
 
