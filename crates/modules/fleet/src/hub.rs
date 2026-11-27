@@ -160,11 +160,11 @@ fn rc_overlay_auto_wire(
 
 // ────────────────────────────────────────────────────────────────────────────
 
-/// #3517 — which of the Hub's four triggers fired a connection's cancel. The
-/// read loop names it on the disconnect line (`by=`), because "the Hub
-/// cancelled it" is four events with four different fixes: a second install
-/// displacing the first, an idle nudge re-hashing through the LB, an overlay
-/// renumber, a pod going down.
+/// #3517 — which of the Hub's triggers fired a connection's cancel. The read
+/// loop names it on the disconnect line (`by=`), because "the Hub cancelled
+/// it" is several events with different fixes: a second install displacing
+/// the first, an idle nudge re-hashing through the LB, an overlay renumber, a
+/// pod going down, a token rotation (FR-155) ending an earlier generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CancelReason {
@@ -178,6 +178,9 @@ pub enum CancelReason {
     Renumber = 3,
     /// The pod's graceful shutdown ([`Hub::cancel_all_agents`]).
     Shutdown = 4,
+    /// FR-155 P1b — the device's token rotated, and this connection was
+    /// admitted below the new generation ([`Hub::end_below_generation`]).
+    Rotated = 5,
 }
 
 impl CancelReason {
@@ -188,6 +191,7 @@ impl CancelReason {
             CancelReason::IdleNudge => "idle_nudge",
             CancelReason::Renumber => "renumber",
             CancelReason::Shutdown => "shutdown",
+            CancelReason::Rotated => "rotated",
         }
     }
 
@@ -197,6 +201,7 @@ impl CancelReason {
             2 => Some(CancelReason::IdleNudge),
             3 => Some(CancelReason::Renumber),
             4 => Some(CancelReason::Shutdown),
+            5 => Some(CancelReason::Rotated),
             _ => None,
         }
     }
@@ -389,6 +394,11 @@ pub struct ConnectedAgent {
     /// gate counts it) from the registration until the claim is answered,
     /// so a new request cannot slip into a slot a kept session holds.
     pub pending_claims: Vec<ObjectId>,
+    /// FR-155 P1b — the token generation this connection was admitted under:
+    /// the `gen` claim the agent socket's upgrade checked. A rotation ends the
+    /// connections below the generation it makes
+    /// ([`Hub::end_below_generation`]).
+    pub generation: u32,
 }
 
 /// #2267 — what a removal's kick did to the device's connection on this pod
@@ -839,6 +849,10 @@ pub struct HubInner {
     /// this pod renews (`slot_leases`) and gives back when the session ends
     /// (`terminate_with_limit`, the one place every session ends).
     slotted: DashMap<ObjectId, Lease>,
+
+    /// FR-155 P1b — per (tenant, agent), the generation a rotation named and
+    /// how long this pod refuses a registration below it (`hub::rotation`).
+    floors: DashMap<(ObjectId, ObjectId), rotation::Floor>,
 }
 
 #[derive(Clone)]
@@ -871,6 +885,7 @@ impl Hub {
                 exec_waiters: DashMap::new(),
                 session_slots: std::sync::OnceLock::new(),
                 slotted: DashMap::new(),
+                floors: DashMap::new(),
             }),
         }
     }
@@ -942,16 +957,22 @@ impl Hub {
         // (see [`ConnectedAgent::supports_exec`]).
         supports_exec: bool,
     ) -> (ClientTx, Arc<AgentCancel>, mpsc::Receiver<ServerMsg>) {
-        let reg = self.register_agent_resuming(
-            agent_id,
-            tenant_id,
-            owner_user_id,
-            os,
-            max_sessions,
-            input_arbiter,
-            supports_exec,
-            ResumeHello::default(),
-        );
+        // FR-155 P1b — at generation 0, which only a floor someone set for
+        // this agent refuses; the agent socket registers through
+        // `register_agent_resuming` with the generation it checked.
+        let reg = self
+            .register_agent_resuming(
+                agent_id,
+                tenant_id,
+                owner_user_id,
+                os,
+                max_sessions,
+                input_arbiter,
+                supports_exec,
+                0,
+                ResumeHello::default(),
+            )
+            .expect("no rotation floor for a registration at generation 0");
         (reg.tx, reg.cancel, reg.rx)
     }
 
@@ -962,6 +983,10 @@ impl Hub {
     /// from here until it is answered, and is spared the in-memory reap
     /// below: whether it goes on is the claim's to decide. With no window,
     /// every claim is refused at once and the reap runs as it always has.
+    ///
+    /// FR-155 P1b — `generation` is the token generation the connection was
+    /// admitted under. Below a rotation's floor on this pod the registration
+    /// is refused ([`BelowFloor`]) and changes nothing (`hub::rotation`).
     #[allow(clippy::too_many_arguments)]
     pub fn register_agent_resuming(
         &self,
@@ -972,8 +997,9 @@ impl Hub {
         max_sessions: u8,
         input_arbiter: bool,
         supports_exec: bool,
+        generation: u32,
         hello: ResumeHello,
-    ) -> Registration {
+    ) -> std::result::Result<Registration, BelowFloor> {
         let resume_window = hello.window;
         let (claims, refused) = resume::sort_claims(hello.window, hello.kept, max_sessions);
         let (tx, rx) = mpsc::channel(SERVER_TX_CAPACITY);
@@ -1047,11 +1073,14 @@ impl Hub {
             advertises_resume: hello.advertised,
             resume_window,
             pending_claims: claims.clone(),
+            generation,
         };
         // FR-138 — a row created before this instant belongs to an earlier
         // connection: the registration read's line.
         let registered_at = bson::DateTime::now();
-        if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
+        // FR-155 P1b — the insert, unless a rotation's floor refuses it: the
+        // two are one step under the entry's lock (`rotation`).
+        if let Some(prev) = self.admit_agent(entry)? {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
             // read-loop polling `socket_rx.next()` for up to one 25 s
             // keepalive interval before the agent's own ping fails and
@@ -1168,7 +1197,7 @@ impl Hub {
                 let _ = tx.try_send(req);
             }
         }
-        Registration {
+        Ok(Registration {
             tx,
             cancel,
             rx,
@@ -1176,7 +1205,7 @@ impl Hub {
             refused,
             reaped: zombies,
             registered_at,
-        }
+        })
     }
 
     /// Unregister a connected agent. The optional `tx` is the channel
@@ -3752,6 +3781,11 @@ pub use resume::{Registration, ResumeHello, Resumed, ResumedSession, RowEnd};
 // rule.
 mod hold;
 pub use hold::HeldParties;
+// FR-155 P1b — what a token rotation ends on this pod: the sweep of the
+// connections below the new generation, and the floor that refuses a late
+// registration below it.
+mod rotation;
+pub use rotation::{BelowFloor, ROTATION_FLOOR_SECS};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Tests
@@ -8325,5 +8359,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// FR-155 P1b — the control event a rotation on another pod sends: an
+    /// envelope with a key missing, malformed or naming another tenant ends
+    /// nothing, and a whole one ends the entry below its generation.
+    #[tokio::test]
+    async fn the_rotation_control_event_ends_only_what_it_names() {
+        let hub = test_hub().await;
+        let (agent, tenant) = (ObjectId::new(), ObjectId::new());
+        let _rx = register_linux(&hub, agent, tenant);
+        let event = |fields: serde_json::Value| {
+            let mut v = serde_json::json!({ "class": "rc", "evt": "end_below_generation" });
+            for (key, value) in fields.as_object().unwrap() {
+                v[key] = value.clone();
+            }
+            v
+        };
+        let (a, t) = (agent.to_hex(), tenant.to_hex());
+        for broken in [
+            serde_json::json!({ "tenant_id": t, "generation": 1 }),
+            serde_json::json!({ "agent_id": a, "generation": 1 }),
+            serde_json::json!({ "agent_id": a, "tenant_id": t }),
+            serde_json::json!({ "agent_id": a, "tenant_id": t, "generation": "1" }),
+            serde_json::json!({ "agent_id": a, "tenant_id": t, "generation": 4_294_967_296_u64 }),
+            serde_json::json!({ "agent_id": a, "tenant_id": ObjectId::new().to_hex(), "generation": 1 }),
+        ] {
+            crate::ctrl::apply_rc_ctrl(&hub, &event(broken.clone()));
+            assert!(hub.is_agent_online(agent), "{broken} ends nothing");
+        }
+        crate::ctrl::apply_rc_ctrl(
+            &hub,
+            &event(serde_json::json!({ "agent_id": a, "tenant_id": t, "generation": 1 })),
+        );
+        assert!(!hub.is_agent_online(agent), "a whole envelope ends it");
     }
 }

@@ -247,7 +247,7 @@ sleep would say hello again and erase the reason.
 ### 3.3 The server
 
 - The fleet socket treats `rc:agent.sleeping` as the goodbye
-  ([`socket.rs:709`](../crates/modules/fleet/src/socket.rs#L709)). It records the
+  ([`socket.rs:728`](../crates/modules/fleet/src/socket.rs#L728)). It records the
   notice first, then leaves its loop, so the ordinary teardown runs at once: the
   hub unregistration, the `Offline` write, and the offline transition. Without
   the goodbye the device would read online until the receive deadline reaped a
@@ -274,7 +274,7 @@ sleep would say hello again and erase the reason.
 | `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3517`](../agents/roomler-cli/src/localclient.rs#L3517)) |
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
-| the admin agent API | `power`, `sleep` ([`agent.rs:1361`](../crates/modules/fleet/src/agent.rs#L1361)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
+| the admin agent API | `power`, `sleep` ([`agent.rs:1378`](../crates/modules/fleet/src/agent.rs#L1378)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
 | peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3651`](../crates/remote_control/src/models.rs#L3651)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:

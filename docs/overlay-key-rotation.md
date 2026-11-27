@@ -191,9 +191,9 @@ duplicate-delivery race below. Any report about a *different* order, and any
 ## The state the dashboard shows
 
 Resolved **once, server-side**, from the order, the claim and the proof
-(`crates/modules/fleet/src/agent.rs:1542-1703`); the grid only names the states
+(`crates/modules/fleet/src/agent.rs:1559-1720`); the grid only names the states
 (`AgentsSection.vue:2115-2216`). The device row also carries `overlay_public_key` and
-`overlay_key_epoch` straight from the proof (`agent.rs:2607-2608`), so an operator
+`overlay_key_epoch` straight from the proof (`agent.rs:2624-2625`), so an operator
 can *see* the key change instead of trusting a chip.
 
 ```mermaid
@@ -221,27 +221,27 @@ flowchart TD
 | `delivered` | pushed to a live socket, no answer for **this** order yet | *rotating key…* | wait a few seconds |
 | `rotating` | the device claims `rotated` (≤ 60 s ago) but its last join still shows the previous key | *rotating key…* | wait — it is re-joining |
 | `rotated` | the join proves it (key ≠ `public_key_before` after the order), **or** the claim's `new_public_key` is what the device joined with | *key rotated · e⟨epoch⟩* | done |
-| `reported_not_joined` | claimed `rotated` > 60 s ago (`KEY_ROTATION_REJOIN_GRACE_SECS`, `agent.rs:1611`), still joined under another key | *key not re-joined* | the re-join failed — read the device log |
+| `reported_not_joined` | claimed `rotated` > 60 s ago (`KEY_ROTATION_REJOIN_GRACE_SECS`, `agent.rs:1628`), still joined under another key | *key not re-joined* | the re-join failed — read the device log |
 | `refused` | the device answered `disabled`, `rate_limited` or `unsupported` | *key rotation refused (⟨outcome⟩)*, tooltip = `report.detail` | fix the stated thing |
 | `failed` | mint or persist failed; identity unchanged | *key rotation failed* | `report.detail` says why |
 | `unsupported` | an order stands, no answer, and the device's hello lacks `key-rotate` | *roomlerd too old for key rotation* | update the device; the order stays queued and runs on the first connect that advertises the verb |
 
 ⚠️ **Compare `request_id`s, never outcomes alone.** A report about an earlier order
 says nothing about this one — the remote-configuration lesson, applied here
-(`agent.rs:1622`).
+(`agent.rs:1639`).
 
 ⚠️ **`unsupported` is a state an *offline* order reaches.** An online pre-feature
 device never gets an order recorded — the route refuses it 409 up front. The state
 appears when a device was ordered while offline and then connected without the verb
 (or whose build lost its overlay surface); the socket logs *"overlay-key rotation not
 ordered — this device's agent predates rc:agent.key_rotate"* and leaves the order
-standing (`fleet/src/socket.rs:416-420`).
+standing (`fleet/src/socket.rs:435-439`).
 
 ## Reconcile on connect — and the three races it must not re-run
 
 At agent register, where `ConfigPush` reconciles, a standing order is pushed again
-if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:317-333`,
-`:362-370`) — the offline case, through the same path as the online one, so it runs
+if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:336-352`,
+`:381-389`) — the offline case, through the same path as the online one, so it runs
 on every connect rather than only when nobody is watching. Three field cycles on
 2026-08-30 each found a way for that to go wrong; each left a rule:
 
@@ -436,11 +436,11 @@ The server cannot see the device switch, so a switched-off device is still order
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2817`, `:1020`; owner `network` (`:2004`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3248`, `:3282`, `:3307`, `:3338`, `:5699`, `:10797`, `:10812` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
-| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:317-333`, `:398-419` |
+| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:336-352`, `:417-438` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:654-677`; `crates/services/src/dao/agent.rs:1233` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1198-1228` |
-| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1542-1703`, `:2600-2608` |
+| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1559-1720`, `:2617-2625` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:838-846` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6337-6479`, `:3591-3633`, `:3635-3656`, `:1453-1480` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |

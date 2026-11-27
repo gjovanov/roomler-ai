@@ -1131,6 +1131,23 @@ pub async fn self_rotate(
         .await
         .map_err(|e| ApiError::Internal(format!("token rotation: {e}")))?;
     if committed {
+        // FR-155 P1b — what the commit ends: the device's connections admitted
+        // below the new generation, on this pod and, through the control
+        // channel, on every other, each pod keeping a floor that refuses a
+        // late registration below it (`hub::rotation`).
+        state
+            .rc_hub
+            .end_below_generation(caller.agent_id, caller.tenant_id, next_gen);
+        crate::ctrl::publish_rc_ctrl(
+            &state.core,
+            "end_below_generation",
+            serde_json::json!({
+                "agent_id": caller.agent_id.to_hex(),
+                "tenant_id": caller.tenant_id.to_hex(),
+                "generation": next_gen,
+            }),
+        )
+        .await;
         audit.record("first", None, Some(next_gen)).await;
         let agent_token = state
             .auth
