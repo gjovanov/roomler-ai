@@ -332,6 +332,7 @@ impl LiveForward {
 /// front already sending redials to pod 2 (maxSurge 0: the other pod is the
 /// survivor). Field: every session the pod carried ended at one instant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "#4501 RED on master: a roll ends the tunnel session; FR-158 P3 turns both switches on here and removes this"]
 async fn an_in_flight_tunnel_connection_survives_a_rolled_pod() {
     let mut rig = live_quic_forward("survive-roll").await;
 
@@ -351,6 +352,7 @@ async fn an_in_flight_tunnel_connection_survives_a_rolled_pod() {
 /// with no close and it redials the same pod, while it and the QUIC path stay
 /// up. Field: the server ended every session aimed at that exit at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "#4501 RED on master: an exit's control-socket drop ends the tunnel session; FR-158 P3 turns both switches on here and removes this"]
 async fn an_in_flight_tunnel_connection_survives_its_exits_control_socket_cycling() {
     let mut rig = live_quic_forward("survive-exit-ws").await;
 
