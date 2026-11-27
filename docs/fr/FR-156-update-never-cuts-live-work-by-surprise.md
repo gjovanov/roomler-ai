@@ -15,7 +15,8 @@ watch), [FR-101](FR-101-rc-session-hygiene.md) P4b-2 (`rc:idle`),
 [FR-67](FR-67-update-outcome-observability.md) (the push's pin guard and its refusals),
 [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (the host's surfaces),
 [FR-105](FR-105-roomler-ssh-as-system.md) (SSH through the Windows service),
-[FR-147](FR-147-root-out-of-homes-macos.md) (the person's child on a Mac)
+[FR-147](FR-147-root-out-of-homes-macos.md) (the person's child on a Mac), #4372 (on a Mac one wake runs the
+update helper twice; it has its own owner, and P2's Mac half waits for its work, as The Mac in P2 says)
 
 **Anchors:** master `500b556e4` (2026-11-27), read in the tree. The russh anchors are in the sources of russh 0.62.7,
 the version `Cargo.lock` pins.
@@ -214,6 +215,10 @@ is an uncounted wake.
   over the root half's move. A push the person's half recorded keeps FR-151's reach under the same deadline: their own
   work and the root half's remote-control sessions (`:215-229`). An ask with no deadline is today's: an older
   daemon's, and the person's own click.
+  - **This half waits for #4372.** That issue is about how the helper is woken (its removal of the wake file fires
+    `WatchPaths` again), and it has its own owner. A push waiting on a Mac must wake the helper again, so before this
+    half starts, read #4372's state and wait for any open change to `helper_gate.rs`. An option here that changes how
+    a wake is read, or how the wake file is removed, goes to #4372's owner first.
 - **The report.** The device sends `rc:agent.update_wait` whenever its state changes: waiting (for what, in `Busy`'s
   words, and until when), noticed (the cut's time and the version), installing, or done. The server keeps the newest
   on the device's row, written only by the connection that holds the row, as the sleep notice is
