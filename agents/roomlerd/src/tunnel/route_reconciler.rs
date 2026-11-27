@@ -1926,4 +1926,37 @@ mod tests {
             "rm answered before the route's flow was stopped"
         );
     }
+
+    /// #1035 — a replace that keeps the local port (FR-84 D1's edit of a
+    /// route's target) moves the route onto the new descriptor's flow in the
+    /// pass that applies it. That pass stops the old flow and creates the new
+    /// one on the same port, and a stopped flow lets go of its port only once
+    /// the runtime drops its task. A create that does not wait for that finds
+    /// the route's own old listener and reads `backoff … 10048` until a later
+    /// pass: the field signature of the bug this fixes.
+    #[tokio::test]
+    async fn a_replace_that_keeps_the_port_moves_the_route_in_one_pass() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let f1 = route_flow(&r, "a");
+        eventually("the flow holds its port", || port_is_held(p)).await;
+
+        let mut edited = desc("a", p, true);
+        edited.remote = Some("db2:5432".into());
+        r.replace(edited).await.unwrap();
+        r.reconcile_pass().await;
+
+        let state = r.list()[0].state.clone();
+        let f2 = state
+            .flow_id()
+            .unwrap_or_else(|| panic!("the replace left the route without a flow: {state:?}"))
+            .to_string();
+        assert_ne!(f1, f2, "the route kept the flow of its old target");
+        let flows = r.inner.hub.flows_snapshot();
+        assert_eq!(flows.len(), 1, "one flow, the new target's: {flows:?}");
+        assert_eq!(flows[0].id, f2);
+        assert_eq!(flows[0].target.as_deref(), Some("db2:5432"));
+        assert_eq!(creates(&r), 2, "the new target's flow took one create");
+    }
 }
