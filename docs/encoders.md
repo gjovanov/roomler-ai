@@ -1678,6 +1678,7 @@ source's CSS values.
 | `rate_factor_{h264,hevc,vp9}_444` | `ROOMLERD_RATE_FACTOR_<CODEC>_444` | 150 | the 4:4:4 ceiling factor (%), 50–400 |
 | — | `ROOMLERD_HW_AUTO=0` | — | `auto` becomes software-first |
 | — | `ROOMLERD_RTP_CAPTURE_WAIT=0` | — | a kill switch, not a setting: the RTP pump's capture no longer waits or floors an empty, its GDI arm no longer holds to the target, and its open no longer waits for a taken seat ([remote-control.md §5.1g](remote-control.md#51g-the-capture-waits-3272)). Read once per pump, environment only. It cannot bring back the reopen #3272 removed |
+| `rc_media_canary` holding `capture_wait` | — | unset: off | FR-135 R4a, temporary: the two DataChannel pumps wait in the capture as the RTP pump does, and no longer sleep on an empty ([remote-control.md §5.1g](remote-control.md#the-datachannel-pumps-wait-behind-capture_wait-fr-135-r4a)). This device only and live at the next session. A Mac and a session on GPU frames (`zero_copy`) keep their sleeps. A pushed `rc_media_legacy` holding `capture_wait` sends a session back. It goes with [#3275](https://github.com/gjovanov/roomler-ai/issues/3275)'s delete |
 | — | `ROOMLERD_MF_SHUTDOWN=0` | — | a kill switch, not a setting: Media Foundation encoders are released without being ended, which [leaks their threads](#ending-a-media-foundation-encoder) |
 | — | `ROOMLERD_USE_FFMPEG=0` | — | no FFmpeg backends at all |
 | — | `ROOMLERD_DC_H264=0` | — | no H.264-over-DataChannel advertisement (its cells are then not probed either) |

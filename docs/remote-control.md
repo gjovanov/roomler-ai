@@ -1454,12 +1454,15 @@ session**. Its idle line ran at 362 lines a second, which crowded its heartbeats
 out of the log uploader (16 on disk, 10 in `agent_logs`).
 
 A pump asks for the contract when it opens the capture (`capture::open_async`'s
-`paced`). Only the RTP pump does so far, and the request travels on each
-`CaptureCmd`, so a pump that does not ask keeps the old path, its open included.
+`paced`). The RTP pump asks. The two DataChannel pumps ask on a session that runs
+the `capture_wait` media path, which is off by default
+([below](#the-datachannel-pumps-wait-behind-capture_wait-fr-135-r4a)). The request
+travels on each `CaptureCmd`, so a pump that does not ask keeps the old path, its
+open included.
 
 ```mermaid
 flowchart TB
-    ASK["the RTP pump asks for a frame<br/>(CaptureCmd with a pace)"] --> ARM{"which arm"}
+    ASK["a pump that opened paced asks for a frame<br/>(CaptureCmd with a pace)"] --> ARM{"which arm"}
     ARM -->|"DXGI direct,<br/>zero-copy on or off"| WAIT["AcquireNextFrame(16 ms):<br/>a new frame ends the wait at once,<br/>and it is read back on this thread"]
     ARM -->|"scrap"| POLL["a fixed 0 inside scrap"]
     ARM -->|"GDI"| GATE["the slot-first bucket holds it to<br/>the target; a failed BitBlt takes no slot"]
@@ -1484,7 +1487,8 @@ drivers with a test in `dxgi_direct.rs`
 from 1 µs to 22 ms and a readback from 6 ms to 67 ms. So a capture that waits keeps
 its device to itself, reads each frame back on its own thread, and hands no GPU
 frame to anyone. `zero_copy` still decides what the DC pumps get, because their
-encoders do take GPU frames.
+encoders do take GPU frames. That is why a DC session whose capture hands out GPU
+frames keeps its pump's sleeps under `capture_wait`.
 
 The other way out was built and measured, and it lost: an `AcquireNextFrame(0)`
 poll resting on the 2 ms floor, which read L4 +11.3 ms p50 on a still screen,
@@ -1555,7 +1559,8 @@ The rest of the change:
   viewer, who really is locked out, pays that once, and then re-climbs quietly
   every 5 s. An unpaced open takes one look and goes straight on, as it always did:
   a DC pump's reopen holds the old capture through the open, so a wait there could
-  not succeed, and FR-70 AC10's week reads those pumps.
+  not succeed, and FR-70 AC10's week reads those pumps. On `capture_wait` a DC pump
+  lets go of its capture before it reopens, so its paced open can take the seat.
 - **An owed keyframe does not wait for the keepalive, and the transport coming up
   owes one.** A frame encoded before the transport is up is lost, and a browser asks
   for a keyframe only once a packet reaches it, which on a still screen is the next
@@ -1587,8 +1592,122 @@ Only the GDI arm holds to the target here.
 The kill switch is `ROOMLERD_RTP_CAPTURE_WAIT=0`: environment only, read once per
 pump. Off, the pump does not ask and the guard is not armed, so the capture spins
 as it did and an open on a taken seat takes one look. The reopen, the time-gated line
-and the blocking open do not come back with it. [FR-98 C7](fr/FR-98-input-to-photon-budget.md#4-design-cuts-each-one-attributed-by-l4)
-moves the other pumps over and retires the opt-in, the switch and their sleeps.
+and the blocking open do not come back with it. The two DataChannel pumps are on the
+contract behind a switch of their own (next), and
+[FR-98 C7](fr/FR-98-input-to-photon-budget.md#4-design-cuts-each-one-attributed-by-l4)'s
+delete retires the opt-in, both switches and the pumps' sleeps.
+
+#### The DataChannel pumps wait, behind `capture_wait` (FR-135 R4a)
+
+`media_pump_ffmpeg_dc` and `media_pump_vp9_444_dc` can take the same contract
+([#3275](https://github.com/gjovanov/roomler-ai/issues/3275)). The switch is the
+`capture_wait` media path ([the media paths](#51h-a-session-says-what-it-got-fr-135-r2),
+FR-135 §7.1). This build has its new code and runs the old by default:
+
+| To | Do | Takes effect |
+|---|---|---|
+| turn it on, on one device | `roomler config set rc_media_canary capture_wait` on that device (a comma-separated list, if the key already holds a name) | at that device's next session |
+| send a device back | push `rc_media_legacy` with `capture_wait` in it (`MANAGE_AGENTS`), or clear the canary key on the device | at its next session. After a push the canary's entry is refused, and the plan's `refused` reads `capture_wait:legacy` |
+| see which arm a session ran | `capture_wait=true` or `false`, the last field of both DC heartbeats | every heartbeat |
+
+Each pump reads the switch once, where its capture opens
+(`capture::pace::dc_capture_wait`), and keeps what it read until it ends.
+
+```mermaid
+flowchart TB
+    OPEN["a DC pump opens its capture"] --> ASKED{"capture_wait new<br/>for this session?"}
+    ASKED -->|"no: the default"| OLD["the pump as it has always run:<br/>unpaced open, its own sleep on an empty,<br/>a reopen that holds the old capture"]
+    ASKED -->|yes| HELD{"a Mac, or a capture that<br/>hands out GPU frames?"}
+    HELD -->|"yes: says why, once per pump"| OLD
+    HELD -->|no| NEW["paced open: the capture waits<br/>EmptyGuard::rest on an empty<br/>a reopen lets go first"]
+```
+
+| | Switch off (the default) | `capture_wait` on |
+|---|---|---|
+| `media_pump_ffmpeg_dc`, on an empty | sleeps 2 ms on the runtime | sleeps nothing after an empty that waited, and 2 ms after one that came straight back (`EmptyGuard::rest`) |
+| `media_pump_vp9_444_dc`, on an empty | sleeps half a frame, and a whole one before its first frame | the same rule as the FFmpeg pump |
+| The SYSTEM-context capture, DXGI direct | `AcquireNextFrame(0)`: answers at once | waits up to 16 ms in the acquire, and a frame ends the wait |
+| The SYSTEM-context capture, scrap | answers at once | cannot wait, so it rests on the 2 ms floor: about 450 asks a second. That is more than either pump asked on that arm: about 266 a second (FFmpeg) and 120 (VP9 at 60 fps) |
+| The SYSTEM-context capture, GDI | a whole capture on every ask | holds to the target, and so to FR-119's grants, which reach that bucket for the first time (`set_target_fps`) |
+| A reopen | opens while the old capture still holds the seat | lets go first. In the FFmpeg pump the let-go is inside the `recapture` timer, so that timer covers the same work on both arms |
+| WGC, the portal, mutter, DRM and the user-session scrap | wait or pace by themselves already, and the pump sleeps on top | the pump's sleep is gone, and nothing else changes |
+
+**Two sessions keep their sleeps with the switch on.** Each writes one line when its
+pump starts (`capture_wait is on, and this session's pump keeps its own sleeps`,
+with `why`):
+
+- `macos`: its capture polls for a frame until R12 gives it an event wake.
+- `gpu_frames`: its capture hands out GPU frames (`zero_copy` on, or a cell on
+  FR-132's default list). A capture that waits hands out none (above), so waiting
+  would turn zero-copy off behind the session's back. It waits once the capture has
+  a device of its own (FR-135 R5).
+
+**What the pump's sleep costs a frame, and what is left.** A frame presented while
+the pump sleeps waits out the rest of that sleep. A model of the pump's empty arm
+reads it on a test clock (`capture::pace::tests`, 40 arrival instants spread over
+one sleep). Its waiting arm is the helper both pumps call, its other arm copies
+their sleeps, and the product's resolver picks the arm from the two keys. A source
+test holds `peer.rs` to that model
+(`with_the_switch_on_no_dc_pump_sleeps_on_an_empty`).
+
+| Pump, and the sleep a frame lands in | Switch off, mean / max | `capture_wait` on |
+|---|---|---|
+| FFmpeg DC, 2 ms | 1.0 / 2.0 ms | 0 |
+| VP9 DC at its default 60 fps, half a frame | 4.2 / 8.2 ms | 0 |
+| VP9 DC at 60 fps before its first frame, a whole frame | 8.3 / 16.5 ms | 0 |
+| VP9 DC pinned to 30 fps, half a frame | 8.3 / 16.5 ms | 0 |
+
+| Asks in 30 s on a still screen, in the model | Switch off | `capture_wait` on |
+|---|---|---|
+| FFmpeg DC | 15,000 | 1,875 |
+| VP9 DC at 60 fps | 3,601 | 1,875 |
+| VP9 DC pinned to 30 fps | 1,800 | 1,875 |
+
+The zero is the pump's share: a frame ends the capture's wait, and no sleep of the
+pump's stands in its way. What is left is the wake itself, a thread switch and a
+channel, which a test clock does not have. A test clock also holds each sleep at
+its nominal length. The same model on a real clock reads both
+(`frame_ready_to_pickup_on_a_real_clock`, run by hand: real timers, a real thread
+for the capture, 200 frames an arm, one run on a loaded development machine):
+
+| On a real clock, mean / p95 / max | Switch off | `capture_wait` on |
+|---|---|---|
+| FFmpeg DC, 2 ms | 1.7 / 3.2 / 3.4 ms | 0.15 / 0.22 / 0.26 ms |
+| VP9 DC at 60 fps, half a frame | 4.7 / 9.2 / 10.5 ms | 0.17 / 0.24 / 0.50 ms |
+
+Its off arm agrees with a host. #3275 read 3.76 ms for the FFmpeg pump's cycle (its
+2 ms, the timer's rounding and the ask on top), which is about 266 asks a second,
+and a frame waiting 1.9 ms on average and 3.8 ms at most. So the first table is
+the floor of what the switch takes off a frame, and its asks overstate a host's
+off arm.
+
+⚠️ **All three tables are a model's numbers, not a field read.** The field read is #3275's
+own: `calls` on the capture worker's 30 s line on the direct arm, at most 2,000
+on a still screen with the pointer at rest, and L4 on FR-98's cells 3 and 4. A
+moving pointer ends each wait early (the RTP pump read about 74 asks a second
+that way, against 58). Until the read is in, the default stays off.
+
+**What changes meaning on a session that waits.** Don't compare these across the
+two arms:
+
+- `avg_capture_ms` on the FFmpeg DC heartbeat adds up every ask, and each empty
+  now holds its wait, so on a still screen it reads tens of milliseconds a frame.
+  It is waiting, not work. The work is `avg_readback_ms`.
+- `frames_empty` falls with the asks: about 60 a second on a still screen, where
+  the FFmpeg pump read about 266. The VP9 heartbeat carries `frames_empty` from
+  this build on, on both arms.
+- The keepalive re-encodes at the first empty past 60 ms, and empties now come
+  16 ms apart, so it lands at about 64 ms.
+- `poll_ms` in a stall line is the 2 ms floor of an empty that came straight back,
+  where it was the pump's 2 ms sleep. It still counts as work, and the wait in the
+  capture still does not (`encode/stall.rs`).
+
+**Three WARNs moved onto time** (#3275). Their arms run once per ask, so a count
+of asks was no limit: `DesktopMismatch` with the desktop unchanged had none, and a
+failed BitBlt and an unreachable input desktop wrote one line per 150 asks, which
+is 5 s at 30 asks a second and a third of a second at the floor's 450. Each is now
+one line per 5 s (`capture::pace::LineEvery`), after the first three for the last
+two.
 
 ### 5.1h A session says what it got (FR-135 R2)
 
@@ -1730,7 +1849,8 @@ flowchart LR
 |---|---|---|---|
 | `stats` | R0 | yes | new |
 | `media_plan` | R2 | yes | new |
-| `capture_wait`, `capture_stage`, `zero_copy_shared`, `dc_sink`, `sctp_rto`, `encode_stage`, `cell_table`, `rtp_sink`, `recording_door`, `high_refresh` | R4a to R12 | not yet | old |
+| `capture_wait` | R4a | yes | old. On with `rc_media_canary=capture_wait` ([§5.1g](#the-datachannel-pumps-wait-behind-capture_wait-fr-135-r4a)) |
+| `capture_stage`, `zero_copy_shared`, `dc_sink`, `sctp_rto`, `encode_stage`, `cell_table`, `rtp_sink`, `recording_door`, `high_refresh` | R4b to R12 | not yet | old |
 
 Some paths stand on others (`capture_wait` under `capture_stage`, both and `dc_sink`
 under `encode_stage` and `high_refresh`, `encode_stage` under `rtp_sink`), so an old
