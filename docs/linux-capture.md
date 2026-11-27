@@ -485,7 +485,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1419`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1427`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -537,7 +537,7 @@ Until the first read lands, which is milliseconds after start, the hello
 carries none.
 
 The brief rides `agents.capabilities`, so the device listing returns it with no
-server change. The count is one aggregate (`crates/api/src/routes/stats.rs:357`),
+server change. The count is one aggregate (`crates/api/src/routes/stats.rs:359`),
 grouped by `type` and `capture_arm`, with `total` and `online`:
 
 | route | scope |

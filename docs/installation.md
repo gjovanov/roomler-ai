@@ -162,7 +162,7 @@ step's words (`steps.rs:305`); the download's ticks and a script's lines have
 panels of their own. The daemon's and the companion's downloads are separate
 rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
 preflight says what is installed here already and what the install does to it,
-in a person's words (`label_existing`, `orchestrator_agent.rs:1883`,
+in a person's words (`label_existing`, `orchestrator_agent.rs:1785`,
 `orchestrator_unix.rs:1577`; `orchestrator_tunnel.rs:412`), for example
 "Roomler is installed for the whole computer (version 0.4.207): this install
 replaces it". A switch to the other kind is the switch's warning row to say.
@@ -578,7 +578,7 @@ file is a *normal* answer for that caller.
 |---|---|---|
 | `config::load` (`crates/agent-core/src/config.rs:3654`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3739`, `:3747`), and the load fails. Each line is worded for what happened to the live file (below) |
 | `config::read_if_present` (`crates/agent-core/src/config.rs:3778`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
-| `config::load_without_restore` (`crates/agent-core/src/config.rs:5262`, #4379) | the config the macOS supervisor's **enrolled worker** runs on | the load fails as it is: no `config.toml.prev` is read and nothing is written, and that worker ends with exit 78 and its own line (below) |
+| `config::load_without_restore` (`crates/agent-core/src/config.rs:5281`, #4379) | the config the macOS supervisor's **enrolled worker** runs on | the load fails as it is: no `config.toml.prev` is read and nothing is written, and that worker ends with exit 78 and its own line (below) |
 
 A start restores a missing file too (#4157). An enrolled device's start whose `config.toml` is missing but whose `config.toml.prev`
 loads and holds an enrollment takes the single-instance lock, then `load` restores the copy with the *"config missing — RESTORED"*
@@ -596,8 +596,8 @@ So removing `config.toml` alone does not make a device forget its enrollment: re
 restores its missing machine config the same way (#4176), with one rule more: only from a copy that passes every check the config itself
 would. That is the machine tree's check, and the rule that `%PROGRAMDATA%\roomler`, the machine folder and the copy were the machine's
 as found (#3609, #3666, [below](#windows)), read through one function
-(`crates/agent-core/src/machine_tree.rs:1175`). While only the copy is there, the repair leaves the tree as it found it unless the
-copy, the machine folder and its keys were the machine's as found, inherited entries counted (`machine_tree.rs:705`). The service host
+(`crates/agent-core/src/machine_tree.rs:1295`). While only the copy is there, the repair leaves the tree as it found it unless the
+copy, the machine folder and its keys were the machine's as found, inherited entries counted (`machine_tree.rs:783`). The service host
 asks that function after the machine config and the SYSTEM profile's own config, the order of the worker's ladder
 (`agents/roomlerd/src/win_service/supervisor.rs:990`), so a SYSTEM-profile config that opens runs, and nothing is restored. For a copy
 that passes, it starts the SYSTEM worker, whose start restores the file as above: written from the bytes the check judged, and put in
@@ -895,10 +895,10 @@ Details worth knowing:
   the tree as it found it, a replace right on `%PROGRAMDATA%\roomler` included,
   unless that file, the folder and its keys were the machine's as found,
   inherited entries counted, and a `.prev` beside a config inherited no right for
-  another account to change it (`machine_tree.rs:705`). With neither file, it
+  another account to change it (`machine_tree.rs:783`). With neither file, it
   leaves the tree as it is (above, #4485). It repairs the attempt
   record in every case, and what was not closed stays refused at every start and
-  tick, until an elevated save writes a closed tree. An elevated save whose config does not load takes the `.prev` beside it only where a start would, by the same rule: from one a start refuses it recovers nothing, and it says so in one line (#4453, `crates/agent-core/src/config.rs:3881`). Whatever the config's state, an elevated save sets aside a `.prev` a start would not take, as `config.toml.prev.set-aside` beside it (`-1` to `-9` when that name is taken), a name no reader loads, and says `machine tree: a config.toml.prev that a start would not take is set aside`; one it cannot move stays at its name, keeping the entries it was found with as its own, and where neither can be done the save stops, naming the file and what to do (`crates/agent-core/src/machine_tree.rs:3224`). A config that was not the
+  tick, until an elevated save writes a closed tree. An elevated save whose config does not load takes the `.prev` beside it only where a start would, by the same rule: from one a start refuses it recovers nothing, and it says so in one line (#4453, `crates/agent-core/src/config.rs:3881`). Whatever the config's state, an elevated save sets aside a `.prev` a start would not take, as `config.toml.prev.set-aside` beside it (`-1` to `-9` when that name is taken), a name no reader loads, and says `machine tree: a config.toml.prev that a start would not take is set aside`; one it cannot move stays at its name, keeping the entries it was found with as its own, and where neither can be done the save stops, naming the file and what to do (`crates/agent-core/src/machine_tree.rs:3372`). A config that was not the
   machine's is never run, never folded into (below), and `roomlerd re-enroll`
   and `roomlerd org` refuse it with nothing sent. Such a device stays without
   SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd
@@ -943,12 +943,20 @@ Details worth knowing:
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
   again for that owner, so the entry `%PROGRAMDATA%` hands whoever made it
-  names Administrators (`machine_tree.rs:998`). A link is refused, never taken
+  names Administrators (`machine_tree.rs:1076`). A link is refused, never taken
   over. What that person made below them stays theirs. Setup also seals
-  `%PROGRAMDATA%\roomler` (rc.52), by path, so only once it is a plain folder
-  that belongs to Administrators. And with `roomlerd adopt-enrollment` they carry an
+  `%PROGRAMDATA%\roomler` (rc.52), through one handle to it, the one on which
+  it was judged a plain folder (#4488, `machine_tree.rs:1126`): no step after
+  that check names it by path. Its new DACL is planned before anything is
+  written; then Administrators are made its owner, and that DACL, protected,
+  with full control for SYSTEM and Administrators, is written in one call. The
+  folder and what it holds end as the seal by path left them. A folder that
+  holds an entry of its own that is neither an allow nor a deny is not sealed:
+  its permissions and everything in it stay as they were, and the wizard
+  warns. And with
+  `roomlerd adopt-enrollment` they carry an
   existing machine config over only when it is private to the computer's
-  administrators once the repair has run (`machine_tree.rs:1292`), and was the
+  administrators once the repair has run (`machine_tree.rs:1412`), and was the
   machine's as found before it (#3666; Setup reads it before it seals
   `%PROGRAMDATA%\roomler`): one that is not is set aside, and a fresh one is
   written in its place, keeping no `.prev` and no key this build does not know

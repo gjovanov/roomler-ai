@@ -1126,6 +1126,17 @@ pub struct RcSettings {
     /// Env: `ROOMLER__RC__GUI_WORKER_READ`.
     #[serde(default)]
     pub gui_worker_read: bool,
+    /// FR-159 P1 — a tunnel-client enrollment that carries the client's own
+    /// `instance_id` is keyed by it: the row that holds it is revived, else an
+    /// unclaimed row with the request's `machine_id` is claimed once, else the
+    /// client gets a row of its own. Default **true**: a request without the
+    /// field is answered as before, and no client sends it before P2. `false`
+    /// is the kill switch for a P1 fault, not a setting to leave off: every
+    /// request is looked up by `machine_id` alone, no `instance_id` is written,
+    /// and a request that carried one is answered `keyed_by: machine_id`.
+    /// Env: `ROOMLER__RC__TUNNEL_INSTANCE_ID`.
+    #[serde(default = "default_true")]
+    pub tunnel_instance_id: bool,
 }
 
 fn default_agent_token_ttl_secs() -> u64 {
@@ -1159,6 +1170,7 @@ impl Default for RcSettings {
             session_slots: false,
             session_resume_secs: 0,
             gui_worker_read: false,
+            tunnel_instance_id: true,
         }
     }
 }
@@ -1668,6 +1680,7 @@ impl Settings {
             .set_default("rc.session_slots", false)?
             .set_default("rc.session_resume_secs", 0)?
             .set_default("rc.gui_worker_read", false)?
+            .set_default("rc.tunnel_instance_id", true)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

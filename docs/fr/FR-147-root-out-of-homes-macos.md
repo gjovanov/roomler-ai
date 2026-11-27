@@ -231,7 +231,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:3312`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:3320`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:1010`) and `folder_words` (`:1143`), with `r5_words` (`:1189`); `refusals` (`:1623`) says them.
 
 ### Refusals at Plan
@@ -333,7 +333,7 @@ result holds no enrollment root's file holds.
 **The supervisor's enrolled worker** (`run --supervised` without `--unenrolled`: a two-row Mac with
 `macos_supervise_gui_worker` on, or one row turned off by hand) never restores a config that is there and does not
 load (`config_at_start::load`, `agents/roomlerd/src/app/config_at_start.rs:121`, through
-`config::load_without_restore`, `crates/agent-core/src/config.rs:5262`), as it never restored a missing one
+`config::load_without_restore`, `crates/agent-core/src/config.rs:5281`), as it never restored a missing one
 (#4157). It ends with 78 and the line `the config at <path> does not load (<why>), and this worker does not restore
 its last good copy: …` (`ConfigDoesNotLoad`, `agents/roomlerd/src/daemon_error.rs:113`), both files as they
 were. The supervisor records no crash for it, and its give-up after exit 78 names both ends (`gave_up_reason`,
@@ -727,7 +727,7 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3025`, its sequence at `:3079`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3033`, its sequence at `:3087`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:3312`): one-row's row, and
