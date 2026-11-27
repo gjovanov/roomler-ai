@@ -477,8 +477,6 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 - The daemon's own machine id (`crates/agent-core/src/machine.rs:33-44`) and device rows (`agents`).
 - #3934, the crash recorder's host name, fixed in #4480.
 - The tunnel transport.
-- Where the tunnel config lives on Windows: under `%APPDATA%` (`config.rs:80-86`), which a roaming profile carries to
-  other machines, token included.
 - Telling, on a live socket, which install holds a row's token: the second machine of a shared row is found only when
   it enrolls again.
 - Merging the rows a split or a lost folder leaves: an administrator removes a stale row, as today.
