@@ -13,9 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::test_fixture::{CHECKED, Case, child, parent, run_in_child, swap_for_junction};
-use super::{HeldRollingWriter, held_dir, open_writer, switch_note};
+use super::{HeldRollingWriter, held_dir, open_writer, switch_note, take_early_lines};
 use crate::logging::{ServiceLogRole, set_service_logging};
-use crate::machine_tree::test_support::{aces, junction, protected, sddl};
+use crate::machine_tree::Seal;
+use crate::machine_tree::test_support::{aces, icacls, junction, me, protected, sddl};
 
 const DAY: u64 = 86_400;
 /// 2026-11-27, 00:00 UTC.
@@ -243,6 +244,13 @@ fn a_refused_hold_falls_back_and_says_why() {
         return run_in_child(root.path(), &test, &[]);
     };
     let roomler = root.join("ProgramData").join("roomler");
+    // The stand-in gives an account no right to delete what it made there;
+    // as the folder's owner, an account that is not elevated grants itself one.
+    assert!(
+        icacls(&roomler, &["/grant", &format!("*{}:(D)", me())]),
+        "DELETE on {}",
+        roomler.display()
+    );
     std::fs::rename(&roomler, root.join("roomler.old")).unwrap();
     junction(&roomler, &elsewhere);
     set_service_logging(ServiceLogRole::Worker);
@@ -299,5 +307,68 @@ fn only_a_role_process_with_the_switch_on_holds_its_log_folder() {
         "{:?}",
         switch_note()
     );
+    println!("{CHECKED}");
+}
+
+/// A reader that does not share deletion (PowerShell's `Get-Content`, `type`)
+/// still opens the day's log while the writer holds it, as it did
+/// tracing-appender's: no handle a writer keeps open holds `DELETE`, and
+/// stderr's two come from the same `append_file`. The control: a handle that
+/// holds it, as `HeldPath::append_file`'s own does, shuts such a reader out.
+#[test]
+fn a_reader_that_does_not_share_deletion_reads_the_days_log() {
+    let Some(Case { dir, .. }) = child(true) else {
+        return elevated("a_reader_that_does_not_share_deletion_reads_the_days_log");
+    };
+    use std::io::Read as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    let read = || {
+        let mut text = String::new();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(dir.join(day(1)))
+            .and_then(|mut file| file.read_to_string(&mut text))
+            .map(|_| text)
+    };
+    let logs = held_dir(&dir).expect("held");
+    let mut log = HeldRollingWriter::open(logs, "roomlerd.log", now).unwrap();
+    log.write_all(b"a line\n").unwrap();
+
+    let with_delete = logs.lock().append_file(&day(1), Seal::Readable).unwrap();
+    assert!(read().is_err(), "the control: a handle with DELETE open");
+    drop(with_delete);
+    assert_eq!(read().unwrap(), "a line\n", "with the writer's handle open");
+    println!("{CHECKED}");
+}
+
+/// The leaf policy's one WARN reaches the log: a start holds `service-logs`
+/// before its subscriber exists, so what the hold logs is kept and said once
+/// it does, each line once. With a junction where `service-logs` is, the hold
+/// moves the junction aside and makes a sealed folder, nothing made where it
+/// leads.
+#[test]
+fn what_the_hold_moved_aside_is_said_once_the_log_is_up() {
+    let Some(Case { dir, elsewhere, .. }) = child(false) else {
+        return elevated("what_the_hold_moved_aside_is_said_once_the_log_is_up");
+    };
+    junction(&dir, &elsewhere);
+    set_service_logging(ServiceLogRole::Worker);
+    let writer = open_writer(&dir, "roomlerd.log").unwrap();
+    assert!(writer.is_some(), "held");
+    assert!(dir.is_dir() && !is_link(&dir), "a sealed service-logs made");
+    assert!(
+        names_in(&elsewhere).is_empty(),
+        "{:?}",
+        names_in(&elsewhere)
+    );
+    let lines = take_early_lines();
+    assert!(
+        lines.len() == 1 && lines[0].contains("is a link") && lines[0].contains("moved aside"),
+        "{lines:?}"
+    );
+    assert!(take_early_lines().is_empty(), "each line once");
     println!("{CHECKED}");
 }

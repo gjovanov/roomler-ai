@@ -243,10 +243,22 @@ pub fn record_update_attempt() -> bool {
     let Some(p) = update_attempt_marker_path() else {
         return false;
     };
+    let stamp = format!("{}\n", chrono::Utc::now().to_rfc3339());
+    // FR-145 P2 — in a process that holds its `service-logs`, by handle.
+    #[cfg(windows)]
+    if let Some((held, name)) = crate::logging::held_logs::held_file(&p) {
+        return match held.write_file(name, stamp.as_bytes()) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+                false
+            }
+        };
+    }
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+    match std::fs::write(&p, stamp) {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");

@@ -281,7 +281,7 @@ pub(crate) fn now_unix() -> u64 {
 
 /// Read the file and accept it only under `key`, fresh enough.
 pub(crate) fn load_matching(path: &Path, key: &CacheKey, now_unix: u64) -> Result<CacheFile, Miss> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match read_cache(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Miss::NoFile),
         Err(e) => return Err(Miss::Unreadable(e.to_string())),
@@ -311,9 +311,35 @@ pub(crate) fn load_matching(path: &Path, key: &CacheKey, now_unix: u64) -> Resul
     Ok(file)
 }
 
+/// The cache's text. FR-145 P2: in a process that holds its `service-logs`,
+/// read below the held folder, never through a link nor from a file of more
+/// than one name; by path elsewhere.
+fn read_cache(path: &Path) -> std::io::Result<String> {
+    #[cfg(windows)]
+    if let Some((held, name)) = crate::logging::held_logs::held_file(path) {
+        let bytes = held
+            .read_file(name, MAX_HELD_READ)?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        return String::from_utf8(bytes).map_err(std::io::Error::other);
+    }
+    std::fs::read_to_string(path)
+}
+
+/// The most of the cache a read below the held folder takes: far above any
+/// real one.
+#[cfg(windows)]
+const MAX_HELD_READ: u64 = 4 * 1024 * 1024;
+
 /// Atomic: write a sibling temp file, then rename over the target, so a crash
 /// mid-write leaves the previous cache (or none) rather than half a file.
+/// FR-145 P2: in a process that holds its `service-logs`, the same by handle:
+/// a fresh file below the held folder, renamed onto the name.
 pub(crate) fn store(path: &Path, file: &CacheFile) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if let Some((held, name)) = crate::logging::held_logs::held_file(path) {
+        let json = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
+        return held.write_file(name, &json);
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }

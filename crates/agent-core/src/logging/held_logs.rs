@@ -1,18 +1,47 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 //! FR-145 P2 — the `service-logs` of a process with a [`super::ServiceLogRole`],
-//! on Windows: the daily log and the other writers of that folder.
+//! on Windows, written by handle.
 //!
-//! The seam: each act below is still by path, as today's writers act, and
-//! nothing outside the tests calls it yet. The change to handles follows it.
-#![allow(dead_code)]
+//! A role process holds its `service-logs` for its whole life: its start
+//! reaches the folder with [`HeldPath::machine`] and [`Seal::Readable`] (the
+//! tray reads the logs), and opens the day's log below that handle
+//! ([`open_writer`]). Every later act in the folder is below the handle too,
+//! the file names stay tracing-appender's daily ones, and an act refused
+//! there walks again once, as a start would: the folder may have been
+//! deleted or swapped since.
+//!
+//! | Writer | By handle |
+//! |---|---|
+//! | the day's log ([`HeldRollingWriter`]) | `append_file("<basename>.<YYYY-MM-DD>")`, a new name each UTC day by the writer's own clock |
+//! | the prune (`prune_old_logs`) | `entries()`, the same name and age rule, `remove_file` |
+//! | the panic file | `write_file("panic-<pid>-<ts>.log")` |
+//! | stderr's file (#3292, #3438) | `append_file` of the day's log, twice; its length from the file itself |
+//! | the daemon's encoder caps cache, install record, wedged MSI log and update-attempt marker | `write_file`, `read_file` and `rename_file`, through [`held_file`] |
+//!
+//! Every handle a writer keeps open appends and reads attributes, nothing
+//! more ([`for_appending`]), as tracing-appender's did: a reader that does not
+//! share deletion still opens the day's log. What the hold logs at the start
+//! (the leaf policy's one WARN) is logged once the subscriber is up.
+//!
+//! A start whose hold is refused takes #3073's fallback, the reason logged
+//! first: nothing is held then, and every writer goes by path in the fallback
+//! folder. With `ROOMLERD_MACHINE_TREE_HELD=0` nothing is held either:
+//! tracing-appender's writer and every other writer by path, as before, with
+//! one WARN that names the switch. A process with no role holds nothing.
+//!
+//! The crash recorder's records and its verdicts ledger keep their own walk
+//! (FR-145 P1): already by handle, for each write.
 
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::machine_tree::held::Refusal;
+use crate::machine_tree::{HeldPath, Seal};
 
 #[cfg(test)]
 mod tests;
@@ -25,16 +54,30 @@ static HELD: OnceLock<HeldLogDir> = OnceLock::new();
 /// `ROOMLERD_MACHINE_TREE_HELD`).
 static SWITCHED_OFF: AtomicBool = AtomicBool::new(false);
 
+/// The names the writers of `service-logs` use besides the logs and the
+/// panic files ([`super::is_pruned`]): the daemon's, and the crash
+/// recorder's ledger. After a seal in place, each one is sealed when it is a
+/// plain file of SYSTEM's or Administrators', and goes when it is not.
+const OTHER_NAMES: [&str; 6] = [
+    "caps-cache.json",
+    "last-install.json",
+    "update-attempt",
+    "msi-wedged.log",
+    "msi-wedged.prev.log",
+    crate::crash_recorder::VERDICTS_FILE,
+];
+
 /// This process's `service-logs`, as its start held it.
 pub struct HeldLogDir {
     dir: PathBuf,
+    held: Mutex<Arc<HeldPath>>,
 }
 
 impl HeldLogDir {
-    fn hold(dir: &Path) -> io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+    fn hold(dir: &Path) -> Result<Self, Refusal> {
         Ok(Self {
             dir: dir.to_path_buf(),
+            held: Mutex::new(Arc::new(walk(dir)?)),
         })
     }
 
@@ -43,47 +86,184 @@ impl HeldLogDir {
         &self.dir
     }
 
-    /// `bytes` as the file `name`, whole.
+    /// `bytes` as the file `name`, whole: a fresh file below the folder,
+    /// renamed onto the name ([`HeldPath::write_file`]).
     pub fn write_file(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        std::fs::write(self.dir.join(name), bytes)
+        self.act(|held| held.write_file(name, bytes, Seal::Readable))
     }
 
-    /// The file `name`, opened for appending.
+    /// The file `name`, opened for appending below the folder: a link or a
+    /// file of more than one name there is deleted as itself and the file
+    /// made again ([`HeldPath::append_file`]). The handle returned appends
+    /// and reads attributes, nothing more ([`for_appending`]).
     pub fn append_file(&self, name: &str) -> io::Result<File> {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.dir.join(name))
+        self.act(|held| held.append_file(name, Seal::Readable))
+            .map(for_appending)
     }
 
-    /// The file `name`, at most `max_len` bytes of it. `Ok(None)`: it is not
-    /// there.
+    /// The file `name`, at most `max_len` bytes of it, never through a link.
+    /// `Ok(None)`: it is not there.
     pub fn read_file(&self, name: &str, max_len: u64) -> io::Result<Option<Vec<u8>>> {
-        use std::io::Read as _;
-        match File::open(self.dir.join(name)) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take(max_len).read_to_end(&mut bytes)?;
-                Ok(Some(bytes))
+        self.act(|held| held.read_file(name, max_len))
+    }
+
+    /// The file `from` renamed to `to` by its own handle, a file there
+    /// replaced.
+    pub fn rename_file(&self, from: &str, to: &str) -> io::Result<()> {
+        self.act(|held| held.rename_file(from, held, to, true))
+    }
+
+    /// The prune: [`super::is_pruned`]'s names older than `cutoff`, read
+    /// from the folder's listing and deleted by their own handles. A folder
+    /// or a link is never one.
+    pub(super) fn prune(&self, cutoff: SystemTime) {
+        let cutoff = cutoff
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let Ok(entries) = self.act(HeldPath::entries) else {
+            return;
+        };
+        for entry in entries {
+            if !entry.is_dir
+                && !entry.is_link
+                && super::is_pruned(&entry.name)
+                && entry.modified_unix < cutoff
+            {
+                let _ = self.act(|held| held.remove_file(&entry.name));
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
         }
     }
 
-    /// The file `from` renamed to `to`, a file there replaced.
-    pub fn rename_file(&self, from: &str, to: &str) -> io::Result<()> {
-        std::fs::rename(self.dir.join(from), self.dir.join(to))
+    /// The length of the day's file `name`, from the file itself, opened as
+    /// its writers open it ([`HeldLogDir::append_file`]). Never from the
+    /// folder's listing: NTFS updates a listed length lazily, and a day's log
+    /// is open for writing all day.
+    pub(super) fn len_of(&self, name: &str) -> io::Result<u64> {
+        Ok(self.append_file(name)?.metadata()?.len())
     }
 
-    /// The prune ([`super::prune_old_logs_at`]'s rule).
-    pub(super) fn prune(&self, cutoff: SystemTime) {
-        super::prune_old_logs_at(&self.dir, cutoff);
+    /// `act` below the folder held; refused, once more below the folder
+    /// walked again, which then stays held.
+    fn act<T>(&self, act: impl Fn(&HeldPath) -> Result<T, Refusal>) -> io::Result<T> {
+        let held = Arc::clone(&self.lock());
+        let refused = match act(&held) {
+            Ok(done) => return Ok(done),
+            Err(refused) => refused,
+        };
+        let Ok(again) = walk(&self.dir) else {
+            return Err(refused.into());
+        };
+        let again = Arc::new(again);
+        *self.lock() = Arc::clone(&again);
+        act(&again).map_err(Into::into)
     }
 
-    /// The length of the file `name`; `None` when it is not there.
-    pub(super) fn len_of(&self, name: &str) -> Option<u64> {
-        std::fs::metadata(self.dir.join(name)).ok().map(|m| m.len())
+    fn lock(&self) -> MutexGuard<'_, Arc<HeldPath>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// `dir`, reached by handle and sealed with the leaf policy (D2). An earlier
+/// build's folder sealed in place hands nothing down: each name a writer of
+/// the folder uses is then sealed by its own handle when it is a plain file
+/// of SYSTEM's or Administrators', and goes when it is not. Other names are
+/// left as they are.
+fn walk(dir: &Path) -> Result<HeldPath, Refusal> {
+    let held = HeldPath::machine(dir, Seal::Readable)?;
+    if held.resealed() {
+        let gone = held.keep_only_plain(
+            |name| super::is_pruned(name) || OTHER_NAMES.contains(&name),
+            Seal::Readable,
+        );
+        if !gone.is_empty() {
+            let gone: Vec<String> = gone.iter().map(ToString::to_string).collect();
+            tracing::warn!(
+                ?gone,
+                "logging: service-logs sealed; what was not a plain file of its writers removed, \
+                 or left"
+            );
+        }
+    }
+    Ok(held)
+}
+
+/// `file`, opened again by its own handle (`ReOpenFile`: the same file, no
+/// name looked up) to append and read attributes alone, and the handle
+/// [`HeldPath::append_file`] gave closed. That one holds `DELETE`, for what
+/// it finds at the name and deletes; while a handle with `DELETE` is open, a
+/// reader that does not share deletion (PowerShell's `Get-Content`, `type`)
+/// cannot open the file, and a day's log is open all day. tracing-appender's
+/// handle never held it. Should the reopen fail (the open before it passed
+/// the same checks), the handle `append_file` gave goes on: the log stays
+/// where it is, as P1's ledger keeps its own.
+fn for_appending(file: File) -> File {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_APPEND_DATA, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, ReOpenFile,
+    };
+    const SYNCHRONIZE: u32 = 0x10_0000;
+    // SAFETY: `file`'s handle stays open for the call; the handle returned is
+    // a new one, owned below.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return file;
+    }
+    // SAFETY: a handle `ReOpenFile` just opened, which nothing else owns.
+    unsafe { File::from_raw_handle(handle) }
+}
+
+/// What the start's hold logged (the leaf policy's WARN, the scrub's), kept
+/// until the subscriber is up: the hold runs before it exists.
+static EARLY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// `start`, with what it logs kept in [`EARLY`].
+fn keeping_its_lines<T>(start: impl FnOnce() -> T) -> T {
+    let text = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = Arc::clone(&text);
+    let keeper = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .without_time()
+        .with_level(false)
+        .with_target(false)
+        .with_writer(move || Lines(Arc::clone(&sink)))
+        .finish();
+    let done = tracing::subscriber::with_default(keeper, start);
+    let text = text.lock().unwrap_or_else(PoisonError::into_inner);
+    EARLY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .extend(String::from_utf8_lossy(&text).lines().map(str::to_owned));
+    done
+}
+
+/// The lines [`keeping_its_lines`] kept, for `init` to log once its
+/// subscriber is up; each once.
+pub(super) fn take_early_lines() -> Vec<String> {
+    std::mem::take(&mut *EARLY.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// The writer of [`keeping_its_lines`]'s subscriber.
+struct Lines(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Lines {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut text = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        text.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -93,7 +273,9 @@ pub fn held_dir(dir: &Path) -> Option<&'static HeldLogDir> {
 }
 
 /// The held folder and the name of `path`, when `path` is a file directly in
-/// the folder this process holds.
+/// the folder this process holds. `None` for any other path, and in a process
+/// that holds none (no role, the switch at `0`, a refused hold): the caller
+/// writes by path, as before.
 pub fn held_file(path: &Path) -> Option<(&'static HeldLogDir, &str)> {
     let name = path.file_name()?.to_str()?;
     Some((held_dir(path.parent()?)?, name))
@@ -107,7 +289,8 @@ fn in_machine_tree(dir: &Path) -> bool {
 
 /// The day's log of a role process in the machine tree, `dir` held for the
 /// life of the process. `Ok(None)`: any other process, or the switch at `0`,
-/// which writes as before.
+/// which writes as before. An error (the hold refused, or the day's file):
+/// nothing is held, and the start takes its fallback (#3073).
 pub(super) fn open_writer(
     dir: &Path,
     basename: &'static str,
@@ -119,16 +302,22 @@ pub(super) fn open_writer(
         SWITCHED_OFF.store(true, Ordering::Relaxed);
         return Ok(None);
     }
-    let logs = HeldLogDir::hold(dir)?;
-    let date = date_of(SystemTime::now());
-    let file = logs.append_file(&day_name(basename, &date))?;
-    let _ = HELD.set(logs);
+    let now = unix_secs(SystemTime::now());
+    let (logs, file) = keeping_its_lines(|| -> io::Result<_> {
+        let logs = HeldLogDir::hold(dir)?;
+        let file = logs.append_file(&day_name(basename, &date_of(now)))?;
+        Ok((logs, file))
+    })?;
+    if HELD.set(logs).is_err() {
+        // One hold a process: `init` opens its log once.
+        return Ok(None);
+    }
     let logs = HELD.get().expect("set above");
     Ok(Some(HeldRollingWriter {
         logs,
         basename,
         now: SystemTime::now,
-        date,
+        next_day: next_day(now),
         file,
     }))
 }
@@ -147,35 +336,49 @@ fn day_name(basename: &str, date: &str) -> String {
     format!("{basename}.{date}")
 }
 
-fn date_of(at: SystemTime) -> String {
-    super::format_utc_date(at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))
+fn unix_secs(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// The daily log of [`open_writer`]: each day's file under tracing-appender's
-/// name, in UTC.
+fn date_of(unix: u64) -> String {
+    super::format_utc_date(unix)
+}
+
+/// The start of the UTC day after the one `unix` is in.
+fn next_day(unix: u64) -> u64 {
+    (unix / 86_400 + 1) * 86_400
+}
+
+/// The daily log of [`open_writer`] (D3): each UTC day's file under
+/// tracing-appender's name, opened below the held folder, and as
+/// tracing-appender's roll, only forward: a clock set back keeps the day's
+/// file. A day whose file cannot be opened keeps writing to the day before's,
+/// as tracing-appender's does, and says so on stderr.
 pub struct HeldRollingWriter {
     logs: &'static HeldLogDir,
     basename: &'static str,
     now: fn() -> SystemTime,
-    date: String,
+    /// When the file in use stops being the day's.
+    next_day: u64,
     file: File,
 }
 
 impl HeldRollingWriter {
     /// The writer of `basename`'s days in `logs`, today's file opened, with
     /// `now` as its clock.
+    #[cfg(test)]
     pub(super) fn open(
         logs: &'static HeldLogDir,
         basename: &'static str,
         now: fn() -> SystemTime,
     ) -> io::Result<Self> {
-        let date = date_of(now());
-        let file = logs.append_file(&day_name(basename, &date))?;
+        let at = unix_secs(now());
+        let file = logs.append_file(&day_name(basename, &date_of(at)))?;
         Ok(Self {
             logs,
             basename,
             now,
-            date,
+            next_day: next_day(at),
             file,
         })
     }
@@ -183,9 +386,9 @@ impl HeldRollingWriter {
 
 impl Write for HeldRollingWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let date = date_of((self.now)());
-        if date != self.date {
-            let name = day_name(self.basename, &date);
+        let at = unix_secs((self.now)());
+        if at >= self.next_day {
+            let name = day_name(self.basename, &date_of(at));
             match self.logs.append_file(&name) {
                 Ok(file) => {
                     let _ = self.file.flush();
@@ -195,7 +398,7 @@ impl Write for HeldRollingWriter {
                     "logging: could not open {name}: {e}; the day before's file goes on"
                 )),
             }
-            self.date = date;
+            self.next_day = next_day(at);
         }
         self.file.write(buf)
     }

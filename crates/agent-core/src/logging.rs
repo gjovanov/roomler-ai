@@ -36,6 +36,14 @@
 //! against the non-blocking appender's worker thread not draining the
 //! queue before the OS reaps a panicking process.
 //!
+//! FR-145 P2: on Windows, a process with a [`ServiceLogRole`] holds its
+//! `service-logs` by handle for its whole life, and writes its daily log, the
+//! prune, the panic file, stderr's file and the daemon's other files there
+//! below that handle ([`held_logs`]). The file names stay tracing-appender's
+//! daily ones. A refused hold takes the per-profile fallback (#3073), the
+//! reason logged first, and `ROOMLERD_MACHINE_TREE_HELD=0` writes everything by
+//! path, as before, with one WARN that names the switch.
+//!
 //! Init is idempotent (a second call is a no-op) so test harness setup
 //! that calls `init()` repeatedly doesn't panic on subscriber re-install.
 
@@ -229,6 +237,13 @@ pub fn init() {
     // stdout-only in silence, and a service's stdout goes nowhere: a sealed
     // `service-logs` left a daemon running for hours with no log at all.
     let (opened, notes) = open_log_appender(resolve_log_dir(), fallback_log_dir(), |d| {
+        // FR-145 P2 — a role process's `service-logs`, held by handle for the
+        // life of the process ([`held_logs`]). A refused hold is an error
+        // here, so the fallback below takes it, by path.
+        #[cfg(windows)]
+        if let Some(held) = held_logs::open_writer(d, log_basename())? {
+            return Ok(LogWriter::Held(held));
+        }
         std::fs::create_dir_all(d)?;
         // P3d Slice B: write under the new `roomlerd.log` basename
         // (S1b: `roomlerd-service.log` for the SCM host — see
@@ -238,6 +253,7 @@ pub fn init() {
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix(log_basename())
             .build(d)
+            .map(LogWriter::Rolling)
             .map_err(std::io::Error::other)
     });
     let _ = LOG_DIR.set(opened.as_ref().map(|(d, _)| d.clone()));
@@ -278,6 +294,17 @@ pub fn init() {
     // use and, through the upload layer, the server.
     for note in notes {
         tracing::warn!(%note, "logging: the log directory could not be used (#3073)");
+    }
+    #[cfg(windows)]
+    {
+        // FR-145 P2 — what the hold of `service-logs` logged before there was
+        // a subscriber (the leaf policy's WARN), and the switch's WARN.
+        for line in held_logs::take_early_lines() {
+            tracing::warn!("{line}");
+        }
+        if let Some(note) = held_logs::switch_note() {
+            tracing::warn!("{note}");
+        }
     }
     // #3438 — and what only stderr carries goes to that file too, as #3292 does
     // for the per-user daemon: the watchdog's last words, a panic, FFmpeg.
@@ -384,6 +411,33 @@ fn open_log_appender<A>(
                 fallback.display()
             )],
         ),
+    }
+}
+
+/// [`init`]'s file writer: tracing-appender's daily roll, by path, or a role
+/// process's daily log below its held `service-logs` (FR-145 P2,
+/// [`held_logs`]). Both name each day's file `<basename>.<YYYY-MM-DD>`, UTC.
+enum LogWriter {
+    Rolling(tracing_appender::rolling::RollingFileAppender),
+    #[cfg(windows)]
+    Held(held_logs::HeldRollingWriter),
+}
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Rolling(writer) => writer.write(buf),
+            #[cfg(windows)]
+            Self::Held(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Rolling(writer) => writer.flush(),
+            #[cfg(windows)]
+            Self::Held(writer) => writer.flush(),
+        }
     }
 }
 
@@ -757,7 +811,7 @@ mod stderr_file {
                 if now != date {
                     on_the_file = repoint(&dir, &now);
                     date = now;
-                } else if on_the_file && !has_room(&rolling_file(&dir, &date)) {
+                } else if on_the_file && !room(&dir, &date) {
                     on_the_file = repoint(&dir, &date);
                 }
             }
@@ -770,7 +824,11 @@ mod stderr_file {
     /// The name tracing-appender's daily roll gives `date`'s file, in UTC. The
     /// tests hold this against a real `RollingFileAppender`.
     pub(super) fn rolling_file(dir: &Path, date: &str) -> PathBuf {
-        dir.join(format!("{}.{date}", log_basename()))
+        dir.join(rolling_name(date))
+    }
+
+    fn rolling_name(date: &str) -> String {
+        format!("{}.{date}", log_basename())
     }
 
     pub(super) fn utc_date_now() -> String {
@@ -788,12 +846,32 @@ mod stderr_file {
     /// Point stderr at `date`'s file, or at `NUL` when that file is at its cap or
     /// cannot be opened. Says whether it is on the file.
     pub(super) fn repoint(dir: &Path, date: &str) -> bool {
-        let file = rolling_file(dir, date);
-        if has_room(&file) && point_stderr_at(&file).is_ok() {
+        if room(dir, date) && point_at_the_day(dir, date).is_ok() {
             return true;
         }
         let _ = point_stderr_at(Path::new("NUL"));
         false
+    }
+
+    /// Whether `date`'s file is under the cap: its length from the file,
+    /// opened below the held folder in a process that holds `dir` (FR-145
+    /// P2), by path elsewhere.
+    fn room(dir: &Path, date: &str) -> bool {
+        match held_logs::held_dir(dir) {
+            Some(held) => held
+                .len_of(&rolling_name(date))
+                .map_or(true, |len| len < DAILY_CAP),
+            None => has_room(&rolling_file(dir, date)),
+        }
+    }
+
+    /// Point stderr at `date`'s file: below the held folder, by handle, in a
+    /// process that holds `dir` (FR-145 P2); by path elsewhere.
+    fn point_at_the_day(dir: &Path, date: &str) -> std::io::Result<()> {
+        match held_logs::held_dir(dir) {
+            Some(held) => point_stderr(|| held.append_file(&rolling_name(date))),
+            None => point_stderr_at(&rolling_file(dir, date)),
+        }
     }
 
     /// Point this process's two stderrs at `path`. The C runtime's is fd 2, in the
@@ -811,12 +889,16 @@ mod stderr_file {
     /// would keep that day's log open for its lifetime. `Command` hands a child its
     /// stderr with a duplicate of its own, so a child that asks for it still gets it.
     fn point_stderr_at(path: &Path) -> std::io::Result<()> {
-        let open = || {
+        point_stderr(|| {
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-        };
+        })
+    }
+
+    /// [`point_stderr_at`], each of the two handles from `open`.
+    fn point_stderr(open: impl Fn() -> std::io::Result<std::fs::File>) -> std::io::Result<()> {
         let for_rust = open()?.into_raw_handle();
         let for_crt = open()?.into_raw_handle();
         // SAFETY: `_open_osfhandle` takes ownership of `for_crt`, and `_dup2`,
@@ -1082,7 +1164,24 @@ fn prune_old_logs(dir: &Path, keep_days: u64) {
     else {
         return;
     };
+    // FR-145 P2 — a role process's held `service-logs`: listed and deleted by
+    // handle, by the same rule.
+    #[cfg(windows)]
+    if let Some(held) = held_logs::held_dir(dir) {
+        held.prune(cutoff);
+        return;
+    }
     prune_old_logs_at(dir, cutoff);
+}
+
+/// The names the prune ages out, by path and by handle alike: every rolling
+/// log's (#3230), the legacy rolled name's, and the panic files.
+fn is_pruned(name: &str) -> bool {
+    rolling_basenames().any(|base| name.starts_with(base))
+        // RETIRED-NAME-ANCHOR: legacy rolled logs must still AGE OUT; dropping this
+        // leaks them forever on an upgraded host. See docs/fr/FR-21.
+        || name.starts_with("roomler-agent.log")
+        || name.starts_with("panic-")
 }
 
 /// Same as [`prune_old_logs`] but takes the cutoff as a parameter so
@@ -1106,20 +1205,16 @@ fn prune_old_logs_at(dir: &Path, cutoff: SystemTime) {
         let Ok(mtime) = meta.modified() else {
             continue;
         };
-        let name = entry.file_name();
-        let lossy = name.to_string_lossy();
-        let is_ours = rolling_basenames().any(|base| lossy.starts_with(base))
-            // RETIRED-NAME-ANCHOR: legacy rolled logs must still AGE OUT; dropping this
-            // leaks them forever on an upgraded host. See docs/fr/FR-21.
-            || lossy.starts_with("roomler-agent.log")
-            || lossy.starts_with("panic-");
-        if is_ours && mtime < cutoff {
+        if is_pruned(&entry.file_name().to_string_lossy()) && mtime < cutoff {
             let _ = std::fs::remove_file(entry.path());
         }
     }
 }
 
 fn install_panic_hook(log_dir: PathBuf) {
+    // FR-145 P2 — a role process's panic file goes below its held folder.
+    #[cfg(windows)]
+    let held = held_logs::held_dir(&log_dir);
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let bt = Backtrace::force_capture();
@@ -1140,6 +1235,13 @@ fn install_panic_hook(log_dir: PathBuf) {
         let path = log_dir.join(format!("panic-{pid}-{ts}.log"));
         // Sync write — we do not trust the non-blocking appender's
         // worker thread to flush before the process is reaped.
+        #[cfg(windows)]
+        if let (Some(held), Some(name)) = (held, path.file_name().and_then(|n| n.to_str())) {
+            let _ = held.write_file(name, content.as_bytes());
+        } else {
+            let _ = std::fs::write(&path, &content);
+        }
+        #[cfg(not(windows))]
         let _ = std::fs::write(&path, &content);
         // Best-effort tracing emission too — usually flushes via the
         // WorkerGuard's Drop, but the sync file above is the source

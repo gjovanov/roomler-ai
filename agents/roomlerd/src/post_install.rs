@@ -270,10 +270,26 @@ const RECORD_RENAME_PAUSES: [Duration; 3] = [
 /// refused (another process holds the record open without sharing its
 /// deletion), the record is written in place, as before.
 fn write_record_file(path: &Path, outcome: &InstallOutcome) -> Result<()> {
+    let json = serde_json::to_string_pretty(outcome).context("serialising install outcome")?;
+    // FR-145 P2 — in a process that holds its `service-logs`, by handle: a
+    // fresh file below the held folder, renamed onto the record, with the same
+    // pauses. Never written in place: by handle nothing writes into whatever
+    // stands at the name.
+    #[cfg(windows)]
+    if let Some((held, name)) = crate::logging::held_logs::held_file(path) {
+        let mut written = Ok(());
+        for pause in RECORD_RENAME_PAUSES {
+            std::thread::sleep(pause);
+            written = held.write_file(name, json.as_bytes());
+            if written.is_ok() {
+                break;
+            }
+        }
+        return written.with_context(|| format!("writing {}", path.display()));
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let json = serde_json::to_string_pretty(outcome).context("serialising install outcome")?;
     let fresh = fresh_record_path(path);
     if let Err(e) = std::fs::write(&fresh, &json) {
         let _ = std::fs::remove_file(&fresh);
@@ -986,6 +1002,15 @@ fn keep_wedged_log(log: &std::path::Path, dir: &std::path::Path) -> Option<PathB
         return None;
     }
     let kept = dir.join("msi-wedged.log");
+    // FR-145 P2 — in a process that holds its `service-logs`, by handle: the
+    // slot before by the file's own handle, the copy written whole.
+    #[cfg(windows)]
+    if let Some((held, name)) = crate::logging::held_logs::held_file(&kept) {
+        let bytes = std::fs::read(log).ok()?;
+        let _ = held.rename_file(name, "msi-wedged.prev.log");
+        held.write_file(name, &bytes).ok()?;
+        return Some(kept);
+    }
     let _ = std::fs::rename(&kept, dir.join("msi-wedged.prev.log"));
     std::fs::copy(log, &kept).ok()?;
     Some(kept)
