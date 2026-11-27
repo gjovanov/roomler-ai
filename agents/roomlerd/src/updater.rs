@@ -4415,10 +4415,10 @@ pub async fn run_update_helper(stop: impl std::future::Future<Output = ()>) -> a
     // already gone and does not re-trigger the path unit.
     #[cfg(target_os = "macos")]
     let wake = {
-        // launchd WatchPaths is edge-triggered and ThrottleInterval spaces
-        // relaunches, so macOS needs no in-helper gate. `remove_file` never
-        // follows a symlink, so a planted link is unlinked, not dereferenced.
-        crate::helper_gate::wake::settle(std::path::Path::new(update_trigger_path()), 0)
+        // The helper keeps its own file at the wake path and reads a wake as a
+        // change to it, so its own consume no longer starts launchd again;
+        // anything else at the path is replaced once (#4372, `helper_gate::wake`).
+        crate::helper_gate::wake::settle(std::path::Path::new(update_trigger_path()), euid)
     };
     #[cfg(target_os = "linux")]
     {
@@ -4569,7 +4569,7 @@ mod mac_gate {
     }
 
     /// The helper's cycles, and its wait between them.
-    pub(super) async fn run(stop: impl Future<Output = ()>, watch: Watch) -> anyhow::Result<()> {
+    pub(super) async fn run(stop: impl Future<Output = ()>, mut wake: Watch) -> anyhow::Result<()> {
         tokio::pin!(stop);
         let dir = crate::logging::log_dir();
         let _lock = match dir.as_deref().map(take_lock) {
@@ -4589,7 +4589,6 @@ mod mac_gate {
         let started = std::time::Instant::now();
         let exe = std::env::current_exe().ok();
         let program = exe.as_deref().and_then(program_id);
-        let mut watch = watch;
         let mut stopped = false;
         loop {
             match cycle(&mut budget, path.as_deref(), &mut stop).await? {
@@ -4606,7 +4605,7 @@ mod mac_gate {
                         && exe.as_deref().and_then(program_id) != program,
                     awake: started.elapsed(),
                     now: unix_now(),
-                    wake: watch.look(),
+                    wake: wake.look(),
                     since_cycle: last_cycle.elapsed(),
                 };
                 match gate::next_step(&seen, budget) {
@@ -4620,11 +4619,10 @@ mod mac_gate {
                         return Ok(());
                     }
                     Step::InstallOverAll | Step::Cycle => {
-                        if seen.wake {
-                            // Consumed unread, as at the start of a run.
-                            let _ = std::fs::remove_file(watch.path());
-                        }
-                        watch.cycled();
+                        // The wake file stays as it is: the baseline becomes
+                        // this tick's read, so a write made during the cycle
+                        // is the next tick's wake.
+                        wake.cycled();
                         break;
                     }
                     Step::Wait(rest) => {
