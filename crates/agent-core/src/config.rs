@@ -4924,8 +4924,8 @@ pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, 
 
 /// #3609 — the parent alone, `%ProgramData%\roomler`, for the machine config at
 /// `path` (`machine_tree::adopt_machine_parent`): what Setup's machine write runs
-/// before it seals the parent, so that the seal, which names it by path, finds a
-/// plain folder that belongs to Administrators. An `Err` for a parent that is
+/// before it seals the parent ([`seal_machine_parent`]): a person's daemon may
+/// have made it. An `Err` for a parent that is
 /// not a plain folder. `Ok(false)` at any other path, when there was nothing to
 /// take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
 #[cfg(windows)]
@@ -4937,6 +4937,25 @@ pub fn take_machine_parent(path: &std::path::Path) -> std::result::Result<bool, 
         return Ok(false);
     }
     crate::machine_tree::adopt_machine_parent(&tree)
+}
+
+/// rc.52, #4488 — Setup's seal of `%ProgramData%\roomler`, the folder two
+/// levels above the machine config at `path`, after the take
+/// ([`take_machine_parent`]): made if it is not there yet, then sealed through
+/// one handle to it, the one that judged it a plain folder
+/// (`machine_tree::seal_machine_parent`). It runs whatever
+/// `ROOMLERD_MACHINE_TREE_REPAIR` says, as the seal always has. Never the
+/// daemon's.
+#[cfg(windows)]
+pub fn seal_machine_parent(path: &std::path::Path) -> std::result::Result<(), String> {
+    let parent = path.parent().and_then(|p| p.parent()).ok_or_else(|| {
+        format!(
+            "machine-global config path {} has no grandparent dir to harden",
+            path.display()
+        )
+    })?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    crate::machine_tree::seal_machine_parent(parent)
 }
 
 /// #3609 — keep the outgoing config at `path` as its `.prev`, through a new

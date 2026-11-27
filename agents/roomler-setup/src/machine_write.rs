@@ -303,9 +303,9 @@ const NO_STEP: &str = "Roomler was installed, but its administrator step ended b
      write this device's enrollment, which on this role only an administrator's process may write. \
      Run Roomler Setup again: nothing was enrolled, and the enrollment token is still unused.";
 
-/// How long one exchange with the step may take: the parent's seal (two
-/// `icacls` runs, each up to 20 s on a host busy with higher-priority work,
-/// #3291) and a few local reads and writes.
+/// How long one exchange with the step may take: the parent's seal and a few
+/// local reads and writes. 180 s, as when the seal was two `icacls` runs of up
+/// to 20 s each on a host busy with higher-priority work (#3291).
 #[cfg(target_os = "windows")]
 const EXCHANGE: Duration = Duration::from_secs(180);
 
@@ -437,14 +437,14 @@ async fn exchange(link: &mut StepLink, request: &Request) -> std::io::Result<Ans
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// rc.52, #3609: `%ProgramData%\roomler`, the parent of the machine config at
-/// `config_path`, as the process that writes that config leaves it (an
-/// elevated wizard, or the step): taken for Administrators first, by handle
-/// (`config::take_machine_parent`: a person's daemon may have made it), then
-/// its inheritance replaced by SYSTEM and Administrators
-/// (`orchestrator_agent::harden_machine_global_dir`). A parent that is not a
-/// plain folder is left for the service's check to refuse, never sealed
-/// through. The warnings, for the person.
+/// rc.52, #3609, #4488: `%ProgramData%\roomler`, the parent of the machine
+/// config at `config_path`, as the process that writes that config leaves it
+/// (an elevated wizard, or the step): taken for Administrators first, by
+/// handle (`config::take_machine_parent`: a person's daemon may have made it),
+/// then sealed through one handle to it, the one that judged it a plain folder
+/// (`config::seal_machine_parent`). A parent that is not a plain folder, or
+/// holds an entry the seal cannot write back, is left as found for the
+/// service's check to refuse. The warnings, for the person.
 #[cfg(target_os = "windows")]
 pub(crate) fn seal_parent(config_path: &Path) -> Vec<String> {
     if let Err(e) = roomlerd::config::take_machine_parent(config_path) {
@@ -452,7 +452,7 @@ pub(crate) fn seal_parent(config_path: &Path) -> Vec<String> {
             "could not take the machine-global config directory's parent for Administrators ({e})"
         )];
     }
-    match crate::orchestrator_agent::harden_machine_global_dir(config_path) {
+    match roomlerd::config::seal_machine_parent(config_path) {
         Ok(()) => Vec::new(),
         Err(e) => vec![format!(
             "could not restrict permissions on the machine-global config directory ({e})"
@@ -956,8 +956,8 @@ mod tests {
     mod on_ntfs {
         use super::*;
         use roomler_node_core::machine_tree::test_support::{
-            USERS, aces, another_account, elevated_or_skip, icacls, junction, local_guest, names,
-            owner, protected, sddl, sealed, set_dacl,
+            USERS, aces, another_account, elevated_or_skip, icacls, junction, local_guest, me,
+            names, owner, protected, sddl, sealed, set_dacl,
         };
         use roomler_node_core::machine_tree::{self, MachineTree};
 
@@ -1232,6 +1232,46 @@ mod tests {
                 "{warnings:?}"
             );
             assert_eq!(std::fs::read(&file).unwrap(), b"x", "it stays a file");
+        }
+
+        /// #4488 — a parent holding an entry of a kind the seal cannot write
+        /// back (a conditional entry, neither an allow nor a deny) is refused
+        /// before anything changes, with the warning the person has had for a
+        /// parent the seal could not restrict, naming the entry's kind: it, the
+        /// machine folder in it and the config there are left byte for byte as
+        /// they were. The service's check refuses such a parent anyway.
+        #[test]
+        fn a_parent_with_an_entry_the_seal_cannot_write_back_is_left_as_found() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("roomler");
+            let folder = parent.join("roomler");
+            std::fs::create_dir_all(&folder).unwrap();
+            let config = folder.join("config.toml");
+            std::fs::write(&config, b"x").unwrap();
+            // This test's own account too, so that it opens the parent as the
+            // seal does whether or not it runs elevated.
+            set_dacl(
+                &parent,
+                &format!(
+                    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})\
+                     (XA;OICI;FA;;;WD;(Member_of {{SID(BA)}}))",
+                    me()
+                ),
+            );
+            let entries = [&parent, &folder, &config];
+            let found: Vec<String> = entries.iter().map(|e| sddl(e)).collect();
+            assert!(found[0].contains("(XA;"), "{}", found[0]);
+            assert_eq!(
+                seal_parent(&config),
+                vec![format!(
+                    "could not restrict permissions on the machine-global config directory ({} \
+                     carries an access rule of a kind the seal cannot write back (type 9), so \
+                     nothing was changed)",
+                    parent.display()
+                )]
+            );
+            let after: Vec<String> = entries.iter().map(|e| sddl(e)).collect();
+            assert_eq!(after, found, "left as it was");
         }
 
         /// #4488 — `ROOMLERD_MACHINE_TREE_REPAIR=0` skips the take of the

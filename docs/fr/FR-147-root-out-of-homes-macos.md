@@ -333,7 +333,7 @@ result holds no enrollment root's file holds.
 **The supervisor's enrolled worker** (`run --supervised` without `--unenrolled`: a two-row Mac with
 `macos_supervise_gui_worker` on, or one row turned off by hand) never restores a config that is there and does not
 load (`config_at_start::load`, `agents/roomlerd/src/app/config_at_start.rs:121`, through
-`config::load_without_restore`, `crates/agent-core/src/config.rs:5234`), as it never restored a missing one
+`config::load_without_restore`, `crates/agent-core/src/config.rs:5253`), as it never restored a missing one
 (#4157). It ends with 78 and the line `the config at <path> does not load (<why>), and this worker does not restore
 its last good copy: …` (`ConfigDoesNotLoad`, `agents/roomlerd/src/daemon_error.rs:113`), both files as they
 were. The supervisor records no crash for it, and its give-up after exit 78 names both ends (`gave_up_reason`,
