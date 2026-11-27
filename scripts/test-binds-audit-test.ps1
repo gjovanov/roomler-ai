@@ -83,3 +83,6 @@ if ($failed -gt 0) {
     exit 1
 }
 Write-Host "all $($cases.Count) cases passed"
+# Said outright: the last case's child exited 1 on purpose, and a caller that
+# reads $LASTEXITCODE (GitHub's pwsh shell does) would take that as ours.
+exit 0
