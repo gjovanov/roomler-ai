@@ -416,6 +416,9 @@ pub mod test_fixture {
 
     /// The root a parent hands its child.
     pub const ROOT: &str = "ROOMLER_NODE_TEST_SERVICE_LOGS_ROOT";
+    /// The stand-in the parent made below the root, handed over whole: the
+    /// child names the folder its parent made, never one of its own.
+    const STAND_IN: &str = "ROOMLER_NODE_TEST_SERVICE_LOGS_STAND_IN";
     /// What a child prints once its case is checked.
     pub const CHECKED: &str = "service-logs case: checked";
 
@@ -457,6 +460,7 @@ pub mod test_fixture {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([test, "--exact", "--nocapture", "--test-threads=1"])
             .env(ROOT, root)
+            .env(STAND_IN, &pd)
             .envs(env.iter().copied())
             .output()
             .unwrap();
@@ -474,7 +478,8 @@ pub mod test_fixture {
     /// holds it, and named as the log folder. `None` in the parent.
     pub fn child(hold: bool) -> Option<Case> {
         let root = PathBuf::from(std::env::var_os(ROOT)?);
-        crate::appdirs::test_fixture::program_data_is(root.join("ProgramData"));
+        let stand_in = std::env::var_os(STAND_IN).expect("the parent names its stand-in");
+        crate::appdirs::test_fixture::program_data_is(PathBuf::from(stand_in));
         let dir = crate::appdirs::machine_global_dir().join("service-logs");
         if hold {
             let held = super::HeldLogDir::hold(&dir).unwrap_or_else(|e| panic!("held: {e}"));
