@@ -94,9 +94,23 @@ in **one** place. Same argument the SSH work settled on: *the refusals are the l
 rows, so recording them cannot be per-call-site* (`decide` returns
 `Result<Granted, SshDenyReason>` and `dispatch` records both arms).
 
-`Limit` is an enum and its `match` inside the helper is exhaustive, so adding a fifteenth
-field to `PlanLimits` fails to compile until someone decides whether it is a gate — the same
-structural trick as `RpcCap::wire()`.
+The compiler asks "is this field a gate?" in both directions — the same structural trick
+as `RpcCap::wire()`:
+
+| Direction | Construct | A new … fails to compile until |
+|---|---|---|
+| field → limit | `quota::field_classes` destructures `PlanLimits` with every field named and **no `..`**, binding each to `FieldClass::Gate(Limit::…)` or `FieldClass::NotAGate("<reason>")` | … `PlanLimits` field is classified there |
+| limit → field | `Limit::describe`'s `match` is exhaustive over `Limit`'s variants and reads a `PlanLimits` field in each arm | … `Limit` variant names the field it caps |
+
+The four non-gates and their reasons are data: `overlay_mesh` (on for every plan),
+`relay_bytes_per_month` (a throttle through the relay allowance, never a refusal — FR-115
+D4), `max_message_history` (the retention bound this FR chose not to gate, reported-only)
+and `per_seat` (not a limit: it says which values scale with seats). The unit test
+`every_plan_limits_field_is_classified` checks that the serialized plan matrix's keys are
+exactly the gated fields' `Limit::as_str()` spellings plus those four. ⚠ The check holds
+only while `PlanLimits` stays a plain struct: `#[non_exhaustive]` would force a `..` into the
+destructure and silently switch it off (#3336; until then the paragraph here claimed it of
+`describe`'s match, which covers only the limit → field direction).
 
 ### 3. The mode must not be able to weaken what was already enforced
 
@@ -252,7 +266,11 @@ one more"), and conflating them would mark every tenant exactly at its limit as 
       FR chose not to gate, so it has no `Limit` variant. Every other comparison goes
       through `Limit::describe`. Whether that exception satisfies this line is an
       operator call.*
-- [ ] Adding a field to `PlanLimits` fails to compile until it is classified in `Limit`.
+- [x] Adding a field to `PlanLimits` fails to compile until it is classified in `Limit`.
+      *True since [#4508](https://github.com/gjovanov/roomler-ai/pull/4508) (2026-11-27,
+      #3336): `quota::field_classes` destructures every field with no `..`, and a scratch
+      field fails with E0027 `pattern does not mention field` there (the RED is in the PR).
+      The note below is the 2026-09-25 finding it fixes.*
       *⚠️ Not true, and never was (2026-09-25). `Limit::describe`'s exhaustive match
       covers `Limit`'s VARIANTS, not `PlanLimits`' FIELDS: two fields —
       `overlay_mesh`, `max_message_history` — have never had a variant (deliberately,

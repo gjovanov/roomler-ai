@@ -87,6 +87,10 @@ pub mod external_access;
 pub mod external_logins;
 pub mod files;
 pub mod fp16;
+/// #3355 — the bytes free in a folder, from the operating system's own answer
+/// for that folder: the recorder's free-space probe. Compiled on every OS, so
+/// every OS's unit-test lane runs its tests.
+pub mod free_space;
 /// A thread's filesystem identity: a root daemon's work in a person's folder,
 /// done as the person (FR-85's, shared with received files by FR-97 P3d).
 #[cfg(any(target_os = "linux", all(unix, feature = "recording")))]
