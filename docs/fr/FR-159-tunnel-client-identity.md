@@ -427,7 +427,7 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 
 ## Acceptance criteria
 
-- [ ] **AC1** (P0): R0–R3 read by the coordinator, counts only, and recorded in the field log.
+- [x] **AC1** (P0): R0–R3 read by the coordinator, counts only, and recorded in the field log.
 - [ ] **AC2** (P0, RED): F1 and F2 read RED on the current release and server, and F4's pair is left enrolled for P3.
 - [ ] **AC3** (P1): the integration tests above, each shown RED on master first, and #3328's tests unchanged and green.
 - [ ] **AC4** (P1): the decision function's table test covers every row of the outcome table, and the owner scope, the
@@ -489,3 +489,4 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 
 | date | what | result |
 |---|---|---|
+| 2026-11-27 12:41Z | P0: R0–R3 on production's `tunnel_clients`, read by the coordinator: bounded, counts only, from outside the database pod. R1 groups by the type of `deleted_at`, so it also shows rows that lack the field. | R0: 29 rows. R1: Linux 6 live and 15 removed, Windows 7 live, macOS 1 removed, and no row lacks `deleted_at`. R2: no name is on two live rows of one organization. R3: **every live Linux row (6 of 6) is derived from `unknown`**; Windows 0 of 7 (7 `other`); none named by an administrator. Each of those six rows is one that a second machine of its organization, with the same name, OS and architecture, would have joined. The database pod's restart count and memory were the same before and after. 🟢 **AC1.** |
