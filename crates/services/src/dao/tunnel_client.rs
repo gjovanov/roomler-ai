@@ -4,7 +4,7 @@ use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{AgentStatus, OsKind, TunnelClient};
 
-use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
+use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
 pub struct TunnelClientDao {
     pub base: BaseDao<TunnelClient>,
@@ -26,6 +26,27 @@ pub enum ReviveScope {
     LiveOrRemoved(ObjectId),
 }
 
+/// What [`TunnelClientDao::claim`] did (FR-159). The update matches only
+/// while the row holds no `instance_id`, so when it matches nothing the row is
+/// read again to tell why.
+#[derive(Debug)]
+pub enum Claim {
+    /// The row held no install and was in scope: revived, and it now holds
+    /// the install's id.
+    Claimed(TunnelClient),
+    /// The same install claimed it first (one config enrolling twice at once,
+    /// with two tokens): revived within the scope, as a row found by that id
+    /// is. Not a new row: the unique index on `instance_id` would refuse it.
+    Revived(TunnelClient),
+    /// Another install claimed it first. Nothing was written: this install
+    /// gets a row of its own.
+    TakenByAnother,
+    /// The row left the scope the route decided (removed since, say), and no
+    /// install holds it. Nothing was written: the route refuses it, as a
+    /// revival that lost its scope is refused.
+    OutOfScope,
+}
+
 impl TunnelClientDao {
     pub fn new(db: &Database) -> Self {
         Self {
@@ -33,6 +54,9 @@ impl TunnelClientDao {
         }
     }
 
+    /// A new row. An FR-159 client passes its `instance_id` as `machine_id`
+    /// too: unique under the `machine_id` index, a value no older client
+    /// sends, and so a row no legacy hash ever finds.
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
@@ -40,6 +64,7 @@ impl TunnelClientDao {
         owner_user_id: ObjectId,
         name: String,
         machine_id: String,
+        instance_id: Option<String>,
         os: OsKind,
         client_version: String,
     ) -> DaoResult<TunnelClient> {
@@ -53,6 +78,7 @@ impl TunnelClientDao {
             tags: Vec::new(),
             name_admin_set: false,
             machine_id,
+            instance_id,
             os,
             client_version,
             status: AgentStatus::Offline,
@@ -84,6 +110,23 @@ impl TunnelClientDao {
             .await
     }
 
+    /// FR-159 — the row an install's own id holds, live or removed, as
+    /// [`Self::find_by_tenant_and_machine`] reads the legacy hash: the unique
+    /// `(tenant_id, instance_id)` index covers removed rows too, so a removed
+    /// client is revived in place, never inserted again.
+    pub async fn find_by_tenant_and_instance(
+        &self,
+        tenant_id: ObjectId,
+        instance_id: &str,
+    ) -> DaoResult<Option<TunnelClient>> {
+        self.base
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "instance_id": instance_id,
+            })
+            .await
+    }
+
     /// Refresh at re-enrollment, within `scope`: clear `deleted_at`, refresh
     /// os / client_version, bump `updated_at`. Returns the updated row so the
     /// caller can mint a fresh tunnel-client token, or `None` when the row is
@@ -109,6 +152,71 @@ impl TunnelClientDao {
         client_version: &str,
         scope: ReviveScope,
     ) -> DaoResult<Option<TunnelClient>> {
+        self.revive(client_id, name, os, client_version, scope, None)
+            .await
+    }
+
+    /// FR-159 — claim a row no install holds yet for the install
+    /// `instance_id`: [`Self::rehydrate`] within `scope`, and the row takes the
+    /// id in the same update, which matches only while the row holds none. It
+    /// never writes `machine_id`, because the row's overlay node is keyed by
+    /// it, and it moves no `token_gen` (D3): the token comes at the row's
+    /// generation, as every re-enrollment's does.
+    ///
+    /// An update that matched nothing is told apart by reading the row again
+    /// ([`Claim`]).
+    pub async fn claim(
+        &self,
+        client_id: ObjectId,
+        instance_id: &str,
+        name: &str,
+        os: OsKind,
+        client_version: &str,
+        scope: ReviveScope,
+    ) -> DaoResult<Claim> {
+        if let Some(row) = self
+            .revive(
+                client_id,
+                name,
+                os,
+                client_version,
+                scope,
+                Some(instance_id),
+            )
+            .await?
+        {
+            return Ok(Claim::Claimed(row));
+        }
+        let held = match self.base.find_by_id(client_id).await {
+            Ok(row) => row.instance_id,
+            Err(DaoError::NotFound) => return Ok(Claim::OutOfScope),
+            Err(e) => return Err(e),
+        };
+        Ok(match held.as_deref() {
+            // The same install claimed it first: the row is this install's,
+            // revived within the scope as a row found by its id is.
+            Some(held) if held == instance_id => self
+                .rehydrate(client_id, name, os, client_version, scope)
+                .await?
+                .map_or(Claim::OutOfScope, Claim::Revived),
+            Some(_) => Claim::TakenByAnother,
+            // No install holds it, so the scope is what no longer held.
+            None => Claim::OutOfScope,
+        })
+    }
+
+    /// The update [`Self::rehydrate`] documents. With `claim`, the row also
+    /// takes that install's id in the same update, which then matches only
+    /// while the row holds none.
+    async fn revive(
+        &self,
+        client_id: ObjectId,
+        name: &str,
+        os: OsKind,
+        client_version: &str,
+        scope: ReviveScope,
+        claim: Option<&str>,
+    ) -> DaoResult<Option<TunnelClient>> {
         let os_bson = bson::to_bson(&os).unwrap_or(bson::Bson::Null);
         let mut set = doc! {
             "os": { "$literal": os_bson },
@@ -116,7 +224,7 @@ impl TunnelClientDao {
             "updated_at": DateTime::now(),
             "deleted_at": bson::Bson::Null,
         };
-        let filter = match scope {
+        let mut filter = match scope {
             // `deleted_at: null` (null OR absent), as every live read here.
             ReviveScope::LiveOwnedBy(owner) => doc! {
                 "_id": client_id,
@@ -134,6 +242,12 @@ impl TunnelClientDao {
                 doc! { "_id": client_id }
             }
         };
+        if let Some(instance_id) = claim {
+            // `null` is null OR absent: an unclaimed row has no field at all
+            // (`skip_serializing_if`), and nothing ever writes it null.
+            filter.insert("instance_id", bson::Bson::Null);
+            set.insert("instance_id", doc! { "$literal": instance_id });
+        }
         let matched = self
             .base
             .collection()
