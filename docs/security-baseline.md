@@ -767,13 +767,35 @@ The sites on it since P1:
 | #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1650` |
 | The machine config's key files the daemon writes: a device key (`peer-auth\<tenant>.json`) and the browser keys (`<tenant>.controllers.json`), #3956 | `HeldPath::base(<machine folder>)`, then `open_or_make_dir("peer-auth", Seal::Private)`: opened as it is, or made sealed, with no leaf policy, since the keys folder is FR-94's to repair; then `write_file(.., Seal::Private)`, so each file comes out as that repair leaves it. A link at `peer-auth` leaves the key unwritten, and the hello offers none | `agents/roomlerd/src/peer_auth.rs:1193`, `crates/agent-core/src/machine_tree/held.rs:453` |
 
-P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
-machine folder, with a test that fails on a new path-based one; until then those sites
-write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's environment
-sends the crash recorder and the machine config's key files back to their writes by
-path, each with one WARN naming the switch
+P2 put the service logs on it (next table). P3 moves the remaining SYSTEM writers below
+the machine folder, with a test that fails on a new path-based one; until then those
+sites write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's
+environment sends the crash recorder, the machine config's key files and the service
+logs back to their writes by path, each with one WARN naming the switch
 (`crates/agent-core/src/machine_tree.rs:381`). The clean-up's removals have no switch: a
 removal that follows a link has no safe old way to return to.
+
+The service logs since P2: a process with a `ServiceLogRole` (the service host, the
+SYSTEM worker, `netd`, the per-Machine package's steps) holds its `service-logs` for its
+whole life, `HeldPath::machine(.., Seal::Readable)`, and acts there only below that
+handle; an act refused there walks again once, since the folder may have been deleted or
+swapped. A process with no role, and every platform but Windows, writes as before.
+
+| Writer | By handle | Code |
+|---|---|---|
+| The day's log | `append_file("<basename>.<YYYY-MM-DD>")`, tracing-appender's daily name, a new one each UTC day, rolled forward only. A day whose file cannot be opened keeps the day before's, as tracing-appender's roll does | `crates/agent-core/src/logging/held_logs.rs:294`, `crates/agent-core/src/logging/held_logs.rs:357` |
+| The prune, the panic file, stderr's file (#3292, #3438) | `entries` and `remove_file`, by the same name and age rule; `write_file`; `append_file` twice, the cap read from the file itself, never from the folder's listing, which NTFS updates lazily for a file open for writing | `crates/agent-core/src/logging.rs:1162`, `crates/agent-core/src/logging.rs:1214`, `crates/agent-core/src/logging.rs:859` |
+| The daemon's encoder caps cache, install record, wedged MSI log and update-attempt marker | `write_file`; the cache read with `read_file`; the wedged log's slot before with `rename_file` | `agents/roomlerd/src/encode/caps_cache.rs:317`, `:337`, `agents/roomlerd/src/post_install.rs:272`, `agents/roomlerd/src/post_install.rs:1000`, `agents/roomlerd/src/updater.rs:242` |
+
+Every handle a writer keeps open there appends and reads attributes, nothing more: the
+one `append_file` gives holds `DELETE`, for what it finds at the name and deletes, so it
+is opened again by its own handle without it (`ReOpenFile`,
+`crates/agent-core/src/logging/held_logs.rs:199`). While a handle with `DELETE` is open,
+a reader that does not share deletion (PowerShell's `Get-Content`, `type`) cannot open
+the file, and a day's log is open all day. A hold that is refused (a link above
+`service-logs`) takes #3073's per-profile fallback, the reason the first line logged; what
+the hold itself logs, the leaf policy's one WARN, is logged once the log is open, since
+the hold comes before it (`crates/agent-core/src/logging/held_logs.rs:229`).
 
 ### A viewer's file transfer acts as the person at the screen (#3048, #3669, #3688)
 
@@ -872,12 +894,12 @@ escaping, on every line that holds it:
 |---|---|---|
 | `user` | the name the client logs in as | `ssh: authenticated (server grant)`, `ssh: authenticated (ssh_authorized_keys)`, `ssh: rejected — no live grant …` |
 | `term` | the terminal the client asks for | `ssh: pty requested`, `ssh: interactive session started` |
-| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2370`) |
-| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2233`) | the four `ssh: forward …` lines |
-| `caller` | the grant's caller as the server words it; in a session `ssh:«caller»@«address»`, or `ssh:«user»@«address» (key-list)` with the client's own login name (`agents/roomlerd/src/ssh.rs:903`, `:926`) | the six `rc:ssh.grant` lines in `agents/roomlerd/src/signaling.rs`, the SYSTEM service's claim (`agents/roomlerd/src/ssh_service.rs:677`), every line of a session, the question to the person at the device, and the exec engine's lines for the command (`fleet-rpc: running command`, `exec: streaming command`, `exec: refusing to run …`, in `agents/roomlerd/src/exec.rs`) |
+| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2372`) |
+| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2235`) | the four `ssh: forward …` lines |
+| `caller` | the grant's caller as the server words it; in a session `ssh:«caller»@«address»`, or `ssh:«user»@«address» (key-list)` with the client's own login name (`agents/roomlerd/src/ssh.rs:905`, `:928`) | the six `rc:ssh.grant` lines in `agents/roomlerd/src/signaling.rs`, the SYSTEM service's claim (`agents/roomlerd/src/ssh_service.rs:677`), every line of a session, the question to the person at the device, and the exec engine's lines for the command (`fleet-rpc: running command`, `exec: streaming command`, `exec: refusing to run …`, in `agents/roomlerd/src/exec.rs`) |
 | `run_as` | `daemon`, `console_user` or `named:«account»` (`RunAs::label`, `agents/roomlerd/src/exec.rs:791`) | `ssh: sftp session started`, `ssh: interactive session started`, `ssh: exec finished`, `exec: refusing to run …` |
 | `e` | the terminal's start error, which on Windows quotes `named:«account»` | `ssh: could not start the terminal session` |
-| `msg` | what `sftp-server` writes to its stderr, which can quote a path the client sent: its first 4 KiB, with `cut_bytes` counting the rest (`SftpStderr`, `agents/roomlerd/src/ssh.rs:2318`, #3890) | `ssh: sftp-server stderr`, one line a session, written when the child closes its stderr, from both spawns (a Windows `console_user` session's too) |
+| `msg` | what `sftp-server` writes to its stderr, which can quote a path the client sent: its first 4 KiB, with `cut_bytes` counting the rest (`SftpStderr`, `agents/roomlerd/src/ssh.rs:2320`, #3890) | `ssh: sftp-server stderr`, one line a session, written when the child closes its stderr, from both spawns (a Windows `console_user` session's too) |
 
 Logged as they are: the server's ids (`grant_id`) and the daemon's own (a
 question's id), which the SYSTEM service checks with `valid_object_id` before it
@@ -1408,7 +1430,7 @@ An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:44
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would
-leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:506`, #3525). A
+leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:563`, #3525). A
 spec that names the crate keeps its say: `RUST_LOG=debug` keeps its DEBUG lines, and
 `roomler_localapi=off` silences it. Only root sets a root daemon's `RUST_LOG`, so the
 person at the device cannot turn the record off.

@@ -334,7 +334,7 @@ Omit `--remote` for a supervised SOCKS5 listener toward the node. The
 | `connecting (fl-N)` | the flow exists; its first tunnel session toward the node is being opened | no |
 | `active (fl-N)` | the tunnel session is up and the listener is bound | **yes** |
 | `retrying (fl-N, attempt K, next in Ss): <error>` | the session failed K times in a row — the node is offline, the daemon's control connection is down, or the transport setup failed; `<error>` is the last attempt's | no |
-| `backoff Ss: <error>` | the flow itself could not be created — its local port is taken (`route still cannot bind its local port` in the log names the holder) | no |
+| `backoff Ss: <error>` | the flow itself could not be created — its local port is taken (`route still cannot bind its local port` in the log names the holder: another process, or one of this daemon's own flows with what it is to the routes, [#1035](tunnels.md#one-writer-owns-the-route-to-flow-map-1035)) | no |
 | `FAILED: <reason>` | terminal — a failure that cannot heal by retrying (enrollment revoked, cross-tenant); fix the cause and `route enable` | no |
 | `disabled` | declared, not supervised | no |
 

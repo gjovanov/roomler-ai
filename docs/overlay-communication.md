@@ -110,7 +110,7 @@ numbers. On `rc:overlay.join` the server looks the machine up by
   capability vector, the warm relay. So a node that joins again mid-session
   (a control-WS Reattach, or an exit whose setup changed its offer, #3562)
   follows the join with what it wiped (`rejoin_plan`,
-  `crates/tunnel-core/src/overlay/runtime.rs:4682`), and an exit's re-offer
+  `crates/tunnel-core/src/overlay/runtime.rs:4684`), and an exit's re-offer
   reaches the admin row and every peer at once
   ([`overlay-exit-nodes.md`](./overlay-exit-nodes.md#the-offer-follows-the-setup-3562)).
 - **no live node** → `allocate_host` pops the head of `free_hosts` (FIFO, so an
@@ -219,7 +219,7 @@ WireGuard device, the TUN and every carrier running, one runtime per tenant
 re-attaches it (`OverlayEvent::Reattach`, `:275`) instead of starting another,
 the runtime joins again, and the full netmap the server answers that join with
 is the reconcile: whatever the runtime still holds that the netmap no longer
-lists is pruned (`crates/tunnel-core/src/overlay/runtime.rs:4221`). What the
+lists is pruned (`crates/tunnel-core/src/overlay/runtime.rs:4223`). What the
 device's own peer list says in between is in
 [§8](#the-peer-list-while-the-control-socket-is-down-4367).
 
@@ -311,7 +311,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:460`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:517`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -617,7 +617,7 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2224`](../crates/tunnel-core/src/overlay/runtime.rs#L2224),
+  ([`runtime.rs:2230`](../crates/tunnel-core/src/overlay/runtime.rs#L2230),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
@@ -1264,7 +1264,7 @@ match this node`), and an org-relay grant that needs them is refused.
     are said on a target of their own, `tunnel_core::overlay::route_guard`
     (`ROUTE_GUARD_LOG`, `crates/tunnel-core/src/overlay/mod.rs:121`), which
     the daemon's log filter keeps at INFO whatever `RUST_LOG` says
-    (`crates/agent-core/src/logging.rs:472`), as FR-110 does for `sockbuf`
+    (`crates/agent-core/src/logging.rs:529`), as FR-110 does for `sockbuf`
     ([fleet-rpc.md](fleet-rpc.md)). The Linux package's units and the macOS
     package's LaunchAgent set `RUST_LOG=roomlerd=info,warn`, which drops every
     other `tunnel_core` INFO and, until #4380, dropped these two as well; the
@@ -1304,8 +1304,8 @@ match this node`), and an org-relay grant that needs them is refused.
   So the child usually exits before the daemon's run loop has heard the stop,
   and #1867's WARN used to go out on every restart. The daemon now marks its
   stop as the first thing each arm of `run`'s shutdown `select!` does
-  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5881`, `:5917`,
-  `:5929`). After the child exits, the supervisor waits out the first part of
+  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5835`, `:5871`,
+  `:5883`). After the child exits, the supervisor waits out the first part of
   the backoff, at most 1 s (`STOP_GRACE`,
   `crates/tunnel-core/src/overlay/netstate.rs:1277`), before it says anything:
 
@@ -1815,7 +1815,7 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   `overlay::runtime_alive` (`agents/roomlerd/src/overlay.rs:122`): the tenant's
   runtime slot exists and its event channel is open. The daemon builds its
   LocalAPI state only with that probe (`DaemonState::for_daemon`,
-  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5238`); the
+  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5192`); the
   constructor without one is test-only.
 - **The mark** (`PeerInfo::control_down`, `crates/localapi/src/lib.rs:1026`) is
   additive. Its `since_ms` is when this device lost that socket, stamped by the
@@ -1824,7 +1824,7 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   the socket's 80 s receive deadline before. In a kept row `connection`,
   `stalled`, `rtt_ms` and `last_seen_ms` stay live, and `online` is the server's
   word from before the loss, never rewritten. A token refused at the upgrade is
-  kept and marked too: any HTTP 401 there refuses it (`signaling.rs:1874`), and a
+  kept and marked too: any HTTP 401 there refuses it (`signaling.rs:1880`), and a
   middlebox the machine trusts can answer one while the mesh runs on.
 - **Several orgs.** Each org's rows carry their own mark and time: the primary's
   outage no longer hides a secondary's live peers, and a secondary's outage no

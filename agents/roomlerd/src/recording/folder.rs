@@ -306,34 +306,19 @@ pub fn unique_recording_name(dir: &Path, now: chrono::DateTime<chrono::Local>) -
         .unwrap_or(first)
 }
 
-/// Bytes free on the volume holding `dir` (the longest mount point that
-/// prefixes its canonical path). `None` when it cannot be told.
+/// The bytes this process may still write in `dir`, from the operating
+/// system's own answer for that folder ([`crate::free_space::available`]), so a
+/// folder on a tmpfs, a network mount or a mapped drive reads that volume's
+/// room. `None` only when that query fails, for example when the folder is
+/// gone, and every reader takes "can't tell" as stopping nothing.
 ///
-/// FR-85 P7 — storage only. A full refresh also reads every disk's kind and
-/// its I/O counters, which on macOS walks IOKit for each volume, and nothing
-/// here reads either.
+/// #3355 — this used to match the folder against `sysinfo`'s mount list, which
+/// leaves those mounts out, so a folder on one read the room of `/`, or none.
+/// The query can block where the folder's own file system has stopped
+/// answering, as the recording's writes there do, which is why the continue
+/// gate asks it from a blocking thread.
 pub fn available_space(dir: &Path) -> Option<u64> {
-    let canon = std::fs::canonicalize(dir).ok()?;
-    let canon = strip_verbatim(&canon);
-    let disks = sysinfo::Disks::new_with_refreshed_list_specifics(
-        sysinfo::DiskRefreshKind::nothing().with_storage(),
-    );
-    disks
-        .list()
-        .iter()
-        .filter(|d| starts_with_ci(&canon, d.mount_point()) || canon.starts_with(d.mount_point()))
-        .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(|d| d.available_space())
-}
-
-/// `\\?\C:\x` → `C:\x`, so a canonical Windows path compares with a mount
-/// point.
-fn strip_verbatim(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    match s.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
-        _ => p.to_path_buf(),
-    }
+    crate::free_space::available(dir)
 }
 
 #[cfg(test)]
@@ -480,5 +465,13 @@ mod tests {
     fn free_space_is_reported_for_a_real_folder() {
         let d = scratch("space");
         assert!(available_space(&d).is_some_and(|b| b > 0));
+    }
+
+    /// #3355 — "can't tell" means only that the query failed, as it does for a
+    /// folder that is gone. The old probe read whichever mount prefixed the path.
+    #[test]
+    fn a_folder_that_is_gone_reads_as_cant_tell() {
+        let gone = scratch("space-gone").join("unplugged");
+        assert_eq!(available_space(&gone), None);
     }
 }

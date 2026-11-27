@@ -70,15 +70,41 @@
 #     patch of the vendored webrtc-sctp: the order written across ordered and
 #     unordered messages, and a `maxRetransmits: 0` chunk abandoned when it
 #     is lost instead of at its first send), beside `gauges()` and in its
-#     way: it never waits for the slot, and a held slot, no association or a
-#     stream the association does not have answers `false`. Nothing calls it
-#     yet.
+#     way: it never waits for the slot. The agent's lane calls it under
+#     `video_deadline` `on` (FR-148 P4b-3). Since FR-148 P4b a refusal says
+#     why, `Err(DeadlineMarkRefusal)`: the slot held, no association, or a
+#     stream the association does not have (the enum, at the end of the
+#     file, writes `slot_held`, `no_association`, `no_stream`). And
+#     `deadline_streams()`, the streams the association has marked
+#     (`Association::deadline_streams`, a patch of the vendored webrtc-sctp),
+#     a read that marks nothing, reached the same way; the agent's cells read
+#     it. src/sctp_transport/sctp_transport_test.rs's
+#     `test_mark_deadline_stream_says_why_it_refused` (each refusal by its
+#     cause, on a real pair) and `test_deadline_mark_refusal_words` hold
+#     their tests.
+#   - src/sctp_transport/mod.rs + src/data_channel/mod.rs (FR-148 P4b): a
+#     channel the remote end opened in band carries its SCTP stream as its
+#     id from the moment the accept path builds it, before the app's
+#     `on_data_channel` handler sees it. Upstream leaves `RTCDataChannel::
+#     new`'s placeholder 0 there, which only `open()` replaces and an
+#     accepted channel never runs, so its `id()` read 0 for good, in logs,
+#     in stats and to the agent's deadline mark: with the viewer the DTLS
+#     server its streams are odd and every mark was refused, and with the
+#     viewer the DTLS client stream 0 is its first channel, which the mark
+#     would have marked instead. Pion passes the stream (`ID: &sid`) to every
+#     channel it accepts. src/data_channel/data_channel_test.rs's
+#     `test_data_channel_accepted_id_is_its_stream_when_the_answerer_is_the_
+#     dtls_client` and `..._dtls_server` hold its tests (the id in the
+#     handler and once open, against the stream, on both DTLS roles). The
+#     ids a local channel takes are unchanged: an accepted channel's has the
+#     remote end's parity.
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only
 # callers that explicitly opt in to a larger value see different
-# behaviour. The agent (which doesn't currently touch SettingEngine
-# at all) is unaffected.
+# behaviour: tunnel-core's `TunnelPeer` (the CLI's and the agent's
+# tunnels) asks for 8 MiB, and the agent's remote-desktop sessions
+# leave it at 0.
 
 [package]
 edition = "2021"
