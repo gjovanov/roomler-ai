@@ -546,19 +546,21 @@ mod tests {
         let on = waits(None, Some("capture_wait"));
         assert!(!off, "with neither key set a pump runs as it always has");
 
+        // The VP9 pump runs at 60 unless a host pins it to 30
+        // (`vp9_444_target_fps`).
         let cells = [
             ("FFmpeg DC pump, its 2 ms sleep", FFMPEG_SLEEP),
             (
-                "VP9 DC pump at 30 fps, half a frame",
-                frame_duration_floor(30) / 2,
-            ),
-            (
-                "VP9 DC pump at 30 fps, a whole frame (no frame yet)",
-                frame_duration_floor(30),
-            ),
-            (
                 "VP9 DC pump at 60 fps, half a frame",
                 frame_duration_floor(60) / 2,
+            ),
+            (
+                "VP9 DC pump at 60 fps, a whole frame (no frame yet)",
+                frame_duration_floor(60),
+            ),
+            (
+                "VP9 DC pump pinned to 30 fps, half a frame",
+                frame_duration_floor(30) / 2,
             ),
         ];
         let mut misses = Vec::new();
@@ -606,36 +608,42 @@ mod tests {
         capture.asks
     }
 
-    /// B3 — asks per 30 s on a still screen, the number a field read takes off
-    /// the heartbeat (`frames_captured` + `frames_empty`). The FFmpeg pump asks
-    /// once per 2 ms sleep with the switch off, and once per 16 ms acquire wait
-    /// with it on. The VP9 pump's half-frame sleep already asks less often than
-    /// that, so there the gain is B1's and not this one.
+    /// B3 — asks per 30 s on a still screen. A field read takes it off the
+    /// SYSTEM-context capture's own 30 s line (`calls`), or off a pump's
+    /// heartbeat (`frames_captured` + `frames_empty`). With the switch off a
+    /// pump asks once per sleep: every 2 ms (FFmpeg), every half frame (VP9,
+    /// 8.3 ms at its default 60). With it on both ask once per 16 ms acquire
+    /// wait. A VP9 pump pinned to 30 already asks about that often, so there
+    /// the gain is B1's and not this one.
     #[tokio::test(start_paused = true)]
     async fn a_still_screen_asks_under_2000_times_in_30_s_on_the_waiting_arm() {
         const WINDOW: Duration = Duration::from_secs(30);
         let off = waits(None, None);
         let on = waits(None, Some("capture_wait"));
-        let half_frame = frame_duration_floor(30) / 2;
-        let ffmpeg_off = still_screen_asks(off, FFMPEG_SLEEP, WINDOW).await;
-        let ffmpeg_on = still_screen_asks(on, FFMPEG_SLEEP, WINDOW).await;
-        let vp9_off = still_screen_asks(off, half_frame, WINDOW).await;
-        let vp9_on = still_screen_asks(on, half_frame, WINDOW).await;
-        println!(
-            "asks in 30 s on a still screen: FFmpeg DC pump {ffmpeg_off} -> {ffmpeg_on}, VP9 DC pump at 30 fps {vp9_off} -> {vp9_on}"
-        );
-        assert_eq!(ffmpeg_off, 15_000, "master: one ask per 2 ms sleep");
-        assert!(
-            (1_790..=1_810).contains(&vp9_off),
-            "master: one ask per half frame at 30 fps, and it reads {vp9_off}"
-        );
-        for (pump, asks) in [("FFmpeg", ffmpeg_on), ("VP9", vp9_on)] {
+        // A pump, its sleep on an empty, and its asks in 30 s with the switch off.
+        let cells = [
+            ("FFmpeg DC pump", FFMPEG_SLEEP, 15_000),
+            ("VP9 DC pump at 60 fps", frame_duration_floor(60) / 2, 3_600),
+            (
+                "VP9 DC pump pinned to 30 fps",
+                frame_duration_floor(30) / 2,
+                1_800,
+            ),
+        ];
+        println!("asks in 30 s on a still screen, switch off -> rc_media_canary=capture_wait:");
+        for (pump, sleep, master) in cells {
+            let was = still_screen_asks(off, sleep, WINDOW).await;
+            let now = still_screen_asks(on, sleep, WINDOW).await;
+            println!("  {pump}: {was} -> {now}");
             assert!(
-                (1_800..=2_000).contains(&asks),
-                "{pump} DC pump with rc_media_canary=capture_wait: {asks} asks in 30 s, and one per 16 ms acquire wait is 1,875"
+                was.abs_diff(master) <= master / 100,
+                "{pump}: master asks once per sleep of {sleep:?}, {master} in 30 s, and the model reads {was}"
+            );
+            assert!(
+                (1_800..=2_000).contains(&now),
+                "{pump} with rc_media_canary=capture_wait: {now} asks in 30 s, and one per 16 ms acquire wait is 1,875"
             );
         }
-        assert!(ffmpeg_on * 4 <= ffmpeg_off, "at least 4 times fewer");
     }
 
     /// The same reading as B1 on a real clock, with a real thread standing in
@@ -705,12 +713,19 @@ mod tests {
         let cells = [
             ("FFmpeg DC pump, its 2 ms sleep", FFMPEG_SLEEP),
             (
-                "VP9 DC pump at 30 fps, half a frame",
-                frame_duration_floor(30) / 2,
+                "VP9 DC pump at 60 fps, half a frame",
+                frame_duration_floor(60) / 2,
+            ),
+        ];
+        let arms = [
+            ("switch off", waits(None, None)),
+            (
+                "rc_media_canary=capture_wait",
+                waits(None, Some("capture_wait")),
             ),
         ];
         for (cell, sleep) in cells {
-            for (arm, pace_capture) in [("switch off", false), ("capture_wait on", true)] {
+            for (arm, pace_capture) in arms {
                 let mut late = real_clock_cell(pace_capture, sleep, FRAMES).await;
                 late.sort();
                 let mean = late.iter().sum::<Duration>() / FRAMES as u32;
