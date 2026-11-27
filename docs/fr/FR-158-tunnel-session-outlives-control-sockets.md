@@ -4,7 +4,8 @@
 
 ## Summary, for the operator
 
-**Today** three things end a live tunnel session, and with it every TCP connection inside it:
+**Today** three things end a live tunnel session, and after each one every new connection waits until a new session
+opens:
 
 1. **A server roll.** The rolled pod's teardown of each exit's control socket terminates every session aimed at that
    exit at once. Production configures no grace, and a grace would not help: its timer runs on the pod that is going
@@ -48,7 +49,8 @@ exits run with `tunnel_peers_survive_reattach` absent; production sets no `ROOML
 | 09:28–09:48 | 2b, one bad stream | 12 session ends, 8 on exit A and 4 on exit B, with no control-socket event on either side. Each: the exit's reap with `signal=quic_conn_ended` first, sometimes a forward for the gone session refused, then the terminate; the client reads `closed by peer: 0` or `peer torn down by server reason=IoError`. Every one sits within 0–35 ms of a client flow that ended `IoError` having moved zero bytes |
 | 10:37:13.122 | 1, a roll (the 10:35Z promote) | All six of the client's sessions ended `ServerTerminated` in the same millisecond; an exit closed its QUIC connection 46 ms later. The re-opened SOCKS session waited the full 30 s for `rc:tunnel.quic.ready`, fell back to webrtc-dc-v1, and re-upgraded to quic-v1 60 s after that |
 
-Each end reset every TCP connection inside the session.
+After each end, every new connection waited until a new session opened: after the roll that took 35 s, 30 of them
+waiting for a QUIC setup that never came.
 
 ### 2.2 The mechanism, in the code [R]
 
@@ -125,10 +127,11 @@ sequenceDiagram
 | Cell | Where | On master |
 |---|---|---|
 | A stream reset before its preamble costs only that stream (real quinn, in process) | `agents/roomlerd/src/tunnel/quic_peer.rs`, `a_stream_reset_before_its_preamble_costs_only_that_stream` | RED, 2026-11-27 11:37Z: `flow 3 = Err("agent quic: flow 3 stream not opened within 5s"), reaped = Some(QuicConnEnded), accept loop ended = true`. The four other `quic_peer` tests pass |
-| A roll keeps an in-flight connection moving and serves a new one (two pods, both agents' real loops, quic-v1) | `crates/tests/src/tunnel_survival_tests.rs`, `an_in_flight_tunnel_connection_survives_a_rolled_pod` | the CI run is in §9 |
-| An exit's control socket cycling keeps an in-flight connection moving and serves a new one | the same file, `an_in_flight_tunnel_connection_survives_its_exits_control_socket_cycling` | the CI run is in §9 |
+| A roll keeps the forward on the same session, an in-flight connection moving and a new one served (two pods, both agents' real loops, quic-v1) | `crates/tests/src/tunnel_survival_tests.rs`, `an_in_flight_tunnel_connection_survives_a_rolled_pod` | the CI run is in §9 |
+| An exit's control socket cycling does the same | the same file, `an_in_flight_tunnel_connection_survives_its_exits_control_socket_cycling` | the CI run is in §9 |
 
-Each lands `#[ignore]`d with its reason, and the phase that fixes it removes the attribute.
+Each lands `#[ignore]`d with its reason, and the phase that fixes it removes the attribute. The integration cells
+read which session the forward runs through `TunnelClientHub::live_session_id`, a read-only accessor this PR adds.
 
 ### 2.4 What the code already has [R]
 
@@ -236,7 +239,8 @@ agent's switch is on, the server it last spoke to announced a window, and the se
 - [ ] **AC1.** A stream reset or finished before its preamble costs only that stream: the P0 unit cell passes, and a
   working day of the client's log, with its exits on the P1 release, shows no session ending within 50 ms of a flow
   that moved zero bytes (12 in 35 minutes on 2026-11-27).
-- [ ] **AC2.** A roll keeps an in-flight tunnel connection moving and serves a new one: the integration cell passes,
+- [ ] **AC2.** A roll keeps the forward on the same session, an in-flight tunnel connection moving, and serves a new
+  one: the integration cell passes,
   and in the field a promote with a live SOCKS route and a live forward through two exits shows no terminate at the
   client, no reset of an in-flight connection, and no webrtc-dc-v1 fallback.
 - [ ] **AC3.** An exit's control socket cycling while its data path holds does the same: the integration cell
