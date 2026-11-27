@@ -89,6 +89,7 @@ function Read-Fields($Record) {
         Address  = [string]$p[2].Value
         Port     = [int]$p[3].Value
         Protocol = [int]$p[4].Value
+        Time     = $Record.TimeCreated.ToUniversalTime()
     }
 }
 
@@ -184,8 +185,14 @@ foreach ($pattern in $Image) {
     if ($offenders.Count -gt 0) {
         $failed = $true
         Write-Summary ("**{0} UDP bind(s) or TCP listen(s) on an address that is not loopback.** Each raises the firewall prompt for a binary Windows has not seen; docs/testing.md says how a test binds." -f $offenders.Count)
-        foreach ($o in ($offenders | Select-Object -First 40)) {
-            Write-Host ("::error title=Non-loopback bind (#4500)::{0} {1} {2}:{3} by pid {4} ({5})" -f $(if ($o.Id -eq 5154) { 'listen' } else { 'bind' }), $(if ($o.Protocol -eq 17) { 'UDP' } else { 'TCP' }), $o.Address, $o.Port, $o.Pid, (Get-Leaf $o.Path))
+        # In time order, each with its time, so a red run can be read against
+        # the test output; the first 40 as annotations.
+        $n = 0
+        foreach ($o in ($offenders | Sort-Object Time)) {
+            $at = $(if ($o.PSObject.Properties['Time'] -and $o.Time) { ' at ' + ([DateTime]$o.Time).ToString('HH:mm:ss.fff') + 'Z' } else { '' })
+            $line = "{0} {1} {2}:{3} by pid {4} ({5}){6}" -f $(if ($o.Id -eq 5154) { 'listen' } else { 'bind' }), $(if ($o.Protocol -eq 17) { 'UDP' } else { 'TCP' }), $o.Address, $o.Port, $o.Pid, (Get-Leaf $o.Path), $at
+            if ($n -lt 40) { Write-Host "::error title=Non-loopback bind (#4500)::$line" } else { Write-Host $line }
+            $n++
         }
     } else {
         Write-Summary 'Every UDP bind and every TCP listen was on loopback.'
