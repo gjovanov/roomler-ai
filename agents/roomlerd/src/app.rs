@@ -4325,60 +4325,14 @@ async fn run_cmd(
     }
 
     // Roomler SSH (P2) — mint this node's SSH host identity on the first
-    // SSH-enabled start, same shape as the WG key above: generated locally,
-    // persisted through `config::save` (atomic + fsync + `.prev` + 0600 / ACL),
-    // never transmitted. A device that never enables SSH never generates one.
-    //
-    // Failing to persist is FATAL to the feature rather than merely logged: a
-    // host key that changes on every boot trains operators to accept unknown
-    // fingerprints, which is precisely the habit that makes SSH host
-    // verification worthless. Better to serve nothing than to serve a new
-    // identity every restart.
-    // ⚠️ The condition is "not USABLE", not "absent". A key that is present but
-    // unparseable is the state this guard used to walk straight past, and it is
-    // strictly worse than having none: the daemon refuses to serve SSH (right)
-    // and publishes no host pubkey (right), and then never mints a replacement —
-    // so the device is wedged permanently and every restart repeats the same
-    // warning into a log nobody reads. Found in the field on a 0.4.96 corp
-    // laptop whose stored PEM had picked up literal `\r` escape text; see
-    // `ssh::stored_host_key_is_usable`.
-    //
-    // Replacing it is safe precisely BECAUSE it was unreadable: the daemon never
-    // served with it and never published it, so no client ever verified against
-    // it. There is no identity to preserve — which is what separates this from
-    // the "never serve a key that changes every restart" rule below.
+    // SSH-enabled start, and on one whose stored key is unusable, same shape
+    // as the WG key above. Why a failure serves nothing rather than a new
+    // identity every restart, and why an unusable key may be replaced:
+    // `ssh_mint::at_start`.
     #[cfg(feature = "ssh-server")]
-    if cfg.ssh_enabled && !roomlerd::ssh::stored_host_key_is_usable(&cfg) {
-        if cfg.ssh_host_key.is_some() {
-            tracing::warn!(
-                "ssh: the stored host key is unreadable — replacing it. Nothing ever \
-                 verified against it (the daemon refused to serve SSH with it), so there \
-                 is no identity to preserve"
-            );
-            cfg.ssh_host_key = None;
-        }
-        match roomlerd::ssh::generate_host_key() {
-            Ok(pem) => {
-                cfg.ssh_host_key = Some(pem);
-                match startup_writes.save(&cfg) {
-                    Ok(()) => tracing::info!("ssh: generated + persisted node SSH host key"),
-                    Err(e) => {
-                        cfg.ssh_host_key = None;
-                        cfg.ssh_enabled = false;
-                        tracing::error!(
-                            error = %e,
-                            "ssh: could not persist the host key — SSH stays OFF this run \
-                             rather than serving an identity that changes on every restart"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                cfg.ssh_enabled = false;
-                tracing::error!(error = %e, "ssh: host key generation failed — SSH stays OFF");
-            }
-        }
-    }
+    roomlerd::ssh_mint::at_start(&mut cfg, roomlerd::ssh::generate_host_key, |c| {
+        startup_writes.save(c)
+    });
 
     // P5 exit-node crash-safety (A2) — boot-time stale-route reconciler. Purge
     // any split-default (`/1`) route a PRIOR run left on the overlay NIC after a

@@ -21,7 +21,7 @@
 //! | the switch | at a key frame, over one `frame_seq` space: a frame dropped for the switch or for D consumes its number too |
 //! | the drain rule | once the pick says switch, nothing more is written on the old channel, and every frame is dropped whole until its buffered amount reads 0 (acknowledged, or abandoned and forwarded); then a key frame is asked through the session's gate ([`KeyframeGate`]), at each frame until an ask passes its 500 ms gap (a switch's own key frame is not recovery, so the key frame rule never spaces it: [`LaneAsk::Switch`]), frames are dropped until one comes, and it goes whole on the new channel. The wait has no time bound: the switch line says how long it held the video |
 //! | the deadline D ([`DEADLINE`]) | under `on`, on `video-deadline` only: a frame older than D at its first write, counted from its hand-off to the send task, is dropped whole, and a key frame is asked through the gate; a frame begun is finished |
-//! | the mark | under `on`, once per stream, before the first write on `video-deadline`: `RTCSctpTransport::mark_deadline_stream` (FR-148 P4b-1). Refused, nothing switches, one line says so, and it is tried again at the next key frame |
+//! | the mark | under `on`, once per stream, before the first write on `video-deadline`: `RTCSctpTransport::mark_deadline_stream` (FR-148 P4b-1), on the channel's id, which the vendored webrtc's accept path sets to its stream's (FR-148 P4b). Refused (no association, the slot held, no such stream), nothing switches, a line names each reason once until a mark is accepted, and the mark is tried again at the next frame, key or delta, until one is accepted; accepted between key frames, the switch asks its own key frame |
 //! | the key frame rule ([`KeyframeGate`], FR-148 P4b-4) | under `on`, while the lane is on `video-deadline` or switching to it, a recovery key frame (D's ask, the viewer's `rc:keyframe`) passes only once [`kf_gap`] has passed since the session's last key frame written (or since the gate's last grant, if later): `max(MIN_KF_GAP, 8 × kf_bytes / (KF_SHARE × rate))`, `kf_bytes` in bytes and `rate` in bit/s. A refused recovery ask is owed, never forgotten: the first frame after the gap opens grants it (after rc.130's gap alone once the lane has left `video-deadline`), and a key frame written answers it. A switch's own asks (FR-148 P4b-4b), and every ask elsewhere, get rc.130's 500 ms gap, grant for grant |
 //! | `shadow` | the pick and D run on the channel `on` would be on, and the lines and counts say what `on` would do, the key frame rule's included; every write and every grant is `off`'s, byte for byte |
 //!
@@ -38,13 +38,13 @@
 //! (`none` as `<from>` at a pump's first pick), with `(shadow)` after
 //! `channel` for the switch `on` would make; one line when the carrier wants
 //! `video-deadline` and the session has none open; one when its stream's mark
-//! is refused; and the class line, with `viewer_relay` and `tcp_end`, when a
-//! read changes the class, the report or the end that holds the TCP leg.
-//! `carrier` is the agent's own class. The counts go on the `path delivery`
-//! line (FR-148 P0) under `shadow` and `on`, and after them FR-148 P4b-4's:
-//! the session's key frame asks over the line by who asked, the refusals by
-//! the 500 ms gap and by the rule, the owed asks granted, and the rule's gap
-//! at the line.
+//! is refused, once per reason, and one when it is marked after refusals; and
+//! the class line, with `viewer_relay` and `tcp_end`, when a read changes the
+//! class, the report or the end that holds the TCP leg. `carrier` is the
+//! agent's own class. The counts go on the `path delivery` line (FR-148 P0)
+//! under `shadow` and `on`, and after them FR-148 P4b-4's: the session's key
+//! frame asks over the line by who asked, the refusals by the 500 ms gap and
+//! by the rule, the owed asks granted, and the rule's gap at the line.
 //!
 //! FR-148 P4b-5a — the key frame ledger closes that line, from the pump's
 //! start, under `shadow` and `on`: the key frames written whole by channel
@@ -70,7 +70,7 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
-use webrtc::sctp_transport::RTCSctpTransport;
+use webrtc::sctp_transport::{DeadlineMarkRefusal, RTCSctpTransport};
 
 use crate::session_carrier::{OverlayPath, PairView, RelayTransport, SessionCarrier};
 use crate::session_telemetry::{KeyframeAsker, KeyframeRefusal, KeyframeSplit, SessionCounters};
@@ -1252,8 +1252,8 @@ pub trait Wire: Send + Sync {
     /// `dc`'s SCTP stream.
     fn stream(dc: &Self::Dc) -> u16;
 
-    /// Marks `dc`'s stream deadline-limited; false when refused.
-    fn mark(&self, dc: &Self::Dc) -> impl Future<Output = bool> + Send;
+    /// Marks `dc`'s stream deadline-limited; refused, why (FR-148 P4b).
+    fn mark(&self, dc: &Self::Dc) -> impl Future<Output = Result<(), DeadlineMarkRefusal>> + Send;
 
     /// One key frame ask through the session's gate, at `now`, the lane in
     /// `scope`, for `why`: whether a key frame comes without asking again,
@@ -1304,10 +1304,10 @@ impl Wire for SessionWire {
     }
 
     fn stream(dc: &Self::Dc) -> u16 {
-        dc.id()
+        dc.id() // its stream's, from the vendored webrtc's accept path (FR-148 P4b)
     }
 
-    async fn mark(&self, dc: &Self::Dc) -> bool {
+    async fn mark(&self, dc: &Self::Dc) -> Result<(), DeadlineMarkRefusal> {
         self.sctp.mark_deadline_stream(dc.id()).await
     }
 
@@ -1564,9 +1564,9 @@ pub struct Lane<W: Wire> {
     phase: Phase,
     /// The stream marked, once.
     marked: Option<u16>,
-    /// A mark was refused: tried again at the next key frame.
-    mark_refused: bool,
-    said_refused: bool,
+    /// FR-148 P4b — marks refused since one was accepted, and the reasons said.
+    refused: u32,
+    said_refused: Vec<DeadlineMarkRefusal>,
     said_none_open: bool,
     /// FR-148 P4b-5a (D60) — its still stretches, under `shadow` and `on`.
     wake: Wake,
@@ -1590,8 +1590,8 @@ impl<W: Wire> Lane<W> {
             on: None,
             phase: Phase::Steady,
             marked: None,
-            mark_refused: false,
-            said_refused: false,
+            refused: 0,
+            said_refused: Vec::new(),
             said_none_open: false,
             wake: Wake::default(),
         }
@@ -1738,9 +1738,9 @@ impl<W: Wire> Lane<W> {
         self.say_none_open(class, end, deadline.is_some());
         let want = pick(end, deadline.is_some());
         if self.phase == Phase::Steady && self.on != Some(want) {
-            // The mark first: refused, nothing switches.
+            // The mark first: refused, nothing switches; the next frame tries.
             let marked = match (&deadline, want) {
-                (Some(dc), Channel::Deadline) => self.mark(dc, keyframe).await,
+                (Some(dc), Channel::Deadline) => self.mark(dc).await,
                 _ => true,
             };
             match self.on {
@@ -1910,30 +1910,53 @@ impl<W: Wire> Lane<W> {
     }
 
     /// Under `on`, before the first write on `video-deadline`: its stream
-    /// marked, once. A refusal is tried again at the next key frame.
-    async fn mark(&mut self, dc: &W::Dc, keyframe: bool) -> bool {
+    /// marked, once.
+    ///
+    /// FR-148 P4b — a refusal is tried again at the lane's next frame that
+    /// wants `video-deadline`, key or delta, and at each one after until one
+    /// is accepted. A key frame need not come first: the encoder sends one
+    /// only when asked, and before, a session whose first mark was refused
+    /// waited on `video-bytes` for one that never came. A mark accepted
+    /// between key frames starts the switch, whose own key frame its ask
+    /// brings through the session's gate ([`LaneAsk::Switch`]: rc.130's gap,
+    /// never owed). A try never waits for the transport's slot: held, it is a
+    /// refusal, tried again at the next frame. Each reason is said once, with
+    /// the stream, until a mark is accepted, and a mark accepted after
+    /// refusals says how many there were.
+    async fn mark(&mut self, dc: &W::Dc) -> bool {
         let stream = W::stream(dc);
         if self.marked == Some(stream) {
             return true;
         }
-        if self.mark_refused && !keyframe {
-            return false;
+        match self.wire.mark(dc).await {
+            Ok(()) => {
+                if self.refused > 0 {
+                    info!(
+                        session = %self.session_id,
+                        stream,
+                        refused = self.refused,
+                        "video channel: video-deadline's stream was marked after it was refused; switching to it (FR-148 P4b-3)"
+                    );
+                }
+                self.marked = Some(stream);
+                self.refused = 0;
+                self.said_refused.clear();
+                true
+            }
+            Err(why) => {
+                self.refused = self.refused.saturating_add(1);
+                if !self.said_refused.contains(&why) {
+                    self.said_refused.push(why);
+                    warn!(
+                        session = %self.session_id,
+                        stream,
+                        reason = %why,
+                        "video channel: video-deadline's stream was not marked; staying on video-bytes, and trying again at each frame (FR-148 P4b-3)"
+                    );
+                }
+                false
+            }
         }
-        if self.wire.mark(dc).await {
-            self.marked = Some(stream);
-            self.mark_refused = false;
-            return true;
-        }
-        self.mark_refused = true;
-        if !self.said_refused {
-            self.said_refused = true;
-            warn!(
-                session = %self.session_id,
-                stream,
-                "video channel: video-deadline's stream was not marked; staying on video-bytes, and trying again at the next key frame (FR-148 P4b-3)"
-            );
-        }
-        false
     }
 
     /// A frame dropped for a switch: it consumes its number. FR-148 P4b-5a —
@@ -2017,6 +2040,9 @@ mod tests {
         deadline: Option<u16>,
         buffered: HashMap<u16, usize>,
         mark_ok: bool,
+        /// FR-148 P4b: why a mark is refused while `mark_ok` is false;
+        /// `None`, no such stream.
+        refusal: Option<DeadlineMarkRefusal>,
         marks: Vec<u16>,
         ask_ok: bool,
         asks: u32,
@@ -2074,10 +2100,13 @@ mod tests {
             *dc
         }
 
-        async fn mark(&self, dc: &u16) -> bool {
+        async fn mark(&self, dc: &u16) -> Result<(), DeadlineMarkRefusal> {
             let mut s = self.st();
             s.marks.push(*dc);
-            s.mark_ok
+            match s.mark_ok {
+                true => Ok(()),
+                false => Err(s.refusal.unwrap_or(DeadlineMarkRefusal::NoStream)),
+            }
         }
 
         fn ask_keyframe(&self, now: Instant, scope: Scope, why: LaneAsk) -> bool {
@@ -3597,8 +3626,10 @@ mod tests {
 
     /// FR-148 P4b-3 — the mark: under `on` only, once per stream, before the
     /// first write on `video-deadline`, however often the session switches.
-    /// Refused, nothing switches: the session stays on `video-bytes`, one
-    /// line says so, and the mark is tried again at the next key frame.
+    /// Refused, nothing switches: the session stays on `video-bytes` and one
+    /// line says so. FR-148 P4b — the mark is tried again at each frame, and
+    /// one accepted between key frames starts the switch (P4b-3 tried it
+    /// again only at the next key frame).
     #[test]
     fn the_mark_comes_once_under_on_before_the_first_write_on_video_deadline() {
         let mut rig = Rig::new(Mode::On);
@@ -3638,17 +3669,503 @@ mod tests {
         });
         let today: Vec<_> = (1..=7).map(|n| Some((BYTES, n))).collect();
         assert_eq!(wrote, today, "no switch");
-        assert_eq!(
-            rig.fake.st().marks,
-            [DL, DL],
-            "the first frame, the next key frame"
-        );
+        assert_eq!(rig.fake.st().marks, [DL; 7], "each frame, key or delta");
         assert_eq!(out.matches("was not marked").count(), 1, "{out}");
         assert_eq!(rig.counters.take(None).unwrap().drained, 0);
         rig.fake.st().mark_ok = true;
-        assert_eq!(rig.delta(), Some((BYTES, 8)), "not between key frames");
+        assert_eq!(
+            rig.delta(),
+            None,
+            "marked between key frames: the switch drops the delta and asks"
+        );
         assert_eq!(rig.key(), Some((DL, 9)));
-        assert_eq!(rig.fake.st().marks, [DL, DL, DL]);
+        assert_eq!(rig.fake.st().marks, [DL; 8]);
+    }
+
+    /// FR-148 P4b — a refused mark is tried again at the lane's next frame,
+    /// key or delta, and at each one after until one is accepted, so a
+    /// session whose encoder sends no key frame unasked (P4b-5's first `on`
+    /// runs: none came in 240 s) still reaches `video-deadline`. Accepted on a
+    /// delta, the session switches as any switch does (D57): `video-bytes`
+    /// drains, and the switch asks its own key frame through the session's
+    /// gate (FR-148 P4b-4b's [`LaneAsk::Switch`]), which goes whole on
+    /// `video-deadline`. Here nothing is buffered and no ask passed before, so
+    /// `video-deadline` carries the second frame after the cause of the
+    /// refusals cleared: the first is dropped for the switch, and the second
+    /// is the key frame its ask brought. The viewer asked for nothing. The ask
+    /// is the lane's and never owed, the key frame it brought counts on
+    /// `video-deadline` in P4b-5a's ledger, and it restarts the rule's clock
+    /// (D61): the viewer's ask 490 ms after it is refused by the gap, and its
+    /// ask 500 ms after it passes.
+    #[test]
+    fn a_refused_mark_reaches_video_deadline_with_no_key_frame_unasked() {
+        let ms = Duration::from_millis;
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::TurnTcp);
+        let (gate, flag, id) = rig.gated(Some(2_000_000));
+        rig.fake.st().mark_ok = false;
+        // The pump: a key frame at the session's first frame and at the frame
+        // after each grant, a delta otherwise, each sent whole as the send
+        // task sends it.
+        let frame = |rig: &mut Rig, first: bool| {
+            let key = flag.swap(false, Relaxed) || first;
+            (key, rig.sent(key, 0, true))
+        };
+        let mut wrote = vec![frame(&mut rig, true)];
+        wrote.extend((0..9).map(|_| frame(&mut rig, false)));
+        let refused: Vec<_> = (1..=10).map(|n| (n == 1, Some((BYTES, n)))).collect();
+        assert_eq!(wrote, refused, "refused: video-bytes, and no switch");
+        // The cause clears.
+        rig.fake.st().mark_ok = true;
+        let wrote: Vec<_> = (0..4).map(|_| frame(&mut rig, false)).collect();
+        assert_eq!(
+            wrote,
+            [
+                (false, None),
+                (true, Some((DL, 12))),
+                (false, Some((DL, 13))),
+                (false, Some((DL, 14)))
+            ],
+            "marked at the next frame, and the switch's own key frame on video-deadline"
+        );
+        let keyed = rig.t - ms(20);
+        assert_eq!(
+            rig.fake.st().marks,
+            [DL; 11],
+            "each frame until one was accepted, then none"
+        );
+        assert_eq!(rig.fake.st().whys, [LaneAsk::Switch]);
+        let s = split(id);
+        assert_eq!(
+            (
+                s.viewer,
+                s.lane,
+                s.refused_gap,
+                s.refused_rule,
+                s.owed_granted
+            ),
+            (0, 1, 0, 0, 0)
+        );
+        let line = rig.counters.take(None).unwrap();
+        assert_eq!((line.switches, line.drained), (1, 1));
+        assert_eq!(line.kf_dropped, (0, 0));
+        assert_eq!(
+            line.kf_written,
+            (1, 1),
+            "the session's first key frame on video-bytes, the switch's own on video-deadline"
+        );
+        assert!(
+            !gate.ask_at(id, keyed + ms(490)),
+            "the gap, from the key frame"
+        );
+        assert!(gate.ask_at(id, keyed + ms(500)));
+    }
+
+    /// FR-148 P4b — a refused mark's line names why it was refused and the
+    /// stream, once: the lane's tries at the frames after it say nothing more.
+    #[test]
+    fn a_refused_mark_says_why_and_on_which_stream() {
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::TurnTcp);
+        rig.fake.st().mark_ok = false;
+        let (_, out) = logged(|| {
+            rig.key();
+            for _ in 0..5 {
+                rig.delta();
+            }
+        });
+        let said: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("was not marked"))
+            .collect();
+        assert_eq!(said.len(), 1, "{out}");
+        assert!(said[0].contains("reason=no_stream"), "{out}");
+        assert!(said[0].contains("stream=3"), "{out}");
+    }
+
+    /// FR-148 P4b — each reason a mark is refused for is said once, with the
+    /// stream, until a mark is accepted; one accepted after refusals says how
+    /// many there were; and after it, a refusal on another stream is said
+    /// again.
+    #[test]
+    fn each_reason_is_said_once_until_a_mark_is_accepted() {
+        let mut rig = Rig::new(Mode::On);
+        rig.class(C::TurnTcp);
+        let set = |rig: &Rig, why: DeadlineMarkRefusal| {
+            let mut s = rig.fake.st();
+            s.mark_ok = false;
+            s.refusal = Some(why);
+        };
+        let (wrote, out) = logged(|| {
+            set(&rig, DeadlineMarkRefusal::NoAssociation);
+            let mut wrote = vec![rig.key(), rig.delta()];
+            set(&rig, DeadlineMarkRefusal::SlotHeld);
+            wrote.extend([rig.delta(), rig.delta()]);
+            set(&rig, DeadlineMarkRefusal::NoAssociation);
+            wrote.push(rig.delta());
+            rig.fake.st().mark_ok = true;
+            wrote.extend([rig.delta(), rig.key()]);
+            // Off it, and back to another stream, refused.
+            rig.class(C::Direct);
+            wrote.extend([rig.delta(), rig.key()]);
+            rig.fake.st().deadline = Some(DL + 2);
+            set(&rig, DeadlineMarkRefusal::NoAssociation);
+            rig.class(C::TurnTcp);
+            wrote.push(rig.delta());
+            wrote
+        });
+        let mut today: Vec<_> = (1..=5).map(|n| Some((BYTES, n))).collect();
+        today.extend([
+            None,
+            Some((DL, 7)),
+            None,
+            Some((BYTES, 9)),
+            Some((BYTES, 10)),
+        ]);
+        assert_eq!(wrote, today);
+        assert_eq!(rig.fake.st().marks, [DL, DL, DL, DL, DL, DL, DL + 2]);
+        let said: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("was not marked"))
+            .collect();
+        assert_eq!(said.len(), 3, "{out}");
+        for (line, (why, stream)) in said.iter().zip([
+            ("no_association", DL),
+            ("slot_held", DL),
+            ("no_association", DL + 2),
+        ]) {
+            assert!(line.contains(&format!("reason={why}")), "{line}");
+            assert!(line.contains(&format!("stream={stream}")), "{line}");
+        }
+        let late: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("was marked after it was refused"))
+            .collect();
+        assert_eq!(late.len(), 1, "{out}");
+        assert!(late[0].contains("stream=3"), "{out}");
+        assert!(late[0].contains("refused=5"), "{out}");
+    }
+
+    /// [`logged`], for a future: what it logged while it was polled, beside
+    /// its output. The tasks it spawned log to nobody.
+    async fn logged_async<T>(f: impl Future<Output = T>) -> (T, String) {
+        use tracing::instrument::WithSubscriber;
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, as `logged` keeps them.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let out = f.with_subscriber(subscriber).await;
+        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        (out, text)
+    }
+
+    /// FR-148 P4b — a session's two ends, both webrtc-rs peers in this
+    /// process, every candidate in the SDP, as `peer.rs`'s `Pair` joins a
+    /// `files` channel. The viewer opens its channels in the browser's order
+    /// and shapes (`useRemoteControl.ts`): `input`, unordered with no
+    /// retransmits, then `control`, `video-bytes`, and `video-deadline`
+    /// beside it, unordered with no retransmits. The daemon's end takes them
+    /// through the vendored webrtc's accept path, into the stashes
+    /// `AgentPeer`'s `on_data_channel` arms fill (`video-bytes` into the stash
+    /// its pump reads, `video-deadline` into the session's,
+    /// [`Session::stash`]). The mark's own cell in `media_delivery` joins two
+    /// SCTP associations, and never reaches that accept path, where the id
+    /// was lost.
+    ///
+    /// The daemon answers as the DTLS client, as today, or as the server
+    /// (`daemon_server`), the viewer then the client, whose streams are even.
+    /// A browser that is the DTLS client opens `input`, its first channel, on
+    /// stream 0. A webrtc-rs client never opens a channel in band on stream 0
+    /// (the channel's own placeholder id, 0, counts as taken in
+    /// `generate_and_set_data_channel_id`), so there both ends open `input`
+    /// negotiated on stream 0.
+    struct Ends {
+        viewer_pc: Arc<RTCPeerConnection>,
+        daemon_pc: Arc<RTCPeerConnection>,
+        session_id: ObjectId,
+        _session: Arc<Session>,
+        bytes: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+        /// The viewer's channels, label and id, in the order it opened them.
+        viewer: Vec<(String, u16)>,
+        /// The channels the daemon's handler saw, label and id there.
+        accepted: Arc<Mutex<Vec<(String, u16)>>>,
+    }
+
+    impl Ends {
+        async fn open(daemon_server: bool) -> Self {
+            use webrtc::api::APIBuilder;
+            use webrtc::api::setting_engine::SettingEngine;
+            use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+            use webrtc::dtls_transport::dtls_role::DTLSRole;
+
+            let session_id = ObjectId::new();
+            let session = Session::register(session_id, Arc::new(AtomicBool::new(false)));
+            let mut daemon_setting = SettingEngine::default();
+            if daemon_server {
+                daemon_setting
+                    .set_answering_dtls_role(DTLSRole::Server)
+                    .expect("a DTLS role");
+            }
+            let viewer_pc = Arc::new(
+                APIBuilder::new()
+                    .build()
+                    .new_peer_connection(Default::default())
+                    .await
+                    .expect("the viewer's peer"),
+            );
+            let daemon_pc = Arc::new(
+                APIBuilder::new()
+                    .with_setting_engine(daemon_setting)
+                    .build()
+                    .new_peer_connection(Default::default())
+                    .await
+                    .expect("the daemon's peer"),
+            );
+            let unordered = |negotiated: Option<u16>| {
+                Some(RTCDataChannelInit {
+                    ordered: Some(false),
+                    max_retransmits: Some(0),
+                    negotiated,
+                    ..Default::default()
+                })
+            };
+            let stream_0 = daemon_server.then_some(0);
+            if daemon_server {
+                daemon_pc
+                    .create_data_channel("input", unordered(stream_0))
+                    .await
+                    .expect("input");
+            }
+            let mut opened = vec![];
+            for (label, init) in [
+                ("input", unordered(stream_0)),
+                ("control", None),
+                (BYTES_LABEL, None),
+                (DEADLINE_LABEL, unordered(None)),
+            ] {
+                let dc = viewer_pc
+                    .create_data_channel(label, init)
+                    .await
+                    .expect("a channel");
+                opened.push(dc);
+            }
+
+            let accepted: Arc<Mutex<Vec<(String, u16)>>> = Arc::default();
+            let bytes: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>> = Arc::default();
+            {
+                let accepted = Arc::clone(&accepted);
+                let bytes = Arc::clone(&bytes);
+                let session = Arc::clone(&session);
+                daemon_pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+                    accepted
+                        .lock()
+                        .unwrap()
+                        .push((dc.label().to_owned(), dc.id()));
+                    let bytes = Arc::clone(&bytes);
+                    let session = Arc::clone(&session);
+                    Box::pin(async move {
+                        match dc.label() {
+                            BYTES_LABEL => *bytes.lock().await = Some(dc.clone()),
+                            DEADLINE_LABEL => session.stash(dc.clone()).await,
+                            _ => {}
+                        }
+                    })
+                }));
+            }
+
+            let offer = viewer_pc.create_offer(None).await.expect("an offer");
+            let mut gathered = viewer_pc.gathering_complete_promise().await;
+            viewer_pc
+                .set_local_description(offer)
+                .await
+                .expect("the offer");
+            let _ = gathered.recv().await;
+            let offer = viewer_pc.local_description().await.expect("a local offer");
+            daemon_pc
+                .set_remote_description(offer)
+                .await
+                .expect("the offer");
+            let answer = daemon_pc.create_answer(None).await.expect("an answer");
+            let mut gathered = daemon_pc.gathering_complete_promise().await;
+            daemon_pc
+                .set_local_description(answer)
+                .await
+                .expect("the answer");
+            let _ = gathered.recv().await;
+            let answer = daemon_pc.local_description().await.expect("a local answer");
+            viewer_pc
+                .set_remote_description(answer)
+                .await
+                .expect("the answer");
+
+            let open = |dc: Option<&Arc<RTCDataChannel>>| {
+                dc.is_some_and(|dc| dc.ready_state() == RTCDataChannelState::Open)
+            };
+            let until = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let both = open(bytes.lock().await.as_ref())
+                    && open(session.deadline.lock().await.as_ref())
+                    && opened.iter().all(|dc| open(Some(dc)));
+                if both {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < until,
+                    "the session's channels never opened"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let viewer = opened
+                .iter()
+                .map(|dc| (dc.label().to_owned(), dc.id()))
+                .collect();
+            Self {
+                viewer_pc,
+                daemon_pc,
+                session_id,
+                _session: session,
+                bytes,
+                viewer,
+                accepted,
+            }
+        }
+
+        /// The viewer's channels, label and id, in the order it opened them.
+        fn viewer_ids(&self) -> Vec<(String, u16)> {
+            self.viewer.clone()
+        }
+
+        /// The viewer's id of its channel `label`, and the id the daemon's
+        /// handler saw for it.
+        fn ids_of(&self, label: &str) -> (u16, Option<u16>) {
+            let viewer = self.viewer.iter().find(|(l, _)| l == label).expect(label);
+            let accepted = self.accepted.lock().unwrap();
+            let seen = accepted.iter().find(|(l, _)| l == label).map(|(_, id)| *id);
+            (viewer.1, seen)
+        }
+
+        /// The session's first frame, a key frame, under `on`, TCP at the
+        /// daemon's end, as a send task takes it: the channel its lane put it
+        /// on, the streams the association has marked then, and what the lane
+        /// said.
+        async fn first_key_frame(&self) -> (Channel, String, Option<Vec<u16>>, String) {
+            let counters = Arc::new(Counters::new(Mode::On));
+            let pump = Pump::start(self.session_id, &self.daemon_pc, &counters).await;
+            pump.note(C::TurnTcp, false);
+            let mut lane = pump.lane(&self.bytes, &self.daemon_pc, true);
+            let key = crate::peer::frame_video_bytes(b"key", true, 1);
+            let (out, said) = logged_async(lane.route(&key, Instant::now())).await;
+            let out = out.expect("written");
+            let wrote = (out.channel, out.dc.label().to_owned());
+            drop(out);
+            let marked = self.daemon_pc.sctp().deadline_streams().await;
+            (wrote.0, wrote.1, marked, said)
+        }
+
+        /// Both ends closed. A close runs every step whatever it returns, and
+        /// the second end's channels may find the association already gone
+        /// (`sending reset packet in non-Established state`), so its answer is
+        /// not read, as `peer_close_tests`' pairs do not read theirs.
+        async fn close(self) {
+            let _ = self.viewer_pc.close().await;
+            let _ = self.daemon_pc.close().await;
+        }
+    }
+
+    /// `(label, id)` pairs, owned, as [`Ends::viewer_ids`] gives them.
+    fn named(ids: &[(&str, u16)]) -> Vec<(String, u16)> {
+        ids.iter()
+            .map(|&(label, id)| (label.to_owned(), id))
+            .collect()
+    }
+
+    /// FR-148 P4b — the daemon the DTLS client, as it answers today: the
+    /// viewer's channels are on odd streams, none of them 0. Its
+    /// `video-deadline` comes through the accept path with its stream's id,
+    /// the lane marks that stream and no other, and the session's first frame
+    /// goes on `video-deadline`. P4b-5's first `on` runs: the mark asked for
+    /// stream 0, which did not exist, and the session stayed on `video-bytes`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_mark_finds_the_viewer_s_video_deadline_when_the_daemon_is_the_dtls_client() {
+        let ends = Ends::open(false).await;
+        let viewer = ends.viewer_ids();
+        let (deadline, accepted) = ends.ids_of(DEADLINE_LABEL);
+        let (channel, label, marked, said) = ends.first_key_frame().await;
+        let refused = said.matches("was not marked").count();
+        ends.close().await;
+        assert_eq!(
+            viewer,
+            named(&[
+                ("input", 1),
+                ("control", 3),
+                (BYTES_LABEL, 5),
+                (DEADLINE_LABEL, 7)
+            ])
+        );
+        assert_eq!(
+            (accepted, channel, label.as_str(), marked, refused),
+            (
+                Some(deadline),
+                Channel::Deadline,
+                DEADLINE_LABEL,
+                Some(vec![deadline]),
+                0
+            ),
+            "{said}"
+        );
+    }
+
+    /// FR-148 P4b — the daemon the DTLS server, the viewer the client: the
+    /// viewer's channels are on even streams, and stream 0 is `input`'s, its
+    /// first. The lane marks `video-deadline`'s stream and leaves stream 0
+    /// alone. Before, the mark asked for stream 0 and found `input`'s, so the
+    /// session went on `video-deadline` with its stream unmarked (its chunks
+    /// abandoned at their first send, FR-17's rule), and `input`'s stream was
+    /// marked instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_mark_leaves_stream_0_alone_when_the_viewer_is_the_dtls_client() {
+        let ends = Ends::open(true).await;
+        let viewer = ends.viewer_ids();
+        let (deadline, accepted) = ends.ids_of(DEADLINE_LABEL);
+        let (channel, label, marked, said) = ends.first_key_frame().await;
+        let refused = said.matches("was not marked").count();
+        ends.close().await;
+        assert_eq!(
+            viewer,
+            named(&[
+                ("input", 0),
+                ("control", 2),
+                (BYTES_LABEL, 4),
+                (DEADLINE_LABEL, 6)
+            ])
+        );
+        assert_eq!(
+            (accepted, channel, label.as_str(), marked, refused),
+            (
+                Some(deadline),
+                Channel::Deadline,
+                DEADLINE_LABEL,
+                Some(vec![deadline]),
+                0
+            ),
+            "{said}"
+        );
     }
 
     /// FR-148 P4b-3 — `shadow` writes exactly `off`'s bytes, and `off` today's:
