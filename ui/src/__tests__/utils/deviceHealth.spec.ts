@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   crashChip,
+  crashSentence,
   installChip,
   installSentence,
   type CrashHealth,
@@ -114,6 +115,29 @@ describe('crashChip (#3332)', () => {
     expect(failed?.text).toBe('crash loop: 0.4.240')
     expect(failed?.tooltip).toContain('rollback_failed')
     expect(failed?.tooltip).toContain('0.4.240')
+  })
+
+  it("gives the crash reports dialog the marker's meaning, without the tap hint", () => {
+    expect(crashSentence(undefined, NOW)).toBe('')
+    expect(crashSentence(crash('ok'), NOW)).toBe('')
+    expect(crashSentence(crash('something-new', { crashes: 9 }), NOW)).toBe('')
+    for (const c of [
+      crash('crashing', { crashes: 1, last_crash_unix: NOW_S - 600 }),
+      crash('rolled_back', { crashes: 3, last_known_good: 'agent-v0.4.239' }),
+      crash('rollback_failed', { crashes: 3, accused_version: '0.4.240' }),
+    ]) {
+      const said = crashSentence(c, NOW)
+      expect(said, c.state).not.toBe('')
+      expect(said, c.state).not.toContain('Tap')
+      expect(crashChip(c, NOW)?.tooltip, c.state).toBe(`${said} Tap for the crash reports.`)
+    }
+    expect(crashSentence(crash('crashing', { crashes: 1, last_crash_unix: NOW_S - 600 }), NOW)).toBe(
+      'The daemon crashed once in 10 min. The last crash was 10 min ago. ' +
+        'Three inside the window trip its crash ladder.',
+    )
+    expect(crashSentence(crash('rolled_back', { crashes: 3, last_known_good: 'agent-v0.4.239' }), NOW)).toContain(
+      'rolled itself back to 0.4.239.',
+    )
   })
 
   it('leaves presence as it is in all three states: absent, nothing and something', () => {

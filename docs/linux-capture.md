@@ -485,7 +485,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1427`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1449`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -531,7 +531,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:130`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`agents/roomlerd/src/signaling.rs:7171`). A changed brief (a login, a
+heartbeat only read that cache (`agents/roomlerd/src/signaling.rs:7185`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2693`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
@@ -2198,7 +2198,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:7299`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7315`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2962,7 +2962,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1170-1257`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3321-3331`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3382-3392`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|

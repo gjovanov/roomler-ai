@@ -2727,6 +2727,8 @@ async fn connect_once(
                             audio = ?c.audio,
                             desktop = ?c.desktop,
                             video_cells = c.video_cells.len(),
+                            last_install = c.last_install.as_ref().map_or("-", |w| w.status.as_str()),
+                            crash_health = c.crash_health.as_ref().map_or("-", |w| w.state.as_str()),
                             "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                         );
                         Box::new(c)
@@ -7121,6 +7123,15 @@ struct Announced {
     /// FR-138 — `rc-resume`: the switch as this connection read it, the same
     /// for its whole life.
     resume: bool,
+    /// FR-67 P5 — the last install's verdict, from the refresher's cache
+    /// ([`crate::health_words`]), never a read of the record on this loop. On
+    /// Windows the first hello after an update says `InProgress`, and the
+    /// verdict landing is news on the next beat.
+    last_install: Option<roomler_ai_remote_control::models::LastInstallWord>,
+    /// #3332 — the crash ladder's state, from the same cache: the clean-run
+    /// promotion clearing a count is news on the next beat. Host-wide, so
+    /// every org's connection says the same.
+    crash_health: Option<roomler_ai_remote_control::models::CrashHealth>,
 }
 
 /// #3992 — what a connection's announcements are built from and that stays the
@@ -7160,6 +7171,9 @@ impl Announcer<'_> {
             ),
             None => (None, None, None, None),
         };
+        // FR-67 P5 / #3332 — the host's two health words, one hold of the
+        // refresher's cache, so the pair is always one read's.
+        let health = crate::health_words::current();
         Announced {
             caps_generation,
             permissions,
@@ -7184,6 +7198,8 @@ impl Announcer<'_> {
                 ),
             ),
             resume: self.survive,
+            last_install: health.last_install,
+            crash_health: health.crash_health,
         }
     }
 
@@ -7311,6 +7327,13 @@ fn stub_caps(multi_org_tun: bool, is_primary: bool, words: &Announced) -> AgentC
     // re-announce REPLACES the stored caps, so a hello-only word would be gone
     // at the first login.
     caps.update_mode = Some(crate::updater::update_mode(is_primary).to_string());
+    // FR-67 P5 / #3332 — the last install's verdict and the crash ladder's
+    // state, stamped here for the same reason: a beat's caps replace the row's,
+    // so a word written only into the hello would be gone at the first beat
+    // that carries caps. Both come from the refresher's cache through
+    // `Announcer::now`, never from disk on this loop.
+    caps.last_install = words.last_install.clone();
+    caps.crash_health = words.crash_health.clone();
     // `detect()` is memoized and config-blind, so the one capability that
     // depends on the host's config gets appended here: `tun` says "this
     // daemon's TUN is already muxed — a second org can join the mesh

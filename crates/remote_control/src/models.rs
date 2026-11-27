@@ -469,6 +469,28 @@ pub struct AgentCaps {
     /// newer agent may say something this server has never heard of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_mode: Option<String>,
+    /// FR-67 P5 — the last install's verdict, as this device's post-install
+    /// watcher recorded it ([`LastInstallWord`]). Live, like `update_mode`:
+    /// stamped at every announcement, and the heartbeat re-announces the caps
+    /// when it changes. On Windows the first hello after an update says
+    /// `InProgress`, because the new service starts while the watcher still
+    /// waits on the installer; the verdict lands later and is news on the next
+    /// beat. A CLAIM by the host, like `desktop`: shown, never enforced on.
+    ///
+    /// `None` = an agent older than P5, whose row shows nothing new. ⚠️ Never
+    /// read it as "no install": that is the word `Absent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_install: Option<LastInstallWord>,
+    /// #3332 — the crash ladder's state on this host ([`CrashHealth`]): the
+    /// crashes inside the current window, and whether the ladder rolled back
+    /// or could not. Host-wide, so every org's row of a multi-org device
+    /// carries the same. Live, like `last_install`: the clean-run promotion
+    /// clearing a count is news on the next beat. A CLAIM by the host.
+    ///
+    /// `None` = an agent older than the word. ⚠️ Never read it as "no
+    /// crashes": that is the word `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crash_health: Option<CrashHealth>,
     /// VP9 chroma format the agent will emit on the
     /// `data-channel-vp9-444` transport. Values: `"yuv444"` (default,
     /// current behaviour, VP9 profile 1) for sharpest text via
@@ -2077,6 +2099,140 @@ impl GuiWorkerBrief {
     /// older than FR-157 P1, or a platform that sends none. No agent sends
     /// it.
     pub const UNKNOWN: &'static str = "unknown";
+}
+
+/// FR-67 P5 — the last install's verdict, as a device's caps carry it
+/// ([`AgentCaps::last_install`]): the post-install watcher's record
+/// (`last-install.json`) as the daemon reads it back, cut down to what a
+/// server may store and an org's admins may see.
+///
+/// Only words, versions and unix times. Never the record's note, its path or
+/// an exit code: a device-local path can carry a person's name (a Windows
+/// profile path), and caps are stored server-side. Strings, not enums, for the
+/// additive-wire reason: a newer agent's word reaches an older reader as a
+/// word it can skip, not as a parse failure. The spellings are fixed
+/// ([`Self::STATUSES`], locked by test) and are the record's own, so one grep
+/// finds the file, the watcher's `post-install verdict:` line and this.
+///
+/// ⚠️ `Absent` (no install on record) and `InProgress` (an install whose
+/// verdict has not come) are different words on purpose, and
+/// [`Self::never_reported`] marks an `InProgress` older than any watcher's
+/// life (`docs/update-outcome.md` §3).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LastInstallWord {
+    /// One of [`Self::STATUSES`]. A word a reader does not know is ignored,
+    /// as an unrecognised `update_mode` is.
+    #[serde(default)]
+    pub status: String,
+    /// `InProgress` and older than the watcher's whole life (25 min): the
+    /// install never reported. It flips once, so it re-announces once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub never_reported: bool,
+    /// The release the install was for, as the record names it
+    /// (`agent-v0.4.240`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// The version the new binary's `--version` answered (`0.4.240`), when
+    /// the watcher's probe ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_binary_version: Option<String>,
+    /// When the watcher started, unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_unix: Option<u64>,
+    /// When it wrote its verdict, unix seconds; unset while `InProgress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_unix: Option<u64>,
+}
+
+impl LastInstallWord {
+    /// No record: this device's updater has installed nothing yet.
+    pub const ABSENT: &'static str = "Absent";
+    /// A record with no verdict yet: a watcher at work, or, with
+    /// [`Self::never_reported`], one that was killed first.
+    pub const IN_PROGRESS: &'static str = "InProgress";
+    /// The installer exited 0 and the new binary answered the expected version.
+    pub const SUCCEEDED_VERIFIED: &'static str = "SucceededVerified";
+    /// The installer exited 0 and the version probe did not confirm it.
+    pub const SUCCEEDED_UNVERIFIED: &'static str = "SucceededUnverified";
+    /// The installer exited non-zero.
+    pub const INSTALLER_FAILED: &'static str = "InstallerFailed";
+    /// The installer did not exit within the watcher's budget.
+    pub const TIMEOUT: &'static str = "Timeout";
+    /// Nothing wrote a verdict in the watcher's whole life, and the daemon
+    /// that settled the record is not the version it was for.
+    pub const WATCHER_STOPPED: &'static str = "WatcherStopped";
+    /// A record is there and does not parse.
+    pub const UNREADABLE: &'static str = "Unreadable";
+    /// Every word a daemon may send, in wire spelling.
+    pub const STATUSES: [&'static str; 8] = [
+        Self::ABSENT,
+        Self::IN_PROGRESS,
+        Self::SUCCEEDED_VERIFIED,
+        Self::SUCCEEDED_UNVERIFIED,
+        Self::INSTALLER_FAILED,
+        Self::TIMEOUT,
+        Self::WATCHER_STOPPED,
+        Self::UNREADABLE,
+    ];
+}
+
+/// #3332 — the crash ladder's state, as a device's caps carry it
+/// ([`AgentCaps::crash_health`]): what the daemon's own start counted
+/// (`crash_count`, `last_crash_unix`), whether the ladder tripped and what it
+/// did, and the version it would go back to. Read fresh from the daemon's
+/// config and its attention sentinels, so the clean-run promotion clears it
+/// without a restart.
+///
+/// Three states stay apart on every reader: no word (`None`, an agent older
+/// than it), nothing to report ([`Self::OK`]) and something to report. Only
+/// words, versions and unix times, as [`LastInstallWord`]: never a sentinel's
+/// message or path. The spellings are fixed ([`Self::STATES`], locked by
+/// test) and only ever added to.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CrashHealth {
+    /// One of [`Self::STATES`]. A word a reader does not know is ignored.
+    #[serde(default)]
+    pub state: String,
+    /// The crashes counted inside the current window, 0 once the window has
+    /// passed or a clean run reset the count.
+    #[serde(default)]
+    pub crashes: u32,
+    /// The window the count is kept in, in seconds (10 min).
+    #[serde(default)]
+    pub window_secs: u64,
+    /// When the last crash inside the window was counted, unix seconds;
+    /// unset when `crashes` is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_crash_unix: Option<u64>,
+    /// With [`Self::ROLLBACK_FAILED`] only: the version the ladder accuses,
+    /// which is the one running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accused_version: Option<String>,
+    /// The last version that ran clean for five minutes: what the ladder
+    /// rolls back to. Unset on a fresh install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_known_good: Option<String>,
+}
+
+impl CrashHealth {
+    /// Nothing to report: no crash inside the window, no rollback pending.
+    pub const OK: &'static str = "ok";
+    /// Crashes inside the window, and the ladder has not tripped.
+    pub const CRASHING: &'static str = "crashing";
+    /// The ladder tripped and its rollback runs: the build running is
+    /// [`Self::last_known_good`], until its own clean run.
+    pub const ROLLED_BACK: &'static str = "rolled_back";
+    /// The ladder tripped and could not roll back: the running build is the
+    /// accused one ([`Self::accused_version`]), as the device's own
+    /// `rollback_failed` sentinel says.
+    pub const ROLLBACK_FAILED: &'static str = "rollback_failed";
+    /// Every state a daemon may send, in wire spelling.
+    pub const STATES: [&'static str; 4] = [
+        Self::OK,
+        Self::CRASHING,
+        Self::ROLLED_BACK,
+        Self::ROLLBACK_FAILED,
+    ];
 }
 
 /// FR-92 P5b — what a device says about its keep busy, on every heartbeat.
@@ -8695,6 +8851,64 @@ mod tests {
         let served = serde_json::to_value(&caps).unwrap();
         assert!(served.get("last_install").is_none(), "{served}");
         assert!(served.get("crash_health").is_none(), "{served}");
+    }
+
+    /// FR-67 P5 / #3332 — the typed side of the two words: a hello without
+    /// them is `None` (an agent that cannot say), a word this build has never
+    /// heard of parses and is carried as it is (readers skip it, as they skip
+    /// an unrecognised `update_mode`), and a word missing its key parses too,
+    /// so no shape a newer agent sends can fail the hello it rides in.
+    #[test]
+    fn the_health_words_decode_absent_unknown_and_short() {
+        let caps: AgentCaps =
+            serde_json::from_value(caps_json_with(serde_json::json!({}))).unwrap();
+        assert_eq!(caps.last_install, None);
+        assert_eq!(caps.crash_health, None);
+
+        let caps: AgentCaps = serde_json::from_value(caps_json_with(serde_json::json!({
+            "last_install": { "status": "SomethingNew", "rolled_by": "a newer field" },
+            "crash_health": { "state": "something-new", "crashes": 9, "lag_secs": 1 },
+        })))
+        .unwrap();
+        let install = caps.last_install.expect("an unknown word still parses");
+        assert_eq!(install.status, "SomethingNew");
+        assert!(!LastInstallWord::STATUSES.contains(&install.status.as_str()));
+        let crash = caps.crash_health.expect("an unknown state still parses");
+        assert_eq!(crash.state, "something-new");
+        assert_eq!(crash.crashes, 9);
+        assert!(!CrashHealth::STATES.contains(&crash.state.as_str()));
+
+        let caps: AgentCaps = serde_json::from_value(caps_json_with(serde_json::json!({
+            "last_install": {},
+            "crash_health": {},
+        })))
+        .unwrap();
+        assert_eq!(caps.last_install.map(|w| w.status), Some(String::new()));
+        assert_eq!(caps.crash_health.map(|w| w.window_secs), Some(0));
+    }
+
+    /// Spelled out literally rather than derived, so a rename has to be a
+    /// deliberate edit here: every deployed device would otherwise look as if
+    /// it said nothing.
+    #[test]
+    fn the_health_word_spellings_are_locked() {
+        assert_eq!(
+            LastInstallWord::STATUSES,
+            [
+                "Absent",
+                "InProgress",
+                "SucceededVerified",
+                "SucceededUnverified",
+                "InstallerFailed",
+                "Timeout",
+                "WatcherStopped",
+                "Unreadable",
+            ]
+        );
+        assert_eq!(
+            CrashHealth::STATES,
+            ["ok", "crashing", "rolled_back", "rollback_failed"]
+        );
     }
 
     /// Spelled out literally rather than derived, so a rename has to be a
