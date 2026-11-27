@@ -35,6 +35,8 @@ use futures::TryStreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use roomler_ai_remote_control::models::GuiWorkerBrief;
+
 use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 
 // ── Guards ──────────────────────────────────────────────────────────────
@@ -379,6 +381,64 @@ pub(crate) fn desktop_breakdown_pipeline(extra: Document) -> Vec<Document> {
     ]
 }
 
+/// FR-157 P2 (AC6) — the live Mac rows by their screen worker's word
+/// (`capabilities.gui_worker`: `state`, `reason`, `one_row`, the daemon's
+/// claim), each group with its total and how many of it are online. A Mac
+/// row with no word, an agent older than FR-157 P1, is counted as
+/// [`GuiWorkerBrief::UNKNOWN`] with `reason` and `one_row` null, because the
+/// row did not say: so the groups add up to every live Mac, and the
+/// denominator after a roll comes from the server. `online` reads the word
+/// with presence (`last_presence`), as the desktop counts do, so an offline
+/// row's last word is never counted as current. `extra` narrows the match
+/// (a tenant). Served only while `rc.gui_worker_read` is on
+/// ([`gui_workers_if_read`]).
+pub(crate) fn gui_worker_breakdown_pipeline(extra: Document) -> Vec<Document> {
+    let mut filter = extra;
+    filter.insert("deleted_at", Bson::Null);
+    // `OsKind::Macos` on the row.
+    filter.insert("os", "macos");
+    vec![
+        doc! { "$match": filter },
+        doc! { "$group": {
+            "_id": {
+                "state": { "$ifNull": [ "$capabilities.gui_worker.state", GuiWorkerBrief::UNKNOWN ] },
+                "reason": { "$ifNull": [ "$capabilities.gui_worker.reason", Bson::Null ] },
+                // A word without `one_row` says two rows; no word says nothing.
+                "one_row": { "$cond": [
+                    { "$eq": [ { "$type": "$capabilities.gui_worker" }, "object" ] },
+                    { "$ifNull": [ "$capabilities.gui_worker.one_row", false ] },
+                    Bson::Null,
+                ] },
+            },
+            "total": { "$sum": 1 },
+            "online": { "$sum": { "$cond": [ { "$eq": [ "$last_presence", "online" ] }, 1, 0 ] } },
+        }},
+        doc! { "$project": {
+            "_id": 0,
+            "state": "$_id.state",
+            "reason": "$_id.reason",
+            "one_row": "$_id.one_row",
+            "total": 1,
+            "online": 1,
+        }},
+        doc! { "$sort": { "state": 1, "reason": 1, "one_row": 1 } },
+    ]
+}
+
+/// FR-157 P2 — an overview's `gui_workers`, or `None` while
+/// `rc.gui_worker_read` is off: the overview then carries no key at all, and
+/// nothing it says changes.
+async fn gui_workers_if_read(
+    state: &Core,
+    extra: Document,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    if !state.settings.rc.gui_worker_read {
+        return Ok(None);
+    }
+    let groups = agg(state, "agents", gui_worker_breakdown_pipeline(extra)).await?;
+    Ok(Some(serde_json::Value::Array(groups)))
+}
+
 // ── Tenant endpoints ────────────────────────────────────────────────────
 
 /// GET /api/tenant/{tid}/stats/overview — ANY member. Powers the org
@@ -479,15 +539,21 @@ pub async fn tenant_overview(
         desktop_breakdown_pipeline(doc! { "tenant_id": tid }),
     )
     .await?;
+    // FR-157 P2 — the org's Macs by their screen worker's word.
+    let gui_workers = gui_workers_if_read(&state, doc! { "tenant_id": tid }).await?;
 
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "enabled": true,
         "machines": { "online": machines_online, "total": machines_total },
         "calls": { "active": calls_active, "minutes_today": minutes_today },
         "spark_machines": spark_machines,
         "spark_minutes": minutes_rows,
         "desktops": desktops,
-    })))
+    });
+    if let Some(groups) = gui_workers {
+        body["gui_workers"] = groups;
+    }
+    Ok(Json(body))
 }
 
 /// GET /api/tenant/{tid}/stats/machines?range= — MANAGE_AGENTS.
@@ -1538,14 +1604,21 @@ pub async fn admin_orgs(
     // FR-93 P2b — the whole fleet's Linux desktops: the denominator a field
     // check after a roll needs, which an exec sweep (online only) cannot give.
     let desktops = agg(&state, "agents", desktop_breakdown_pipeline(doc! {})).await?;
-    Ok(Json(serde_json::json!({
+    // FR-157 P2 — the whole fleet's Macs by their screen worker's word,
+    // counted as the org overview counts them; the names are read per org.
+    let gui_workers = gui_workers_if_read(&state, doc! {}).await?;
+    let mut body = serde_json::json!({
         "enabled": true,
         "tenants": tenants,
         "machines": machines,
         "members": members,
         "calls": calls,
         "desktops": desktops,
-    })))
+    });
+    if let Some(groups) = gui_workers {
+        body["gui_workers"] = groups;
+    }
+    Ok(Json(body))
 }
 
 /// GET /api/admin/stats/machines?tenant_id&range — cross-org machine

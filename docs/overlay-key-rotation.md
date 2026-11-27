@@ -171,8 +171,8 @@ The device's report is a **claim** (the `ssh_activity` sense). What the server c
 *verify* is the join: `rc:overlay.join` under the new public key passes
 `wg_key_taken_by_other` (machine-scoped, so a device rotating its own key is admitted
 — `security-baseline.md` §4), and the server stamps what the device presented onto
-the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:638-661`
-→ `dao/agent.rs:930`). It is stamped on **every** join, not only after a rotation, so
+the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:654-677`
+→ `dao/agent.rs:1269`). It is stamped on **every** join, not only after a rotation, so
 the grid can always show the device's current key.
 
 | record | lives in | written by | what it is |
@@ -183,7 +183,7 @@ the grid can always show the device's current key.
 | the **proof** | `agents.overlay_identity` (`OverlayIdentity`, `models.rs:3338`) | the overlay join | the public key and epoch the device actually presented, and when |
 
 ⚠️ **Never fold them.** A later **refusal** for the same `request_id` is withheld
-rather than written over a `rotated` claim (`dao/agent.rs:904-921`) — a rotation that
+rather than written over a `rotated` claim (`dao/agent.rs:1243-1260`) — a rotation that
 happened, happened; the only way a refusal follows a success for one order is the
 duplicate-delivery race below. Any report about a *different* order, and any
 `rotated`, still replaces.
@@ -247,7 +247,7 @@ on every connect rather than only when nobody is watching. Three field cycles on
 
 | cycle | what the run showed | the rule it left |
 |---|---|---|
-| 1 → **P1b** | 30 ms after the re-join, the reconnect's own register re-pushed the **same** order (the `rotated` report, sent on the dying session and written by a spawned task, had not landed); the device refused the duplicate under its own ceiling, and that refusal **overwrote** the success — the grid read `refused (rate_limited)` for a rotation that worked | an order delivered < **120 s** ago is in progress, not lost: `should_redeliver` (`models.rs:6680`, `:6705`); and a refusal never overwrites a `rotated` report for the same order (`dao/agent.rs:904-921`) |
+| 1 → **P1b** | 30 ms after the re-join, the reconnect's own register re-pushed the **same** order (the `rotated` report, sent on the dying session and written by a spawned task, had not landed); the device refused the duplicate under its own ceiling, and that refusal **overwrote** the success — the grid read `refused (rate_limited)` for a rotation that worked | an order delivered < **120 s** ago is in progress, not lost: `should_redeliver` (`models.rs:6680`, `:6705`); and a refusal never overwrites a `rotated` report for the same order (`dao/agent.rs:1243-1260`) |
 | 2 → **P1c** | the dying-session report was **lost** this time, so the state stuck at `delivered` although the server had verified the new key at the join | the order snapshots `public_key_before`; a join under another key resolves `rotated` with or without a report; the agent **re-sends** its report on the next session, keyed per org (`agents/roomlerd/src/signaling.rs:3597-3639`) |
 | 3 → **P1d** | the cycle-2 order (report lost, no snapshot) was re-delivered on every later connect — a pod roll, then the 0.4.26 restart: **three rotations for one click** | `order_is_satisfied` (`models.rs:6690`): a verified identity change after the order satisfies it, and a satisfied order is never pushed again |
 
