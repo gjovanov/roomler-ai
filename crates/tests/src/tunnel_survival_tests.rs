@@ -18,7 +18,8 @@
 //! could have carried on. Each also opens a NEW connection after the event,
 //! because a route people use opens connections all the time, and a session
 //! that kept its old connections but could not open new ones would not be
-//! serving.
+//! serving. And each reads which session the forward runs before and after,
+//! since a session ended and opened again is what the field saw.
 //!
 //! Both agents run their real `signaling::run`; the forward is the daemon's own
 //! (`TunnelClientHub::create_forward`, what `roomler forward --daemon` asks for),
@@ -149,7 +150,11 @@ struct LiveForward {
     flow_id: String,
     local: u16,
     in_flight: TcpStream,
+    /// The tunnel session the forward ran before the event.
+    session_before: Option<String>,
     stops: Vec<tokio::sync::watch::Sender<bool>>,
+    /// Both agents' signalling loops, ended by `stop`.
+    loops: Vec<tokio::task::JoinHandle<()>>,
 }
 
 async fn live_quic_forward(tag: &str) -> LiveForward {
@@ -191,6 +196,7 @@ async fn live_quic_forward(tag: &str) -> LiveForward {
     let exit_front = Front::to(pod1.addr).await;
     let client_front = Front::to(pod1.addr).await;
     let mut stops = Vec::new();
+    let mut loops = Vec::new();
 
     let mut exit_cfg = enrol_agent_lib(&pod1, &seeded, &format!("mach-{tag}-exit"), "exit").await;
     exit_cfg.ws_url = Some(exit_front.ws_url());
@@ -198,7 +204,11 @@ async fn live_quic_forward(tag: &str) -> LiveForward {
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     stops.push(stop);
     // The exit serves; the hub it is handed is never driven.
-    let _ = spawn_origin_signaling(exit_cfg, TunnelClientHub::new("0.3.0-test".into()), stop_rx);
+    loops.push(spawn_origin_signaling(
+        exit_cfg,
+        TunnelClientHub::new("0.3.0-test".into()),
+        stop_rx,
+    ));
     wait_agent_online(&pod1, &seeded, &exit_id).await;
 
     let mut client_cfg =
@@ -208,7 +218,7 @@ async fn live_quic_forward(tag: &str) -> LiveForward {
     let hub = TunnelClientHub::new("0.3.0-test".into());
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     stops.push(stop);
-    let _ = spawn_origin_signaling(client_cfg, hub.clone(), stop_rx);
+    loops.push(spawn_origin_signaling(client_cfg, hub.clone(), stop_rx));
     wait_agent_online(&pod1, &seeded, &client_id).await;
 
     let local = free_local_port().await;
@@ -230,6 +240,8 @@ async fn live_quic_forward(tag: &str) -> LiveForward {
     echo(&mut in_flight, "second;", Duration::from_secs(5))
         .await
         .expect("the forward keeps carrying bytes before the event");
+    let session_before = hub.live_session_id(&flow_id);
+    assert!(session_before.is_some(), "a serving forward runs a session");
 
     LiveForward {
         pod1,
@@ -240,15 +252,37 @@ async fn live_quic_forward(tag: &str) -> LiveForward {
         flow_id,
         local,
         in_flight,
+        session_before,
         stops,
+        loops,
+    }
+}
+
+/// What a cell reads after its event.
+#[derive(Debug)]
+struct Outcome {
+    /// Every probe on the in-flight connection echoed for 12 s, each within 5 s.
+    in_flight: Result<(), String>,
+    /// A connection opened after the probes was served within 15 s.
+    fresh: Result<(), String>,
+    /// The session the forward runs after the event, against the one before.
+    session_before: Option<String>,
+    session_after: Option<String>,
+}
+
+impl Outcome {
+    /// The session was kept (the same one, not ended and opened again) and
+    /// both connections were served.
+    fn kept(&self) -> bool {
+        self.in_flight.is_ok() && self.fresh.is_ok() && self.session_after == self.session_before
     }
 }
 
 /// After the event: the in-flight connection must echo every probe for 12 s
-/// (each within 5 s), and a connection opened after the event must be served
-/// within 15 s. Returns both outcomes, so a failure says which half failed and
-/// when.
-async fn after_the_event(rig: &mut LiveForward) -> (Result<(), String>, Result<(), String>) {
+/// (each within 5 s), a connection opened after the event must be served
+/// within 15 s, and the forward must still run the session it ran before.
+/// All three are read, so a failure says which failed and when.
+async fn after_the_event(rig: &mut LiveForward) -> Outcome {
     let event = Instant::now();
     let mut in_flight = Ok(());
     let mut n = 0u32;
@@ -273,22 +307,30 @@ async fn after_the_event(rig: &mut LiveForward) -> (Result<(), String>, Result<(
         Ok(mut c) => echo(&mut c, "fresh;", Duration::from_secs(15)).await,
         Err(e) => Err(e),
     };
-    (in_flight, fresh)
+    Outcome {
+        in_flight,
+        fresh,
+        session_before: rig.session_before.clone(),
+        session_after: rig.hub.live_session_id(&rig.flow_id),
+    }
 }
 
 impl LiveForward {
-    fn stop(self) {
+    /// Ends the forward and both signalling loops before the pods drop.
+    async fn stop(self) {
         let _ = self.hub.kill_flow(&self.flow_id);
         for stop in &self.stops {
             let _ = stop.send(true);
+        }
+        for signalling in self.loops {
+            let _ = tokio::time::timeout(Duration::from_secs(3), signalling).await;
         }
     }
 }
 
 /// Cell A, the roll: pod 1 shuts down as SIGTERM shuts it down, with the
 /// front already sending redials to pod 2 (maxSurge 0: the other pod is the
-/// survivor). Field: every session the pod carried ended, and every in-flight
-/// connection in them was reset.
+/// survivor). Field: every session the pod carried ended at one instant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_in_flight_tunnel_connection_survives_a_rolled_pod() {
     let mut rig = live_quic_forward("survive-roll").await;
@@ -297,12 +339,11 @@ async fn an_in_flight_tunnel_connection_survives_a_rolled_pod() {
     rig.exit_front.point_at(rig.pod2.addr);
     roomler_ai_api::state::shutdown_cleanup(&rig.pod1.state).await;
 
-    let (in_flight, fresh) = after_the_event(&mut rig).await;
-    rig.stop();
+    let outcome = after_the_event(&mut rig).await;
+    rig.stop().await;
     assert!(
-        in_flight.is_ok() && fresh.is_ok(),
-        "a roll must not end a tunnel session its data plane still carries: \
-         in-flight connection = {in_flight:?}; new connection = {fresh:?}"
+        outcome.kept(),
+        "a roll must not end a tunnel session its data plane still carries: {outcome:?}"
     );
 }
 
@@ -315,12 +356,11 @@ async fn an_in_flight_tunnel_connection_survives_its_exits_control_socket_cyclin
 
     rig.exit_front.cut();
 
-    let (in_flight, fresh) = after_the_event(&mut rig).await;
-    rig.stop();
+    let outcome = after_the_event(&mut rig).await;
+    rig.stop().await;
     assert!(
-        in_flight.is_ok() && fresh.is_ok(),
+        outcome.kept(),
         "an exit's control socket cycling must not end a tunnel session its data \
-         plane still carries: in-flight connection = {in_flight:?}; \
-         new connection = {fresh:?}"
+         plane still carries: {outcome:?}"
     );
 }
