@@ -2253,9 +2253,6 @@ jobs:
       # `roomler-node-core` is Linux, where these tests do not exist. Also the
       # elevated writers' merge base (`config::tests::machine_merge_base`): a
       # machine config is folded into only when it is private (#4176: and its copy).
-      # FR-145 P2 — and a role process's `service-logs` by handle
-      # (`logging::held_logs::tests`): the day's log, the prune, the panic file
-      # and stderr's file, below a sealed folder only this token writes in.
       # ⚠️ No `: ` in a plain YAML value (`machine_tree:: x` is a mapping, and
       # the whole workflow file fails to load), and no ` #` in a name.
       - name: "The machine tree is repaired and checked, the anchor key's check, and the machine folder by handle (#3073, #3609, #3737, FR-145)"

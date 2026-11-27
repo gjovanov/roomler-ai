@@ -311,7 +311,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:460`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:517`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -1264,7 +1264,7 @@ match this node`), and an org-relay grant that needs them is refused.
     are said on a target of their own, `tunnel_core::overlay::route_guard`
     (`ROUTE_GUARD_LOG`, `crates/tunnel-core/src/overlay/mod.rs:121`), which
     the daemon's log filter keeps at INFO whatever `RUST_LOG` says
-    (`crates/agent-core/src/logging.rs:472`), as FR-110 does for `sockbuf`
+    (`crates/agent-core/src/logging.rs:529`), as FR-110 does for `sockbuf`
     ([fleet-rpc.md](fleet-rpc.md)). The Linux package's units and the macOS
     package's LaunchAgent set `RUST_LOG=roomlerd=info,warn`, which drops every
     other `tunnel_core` INFO and, until #4380, dropped these two as well; the

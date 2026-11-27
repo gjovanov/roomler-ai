@@ -324,7 +324,7 @@ restart changes it. That is why P6 added a fourth value:
   `compute_caps` advertised `list` on a device whose owner had set
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
-  `caps_cache.rs:332`). `apps` is now assigned in `detect()`, in the daemon,
+  `caps_cache.rs:358`). `apps` is now assigned in `detect()`, in the daemon,
   and the child's struct carries none (`apps_caps`, `caps.rs:4497`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
