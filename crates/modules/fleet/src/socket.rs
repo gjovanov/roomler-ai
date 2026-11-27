@@ -1433,7 +1433,7 @@ pub async fn ws_upgrade_agent(
         Err(_) => {
             return Response::builder()
                 .status(401)
-                .body("Unauthorized (agent)".into())
+                .body("Unauthorized (device)".into())
                 .unwrap();
         }
     };
@@ -1451,7 +1451,7 @@ pub async fn ws_upgrade_agent(
         Err(_) => {
             return Response::builder()
                 .status(400)
-                .body("Invalid agent ID".into())
+                .body("Invalid device ID".into())
                 .unwrap();
         }
     };
@@ -1493,7 +1493,7 @@ pub async fn ws_upgrade_agent(
             info!(%agent_id, %tenant_id, "refusing agent WS: row gone (a reaped ephemeral device?)");
             return Response::builder()
                 .status(401)
-                .body("Unauthorized (agent)".into())
+                .body("Unauthorized (device)".into())
                 .unwrap();
         }
         Err(_) => None,
@@ -1503,13 +1503,14 @@ pub async fn ws_upgrade_agent(
         && let Some(reason) = crate::auth_agent::generation_refusal(
             claims.generation,
             row.token_gen,
+            crate::auth_agent::generation_from_rotation(row),
             state.settings.rc.token_generation_check,
         )
     {
-        info!(%agent_id, reason, row_gen = row.token_gen, "refusing agent WS: token predates the device's removal");
+        info!(%agent_id, reason, row_gen = row.token_gen, "refusing agent WS: token of another generation");
         return Response::builder()
             .status(401)
-            .body("Unauthorized (agent)".into())
+            .body("Unauthorized (device)".into())
             .unwrap();
     }
     let token_exp = claims.exp;
@@ -1551,7 +1552,7 @@ pub async fn ws_upgrade_agent(
                 info!(%agent_id, reason, "refusing WS with rc:goodbye");
                 let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
                     reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
-                    message: "This agent's server-side row was deleted (or quarantined). \
+                    message: "This device's server-side row was deleted (or quarantined). \
                           Re-enrol with a fresh enrollment token from the admin UI to \
                           revive (soft-deleted rows rehydrate by (tenant_id, machine_id))."
                         .into(),
@@ -1770,6 +1771,120 @@ mod tests {
                 assert_eq!(kind, "eof", "{detail}");
             }
             other => panic!("a FIN with no close frame read {other:?}"),
+        }
+    }
+
+    /// FR-133 P2b: a removed device's daemon quotes this goodbye to a person
+    /// (its server-side-close notice), so the text names the device, never an
+    /// "agent". It sits inline in the WS upgrade path, which only a live
+    /// database row reaches, and docs anchor this file's lines, so the test
+    /// reads the literal from the source rather than moving it.
+    #[test]
+    fn device_deleted_goodbye_names_the_device_not_an_agent() {
+        let src = include_str!("socket.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("the tests module")];
+        let goodbye = code
+            .split_once("AgentCloseReason::AgentDeleted,")
+            .expect("the AgentDeleted goodbye")
+            .1;
+        let text = goodbye
+            .split_once("message: \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .expect("its message literal")
+            .0;
+        let says_agent = text
+            .replace("agent_id", "")
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w.eq_ignore_ascii_case("agent") || w.eq_ignore_ascii_case("agents"));
+        assert!(
+            !says_agent,
+            "a person reads this in the daemon's notice: {text}"
+        );
+    }
+
+    /// FR-133 P2e: what fleet's handlers send a caller, inline where only a
+    /// live row or a socket reaches it, so read from the source (docs anchor
+    /// these files' lines). Each names the device or `roomlerd`, and the old
+    /// "agent" words are gone. `agent_id` is a route parameter, an identity.
+    /// `agent_org.rs` keeps "predates remote org-join": `crates/tests`'
+    /// agent_tests match it.
+    #[test]
+    fn fleet_refusals_say_device_not_agent() {
+        fn code(src: &str) -> &str {
+            &src[..src.find("#[cfg(test)]").unwrap_or(src.len())]
+        }
+        let files: [(&str, &str, &[&str], &[&str]); 8] = [
+            (
+                "socket.rs",
+                code(include_str!("socket.rs")),
+                &["\"Unauthorized (device)\"", "\"Invalid device ID\""],
+                &["Unauthorized (agent)", "Invalid agent ID"],
+            ),
+            (
+                "agent_log.rs",
+                code(include_str!("agent_log.rs")),
+                &[
+                    "tenant_id in route does not match the device credential",
+                    "agent_id in route does not match the device credential",
+                    "browser source not accepted on a device-authed route",
+                ],
+                &["match agent JWT", "accepted on agent-authed route"],
+            ),
+            (
+                "agent_org.rs",
+                code(include_str!("agent_org.rs")),
+                &["runs roomlerd {} which predates remote org-join. Update the device"],
+                &["runs agent {}"],
+            ),
+            (
+                "agent_exec.rs",
+                code(include_str!("agent_exec.rs")),
+                &[
+                    "device runs roomlerd {} which predates Fleet RPC",
+                    "this device's daemon cannot run commands as the person at its screen",
+                ],
+                &["runs agent {}", "this device's agent", "update the agent"],
+            ),
+            (
+                "agent.rs",
+                code(include_str!("agent.rs")),
+                &["\"device missing _id\""],
+                &["agent missing _id", "the agent's current"],
+            ),
+            (
+                "removal.rs",
+                code(include_str!("removal.rs")),
+                &["\"device missing _id\""],
+                &["agent missing _id"],
+            ),
+            (
+                "auth_agent.rs",
+                code(include_str!("auth_agent.rs")),
+                &[
+                    "\"device lookup: {other}\"",
+                    "\"device has been deleted\"",
+                    "\"device is quarantined\"",
+                ],
+                &[
+                    "agent lookup",
+                    "agent has been deleted",
+                    "agent is quarantined",
+                ],
+            ),
+            (
+                "exec_service.rs",
+                code(include_str!("exec_service.rs")),
+                &["\"device lookup: {other}\""],
+                &["agent lookup"],
+            ),
+        ];
+        for (file, code, says, said) in files {
+            for words in says {
+                assert!(code.contains(words), "{file} no longer says {words}");
+            }
+            for words in said {
+                assert!(!code.contains(words), "{file} says {words} again");
+            }
         }
     }
 }

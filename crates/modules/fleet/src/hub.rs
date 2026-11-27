@@ -1069,7 +1069,7 @@ impl Hub {
             let goodbye = ServerMsg::Goodbye {
                 reason: AgentCloseReason::ReplacedByNewerConnection,
                 message: format!(
-                    "Another agent is connecting with the same agent_id ({agent_id}); \
+                    "Another daemon is connecting with the same agent_id ({agent_id}); \
                      this connection is being closed. Check for a duplicate install \
                      (another physical host with a copy of this config.toml, the tray \
                      companion, etc.) or re-enrol to mint a fresh agent_id."
@@ -3600,7 +3600,7 @@ impl Hub {
                 // FR-121 — the device's own report, keyed by the
                 // authenticated socket's agent id, never by anything in the
                 // frame.
-                let agent_id = ctx.agent_id.ok_or(Error::PermissionDenied("no agent"))?;
+                let agent_id = ctx.agent_id.ok_or(Error::PermissionDenied("no device"))?;
                 self.set_agent_local_relay(agent_id, relay);
                 Ok(())
             }
@@ -8140,5 +8140,73 @@ mod tests {
             !hub.deliver_exec_result("req-4", ExecOutcome::default()),
             "waiter must have been deregistered"
         );
+    }
+
+    /// FR-133 P2b: the displaced daemon's notice quotes this goodbye to a
+    /// person (its duplicate-instance notice), so the text names the daemon,
+    /// never an "agent". `agent_id` is the field's own name and stays.
+    #[tokio::test]
+    async fn displacement_goodbye_names_the_daemon_not_an_agent() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let register = || {
+            hub.register_agent(
+                agent_id,
+                ObjectId::new(),
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                false,
+            )
+        };
+        let (_tx1, _cancel1, mut rx1) = register();
+        let (_tx2, _cancel2, _rx2) = register();
+        let Ok(ServerMsg::Goodbye { message, .. }) = rx1.try_recv() else {
+            panic!("the displaced connection should receive a Goodbye");
+        };
+        let says_agent = message
+            .replace("agent_id", "")
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w.eq_ignore_ascii_case("agent") || w.eq_ignore_ascii_case("agents"));
+        assert!(
+            !says_agent,
+            "a person reads this in the daemon's notice: {message}"
+        );
+    }
+
+    /// FR-133 P2e: a device frame on a socket with no device id is refused as
+    /// "no device". The error is logged (the agent socket's dispatch warning)
+    /// and never sent, and a person reads that log.
+    #[tokio::test]
+    async fn a_device_frame_with_no_device_is_refused_as_no_device() {
+        let hub = test_hub().await;
+        let ctx = DispatchCtx {
+            role: Role::Agent,
+            user_id: None,
+            agent_id: None,
+            controller_name: None,
+            controller_tx: None,
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: RcOverlayMode::Off,
+            session_policy: OrgPolicy::Unavailable,
+            max_duration: None,
+            idle_secs: None,
+            lock_on_end: None,
+            org_session_cap: None,
+            slot: None,
+        };
+        let err = hub
+            .dispatch(&ctx, ClientMsg::AgentLocalRelay { relay: None })
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PermissionDenied("no device")),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "permission denied: no device");
     }
 }

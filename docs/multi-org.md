@@ -50,6 +50,56 @@ worth recording why so nobody re-proposes it:
 
 So: **one daemon, many orgs**. Everything below follows from that.
 
+### The machine's guard: one daemon per machine, enforced (#4280)
+
+A `roomlerd run` takes a guard that belongs to the machine, not to its config, before anything
+above: before the start's purge of the overlay's routes, the LocalAPI pipe and the first connect
+(`start_gate`, `agents/roomlerd/src/app.rs:3976`; the guard is
+`agents/roomlerd/src/machine_guard.rs`). A run that finds it held leaves there, whatever config it
+loaded and elevated or not, and marks, saves and counts nothing.
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Who holds it | SYSTEM, or an elevated administrator | root | root |
+| An unprivileged run | reads whether it is held, and never creates it | takes none | takes none: the screen worker is a second run on purpose |
+| A run that finds it held leaves with | 8 | 8 | 0 |
+
+- **Only a privileged daemon can hold the machine's guard; an unprivileged start can check for it
+  but never creates it.** It is keyed by the overlay interface's name, and it is held only while its
+  owner lives, so a holder that ends, a crash included, leaves it free.
+- On Windows only SYSTEM and Administrators, at high integrity, can take it or change it; any other
+  signed-in account can only read whether it is held. On Linux and macOS it is the kernel's lock on
+  a 0600 file in the root daemon's own folder, `/var/run/roomler`.
+- **The first privileged holder stays.** A start under a supervisor (the service host, the per-user
+  task's launcher, systemd, launchd) waits up to 30 s for the guard, because its holder is most
+  likely its own predecessor, still exiting; any other start leaves at once.
+- **Every supervisor reads the code as "leave"** (`daemon_error::machine_held_exit_code`): systemd
+  does not restart on 8 (`RestartPreventExitStatus=7 8`), the per-user task's launcher stays down
+  on 8 (`agents/roomlerdw/src/ends.rs`), launchd leaves a clean exit alone, and the Windows service
+  host stops instead of respawning, unless its reaper ended a predecessor of its own.
+- The service host's worker hand-off has two covers: the bounded wait, and that reaper, which ends
+  this host's own predecessor that outlived the wait and then respawns the worker
+  ([remote-control.md §19.8.9](remote-control.md#1989-a-worker-its-host-left-behind-2465)). If an
+  elevated console `roomlerd run` holds the guard when the service's worker starts, the worker
+  leaves with 8 and the host stops the service until a reboot or a manual start.
+- **The service's own SYSTEM worker is decided by the guard alone** (#4403): it holds the
+  machine's guard, which already makes it the only privileged daemon on the machine, so the
+  config's single-instance lock no longer decides whether that worker runs, and the worker still
+  takes the lock, so every other start finds it as before (`config_lock`,
+  `agents/roomlerd/src/app.rs:4040`; the rule is `machine_guard::relaxes_config_lock`).
+- A start that can neither take nor read the guard runs without it and logs
+  `machine guard unavailable; running without it` at WARN: a machine left with no daemon is the one
+  answer the guard must never give.
+- A daemon that runs unprivileged holds no guard, so a privileged start beside it still runs. That
+  is a per-user install's daemon on Linux, and two daemons on Windows: every per-user install's,
+  because its scheduled task runs at `LeastPrivilege` (`agents/roomlerd/src/service.rs:1506`), and
+  the service's user-context worker whenever the service starts it with the person's standard
+  rights: a standard user, `ROOMLERD_ELEVATE_WORKER=0`, or SystemContext waiting for a machine
+  enrollment (`user_arm_elevates`, `agents/roomlerd/src/win_service/supervisor.rs:1053`). None of
+  them can create the overlay interface: an unprivileged process cannot create a WireGuard TUN
+  ([vmtest.md](vmtest.md)); on Windows `WintunCreateAdapter` is a privileged device install
+  (`supervisor.rs:412`), and the service's optional `netd` child hosts nothing yet.
+
 ---
 
 ## 3. P1 — the foundation: `[[orgs]]` (shipped, #313)
@@ -82,6 +132,14 @@ overlay_mode = "off"          # off | netstack | tun — P1 forces secondaries o
 | same `(server, tenant)` | refreshes in place, keeping operator state |
 | a NEW `(server, tenant)` | **appends** a secondary org with a freshly **minted** WG key |
 | `--replace` | the legacy rebind, for when you really do mean "move this box" |
+| an **ephemeral** answer that would append a secondary or refresh one | **refused** (#4352): the config is not written, and a row the enrollment made is removed again with the answer's own token ([ephemeral-nodes.md](ephemeral-nodes.md#a-second-organization-is-never-ephemeral-4352)) |
+
+**An ephemeral key cannot add an organization.** An `[[orgs]]` entry has no
+`ephemeral`, and a stop removes only the row its run started as, so nothing
+would ever remove the row of an ephemeral secondary. To add an org, join it
+with a standard enrollment token; to run as an ephemeral device of an org,
+enroll it as the primary of a config of its own. The primary itself takes an
+ephemeral answer as before.
 
 The fresh key mint is a security property, not an optimisation: copying the
 primary's WG public key into a second org would let two orgs correlate the
@@ -119,6 +177,37 @@ then cost a two-org host its mesh path, measured on 2026-10-19.
 
 The command prints the outcome for each enrollment, with the way back on where
 it could not keep one.
+
+⚠️ **An ephemeral primary is never swapped out** (#4370). While the primary
+enrollment is ephemeral, `set-primary` refuses, whatever label it is given:
+`promote_org_to_primary` checks it before anything else
+(`crates/agent-core/src/config.rs:2367-2380`), and the file stays as it was,
+since `org_cmd` saves only after its arm succeeds
+(`agents/roomlerd/src/app.rs:3612`). The swap would put the ephemeral row
+beside another org, which #4352 rules out. An `[[orgs]]` entry has no
+`ephemeral`, so the swap would leave:
+- **the moved row** in `[[orgs]]`, where the device no longer knows it is
+  ephemeral. The restart that applies the swap stops the run that started as
+  that row, and when it is an OS stop it removes that row on the server
+  ([#4352](ephemeral-nodes.md#a-stop-removes-only-the-row-its-run-started-as-4352))
+  while the file still lists it;
+- **the promoted org**, a permanent row, marked ephemeral: every later stop
+  asks the server to remove it and is refused (403).
+
+The way on is the order the server's 409 gives
+([ephemeral-nodes.md](ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)):
+remove the ephemeral row on its Devices page, enroll the machine in that org
+again with a standard enrollment token (the config keeps its settings and its
+`[[orgs]]`), then run `set-primary` again.
+
+**Known limit: the reverse case is swapped as before.** A permanent primary can
+sit beside an `[[orgs]]` entry whose row the server holds as ephemeral: a join
+could add one before #4352 refused it. The device cannot tell, since an
+`OrgEntry` carries no flag, so `set-primary` promotes that entry and marks the
+new primary permanent. No stop removes its row, and the server's reaper, where
+it runs, removes it once the device is silent past its deadline. To make it
+permanent, remove it on its Devices page and enroll again with a standard
+enrollment token.
 
 **Per-org supervisors.** `run_cmd` starts one supervised loop per enabled org.
 `OrgCtx` threads the per-enrollment identity through `run` / `connect_once` /
@@ -257,7 +346,7 @@ sequenceDiagram
 
 | `reason` | the server sends it when | `roomler status` says |
 |---|---|---|
-| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:526-529`](../crates/modules/network/src/overlay.rs#L526-L529)) | retrying will not help; an operator has to act |
+| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:530-533`](../crates/modules/network/src/overlay.rs#L530-L533)) | retrying will not help; an operator has to act |
 | `network_unavailable` | the tenant's network row cannot be read or created, or an allocated ordinal falls outside the network's address space | retrying will not help; an operator has to act |
 | `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
 | `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
@@ -268,19 +357,19 @@ either case: its signalling loop reconnects on its own ladder, and a retry at th
 refusal would race it.
 
 - **The wire.** `rc:overlay.join_refused { reason, detail }`
-  ([`signaling.rs:3436-3442`](../crates/remote_control/src/signaling.rs#L3436-L3442)) goes only to a
+  ([`signaling.rs:3443-3449`](../crates/remote_control/src/signaling.rs#L3443-L3449)) goes only to a
   node whose join set `supports_join_refusal`
   ([`signaling.rs:1681`](../crates/remote_control/src/signaling.rs#L1681)). An older node keeps the
   old silence, and the server's ERROR line, `alert = "overlay_join_refused"`
-  ([`overlay.rs:281-298`](../crates/modules/network/src/overlay.rs#L281-L298)), is then the only
+  ([`overlay.rs:284-301`](../crates/modules/network/src/overlay.rs#L284-L301)), is then the only
   trace. The frame is a new top-level variant, which an old agent drops as an unknown
   frame, so it needed no forward-compatible pre-roll.
 - **The device.** The daemon logs `overlay: the server REFUSED our join` at ERROR and
   keeps the refusal in a process-global slot
-  ([`overlay.rs:1019-1029`](../agents/roomlerd/src/overlay.rs#L1019-L1029)). No overlay runtime
+  ([`overlay.rs:1036-1046`](../agents/roomlerd/src/overlay.rs#L1036-L1046)). No overlay runtime
   exists to hold it, because the runtime is exactly what never came up.
 - **`roomler status`** prints it
-  ([`localclient.rs:2692-2714`](../agents/roomler-cli/src/localclient.rs#L2692-L2714)):
+  ([`localclient.rs:2711-2733`](../agents/roomler-cli/src/localclient.rs#L2711-L2733)):
 
   ```
     overlay ip  —
@@ -293,7 +382,7 @@ refusal would race it.
   The line stays for the daemon's lifetime, even after a later join succeeds: "refused
   twenty minutes ago" is the only trace left once the log rotates, and `server` already
   says what is true now. A daemon that predates the field sends no `join_refusal`
-  ([`lib.rs:297`](../crates/localapi/src/lib.rs#L297)), and then nothing is printed, never a
+  ([`lib.rs:303`](../crates/localapi/src/lib.rs#L303)), and then nothing is printed, never a
   false "clear". `roomler status --json` carries it as
   `join_refusal { reason, detail, at_unix, retryable }`.
 
@@ -413,7 +502,7 @@ its free pool → cycle every agent's WS.
 > compensation stack around it, once its evidence counters (`mux_nat_rewrites`,
 > `restores`, `skip_as_source_flips`) had read zero fleet-wide for 7 days. Every
 > org now gets its own adapter ([Per-org TUN adapters](#per-org-tun-adapters-the-only-path-since-w7c),
-> `agents/roomlerd/src/overlay.rs:318`). This section records how the mux
+> `agents/roomlerd/src/overlay.rs:335`). This section records how the mux
 > worked, for the history it explains.
 
 One `roomler` adapter, N per-org runtimes. Each org's `OverlayRuntime` gets a
@@ -512,7 +601,7 @@ re-binds ONCE, and every org re-establishes on `Ready`.
 ### Per-org TUN adapters (the only path since W7c)
 
 The second half of multi-org v2: with `overlay_multi_org` on, each org gets its
-**own adapter** (`per_org_systun_factory`, `agents/roomlerd/src/overlay.rs:318`).
+**own adapter** (`per_org_systun_factory`, `agents/roomlerd/src/overlay.rs:335`).
 It shipped behind `overlay_tun_per_org`, default ON since rc.339; W7c deleted
 the switch along with the shared adapter it chose between, so neither the key
 nor `ROOMLERD_OVERLAY_TUN_PER_ORG` is read any more:
@@ -799,7 +888,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
 | One org's server is down / its token is revoked | Only that supervisor backs off and retries; other orgs are untouched, each with its own `DOWN_SINCE` | P1 |
 | Pod roll | Every org's WS reconnects independently and re-lands on the current LB hash; rc/tunnel/media/derp rehome per the S6 cluster layer | P1 + S6 |
 | Half-open WS (middlebox ACKs pings after the upstream leg dies) | Per-connection receive-liveness deadline (rc.293): no inbound frames for 80–90 s ⇒ reconnect | pre-existing, per-org since P1 |
-| A netstack org's loopback SOCKS port is still held when its front starts | The front waits it out with a bind retry that doubles from 1 s to 30 s. It WARNs on the first failure and every 10th, and the stack logs `socks_front="not bound yet"` until the bind succeeds (`agents/roomlerd/src/overlay.rs:868-927`). Before the fix it tried ONCE, and the org had no front until the next daemon restart while its log said the stack was up. The holder, measured on Windows: across a self-update, the post-install watcher held an inherited copy of the old front's socket, now impossible (`docs/remote-control.md`, the watcher) | #2836 |
+| A netstack org's loopback SOCKS port is still held when its front starts | The front waits it out with a bind retry that doubles from 1 s to 30 s. It WARNs on the first failure and every 10th, and the stack logs `socks_front="not bound yet"` until the bind succeeds (`agents/roomlerd/src/overlay.rs:885-944`). Before the fix it tried ONCE, and the org had no front until the next daemon restart while its log said the stack was up. The holder, measured on Windows: across a self-update, the post-install watcher held an inherited copy of the old front's socket, now impossible (`docs/remote-control.md`, the watcher) | #2836 |
 | Redis down | Presence sweeper aborts rather than mass-emitting from a partial view; per-pod fan-out degrades to pod-local; the UI's slow poll is the belt | P4 |
 | Agent crash mid-renumber | Node rows are written before the network row, so the worst case is nodes already on new addresses with the network still describing the old range — re-running the renumber is idempotent from there | P2b |
 | Renumber loses the block-allocation race | The old block is already quarantined and the network keeps its old CIDR — safe, and the retry allocates above | P2b |
@@ -854,7 +943,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   module with it; each organization now gets its own adapter. The CI step
   that ran it ran no test from then until `tun_kernel_tests` came back with
   one about the overlay TUN's descriptor
-  (`agents/roomlerd/src/overlay.rs:1394`, root +
+  (`agents/roomlerd/src/overlay.rs:1411`, root +
   `ROOMLER_TUN_KERNEL_TEST=1`, a named skip everywhere else). The step,
   "Overlay TUN against real kernel networking", now fails unless the test
   ran.
@@ -902,10 +991,10 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2149-2151`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2160-2162`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
-  (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:
+  (`agents/roomlerd/src/overlay.rs:328`). A port that is unset is **picked**:
   - at `enroll --overlay`, `org overlay <org> netstack` and a pushed join;
   - at daemon start, for an entry from before the fix.
 

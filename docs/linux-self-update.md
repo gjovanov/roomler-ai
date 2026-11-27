@@ -93,12 +93,12 @@ proxy for that. Falling back to the tarball when a Debian host somehow lacks the
 New `install_tarball_linux` alongside `run_linux_install_candidates`.
 
 ⚠️ **It has no privilege ladder**, whatever this design first said. It refuses any
-non-root daemon (`agents/roomlerd/src/updater.rs:2422-2431`). It places the files
+non-root daemon (`agents/roomlerd/src/updater.rs:2467-2476`). It places the files
 in-process rather than running one command it could hand to `sudo`, so there is
 nothing to escalate. A per-user tarball install therefore never updated (#2046)
 until FR-96 gave it a root helper ([below](#the-update-half-of-a-per-user-install-fr-96)).
 The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
-(`linux_install_candidates`, `updater.rs:2367-2382`). Every rung hands dpkg the options in
+(`linux_install_candidates`, `updater.rs:2412-2427`). Every rung hands dpkg the options in
 [Every package install keeps an edited configuration file and asks nothing](#every-package-install-keeps-an-edited-configuration-file-and-asks-nothing-3932).
 
 1. Extract to a staging dir under the same filesystem as `/usr`.
@@ -132,8 +132,8 @@ its own updater's next check installed the release a second time.
 
 Since #2724, on Linux, the command restarts the daemon running beside it once its
 install has completed, the way `roomler restart` does
-(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6444`, called
-at `app.rs:6421`):
+(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6729`, called
+at `app.rs:6706`):
 
 ```mermaid
 sequenceDiagram
@@ -155,10 +155,10 @@ sequenceDiagram
 
 - **Only onto a proven binary.** The file the command was started as, read before
   the install replaces it, must answer `--version` as the release just installed
-  (`beside_daemon_after_install`, `agents/roomlerd/src/post_install.rs:1160`).
+  (`beside_daemon_after_install`, `agents/roomlerd/src/post_install.rs:1816`).
   Otherwise the service keeps its image: P2b's rule for the same question.
 - **The daemon's refusals stand** (FR-84 D3, `roomler restart`'s client,
-  `agents/roomler-cli/src/localclient.rs:1651`): `local_restart_enabled = false`,
+  `agents/roomler-cli/src/localclient.rs:1657`): `local_restart_enabled = false`,
   a recording, a restart in the last 30 s, no supervisor it can prove. A refusal,
   a daemon older than the verb, or a binary that did not answer each end in one
   line: what still runs, and `sudo systemctl restart roomlerd` (a per-user install:
@@ -362,8 +362,10 @@ release itself.
 ### The per-user daemon steps aside (P2a)
 
 On a host whose helper is enabled, a per-user daemon installs nothing: a pushed
-`rc:agent.update` becomes a touch of the wake file, and the helper's timer
-replaces the daemon's own periodic check. The daemon decides once, at its start
+`rc:agent.update`, and the daemon's own update recheck after a long
+control-socket outage (#4245), each become a touch of the wake file, and the
+helper's timer replaces the daemon's own periodic check. Its log names which of
+the two it queued. The daemon decides once, at its start
 (`run_periodic` → `decide_update_owner`, `updater.rs`):
 
 ```mermaid
@@ -374,7 +376,7 @@ flowchart TD
     K -->|yes| IP2[installs its own updates<br/>the kill switch: as before FR-96]
     K -->|no| E{an enable link for<br/>roomler-update.path or .timer<br/>that leads to the unit?}
     E -->|no| IP3[installs its own updates]
-    E -->|yes| H[forwards each push to<br/>/var/tmp/roomler-update-check<br/>and installs nothing]
+    E -->|yes| H[forwards each push or recheck to<br/>/var/tmp/roomler-update-check<br/>and installs nothing]
 ```
 
 - **"Enabled" is a file check**, not `systemctl is-enabled`: the `.wants` link
@@ -423,7 +425,7 @@ stateDiagram-v2
     Replaced --> Settled: unchanged for 2 min
     Settled --> Ignored: --version says the same release, or it does not run (asked again in 10 min)
     Settled --> Waiting: --version says another release
-    Waiting --> Waiting: a session, SSH, a transfer or a recording (up to 24 h) — or a network transition, or its own install in flight (never forced)
+    Waiting --> Waiting: a session, SSH, an exec run, a transfer or a recording (up to 24 h) — or a network transition, or its own install in flight (never forced)
     Waiting --> Restart: idle, or the 24 h ceiling cuts the work
     Restart --> [*]: graceful exit 9, and systemd starts the new binary
 ```
@@ -438,6 +440,10 @@ stateDiagram-v2
 - ⚠️ **An SSH session counts.** The likeliest replacement outside the helper is an
   admin's `apt upgrade` typed into a roomler SSH session on that device, so open
   SSH connections defer the restart like a remote-control session does.
+- **So does a Fleet RPC run** (#3429), for as long as it runs: 5 min at most. "Idle"
+  is one model, `Busy` (`agents/roomlerd/src/busy.rs`), and the periodic update
+  check reads it too, on every OS
+  ([installation.md](installation.md#an-update-waits-for-live-work-3429)).
 - **The restart is "Apply now"'s** (FR-84 D3): only under a supervisor that
   relaunches the process, rate-limited by the persisted record, and checked
   against systemd's own policy first. An orphan `roomlerd run` never exits for it.
@@ -551,9 +557,9 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 
 | Host | Who moves the companion | When |
 |---|---|---|
-| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3461`) | after every check that installs nothing; at the start after an update (`:3349`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3400`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4029`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3278`, `package_needs_sync`) |
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3762`) | after every check that installs nothing; at the start after an update (`:3613`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3688`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4495`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3539`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in
@@ -605,10 +611,10 @@ our stdin.
 
 | Road | Command | stdin |
 |---|---|---|
-| the daemon's own package, as root: a system daemon, or FR-96's helper (`linux_install_candidates`, `agents/roomlerd/src/updater.rs:2367-2382`) | `apt-get install -y -o Dpkg::Options::=--force-confold <deb>`, then `dpkg --force-confold --install <deb>` | `/dev/null` (`run_linux_install_candidates`, `:2564`) |
+| the daemon's own package, as root: a system daemon, or FR-96's helper (`linux_install_candidates`, `agents/roomlerd/src/updater.rs:2412-2427`) | `apt-get install -y -o Dpkg::Options::=--force-confold <deb>`, then `dpkg --force-confold --install <deb>` | `/dev/null` (`run_linux_install_candidates`, `:2609`) |
 | the daemon's own package, not root | `pkexec`, then `sudo -n`, in front of the same `apt-get` | `/dev/null` |
 | the companion's package (`install_commands`, `agents/roomlerd/src/companion/package_sync.rs:138`) | `apt-get install -y --no-remove -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold <deb>`, with `INSTALL_ENV` | `/dev/null` (`run_bounded`) |
-| the tunnel CLI's `self-update` (`dpkg_install_args`, `agents/roomler-cli/src/update.rs:570`) | `dpkg --force-confold -i <deb>` | the person's terminal; dpkg asks nothing there either |
+| the tunnel CLI's `self-update` (`dpkg_install_args`, `agents/roomler-cli/src/update.rs:592`) | `dpkg --force-confold -i <deb>` | the person's terminal; dpkg asks nothing there either |
 | `install.sh`'s `deb_install` (#3926, [installation.md](installation.md)) | `dpkg --force-confold -i`, then `apt-get … -o Dpkg::Options::=--force-confold` | `/dev/null` |
 
 **What a person finds afterwards:** their file as they left it, a deleted one still deleted,

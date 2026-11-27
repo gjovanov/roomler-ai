@@ -25,7 +25,7 @@ negotiates down to something that actually works rather than failing.
 
 :::os
 @windows
-The broadest support of the three. On startup the agent probes what the machine
+The broadest support of the three. On startup the daemon probes what the machine
 can really do and advertises only what succeeded.
 
 - **Media Foundation H.264** — the built-in hardware path.
@@ -54,16 +54,16 @@ sessions use the software VP9 4:4:4 path.
 NVIDIA, Intel and AMD hardware encoders are used where the driver provides them,
 with software as the floor.
 
-The agent's capability probe runs in a **separate process** on purpose: a
+The daemon's capability probe runs in a **separate process** on purpose: a
 graphics driver that faults while being probed then takes down the probe rather
-than the agent. Before that, a bad driver could restart the agent straight back
+than the daemon. Before that, a bad driver could restart the daemon straight back
 into the same probe — a crash loop rather than a degraded machine.
 :::
 
 ## Why a probe rather than a list
 
 Reporting a codec as available because the hardware *ought* to support it is how
-you get a session that negotiates a format and then produces nothing. The agent
+you get a session that negotiates a format and then produces nothing. The daemon
 therefore encodes an actual frame with each candidate at startup and advertises
 only what worked.
 

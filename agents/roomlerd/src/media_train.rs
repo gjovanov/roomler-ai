@@ -12,13 +12,16 @@
 //! "write n bytes" or "stopped, and this is the reading". No session runs it
 //! yet (FR-148 P0's step 4b wires it in, behind a switch); the cells below
 //! drive it over the real vendored SCTP through `media_delivery`'s shaped
-//! link.
+//! link. While a train runs, its writer keeps the association's pacer on
+//! ([`Pacing`]), steered after every step to what [`Train::pace`] answers,
+//! and off from the stop on (D43, D64).
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use webrtc::sctp::association::delivery::Delivery;
 use webrtc::sctp::association::gauges::Gauges;
+use webrtc::sctp::association::pacer::{PaceSwitch, WHOLE};
 
 /// Bytes of SCTP payload a train writes at most (D38).
 pub const BUDGET: u64 = 512 * 1024;
@@ -34,9 +37,11 @@ pub const DEADLINE: Duration = Duration::from_millis(2_500);
 const STANDING: Duration = Duration::from_millis(10);
 
 /// A sample this far above the least seen shows the bottleneck queued: the
-/// in-flight cap applies from then on. It is P-d's floor too: two packets
-/// sent together at 2 Mbit/s already put 4.9 ms between their samples, and a
-/// cap that starts on that holds a climb at its first round's rate.
+/// in-flight cap applies from then on, on trial until samples of packets sent
+/// after it confirm the queue ([`Hold`]). It is P-d's floor too: two
+/// packets sent together at 2 Mbit/s already put 4.9 ms between their
+/// samples, and a cap that starts on that holds a climb at its first round's
+/// rate.
 const QUEUED: Duration = Duration::from_millis(10);
 
 /// The in-flight cap's queue: a third of the least round trip or of this
@@ -70,13 +75,44 @@ const DISPERSION_ACKS: usize = 4;
 const ROUND_SAMPLES: u32 = 4;
 const EARLY_SPAN: Duration = Duration::from_millis(50);
 
-/// Once a slow link's bottleneck queued, the train writes no more than what
-/// had been acknowledged then and what its estimate of the rate carries in
-/// this long; then it writes nothing, and the judgment comes from what is in
-/// flight. At 0.4 Mbit/s and 250 ms that is about 8 KB and 34 KB, inside
-/// P-f's 64 KB for an estimate up to 1.6 times the link's rate, however late
-/// the judgment comes; and the packets it leaves in flight carry the run of
-/// samples that judges the queue.
+/// FR-148 4a-3c — the samples of packets sent after the cap engaged on trial
+/// that confirm it by standing [`QUEUED`] above the least, and those that
+/// lift it by not standing ([`Hold`]). Two: a stall's samples all acknowledge
+/// packets sent before it, so one stall never confirms the trial it began,
+/// and a second stall alone does not either (at 2/80/C a runner's noise held
+/// a second SACK to 101.8 ms against an 89 ms least, and one confirming
+/// sample capped the train at three messages, a plateau at 0.11). Eight:
+/// under a cap the estimate's pipe sizes, a slow link's queue may show in
+/// one sample of four, as a round of [`ROUND_SAMPLES`] judges it, so two
+/// standing samples need two rounds' worth before a trial lifts.
+const TRIAL_STANDING: u32 = 2;
+const TRIAL_CLEAR: u32 = TRIAL_STANDING * ROUND_SAMPLES;
+
+/// FR-148 4a-3c — the queue a short path's claim may build on the link it
+/// claims ([`Claim::probe`]): three quarters of P-e's 50 ms, the margin
+/// [`pace_share`] keeps ([`PACE_MARGIN`]). On a link faster than the claim,
+/// a probe of k messages of one lead L each comes back in the least round
+/// trip R and the writer's reply to its SACKs, d, so it reads k·L/(R + d) of
+/// the claim. Filling R and this much more, k·L ≥ R + 37.5 ms − L, and that
+/// exceeds 1.25·(R + d), which refutes the claim, for every lead under
+/// 37.5 ms − R/4 − 1.25·d: about 13 ms at R = 50 ms in the model of the
+/// train, where d is about 9 ms. A probe of one message more than the claim's
+/// link serialises in 50 ms ignored R: at 8 Mbit/s and 50 ms a 20 ms stall in
+/// the first round read as a claim the probe could not refute, and the train
+/// stopped on a plateau at 0.05 of the link, where sized by the least it read
+/// 1.03 (the model). A longer lead on a faster link is still not refuted.
+const CLAIM_QUEUE: Duration = Duration::from_micros(37_500);
+
+/// Once the bottleneck first queued, the train writes no more than what had
+/// been acknowledged then and what its estimate of the rate carries in this
+/// long ([`Train::write_budget`]); then it writes nothing, and the judgment
+/// comes from what is in flight. At 0.4 Mbit/s the cap first applies with 5
+/// to 6 KB acknowledged on path I and at 20 ms on path C, and 18 to 19 KB at
+/// 80 and 250 ms on path C, whose climb is paced from its first window; the
+/// estimate carries 35 KB at the link's rate: inside P-f's 64 KB for an
+/// estimate up to 1.66 and 1.28 times the link's rate, however late the
+/// judgment comes and however many trials lift; and the packets it leaves in
+/// flight carry the run of samples that judges the queue.
 const WRITE_SPAN: Duration = Duration::from_millis(700);
 
 /// The train stops this long before [`DEADLINE`], or two step intervals
@@ -106,6 +142,80 @@ const DELAYED_ACK: Duration = Duration::from_millis(200);
 /// SCTP's common header and a DATA chunk's header: what each packet of a
 /// message that fills one chunk adds to it.
 const PACKET_OVERHEAD: u64 = 12 + 16;
+
+/// The share of P-e's bound, max(the least round trip, [`QUEUE_FLOOR`]),
+/// that [`pace_share`]'s derivation leaves out: the queue it predicts stays
+/// within the rest. The derivation leaves out a step's lateness, the second
+/// packet a SACK waits for, and the serialisation a least round trip
+/// carries; its predictions sat within 15 % of what the cells measured. A
+/// quarter is also the most that keeps the whole window at a 250 ms round
+/// trip, where the whole window's queue is 0.73 of one. The cap's trial
+/// ([`Hold`]) leaves it as it was.
+const PACE_MARGIN: f64 = 0.25;
+
+/// The share of the congestion window, in thousandths ([`WHOLE`] is all of
+/// it), that the association's pacer lets out per least round trip in slow
+/// start until the bottleneck queued: the largest up to the whole window
+/// whose queue, by the derivation below, stays within `1 - PACE_MARGIN` of
+/// P-e's bound. It comes from the least round trip and [`QUEUED`] alone.
+///
+/// Paced at a share G of cwnd over the least round trip R, with every SACK
+/// adding what it acknowledges to cwnd (slow start, while chunks wait), the
+/// window and the rate grow as e^(x t / R), where x e^x = G. Once the rate
+/// passes the link the SACKs still carry what left a round trip before, so
+/// the rate keeps that growth for one more round trip, and then rises by G
+/// times the link a round trip, as the link's SACKs add to the window. The
+/// queue is what the rate put above the link. The first packet that meets
+/// [`QUEUED`] of it is acknowledged a round trip and that queue later, and
+/// its sample engages the cap, which binds the association's sends from
+/// then on: the queue at that moment is the most the train causes. The cap
+/// engages on trial (4a-3c, [`Hold`]), at that sample and with its bound,
+/// so the trial adds no lag here.
+fn pace_share(least: Duration) -> u32 {
+    let r = least.as_secs_f64();
+    if r <= 0.0 {
+        return WHOLE;
+    }
+    let theta = QUEUED.as_secs_f64() / r;
+    let bound = (1.0 - PACE_MARGIN) * least.max(QUEUE_FLOOR).as_secs_f64() / r;
+    if pace_queue(1.0, theta) <= bound {
+        return WHOLE;
+    }
+    let g = bisect(0.0, 1.0, |g| pace_queue(g, theta) <= bound);
+    ((g * f64::from(WHOLE)) as u32).max(1)
+}
+
+/// The queue, in round trips, that a slow start paced at a share `g` of the
+/// window has built when a sample shows `theta` round trips of it: the
+/// derivation at [`pace_share`]. Time counts in round trips from when the
+/// rate passed the link.
+fn pace_queue(g: f64, theta: f64) -> f64 {
+    let x = bisect(0.0, 1.0, |x| x * x.exp() < g);
+    let ex = x.exp();
+    let queue = |tau: f64| {
+        if tau <= 1.0 {
+            ((x * tau).exp() - 1.0) / x - tau
+        } else {
+            let s = tau - 1.0;
+            (ex - 1.0) / x - 1.0 + (ex - 1.0) * s + g * s * s / 2.0
+        }
+    };
+    let met = bisect(0.0, 16.0, |tau| queue(tau) < theta);
+    queue(met + 1.0 + theta)
+}
+
+/// The point in `lo..hi` where `below` turns false, by bisection.
+fn bisect(mut lo: f64, mut hi: f64, below: impl Fn(f64) -> bool) -> f64 {
+    for _ in 0..60 {
+        let mid = (lo + hi) / 2.0;
+        if below(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
 
 /// Why a train stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +317,50 @@ pub enum Step {
     Stopped(Reading),
 }
 
+/// How the association's pacer runs while a train does (D43, D64), as
+/// [`Train::pace`] answers it after each step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pace {
+    /// The share of the congestion window, in thousandths, let out per least
+    /// round trip in slow start: [`pace_share`] of the least round trip until
+    /// the bottleneck queued, the whole window ([`WHOLE`]) from then on.
+    pub share: u32,
+    /// The in-flight cap, once the bottleneck queued: new data waits while
+    /// what is in flight is at or above it.
+    pub cap: Option<u64>,
+}
+
+/// The association's pacer, for as long as a train runs: [`Pacing::on`]
+/// turns it on, [`Pacing::follow`] steers it to each step's [`Train::pace`]
+/// and turns it off at the train's stop, and dropping it turns it off too,
+/// so an error that ends the train's writer, or a writer dropped with its
+/// train, leaves no pacing behind.
+#[derive(Debug)]
+#[must_use = "the pacer is off again as soon as this is dropped"]
+pub struct Pacing(PaceSwitch);
+
+impl Pacing {
+    /// Turns `switch`'s pacer on, at the whole window with no cap.
+    pub fn on(switch: PaceSwitch) -> Self {
+        switch.set(true);
+        Self(switch)
+    }
+
+    /// Steers the pacer to `pace`, or turns it off at `None`.
+    pub fn follow(&self, pace: Option<Pace>) {
+        match pace {
+            Some(p) => self.0.steer(p.share, p.cap),
+            None => self.0.set(false),
+        }
+    }
+}
+
+impl Drop for Pacing {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 /// What the first step saw.
 #[derive(Debug, Clone, Copy)]
 struct Start {
@@ -253,6 +407,86 @@ struct Run {
     min: Duration,
 }
 
+/// FR-148 4a-3c — the in-flight cap on trial. A host stall reads as a queue:
+/// a SACK the scheduler held, and those it held with it, sit as far above
+/// the least as the stall was long, while the bottleneck's queue does not
+/// move (prod 1: four SACKs over 33 ms, the window cells' one, each capped a
+/// climb in its first rounds, where the estimate, and so the cap, was a
+/// fraction of the link's rate). A queue is the path's: while it stands,
+/// every packet sent into it meets it. A stall is a moment's: it delays only
+/// the SACKs that cross it, and each of those acknowledges a packet sent
+/// before it. So the cap engages at the sample it engaged at before, with
+/// the same bound, the whole window and the write budget, and only samples of
+/// packets sent after it engaged judge it: [`TRIAL_STANDING`] that stand
+/// confirm it, and [`TRIAL_CLEAR`] that do not lift it. A stall cannot
+/// confirm the trial it engaged, and a second one cannot alone. Where no
+/// sample can stand, on a short path to a slow link, the delivery judges the
+/// trial instead ([`Claim`]). Until it is confirmed, no round counts as held
+/// at it, so a plateau never stops a train on a cap a stall set, and the most
+/// one step acknowledged keeps its value: a stall's held SACKs come at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Hold {
+    /// The step it engaged at: a sample of a packet sent before this does
+    /// not judge it.
+    at: Duration,
+    /// How far the greatest sample stood above the least then.
+    lead: Duration,
+    /// Samples of packets sent since that stood, and that did not.
+    stood: u32,
+    clear: u32,
+    /// The short path's claim, if the trial began on one.
+    claim: Option<Claim>,
+}
+
+/// FR-148 4a-3c — a short path's claim, put to the test. On a path under
+/// [`QUEUE_FLOOR`] and [`QUEUED`] to a slow link, the receiver acknowledges
+/// every second packet, so each sampled packet left first of its pair and met
+/// no queue: three messages fill 0.4/20 with no sample standing, and a climb
+/// that waited for one queued 140 ms against P-e's 50. A trial's lead under
+/// the least round trip there claims a link that serialises one message in
+/// that lead. The cap lets out [`Claim::probe`] messages, which such a link
+/// queues for [`CLAIM_QUEUE`] at most, and the delivery over a least round trip
+/// with that much out answers: more than a quarter above the claim refutes it
+/// (a stall's lead, on a faster link), within it confirms the trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Claim {
+    /// The trial's lead: one message's serialisation at the claimed rate.
+    lead: Duration,
+    /// The least round trip when the trial engaged.
+    least: Duration,
+    /// The first judging sample's `(at, acked)`, which the delivery counts
+    /// from, and the most out since.
+    from: Option<(Duration, u64)>,
+    out: u64,
+    /// `Some(true)` once the delivery confirmed it, `Some(false)` once it
+    /// refuted it.
+    verdict: Option<bool>,
+}
+
+impl Claim {
+    /// The messages the claim may keep out: as many as its link serialises
+    /// in the least round trip and [`CLAIM_QUEUE`], and
+    /// [`CAP_FLOOR_MESSAGES`] at least.
+    fn probe(&self) -> u64 {
+        let per = self.lead.as_micros().max(1);
+        let held = (self.least + CLAIM_QUEUE).as_micros() / per;
+        CAP_FLOOR_MESSAGES.max(u64::try_from(held).unwrap_or(0))
+    }
+}
+
+/// FR-148 4a-3c — what the cap's trials came to, for the daemon's INFO line
+/// at the stop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Trials {
+    /// Trials the cap began, those confirmed, and those lifted.
+    pub engaged: u32,
+    pub confirmed: u32,
+    pub lifted: u32,
+    /// Short paths' claims put to the test, and those the delivery refuted.
+    pub claimed: u32,
+    pub refuted: u32,
+}
+
 /// The open-time train's state.
 #[derive(Debug)]
 pub struct Train {
@@ -270,10 +504,21 @@ pub struct Train {
     min: Option<Duration>,
     first_sample: Option<Duration>,
     max_sample: Option<Duration>,
-    /// The bottleneck queued once: the in-flight cap and the write budget
-    /// apply, from the bytes acknowledged then.
+    /// Whether the first sample's packet left in the same step as the packet
+    /// ahead of it: only then is its lead a serialisation ([`Train::pair`]).
+    first_paired: bool,
+    /// The bottleneck queued: the in-flight cap applies.
     capped: bool,
-    capped_acked: u64,
+    /// The bytes acknowledged when the cap first applied, on trial or
+    /// confirmed: the write budget counts from them, whatever came after.
+    capped_acked: Option<u64>,
+    /// The cap on trial, if it is (4a-3c): it applies as `capped` does,
+    /// except that no round counts as held at it.
+    hold: Option<Hold>,
+    trials: Trials,
+    /// `(at, sent)` at every step that saw bytes leave the association: when
+    /// each byte was first sent, to the step.
+    sends: Vec<(Duration, u64)>,
     run: Option<Run>,
     /// Acknowledgement events of more than one message, `(at, acked)`, the
     /// oldest at least [`DISPERSION_SPAN`] old.
@@ -291,6 +536,9 @@ pub struct Train {
     /// The offered rate of the round that pushed back, bytes a second.
     high: Option<u64>,
     stopped: Option<Reading>,
+    /// The pacer's share of the window in slow start, from the least
+    /// acknowledgement delay ([`pace_share`]).
+    share: u32,
 }
 
 /// Bytes a second, of `bytes` over `d`.
@@ -325,8 +573,12 @@ impl Train {
             min: None,
             first_sample: None,
             max_sample: None,
+            first_paired: false,
             capped: false,
-            capped_acked: 0,
+            capped_acked: None,
+            hold: None,
+            trials: Trials::default(),
+            sends: Vec::new(),
             run: None,
             events: VecDeque::new(),
             dispersion: 0,
@@ -337,12 +589,49 @@ impl Train {
             flat: 0,
             high: None,
             stopped: None,
+            share: WHOLE,
         }
     }
 
     /// The length of every message the train asks for.
     pub fn message_len(&self) -> usize {
         usize::try_from(self.msg).unwrap_or(usize::MAX)
+    }
+
+    /// What the cap's trials came to so far.
+    pub fn trials(&self) -> Trials {
+        self.trials
+    }
+
+    /// How the association's pacer runs after this step: `None` once the
+    /// train stopped, whatever stopped it. Until the bottleneck queued it
+    /// lets out [`pace_share`] of the window over the least round trip in
+    /// slow start; from then on the whole window, with the in-flight cap,
+    /// which then binds what the association sends as well as what the
+    /// train writes: chunks already pending wait while in flight is at or
+    /// above it. A train that queued before anything estimated the rate has
+    /// no cap yet. A cap on trial ([`Hold`]) paces as the cap does, and one
+    /// lifted gives the share back.
+    pub fn pace(&self) -> Option<Pace> {
+        if self.stopped.is_some() {
+            return None;
+        }
+        Some(if self.cap_applies() {
+            Pace {
+                share: WHOLE,
+                cap: Some(self.cap()).filter(|&c| c < u64::MAX),
+            }
+        } else {
+            Pace {
+                share: self.share,
+                cap: None,
+            }
+        })
+    }
+
+    /// The in-flight cap applies: it is confirmed or on trial.
+    fn cap_applies(&self) -> bool {
+        self.capped || self.hold.is_some()
     }
 
     /// One step: `at` is the time on any clock that does not go back,
@@ -386,6 +675,9 @@ impl Train {
         let acked = delivery.acked_bytes.saturating_sub(start.acked);
         let pending = gauges.pending_bytes;
         let sent = self.written.saturating_sub(pending);
+        if self.sends.last().is_none_or(|&(_, s)| sent > s) {
+            self.sends.push((at, sent));
+        }
         let step_acked = acked.saturating_sub(self.last_acked);
         // A SACK of one message is a lone packet's, and may have waited for
         // the receiver's delayed acknowledgement: it is not a sample.
@@ -393,15 +685,23 @@ impl Train {
         if step_acked > msg
             && let Some(s) = gauges.ack_delay_min
         {
-            let was_capped = self.capped;
+            if self.first_sample.is_none() {
+                // The sampled packet, the newest acknowledged, and the one
+                // ahead of it left the association in one step.
+                let ahead = self.sent_at(acked.saturating_sub(msg));
+                self.first_paired = ahead.is_some() && ahead == self.sent_at(acked);
+            }
             self.sample(s);
-            if self.capped && !was_capped {
-                self.capped_acked = acked;
+            self.judge(s, at, acked);
+            if self.cap_applies() {
+                self.capped_acked.get_or_insert(acked);
             }
             ran = self.extend_run(s, at, acked, sent);
         }
         if step_acked > 0 {
-            self.peak_step = self.peak_step.max(step_acked);
+            if self.hold.is_none() {
+                self.peak_step = self.peak_step.max(step_acked);
+            }
             self.last_acked = acked;
             self.last_ack_at = Some(at);
             self.disperse(at, acked, step_acked);
@@ -451,7 +751,7 @@ impl Train {
             // releases as much again, not twice as much.
             room = start.first_window.saturating_sub(out);
         }
-        if self.capped {
+        if self.cap_applies() {
             room = room.min(self.cap().saturating_sub(out));
         }
         // Enough pending that slow start grows at every SACK until the next
@@ -482,6 +782,11 @@ impl Train {
             room = room.min(left);
         }
         let n = want.min(room).min(BUDGET - self.written) / msg * msg;
+        if let Some(c) = self.hold.as_mut().and_then(|h| h.claim.as_mut())
+            && c.from.is_some()
+        {
+            c.out = c.out.max(out + n);
+        }
         self.written += n;
         self.last_at = at;
         Step::Write(n)
@@ -492,12 +797,100 @@ impl Train {
         self.first_sample.get_or_insert(s);
         let min = self.min.map_or(s, |m| m.min(s));
         let max = self.max_sample.map_or(s, |m| m.max(s));
+        if self.min != Some(min) {
+            self.share = pace_share(min);
+        }
         self.min = Some(min);
         self.max_sample = Some(max);
         self.round.min = Some(self.round.min.map_or(s, |m| m.min(s)));
         self.round.samples += 1;
-        if max.saturating_sub(min) >= QUEUED {
+    }
+
+    /// FR-148 4a-3c — whether the bottleneck queued, from the sample `s` of
+    /// the bytes up to `acked` that the step at `at` took. The greatest sample
+    /// [`QUEUED`] above the least engages the cap on trial ([`Hold`]), with a
+    /// claim on a short path ([`Claim`]). On trial, only a sample whose packet
+    /// left at or after the cap engaged judges it: [`TRIAL_STANDING`] that
+    /// stand confirm it, as a claim the delivery confirmed does, and
+    /// [`TRIAL_CLEAR`] that do not stand lift it, after which the greatest
+    /// sample is the least again, and a sample [`QUEUED`] above it engages the
+    /// cap anew.
+    fn judge(&mut self, s: Duration, at: Duration, acked: u64) {
+        let (Some(least), Some(max)) = (self.min, self.max_sample) else {
+            return;
+        };
+        if self.capped {
+            return;
+        }
+        let Some(mut hold) = self.hold else {
+            let lead = max.saturating_sub(least);
+            if lead >= QUEUED {
+                let claim = (least < QUEUE_FLOOR + QUEUED && lead < least).then_some(Claim {
+                    lead,
+                    least,
+                    from: None,
+                    out: 0,
+                    verdict: None,
+                });
+                self.trials.engaged += 1;
+                self.trials.claimed += u32::from(claim.is_some());
+                self.hold = Some(Hold {
+                    at,
+                    lead,
+                    stood: 0,
+                    clear: 0,
+                    claim,
+                });
+            }
+            return;
+        };
+        if at.saturating_sub(s) < hold.at {
+            return;
+        }
+        if let Some(c) = hold.claim.as_mut()
+            && c.verdict.is_none()
+        {
+            self.test_claim(c, least, at, acked);
+        }
+        let stands = s.saturating_sub(least) >= QUEUED;
+        hold.stood += u32::from(stands);
+        let claimed = hold.claim.is_some_and(|c| c.verdict == Some(true));
+        if hold.stood >= TRIAL_STANDING || (!stands && claimed) {
+            self.hold = None;
             self.capped = true;
+            self.trials.confirmed += 1;
+            return;
+        }
+        hold.clear += u32::from(!stands);
+        if hold.clear >= TRIAL_CLEAR {
+            self.hold = None;
+            self.max_sample = Some(least);
+            self.trials.lifted += 1;
+        } else {
+            self.hold = Some(hold);
+        }
+    }
+
+    /// FR-148 4a-3c — the claim `c` put to the test by the sample at `at` of
+    /// the bytes up to `acked`. The first sample that judges the trial starts
+    /// the count; from a least round trip `least` on, a delivery more than a
+    /// quarter above the claimed rate refutes the claim, and one within it,
+    /// with the probe's messages out since the count began, confirms it.
+    fn test_claim(&mut self, c: &mut Claim, least: Duration, at: Duration, acked: u64) {
+        let Some((t, a)) = c.from else {
+            c.from = Some((at, acked));
+            c.out = 0;
+            return;
+        };
+        if at.saturating_sub(t) < least {
+            return;
+        }
+        let delivered = rate(acked.saturating_sub(a), self.span(t, a, at, acked));
+        if delivered * 4 > rate(self.msg, c.lead) * 5 {
+            c.verdict = Some(false);
+            self.trials.refuted += 1;
+        } else if c.out >= c.probe() * self.msg {
+            c.verdict = Some(true);
         }
     }
 
@@ -525,7 +918,33 @@ impl Train {
         }
         if starts(&self.events, 0) {
             let (t, a) = self.events[0];
-            self.dispersion = self.dispersion.max(rate(acked - a, at.saturating_sub(t)));
+            self.dispersion = self
+                .dispersion
+                .max(rate(acked - a, self.span(t, a, at, acked)));
+        }
+    }
+
+    /// When the association first sent byte `b`, to the step; `None` for a
+    /// byte no step saw leave.
+    fn sent_at(&self, b: u64) -> Option<Duration> {
+        let i = self.sends.partition_point(|&(_, s)| s < b);
+        self.sends.get(i).map(|&(t, _)| t)
+    }
+
+    /// FR-148 4a-3c — the span a delivery of the bytes acknowledged from `a`,
+    /// acknowledged at `t`, to `acked` at `at` is taken over: the
+    /// acknowledgements', or the sends' of the same bytes where those took
+    /// longer. A link never delivers bytes faster than they were sent, as the
+    /// delivery-rate estimate of draft-cheng-iccrg-delivery-rate-estimation
+    /// takes it; a host stall releases the SACKs it held together, and over
+    /// their span alone the bytes read as delivered at several times the
+    /// link's rate (8/20/I, a 40 ms stall: 3.9 MB/s on a 1 MB/s link, and a
+    /// reading of 17.6 Mbit/s).
+    fn span(&self, t: Duration, a: u64, at: Duration, acked: u64) -> Duration {
+        let acks = at.saturating_sub(t);
+        match (self.sent_at(a), self.sent_at(acked)) {
+            (Some(from), Some(to)) => acks.max(to.saturating_sub(from)),
+            _ => acks,
         }
     }
 
@@ -584,20 +1003,39 @@ impl Train {
         };
         let d = at.saturating_sub(r.at);
         (
-            rate(acked.saturating_sub(r.acked), d),
+            rate(
+                acked.saturating_sub(r.acked),
+                self.span(r.at, r.acked, at, acked),
+            ),
             rate(sent.saturating_sub(r.sent), d),
         )
     }
 
-    /// The most the train may have written once the bottleneck queued, on a
-    /// slow link: one whose packet's serialisation shows in the first
-    /// sample, so that the estimate had the rate before the queue came.
-    /// `None` elsewhere: on a faster link the estimate when the queue first
-    /// shows can be a sixth of the rate, and a budget that followed it would
-    /// hold the climb.
+    /// FR-148 4a-3c — the most the train may have written once the
+    /// bottleneck queued: what was acknowledged when the cap first applied,
+    /// on trial or confirmed, and what the estimate carries in
+    /// [`WRITE_SPAN`]. Where it counts from is set once and never moves, and
+    /// it holds from then on, whether the cap still applies or not, and with
+    /// a pair or without: P-f's bound at 0.4 Mbit/s is this sum, however
+    /// many trials lift. A lift that moved it, after a trial in which no
+    /// sample stood, counted a stall twice on a slow link: at 0.4 Mbit/s and
+    /// 80 ms on path C, a 40 ms stall held the climb under a cap of three
+    /// messages for 640 ms, and counted from the lift the train wrote 68,400
+    /// bytes, over P-f's 64,000. A first-round stall on a fast link pays
+    /// instead: it reads as a slow link's pair, the trial's three messages
+    /// spend the budget its estimate sizes before eight samples lift it, and
+    /// the train stops on the budget with a floor. A window's worth a
+    /// least round trip would be no tighter: the cap is at least the
+    /// estimate's pipe and a third, so the estimate's 700 ms is at most three
+    /// quarters of what the cap carries in them. It follows the estimate as
+    /// it grows, so a slow start whose estimate lags never meets it within a
+    /// 175 ms round trip: a round writes about twice what the last delivered.
+    /// `None` only while nothing estimates the rate, when no cap binds either.
     fn write_budget(&self) -> Option<u64> {
-        (self.capped && self.pair() > 0)
-            .then(|| self.capped_acked + bytes_in(self.estimate(), WRITE_SPAN))
+        let e = self.estimate();
+        self.capped_acked
+            .filter(|_| e > 0)
+            .map(|a| a + bytes_in(e, WRITE_SPAN))
     }
 
     /// The rate the bottleneck serves, as estimated so far, bytes a second;
@@ -607,10 +1045,18 @@ impl Train {
     }
 
     /// The packet-pair estimate, bytes a second: 0 on a link too fast for
-    /// one packet's serialisation to show in the first sample's lead.
+    /// one packet's serialisation to show in the first sample's lead, and 0
+    /// where the first sample's packet left a step after the one ahead of it
+    /// (4a-3c). A lead is a serialisation only when the two packets reached
+    /// the bottleneck together; a paced packet waits only for what is left of
+    /// the one ahead, and its lead reads the link fast: path C's first round
+    /// is paced, and at 0.4/80/C a 10.7 ms lead read 112 kB/s on a 50 kB/s
+    /// link, the cap let 88 ms queue, and under noise 111 ms and 64,800 bytes.
     fn pair(&self) -> u64 {
         match (self.first_sample, self.min) {
-            (Some(first), Some(min)) if first.saturating_sub(min) >= PAIR_LEAD => {
+            (Some(first), Some(min))
+                if self.first_paired && first.saturating_sub(min) >= PAIR_LEAD =>
+            {
                 rate(self.msg, first.saturating_sub(min))
             }
             _ => 0,
@@ -643,7 +1089,10 @@ impl Train {
     fn round_rates(&self, at: Duration, acked: u64, sent: u64) -> (u64, u64) {
         let d = at.saturating_sub(self.round.at);
         (
-            rate(acked.saturating_sub(self.round.acked), d),
+            rate(
+                acked.saturating_sub(self.round.acked),
+                self.span(self.round.at, self.round.acked, at, acked),
+            ),
             rate(sent.saturating_sub(self.round.sent), d),
         )
     }
@@ -654,18 +1103,25 @@ impl Train {
     /// and a message, nor [`CAP_FLOOR_MESSAGES`]. It is the nearest whole
     /// number of messages to that: a slow link's pipe is a few messages,
     /// and a train that writes in pairs fills it only with about a message
-    /// more, which a cap cut down to whole messages can take away.
+    /// more, which a cap cut down to whole messages can take away. While a
+    /// short path's claim is on test, never less than its probe
+    /// ([`Claim::probe`]).
     fn cap(&self) -> u64 {
+        let probe = self
+            .hold
+            .and_then(|h| h.claim)
+            .filter(|c| c.verdict != Some(false))
+            .map_or(0, |c| c.probe() * self.msg);
         let (c, Some(min)) = (self.estimate(), self.min) else {
             return u64::MAX;
         };
         if c == 0 {
-            return u64::MAX;
+            return if probe > 0 { probe } else { u64::MAX };
         }
         let cap = bytes_in(c, min + min.max(QUEUE_FLOOR) / 3)
             .max(bytes_in(self.best, min) + self.msg)
             .max(CAP_FLOOR_MESSAGES * self.msg);
-        (cap + self.msg / 2) / self.msg * self.msg
+        ((cap + self.msg / 2) / self.msg * self.msg).max(probe)
     }
 
     /// The round ends: its delivery, and whether it pushed back.
@@ -792,6 +1248,9 @@ mod cells {
         ready_after: Option<Duration>,
         /// Scheduling noise on the link's deliveries and the writer's steps.
         noise: Option<Noise>,
+        /// FR-148 4a-3c — a host stall: this long after the train starts,
+        /// what reaches the agent waits this long ([`shaped_link::HostStall`]).
+        stall: Option<(Duration, Duration)>,
     }
 
     impl Cell {
@@ -806,6 +1265,7 @@ mod cells {
                 window: 0,
                 ready_after: None,
                 noise: None,
+                stall: None,
             }
         }
 
@@ -823,8 +1283,11 @@ mod cells {
                     n.stall_every.as_millis()
                 )
             });
+            let stall = self.stall.map_or(String::new(), |(at, len)| {
+                format!(" stall {}+{}", at.as_millis(), len.as_millis())
+            });
             format!(
-                "{}/{}/{path}{noise}",
+                "{}/{}/{path}{noise}{stall}",
                 self.bps as f64 / 1e6,
                 self.rtt.as_millis()
             )
@@ -860,6 +1323,15 @@ mod cells {
         /// A line for each step that saw an acknowledgement, closed a round
         /// or stopped: what the train read and how it judged.
         trace: Vec<String>,
+        /// When the cap engaged, and the window, in flight and pending then;
+        /// the pacer's share once a sample came, and its last before the cap.
+        capped_at: Option<(Duration, u32, u64, u64)>,
+        share_first: Option<u32>,
+        share_at_cap: Option<u32>,
+        /// What the cap's trials came to (4a-3c).
+        trials: Trials,
+        /// When the cell's host stall began, if it did.
+        stall_began: Option<Duration>,
     }
 
     /// The trace line of one step, or `None` for a step that saw nothing:
@@ -922,7 +1394,7 @@ mod cells {
         Some(format!(
             "TR t {:7.1} ack {acked:6} +{step_acked:5} infl {:6} pend {:5} cwnd {:6} ad {} | \
              {}round {} rmin {} least {} q {} std {:.1} held {} win {} spent {} run {run} | \
-             est {} (best {} disp {} pair {}) kB/s capped {} cap {} budget {} wr {} -> {verdict}",
+             est {} (best {} disp {} pair {}) kB/s capped {} cap {} hold {} budget {} wr {} -> {verdict}",
             at.as_secs_f64() * 1e3,
             g.inflight_bytes,
             g.pending_bytes,
@@ -942,7 +1414,12 @@ mod cells {
             kbs(t.dispersion),
             kbs(pair),
             t.capped,
-            if t.capped { t.cap() } else { 0 },
+            if t.cap_applies() { t.cap() } else { 0 },
+            t.hold.map_or("-".to_owned(), |h| format!(
+                "{}@{:.1}",
+                h.clear,
+                h.at.as_secs_f64() * 1e3
+            )),
             t.write_budget().unwrap_or(0),
             t.written,
         ))
@@ -986,9 +1463,13 @@ mod cells {
         keep_timer_resolution();
         #[cfg(target_os = "windows")]
         let _timer = crate::win_timer::TimerResolutionGuard::request_1ms();
-        let (a, b) = match cell.noise {
-            Some(n) => shaped_link::shaped_noisy(cell.bps, cell.rtt / 2, cell.queue, n),
-            None => shaped_link::shaped(cell.bps, cell.rtt / 2, cell.queue),
+        let slot = Arc::new(shaped_link::StallSlot::default());
+        let (a, b) = match (cell.noise, cell.stall) {
+            (Some(n), _) => shaped_link::shaped_noisy(cell.bps, cell.rtt / 2, cell.queue, n),
+            (None, Some(_)) => {
+                shaped_link::shaped_stalled(cell.bps, cell.rtt / 2, cell.queue, Arc::clone(&slot))
+            }
+            (None, None) => shaped_link::shaped(cell.bps, cell.rtt / 2, cell.queue),
         };
         // The writer's steps meet the noise too, from draws of their own.
         let mut step_draws = cell
@@ -1013,9 +1494,20 @@ mod cells {
         let gauges = agent.gauges();
         let acked_before = clock.read().acked_bytes;
         let mut train = Train::new(gauges.take().max_payload);
+        // The association paces while the train runs (D43): on now, steered
+        // after every step, and off at the stop.
+        let pacing = Pacing::on(agent.pacer());
         let message = Bytes::from(vec![0x7e; train.message_len()]);
         let mut limits = Limits::default();
+        // The pacer's first share once a sample came and its last before the
+        // cap, and the window, in flight and pending at the step the cap
+        // engaged.
+        let (mut share_first, mut share_at_cap) = (None, None);
+        let mut capped_at = None;
         let t0 = Instant::now();
+        if let Some((at, len)) = cell.stall {
+            slot.arm(shaped_link::HostStall { from: t0 + at, len });
+        }
         let reading = loop {
             let at = t0.elapsed();
             let g = gauges.take();
@@ -1045,6 +1537,19 @@ mod cells {
                 last_acked,
                 &step,
             ));
+            let pace = train.pace();
+            match pace {
+                Some(_) if train.capped => {
+                    capped_at.get_or_insert((at, g.cwnd, g.inflight_bytes, g.pending_bytes));
+                }
+                Some(_) if train.hold.is_some() => {}
+                Some(Pace { share, .. }) if train.min.is_some() => {
+                    share_first.get_or_insert(share);
+                    share_at_cap = Some(share);
+                }
+                _ => {}
+            }
+            pacing.follow(pace);
             match step {
                 Step::Write(n) => {
                     for _ in 0..n / msg {
@@ -1057,6 +1562,8 @@ mod cells {
             let late = step_draws.as_mut().map_or(Duration::ZERO, |d| d.late(due));
             tokio::time::sleep(TICK + late).await;
         };
+        assert!(!agent.pacer().is_on(), "the stop turned the pacer off");
+        drop(pacing);
         let stopped = Instant::now();
         let mut drained = false;
         while stopped.elapsed() < DRAIN {
@@ -1074,6 +1581,11 @@ mod cells {
             limits,
             reading,
             trace,
+            capped_at,
+            share_first,
+            share_at_cap,
+            trials: train.trials(),
+            stall_began: slot.began().map(|b| b.saturating_duration_since(t0)),
         };
         let _ = agent.close().await;
         let _ = viewer.close().await;
@@ -1134,10 +1646,20 @@ mod cells {
     fn describe(cell: &Cell, o: &Outcome) -> String {
         let r = &o.reading;
         let mbps = |b: u64| b as f64 / 1e6;
+        let cap = o
+            .capped_at
+            .map_or("never".to_owned(), |(at, cwnd, infl, pend)| {
+                format!(
+                    "at {} ms cwnd {cwnd} infl {infl} pend {pend}",
+                    at.as_millis()
+                )
+            });
+        let share = |s: Option<u32>| s.map_or("-".to_owned(), |s| s.to_string());
         format!(
             "train cell {} window {}: {} low {:.3} ({:.2}) high {} floor_only {} rounds {} \
              written {} wire {} min_rtt {:?} ss0 {} fr {} t3 {} t {} ms; \
-             peak queue {:.1} ms, tail drops {}, drained {}, taken {}, limited by window {} cwnd {}",
+             peak queue {:.1} ms, tail drops {}, drained {}, taken {}, limited by window {} cwnd {}; \
+             capped {cap}; trials {} lifted {} confirmed {} claims {} refuted {}; share {} then {}{}",
             cell.name(),
             if cell.window == 0 {
                 1 << 20
@@ -1164,6 +1686,17 @@ mod cells {
             o.taken,
             o.limits.window,
             o.limits.cwnd,
+            o.trials.engaged,
+            o.trials.lifted,
+            o.trials.confirmed,
+            o.trials.claimed,
+            o.trials.refuted,
+            share(o.share_first),
+            share(o.share_at_cap),
+            o.stall_began.map_or(String::new(), |b| format!(
+                "; stall began {} ms",
+                b.as_millis()
+            )),
         )
     }
 
@@ -1322,14 +1855,19 @@ mod cells {
         out
     }
 
-    /// RED, and kept as written: P-a does not hold here while SCTP's slow
-    /// start is the step law. A SACK of two packets releases four, so in a
-    /// round the queue grows by the window of the round before; a 20 ms queue,
-    /// a quarter of the pipe, overflows once that passes a quarter, and no
-    /// round closed before the loss is seen carries much more than half the
-    /// link's rate (docs/rate-control.md, "The open-time train").
+    /// D43's cell, green since the association paces while the train runs.
+    /// Unpaced, a SACK of two packets released four back to back, so in a
+    /// round the queue grew by the window of the round before; a 20 ms queue,
+    /// a quarter of the pipe, overflowed once that passed a quarter, and no
+    /// round closed before the loss carried much more than half the link's
+    /// rate (0.14 to 0.52 of it over twelve runs). Paced, a flight leaves
+    /// spread over its round trip, the queue builds only once a round carries
+    /// more than the link, and the round before the loss carries the link:
+    /// 0.84 to 1.02 of it, five runs of five, alone. It stays a measurement
+    /// (D44): it ends on a push-back whose low edge a busy runner can move
+    /// (docs/rate-control.md, "The open-time train").
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "P-a cannot hold under slow start's bursts: see the doc comment"]
+    #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): see docs/rate-control.md"]
     async fn path_i_a_shallow_buffer_stops_on_loss() {
         assert_cell(shallow(OpenPath::InitAck), stops_on_loss).await;
     }
@@ -1381,6 +1919,56 @@ mod cells {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn path_c_a_peer_window_limit_is_a_floor() {
         assert_cell(peer_window(OpenPath::CookieEcho), window_is_a_floor).await;
+    }
+
+    /// FR-148 4a-3c — `cell`, with a host stall of [`STALL`] that starts
+    /// `at_ms` after the train does ([`shaped_link::HostStall`]): the SACKs
+    /// due in it reach the agent late, the first at its end and the rest a
+    /// little later, while the link's own queue does not move.
+    fn stalled(cell: Cell, at_ms: u64) -> Cell {
+        Cell {
+            stall: Some((Duration::from_millis(at_ms), Duration::from_millis(STALL))),
+            ..cell
+        }
+    }
+
+    /// The stall cells' stall: longer than the 33 ms over which a loaded
+    /// runner's late SACKs capped the train in prod 1 (2/20/I's four
+    /// standing samples, its window cells' one), and short of the 50 ms the
+    /// rule was ranked up to.
+    const STALL: u64 = 40;
+
+    /// Each stall cell must read as its cell does without the stall: the
+    /// cell's own checks and P-a to P-g. They stay measurements (D44): after
+    /// the stall, one SACK a busy runner delivers 10 ms late among the
+    /// samples that judge the cap's trial confirms it, as one late SACK
+    /// capped the window cells in prod 1. The machine's tests are the gate.
+    macro_rules! stall_cells {
+        ($($name:ident: $cell:expr, $at:expr, $extra:expr;)*) => {$(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): see docs/rate-control.md"]
+            async fn $name() {
+                assert_cell(stalled($cell, $at), $extra).await;
+            }
+        )*};
+    }
+
+    stall_cells! {
+        path_i_8_mbps_20_ms_stalls_in_the_first_round: Cell::grid(8_000_000, 20, OpenPath::InitAck), 0, none;
+        path_i_8_mbps_20_ms_stalls_mid_climb: Cell::grid(8_000_000, 20, OpenPath::InitAck), 150, none;
+        path_i_8_mbps_20_ms_stalls_before_the_cap: Cell::grid(8_000_000, 20, OpenPath::InitAck), 250, none;
+        path_i_a_shallow_buffer_stalls_in_the_first_round: shallow(OpenPath::InitAck), 0, stops_on_loss;
+        path_i_a_shallow_buffer_stalls_mid_climb: shallow(OpenPath::InitAck), 600, stops_on_loss;
+        path_i_a_shallow_buffer_stalls_before_the_cap: shallow(OpenPath::InitAck), 1100, stops_on_loss;
+        path_i_a_peer_window_stalls_in_the_first_round: peer_window(OpenPath::InitAck), 0, window_is_a_floor;
+        path_i_a_peer_window_stalls_mid_climb: peer_window(OpenPath::InitAck), 600, window_is_a_floor;
+        path_i_a_peer_window_stalls_before_the_stop: peer_window(OpenPath::InitAck), 1100, window_is_a_floor;
+        // Path C's first SACK, about 285 ms in, is the handshake's lone
+        // packet's and no sample; its first round's samples come from about
+        // 450 ms, and a stall from 300 ms meets the first of them.
+        path_c_a_peer_window_stalls_in_the_first_round: peer_window(OpenPath::CookieEcho), 300, window_is_a_floor;
+        path_c_a_peer_window_stalls_mid_climb: peer_window(OpenPath::CookieEcho), 1200, window_is_a_floor;
+        path_c_a_peer_window_stalls_before_the_stop: peer_window(OpenPath::CookieEcho), 2300, window_is_a_floor;
     }
 
     /// P-d: 50 Mbit/s at 250 ms holds 1.5 MB, three times what the train
@@ -1894,9 +2482,10 @@ mod machine {
         // reads 20 kB/s. Queued with 6,000 bytes acknowledged, the train may
         // write 6,000 and 14,000 bytes.
         t.capped = true;
-        t.capped_acked = 6_000;
+        t.capped_acked = Some(6_000);
         t.min = Some(ms(100));
         t.first_sample = Some(ms(160));
+        t.first_paired = true;
         t.rounds = 1;
         t.round.mark = u64::MAX;
         t.written = 14 * MSG;
@@ -1922,17 +2511,920 @@ mod machine {
         assert!(r.written_bytes <= 20_000);
     }
 
-    /// A link too fast for a packet's serialisation to show in the first
-    /// sample has no write budget: the estimate when the queue first shows
-    /// lags the rate.
+    /// The write budget counts from the bytes acknowledged when the cap first
+    /// applied, on trial, and holds from then on: on a link too fast for a
+    /// pair too, and whatever came after. A trial that lifts after a sample
+    /// stood leaves it where it was, and so does the next: at 0.4 Mbit/s and
+    /// 250 ms a budget that each trial counted afresh let the train write
+    /// 60,000 bytes, and with two samples to confirm, 78,000 at 80 ms on path
+    /// C, where the first round has no pair (P-f: 64,000).
     #[test]
-    fn a_fast_link_has_no_write_budget() {
+    fn the_write_budget_counts_from_the_first_cap_and_never_turns_off() {
+        let mut t = climbing();
+        assert_eq!(t.write_budget(), None);
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(120), 8 * MSG);
+        assert_eq!(t.pair(), 0);
+        let budget = |t: &Train| Some(2 * MSG + bytes_in(t.estimate(), WRITE_SPAN));
+        assert_eq!(t.write_budget(), budget(&t));
+        // One sample of a packet sent after the trial began stands.
+        sack_exact(&mut t, ms(236), 4 * MSG, ms(95), 8 * MSG);
+        assert!(t.hold.is_some_and(|h| h.stood == 1));
+        for i in 0..TRIAL_CLEAR {
+            let n = u64::from(i);
+            sack_exact(&mut t, ms(238 + 2 * n), (6 + 2 * n) * MSG, ms(80), 8 * MSG);
+        }
+        assert!(t.hold.is_none() && !t.capped);
+        assert_eq!(t.write_budget(), budget(&t));
+        // A second trial, 20 messages on.
+        sack_exact(&mut t, ms(300), 22 * MSG, ms(95), 8 * MSG);
+        assert!(t.hold.is_some_and(|h| h.at == ms(300)));
+        assert_eq!(t.capped_acked, Some(2 * MSG));
+        assert_eq!(t.write_budget(), budget(&t));
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 2,
+                lifted: 1,
+                ..Trials::default()
+            }
+        );
+    }
+
+    /// A trial in which no sample stood lifts, and the write budget still
+    /// counts from where the cap first applied: P-f's bound is that sum,
+    /// however many trials lift. Moved to the lift, the budget counted a
+    /// stall twice on a slow link: at 0.4 Mbit/s and 80 ms on path C a 40 ms
+    /// stall held the climb under a cap of three messages for 640 ms, and the
+    /// train wrote 68,400 bytes, and under the runner's noise 75,600, over
+    /// P-f's 64,000 (the model of the train).
+    #[test]
+    fn a_lifted_trial_never_moves_where_the_write_budget_counts_from() {
+        let mut t = climbing();
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(120), 8 * MSG);
+        assert_eq!(t.capped_acked, Some(2 * MSG));
+        for i in 0..TRIAL_CLEAR {
+            let n = u64::from(i);
+            sack_exact(&mut t, ms(230 + 2 * n), (4 + 2 * n) * MSG, ms(80), 8 * MSG);
+        }
+        assert!(t.hold.is_none() && !t.capped);
+        assert_eq!(t.capped_acked, Some(2 * MSG));
+        assert_eq!(
+            t.write_budget(),
+            Some(2 * MSG + bytes_in(t.estimate(), WRITE_SPAN))
+        );
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 1,
+                lifted: 1,
+                ..Trials::default()
+            }
+        );
+        // The next trial counts from the first one too.
+        sack_exact(&mut t, ms(300), 20 * MSG, ms(95), 8 * MSG);
+        assert!(t.hold.is_some_and(|h| h.at == ms(300)));
+        assert_eq!(t.capped_acked, Some(2 * MSG));
+    }
+
+    /// P-f's bound at 0.4 Mbit/s: whatever the trials do, the train writes
+    /// no more than what was acknowledged when the cap first applied and what
+    /// the estimate carries in [`WRITE_SPAN`]. At 250 ms on path I the pair
+    /// engages the cap on trial in the first round, here at four messages
+    /// (4,800 bytes); with the estimate a quarter over the link's 50 kB/s
+    /// that is 4,800 + 43,750 = 48,550 bytes, 15,450 under P-f's 64,000, and
+    /// the estimate would have to read 1.69 times the link to reach it. The
+    /// pair's trial lifts, and a stall engages another before the stop: the
+    /// bound moves for neither, and between them, with no cap, it holds the
+    /// writer alone.
+    #[test]
+    fn the_write_budget_holds_p_f_at_0_4_mbit_s() {
         let mut t = Train::new(1_200);
         t.step(ms(0), &acked(0), &gauges(0, 0), false);
-        t.capped = true;
-        t.min = Some(ms(100));
-        t.first_sample = Some(ms(105));
-        t.best = 20_000;
-        assert_eq!(t.write_budget(), None);
+        sack_exact(&mut t, ms(300), 2 * MSG, ms(298), 2 * MSG);
+        sack_exact(&mut t, ms(340), 4 * MSG, ms(274), MSG);
+        assert!(t.hold.is_some() && t.pair() == rate(MSG, ms(24)));
+        assert_eq!(t.capped_acked, Some(4 * MSG));
+        t.best = 62_500;
+        let bound = 4 * MSG + bytes_in(62_500, WRITE_SPAN);
+        assert_eq!(bound, 48_550);
+        // Two messages every 40 ms, 60 kB/s; a stall's SACK at 940.
+        let mut done = 4 * MSG;
+        let mut at = 340;
+        let r = loop {
+            at += 40;
+            done = (done + 2 * MSG).min(t.written);
+            let delay = if at == 940 { 300 } else { 274 };
+            let inflight = t.written - done;
+            // At 380 SCTP holds two messages its full window will not send.
+            let pending = if at == 380 { 2 * MSG } else { 0 };
+            let g = Gauges {
+                ack_delay_min: Some(ms(delay)),
+                ..gauges(inflight, pending)
+            };
+            let step = t.step(ms(at), &acked(done), &g, false);
+            assert!(t.written <= bound, "{} bytes at {at} ms", t.written);
+            if at == 900 {
+                assert!(t.hold.is_none() && !t.capped && t.trials().lifted == 1);
+            }
+            if let Step::Stopped(r) = step {
+                break r;
+            }
+        };
+        assert_eq!(r.stop, Stop::Budget);
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 2,
+                lifted: 1,
+                ..Trials::default()
+            }
+        );
+        assert_eq!(t.estimate(), 62_500);
+        assert!(r.written_bytes <= bound && bound < 64_000);
+    }
+
+    /// The pacer's share of the window is the largest whose queue, by the
+    /// derivation, stays within three quarters of P-e's bound, max(the least
+    /// round trip, 50 ms): a hundredth of the window more breaks it. From
+    /// about 235 ms on, the whole window's queue fits.
+    #[test]
+    fn the_pace_share_is_the_largest_whose_queue_keeps_within_three_quarters_of_p_e() {
+        for least in [5_u32, 20, 50, 80, 160, 200] {
+            let share = pace_share(ms(u64::from(least)));
+            let r = f64::from(least);
+            let theta = 10.0 / r;
+            let bound = 0.75 * r.max(50.0) / r;
+            let queue = |s: u32| pace_queue(f64::from(s) / f64::from(WHOLE), theta);
+            assert!(share < WHOLE, "{least} ms: {share}");
+            assert!(queue(share) <= bound, "{least} ms: {share}");
+            assert!(queue(share + 10) > bound, "{least} ms: {share}");
+        }
+        // Where the grid's paths are, 20 and 80 ms: under half the window.
+        assert!((380..=410).contains(&pace_share(ms(20))));
+        assert!((420..=460).contains(&pace_share(ms(80))));
+        for least in [ms(250), ms(1_000), Duration::ZERO] {
+            assert_eq!(pace_share(least), WHOLE, "{least:?}");
+        }
+    }
+
+    /// Until the bottleneck queued, the pacer lets out the share the least
+    /// round trip gives, and follows the least as it falls; from then on the
+    /// whole window, with the in-flight cap: on trial at first (4a-3c), and
+    /// confirmed once the samples of two packets sent after it stand too.
+    #[test]
+    fn the_pace_follows_the_least_round_trip_then_the_cap() {
+        let whole = Some(Pace {
+            share: WHOLE,
+            cap: None,
+        });
+        let mut t = Train::new(1_200);
+        assert_eq!(t.pace(), whole);
+        t.step(ms(0), &acked(0), &gauges(0, 0), false);
+        assert_eq!(t.pace(), whole, "no round trip yet");
+        let shared = |least| {
+            Some(Pace {
+                share: pace_share(ms(least)),
+                cap: None,
+            })
+        };
+        sack(&mut t, 75, 2 * MSG, 75);
+        assert_eq!(t.pace(), shared(75));
+        sack(&mut t, 85, 4 * MSG, 70);
+        assert_eq!(t.pace(), shared(70));
+        // 9 ms above the least: no queue yet.
+        sack(&mut t, 95, 6 * MSG, 79);
+        assert_eq!(t.pace(), shared(70));
+        // 10 ms above it: the bottleneck queued. The cap engages, on trial.
+        sack(&mut t, 105, 8 * MSG, 80);
+        assert!(!t.capped && t.hold.is_some() && t.stopped.is_none());
+        let cap = t.cap();
+        assert!(cap < u64::MAX && cap.is_multiple_of(MSG), "{cap}");
+        assert_eq!(
+            t.pace(),
+            Some(Pace {
+                share: WHOLE,
+                cap: Some(cap)
+            })
+        );
+        // Packets sent at 108 and 110, after that, meet the queue too:
+        // confirmed.
+        sack(&mut t, 190, 10 * MSG, 82);
+        assert!(!t.capped && t.hold.is_some_and(|h| h.stood == 1));
+        sack(&mut t, 192, 12 * MSG, 82);
+        assert!(t.capped && t.hold.is_none() && t.stopped.is_none());
+        assert_eq!(
+            t.pace(),
+            Some(Pace {
+                share: WHOLE,
+                cap: Some(t.cap())
+            })
+        );
+    }
+
+    /// FR-148 4a-3c: a step at `at` whose SACK acknowledged up to `bytes`,
+    /// its newest chunk `delay` after it left, with `inflight` in flight.
+    fn sack_exact(t: &mut Train, at: Duration, bytes: u64, delay: Duration, inflight: u64) -> Step {
+        let g = Gauges {
+            ack_delay_min: Some(delay),
+            ..gauges(inflight, 0)
+        };
+        t.step(at, &acked(bytes), &g, false)
+    }
+
+    /// A train 80 ms from its peer, climbing: its least round trip taken,
+    /// its estimate 100 kB/s, which puts its cap at 9 messages, no sample
+    /// standing, and its round far from its end. 40 messages written.
+    fn climbing() -> Train {
+        let mut t = Train::new(1_200);
+        t.step(ms(0), &acked(0), &gauges(0, 0), false);
+        t.min = Some(ms(80));
+        t.first_sample = Some(ms(80));
+        t.max_sample = Some(ms(80));
+        t.share = pace_share(ms(80));
+        t.best = 100_000;
+        t.rounds = 1;
+        t.round.mark = u64::MAX;
+        t.written = 40 * MSG;
+        assert_eq!(t.cap(), 9 * MSG);
+        t
+    }
+
+    /// A host stall: one SACK held 40 ms reads 40 ms over the least, and so
+    /// do those its packets left before it was read. A single stalled
+    /// sample never caps: the cap engages on trial, as it engaged before,
+    /// and [`TRIAL_CLEAR`] samples of packets sent after it that show no
+    /// queue lift it. The train paces at its share again, and the stall's
+    /// sample no longer counts: only a new one 10 ms over the least engages
+    /// the cap again.
+    #[test]
+    fn a_stalled_sample_never_caps() {
+        let mut t = climbing();
+        let cap = t.cap();
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(120), 8 * MSG);
+        assert!(!t.capped, "a stall's sample confirmed the cap");
+        assert_eq!(
+            t.hold,
+            Some(Hold {
+                at: ms(140),
+                lead: ms(40),
+                stood: 0,
+                clear: 0,
+                claim: None
+            })
+        );
+        assert_eq!(
+            t.pace(),
+            Some(Pace {
+                share: WHOLE,
+                cap: Some(cap)
+            })
+        );
+        // Released with it: its packet left at 40, before the trial began.
+        sack_exact(&mut t, ms(142), 4 * MSG, ms(102), 6 * MSG);
+        assert!(!t.capped && t.hold.is_some_and(|h| h.clear == 0));
+        // The writer keeps to the cap: 8 messages in flight leave it one.
+        assert_eq!(
+            sack_exact(&mut t, ms(150), 6 * MSG, ms(85), 8 * MSG),
+            Step::Write(cap - 8 * MSG)
+        );
+        // Packets sent from 150 on, after it began, meet no queue.
+        for i in 0..TRIAL_CLEAR - 1 {
+            let n = u64::from(i);
+            sack_exact(&mut t, ms(230 + 2 * n), (8 + 2 * n) * MSG, ms(80), 8 * MSG);
+            assert!(!t.capped && t.hold.is_some_and(|h| h.clear == i + 1));
+        }
+        // On trial, what a step acknowledged may be a stall's held SACKs at
+        // once: the most one step acknowledged keeps its value.
+        assert_eq!(t.peak_step, 0);
+        sack_exact(&mut t, ms(245), 22 * MSG, ms(80), 8 * MSG);
+        assert!(!t.capped && t.hold.is_none());
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 1,
+                lifted: 1,
+                ..Trials::default()
+            }
+        );
+        assert_eq!(
+            t.pace(),
+            Some(Pace {
+                share: pace_share(ms(80)),
+                cap: None
+            })
+        );
+        sack_exact(&mut t, ms(250), 24 * MSG, ms(89), 8 * MSG);
+        assert!(t.hold.is_none(), "the stall's sample still counted");
+        sack_exact(&mut t, ms(255), 26 * MSG, ms(90), 8 * MSG);
+        assert!(!t.capped && t.hold.is_some_and(|h| h.at == ms(255)));
+    }
+
+    /// Two stalls: the second's SACK, of a packet sent after the first
+    /// engaged the cap on trial, stands, as one confirming sample capped
+    /// 2/80/C at three messages under a runner's noise, a plateau at 0.11.
+    /// A queue stands for the packets that follow it; a stall does not: the
+    /// samples of the next ones meet none, and the trial lifts.
+    #[test]
+    fn a_second_stall_never_confirms_a_trial() {
+        let mut t = climbing();
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(120), 8 * MSG);
+        // Sent at 150, held by a second stall: it stands, and only once.
+        sack_exact(&mut t, ms(250), 4 * MSG, ms(100), 8 * MSG);
+        assert!(!t.capped && t.hold.is_some_and(|h| (h.stood, h.clear) == (1, 0)));
+        for i in 0..TRIAL_CLEAR {
+            let n = u64::from(i);
+            sack_exact(&mut t, ms(252 + 2 * n), (6 + 2 * n) * MSG, ms(80), 8 * MSG);
+            assert!(!t.capped, "a second stall confirmed the cap");
+        }
+        assert!(t.hold.is_none());
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 1,
+                lifted: 1,
+                ..Trials::default()
+            }
+        );
+    }
+
+    /// A queue the cap keeps small may show in one sample of four: two
+    /// standing among eight confirm the trial. Lifted after four that did
+    /// not stand, as a round's count would, the trial let a slow link's climb
+    /// go on into the queue it had found: in the model at 0.4/80/I under
+    /// noise, the next trial confirmed with 80.2 ms queued against P-e's 80,
+    /// and at 0.4/250/I the train stopped on its budget at 0.71 of the link,
+    /// where eight read 1.00.
+    #[test]
+    fn a_queue_that_stands_in_one_sample_of_four_confirms_the_trial() {
+        let mut t = climbing();
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(92), 8 * MSG);
+        assert!(t.hold.is_some());
+        let mut bytes = 2 * MSG;
+        for (i, at) in [230, 235, 240, 245, 250, 255, 260, 265]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(!t.capped && t.hold.is_some(), "lifted before sample {i}");
+            bytes += 2 * MSG;
+            let delay = if i % 4 == 3 { 94 } else { 85 };
+            sack_exact(&mut t, ms(at), bytes, ms(delay), 8 * MSG);
+        }
+        assert!(t.capped && t.hold.is_none());
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 1,
+                confirmed: 1,
+                ..Trials::default()
+            }
+        );
+    }
+
+    /// A true queue: its first standing sample engages the cap at once, with
+    /// the bound it had before, at the step the derivation of the pacer's
+    /// share takes it at, so the trial adds no lag to it; the samples of the
+    /// first two packets sent after that which meet the queue too confirm
+    /// it, a least round trip and the queue later, its write budget counted
+    /// from the bytes acknowledged when it engaged.
+    #[test]
+    fn a_true_queue_caps_within_the_derived_lag() {
+        let mut t = climbing();
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(92), 8 * MSG);
+        assert!(!t.capped);
+        assert_eq!(
+            t.pace(),
+            Some(Pace {
+                share: WHOLE,
+                cap: Some(t.cap())
+            })
+        );
+        // Its packet left at 55, before the cap engaged: it judges nothing.
+        sack_exact(&mut t, ms(150), 4 * MSG, ms(95), 8 * MSG);
+        assert!(!t.capped && t.hold.is_some_and(|h| h.stood == 0));
+        // Left at 141 and 143: the queue stands for both.
+        sack_exact(&mut t, ms(235), 6 * MSG, ms(94), 8 * MSG);
+        assert!(!t.capped && t.hold.is_some_and(|h| h.stood == 1));
+        sack_exact(&mut t, ms(237), 8 * MSG, ms(94), 8 * MSG);
+        assert!(t.capped && t.hold.is_none());
+        assert_eq!(t.capped_acked, Some(2 * MSG));
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 1,
+                confirmed: 1,
+                ..Trials::default()
+            }
+        );
+    }
+
+    /// [`QUEUED`] is the edge both ways: 9 ms over the least neither engages
+    /// nor confirms the cap, 10 ms does both; a trial that met one sample of
+    /// no queue still waits for the rest.
+    #[test]
+    fn a_sample_exactly_at_queued_caps_when_confirmed() {
+        let mut t = climbing();
+        sack_exact(&mut t, ms(130), 2 * MSG, ms(89), 8 * MSG);
+        assert!(!t.capped && t.hold.is_none());
+        sack_exact(&mut t, ms(140), 4 * MSG, ms(90), 8 * MSG);
+        assert!(!t.capped && t.hold.is_some());
+        sack_exact(&mut t, ms(229), 6 * MSG, ms(89), 8 * MSG);
+        assert!(!t.capped && t.hold.is_some_and(|h| (h.stood, h.clear) == (0, 1)));
+        sack_exact(&mut t, ms(231), 8 * MSG, ms(90), 8 * MSG);
+        assert!(!t.capped && t.hold.is_some_and(|h| (h.stood, h.clear) == (1, 1)));
+        sack_exact(&mut t, ms(233), 10 * MSG, ms(90), 8 * MSG);
+        assert!(t.capped && t.hold.is_none());
+    }
+
+    /// The trial's own edge: a stall's late sample whose packet left a
+    /// microsecond before the cap engaged judges nothing, however late it
+    /// reads; one that left at the step it engaged at judges it.
+    #[test]
+    fn a_stall_ending_at_the_trials_edge_never_caps() {
+        let mut t = climbing();
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(120), 8 * MSG);
+        let us = Duration::from_micros(1);
+        sack_exact(&mut t, ms(239), 4 * MSG, ms(99) + us, 8 * MSG);
+        assert!(!t.capped && t.hold.is_some_and(|h| (h.stood, h.clear) == (0, 0)));
+        sack_exact(&mut t, ms(240), 6 * MSG, ms(100), 8 * MSG);
+        assert!(!t.capped && t.hold.is_some_and(|h| h.stood == 1));
+        sack_exact(&mut t, ms(241), 8 * MSG, ms(100), 8 * MSG);
+        assert!(t.capped, "packets sent as the cap engaged meet the queue");
+    }
+
+    /// A slow link's pair: the first sample sits a message's serialisation
+    /// above the least, 24 ms at 0.4 Mbit/s, and that lead engages the cap
+    /// at the step that took the least, in the train's first round, with
+    /// the write budget counted from then, as before; the queue its own
+    /// bound keeps confirms it. 0.4/80/I read 87.7 ms of queue against P-e's
+    /// 80 when nothing bound it before a later sample stood.
+    #[test]
+    fn a_slow_links_pair_engages_the_cap_in_the_first_round() {
+        let mut t = Train::new(1_200);
+        t.step(ms(0), &acked(0), &gauges(0, 0), false);
+        sack(&mut t, 133, 2 * MSG, 132);
+        assert!(t.hold.is_none() && !t.capped && t.first_paired);
+        sack(&mut t, 241, 4 * MSG, 108);
+        assert!(!t.capped && t.hold.is_some_and(|h| h.at == ms(241) && h.claim.is_none()));
+        assert_eq!(t.pair(), rate(MSG, ms(24)));
+        assert_eq!(
+            t.write_budget(),
+            Some(4 * MSG + bytes_in(t.estimate(), WRITE_SPAN))
+        );
+        // Sent at 260 and 265, they meet the queue the cap keeps: confirmed.
+        sack(&mut t, 390, 6 * MSG, 130);
+        sack(&mut t, 395, 8 * MSG, 130);
+        assert!(t.capped && t.hold.is_none());
+    }
+
+    /// A first sample whose packet left a step after the one ahead of it is
+    /// no pair: path C's first round is paced, a packet waits only for what
+    /// is left of the one ahead, and at 0.4/80/C a 10.7 ms lead read 112 kB/s
+    /// on a 50 kB/s link, so the cap let 88 ms queue against P-e's 80, and
+    /// under noise 111 ms and 64,800 bytes against P-f's 64,000. Two that
+    /// left in one step are one.
+    #[test]
+    fn a_paced_first_sample_is_no_pair() {
+        for paced in [true, false] {
+            let mut t = Train::new(1_200);
+            t.step(ms(0), &acked(0), &gauges(0, 0), false);
+            // The first message leaves at 10; the second at 30 when paced.
+            t.step(ms(10), &acked(0), &gauges(MSG, 3 * MSG), false);
+            if paced {
+                t.step(ms(30), &acked(0), &gauges(2 * MSG, 2 * MSG), false);
+            } else {
+                t.step(ms(10), &acked(0), &gauges(2 * MSG, 2 * MSG), false);
+            }
+            sack(&mut t, 160, 2 * MSG, 130);
+            sack(&mut t, 200, 4 * MSG, 108);
+            assert_eq!(t.first_paired, !paced, "paced {paced}");
+            let pair = if paced { 0 } else { rate(MSG, ms(22)) };
+            assert_eq!(t.pair(), pair, "paced {paced}");
+        }
+    }
+
+    /// A train on a short path, climbing: its least round trip `least` ms,
+    /// its best round `best` bytes a second, 40 messages written.
+    fn short_path(least: u64, best: u64) -> Train {
+        let mut t = climbing();
+        t.min = Some(ms(least));
+        t.first_sample = Some(ms(least));
+        t.max_sample = Some(ms(least));
+        t.share = pace_share(ms(least));
+        t.best = best;
+        t
+    }
+
+    /// A slow link on a short path: the receiver acknowledges every second
+    /// packet, so each sampled packet left first of its pair and meets no
+    /// queue, and at 0.4/20/C samples of none lifted the trial, and the climb
+    /// that followed queued 140 ms against P-e's 50. The trial's lead claims
+    /// a link of a message per lead: at 0.4 Mbit/s, 24 ms. The cap lets out
+    /// the probe, three messages, which that link queues for 48 ms; a least
+    /// round trip later the delivery, 50 kB/s, agrees with the claim, and a
+    /// sample of no queue confirms the trial. The first sample that judges
+    /// it only starts the count.
+    #[test]
+    fn a_short_paths_claim_confirms_the_trial_once_the_delivery_agrees() {
+        let mut t = short_path(44, 50_000);
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(68), 3 * MSG);
+        let claim = t.hold.and_then(|h| h.claim);
+        assert!(claim.is_some_and(|c| c.lead == ms(24) && c.probe() == 3));
+        assert_eq!(t.cap(), 3 * MSG);
+        // Sent at 146: no queue, and the count begins.
+        sack_exact(&mut t, ms(190), 4 * MSG, ms(44), 3 * MSG);
+        assert!(!t.capped, "a short path's lead confirmed the cap untested");
+        let claim = t.hold.and_then(|h| h.claim);
+        assert!(claim.is_some_and(|c| c.from == Some((ms(190), 4 * MSG)) && c.out == 3 * MSG));
+        // 48 ms on, two messages more: 50 kB/s, the claim's rate.
+        sack_exact(&mut t, ms(238), 6 * MSG, ms(44), 3 * MSG);
+        assert!(t.capped && t.hold.is_none());
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 1,
+                confirmed: 1,
+                claimed: 1,
+                ..Trials::default()
+            }
+        );
+    }
+
+    /// A stall on a short path to a fast link leads as a slow link's pair
+    /// does: at 8/20/I a SACK held 18 ms over a 23 ms least claims 67 kB/s,
+    /// and a rule that asked only whether the rate delivered so far, 60 kB/s
+    /// early in the climb, explains a lead that long confirmed it at once: a
+    /// cap of three messages, and a plateau at 0.10. The probe's three
+    /// messages come back faster than a quarter over the claim, which
+    /// refutes it; then samples of no queue lift the trial. A lead as long
+    /// as the least round trip, or a path of 60 ms, claims nothing.
+    #[test]
+    fn a_stalls_lead_on_a_short_path_is_refuted_by_the_delivery() {
+        let mut t = short_path(23, 60_000);
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(41), 3 * MSG);
+        assert!(
+            t.hold
+                .is_some_and(|h| h.claim.is_some_and(|c| c.probe() == 3))
+        );
+        // Sent from 147 on: four messages over 24 ms, 200 kB/s.
+        for (at, bytes) in [(170, 4), (182, 6), (194, 8)] {
+            sack_exact(&mut t, ms(at), bytes * MSG, ms(23), 3 * MSG);
+            assert!(!t.capped, "a stall's lead confirmed the cap");
+        }
+        let claim = t.hold.and_then(|h| h.claim);
+        assert!(claim.is_some_and(|c| c.verdict == Some(false)));
+        for i in 3..TRIAL_CLEAR {
+            let n = u64::from(i);
+            sack_exact(&mut t, ms(194 + 6 * n), (4 + 2 * n) * MSG, ms(23), 3 * MSG);
+            assert!(!t.capped);
+        }
+        assert!(t.hold.is_none());
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 1,
+                lifted: 1,
+                claimed: 1,
+                refuted: 1,
+                ..Trials::default()
+            }
+        );
+        for (least, delay) in [(40, 80), (60, 75)] {
+            let mut t = short_path(least, 100_000);
+            sack_exact(&mut t, ms(140), 2 * MSG, ms(delay), 3 * MSG);
+            assert!(t.hold.is_some_and(|h| h.claim.is_none()), "{least} {delay}");
+        }
+    }
+
+    /// The probe floors the cap while the claim is open: at a lead of 12 ms
+    /// and a least round trip of 30 ms, a link of one message per lead holds
+    /// the round trip and 37.5 ms of queue in five messages, and the cap lets
+    /// out five where the estimate gives three. A refuted claim's floor goes,
+    /// and the cap is the estimate's again.
+    #[test]
+    fn the_claims_probe_holds_the_cap_until_the_claim_is_refuted() {
+        let mut t = short_path(30, 20_000);
+        assert_eq!(t.cap(), 3 * MSG);
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(42), 3 * MSG);
+        let claim = t.hold.and_then(|h| h.claim);
+        assert!(claim.is_some_and(|c| c.lead == ms(12) && c.probe() == 5));
+        assert_eq!(t.cap(), 5 * MSG);
+        if let Some(c) = t.hold.as_mut().and_then(|h| h.claim.as_mut()) {
+            c.verdict = Some(false);
+        }
+        assert_eq!(t.cap(), 3 * MSG);
+    }
+
+    /// The probe is sized by the least round trip, so a link faster than the
+    /// claim refutes it on every short path. A 12 ms stall on a fast link,
+    /// early in the climb, claims 100 kB/s, and the probe's messages come back
+    /// within a least round trip: at 30 ms five read 2.0 times the claim. At
+    /// 50 ms a probe of one message more than the claim serialises in 50 ms,
+    /// five, read 1.2 times it, under the quarter, and confirmed the stall's
+    /// trial at five messages; sized by the least, seven read 1.68 times it.
+    /// On the claimed link each probe queues [`CLAIM_QUEUE`] at most.
+    #[test]
+    fn a_faster_link_refutes_the_claim_on_every_short_path() {
+        for (least, probe) in [(30, 5), (40, 6), (48, 7), (50, 7), (55, 7), (59, 8)] {
+            let mut t = short_path(least, 20_000);
+            sack_exact(&mut t, ms(140), 2 * MSG, ms(least + 12), 3 * MSG);
+            let claim = t.hold.and_then(|h| h.claim);
+            assert!(
+                claim.is_some_and(|c| c.probe() == probe),
+                "{least}: {claim:?}"
+            );
+            assert!(ms(12) * u32::try_from(probe).unwrap() <= ms(least) + CLAIM_QUEUE);
+            assert_eq!(t.cap(), probe * MSG);
+            // A fast link: what is out comes back within the least round trip.
+            let mut acked = 2 * MSG;
+            for i in 1..=6 {
+                acked += probe * MSG / 2;
+                sack_exact(
+                    &mut t,
+                    ms(200 + i * least / 2),
+                    acked,
+                    ms(least),
+                    probe * MSG,
+                );
+                assert!(!t.capped, "{least}: a stall's claim confirmed the cap");
+            }
+            assert_eq!(t.trials().refuted, 1, "{least}");
+        }
+    }
+
+    /// A claim stands only once its probe was out: a delivery that agrees
+    /// with the claim while fewer messages were out says only that the link
+    /// carried what it was given. Here the write budget, 2,400 bytes and
+    /// 700 ms at 20 kB/s, is spent, so three of the five stay out and the
+    /// delivery, 60 kB/s against the claim's 100, leaves the trial on trial.
+    /// Once five were out the next sample confirms it.
+    #[test]
+    fn a_claim_stands_only_once_its_probe_was_out() {
+        let mut t = short_path(30, 20_000);
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(42), 3 * MSG);
+        assert!(t.hold.is_some_and(|h| h.claim.is_some()));
+        sack_exact(&mut t, ms(190), 4 * MSG, ms(30), 3 * MSG);
+        sack_exact(&mut t, ms(230), 6 * MSG, ms(30), 5 * MSG);
+        assert!(
+            !t.capped,
+            "a claim stood with three of its five messages out"
+        );
+        let claim = t.hold.and_then(|h| h.claim);
+        assert!(claim.is_some_and(|c| c.verdict.is_none() && c.out == 5 * MSG));
+        sack_exact(&mut t, ms(260), 8 * MSG, ms(30), 5 * MSG);
+        assert!(t.capped && t.hold.is_none());
+        assert_eq!(
+            t.trials(),
+            Trials {
+                engaged: 1,
+                confirmed: 1,
+                claimed: 1,
+                ..Trials::default()
+            }
+        );
+    }
+
+    /// A round held at a cap on trial is not held at the cap: a stall whose
+    /// cap holds a round that does not grow never stops the train on a
+    /// plateau, as such caps stopped 8/80/I and the window cells at a
+    /// quarter of a megabit in prod 1. Once a queue confirmed the cap, a
+    /// held round that did not grow counts, as before.
+    #[test]
+    fn a_cap_on_trial_never_reads_a_plateau() {
+        let g = |inflight, delay| Gauges {
+            ack_delay_min: delay,
+            cwnd: 1 << 20,
+            ..gauges(inflight, 0)
+        };
+        let mut t = climbing();
+        let cap = t.cap();
+        t.flat = PLATEAU_ROUNDS - 1;
+        t.last_round = 48_000;
+        t.round.mark = 3 * MSG;
+        // A stall's sample; the cap holds the writer, the windows have room.
+        let step = t.step(ms(140), &acked(2 * MSG), &g(cap, Some(ms(120))), false);
+        assert_eq!(step, Step::Write(0));
+        // The round ends, 32 kB/s: no plateau, and no flat round.
+        let step = t.step(ms(150), &acked(4 * MSG), &g(cap, None), false);
+        assert!(matches!(step, Step::Write(_)), "{step:?}");
+        assert_eq!(t.flat, 0);
+        // Packets sent at 145 and 147 meet a queue: confirmed. The next round
+        // the cap holds does not grow: a plateau.
+        t.flat = PLATEAU_ROUNDS - 1;
+        t.last_round = 1_000_000;
+        t.round.mark = u64::MAX;
+        assert_eq!(
+            t.step(ms(240), &acked(6 * MSG), &g(cap, Some(ms(95))), false),
+            Step::Write(0)
+        );
+        assert!(!t.capped && !t.round.held);
+        assert_eq!(
+            t.step(ms(242), &acked(8 * MSG), &g(cap, Some(ms(95))), false),
+            Step::Write(0)
+        );
+        assert!(t.capped && t.round.held);
+        t.round.mark = 9 * MSG;
+        let r = reading(t.step(ms(250), &acked(10 * MSG), &g(cap, None), false));
+        assert_eq!(r.stop, Stop::Plateau);
+    }
+
+    /// A stall releases the SACKs it held within a few milliseconds of each
+    /// other, for bytes sent over 40 ms: what they acknowledge reads as
+    /// delivered no faster than it was sent, in a round and in the
+    /// dispersion alike.
+    #[test]
+    fn released_acknowledgements_read_no_faster_than_they_were_sent() {
+        let mut t = climbing();
+        // 36,000 bytes leave over 40 ms, from 100 to 140.
+        for (at, pending) in [(100, 28 * MSG), (120, 18 * MSG), (140, 10 * MSG)] {
+            assert_eq!(
+                t.step(ms(at), &acked(0), &gauges(10 * MSG, pending), false),
+                Step::Write(0)
+            );
+        }
+        t.round = Round {
+            at: ms(195),
+            mark: 25 * MSG,
+            ..Round::default()
+        };
+        // Their SACKs come 3 ms apart from 196 to 208.
+        for (i, at) in [196, 199, 202, 205, 208].into_iter().enumerate() {
+            let step = t.step(
+                ms(at),
+                &acked((i as u64 + 1) * 6 * MSG),
+                &gauges(0, 0),
+                false,
+            );
+            assert!(matches!(step, Step::Write(_)), "{step:?}");
+        }
+        assert_eq!(t.rounds, 2);
+        assert_eq!(t.best, rate(30 * MSG, ms(40)));
+        assert_eq!(t.dispersion, rate(24 * MSG, ms(40)));
+    }
+
+    /// Whatever stops the train, the pacing ends with it: `pace` answers
+    /// `None` from the stop on, so the writer's [`Pacing`] turns the pacer
+    /// off at the step that stopped it. Each path is set up as the tests
+    /// above set it up.
+    #[test]
+    fn the_pacing_ends_on_every_stop_path() {
+        let ready = started();
+        let loss = started();
+        let expiry = started();
+        let deadline = started();
+        let mut bytes = started();
+        bytes.written = BUDGET;
+        // As `a_spent_write_budget_holds_the_writer_and_ends_on_a_floor`.
+        let mut writes = started();
+        writes.capped = true;
+        writes.capped_acked = Some(6_000);
+        writes.min = Some(ms(100));
+        writes.first_sample = Some(ms(160));
+        writes.first_paired = true;
+        writes.rounds = 1;
+        writes.round.mark = u64::MAX;
+        writes.written = 16 * MSG;
+        // A round of four samples, 40 ms above the least.
+        let mut round = started();
+        round.min = Some(ms(50));
+        round.best = 10_000_000;
+        round.round.min = Some(ms(90));
+        round.round.samples = ROUND_SAMPLES;
+        // As `a_run_of_samples_that_stand_stops_on_delay`.
+        let mut run = queued();
+        sack(&mut run, 200, 2 * MSG, 100);
+        for (at, bytes) in [(250, 4 * MSG), (300, 6 * MSG), (350, 8 * MSG)] {
+            sack(&mut run, at, bytes, 170);
+        }
+        // A round the cap held that grew less than 10 %, after one more.
+        let mut plateau = started();
+        plateau.round.held = true;
+        plateau.flat = PLATEAU_ROUNDS - 1;
+        plateau.last_round = 48_000;
+        // Nothing acknowledged for 600 ms of a 50 ms path.
+        let mut stall = started();
+        stall.min = Some(ms(50));
+        stall.last_ack_at = Some(ms(0));
+        stall.last_at = ms(590);
+
+        type Last = fn(&mut Train) -> Step;
+        let paths: [(Stop, Train, Last); 10] = [
+            (Stop::Ready, ready, |t| {
+                t.step(ms(300), &acked(0), &gauges(3 * MSG, MSG), true)
+            }),
+            (Stop::Loss, loss, |t| {
+                let g = Gauges {
+                    fast_retransmits: 1,
+                    ..gauges(3 * MSG, MSG)
+                };
+                t.step(ms(10), &acked(0), &g, false)
+            }),
+            (Stop::Loss, expiry, |t| {
+                let g = Gauges {
+                    t3_expiries: 1,
+                    ..gauges(3 * MSG, MSG)
+                };
+                t.step(ms(10), &acked(0), &g, false)
+            }),
+            (Stop::Deadline, deadline, |t| {
+                t.step(DEADLINE, &acked(0), &gauges(3 * MSG, MSG), false)
+            }),
+            (Stop::Budget, bytes, |t| {
+                t.step(ms(10), &acked(0), &gauges(3 * MSG, MSG), false)
+            }),
+            (Stop::Budget, writes, |t| {
+                t.step(ms(30), &acked(15 * MSG), &gauges(MSG, 0), false)
+            }),
+            (Stop::Delay, round, |t| {
+                t.step(ms(100), &acked(4 * MSG), &gauges(0, 0), false)
+            }),
+            (Stop::Delay, run, |t| sack(t, 400, 10 * MSG, 170)),
+            (Stop::Plateau, plateau, |t| {
+                t.step(ms(100), &acked(4 * MSG), &gauges(0, 0), false)
+            }),
+            (Stop::Stall, stall, |t| {
+                t.step(ms(600), &acked(0), &gauges(3 * MSG, 0), false)
+            }),
+        ];
+        for (stop, mut t, last) in paths {
+            let switch = PaceSwitch::default();
+            let pacing = Pacing::on(switch.clone());
+            pacing.follow(t.pace());
+            assert!(switch.is_on(), "{stop:?}: on before the stop");
+            let step = last(&mut t);
+            pacing.follow(t.pace());
+            assert_eq!(reading(step).stop, stop);
+            assert_eq!(t.pace(), None, "{stop:?}");
+            assert!(!switch.is_on(), "{stop:?}: off from the stop");
+            // A step after the stop leaves it off.
+            t.step(ms(2_000), &acked(1 << 20), &gauges(0, 0), false);
+            pacing.follow(t.pace());
+            assert!(!switch.is_on(), "{stop:?}");
+        }
+    }
+
+    /// The writer's pacing: on from the train's first step, steered to each
+    /// step's pace, off at the stop; and off when it is dropped without a
+    /// stop, as an error that ends the writer, or a writer dropped with its
+    /// train, drops it.
+    #[test]
+    fn the_pacing_is_off_once_the_writer_stops_ends_or_is_dropped() {
+        let switch = PaceSwitch::default();
+        let pacing = Pacing::on(switch.clone());
+        assert!(switch.is_on());
+        assert_eq!((switch.share(), switch.cap()), (WHOLE, None));
+        pacing.follow(Some(Pace {
+            share: 440,
+            cap: None,
+        }));
+        assert_eq!((switch.share(), switch.cap()), (440, None));
+        pacing.follow(Some(Pace {
+            share: WHOLE,
+            cap: Some(9_600),
+        }));
+        assert_eq!((switch.share(), switch.cap()), (WHOLE, Some(9_600)));
+        pacing.follow(None);
+        assert!(!switch.is_on());
+        assert_eq!((switch.share(), switch.cap()), (WHOLE, None));
+        drop(pacing);
+        assert!(!switch.is_on());
+
+        // A writer that ends on an error before its train stops.
+        fn writer(switch: PaceSwitch, fail: bool) -> Result<(), &'static str> {
+            let pacing = Pacing::on(switch);
+            pacing.follow(Some(Pace {
+                share: 440,
+                cap: Some(4_800),
+            }));
+            if fail {
+                return Err("the channel closed");
+            }
+            pacing.follow(None);
+            Ok(())
+        }
+        assert_eq!(writer(switch.clone(), false), Ok(()));
+        assert!(!switch.is_on());
+        assert_eq!(writer(switch.clone(), true), Err("the channel closed"));
+        assert!(!switch.is_on());
+        assert_eq!((switch.share(), switch.cap()), (WHOLE, None));
+
+        // A writer dropped with its train, mid-train.
+        struct Writer {
+            _train: Train,
+            _pacing: Pacing,
+        }
+        let w = Writer {
+            _train: started(),
+            _pacing: Pacing::on(switch.clone()),
+        };
+        assert!(switch.is_on());
+        drop(w);
+        assert!(!switch.is_on());
+    }
+
+    /// A train after its first step.
+    fn started() -> Train {
+        let mut t = Train::new(1_200);
+        t.step(ms(0), &acked(0), &gauges(0, 0), false);
+        t
     }
 }

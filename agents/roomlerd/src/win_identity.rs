@@ -114,6 +114,30 @@ pub fn process_is_elevated() -> bool {
     ok != 0 && elevation.TokenIsElevated != 0
 }
 
+/// #3746 — whether this process runs elevated from a split token
+/// (`TokenElevationTypeFull`): the elevated half of an administrator whose
+/// other processes run with the filtered half. `Some(false)` for every other
+/// token: a filtered one, LocalSystem, or a token with no linked half (UAC
+/// off, the built-in Administrator). `None` when the token could not be read.
+/// The one-time folder move leaves its data merge to the account's own
+/// unelevated daemon when this is not `Some(false)`
+/// (`appdirs::DataMerge::from_split_elevation`).
+pub fn own_token_is_elevated_from_split() -> Option<bool> {
+    use windows_sys::Win32::Security::TokenElevationTypeFull;
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: our own process's pseudo-handle; the token is closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+        || token.is_null()
+    {
+        return None;
+    }
+    // SAFETY: a live token opened with TOKEN_QUERY, closed once below.
+    let kind = unsafe { crate::win_service::supervisor::token_elevation_type(token) };
+    // SAFETY: the handle OpenProcessToken gave us, closed once.
+    unsafe { CloseHandle(token) };
+    kind.ok().map(|kind| kind == TokenElevationTypeFull)
+}
+
 /// Whether `token`'s user is LocalSystem; `None` when the token would not say.
 fn token_user_is_local_system(token: HANDLE) -> Option<bool> {
     let mut needed: u32 = 0;

@@ -127,7 +127,7 @@ pub fn run(seconds: u64) -> anyhow::Result<()> {
 pub fn run(_seconds: u64) -> anyhow::Result<()> {
     anyhow::bail!(
         "probe-target is Windows-only for now: it paints from WM_MOUSEMOVE. \
-         Bench a Linux or macOS host with an agent built with the synthetic source"
+         Bench a Linux or macOS host with a roomlerd built with the synthetic source"
     )
 }
 

@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 /// Default operator-decision timeout when an operator-consent prompt
@@ -439,7 +439,7 @@ impl PendingGuard {
     /// so an Allow that passed `record_decision`'s check just before a cancel,
     /// or one the CLI's fallback wrote with no check at all, landed after it
     /// and was taken.
-    fn look(&self, deadline: Instant) -> Option<Decision> {
+    fn look(&self, deadline: tokio::time::Instant) -> Option<Decision> {
         let mut books = self.inner.pending.lock().unwrap();
         let answered = |kind| self.inner.answered(&books, &self.session_hex, kind);
         let decided = if !self.holds(&books) {
@@ -448,7 +448,7 @@ impl PendingGuard {
             Decision::Granted
         } else if answered(SentinelKind::Deny) {
             Decision::Denied
-        } else if Instant::now() >= deadline {
+        } else if tokio::time::Instant::now() >= deadline {
             Decision::Timeout
         } else {
             return None;
@@ -543,7 +543,7 @@ impl ArmedPrompt {
         // was registered — a sentinel that exists now is an answer to this
         // prompt. Purging here again would eat one recorded between arming
         // and this first poll.
-        let deadline = Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now() + timeout; // the poll's clock (#3559)
         let outcome = loop {
             if let Some(decided) = guard.look(deadline) {
                 break decided;
@@ -1085,6 +1085,12 @@ pub(crate) enum NoSurface {
     /// Mac's screen worker, or a two-row Mac's per-user half, did not relay
     /// it ([`crate::companion::TrayVerdict::RoadClosed`]).
     RoadClosed,
+    /// #4164 — a consent panel showed another question, so it did not take
+    /// this one, and nothing else showed it: this daemon's own panel, or on a
+    /// one-row Mac's root daemon the session panel
+    /// ([`crate::indicator::session_panel::Prompted::why_not_shown`]). Over
+    /// either cause above: the panel is what kept it from the person.
+    PanelBusy,
 }
 
 /// #3982 — what a caller is told when its question stood its window and no
@@ -1093,7 +1099,9 @@ pub(crate) enum NoSurface {
 /// policy that would skip the question: `SSH`, `execution`. #4140 — `why`
 /// picks the words: nothing up keeps FR-27's, and a closed road says that the
 /// question could not reach the desktop app, never that the app is not
-/// running or that nobody is at the screen.
+/// running or that nobody is at the screen. #4164 — and a busy panel says
+/// that the device's consent panel was showing another question, never
+/// either of FR-27's guesses: someone may well be at that screen.
 pub(crate) fn nobody_could_be_asked(policy: &str, why: NoSurface) -> String {
     match why {
         NoSurface::NothingUp => format!(
@@ -1106,6 +1114,12 @@ pub(crate) fn nobody_could_be_asked(policy: &str, why: NoSurface) -> String {
              desktop app there (the app gets this device's questions through a part of Roomler \
              in the person's session, and that part is not running or did not answer); answer \
              with `roomlerd consent` there, or set this device's {policy} policy to auto"
+        ),
+        NoSurface::PanelBusy => format!(
+            "nobody could be asked at this device — its consent panel was showing another \
+             question, and nothing else there could show this one; answer with `roomlerd \
+             consent` there, ask again once the panel is free, or set this device's {policy} \
+             policy to auto"
         ),
     }
 }
@@ -1132,6 +1146,47 @@ impl ConsentBroker {
             return Ok(false);
         }
         let body = prompt.to_body(session_hex);
+        if self.inner.sentinel_dir.is_none() {
+            books.marks.insert(session_hex.to_string(), body);
+            return Ok(true);
+        }
+        self.write_pending(session_hex, &body).map(|_| true)
+    }
+
+    /// FR-149 P1, D4 — a question the screen worker's panel showed, whose
+    /// channel then ended: its marker says `companion` from now on, so the
+    /// person's app shows it for the rest of its window. The marker is
+    /// rewritten as it stands, its deadline (`expires_at_ms`) kept, only while
+    /// the question is on the books and under their lock, as
+    /// [`Self::write_prompt_while_asking`] does. `Ok(false)` = the question
+    /// had ended, had no marker to rewrite, or was the app's already (two
+    /// moves of one question, the channel's end and its caller's write, move
+    /// it, and start the app, once).
+    pub fn to_the_companion_while_asking(&self, session_hex: &str) -> Result<bool> {
+        let mut books = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !books.asking.contains_key(session_hex) {
+            return Ok(false);
+        }
+        let body = match self.inner.sentinel_dir.as_ref() {
+            None => books.marks.get(session_hex).cloned(),
+            Some(_) => self
+                .pending_path(session_hex)
+                .and_then(|p| std::fs::read_to_string(p).ok()),
+        };
+        let Some(mut marker) = body
+            .and_then(|b| serde_json::from_str::<tunnel_core::localapi::ConsentRequest>(&b).ok())
+        else {
+            return Ok(false);
+        };
+        if marker.surface == PromptSurface::Companion.wire() {
+            return Ok(false);
+        }
+        marker.surface = PromptSurface::Companion.wire().to_string();
+        let body = serde_json::to_string(&marker)?;
         if self.inner.sentinel_dir.is_none() {
             books.marks.insert(session_hex.to_string(), body);
             return Ok(true);
@@ -1329,16 +1384,20 @@ mod tests {
         assert!(SentinelKind::from_flags(false, false).is_err());
     }
 
-    #[tokio::test]
+    /// #3559 — on paused time, so a loaded runner cannot fail it: an
+    /// auto-grant answers with no time passing, since it waits on no poll and
+    /// no timer.
+    #[tokio::test(start_paused = true)]
     async fn auto_grant_resolves_immediately() {
         let dir = fixture_dir("auto");
         let broker = ConsentBroker::new(Mode::AutoGrant, dir.clone()).unwrap();
-        let start = Instant::now();
+        let start = tokio::time::Instant::now();
         let decision = broker.request("abc123").await;
         assert_eq!(decision, Decision::Granted);
-        assert!(
-            start.elapsed() < Duration::from_millis(200),
-            "auto-grant must not block on any I/O"
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "auto-grant must answer at once, waiting on no poll and no timer"
         );
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
@@ -1389,7 +1448,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
+    /// #3559 — on paused time. The directed prompt ends at its window on the
+    /// paused clock, bounded so that a window the wait ignores fails the test
+    /// instead of spinning it forever, and the directed auto-grant answers
+    /// with no time passing.
+    #[tokio::test(start_paused = true)]
     async fn request_with_mode_overrides_startup_mode() {
         // Server-authoritative consent (Phase 2): the per-session directive from
         // `ServerMsg::Request { consent_mode }` wins over the broker's startup
@@ -1399,14 +1462,15 @@ mod tests {
         // Startup = AutoGrant, but the server directs Prompt → we take the prompt
         // path and (no sentinel) time out, proving auto-grant was NOT used.
         let auto_broker = ConsentBroker::new(Mode::AutoGrant, dir.clone()).unwrap();
-        let d = auto_broker
-            .request_with_mode(
-                "aaaaaaaaaaaaaaaaaaaaaaaa",
-                Mode::Prompt {
-                    timeout: Duration::from_millis(80),
-                },
-            )
-            .await;
+        let directed = auto_broker.request_with_mode(
+            "aaaaaaaaaaaaaaaaaaaaaaaa",
+            Mode::Prompt {
+                timeout: Duration::from_millis(80),
+            },
+        );
+        let d = tokio::time::timeout(PROMPT_BOUND, directed)
+            .await
+            .expect("the directed prompt must end at its window");
         assert_eq!(
             d,
             Decision::Timeout,
@@ -1422,7 +1486,7 @@ mod tests {
             dir.clone(),
         )
         .unwrap();
-        let start = Instant::now();
+        let start = tokio::time::Instant::now();
         let d = prompt_broker
             .request_with_mode("bbbbbbbbbbbbbbbbbbbbbbbb", Mode::AutoGrant)
             .await;
@@ -1431,7 +1495,11 @@ mod tests {
             Decision::Granted,
             "Auto directive must override startup Prompt"
         );
-        assert!(start.elapsed() < Duration::from_millis(200));
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the Auto directive must answer at once, waiting on no poll and no timer"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2028,7 +2096,7 @@ mod tests {
                 let broker = broker.clone();
                 std::thread::spawn(move || broker.arm(session, Duration::from_millis(300)))
             };
-            let waited = Instant::now();
+            let waited = std::time::Instant::now();
             while leftover.exists() && waited.elapsed() < Duration::from_secs(1) {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -2158,32 +2226,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
+    /// #3559 — on paused time, so a loaded runner cannot fail it. The prompt
+    /// wait's deadline and its poll read one clock, tokio's: a
+    /// `std::time::Instant` deadline beside tokio's sleep never comes while
+    /// the paused clock jumps a poll at a time, and the bound then ends the
+    /// test, as it does for a window the wait ignores.
+    #[tokio::test(start_paused = true)]
     async fn prompt_times_out_when_no_sentinel_arrives() {
         let dir = fixture_dir("timeout");
-        let broker = ConsentBroker::new(
-            Mode::Prompt {
-                timeout: Duration::from_millis(400),
-            },
-            dir.clone(),
-        )
-        .unwrap();
-        let start = Instant::now();
-        let decision = broker.request("nopromptever").await;
+        let window = Duration::from_millis(400);
+        let broker = ConsentBroker::new(Mode::Prompt { timeout: window }, dir.clone()).unwrap();
+        let start = tokio::time::Instant::now();
+        let decision = tokio::time::timeout(PROMPT_BOUND, broker.request("nopromptever"))
+            .await
+            .expect("the prompt must end at its window");
+        let waited = start.elapsed();
         assert_eq!(decision, Decision::Timeout);
         assert!(
-            start.elapsed() >= Duration::from_millis(400),
-            "must respect timeout duration"
+            waited >= window,
+            "must respect timeout duration (got {waited:?})"
         );
         assert!(
-            start.elapsed() < Duration::from_millis(900),
-            "must not run far past timeout (got {:?})",
-            start.elapsed()
+            waited < window + POLL_INTERVAL,
+            "must end within one poll of its window (got {waited:?})"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
+    /// #3559 — on paused time: denied with no time passing, before any wait.
+    #[tokio::test(start_paused = true)]
     async fn request_with_empty_session_id_denies_safely() {
         // Defensive: a malformed signaling message that arrives with
         // an empty session_hex must NOT cause the broker to scan the
@@ -2196,9 +2267,13 @@ mod tests {
             dir.clone(),
         )
         .unwrap();
-        let start = Instant::now();
+        let start = tokio::time::Instant::now();
         assert_eq!(broker.request("").await, Decision::Denied);
-        assert!(start.elapsed() < Duration::from_millis(50));
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "an empty id must be denied at once, before any wait"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2718,6 +2793,55 @@ mod no_surface_words_tests {
                 nobody_could_be_asked(policy, NoSurface::NothingUp),
                 "{policy}: one text for both causes"
             );
+        }
+    }
+
+    /// #4164 — a busy panel's sentence, word for word, for SSH and exec. It
+    /// says the device's consent panel was showing another question. It never
+    /// says that nobody is at the screen or that the app is not running (a
+    /// panel showing a question is on someone's screen), nor "start the
+    /// desktop app". Answering with `roomlerd consent` and the policy switch
+    /// stay, and it is neither of the other causes' texts.
+    ///
+    /// Red before #4164: a busy panel read FR-27's "no one at its screen and
+    /// the Roomler desktop app is not running".
+    #[test]
+    fn a_busy_panels_sentence_is_pinned_and_names_neither_guess() {
+        assert_eq!(
+            nobody_could_be_asked("SSH", NoSurface::PanelBusy),
+            "nobody could be asked at this device — its consent panel was showing another question, and nothing else there could show this one; answer with `roomlerd consent` there, ask again once the panel is free, or set this device's SSH policy to auto"
+        );
+        assert_eq!(
+            nobody_could_be_asked("execution", NoSurface::PanelBusy),
+            "nobody could be asked at this device — its consent panel was showing another question, and nothing else there could show this one; answer with `roomlerd consent` there, ask again once the panel is free, or set this device's execution policy to auto"
+        );
+        for policy in ["SSH", "execution"] {
+            let words = nobody_could_be_asked(policy, NoSurface::PanelBusy);
+            for guess in ["screen", "app is not running", "start the desktop app"] {
+                assert!(
+                    !words.contains(guess),
+                    "{policy}: a busy panel's words say {guess:?}: {words}"
+                );
+            }
+            assert!(
+                words.contains("its consent panel was showing another question"),
+                "{policy}: {words}"
+            );
+            assert!(
+                words.contains("answer with `roomlerd consent` there"),
+                "{policy}: {words}"
+            );
+            assert!(
+                words.ends_with(&format!("set this device's {policy} policy to auto")),
+                "{policy}: {words}"
+            );
+            for other in [NoSurface::NothingUp, NoSurface::RoadClosed] {
+                assert_ne!(
+                    words,
+                    nobody_could_be_asked(policy, other),
+                    "{policy}: one text with {other:?}"
+                );
+            }
         }
     }
 }

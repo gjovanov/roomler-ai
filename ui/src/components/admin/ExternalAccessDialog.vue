@@ -118,9 +118,9 @@
           density="compact"
           class="mt-4"
         >
-          This device's agent is too old for external access — it cannot tell
+          This device's daemon is too old for external access — it cannot tell
           the person at the machine that the controller is from outside your
-          organization. Update the agent first.
+          organization. Update roomlerd first.
         </v-alert>
         <v-alert type="info" variant="tonal" density="compact" class="mt-4">
           The device itself must also allow it, and must hold the password:
@@ -269,9 +269,9 @@ watch(
     error.value = ''
     draft.value = { ...emptyPolicy(), ...(agent.value?.external_access_policy ?? {}) }
     void readCode()
-    if (agentStore.orgExternalAccessEnabled === null) {
-      void agentStore.fetchExternalAccess(props.tenantId)
-    }
+    // #4332 — this org's switch, not any: a switch that holds another org's
+    // value is not unset.
+    void agentStore.ensureExternalAccess(props.tenantId)
   },
   { immediate: true },
 )

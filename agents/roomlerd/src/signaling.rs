@@ -603,12 +603,12 @@ async fn next_major_netchange(rx: &mut Option<NetDeltaRx>) -> String {
 /// not kept.
 pub(crate) const RESUME_SKEW_MIN: Duration = Duration::from_secs(120);
 
-/// A5 — a control-WS outage this long (or longer) triggers an immediate
-/// update check on reconnect: the standing fleet-heal path for an agent
-/// that missed a server-pushed `rc:agent.update` while its socket was
-/// wedged/split (the push rides this very WS). One hour matches "a broken
-/// agent should pick up the fixed build within minutes of recovering, not
-/// at the next periodic check".
+/// A5 — a control-WS outage this long (or longer) runs the update check at
+/// once on reconnect, through the periodic check's live-work gate (#4245):
+/// the fleet-heal path for an agent that missed a server-pushed
+/// `rc:agent.update` while its socket was wedged/split (the push rides this
+/// very WS). One hour matches "a broken agent should pick up the fixed build
+/// within minutes of recovering, not at the next periodic check".
 const UPDATE_RECHECK_AFTER_DOWN: Duration = Duration::from_secs(3600);
 
 /// #2221 — a connection that sent its hello and then ran this long proves the
@@ -661,6 +661,14 @@ pub struct OrgCtx {
     /// static pre-multi-org: one org's reconnect would have erased another
     /// org's outage stamp (and fired the update recheck off the wrong org).
     down_since_ms: Arc<std::sync::atomic::AtomicI64>,
+    /// #4367 — Unix ms when this org's control socket was last lost; 0 = never
+    /// in this process. [`ConnectedGuard`] stamps it on every exit path, just
+    /// before the connected flag drops, and the LocalAPI's `peers` answer reads
+    /// it (through the org's `OrgRuntime` row) as the time on the mark of a
+    /// peer it lists while the socket is down. Unlike `down_since_ms` (the A5
+    /// update recheck's clock, stamped only on a failed connect), it is
+    /// stamped on the loss itself.
+    pub control_lost_at_ms: Arc<std::sync::atomic::AtomicU64>,
     /// `rc:agent.update` pushes ignored on this org's WS because it is not
     /// the primary. Surfaced in the LocalAPI `OrgStatus`.
     pub updates_ignored: Arc<std::sync::atomic::AtomicU32>,
@@ -688,6 +696,7 @@ impl OrgCtx {
             unenrolled: false,
             pump: "signaling",
             down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            control_lost_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             token,
             renewal: Default::default(),
@@ -705,6 +714,7 @@ impl OrgCtx {
             // wants `&'static str`; one bounded leak per org per process.
             pump: Box::leak(format!("signaling:{label}").into_boxed_str()),
             down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            control_lost_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             token,
             renewal: Default::default(),
@@ -776,11 +786,11 @@ impl OrgCtx {
             return;
         }
         if self.is_primary {
-            let fired = crate::updater::request_update_now(None);
+            let fired = crate::updater::request_update_recheck();
             info!(
                 down_mins = down_ms / 60_000,
                 update_check_fired = fired,
-                "control WS recovered after a long outage — requesting an immediate update check"
+                "control WS recovered after a long outage — requesting the update recheck"
             );
         } else {
             // The machine-wide updater is the primary's to drive; a
@@ -832,12 +842,22 @@ impl Drop for SignalingPumpGuard {
 /// coordination server" for the LocalAPI (`roomler status`) while a WS
 /// connection is live, and clears it on EVERY exit path from `connect_once`
 /// (Ok, `?`-propagated Err, explicit return) — same discipline as
-/// [`SignalingPumpGuard`]. The `DaemonState` reads this flag; while it's false
-/// `peers()` reports none (the overlay carriers are torn down on disconnect).
-struct ConnectedGuard(Arc<AtomicBool>);
+/// [`SignalingPumpGuard`]. The `DaemonState` reads this flag. The overlay
+/// runtime outlives the socket (its carriers keep running through the outage),
+/// so while the flag is false `peers()` still lists what this org's mesh
+/// holds, each peer marked as last known (#4367), with the time the guard
+/// stamped into `lost_at_ms` as it dropped.
+struct ConnectedGuard {
+    flag: Arc<AtomicBool>,
+    lost_at_ms: Arc<std::sync::atomic::AtomicU64>,
+}
 
 impl ConnectedGuard {
-    fn mark(flag: Arc<AtomicBool>, clear_attention: bool) -> Self {
+    fn mark(
+        flag: Arc<AtomicBool>,
+        lost_at_ms: Arc<std::sync::atomic::AtomicU64>,
+        clear_attention: bool,
+    ) -> Self {
         flag.store(true, Ordering::Relaxed);
         // S1b — a healthy authenticated connect resolves (almost) every
         // attention reason by definition: auth works, no goodbye, no live
@@ -860,13 +880,19 @@ impl ConnectedGuard {
         if clear_attention {
             crate::notify::clear_attention_on_healthy_connect_from(env!("CARGO_PKG_VERSION"));
         }
-        Self(flag)
+        Self { flag, lost_at_ms }
     }
 }
 
 impl Drop for ConnectedGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Relaxed);
+        // #4367 — the time first, then the flag (Release): a reader that sees
+        // the flag down (Acquire) reads this loss's time, never an older one.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        self.lost_at_ms.store(now_ms, Ordering::Relaxed);
+        self.flag.store(false, Ordering::Release);
     }
 }
 
@@ -1349,15 +1375,7 @@ pub async fn run(
                 // sentinel is primary-only; a secondary org's auth death
                 // is surfaced via the LocalAPI `OrgStatus` + logs.
                 if auth_failures == 3 && ctx.is_primary {
-                    let msg = "Roomler agent: re-enrollment required.\n\n\
-                              The server is rejecting this agent's token. \
-                              Either the device was removed or re-enrolled \
-                              elsewhere, or its token expired and could not \
-                              be renewed. Run:\n\n\
-                              \troomlerd re-enroll --token <new-jwt>\n\n\
-                              with a fresh enrollment JWT from the admin UI \
-                              to restore service.";
-                    match notify::raise_attention_with_reason(notify::REASON_AUTH, msg) {
+                    match notify::raise_attention_with_reason(notify::REASON_AUTH, AUTH_NOTICE) {
                         Ok(path) => warn!(
                             path = %path.display(),
                             "wrote needs-attention sentinel"
@@ -1406,13 +1424,7 @@ pub async fn run(
                 // systemd never restarts exit 7.
                 let after =
                     crate::service::Install::detect(remote_cfg.config_path()).after_removal();
-                let body = format!(
-                    "Roomler agent: server-side close — {reason:?}.\n\n{message}\n\n\
-                     The agent will not reconnect. Re-enrol with a fresh enrollment \
-                     JWT from the admin UI:\n\n\
-                     \troomlerd re-enroll --token <new-jwt>\n\n\
-                     {after}"
-                );
+                let body = goodbye_notice(reason, &message, after);
                 match notify::raise_attention_machine_aware_with_reason(
                     notify::REASON_GOODBYE,
                     &body,
@@ -1428,15 +1440,15 @@ pub async fn run(
                         "failed to write needs-attention sentinel for FatalGoodbye"
                     ),
                 }
-                // Exit with the documented code so the SCM
-                // supervisor's rc.53 code-7 fast-alarm fires on this
-                // FIRST exit (not after 8). Operator sees the
-                // structured error within <1 minute.
+                // Exit with the documented code so the SCM supervisor's rc.53
+                // code-7 fast-alarm fires on this FIRST exit (not after 8), with
+                // the run marked clean first: a removal is no crash (#4292).
+                // Operator sees the structured error within <1 minute.
                 // P5/A2 — a fatal goodbye is a PERMANENT stop (the row is gone);
                 // no restart will run the boot reconciler, so drop any exit-node
                 // split-default now or the host stays blackholed until reboot.
                 crate::purge_exit_routes();
-                std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
+                crate::run_end::exit_removed();
             }
             Err(ConnectError::KeyRotated {
                 secret_base64,
@@ -1484,8 +1496,8 @@ pub async fn run(
                 );
 
                 // Legacy escalation (`ws_replaced_exit = true`): sentinel +
-                // process exit at the 3rd displacement, exactly as before
-                // W4(d). Off by default — see below.
+                // process exit at the 3rd displacement, as before W4(d), and
+                // no crash since #4292. Off by default — see below.
                 if displacements >= 3 && cfg.ws_replaced_exit.unwrap_or(false) {
                     // Multi-org P1: a secondary org's duel terminates only
                     // its own loop (see the FatalGoodbye arm's rationale).
@@ -1506,7 +1518,7 @@ pub async fn run(
                     // P5/A2 — bypasses RAII; drop any exit-node split-default so
                     // a duel-losing instance doesn't leave the host blackholed.
                     crate::purge_exit_routes();
-                    std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
+                    crate::run_end::exit_duel_lost();
                 }
 
                 // W4(d) — NO process exit by default. Field (winhost-a, every
@@ -1667,15 +1679,7 @@ pub(crate) fn replaced_backoff_for(displacements: usize) -> Duration {
 /// The ReplacedByNewer operator sentinel — written once per storm (at the
 /// 3rd displacement in the window), whether or not the legacy exit is on.
 fn write_replaced_sentinel(message: &str, displacements: usize) {
-    let body = format!(
-        "Roomler agent: duplicate-instance duel detected.\n\n{message}\n\n\
-         This connection has been displaced {displacements} times in the current \
-         window — another process (different physical host with a copy of this \
-         config.toml, or a stale half-open connection through a TLS-inspecting \
-         middlebox) is using the same agent_id. The agent stays up and backs \
-         off; if this persists, stop the duplicate or re-enrol THIS host with \
-         a fresh enrollment JWT to mint a new agent_id."
-    );
+    let body = replaced_notice(message, displacements);
     match notify::raise_attention_machine_aware_with_reason(notify::REASON_DUPLICATE, &body) {
         Ok(path) => warn!(
             path = %path.display(),
@@ -1687,6 +1691,28 @@ fn write_replaced_sentinel(message: &str, displacements: usize) {
             "failed to write needs-attention sentinel for ReplacedByNewer escalation"
         ),
     }
+}
+
+/// FR-133 — what this loop's sentinels say, held here so a test reads each one whole.
+pub(crate) const AUTH_NOTICE: &str = "roomlerd: re-enrollment required.\n\nThe server is rejecting this \
+    device's token. Either the device was removed or re-enrolled elsewhere, or its token expired and \
+    could not be renewed. Run:\n\n\troomlerd re-enroll --token <new-jwt>\n\nwith a fresh enrollment \
+    JWT from the admin UI to restore service.";
+pub(crate) fn goodbye_notice(reason: AgentCloseReason, message: &str, after: &str) -> String {
+    let why = notify::goodbye_words(reason);
+    format!(
+        "roomlerd: server-side close — {why}.\n\n{message}\n\nThe daemon will not reconnect. Re-enrol \
+         with a fresh enrollment JWT from the admin UI:\n\n\troomlerd re-enroll --token <new-jwt>\n\n{after}"
+    )
+}
+pub(crate) fn replaced_notice(message: &str, displacements: usize) -> String {
+    format!(
+        "roomlerd: duplicate-instance duel detected.\n\n{message}\n\nThis connection has been displaced \
+         {displacements} times in the current window — another process (different physical host with a \
+         copy of this config.toml, or a stale half-open connection through a TLS-inspecting middlebox) is \
+         using the same agent_id. The daemon stays up and backs off; if this persists, stop the duplicate \
+         or re-enrol THIS host with a fresh enrollment JWT to mint a new agent_id."
+    )
 }
 
 /// #1750 — a SECONDARY org's loop ended because that org's server refuses this
@@ -1885,9 +1911,11 @@ async fn connect_once(
     // select loop. Dropped where the loop starts; its arms name their own.
     let setup_stage = watchdog::enter(ctx.pump, "setup");
     // Unification P1 — mark the daemon connected for the LocalAPI; the guard
-    // clears it on every return path (like `_pump_guard`). Sentinel clearing
-    // is primary-only (see `ConnectedGuard::mark`).
-    let _connected_guard = ConnectedGuard::mark(connected, ctx.is_primary);
+    // clears it on every return path (like `_pump_guard`), stamping the loss's
+    // time first (#4367). Sentinel clearing is primary-only (see
+    // `ConnectedGuard::mark`).
+    let _connected_guard =
+        ConnectedGuard::mark(connected, ctx.control_lost_at_ms.clone(), ctx.is_primary);
 
     // Fleet RPC — teach the redactor THIS org's agent token before any exec
     // can run. Registered per-org (the registry is process-wide) so a command
@@ -2831,20 +2859,51 @@ async fn connect_once(
             }
             Some((session_hex, allow)) = consent_rx.recv() => {
                 let _stage = watchdog::enter(ctx.pump, "consent");
-                // FR-27 — an Approve/Deny from the NATIVE panel. Routed
-                // through the broker, not applied here, so it passes the same
-                // live-prompt gate as a LocalAPI or CLI decision: an answer
-                // only counts for a question the broker is actively asking,
-                // which is what makes pre-approval unrepresentable.
-                let recorded = consent_broker.record_decision(&session_hex, allow);
-                info!(
-                    session = %session_hex, allow, recorded,
-                    "native consent panel decision"
-                );
-                // Take the panel down either way. If the broker refused it,
-                // the prompt it belonged to is already over, and a panel left
-                // on screen for a resolved session is its own bug.
-                indicator.hide_prompt(&session_hex);
+                // FR-149 P1 (D3) — a one-row Mac's screen worker shows the
+                // root daemon's questions on its panel too. A click on one its
+                // own broker is not asking takes the person's app's road to
+                // the root half, whose person socket asks the seat again
+                // before its broker takes it: on a task, since that answer can
+                // take `DECIDE_WITHIN`, and this loop reads on. A click the
+                // root half did not take is said to the root daemon, whose
+                // question then goes to the app (`panel_answered`).
+                if let Some(road) = crate::consent_relay::panel_road(&consent_broker, &session_hex) {
+                    let (broker, ind) = (consent_broker.clone(), indicator.clone());
+                    tokio::spawn(async move {
+                        let recorded = crate::consent_relay::panel_answered(
+                            &broker,
+                            Some(&*road),
+                            &session_hex,
+                            allow,
+                            |state| crate::indicator::session_panel::tell_the_root(&session_hex, state),
+                        )
+                        .await;
+                        info!(
+                            session = %session_hex, allow, recorded, road = "root_half",
+                            "native consent panel decision"
+                        );
+                        // Down either way, as below: a refusal is logged by
+                        // `panel_clicked`, and its panel does not stay up.
+                        ind.hide_prompt(&session_hex);
+                    });
+                } else {
+                    // FR-27 — an Approve/Deny from the NATIVE panel. Routed
+                    // through the broker, not applied here, so it passes the
+                    // same live-prompt gate as a LocalAPI or CLI decision: an
+                    // answer only counts for a question the broker is actively
+                    // asking, which is what makes pre-approval
+                    // unrepresentable.
+                    let recorded = consent_broker.record_decision(&session_hex, allow);
+                    info!(
+                        session = %session_hex, allow, recorded,
+                        "native consent panel decision"
+                    );
+                    // Take the panel down either way. If the broker refused
+                    // it, the prompt it belonged to is already over, and a
+                    // panel left on screen for a resolved session is its own
+                    // bug.
+                    indicator.hide_prompt(&session_hex);
+                }
                 watchdog::tick(ctx.pump);
             }
             // FR-138 — what the last connection kept waits for its claim here:
@@ -4358,7 +4417,11 @@ async fn handle_server_msg(
                     org: asking_org.clone().unwrap_or_default(),
                     expires_at: std::time::Instant::now() + host_window,
                 };
-                let native = indicator.show_prompt(view.clone());
+                // FR-149 P1 — on a one-row Mac's root daemon, the screen
+                // worker's panel first, `PANEL_WITHIN` at most: the wait
+                // #4063's probe had here, never added to it.
+                let shown = indicator.show_prompt(view.clone()).await;
+                let native = shown.native;
                 let prompt = crate::consent::PendingPrompt {
                     kind: crate::consent::PromptKind::RemoteControl,
                     asked_by: &controller_name,
@@ -4385,7 +4448,14 @@ async fn handle_server_msg(
                 };
 
                 let mut marker = true;
-                if let Err(e) = consent_broker.write_prompt(&session_hex, &prompt) {
+                // FR-149 P1 — and read on the session panel's books after it
+                // (`session_panel::write_marker`).
+                if let Err(e) = crate::indicator::session_panel::write_marker(
+                    consent_broker,
+                    &session_hex,
+                    &prompt,
+                    &shown,
+                ) {
                     // Only fatal to the SURFACE when the companion was the
                     // plan: with a native panel already up, a human can still
                     // answer — the marker's loss costs the CLI listing, not
@@ -4444,7 +4514,7 @@ async fn handle_server_msg(
                     });
                 }
                 surfaces = Some(RcSurfaces {
-                    native,
+                    shown,
                     marker,
                     behind,
                     mark_up,
@@ -5554,8 +5624,8 @@ async fn handle_server_msg(
         // S1a — operator-triggered forced self-update from the web UI.
         // Hand the request to the updater loop's trigger channel; the
         // actual check/download/install runs there (same gates as the
-        // periodic path: 5-min install-storm cooldown; transfer-defer
-        // is bypassed with a warn because the operator asked NOW).
+        // periodic path: 5-min install-storm cooldown; the live-work gate
+        // is bypassed with a warn naming it: the operator asked NOW).
         ServerMsg::UpdateNow { pin } => {
             // Multi-org P1: the self-updater is machine-wide, so only the
             // PRIMARY enrollment may drive it — a secondary org's admin
@@ -5758,7 +5828,7 @@ async fn handle_server_msg(
                         duration_ms: 0,
                         error: Some(
                             "this device cannot run commands through its SYSTEM service \
-                             (update the agent)"
+                             (update roomlerd)"
                                 .to_string(),
                         ),
                     })
@@ -5887,7 +5957,10 @@ async fn handle_server_msg(
                     org: org.clone(),
                     expires_at: std::time::Instant::now() + crate::consent::DEFAULT_PROMPT_TIMEOUT,
                 };
-                let native = indicator.show_prompt(view.clone());
+                // FR-149 P1 — the screen worker's panel first on a one-row
+                // Mac's root daemon, as for a screen-control request.
+                let on_screen = indicator.show_prompt(view.clone()).await;
+                let native = on_screen.native;
                 let prompt = crate::consent::PendingPrompt {
                     kind: crate::consent::PromptKind::Exec,
                     asked_by: &caller,
@@ -5901,7 +5974,12 @@ async fn handle_server_msg(
                         crate::consent::PromptSurface::Companion
                     },
                 };
-                let marker = match consent_broker.write_prompt(&request_id, &prompt) {
+                let marker = match crate::indicator::session_panel::write_marker(
+                    consent_broker,
+                    &request_id,
+                    &prompt,
+                    &on_screen,
+                ) {
                     Ok(_) => true,
                     Err(e) => {
                         tracing::warn!(%request_id, %e, native, "could not write the .pending consent marker for this command");
@@ -5909,7 +5987,7 @@ async fn handle_server_msg(
                     }
                 };
                 if native {
-                    info!(%request_id, native, "consent prompt surface (exec)");
+                    info!(%request_id, native, panel = on_screen.panel(), "consent prompt surface (exec)");
                     let _ = surface_tx.send(Shown::Yes);
                 } else {
                     // FR-93 P6f — and where the companion cannot show it, a
@@ -5922,7 +6000,8 @@ async fn handle_server_msg(
                     // then would outlive it.
                     let ind = indicator.clone();
                     tokio::spawn(async move {
-                        let _ = surface_tx.send(exec_surfaces_up(marker, &ind, view).await);
+                        let _ =
+                            surface_tx.send(exec_surfaces_up(marker, &ind, view, on_screen).await);
                     });
                 }
             }
@@ -6043,7 +6122,17 @@ async fn handle_server_msg(
             via_service,
         } => {
             #[cfg(feature = "ssh-server")]
-            if via_service {
+            if via_service && !crate::ssh::first_sight_via_service(&grant_id) {
+                // #3558 — a copy of a grant this worker already handed on, or
+                // refused, answers nothing: a refusal could reach a wait the
+                // first copy's claim left open on another server instance
+                // (`first_sight_via_service`).
+                warn!(
+                    %grant_id, ?caller,
+                    "rc:ssh.grant already handed to the SYSTEM service (or refused); \
+                     this copy is dropped, no ack"
+                );
+            } else if via_service {
                 // FR-105 — a grant for this device's SYSTEM service never
                 // lands in the worker's table, where the worker's own server
                 // would honour it as the signed-in user. The service claims
@@ -7640,8 +7729,10 @@ async fn end_in_gap<P: TablePeer>(
 /// ([`rc_surfaces_up`]) beside the prompt's window, which since #4000 does not
 /// wait for it.
 pub(crate) struct RcSurfaces {
-    /// The daemon's own panel is up.
-    pub(crate) native: bool,
+    /// Whether a panel is up (`native`): the daemon's own, or, FR-149 P1, on
+    /// a one-row Mac's root daemon the screen worker's, and which, or why
+    /// none ([`crate::indicator::session_panel::Prompted`]).
+    pub(crate) shown: crate::indicator::session_panel::Prompted,
     /// The `.pending` marker landed: the companion has a question to read.
     pub(crate) marker: bool,
     /// Where no panel is up: the companion's start, which the loop started
@@ -7675,11 +7766,12 @@ pub(crate) async fn rc_surfaces_up(
     outbound: &mpsc::Sender<ClientMsg>,
 ) -> bool {
     let RcSurfaces {
-        native,
+        shown,
         marker,
         behind,
         mark_up,
     } = surfaces;
+    let native = shown.native;
     let mut companion = None;
     let mut notified = false;
     if let Some((starting, view)) = behind {
@@ -7709,14 +7801,19 @@ pub(crate) async fn rc_surfaces_up(
     // #4016 — a question that ended while its surfaces went up (answered,
     // withdrawn, out of time, or its socket closed) is said to have ended:
     // what they came to never reads as the give-up of a live question.
+    // FR-149 P1 — `panel`, `session_panel` and `why` are absent off a one-row
+    // Mac's root daemon, so every other line reads as before.
+    let (panel, session_panel, why) = (shown.panel(), shown.session_panel(), shown.why());
     if still_asked() && !outbound.is_closed() {
         info!(
-            session = %session_hex, native, ?companion, notified, have_surface,
+            session = %session_hex, native, panel, session_panel, why, ?companion, notified,
+            have_surface,
             "consent prompt surface"
         );
     } else {
         info!(
-            session = %session_hex, native, ?companion, notified, have_surface,
+            session = %session_hex, native, panel, session_panel, why, ?companion, notified,
+            have_surface,
             "consent prompt surface, after its question had ended (#4016)"
         );
     }
@@ -7887,11 +7984,13 @@ pub(crate) async fn rc_consent_task(
 /// which the command's answer reads at the window's end ([`shown_by_now`],
 /// [`exec_refusal`]). Run on a task of its own: the command waits on the
 /// broker alone, never on this. Logs the question's surfaces, as an SSH or a
-/// remote-control question's are.
+/// remote-control question's are, with FR-149's `session_panel` and `why`
+/// from `prompted` on a one-row Mac's root daemon (absent everywhere else).
 pub(crate) async fn exec_surfaces_up(
     marker: bool,
     indicator: &ViewerIndicator,
     view: crate::indicator::PromptView,
+    prompted: crate::indicator::session_panel::Prompted,
 ) -> Shown {
     let request_id = view.session_hex.clone();
     let tray = crate::companion::ensure_running_verdict().await;
@@ -7902,13 +8001,15 @@ pub(crate) async fn exec_surfaces_up(
     let notified = !(companion && marker) && indicator.show_notification_prompt(view).await;
     let have_surface = (companion && marker) || notified;
     info!(
-        %request_id, native = false, companion, marker, notified, have_surface,
+        %request_id, native = false, session_panel = prompted.session_panel(), why = prompted.why(),
+        panel_busy = prompted.panel_busy(), companion, marker, notified, have_surface,
         "consent prompt surface (exec)"
     );
     if have_surface {
         Shown::Yes
     } else {
-        Shown::No(tray.why_not_shown(marker))
+        // #4164 — a panel busy with another question wins over the app's cause.
+        Shown::No(prompted.why_not_shown(tray.why_not_shown(marker)))
     }
 }
 
@@ -9314,7 +9415,7 @@ mod tests {
             let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
             // Nothing showed it: no panel, and no tray to read the marker.
             let surfaces = RcSurfaces {
-                native: false,
+                shown: crate::indicator::session_panel::Prompted::plain(false),
                 marker: true,
                 behind: None,
                 mark_up: None,
@@ -10271,6 +10372,34 @@ mod exec_answer_tests {
             );
         }
     }
+
+    /// #4164 — a window that ran out while a consent panel busy with another
+    /// question kept the command's question from the person says that the
+    /// device's consent panel was showing another question, naming the
+    /// execution policy. The verdict carries it to the window's end. An
+    /// answer, and a question withdrawn, read as they always did.
+    ///
+    /// Red before #4164: a busy panel read "no one at its screen and the
+    /// Roomler desktop app is not running".
+    #[test]
+    fn a_window_a_busy_panel_kept_from_the_person_says_the_panel_was_busy() {
+        let busy = Shown::No(NoSurface::PanelBusy);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(busy).unwrap();
+        assert_eq!(shown_by_now(rx), busy, "a verdict that came");
+        assert_eq!(
+            exec_refusal(Decision::Timeout, busy),
+            "nobody could be asked at this device — its consent panel was showing another question, and nothing else there could show this one; answer with `roomlerd consent` there, ask again once the panel is free, or set this device's execution policy to auto"
+        );
+        assert_eq!(
+            exec_refusal(Decision::Denied, busy),
+            "the operator at this device did not approve the command (Denied)"
+        );
+        assert_eq!(
+            exec_refusal(Decision::Cancelled, busy),
+            "the operator at this device did not approve the command (Cancelled)"
+        );
+    }
 }
 
 /// #3992 — the hello and the heartbeat announce one snapshot: the words
@@ -10650,5 +10779,43 @@ mod announce_tests {
             announcer.beat(&mut hello.last, Some(&host)).is_none(),
             "nothing the row says changed"
         );
+    }
+}
+#[cfg(test)]
+mod connected_guard_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    /// #4367 — the guard marks the socket up, and its drop stamps when the
+    /// socket was lost before the flag goes down, so a reader that sees the
+    /// flag down reads the time of this loss.
+    #[test]
+    fn the_guard_stamps_the_loss_time_before_the_flag_drops() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let lost_at = Arc::new(AtomicU64::new(0));
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let guard = ConnectedGuard::mark(flag.clone(), lost_at.clone(), false);
+        assert!(flag.load(Ordering::Acquire), "marked up");
+        assert_eq!(lost_at.load(Ordering::Relaxed), 0, "nothing was lost yet");
+
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire), "down on drop");
+        let stamped = lost_at.load(Ordering::Relaxed);
+        assert!(
+            stamped >= before,
+            "the loss time is this drop's: {stamped} < {before}"
+        );
+
+        // A reconnect does not clear the time (the reader ignores it while
+        // the flag is up), and the next loss stamps a newer one.
+        let guard = ConnectedGuard::mark(flag.clone(), lost_at.clone(), false);
+        assert_eq!(lost_at.load(Ordering::Relaxed), stamped);
+        drop(guard);
+        assert!(lost_at.load(Ordering::Relaxed) >= stamped);
+        assert!(!flag.load(Ordering::Acquire));
     }
 }

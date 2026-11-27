@@ -182,6 +182,112 @@ impl InstallScope {
     }
 }
 
+/// #3565 — the program that enrolled a device, and the version it was built
+/// as, as the enroll request names them. Shared by both ends of
+/// `POST /api/agent/enroll`, like [`InstallInfo`].
+///
+/// It says how the device was enrolled. It is neither the device's version
+/// ([`Agent::agent_version`], which only the daemon's own hello writes) nor
+/// who enrolled it ([`Agent::enrolled_by`], a person): a different name, and
+/// a different type from both.
+///
+/// Strings on the wire and on the row: a name this build has never heard of
+/// is **clamped to `other`**, never refused, so an older server keeps
+/// enrolling a newer program. [`EnrollingProgramName`] is the vocabulary.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EnrollingProgram {
+    /// One of [`EnrollingProgramName`]'s spellings.
+    pub name: String,
+    /// The version the program was built as. Empty when the server kept none
+    /// of what it was sent ([`EnrollingProgram::clamped`]).
+    #[serde(default)]
+    pub version: String,
+}
+
+/// The ceiling on an enrolling program's version the server keeps.
+pub const ENROLLING_PROGRAM_VERSION_MAX_LEN: usize = 64;
+
+impl EnrollingProgram {
+    pub fn new(name: EnrollingProgramName, version: &str) -> Self {
+        Self {
+            name: name.wire().to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    /// What the server stores for an enroll request without the field: an
+    /// enroller from before #3565. The request's `agent_version` is that
+    /// program's own version, so it is kept here, and only here.
+    pub fn older_enroller(agent_version: &str) -> Self {
+        Self::new(EnrollingProgramName::Unknown, agent_version).clamped()
+    }
+
+    /// The server's view of a client's claim: a name outside the vocabulary
+    /// is `other`, and a version that is not a short version string is
+    /// dropped (kept empty). Never an error: the enroll must succeed whatever
+    /// this says.
+    pub fn clamped(&self) -> Self {
+        let name =
+            EnrollingProgramName::parse(self.name.trim()).unwrap_or(EnrollingProgramName::Other);
+        let version = self.version.trim();
+        let keep = !version.is_empty()
+            && version.len() <= ENROLLING_PROGRAM_VERSION_MAX_LEN
+            && version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'));
+        Self {
+            name: name.wire().to_string(),
+            version: if keep {
+                version.to_string()
+            } else {
+                String::new()
+            },
+        }
+    }
+}
+
+/// The programs that enroll a device. The wire spelling is the stored
+/// spelling, so it is locked by a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EnrollingProgramName {
+    /// The daemon's own `roomlerd enroll`, and its join of another org.
+    Roomlerd,
+    /// The setup wizard, which enrolls in-process.
+    RoomlerSetup,
+    /// The companion's enroll form.
+    RoomlerDesktop,
+    /// A spelling this build does not know: the server's clamp.
+    Other,
+    /// The request did not say: an enroller from before #3565.
+    /// Server-assigned; a client never needs to send it.
+    Unknown,
+}
+
+impl EnrollingProgramName {
+    pub const ALL: [EnrollingProgramName; 5] = [
+        EnrollingProgramName::Roomlerd,
+        EnrollingProgramName::RoomlerSetup,
+        EnrollingProgramName::RoomlerDesktop,
+        EnrollingProgramName::Other,
+        EnrollingProgramName::Unknown,
+    ];
+
+    pub fn wire(self) -> &'static str {
+        match self {
+            EnrollingProgramName::Roomlerd => "roomlerd",
+            EnrollingProgramName::RoomlerSetup => "roomler-setup",
+            EnrollingProgramName::RoomlerDesktop => "roomler-desktop",
+            EnrollingProgramName::Other => "other",
+            EnrollingProgramName::Unknown => "unknown",
+        }
+    }
+
+    /// Exact, case-sensitive, like [`InstallMethod::parse`].
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|n| n.wire() == raw)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -229,9 +335,14 @@ pub struct AgentCaps {
     /// * `upload`   — browser → host file uploads (the v1 default).
     /// * `download` — host → browser single-file downloads.
     /// * `download-folder` — host → browser folder zip streams.
+    /// * `resume`   — an interrupted upload resumes from the agent's
+    ///   accepted offset (`files:resume`, file-DC v3).
     /// * `browse`   — browser can navigate the host's filesystem
     ///   via `files:dir`. Conditional on the agent's
     ///   `enable_remote_browse` config flag.
+    /// * `dir-pages` — with `browse` (#4121): a listing too large for one
+    ///   message (64 KiB) reaches a viewer that sends `paged: true` in
+    ///   pages. Matched by equality, as every token here.
     ///
     /// Empty / unset (older agents) deserialises to `[]`; browsers
     /// that see an empty list fall back to `supports_file_transfer`
@@ -2191,7 +2302,15 @@ pub struct Agent {
     /// FR-97 P0d — the agent binary runs under emulation on that hardware.
     #[serde(default)]
     pub arch_emulated: bool,
-    pub agent_version: String,
+    /// The version the device's daemon reported in its hello. #3565: the
+    /// hello (`AgentDao::update_hello`) is its one writer, and an enrollment
+    /// never writes it, so a row's version is its daemon's own. `None` until
+    /// the daemon first connects: "not reported yet", absent from the row,
+    /// and `""` on the API's wire. Read it through
+    /// [`Agent::reported_version`], which also takes a hello's empty value as
+    /// not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
     /// FR-27 — the version of the `roomler-desktop` companion INSTALLED on this
     /// host, reported on the heartbeat. `None` means one of three different
     /// things and the grid must not flatten them: a pre-FR-27 agent that never
@@ -2259,9 +2378,9 @@ pub struct Agent {
     /// its `gen` claim equals this. Removing the device bumps it
     /// (`AgentDao::soft_delete`), so every token minted before the removal
     /// is refused, even after the same machine re-enrolls and revives this
-    /// row. Enrollment and renewal mint at the current value. 0 on every row
-    /// that was never removed, which is also what every pre-FR-103 token
-    /// carries.
+    /// row; so does a token rotation (FR-155, `AgentDao::rotate_token`).
+    /// Enrollment and renewal mint at the current value. 0 on a row never
+    /// removed or rotated, as on every pre-FR-103 token.
     #[serde(default)]
     pub token_gen: u32,
     /// FR-103: the `exp` of the agent token this device last connected with,
@@ -2270,6 +2389,10 @@ pub struct Agent {
     /// before it drops. `None` on rows that have not connected since FR-103.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_exp: Option<DateTime>,
+    /// FR-155: the device's last token rotation (`POST /api/agent/self/rotate`).
+    /// Absent on a row that never rotated; a revived row starts without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_rotation: Option<TokenRotation>,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
     /// P4 — the presence value (`online`/`stale`/`offline`) most recently
@@ -2326,6 +2449,14 @@ pub struct Agent {
     /// `None` and `unknown` as *unknown*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install: Option<InstallInfo>,
+    /// #3565 — the program that enrolled the device, and its version, as the
+    /// latest enrollment's request named them ([`EnrollingProgram`]):
+    /// `{name: "unknown", version: <its agent_version>}` for an enroller from
+    /// before the field. How the device was enrolled, never its version
+    /// ([`Self::agent_version`]) nor who enrolled it ([`Self::enrolled_by`]).
+    /// `None` on a row whose latest enrollment came before #3565.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrolling_program: Option<EnrollingProgram>,
     /// Roomler-SSH policy for this device (gate 3). Same shape and the same
     /// closed default as [`Self::exec_policy`] — every pre-feature row
     /// deserialises to [`SshMode::Off`].
@@ -2446,6 +2577,17 @@ pub struct Agent {
 
 impl Agent {
     pub const COLLECTION: &'static str = "agents";
+
+    /// #3565 — the version the device's daemon reported, or `None` while it
+    /// has not reported one yet: no hello since the row was made, or a hello
+    /// that sent an empty value. Every reader of the row's version goes
+    /// through this, so "not reported yet" never reads as a version.
+    pub fn reported_version(&self) -> Option<&str> {
+        self.agent_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -4487,7 +4629,7 @@ impl ExternalRcDenyReason {
                  (clearing it does not)"
             }
             Self::DeviceUnsupported => {
-                "this device's agent is too old for external access — it cannot tell the \
+                "this device's daemon is too old for external access — it cannot tell the \
                  person at the machine that the controller is from outside the organization"
             }
         }
@@ -5189,7 +5331,7 @@ impl SshDenyReason {
                 "the device you are calling from is not permitted to originate SSH sessions"
             }
             Self::Unsupported => {
-                "this device's agent does not support roomler SSH (needs a build with the \
+                "this device's daemon does not support roomler SSH (needs a build with the \
                  ssh-server feature)"
             }
             Self::Offline => "the device is offline",
@@ -5204,7 +5346,7 @@ impl SshDenyReason {
             }
             Self::GrantExpiredOnArrival => {
                 "the grant expired before the device got it — its clock is probably about 11 \
-                 minutes or more ahead; fix that clock, or update its agent to 0.4.202 or later"
+                 minutes or more ahead; fix that clock, or update its daemon to 0.4.202 or later"
             }
             Self::GrantRefused => {
                 "the device refused the session grant — its own log (`roomler logs \
@@ -5225,7 +5367,7 @@ impl SshDenyReason {
             }
             Self::SessionNotAllowed => "no SSH policy on this device admits agent sessions",
             Self::TargetTooOld => {
-                "this device's agent cannot hold an agent session to one command (needs a \
+                "this device's daemon cannot hold an agent session to one command (needs a \
                  build that advertises ssh-one-command)"
             }
         }
@@ -5579,6 +5721,60 @@ pub struct KeyRotationAuditEvent {
 
 impl KeyRotationAuditEvent {
     pub const COLLECTION: &'static str = "key_rotation_audit";
+}
+
+/// FR-155: what a token rotation records on the device row
+/// ([`Agent::token_rotation`]). It lets a device whose answer was lost ask
+/// again with the same rotation key and receive a token of the generation
+/// the rotation made, and its `at` is the once-an-hour ceiling.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TokenRotation {
+    /// The generation this rotation made.
+    #[serde(rename = "gen")]
+    pub generation: u32,
+    /// The sha256 of the rotation key's 32 bytes, lowercase hex. The key
+    /// itself is never stored.
+    pub key_sha256: String,
+    /// When the rotation committed.
+    pub at: DateTime,
+}
+
+/// FR-155 — one decision of `POST /api/agent/self/rotate`, in
+/// `token_rotation_audit`: a rotation that committed (`first`), the answer to
+/// one asked again with its rotation key (`replay`), a refusal with its reason
+/// (`refused`), a first call within the hour of the last rotation
+/// (`rate_limited`), or a call the server's switches answer 404
+/// (`unsupported`, the switch as the reason). The SERVER's record of what it
+/// decided. A request whose token does not verify names no device and has
+/// no row.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TokenRotationAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub at: DateTime,
+    /// `first`, `replay`, `refused`, `rate_limited` or `unsupported`.
+    pub decision: String,
+    /// Why, on a `refused` or `unsupported` row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The caller's address, by the server's one rule
+    /// (`roomler_core::client_ip`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
+    /// The generation of the token presented.
+    pub gen_from: u32,
+    /// The row's generation once the decision is made: one more than
+    /// `gen_from` after a `first`, and the row's as it stands otherwise.
+    /// `None` when the row was not read (it is gone, or a switch answered
+    /// first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen_to: Option<u32>,
+}
+
+impl TokenRotationAuditEvent {
+    pub const COLLECTION: &'static str = "token_rotation_audit";
 }
 
 /// What a device reported doing inside an SSH session (P8).
@@ -7165,6 +7361,11 @@ pub struct OverlayNode {
     /// the table with no word of why. `None` on an older device or row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_offer_withheld: Option<String>,
+    /// #3562 — whether this exit serves IPv6, as its last join stated it
+    /// (`NetmapPeer::exit_serves_v6`): `None` = an older device or row, kept
+    /// ABSENT in the document (never `null`), so its clients keep the old rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_serves_v6: Option<bool>,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
     pub created_at: DateTime,
@@ -7948,6 +8149,82 @@ mod tests {
             .unwrap(),
             r#"{"method":"manual","scope":"unknown"}"#
         );
+    }
+
+    /// #3565 — the enrolling program's name is a stored spelling: renaming
+    /// one would make every existing row name a program no build sends.
+    /// Locked, and matched by equality only.
+    #[test]
+    fn enrolling_program_spellings_are_locked() {
+        let names: Vec<&str> = EnrollingProgramName::ALL.iter().map(|n| n.wire()).collect();
+        assert_eq!(
+            names,
+            [
+                "roomlerd",
+                "roomler-setup",
+                "roomler-desktop",
+                "other",
+                "unknown"
+            ]
+        );
+        for n in EnrollingProgramName::ALL {
+            assert_eq!(EnrollingProgramName::parse(n.wire()), Some(n));
+        }
+        // `roomler` is not a program, and `roomlerd` is a prefix of no other.
+        assert_eq!(EnrollingProgramName::parse("roomler"), None);
+        assert_eq!(EnrollingProgramName::parse("roomler-setup.exe"), None);
+        assert_eq!(EnrollingProgramName::parse("Roomlerd"), None);
+        assert_eq!(EnrollingProgramName::parse(""), None);
+    }
+
+    /// The server's clamp: a name from the future is `other`, a version that
+    /// is not a short version string is dropped, and a known value passes
+    /// through untouched. The enroll never fails on any of it.
+    #[test]
+    fn enrolling_program_clamps_instead_of_refusing() {
+        let known = EnrollingProgram::new(EnrollingProgramName::RoomlerSetup, "0.4.215");
+        assert_eq!(known.clamped(), known);
+        assert_eq!(
+            serde_json::to_string(&known).unwrap(),
+            r#"{"name":"roomler-setup","version":"0.4.215"}"#
+        );
+
+        let future = EnrollingProgram {
+            name: "a-program-from-later".into(),
+            version: "1.0.0-beta.2+build.7".into(),
+        };
+        assert_eq!(
+            future.clamped(),
+            EnrollingProgram {
+                name: "other".into(),
+                version: "1.0.0-beta.2+build.7".into(),
+            }
+        );
+        let junk = EnrollingProgram {
+            name: " roomlerd ".into(),
+            version: "<script>alert(1)</script>".into(),
+        };
+        assert_eq!(
+            junk.clamped(),
+            EnrollingProgram {
+                name: "roomlerd".into(),
+                version: String::new(),
+            }
+        );
+        let long = EnrollingProgram::new(EnrollingProgramName::Roomlerd, &"9".repeat(65));
+        assert_eq!(long.clamped().version, "");
+
+        // An enroller from before the field: its agent_version is its own.
+        assert_eq!(
+            EnrollingProgram::older_enroller("0.4.190"),
+            EnrollingProgram {
+                name: "unknown".into(),
+                version: "0.4.190".into(),
+            }
+        );
+        // On the wire, `version` may be absent.
+        let wire: EnrollingProgram = serde_json::from_str(r#"{"name":"roomlerd"}"#).unwrap();
+        assert_eq!(wire.version, "");
     }
 
     /// FR-19 — the `relay-server` verb: spelling locked (a rename silently
@@ -10794,6 +11071,26 @@ mod session_video_tests {
         assert!(at_the_limit.checked().is_some());
     }
 
+    /// FR-132 P2 — the server holds no list of reasons. `default_off`, which
+    /// an agent sends from P2 on, is kept as it came, on the row and on the
+    /// wire, and so is a reason some later agent adds: a new reason never
+    /// waits for a server to ship first.
+    #[test]
+    fn a_reason_this_server_never_listed_is_kept_as_it_came() {
+        for reason in ["switch_off", "default_off", "a_reason_from_a_later_agent"] {
+            let r = SessionVideo {
+                input_reason: Some(reason.into()),
+                ..reading()
+            };
+            assert_eq!(r.clone().checked(), Some(r.clone()), "{reason}");
+            let row: SessionVideo = bson::from_document(bson::to_document(&r).unwrap()).unwrap();
+            assert_eq!(row, r, "{reason}");
+            let wire: SessionVideo =
+                serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+            assert_eq!(wire, r, "{reason}");
+        }
+    }
+
     /// GPU input's missing reason stays absent on the row and on the wire.
     #[test]
     fn no_reason_is_absent_on_the_row_and_the_wire() {
@@ -11376,6 +11673,84 @@ mod fr138_session_ended_tests {
                 assert_eq!(reason, EndReason::AgentDisconnect);
                 assert_eq!(limit, None);
             }
+        }
+    }
+}
+
+// FR-133 P2e — the refusals a person reads (`roomler ssh` and the web app
+// print `message()`, the external-access dialog shows its reason) name the
+// device's daemon, never an "agent". "agent session" is FR-90's name for a
+// kind of session, an identity, and stays. At the end of the file so no
+// anchor above moves.
+#[cfg(test)]
+mod deny_reasons_say_device_not_agent {
+    use super::*;
+
+    #[test]
+    fn the_reworded_reasons_read_as_written() {
+        assert_eq!(
+            ExternalRcDenyReason::DeviceUnsupported.message(),
+            "this device's daemon is too old for external access — it cannot tell the person \
+             at the machine that the controller is from outside the organization"
+        );
+        assert_eq!(
+            SshDenyReason::Unsupported.message(),
+            "this device's daemon does not support roomler SSH (needs a build with the \
+             ssh-server feature)"
+        );
+        assert!(
+            SshDenyReason::GrantExpiredOnArrival
+                .message()
+                .ends_with("; fix that clock, or update its daemon to 0.4.202 or later"),
+            "{}",
+            SshDenyReason::GrantExpiredOnArrival.message()
+        );
+        assert_eq!(
+            SshDenyReason::TargetTooOld.message(),
+            "this device's daemon cannot hold an agent session to one command (needs a build \
+             that advertises ssh-one-command)"
+        );
+        // `crates/tests` (ssh_grant_ack_tests, ssh_service_tests) match these words.
+        assert!(
+            SshDenyReason::Unsupported
+                .message()
+                .contains("does not support roomler SSH")
+        );
+    }
+
+    #[test]
+    fn no_reason_calls_the_daemon_an_agent() {
+        let ssh = [
+            SshDenyReason::OrgDisabled,
+            SshDenyReason::NoPermission,
+            SshDenyReason::DeviceDisabled,
+            SshDenyReason::CallerNotAllowed,
+            SshDenyReason::OriginNotAllowed,
+            SshDenyReason::Unsupported,
+            SshDenyReason::Offline,
+            SshDenyReason::NoOverlayAddress,
+            SshDenyReason::RateLimited,
+            SshDenyReason::BadPublicKey,
+            SshDenyReason::AgentDisabled,
+            SshDenyReason::GrantExpiredOnArrival,
+            SshDenyReason::GrantRefused,
+            SshDenyReason::GrantUnconfirmed,
+            SshDenyReason::ClaimRefused,
+            SshDenyReason::TicketRefused,
+            SshDenyReason::SessionNotAllowed,
+            SshDenyReason::TargetTooOld,
+        ]
+        .map(SshDenyReason::message);
+        let external = ExternalRcDenyReason::ALL.iter().map(|r| r.message());
+        // "agent" as a word, the P4 guard's rule (`scripts/says-roomlerd.cjs`):
+        // a permission's name (`MANAGE_AGENTS`) is one word of its own, and
+        // FR-90's "agent session" is an identity.
+        for text in ssh.into_iter().chain(external) {
+            let rest = text.replace("agent session", "");
+            let says_agent = rest
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|w| w.eq_ignore_ascii_case("agent") || w.eq_ignore_ascii_case("agents"));
+            assert!(!says_agent, "{text:?} says agent");
         }
     }
 }

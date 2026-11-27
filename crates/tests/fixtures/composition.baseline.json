@@ -237,6 +237,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/agent/self/rotate",
+      "methods": "POST"
+    },
+    {
       "path": "/api/agent/self/unenroll",
       "methods": "POST"
     },
@@ -2805,6 +2809,29 @@
         ]
       },
       {
+        "collection": "token_rotation_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "touch_presets",
         "indexes": [
           {
@@ -4781,6 +4808,29 @@
             "key": {
               "owner_id": 1
             }
+          }
+        ]
+      },
+      {
+        "collection": "token_rotation_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },

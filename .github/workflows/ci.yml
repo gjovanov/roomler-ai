@@ -1297,8 +1297,8 @@ jobs:
         # whose marker printed first passed the step.
         run: |
           set -o pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends xvfb xauth
+          # Probe, failover, refresh and install, each bounded (#3710).
+          bash .github/actions/ci-linux-system-deps/ci-apt.sh install -y --no-install-recommends -- xvfb xauth
           xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::pointer capture::x11_cursor keep_busy::host_x11 capture::xwayland_probe_tests indicator::x11 input::layout_x11 virtual_desktop::wm_nudge_tests virtual_desktop::supervise_tests --nocapture --test-threads=1 2>&1 | tee /tmp/x11-tests.log
           grep -q "x11-real: XTest motion reset the idle counter" /tmp/x11-tests.log
           grep -q "x11-real: ran with idle" /tmp/x11-tests.log
@@ -1333,8 +1333,8 @@ jobs:
       - name: The real clipboard on X11 — untouched without the opt-in, its tests run with it (#3813)
         run: |
           set -euo pipefail
-          # The step above refreshed the index and installed xvfb.
-          sudo apt-get install -y --no-install-recommends xvfb xauth xclip
+          # The step above installed xvfb; the helper asks the mirror names again.
+          bash .github/actions/ci-linux-system-deps/ci-apt.sh install -y --no-install-recommends -- xvfb xauth xclip
           export SENTINEL="roomler-3813-sentinel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env -u ROOMLERD_TEST_REAL_CLIPBOARD ROOMLERD_TEST_X11=1 bash -euo pipefail -c '
             holds() { [ "$(xclip -selection clipboard -o 2>/dev/null)" = "$SENTINEL" ]; }
@@ -1442,7 +1442,7 @@ jobs:
         run: |
           set -o pipefail
           command -v xvfb-run >/dev/null || { echo "::error::xvfb-run is missing: the X11 step above did not install xvfb, so no X server can start here"; exit 1; }
-          command -v xclip >/dev/null || sudo apt-get install -y --no-install-recommends xclip || { echo "::error::xclip is missing and did not install: the follow tests copy and read through it"; exit 1; }
+          command -v xclip >/dev/null || bash .github/actions/ci-linux-system-deps/ci-apt.sh install -y --no-install-recommends -- xclip || { echo "::error::xclip is missing and did not install: the follow tests copy and read through it"; exit 1; }
           rc=0
           results=()
           # One invocation: its output to a log, its `x11-real:` line grepped, its
@@ -1655,11 +1655,13 @@ jobs:
       # FR-147 P1: and `one_row::` with `one_row_home::`: root's side of
       # `sudo roomlerd one-row` and the person's own child, whose plans, lines
       # and records every lane tests, on the platform they serve; the `mac`
-      # effects compile in the check above. #4053: and `indicator::panel_gate::` (the panel's gate, on the Mac it serves) with `indicator::console_watch::` (the console-session reader on a real notify(3), a name of its own). #4119: and `indicator::exit_net::` (the panel's exit net, in copies of the test binary: an exit inside a marked call leaves with its own code, 32, never the requested restart's 9, and every other keeps its code, on the libc whose `exit` it hooks).
+      # effects compile in the check above. FR-151 P1: and `helper_gate::`,
+      # the root update helper's wait for live work, beside the child's
+      # `live-work` verb (H6 runs here alone: the child's socket folder). #4053: and `indicator::panel_gate::` (the panel's gate, on the Mac it serves) with `indicator::console_watch::` (the console-session reader on a real notify(3), a name of its own). #4119: and `indicator::exit_net::` (the panel's exit net, in copies of the test binary: an exit inside a marked call leaves with its own code, 32, never the requested restart's 9, and every other keeps its code, on the libc whose `exit` it hooks). #4071: and `daemon_error::` with `app::no_enrollment_exit_tests::`: a `run --supervised` with no config leaves with 78 on a Mac, the one platform where `detect_here` answers FR-43's supervisor. #4157: and `app::config_at_start::`, with `app::no_enrollment_exit_tests::` above (what a root daemon's `run` does with a missing config: an enrolled copy is restored, and with none it ends with `NoConfig` as before). FR-149 P1: and `indicator::session_panel::` (a one-row Mac's questions on the screen worker's panel: the chain, the worker's gate, a late `shown` taken down, D4's two cases, with stood-in readers and the real delegation channel), which compiles in every build, the panel's own `mac` half only with `viewer-indicator-macos` (the check above), with P1's three cells in other modules: the frames and the word (`delegate::tests::`) and the click on the app's road (`localapi_state::tests::`). Its C2 cell is `indicator::panel_gate::`'s. #3559: and `consent::tests::` (the prompt wait on paused time). And `instance_lock::`: the single-instance lock on a Mac's own file system. A fresh path and a file already there are taken; a FIFO or a folder at the lock's path is refused and left as it is.
       - name: cargo check + test the agent's Mac-only units
         run: |
           cargo check -p roomlerd --lib --bins
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests:: one_row:: one_row_home:: indicator::panel_gate:: indicator::console_watch:: indicator::exit_net::
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests:: one_row:: one_row_home:: helper_gate:: indicator::panel_gate:: indicator::console_watch:: indicator::exit_net:: daemon_error:: app::no_enrollment_exit_tests:: app::config_at_start:: indicator::session_panel:: delegate::tests::a_panel_question_is_read_on_the_attached_channel_only delegate::tests::the_panel_word_is_kept_by_equality localapi_state::tests::a_session_panel_click_on_the_roots_question_takes_the_apps_road consent::tests:: instance_lock::
 
       # #3813 — the real clipboard on a Mac. A test that writes it replaces
       # what the person at the Mac had copied, so each such test runs only
@@ -1765,17 +1767,17 @@ jobs:
       # (`crates/agent-core/src/machine.rs`): `ioreg`'s IOPlatformUUID, and on
       # a virtual Mac the VM's own en0 address. The parsers are tested on
       # every lane against a Mac's output; only a Mac runs the real commands,
-      # and this runner is itself a VM, so it reads the virtual-Mac branch.
-      - name: cargo test the root half's machine id on a real Mac (FR-129 B2)
-        run: cargo test -p roomler-node-core --lib -- machine::tests --nocapture
+      # and this runner is itself a VM, so it reads the virtual-Mac branch. #3934: and the host name a crash record carries, which the OS gives (`machine::hostname`): a Mac has no /etc/hostname, and only a Mac shows a reader of that file reading nothing.
+      - name: cargo test the root half's machine id and a crash record's host name on a real Mac (FR-129 B2, #3934)
+        run: cargo test -p roomler-node-core --lib -- machine::tests crash_recorder::tests::a_crash_record_names_its_host_from_the_os --nocapture
 
       # #3802 — a roomlerd process on a Mac takes its folders from the account
       # it runs as, not from the `HOME` sudo kept from its caller
       # (`crates/agent-core/src/appdirs.rs`). Its test runs children of itself
       # with another `HOME`; the rule's other tests run on every lane, and only
-      # a Mac runs the macOS rule against a real account database.
-      - name: cargo test the agent's folders on a real Mac (#3802)
-        run: cargo test -p roomler-node-core --lib -- appdirs::tests
+      # a Mac runs the macOS rule against a real account database. #4157: and the restore of a missing config, which a root daemon's start now runs through. #4379: and the load with no restore that the macOS supervisor's enrolled worker now runs on.
+      - name: cargo test the agent's folders and its config restore on a real Mac (#3802, #4157)
+        run: cargo test -p roomler-node-core --lib -- appdirs::tests config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_restored_config_brings_no_crash_to_the_next_start config::tests::a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written config::tests::previous_copy_reads_the_copy_and_writes_nothing config::tests::load_without_restore_never_reads_or_writes_the_prev
 
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
@@ -1844,6 +1846,14 @@ jobs:
           echo "test binary: $BIN"
           sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" macos_kernel_tests \
             --test-threads=1 --nocapture
+
+      - name: The route monitor's supervisor on macOS (#4382)
+        # #1867's respawn and #4382's stop cells run on Linux in rust-agent's
+        # tunnel-core step. The step above runs only the utun tests, so on a
+        # Mac, the platform of `route -n monitor`, nothing ran them. The same
+        # build as the step above, run as the normal user: the cells start
+        # `sh` stand-ins, never `route`.
+        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib -- monitor_child --test-threads=1 --nocapture
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
@@ -1948,12 +1958,12 @@ jobs:
       # refusal: `appdirs`' Windows tests run in no other lane.
       # #4067 — and the log uploader's, the pool's idle timeout among them: they
       # ran only on Linux.
-      # #4058 — and the config load's line for a missing live file, told from an unreadable one (a refused read on NTFS among them).
+      # #4058 — and the config load's line for a missing live file, told from an unreadable one (a refused read on NTFS among them). #4157 — and a restore that clears the run marks, a copy that does not load leaving nothing written, and the copy a start reads. #4379 — and the load that restores no copy.
       - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
-          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests config::tests::only_a_read_that_found_no_file_is_missing config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_config_that_does_not_parse_keeps_the_unreadable_line config::tests::a_config_whose_read_is_refused_keeps_the_unreadable_line
+          cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings; cargo test -p roomlerdw
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests config::tests::only_a_read_that_found_no_file_is_missing config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_config_that_does_not_parse_keeps_the_unreadable_line config::tests::a_config_whose_read_is_refused_keeps_the_unreadable_line config::tests::a_restored_config_brings_no_crash_to_the_next_start config::tests::a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written config::tests::previous_copy_reads_the_copy_and_writes_nothing config::tests::load_without_restore_never_reads_or_writes_the_prev
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |
@@ -2242,12 +2252,12 @@ jobs:
       # this lane's elevated token. The other lane that runs
       # `roomler-node-core` is Linux, where these tests do not exist. Also the
       # elevated writers' merge base (`config::tests::machine_merge_base`): a
-      # machine config is folded into only when it is private.
+      # machine config is folded into only when it is private (#4176: and its copy).
       # ⚠️ No `: ` in a plain YAML value (`machine_tree:: x` is a mapping, and
       # the whole workflow file fails to load), and no ` #` in a name.
       - name: "The machine tree is repaired and checked, the anchor key's check, and the machine folder by handle (#3073, #3609, #3737, FR-145)"
         if: ${{ !cancelled() }}
-        run: cargo test -p roomler-node-core --lib -- machine_tree::tests machine_key::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make config::tests::machine_merge_base crash_recorder::tests machine_tree::held::tests --nocapture
+        run: cargo test -p roomler-node-core --lib -- machine_tree::tests machine_key::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make config::tests::machine_merge_base config::tests::machine_copy crash_recorder::tests machine_tree::held::tests --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.
@@ -2334,10 +2344,10 @@ jobs:
       # (its apt-retries step sits ~400 lines further down, long after this),
       # so `ci-ffmpeg-*` was one superseded libvpx version away from the same
       # outage the GTK set just caused.
-      - name: Configure apt retries and refresh the index
+      - name: Configure apt retries, reach the mirror, refresh the index
         run: |
           echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update -qq
+          bash .github/actions/ci-linux-system-deps/ci-apt.sh prepare || echo "::warning::ci-apt.sh prepare failed (rc=$?): the cached-apt step below runs unbounded, as before #3710"
 
       - name: Install build deps (cached apt)
         # libclang is bindgen's runtime requirement (ffmpeg-sys-next and
@@ -2361,8 +2371,8 @@ jobs:
           sudo ldconfig
           if ! ldconfig -p | grep -q 'libvpx\.so'; then
             echo "::warning::cached apt set did not deliver libvpx — installing directly"
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libvpx-dev
+            bash .github/actions/ci-linux-system-deps/ci-apt.sh fallback \
+              pkg-config libclang-dev libvpx-dev
           fi
           ldconfig -p | grep 'libvpx\.so' || { echo "::error::libvpx.so still not loadable after the fallback install"; exit 1; }
       # 2026-10-24: this lane's cache was evicted, bindgen ran fresh under the
@@ -2849,6 +2859,9 @@ jobs:
       - name: Report (always, so a red run shows WHAT moved)
         if: always()
         run: bash scripts/name-audit.sh --summary
+      - name: Person-facing text says roomlerd, not agent (FR-133 P4)
+        if: ${{ !cancelled() }}
+        run: node scripts/says-roomlerd.cjs --check
 
   frontend:
     name: Frontend checks
@@ -3137,11 +3150,15 @@ jobs:
         run: bash scripts/macos-postinstall-check.sh --bash 3.2
       # #3881 — the served install script's own output (the release it names,
       # the installed daemon's --version), under the /bin/sh of both hosts.
+      # #3931 — each shell's verdict is read even when another's failed.
       - name: Run the install script's output cases under dash, Debian's /bin/sh
+        if: ${{ !cancelled() }}
         run: bash scripts/install-sh-output-check.sh --shell dash
       - name: Run the install script's output cases under bash 5 in POSIX mode
+        if: ${{ !cancelled() }}
         run: bash scripts/install-sh-output-check.sh --shell bash
       - name: Run the install script's output cases under bash 3.2 in POSIX mode, the version of macOS's /bin/sh
+        if: ${{ !cancelled() }}
         run: bash scripts/install-sh-output-check.sh --shell bash3.2
 
   vendored-sctp:

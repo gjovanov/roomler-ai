@@ -2,7 +2,7 @@
 
 ### CORS Fully Permissive — discovered 2026-03-10
 **Symptom:** Any origin can make authenticated requests to the API
-**Root cause:** `CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)` in `crates/api/src/lib.rs:20-23`
+**Root cause:** `CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)` in `build_router` in `crates/api/src/lib.rs`, as that function stood when this was found (lines 20-23 of the file at `97dc189a4`, 2026-03-10; the file has been rewritten since)
 **Status:** OPEN — CRITICAL risk for production
 **Fix proposed:** Use `settings.app.cors_origins` (already defined in Settings struct) to configure allowed origins:
 ```rust
@@ -22,7 +22,7 @@ let cors = CorsLayer::new()
 
 ### JWT Default Secret — discovered 2026-03-10
 **Symptom:** Default JWT secret is "change-me-in-production"
-**Root cause:** `crates/config/src/settings.rs:1595` sets `.set_default("jwt.secret", "change-me-in-production")`
+**Root cause:** `crates/config/src/settings.rs:1622` sets `.set_default("jwt.secret", "change-me-in-production")`
 **Status:** OPEN — production MUST override via `ROOMLER__JWT__SECRET` env var
 **Recurrence prevention:** Health check verifies JWT secret length > 32 chars in production
 

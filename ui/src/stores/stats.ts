@@ -336,12 +336,27 @@ export const useStatsStore = defineStore('stats', () => {
   const relayCurrent = ref<RelayCurrent | null>(null)
   const mesh = ref<MeshPayload | null>(null)
   const error = ref<string | null>(null)
+  // #4257 — the overview and the mesh are ONE org's each: the org of the
+  // latest fetch, answered or not. A fetch for another org drops the previous
+  // org's at once, and only the latest fetch writes. The org dashboard is
+  // reused when only its org changes, and its poll and its org watch can each
+  // have a fetch in flight: an answer for the org asked before is dropped.
+  const overviewTenantId = ref<string | null>(null)
+  const meshTenantId = ref<string | null>(null)
+  let overviewSeq = 0
+  let meshSeq = 0
 
   async function fetchOverview(tenantId: string): Promise<TenantOverview | null> {
+    const mySeq = ++overviewSeq
+    if (overviewTenantId.value !== null && overviewTenantId.value !== tenantId) overview.value = null
+    overviewTenantId.value = tenantId
     try {
-      overview.value = await api.get<TenantOverview>(`/tenant/${tenantId}/stats/overview`)
+      const resp = await api.get<TenantOverview>(`/tenant/${tenantId}/stats/overview`)
+      if (mySeq !== overviewSeq) return overview.value
+      overview.value = resp
       error.value = null
     } catch (e) {
+      if (mySeq !== overviewSeq) return overview.value
       // 404 = not a member / stats hidden — treat as "no panel", never throw
       // into the dashboard.
       error.value = e instanceof Error ? e.message : 'overview failed'
@@ -362,10 +377,16 @@ export const useStatsStore = defineStore('stats', () => {
 
   /** Overlay topology for the dashboard mesh graph (member-visible). */
   async function fetchMesh(tenantId: string): Promise<MeshPayload | null> {
+    const mySeq = ++meshSeq
+    if (meshTenantId.value !== null && meshTenantId.value !== tenantId) mesh.value = null
+    meshTenantId.value = tenantId
     try {
-      mesh.value = await api.get<MeshPayload>(`/tenant/${tenantId}/stats/mesh`)
+      const resp = await api.get<MeshPayload>(`/tenant/${tenantId}/stats/mesh`)
+      if (mySeq !== meshSeq) return mesh.value
+      mesh.value = resp
       error.value = null
     } catch (e) {
+      if (mySeq !== meshSeq) return mesh.value
       // 404 = not a member / stats off — the panel just doesn't render.
       error.value = e instanceof Error ? e.message : 'mesh failed'
       mesh.value = null

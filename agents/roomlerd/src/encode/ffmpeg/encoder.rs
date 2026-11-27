@@ -4547,6 +4547,29 @@ mod tests {
         }
     }
 
+    /// FR-148 — `qsv_rate_mode`'s declared values against this parser,
+    /// fed through the config fallback as `QsvRateOpen::plan` reads it: each
+    /// declared value reads as a mode of its own, and each mode is declared
+    /// (`config_surface::pin_declared_values`). The match has no wildcard, so
+    /// a new mode fails to compile here until it is listed.
+    #[test]
+    fn qsv_rate_mode_declares_every_mode_the_open_reads() {
+        let modes = [QsvRateMode::Cbr, QsvRateMode::Qvbr].map(|m| match m {
+            QsvRateMode::Cbr | QsvRateMode::Qvbr => m,
+        });
+        crate::config_surface::pin_declared_values(
+            "qsv_rate_mode",
+            |cfg| {
+                QsvRateMode::parse(
+                    crate::config::env_fallbacks(cfg)
+                        .remove("QSV_RATE_MODE")
+                        .as_deref(),
+                )
+            },
+            &modes,
+        );
+    }
+
     /// The parameters with the switch on. An HEVC or H.264 QSV open asks for
     /// 0.9 × its cap under `maxrate` at the cap, `global_quality` kept, and
     /// `select_rc_mode` reads only `rc_max_rate == bit_rate` as constant bitrate
@@ -4854,6 +4877,422 @@ mod tests {
             pct(90),
             pct(99),
         );
+    }
+
+    /// FR-148 O18 — how each FFmpeg hardware encoder spends after a gap in
+    /// its timestamps. Both data-channel pumps run their capacity gate before
+    /// they capture (`peer.rs`), so a budget's hold of H ms reaches the encoder
+    /// as a pts gap of one interval plus H: this encoder stamps every frame
+    /// with its capture time (`stamp_frame`). libvpx grants that gap
+    /// (`encode::libvpx`, `a_hold_charged_the_interval_is_not_granted`), and
+    /// B4f bounds only the VP9-444 pump's charge. This cell measures the same
+    /// for each NVENC and AMF encoder, opened as a relayed session opens it
+    /// (`new_preferred` with `constrained`; `hevc_nvenc` in 4:4:4 through
+    /// `new_hevc_adaptive`), on the libvpx cell's content: a grey frame with a
+    /// window of fresh noise on every frame, so the cap binds.
+    ///
+    /// Two arms, a fresh encoder each. `hold`: three seconds at 1/fps steps
+    /// (the third is on time), a pts jump of the hold, three seconds at 1/fps
+    /// steps, then tail frames until every one of those has left the encoder.
+    /// `interval`: the same frames with no jump, which is what B4f hands an
+    /// encoder. A packet is the frame it was sent for, in order (no B-frames,
+    /// one packet a frame), so an encoder that answers a call late is still
+    /// counted right: `L` is the calls that returned nothing before the first
+    /// packet, `irregular` the calls after it that did not return exactly one.
+    /// One `O18 ` line per encoder and arm. `x_on_time` is the first second
+    /// after the hold over the on-time second, and the verdict takes the
+    /// libvpx cell's two thresholds: `grants` at 1.25 or more, `holds` at 1.10
+    /// or less, `between` otherwise. `cap_binds=no` (the on-time second spent
+    /// under 0.85 of the cap) means the line says nothing: that row needs a
+    /// wider noise window.
+    ///
+    /// Each row is its own test ([`O18Row`]), so a row is run by name and reads
+    /// no environment: every row holds 500 ms, and its noise window is 200x120
+    /// at 640x360, scaled with the frame. NVENC and AMF only: any other family
+    /// is refused by name. On a host with the GPU (`o18_` runs the three rows
+    /// in turn, `o18_r2` one of them):
+    ///
+    /// ```text
+    /// cargo test -p roomlerd --lib --features ffmpeg-encoder -- --ignored o18_ \
+    ///   --nocapture --test-threads=1 --skip clipboard::
+    /// ```
+    fn o18_spend_after_a_hold(row: O18Row) {
+        /// What one arm read, frame by frame in the order sent.
+        struct Read {
+            bytes: Vec<usize>,
+            qp: Vec<Option<i32>>,
+            keys: Vec<usize>,
+            latency: usize,
+            irregular: usize,
+            tail: usize,
+        }
+        /// The open's own log lines (the option tier it opened at), printed.
+        fn logged<T>(open: impl FnOnce() -> T) -> T {
+            let subscriber = tracing_subscriber::fmt()
+                .with_target(false)
+                .with_ansi(false)
+                .with_test_writer()
+                .finish();
+            tracing::subscriber::with_default(subscriber, open)
+        }
+        let O18Row {
+            names,
+            w,
+            h,
+            fps,
+            maxrate,
+            with_444,
+        } = row;
+        let hold_ms: u64 = 500;
+        // The noise window, centred and scaled with the frame (200x120 at 640x360).
+        let (ww, wh) = ((w * 200 / 640).min(w), (h * 120 / 360).min(h));
+        let (x0, y0) = ((w - ww) / 2, (h - wh) / 2);
+        let f = fps as usize;
+        let (pre, post) = (3 * f, 3 * f);
+        let slot_us = |n: usize| 1_000 + n as u64 * 1_000_000 / u64::from(fps);
+        println!(
+            "O18 setup dims={w}x{h} fps={fps} maxrate={maxrate} hold_ms={hold_ms} \
+             window={ww}x{wh}@{x0},{y0} frames={pre}+{post} frame_cap_bytes={}",
+            maxrate / f / 8
+        );
+        let frame_at = |t_us: u64, seed: &mut u64| -> Frame {
+            let mut buf = vec![40u8; (w * h * 4) as usize];
+            for y in y0..y0 + wh {
+                for x in x0..x0 + ww {
+                    *seed ^= *seed << 13;
+                    *seed ^= *seed >> 7;
+                    *seed ^= *seed << 17;
+                    let i = ((y * w + x) * 4) as usize;
+                    buf[i..i + 3].copy_from_slice(&seed.to_le_bytes()[..3]);
+                }
+            }
+            Frame {
+                width: w,
+                height: h,
+                stride: w * 4,
+                pixel_format: PixelFormat::Bgra,
+                data: buf.into(),
+                monotonic_us: t_us,
+                monitor: 0,
+                damage: crate::capture::Damage::Unknown,
+                source: None,
+            }
+        };
+        // One arm: the same frames every time, with `jump_us` added to every
+        // pts from the first frame after the hold on.
+        let run = |enc: &mut FfmpegEncoder, jump_us: u64| -> std::result::Result<Read, String> {
+            let mut seed = 0x0018_5eed_u64;
+            let want = pre + post;
+            let mut packets: Vec<EncodedPacket> = Vec::new();
+            let (mut latency, mut irregular, mut n) = (None, 0, 0);
+            while packets.len() < want {
+                if n >= want + 30 {
+                    return Err(format!(
+                        "{} packets for {want} frames after {n} calls",
+                        packets.len()
+                    ));
+                }
+                let t = slot_us(n) + if n >= pre { jump_us } else { 0 };
+                let got = enc
+                    .encode_sync(&frame_at(t, &mut seed))
+                    .map_err(|e| format!("frame {n}: {e:#}"))?;
+                if latency.is_none() && !got.is_empty() {
+                    latency = Some(n);
+                }
+                if latency.is_some() && got.len() != 1 {
+                    irregular += 1;
+                }
+                packets.extend(got);
+                n += 1;
+            }
+            packets.truncate(want);
+            Ok(Read {
+                bytes: packets.iter().map(|p| p.data.len()).collect(),
+                qp: packets.iter().map(|p| p.qp).collect(),
+                keys: (0..want).filter(|&i| packets[i].is_keyframe).collect(),
+                latency: latency.unwrap_or(0),
+                irregular,
+                tail: n.saturating_sub(want),
+            })
+        };
+        // The opened context, read back.
+        let context = |enc: &FfmpegEncoder| -> String {
+            // SAFETY: read-only field reads of the opened context, which `enc`
+            // owns for the duration of the borrow.
+            unsafe {
+                let c = enc.encoder.as_ptr();
+                format!(
+                    "bit_rate={} rc_max_rate={} rc_buffer_size={} rc_initial_buffer_occupancy={} \
+                     time_base={}/{} framerate={}/{} gop={} max_b_frames={}",
+                    (*c).bit_rate,
+                    (*c).rc_max_rate,
+                    (*c).rc_buffer_size,
+                    (*c).rc_initial_buffer_occupancy,
+                    (*c).time_base.num,
+                    (*c).time_base.den,
+                    (*c).framerate.num,
+                    (*c).framerate.den,
+                    (*c).gop_size,
+                    (*c).max_b_frames,
+                )
+            }
+        };
+        // The encoder's private options as it opened, its own defaults included.
+        let private = |enc: &FfmpegEncoder| -> String {
+            let keys: &[&str] = if enc.encoder_name.ends_with("_nvenc") {
+                &[
+                    "preset",
+                    "tune",
+                    "rc",
+                    "cq",
+                    "multipass",
+                    "rc-lookahead",
+                    "delay",
+                    "zerolatency",
+                    "forced-idr",
+                    "spatial-aq",
+                    "temporal-aq",
+                    "no-scenecut",
+                    "b_ref_mode",
+                ]
+            } else {
+                &[
+                    "usage",
+                    "quality",
+                    "rc",
+                    "qp_i",
+                    "qp_p",
+                    "latency",
+                    "async_depth",
+                    "query_timeout",
+                    "enforce_hrd",
+                    "filler_data",
+                    "skip_frame",
+                    "preencode",
+                    "vbaq",
+                    "preanalysis",
+                    "max_au_size",
+                ]
+            };
+            // `-` is an option this encoder does not have.
+            keys.iter()
+                .map(|k| {
+                    let Ok(key) = std::ffi::CString::new(*k) else {
+                        return format!("{k}=-");
+                    };
+                    let mut out: *mut u8 = std::ptr::null_mut();
+                    // SAFETY: `priv_data` is the opened codec's private context,
+                    // which `enc` owns for the borrow; `av_opt_get` allocates
+                    // `out` when it answers, and it is freed here.
+                    unsafe {
+                        let c = enc.encoder.as_ptr();
+                        if ffmpeg_next::ffi::av_opt_get((*c).priv_data, key.as_ptr(), 0, &mut out)
+                            < 0
+                            || out.is_null()
+                        {
+                            return format!("{k}=-");
+                        }
+                        let v = std::ffi::CStr::from_ptr(out.cast::<std::os::raw::c_char>())
+                            .to_string_lossy()
+                            .into_owned();
+                        ffmpeg_next::ffi::av_free(out.cast());
+                        format!("{k}={v}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut cells: Vec<(&'static str, bool)> = Vec::new();
+        for raw in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if !(raw.ends_with("_nvenc") || raw.ends_with("_amf")) {
+                println!(
+                    "O18 name={raw} refused: this round measures NVENC and AMF only \
+                     (AMD's driver faults on hevc_vulkan)"
+                );
+                continue;
+            }
+            match FfmpegEncoder::static_name(raw) {
+                Some(name) => cells.push((name, false)),
+                None => println!("O18 name={raw} refused: no cascade table carries it"),
+            }
+        }
+        if with_444 {
+            cells.push(("hevc_nvenc", true));
+        }
+        for (name, chroma444) in cells {
+            let chroma = if chroma444 { "444" } else { "420" };
+            let mut arms: Vec<Vec<usize>> = Vec::new();
+            for (arm, jump_us) in [("hold", hold_ms * 1_000), ("interval", 0)] {
+                let opened = logged(|| {
+                    if chroma444 {
+                        FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate, 0, true, true)
+                    } else {
+                        FfmpegEncoder::new_preferred(name, w, h, fps, maxrate, 0, true)
+                    }
+                });
+                let mut enc = match opened {
+                    Ok(enc) if chroma444 && !enc.chroma444() => {
+                        println!(
+                            "O18 name={name} chroma={chroma} arm={arm} open=fell-back-to-420 ({})",
+                            enc.encoder_name
+                        );
+                        break;
+                    }
+                    Ok(enc) => enc,
+                    Err(e) => {
+                        println!(
+                            "O18 name={name} chroma={chroma} arm={arm} open=failed error={e:#}"
+                        );
+                        break;
+                    }
+                };
+                println!(
+                    "O18 open name={name} chroma={chroma} arm={arm} opened={} cq={} hrd_pct={} {} \
+                     options=[{}] private=[{}]",
+                    enc.encoder_name,
+                    enc.cq,
+                    enc.hrd_pct,
+                    context(&enc),
+                    encoder_options(name, maxrate, enc.cq, false, chroma444, true).2,
+                    private(&enc),
+                );
+                let read = run(&mut enc, jump_us);
+                drop(enc);
+                let r = match read {
+                    Ok(r) => r,
+                    Err(e) => {
+                        println!(
+                            "O18 name={name} chroma={chroma} arm={arm} encode=failed error={e}"
+                        );
+                        continue;
+                    }
+                };
+                let sum = |a: usize, b: usize| r.bytes[a..b].iter().sum::<usize>();
+                let qp = |a: usize, b: usize| -> String {
+                    let got: Vec<i32> = r.qp[a..b].iter().flatten().copied().collect();
+                    if got.is_empty() {
+                        "-".to_string()
+                    } else {
+                        format!("{:.1}", got.iter().sum::<i32>() as f64 / got.len() as f64)
+                    }
+                };
+                let before = [sum(0, f), sum(f, 2 * f), sum(2 * f, pre)];
+                let on_time = before[2];
+                let after = [
+                    sum(pre, pre + f),
+                    sum(pre + f, pre + 2 * f),
+                    sum(pre + 2 * f, pre + post),
+                ];
+                let x = after.map(|s| s as f64 / on_time.max(1) as f64);
+                let verdict = if x[0] >= 1.25 {
+                    "grants"
+                } else if x[0] <= 1.10 {
+                    "holds"
+                } else {
+                    "between"
+                };
+                let cap_binds = on_time as f64 >= 0.85 * maxrate as f64 / 8.0;
+                println!(
+                    "O18 name={name} chroma={chroma} dims={w}x{h} fps={fps} maxrate={maxrate} \
+                     hold_ms={hold_ms} arm={arm} L={} irregular={} tail={} cap_binds={} \
+                     on_time={on_time} after={after:?} first6={:?} qp_on_time={} \
+                     qp_after=[{}, {}, {}] keys={:?} before={before:?} \
+                     x_after=[{:.2}, {:.2}, {:.2}] x_on_time={:.2} verdict={verdict}",
+                    r.latency,
+                    r.irregular,
+                    r.tail,
+                    if cap_binds { "yes" } else { "no" },
+                    &r.bytes[pre..pre + 6],
+                    qp(2 * f, pre),
+                    qp(pre, pre + f),
+                    qp(pre + f, pre + 2 * f),
+                    qp(pre + 2 * f, pre + post),
+                    r.keys,
+                    x[0],
+                    x[1],
+                    x[2],
+                    x[0],
+                );
+                arms.push(r.bytes);
+            }
+            // The two arms differ only in the hold, so the frames they agree on
+            // are the frames the gap did not move.
+            if let [hold, interval] = &arms[..] {
+                let first = |v: &[usize]| v[pre..pre + f].iter().sum::<usize>();
+                let same = hold.iter().zip(interval).filter(|(a, b)| a == b).count();
+                let most = hold
+                    .iter()
+                    .zip(interval)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
+                println!(
+                    "O18 name={name} chroma={chroma} summary hold_over_interval={:.2} \
+                     same_frames={same}/{} max_frame_diff={most}",
+                    first(hold) as f64 / first(interval).max(1) as f64,
+                    hold.len(),
+                );
+            }
+        }
+    }
+
+    /// One row of [`o18_spend_after_a_hold`], fixed in the code rather than read
+    /// from the environment, so a run is named by its test.
+    struct O18Row {
+        /// The encoders, comma-separated: NVENC and AMF names only.
+        names: &'static str,
+        w: u32,
+        h: u32,
+        fps: u32,
+        /// The cap, in bits a second.
+        maxrate: usize,
+        /// `hevc_nvenc` in 4:4:4 as well.
+        with_444: bool,
+    }
+
+    /// Every NVENC and AMF encoder the cascades carry.
+    const O18_NAMES: &str = "h264_nvenc,hevc_nvenc,av1_nvenc,h264_amf,hevc_amf,av1_amf";
+
+    /// R1: 640x360 at 30 fps and 3 Mbit/s.
+    #[test]
+    #[ignore = "needs a hardware encoder; a measurement: run by name with --ignored --nocapture"]
+    fn o18_r1_640x360_at_30_fps_and_3_mbit() {
+        o18_spend_after_a_hold(O18Row {
+            names: O18_NAMES,
+            w: 640,
+            h: 360,
+            fps: 30,
+            maxrate: 3_000_000,
+            with_444: true,
+        });
+    }
+
+    /// R2: 1280x720 at 30 fps and 2 Mbit/s.
+    #[test]
+    #[ignore = "needs a hardware encoder; a measurement: run by name with --ignored --nocapture"]
+    fn o18_r2_1280x720_at_30_fps_and_2_mbit() {
+        o18_spend_after_a_hold(O18Row {
+            names: O18_NAMES,
+            w: 1280,
+            h: 720,
+            fps: 30,
+            maxrate: 2_000_000,
+            with_444: true,
+        });
+    }
+
+    /// R3: R2 at 60 fps, HEVC only.
+    #[test]
+    #[ignore = "needs a hardware encoder; a measurement: run by name with --ignored --nocapture"]
+    fn o18_r3_1280x720_at_60_fps_hevc() {
+        o18_spend_after_a_hold(O18Row {
+            names: "hevc_nvenc,hevc_amf",
+            w: 1280,
+            h: 720,
+            fps: 60,
+            maxrate: 2_000_000,
+            with_444: false,
+        });
     }
 }
 

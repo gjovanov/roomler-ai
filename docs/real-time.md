@@ -57,8 +57,8 @@ The shared rules live in `crates/remote_control/src/upgrade_auth.rs`.
 
 From 0.4.210 every native dial puts its credential in an `Authorization: Bearer`
 header whose value is marked sensitive: the daemon's control socket
-(`agents/roomlerd/src/signaling.rs:1842`), its central and regional DERP sockets
-(`agents/roomlerd/src/derp.rs:381`) and the CLI's tunnel-client socket. The URL
+(`agents/roomlerd/src/signaling.rs:1868`), its central and regional DERP sockets
+(`agents/roomlerd/src/derp.rs:424`) and the CLI's tunnel-client socket. The URL
 names the role and the tenant only. The rule is one function in each client
 (`agents/roomlerd/src/ws_connect.rs:224`, `agents/roomler-cli/src/forward.rs:442`):
 
@@ -91,7 +91,10 @@ target directive loses to a span-scoped one such as `[org]=trace`, which
 `EnvFilter` lets win.
 
 Delivery across pods: WS sessions are pod-local; chat, presence, and notification
-events fan out through Redis pub/sub so every pod pushes to its own sockets.
+events fan out through Redis pub/sub so every pod pushes to its own sockets. Each pod's
+subscriber probes its own connection, so one that a lost Redis left deaf is found and subscribes
+again within a minute of Redis answering, losing the events in between (at-most-once)
+([multi-pod-scale-out.md](multi-pod-scale-out.md#the-subscriptions-3952)).
 
 ## User plane (browser)
 
@@ -167,13 +170,13 @@ sequenceDiagram
 
 | Moment | Where | What happens |
 |---|---|---|
-| Join | `ConferenceView.vue:607`, `stores/rooms.ts:194` `callConnectionId`, `:200` `joinCall`; server `call.rs:152`, `dao/room.rs:749` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:184`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
-| Leave | `rooms.ts:209` `leaveCall`, `call.rs:225`, `finalize_call_leave_db` (`call.rs:302`), `leave_participant` (`dao/room.rs:951`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
+| Join | `ConferenceView.vue:613`, `stores/rooms.ts:273` `callConnectionId`, `:279` `joinCall`; server `call.rs:152`, `dao/room.rs:749` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:263`, 10 s) for its socket's id (`stores/ws.ts:416` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:644`). A join on a connection that already holds a session closes that one first |
+| Leave | `rooms.ts:288` `leaveCall`, `call.rs:225`, `finalize_call_leave_db` (`call.rs:302`), `leave_participant` (`dao/room.rs:951`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
 | Socket close | `ws_media.rs:83` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:134`), and the same leave runs naming the socket (`:141`) |
 | A miss | `dao/room.rs:960`, the close itself `close_sessions` (`:1028`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
 | Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
-| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:288`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
-| Room deleted | `crates/modules/chat/src/room.rs:364`, `dao/room.rs:348` `cascade_delete` | The room's `room_members` rows go with its document, and their sessions with them. The call ends for everyone in it, on the pod serving it ([below](#a-room-deleted-mid-call-ends-its-call)) |
+| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`crates/modules/conference/src/lib.rs:290`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
+| Room deleted | `crates/modules/chat/src/room.rs:373`, `dao/room.rs:348` `cascade_delete` | The room's `room_members` rows go with its document, and their sessions with them. The call ends for everyone in it, on the pod serving it ([below](#a-room-deleted-mid-call-ends-its-call)) |
 
 What a leave naming connection C may close:
 
@@ -262,7 +265,7 @@ playback of another room's file, or of a removed one.
 The gate checks membership once, at `media:join`. The seat it admits lasts only as long as
 that membership: when someone is removed from the org or leaves it, or leaves the room, any
 seat they hold in a call of that org or room goes at once, on whichever pod serves the call.
-When no word of it reaches that pod, the pod finds it by its own seat check, within 30 s
+When no word of it reaches that pod, the pod finds it by its own seat check, within 40 s
 ([below](#the-pod-serving-a-call-checks-its-own-seats)).
 The membership's owner tells `conference` through core's `MembershipLifecycle` hook
 (`crates/core/src/hooks.rs:194`), after the membership row is gone, so nothing can be
@@ -292,7 +295,7 @@ sequenceDiagram
 |---|---|---|
 | Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:239`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:251`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
 | Left the room (`POST …/room/{room_id}/leave`) | `crates/modules/chat/src/room.rs:239`, `room_member_removed` | their seats in that room's call (`revoke.rs:223`). The membership row held their call sessions, so the leave itself drops the call's count (`dao/room.rs:526`), and a call they were the last one in ends (`call.rs:331` `settle_call_after_departure`) |
-| The room was deleted (`DELETE …/room/{room_id}`) | `crates/modules/chat/src/room.rs:384`, `room_removed` | the room's call, for everyone in it (`revoke.rs:120` `room_deleted`): every seat, the router, the claim and the call's stats record ([below](#a-room-deleted-mid-call-ends-its-call)) |
+| The room was deleted (`DELETE …/room/{room_id}`) | `crates/modules/chat/src/room.rs:393`, `room_removed` | the room's call, for everyone in it (`revoke.rs:120` `room_deleted`): every seat, the router, the claim and the call's stats record ([below](#a-room-deleted-mid-call-ends-its-call)) |
 
 - The seats close on the pod that holds them (`revoke.rs:355` `withdraw_seats_here`), reached
   over the bus as `media.withdraw_seats` when it is the other pod (`revoke.rs:316`,
@@ -300,10 +303,13 @@ sequenceDiagram
   bus deadline, or no bus on this pod) is not taken to mean the pod is gone: it may be alive
   and serving the call. It is a warning with the org, the room, the person and the pod
   (`alert = membership_seat_unreached`), conference's hook still answers `Ok` so the hooks
-  after it run, and the pod serving the call ends the seat by its own check
-  ([below](#the-pod-serving-a-call-checks-its-own-seats)).
+  after it run, and the pod serving the call ends the seat by its own check where it runs
+  one ([below](#the-pod-serving-a-call-checks-its-own-seats)). A request that was only late
+  closed the seat there and settled nothing: a call a room leave emptied stays `in_progress`
+  at count 0 until the next leave in it or the next pod start (`maintenance.rs:21`
+  `stale_call_reset`), as before the check. An org removal's hook settles the call itself.
 - `room:call_ended` is what the web client already reads as "this call is over for you"
-  (`ui/src/stores/ws.ts:349`): it tears the call down, with no client change.
+  (`ui/src/stores/ws.ts:351`): it tears the call down, with no client change.
 - A join already on its way when the membership ends asks the gate again once its seat
   exists (`ws_media.rs:457`): either the withdrawal sees that seat, or the seat sees the
   membership gone and closes itself before the client hears anything.
@@ -335,8 +341,9 @@ the pod that took the membership's end has no bus, when the pod serving the call
 older image during a roll, or when a membership goes by a path that never calls the hook,
 no word reaches the seat, and the pod serving the call is not gone: the person would keep
 hearing and being heard in a meeting of an org or a room they no longer belong to. So that
-pod checks its own seats (`crates/modules/conference/src/seat_check.rs`), and a seat whose
-admission reads as gone twice in a row, a pass apart, ends there.
+pod checks its own seats (`crates/modules/conference/src/seat_check.rs`). Its reads pick the
+seats whose admission reads as gone twice in a row, a pass apart; the room guard `media:join`
+runs then decides each, and only its refusal ends the seat there.
 
 ```mermaid
 sequenceDiagram
@@ -348,66 +355,143 @@ sequenceDiagram
     R--xO: media.withdraw_seats lost, late, no bus, or an older image
     R->>R: warn alert=membership_seat_unreached, the hook answers Ok, chat's hook runs
     loop every SEAT_CHECK_SECS = 10 s
-        O->>O: read its own seats into owned values, the person in the room and their connections
+        O->>O: read its seats into owned values, each connection with its send transport
         O->>DB: rooms by _id, tenant_members, room_members of members-only rooms, within 5 s
-        DB-->>O: one complete read, or a failed one that changes nothing
-        O->>O: seats_to_end, a second miss in a row ends the seat
+        DB-->>O: one complete read, each document decoded on its own, or a failed read
+        O->>O: seats_to_end, a second miss in a row is a verdict
     end
-    O->>O: close the connections seated before the deciding read
+    O->>DB: the room guard of media:join, for each verdict, all within 5 s
+    DB-->>O: a refusal ends the seat, an admission, a failure or no answer keeps it
+    O->>O: close each connection still holding the seat read, same person and send transport
     O->>M: room:call_ended, reason not_a_member
     O->>P: media:peer_left for each closed connection
-    O->>DB: close their open call sessions, settle the call
     O->>O: warn seat check ended a call seat whose admission is gone, alert=seat_check_ended
+    O->>DB: close their open call sessions, settle the call once
 ```
 
 - **The loop.** Every pod runs it in a task of its own (`seat_check::spawn`,
-  `seat_check.rs:195`, started at `crates/modules/conference/src/lib.rs:194`), every
-  `SEAT_CHECK_SECS` = 10 s (`seat_check.rs:74`), the room reconcile's cadence. A pass first
-  reads the pod's seats out of the room manager into owned values (`seats_here`, `:217`), so
-  no guard of it is held across a read.
-- **What it re-reads.** Two of the three checks `media:join` passed (`media_gate.rs:114`),
-  with the room guard's own rule: membership of the room's org (the `tenant_id` the room
-  records), and, in a room whose visibility `requires_membership()` (Private, Secret), a room
-  membership. Each counts as `is_member` counts it: `{tenant_id, user_id}` for the org,
-  `{tenant_id, room_id, user_id}` for the room. The third, an open call session for the
-  connection, is not re-read: a person's other tab, or a call whose sessions a sweep closed,
-  would lose a seat they are entitled to.
-- **One read a pass, three queries, from the primary** (`read_admissions_unbounded`, `:337`):
-  the rooms by `_id`; `tenant_members` by `$in` lists of orgs and people, on its unique
-  `(tenant_id, user_id)` index (`crates/db/src/indexes.rs:155`); and, for the members-only
-  rooms only, `room_members` by `$in` lists of rooms and people, on its unique
-  `(room_id, user_id)` index (`crates/modules/chat/src/lib.rs:224`). Each has a projection
-  and reads the primary whatever the connection string says (`:440`), so a person added a
+  `seat_check.rs:280`, started at `crates/modules/conference/src/lib.rs:194`), every
+  `SEAT_CHECK_SECS` = 10 s (`seat_check.rs:109`), the room reconcile's cadence. A pass is a
+  read half and an end half, in that order (`check_seats_once`, `:341`). The read half
+  (`read_seats`, `:370`) first reads the pod's seats out of the room manager into owned
+  values (`seats_here`, `:325`): each person in each room, with their connections and the
+  seat each holds, its send transport's id (`HeldSeat`, `:320`), which every join makes
+  anew. No guard of the room manager is held across a read. The end half (`end_seats`,
+  `:418`) ends only what the read half hands it, and a test drives the two apart to act
+  between them.
+- **The reads pick, the guard decides.** The reads re-check two of the three checks
+  `media:join` passed (`media_gate.rs:114`): membership of the room's org (the `tenant_id`
+  the room records), and, in a room whose visibility `requires_membership()` (Private,
+  Secret), a room membership. Each counts as `is_member` counts it: `{tenant_id, user_id}`
+  for the org, `{tenant_id, room_id, user_id}` for the room. The third, an open call session
+  for the connection, is not re-read: a person's other tab, or a call whose sessions a sweep
+  closed, would lose a seat they are entitled to. What the reads find is a cheap filter: it
+  picks the seats to ask the room guard about, and the guard's own answer decides each, so
+  any admission path the guard has or gains keeps its seats with no change here.
+- **One read a pass, three queries, from the primary** (`read_admissions_unbounded`,
+  `:907`): the rooms by `_id`; `tenant_members` by `$in` lists of the rooms' orgs and the
+  people, on its unique `(tenant_id, user_id)` index (`crates/db/src/indexes.rs:155`); and,
+  for the members-only rooms only, `room_members` by `$in` lists of their orgs, the rooms and
+  the people, the three fields `RoomDao::is_member` names
+  (`crates/services/src/dao/room.rs:565`), served by the unique `(room_id, user_id)` index
+  (`crates/modules/chat/src/lib.rs:240`) with the org checked on the rows it fetches, or by
+  `(user_id, tenant_id)` (`:241`); no index is new. Each query has a projection and reads the
+  primary whatever the connection string says (`seat_check.rs:951`), so a person added a
   moment ago reads as a member, as the join's own gate read them; all three together within
-  `READ_TIMEOUT` = 5 s (`:82`). A pod with 300 seats in 20 rooms makes three indexed queries
+  `READ_TIMEOUT` = 5 s (`:117`). A pod with 300 seats in 20 rooms makes three indexed queries
   every 10 s, with `$in` lists of at most 20 rooms, their orgs and the seated people, and
   reads back at most about 620 small documents; a pod with no seats reads nothing.
-- **The verdict** (`seats_to_end`, `:153`, a pure function), counted by the person in the
-  room. A seat ends on the `MISSES_TO_END` = 2nd complete read in a row that finds its
-  admission gone (`:78`). A read that fails, breaks off, does not decode or is late changes
-  nothing, not even what it forgets. A person found admitted, or seated in a room the read
-  found no document for (the reconcile's case,
-  [below](#a-room-deleted-mid-call-ends-its-call)), starts again from zero, and a seat no
-  longer held is forgotten. From the `FAILED_READS_TO_WARN` = 3rd failed read in a row,
-  each one warns (`:86`).
-- **One teardown, counted once.** A seat ends as a withdrawal that reached it ends
-  (`revoke::withdraw_these_seats_here`, `revoke.rs:372`): only the connections seated before
-  the deciding read close, so a person added back who joins again keeps the new seat; they
-  hear `room:call_ended` with `reason: "not_a_member"`, and everyone left hears
-  `media:peer_left`. Then the call's books, as a hang-up keeps them (`seat_check.rs:287`):
-  the person's open call sessions in the room close and the count drops
-  (`finalize_call_leave_db`, which finds nothing where the membership's hook closed them
-  already), and the call is settled (`settle_call_after_departure`), so a call they were the
-  last one in ends on the pod where its media is. A room row deleted by a raw write took its
-  call sessions with it; the count it leaves is the stale sweep's, not the check's.
+- **The verdict** (`seats_to_end`, `:219`, a pure function), counted by the person in the
+  room. A seat whose admission the `MISSES_TO_END` = 2nd complete read in a row finds gone
+  (`:113`) is a verdict. A read that fails, breaks off or is late changes nothing, not even
+  what it forgets, and from the `FAILED_READS_TO_WARN` = 3rd in a row each one warns
+  (`:121`). A person found admitted, one seated in a room the read found no document for
+  (the reconcile's case, [below](#a-room-deleted-mid-call-ends-its-call)), and one a document
+  that did not decode bears on all start again from zero, and a seat no longer held is
+  forgotten.
+- **A document that does not decode costs only its own seats their verdict.** Each room
+  document and each membership row decodes on its own (`RoomsRead::decode`, `:677`;
+  `decode_rows`, `:748`). One that does not fails no read: the seats it bears on read
+  `Unreadable` (`:178`), and every other seat reads as the complete read would read it
+  without that document (`readings_of`, `:828`). When in doubt, more seats lose their
+  verdict, never fewer:
+
+  | The document that does not decode | The seats it bears on, which get no verdict |
+  |---|---|
+  | a room (a visibility the model does not know, a `tenant_id` that is not an id) | the room's own. It stays out of the membership reads, and its `_id` decodes, since the read matched it by `_id` |
+  | a `tenant_members` row (an id in an array, an id missing) | every seat whose room's org is among the row's `tenant_id` values and whose person is among its `user_id` values |
+  | a `room_members` row | every seat whose room is among the row's `room_id` values and whose person is among its `user_id` values, whatever its `tenant_id` |
+
+  A value is the id itself or an array's elements, and a field that holds no id could name
+  any. ⚠️ A membership row that does not decode is never "absent": `TenantDao::is_member`
+  counts rows without decoding them (`crates/services/src/dao/tenant.rs:593`), so the guard
+  admits a person through an org row whose `tenant_id` is an array holding the org, and
+  skipping such a row would end a seat the guard admits. A `room_members` row of no org or
+  of another org is no doubt: the filter never matches it, as the guard's own filter never
+  does. Each document that does not decode warns (`ODD_DOCUMENT`, in the log below); while it
+  stays so, a pod warns about it at most once an hour (`ODD_DOCUMENT_WARN_EVERY`, `:140`),
+  and again at its first pass after a start.
+- **The room guard decides each end** (`ask_the_room_guard`, `:535`). For each verdict the
+  end half asks `roomler_ai_mod_chat::guards::require_room_in_tenant_with`
+  (`crates/modules/chat/src/guards.rs:89`), the function `media:join`'s gate runs
+  (`crates/modules/conference/src/guards.rs:24`), about the person, in the org the read found
+  for the room. Its two DAOs sit on a handle that reads the primary (`on_the_primary`,
+  `seat_check.rs:579`), as the check's own reads do: the driver's default is the primary, but
+  a connection string naming another read preference would move the default DAOs to a
+  secondary, where a lagging one could admit a person whose row is gone or refuse one added a
+  moment ago. At most `GUARD_READS_AT_ONCE` = 8 asks run at once (`:149`), all within one
+  deadline of `READ_TIMEOUT` (`:539`). Only a refusal ends a seat, matched by the error's
+  variant (`guard_word`, `:518`), never by its message, and never through `admit_join`'s
+  folded refusal:
+
+  | The guard answers | The seat |
+  |---|---|
+  | `NotAMember`: not in the room's org (`chat/src/guards.rs:49`) | ends, and `ENDED` names the refusal (`guard = not_a_member`) |
+  | `Forbidden`: a private room the person is not in (`:81`) | ends (`guard = forbidden`) |
+  | `NotFound`: no live room of that id in the org (`:51`), or a secret room the person is not in (`:79`) | ends (`guard = not_found`) |
+  | `Ok`: it admits the person | stays, and warns `GUARD_ADMITS` with what each read found |
+  | any other error (a failed read, a row its typed read cannot decode), or no answer by the deadline | stays: debug, and from the 3rd in a row a warning |
+
+  A verdict the guard does not refuse is spent, and the seat is read again from zero, so a
+  guard that does not answer keeps it for two more passes at least. The 24-cell matrix test
+  stays as the other direction: wherever the guard refuses, the reads find the seat gone.
+- **One teardown, counted once.** A seat the guard refuses ends as a withdrawal that reached
+  it ends (`revoke::withdraw_these_seats_here`, `revoke.rs:372`), for each connection still
+  holding the seat the pass read: the same person and the same send transport, decided and
+  removed under one lock of the room's map (`RoomManager::close_participant_seat`,
+  `media/room_manager.rs:1280`, one `remove_if`). A connection that took a seat again since
+  (a rejoin on it makes a new send transport) or closed meanwhile (a hang-up, a withdrawal
+  that came late) is left alone, and a seat taken since is the next passes' to judge. Each
+  connection closed hears `room:call_ended` with `reason: "not_a_member"` once, and everyone
+  left hears `media:peer_left` once for it. Then the call's books, as a hang-up keeps them
+  (`seat_check.rs:485`): the person's open call sessions in the room close and the count
+  drops (`finalize_call_leave_db`, `call.rs:302`), and the call is settled once: by finalize
+  when it closed their last session, else by the check (`settle_call_after_departure`,
+  `call.rs:331`), as when the membership's hook closed the sessions already or finalize
+  failed. So a call they were the last one in ends on the pod where its media is. A pass that
+  closed nothing for a verdict logs nothing and keeps no books. A room row deleted by a raw
+  write took its call sessions with it; the count it leaves is the stale sweep's, not the
+  check's. ⚠️ **The cross-pod repeat stays.** Where the pod that took an org membership's end
+  closed the person's sessions (its hook's finalize settles the call, `revoke.rs:251`) and
+  the pod serving the call then ends the seat by its check, that pod settles too: the room's
+  members hear `room:call_updated` twice, with one count. Nothing dedupes it across pods.
 - **The bound.** On a pod whose reads succeed, a seat whose admission is gone ends within
-  two passes and their reads after the membership's end:
-  `2 × (SEAT_CHECK_SECS + READ_TIMEOUT)` = 30 s.
-- **Doubt keeps the seat.** The check's reading agrees with the room guard in every cell of
-  room visibility, room row, org membership and role: wherever the guard admits, it reads
-  admitted. A room that still has a document, a tombstone included, is judged by its
-  memberships, as the reconcile reads "no document" literally; the guard would answer 404
-  there, and the check keeps the seat.
+  `2 × (SEAT_CHECK_SECS + 2 × READ_TIMEOUT)` = 40 s of the membership's end: the read under
+  way then, two sleeps, the two reads that miss and one ask of the room guard, each at its
+  5 s limit (each takes milliseconds on a healthy pod, so the seat goes in about 20 s). Asks
+  about other seats in the same passes can add up to 5 s to each of the two passes before the
+  deciding one, 50 s at most: many seats ending at once (an org removal of a person seated in
+  many rooms on one pod) cost one ask each, 8 at a time, all within their pass's one 5 s
+  deadline. A guard that does not answer keeps the seat for two more passes. Before the
+  guard decided, the bound was `2 × (SEAT_CHECK_SECS + READ_TIMEOUT)` = 30 s.
+- **Doubt keeps the seat.** Wherever the guard admits, the seat stays, whatever the reads
+  found, and a read or an ask that fails or is late keeps every seat it bears on. A room that
+  still has a document, a tombstone included, is judged by its memberships, as the reconcile
+  reads "no document" literally: the guard, which answers 404 for a tombstone, is asked only
+  about a seat whose admission the reads found gone.
+- **The window that is left.** A person added back after the guard's read and before the
+  close loses the seat they held, and is admitted again on their next join. Before the guard
+  decided, the same read-then-act window ran from the deciding read to the close, wider.
 - **Who holds a seat.** Every participant entry is made by `RoomManager::create_transports`
   (`media/room_manager.rs:333`), whose one caller, `handle_media_join` (`ws_media.rs:442`),
   takes a `JoinPass` that only `admit_join` mints (`media_gate.rs:138`). A recording is no
@@ -415,32 +499,75 @@ sequenceDiagram
   its participants. ⚠️ A seat made any other way (a recorder, a bot, a pipe between pods or
   workers: anything no membership admits by design) must be skipped by the check, or the
   check ends it.
-- **The switch.** `ROOMLER__CONFERENCE__SEAT_CHECK` set to `false`, `0`, `off` or `no` turns
-  the check off on a pod (`seat_check.rs:89`). It is read once, as the pod starts: turning
-  it off takes a pod restart with the variable set, not a new image. As it starts, a pod logs
+- **The switch.** `ROOMLER__CONFERENCE__SEAT_CHECK` (`SWITCH`, `seat_check.rs:124`) is read
+  from the environment only, once, as the pod starts: no config file sets it (`Settings` has
+  no `conference` section), and turning it off takes a pod restart with the variable set,
+  not a new image. `spawn` reads it in one line and hands the value to `start` (`:289`),
+  which the tests drive with each value. `false`, `0`, `off` or `no`, in any case and with
+  the space around it aside, turns the check off on that pod; unset, empty, `true`, `1`, `on`
+  or `yes` leaves it on; any other value leaves it on and warns (`SWITCH_UNKNOWN`), so a typo
+  never turns it off unseen (`switch_of`, `:263`). As it starts, a pod logs
   `seat check: on this pod` or `seat check: off on this pod` at info; with it off, a seat no
   withdrawal reached keeps its call.
-- **The log, read by hand.** Each seat the check ends is one warning,
-  `seat check: ended a call seat whose admission is gone` (`seat_check.rs:92`), with the
-  org, the room, the person, how many connections closed and what each of the two reads
-  found, `alert = seat_check_ended`. A withdrawal that did not reach the pod serving the
-  call is one warning on the pod that took the membership's end,
-  `call seat withdrawal did not reach the pod serving the call; its seat check ends the seat`,
-  with the org, the room, the person and the pod, `alert = membership_seat_unreached`
-  (`revoke.rs:316`). The two `alert` fields are handles for a person reading the pod logs:
-  nothing files or pages on them. `membership_seat_unreached` is expected once per room with
-  a remote claim when a removal lands in a roll's mixed minute; outside a roll it means a bus
-  that did not answer. `seat check: the admissions read keeps failing` is a pod that ends no
-  seat until it reads again.
+- **The log, read by hand.** Each line has one wording, and most an `alert` field: a handle
+  for a person reading the pod logs, on which nothing files or pages. Count them with
+  `grep -F` on plain text (strip the colour codes from a log older than #4402's roll first):
+
+  | Line (its wording, and what it carries) | `alert` | Expected | A count above that means | Seen firing in |
+  |---|---|---|---|---|
+  | `seat check: on this pod` / `seat check: off on this pod`, info (`seat_check.rs:307`, `:292`) | none | one of the two at each pod's start | | every test app's log |
+  | `seat check: ended a call seat whose admission is gone` (`ENDED`, `:132`): the org, the room, the person, the connections closed, both readings and the guard's refusal (`guard`) | `seat_check_ended` | one per seat no withdrawal reached, beside a membership's end | a seat ended with no membership's end near it: read its two readings and its `guard` | `cluster_tests::an_org_removal_the_pod_serving_the_call_did_not_hear_ends_the_seat_there` |
+  | `seat check: the room guard admits a seat its reads found gone; the seat stays` (`GUARD_ADMITS`, `:145`): the org, the room, the person and both readings | `seat_check_guard_admits` | 0 | the reads and the guard disagree (an admission path the reads do not know): the seat stays | `seat_check_tests::a_seat_the_room_guard_admits_is_not_ended_whatever_the_reads_found` |
+  | `seat check: a document did not decode; the seats it bears on get no verdict` (`ODD_DOCUMENT`, `:135`): the collection, the `_id` and the fields read | `seat_check_odd_document` | 0 | a document the models cannot read: the seats it bears on go unchecked while it stays | `seat_check_tests::a_document_that_stays_odd_warns_once` |
+  | `seat check: the switch has a value it does not know; the check runs on this pod` (`SWITCH_UNKNOWN`, `:128`): the value | `seat_check_switch_unknown` | 0 | a mistyped switch: the check runs anyway | `seat_check_tests::the_switch_decides_inside_spawn` |
+  | `seat check: the admissions read keeps failing; no seat ends here until it reads again` (`:386`) | none | 0 | a pod that ends no seat until it reads again | `seat_check_tests::a_failed_read_ends_no_seat_and_keeps_the_count` |
+  | `seat check: the room guard keeps failing to answer; the seat stays` (`:452`) | none | 0 | a guard that cannot read: every verdict is kept | `seat_check_tests::a_seat_whose_room_guard_cannot_answer_is_kept` |
+  | `call seat withdrawal did not reach the pod serving the call; that pod's seat check ends the seat where it runs one, and a pod without the check keeps it` (`revoke.rs:316`): the org, the room, the person and the pod, on the pod that took the membership's end | `membership_seat_unreached` | once per room with a remote claim when a removal lands in a roll's mixed minute, else 0 | a bus that did not answer | `cluster_tests::an_org_removal_the_pod_serving_the_call_did_not_hear_ends_the_seat_there` |
+
+  The unreached line keeps its prefix, `call seat withdrawal did not reach the pod serving the
+  call`, byte for byte, so a roll's count reads it on both images; only what follows the
+  semicolon changed.
 - **Mixed versions.** The check runs where the seat lives and adds no message:
   `media.withdraw_seats` and its reply are unchanged, so pods on either image ask and answer
-  each other as before. A pod on the previous image runs no check; a seat it serves that no
-  withdrawal reached lasts until that pod is replaced.
+  each other as before. During a roll, the pod on the previous image runs that image's check:
+  before #3950, one that ends a verdict on its own reads with no word from the guard; before
+  #3839, none, and a seat it serves that no withdrawal reached lasts until that pod is
+  replaced.
 
-**Tests.** `seat_check::tests`: a seat ends on its second miss in a row and not before; a
-failed read changes nothing; one miss then found starts again from zero; no room document
-and no reading give no verdict; only the seat whose admission is gone ends; the switch; a
-room document decodes with the model's visibility default. `cluster_tests`:
+**Tests.** `seat_check::tests`: a seat ends on its second miss in a row and not before; an
+admitted seat never ends; a failed read changes nothing; one miss then found starts again
+from zero; no room document and no reading give no verdict; only the seat whose admission is
+gone ends; a seat no longer here is forgotten; both readings are reported; the switch knows
+its on and off values and no others; a room document decodes with the model's visibility
+default; the readings of a world of documents are the ones a complete read gave before, and
+a room document, an org row or a room row that does not decode costs only the seats it could
+name their verdict (`the_worlds_readings_are_the_ones_master_gives` and the three after it);
+the room rows are read by the rooms' orgs, as the guard reads them;
+`only_a_refusal_of_the_room_guard_ends_a_seat`;
+`a_document_that_stays_odd_warns_once_an_hour_at_most`. `media::room_manager::tests`:
+`a_close_of_a_gone_or_a_foreign_connection_reports_false_and_changes_nothing` and
+`a_close_of_a_seat_taken_again_on_its_connection_reports_false_and_keeps_it`.
+`seat_check_tests` (one pod; each cell drives its own passes, the read and the end half apart
+where it says so, within the background loop's 10 s window):
+
+| Test | What it pins |
+|---|---|
+| `a_room_document_that_does_not_decode_costs_only_its_own_seats_their_verdict` | a room of a visibility the model does not know blinds the pass to no other seat |
+| `an_org_row_that_does_not_decode_keeps_the_seats_it_could_admit_and_blinds_no_other` | an org row with an array `tenant_id`, which the guard admits by, gives that seat no verdict, and another seat ends |
+| `a_room_row_that_does_not_decode_keeps_the_seats_it_could_admit_and_blinds_no_other` | the same for a room row with an array `room_id` |
+| `a_room_row_without_its_org_is_not_read` | a `room_members` row with no `tenant_id` is not read, so it blinds the pass to nothing |
+| `a_room_row_of_no_org_does_not_hide_the_seat_it_names` | nor does it hide the seat it names: the guard refuses, and the seat ends |
+| `a_document_that_stays_odd_warns_once` | `ODD_DOCUMENT` fires, once over three passes, and ends nothing |
+| `a_failed_read_ends_no_seat_and_keeps_the_count`, `a_late_read_ends_no_seat_and_keeps_the_count` | a read that fails (the 3rd in a row warns) or is late ends nothing and keeps the miss before it |
+| `one_person_on_two_connections_loses_both_seats_counted_once` | both connections close, under one key, each frame heard once |
+| `an_ended_seat_settles_its_call_once` | the host hears one `room:call_updated`, as a hang-up gives |
+| `a_seat_the_room_guard_admits_is_not_ended_whatever_the_reads_found` | a verdict for an entitled person ends nothing and `GUARD_ADMITS` fires; the same verdict ends the seat once the guard refuses |
+| `a_seat_whose_room_guard_cannot_answer_is_kept` | a guard that cannot be reached keeps the seat (the 3rd in a row warns) |
+| `a_pass_ends_only_the_seat_it_read`, `a_join_on_a_new_connection_after_the_read_is_not_ended_by_that_pass` | a rejoin on the same connection, or a join on another, between the read and the end keeps its seat |
+| `a_reached_withdrawal_during_a_pass_leaves_it_nothing_to_end` | a withdrawal that reached the seats first leaves the pass nothing, each frame heard once |
+| `the_switch_decides_inside_spawn` | no loop for each off value; a loop, and `SWITCH_UNKNOWN`, for a value it does not know |
+
+`cluster_tests`:
 `an_org_removal_the_pod_serving_the_call_did_not_hear_ends_the_seat_there` and
 `a_private_room_leave_the_pod_serving_the_call_did_not_hear_ends_the_seat_there` (the pod
 serving the call cannot be reached: the removal answers, chat's hook runs, and the seat ends
@@ -460,7 +587,7 @@ document and its `room_members` rows, and the call sessions those rows held go w
 The call running in the room ends with them, for everyone in it, on whichever pod serves
 it. `chat` tells `conference` through `MembershipLifecycle::room_removed`
 (`crates/core/src/hooks.rs:229`) once the room is gone
-(`crates/modules/chat/src/room.rs:384`).
+(`crates/modules/chat/src/room.rs:393`).
 
 ```mermaid
 sequenceDiagram
@@ -499,10 +626,10 @@ sequenceDiagram
   it over the bus: `media.close_room` with `reason: "room_deleted"` (`media_cluster.rs:397`
   `close_room_everywhere`, handled at `:898`). The hook awaits one directory read, at most
   one request whose reply waits at most `RPC_DEADLINE`, 2 s
-  (`crates/core/src/cluster/bus.rs:41`), a second read and a release when no reply comes,
+  (`crates/core/src/cluster/bus.rs:42`), a second read and a release when no reply comes,
   and one update of the stats record.
 - **The delete waits a bounded time.** The hook runs in a task of its own, and the delete
-  waits for it at most `ROOM_REMOVED_BOUND`, 5 s (`crates/modules/chat/src/room.rs:342`),
+  waits for it at most `ROOM_REMOVED_BOUND`, 5 s (`crates/modules/chat/src/room.rs:351`),
   well above the slowest healthy teardown. Past the bound (a Redis or Mongo node lost
   without a reset hangs a read without end), or when the client hangs up, the delete
   answers and the teardown goes on: it is never cut off between a router removed and its
@@ -540,7 +667,7 @@ sequenceDiagram
   is replaced. A request with no `reason`, as the previous image sends, closes the room as
   an ended call, as before.
 - The web client reads `room:call_ended` as "this call is over for you" whatever its reason
-  (`ui/src/stores/ws.ts:349`), so a deleted room needs no client change.
+  (`ui/src/stores/ws.ts:351`), so a deleted room needs no client change.
 
 **Tests.** `conference_gate_tests`: `deleting_a_room_mid_call_ends_its_call_for_everyone_in_it`,
 `deleting_a_room_leaves_a_call_in_another_room_alone` (the deleted room has no call, and
@@ -570,7 +697,7 @@ without a seam in production code. What they miss, the reconcile reaps within tw
 
 Each socket has a token bucket for its `media:*` frames: `[meetings] media_frame_burst`
 frames at once (400), refilled at `media_frame_rate` a second (20)
-(`crates/config/src/settings.rs:307`, `:312`; env `ROOMLER__MEETINGS__MEDIA_FRAME_BURST` and
+(`crates/config/src/settings.rs:319`, `:324`; env `ROOMLER__MEETINGS__MEDIA_FRAME_BURST` and
 `…_RATE`; `0` turns the limit off). A frame is counted on the pod that holds the socket, as it
 arrives and before anything is looked up for it (`ws_media.rs:56`), so a frame forwarded to
 the call's owner pod is counted once, where it came in.
@@ -579,7 +706,7 @@ the call's owner pod is counted once, where it came in.
 |---|---|
 | is not run, and the socket hears `media:error` with `code: "rate_limited"`, `retry_after_ms` (the time until the bucket holds a frame again) and a `message` | `crates/modules/conference/src/frame_limit.rs:48` `refused` |
 | leaves the socket open: a client that overruns loses that frame, never its socket or its call | the same |
-| counts in `media_frames_rate_limited_total` on `GET /api/cluster/status` | `crates/core/src/cluster/metrics.rs:36`, `crates/api/src/cluster/metrics.rs:63` |
+| counts in `media_frames_rate_limited_total` on `GET /api/cluster/status` | `crates/core/src/cluster/metrics.rs:38`, `crates/api/src/cluster/metrics.rs:63` |
 | is logged: the socket's first refusal at warn, and its total at info when it closes | `frame_limit.rs:48`, `:85` `socket_closed` |
 
 **How deep, measured.** The deepest burst a real client sends is a join into a large
@@ -689,7 +816,7 @@ it was rolled back. Two nets now catch it, and neither catches everything:
   it: `consume` holding an `Option<RefMut>` across its awaits passed clippy. Read what the
   await needs into owned values first, and `rooms_ref()` is crate-private so every caller
   is behind the same gate.
-- **Tests on two worker threads** (`room_manager.rs`'s `tests`, `room_manager.rs:1528`). A burst of
+- **Tests on two worker threads** (`room_manager.rs`'s `tests`, `room_manager.rs:1558`). A burst of
   joins, publishes, consumes and view reports in one room, behind a watchdog: on the old
   code both threads park in dashmap's lock and the test fails at 60 s, and the review's
   `Option<RefMut>` variant froze it too. Fixed, the conference unit suite finishes in under
@@ -715,11 +842,11 @@ reaches every viewer whatever their view says. Locked against a real worker by
 `crates/tests/src/conference_view_tests.rs:439`.
 
 **What "visible" is.** Each remote `VideoTile` runs an `IntersectionObserver` on its root
-(`ui/src/components/conference/VideoTile.vue:507`), which applies the clip of every
+(`ui/src/components/conference/VideoTile.vue:481`), which applies the clip of every
 scrolling ancestor, and emits `visible: { visible, w, h }` once per change and `false` on
-unmount (`:553`), while its parent still listens. Every layout forwards it with the stream
+unmount (`:527`), while its parent still listens. Every layout forwards it with the stream
 key (`layouts/TiledLayout.vue:23`, `SpotlightLayout.vue:25`, `SidebarLayout.vue:25`), the
-call page hands it to the store (`ConferenceView.vue:435`), and the store keeps the tiles on
+call page hands it to the store (`ConferenceView.vue:441`), and the store keeps the tiles on
 screen, maps stream keys to the video producers it consumes
 (`ui/src/stores/conference.ts:428`) and sends one `media:view` at most every 100 ms
 (`:672-734`) — and again every 15 s while in the call and when the tab returns to the
@@ -734,7 +861,7 @@ declared viewer that never reported would have every camera paused.
 | tiled | `primary`, at most `tiledMaxTiles` (`useConferenceLayout.ts:306`), no scrolling | exactly the rendered remote tiles |
 | spotlight | the big tile, a 120 px filmstrip that scrolls sideways | the big tile plus the strip tiles inside the strip's viewport |
 | sidebar | the big tile, a 280 px column that scrolls | the same rule |
-| the mini view (another page of the app, `MiniConference.vue`) | up to three remote cameras in the app bar's widget, no `VideoTile` | exactly those three (the widget reports them itself; the per-key count tolerates its report overlapping a tile's during the page switch); the rest paused until the call page is back; audio flows |
+| the mini view (another page of the app, `MiniConference.vue`) | up to three remote cameras in the app bar's widget, no `VideoTile` | exactly those three (the widget reports them itself; the per-key count tolerates its report overlapping a tile's during the page switch); the rest paused until the call page is back; audio flows, and the app shell's `CallAudio` plays every participant's, these three included (#3563) |
 
 A tile scrolled into view plays within a second: one debounce, one round trip, and the
 worker requests a key frame the moment a consumer resumes (`SimpleConsumer::UserOnResumed`
@@ -762,7 +889,7 @@ more packets than one worker carries without it.
 
 **Reading it.** `GET /api/cluster/status` gains `local.media_video_paused` — the video
 consumers held back by their viewers' views, never the owner's FR-30 pause
-(`crates/api/src/cluster/metrics.rs:88`, from `MediaGauges::video_paused_total`,
+(`crates/api/src/cluster/metrics.rs:96`, from `MediaGauges::video_paused_total`,
 `crates/modules/conference/src/lib.rs:128`) — and each row of `media_rooms_detail` its
 `video_paused`. With `RUST_LOG=roomler_ai_mod_conference=debug` every applied report logs
 `view applied` with `resumed` and `paused` counts. What this lever buys in packets, and the
@@ -791,7 +918,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
-| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1186`), `RETIRED_RC_TAG_FAMILIES` (`:1215`), `RETIRED_USER_WS_NAMESPACES` (`:1220`) and `RETIRED_MODULE_IDS` (`:1224`), locked by `retired_rpc_verbs_are_never_reused` (`:8324`), `retired_wire_families_and_module_ids_are_never_reused` (`:8393`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5308`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1297`), `RETIRED_RC_TAG_FAMILIES` (`:1326`), `RETIRED_USER_WS_NAMESPACES` (`:1331`) and `RETIRED_MODULE_IDS` (`:1335`), locked by `retired_rpc_verbs_are_never_reused` (`:8601`), `retired_wire_families_and_module_ids_are_never_reused` (`:8670`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `crates/remote_control/src/signaling.rs:5321`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 
@@ -900,9 +1027,9 @@ UDP-blocked:
 - A `401` on upgrade (after [the one query-form redial](#how-the-daemon-and-the-cli-dial-3656)
   where that applies) is not fatal. It closes the sessions the agent kept, and
   FR-103 looks for a newer token in the config file, else renews this one, and
-  retries once (`agents/roomlerd/src/signaling.rs:1311`). Otherwise the agent
+  retries once (`agents/roomlerd/src/signaling.rs:1337`). Otherwise the agent
   waits 30 s, 60 s, 5 min, then an hour between tries
-  (`agents/roomlerd/src/signaling.rs:1639`), and the third refusal in a row raises
+  (`agents/roomlerd/src/signaling.rs:1651`), and the third refusal in a row raises
   the re-enrollment prompt on the primary org.
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially
@@ -943,7 +1070,7 @@ flowchart LR
 | `cause` | its fields | what ended the socket |
 |---|---|---|
 | `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
-| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2302`) |
+| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2330`) |
 | `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
 | `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:556`). The check runs on a tick, so `elapsed_s` reads past the deadline |
 | `cancelled` | `by` | the Hub cancelled the loop; `by` below |
@@ -991,7 +1118,8 @@ how it ended on its own warn line, `agent opened WS without rc:agent.hello — c
 with the same `cause`, `code`, `reason`, `kind` and `error`. Before #3517 that line read
 `other=None` for every end.
 
-**The grep.** Pod logs are ANSI-coloured, so strip the codes first. Tenant affinity pins
+**The grep.** Since #4402 a pod's log is plain text; a log written before that roll carries
+ANSI colour codes, which the `sed` below strips (on plain text it changes nothing). Tenant affinity pins
 each socket to one pod, so read every pod. Select the pods by their label. A name match
 such as `grep roomler2-` also catches the `roomler2-prepull-*` pods of FR-28's pre-pull
 DaemonSet (`.github/workflows/promote.yml:46`), which carry `app=roomler2-prepull` and
@@ -1010,8 +1138,18 @@ For one device's history, replace the last `grep -oE …` with `grep 'agent_id=<
 
 ⚠️ **`kubectl logs` reads only the pod's current log file.** The kubelet rotates that
 file at its size cap, which under daytime traffic has been every 10 to 15 minutes, so an
-empty grep can be the file's boundary rather than the absence of a disconnect. For an
-older window, read the rotated files through the kubelet's log proxy. The newest rotated
+empty grep can be the file's boundary rather than the absence of a disconnect. Most of
+those lines were one DEBUG line per item: two for each request, one for each peer of an
+overlay fan-out, one for each inserted row and one for each WS message sent or received.
+Since #4402 they write at TRACE, except a request's finished line for a 4xx, a 5xx or an
+answer of 1 s or more (`crates/api/src/request_log.rs:32`), and a fan-out pass writes one
+`overlay: delta fanned out` line with its counts (`crates/modules/network/src/overlay.rs:2250`).
+The other part of the size was colour codes. The server coloured every line whatever its output
+was, and in the first hour after that change the codes were 41 % of the busier pod's bytes. It
+now colours only when stdout is a terminal and `NO_COLOR` is unset or empty
+(`crates/api/src/logging.rs:58`, asked once at start in `crates/api/src/main.rs:27`). In a
+container stdout is a pipe, so the node stores plain text, with the same words, levels, targets
+and fields as before. For an older window, read the rotated files through the kubelet's log proxy. The newest rotated
 file is plain text and the older ones are gzipped, and each line there carries the CRI
 prefix `<ts> stdout F`:
 

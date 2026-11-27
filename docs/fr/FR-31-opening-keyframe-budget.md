@@ -5,6 +5,8 @@ Child of the RC-quality program; sibling of FR-10 (relay IDR thrift), FR-17 (rel
 FR-22 (time-to-first-frame). Spec ships with the implementation PR (the default is decided by
 an A/B, see "Open decisions").
 
+**Anchors:** master `8c154c2d9` (closed 2026-11-08): this spec is the record of the work, and its line anchors read at that commit.
+
 ## The measurement
 
 Operator report (2026-08-29): `neo16 → CORPLAP-2` "starts blurred for 1–2 s, then crystallizes".
@@ -16,7 +18,7 @@ rc=vbr cq=22 preset=p4 tune=ll rc-lookahead=0 bf=0 forced-idr=1 maxrate=2550000 
 ```
 
 Per-frame sizes read off the `video-bytes` DataChannel in the browser (FR-17 framing header,
-then the pump's own header — `peer.rs:10255`, `byte[4]` flags, bit 0 = keyframe). Identical in
+then the pump's own header — `peer.rs:3709`, `byte[4]` flags, bit 0 = keyframe). Identical in (2026-11-24)
 every run:
 
 | frame | bytes | arrival | flags |
@@ -60,7 +62,7 @@ Two things this is NOT, both refuted by data rather than assumed:
    driver. That is what the A/B has to establish.
 
 The runtime side already works: the agent's `set_bitrate`
-(`encoder.rs:1747-1790`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
+(`encoder.rs:1740-1783`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
 ffmpeg's reconfigure path (`nvenc.c:2985-3001`) applies both via `NvEncReconfigureEncoder`
 before the next frame — the `if (avctx->rc_buffer_size > 0 && vbvBufferSize != rc_buffer_size)`
 branch is unconditional on `cq`. Consequence worth writing down: **from the first AIMD step
@@ -101,7 +103,7 @@ default 0 (inert). If the driver honours `ldkfs` only under CBR, the remaining p
 vendored-ffmpeg patch mapping `rc_initial_buffer_occupancy` → `vbvInitialDelay`.
 
 **P0 — the A/B, on this box's own daemon** (self-view over `ROOMLERD_ICE_RELAY_TCP=1`, which
-forces both a relay-class ICE path and the constrained profile — `peer.rs:1478`; the mirror
+forces both a relay-class ICE path and the constrained profile — `peer.rs:532`, `peer.rs:2060`; the mirror (2026-11-24)
 recursion only affects inter-frame dynamics, the opening IDR captures a static screen). Legs:
 baseline · `pct=100` · `pct=40` · `tune=hq` (driver-default reservoir under a different
 tuning; env `ROOMLERD_FFMPEG_TUNE`, no code). Metrics per leg, N ≥ 5, foreground tab, 100 ms

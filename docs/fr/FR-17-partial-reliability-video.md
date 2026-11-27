@@ -8,6 +8,8 @@ that #1169 replaced, so those runs do not yet say what unordered delivery buys o
 receiver that exists now (field log). Tracking issue: `FR-17` (#799). Sibling of FR-16
 (#798, the harness that must gate it); the architectural half of the FR-1 program.
 
+**Anchors:** master `1c584fb7e` (closed 2026-11-16): this spec is the record of the work, and its line anchors read at that commit.
+
 ## The measurement
 
 Prod `agent_logs`, 2026-08-27, both hosts on 0.4.9, 1920×1200@30 over a DERP relay:

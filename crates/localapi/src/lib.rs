@@ -91,6 +91,12 @@ pub struct ExitNodeStatus {
     /// back-compat with a daemon/CLI that predates v6 egress.
     #[serde(default)]
     pub v6_active: bool,
+    /// #3562 — why IPv6 is fail-closed while `active`: "the exit serves IPv4
+    /// only" (the exit's own statement) or "no v6 uplink to exempt the
+    /// coordination server" (this host's). `None` while `v6_active`, while not
+    /// `active`, on a netstack node, and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6_withheld_reason: Option<String>,
     /// P5/S4b — `true` when the DEFAULT ("." catch-all) DNS namespace is steered
     /// through the exit, so every non-overlay query resolves from the exit's
     /// vantage (no DNS leak to the local ISP resolver). When `active` but this is
@@ -601,6 +607,45 @@ pub struct LastInstallStatus {
     /// daemon resolved no log dir at all (a checkout run with no home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// FR-150 P1b — a Windows per-user daemon after the install, as the
+    /// watcher found it and brought it back ([`InstallDaemon`]). `None` from a
+    /// watcher that predates P1b, and on every other flavour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<InstallDaemon>,
+}
+
+/// FR-150 P1b — the post-install watcher's last act on a Windows per-user
+/// device: whether a daemon runs once the verdict is written, how it came
+/// back, and what each rung of the relaunch answered. The verdict words are
+/// unchanged: an install that went through and left no daemon is
+/// `SucceededVerified` with `running: false` here (#3507).
+///
+/// Additive in `last-install.json` and on this wire: a watcher before P1b
+/// writes no key, an older client ignores it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct InstallDaemon {
+    /// A daemon for this config holds its stop event: it runs.
+    pub running: bool,
+    /// How it came back, when it did, in [`Self::BY_THE_TASK`]'s words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how: Option<String>,
+    /// Each rung the watcher took and its answer, in order. Empty when the
+    /// daemon came back by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rungs: Vec<String>,
+}
+
+impl InstallDaemon {
+    /// The install's own registration started it: the task's one-shot.
+    pub const BY_THE_TASK: &'static str = "by the task";
+    /// `service start`, a `/Run` of the account's task, started it.
+    pub const STARTED_THROUGH_THE_TASK: &'static str = "started through the task";
+    /// `service install` registered the task again, and its start started it.
+    pub const AFTER_THE_TASK_WAS_REGISTERED_AGAIN: &'static str =
+        "after the task was registered again";
+    /// The watcher started the launcher itself: the daemon runs outside its
+    /// task, which `rungs` says could not start it (D2).
+    pub const OUTSIDE_ITS_TASK: &'static str = "outside its task";
 }
 
 impl LastInstallStatus {
@@ -968,6 +1013,29 @@ pub struct PeerInfo {
     /// the prober is off, or before it has issued a round.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probes: Vec<PathProbe>,
+    /// #4367 — set while THIS device's control socket for the peer's org is
+    /// down and its mesh still holds the peer. The row is then the data
+    /// plane's last known: `connection`, `stalled`, `rtt_ms` and
+    /// `last_seen_ms` stay live (the WireGuard side keeps measuring), and
+    /// `online` is the control plane's last word from before the loss.
+    ///
+    /// `None` while the socket is up, and from a daemon older than the field,
+    /// which listed no peer at all during an outage. An older CLI ignores the
+    /// key and prints the kept rows as it always printed rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_down: Option<ControlDown>,
+}
+
+/// #4367 — the mark on a peer listed while this device's control socket for
+/// the peer's org is down ([`PeerInfo::control_down`]). Its presence is the
+/// mark; the time is what the daemon knows about it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControlDown {
+    /// Unix ms when this device lost that control socket. The control plane's
+    /// last frame came at most the socket's receive deadline before it.
+    /// `None` when the daemon cannot say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
 }
 
 /// A — the disco prober's measurement of one path to this peer (C2).
@@ -1792,6 +1860,50 @@ pub enum Request {
     /// socket serves it too (#3831, [`person_may`]); a daemon older than that
     /// refuses it there.
     EncoderCaps,
+    /// FR-151 — what live work this daemon serves now, which an install
+    /// that restarts it would cut, and the age of the newest ask for an
+    /// update it recorded. The root update helper on a Mac asks it before it
+    /// installs. READ-ONLY, sync and cheap: counts the daemon already holds.
+    /// Returns [`Response::LiveWork`]. A daemon older than FR-151 answers an
+    /// unknown verb ([`is_unknown_verb`]), which the helper counts as live
+    /// work. Never on the person socket ([`person_may`]).
+    LiveWork,
+    /// FR-151 — the person asks for an update now ("Apply update", a
+    /// `roomlerd self-update` run as the person). The daemon behind the
+    /// person's OWN socket records when, and [`Request::LiveWork`] answers
+    /// its age, which lets the root update helper skip the wait over that
+    /// person's own work only. A daemon that runs as root refuses it, so a
+    /// root daemon's record is only ever an operator's push. Returns
+    /// [`Response::UpdateAskRecorded`]. Never on the person socket.
+    AskForUpdate,
+}
+
+/// FR-151 — [`Request::LiveWork`]'s answer: what an install that restarts
+/// this daemon would cut or wedge now, as the daemon's own busy state counts
+/// it, and the age of the newest ask for an update it recorded. Every field
+/// defaults, so a field added later reads as nothing from an older daemon.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LiveWorkInfo {
+    /// Live remote-control sessions.
+    #[serde(default)]
+    pub rc_sessions: u32,
+    /// Open roomler SSH connections.
+    #[serde(default)]
+    pub ssh_connections: u32,
+    /// Fleet RPC `exec` runs in flight.
+    #[serde(default)]
+    pub exec_runs: u32,
+    /// File transfers and recordings in progress.
+    #[serde(default)]
+    pub work: u32,
+    /// A network transition in the last 10 minutes (R5b).
+    #[serde(default)]
+    pub net_transition: bool,
+    /// Seconds since the newest ask for an update this daemon recorded: an
+    /// operator's push to its row, or its person's own ask. `None` when it
+    /// recorded none since it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_age_secs: Option<u64>,
 }
 
 /// FR-84 D4 — what this device can encode, as [`Request::EncoderCaps`]
@@ -2062,6 +2174,10 @@ pub enum Response {
     },
     /// FR-84 D4 — answer to [`Request::EncoderCaps`].
     EncoderCaps(EncoderCapsSummary),
+    /// FR-151 — answer to [`Request::LiveWork`].
+    LiveWork(LiveWorkInfo),
+    /// FR-151 — answer to [`Request::AskForUpdate`]: the ask is recorded.
+    UpdateAskRecorded,
     /// FR-85 — the recorder's state, answering [`Request::RecordStart`],
     /// [`Request::RecordStop`] and [`Request::RecordStatus`].
     Recording(RecordingState),
@@ -3364,6 +3480,18 @@ pub trait LocalApiState: Send + Sync {
     fn encoder_caps(&self) -> Option<EncoderCapsSummary> {
         None
     }
+    /// FR-151 — what live work this node serves ([`Request::LiveWork`]).
+    /// `None` = not reported here (mocks, non-daemon impls), answered as an
+    /// `Error`, which the update helper counts as live work.
+    fn live_work(&self) -> Option<LiveWorkInfo> {
+        None
+    }
+    /// FR-151 — record the person's own ask for an update
+    /// ([`Request::AskForUpdate`]). `Err` carries the refusal. Default: not
+    /// served here.
+    fn ask_for_update(&self) -> Result<(), String> {
+        Err("asking for an update is not served on this node".into())
+    }
 }
 
 /// FR-85 — a recording verb's refusal, which names the screen's person (#3907).
@@ -3783,6 +3911,14 @@ pub fn person_may(req: &Request) -> bool {
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
+        // FR-151 — the root update helper's read of live work, and the record
+        // of a person's own ask for an update. The first lists the root
+        // half's SSH connections and runs, which this socket lists nowhere
+        // else. The second must never reach a root daemon from a person: a
+        // root daemon's record lets an update install over everything. The
+        // helper asks the system socket, and a person asks their own daemon.
+        | Request::LiveWork
+        | Request::AskForUpdate
         | Request::RestartDaemon { .. } => false,
     }
 }
@@ -3972,6 +4108,17 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
             None => Response::Error {
                 message: "encoder capabilities are not reported on this node".into(),
             },
+        },
+        // FR-151 — sync by contract: counts the daemon already holds.
+        Request::LiveWork => match state.live_work() {
+            Some(info) => Response::LiveWork(info),
+            None => Response::Error {
+                message: "live work is not reported on this node".into(),
+            },
+        },
+        Request::AskForUpdate => match state.ask_for_update() {
+            Ok(()) => Response::UpdateAskRecorded,
+            Err(message) => Response::Error { message },
         },
         // `Ping` / `Create*` / the mutating `Route*` verbs are async —
         // intercepted in `serve_connection` before this sync dispatch runs.
@@ -4792,6 +4939,32 @@ pub(crate) fn per_user_socket_path() -> Option<std::path::PathBuf> {
     )
 }
 
+/// FR-151 — this account's OWN per-user endpoint, never the system one:
+/// where `roomlerd self-update`, run as a person, records that person's ask
+/// for an update, so the ask can never land in a root daemon. `None` when
+/// this account has no private directory for one, and always for root on
+/// macOS.
+#[cfg(unix)]
+pub fn own_socket_path() -> Option<std::path::PathBuf> {
+    per_user_socket_path()
+}
+
+/// FR-151 — [`own_socket_path`] for a process that reads no environment:
+/// the root update helper's child (`roomlerd one-row-home live-work`). The
+/// caller names the folder: on macOS `temp_dir`, which the child resolves
+/// with `confstr(_CS_DARWIN_USER_TEMP_DIR)`, the folder launchd gives the
+/// person's daemon as `TMPDIR`; elsewhere `runtime_dir`. The same rule as
+/// the daemon's own ([`per_user_socket_path_for`]).
+#[cfg(unix)]
+pub fn own_socket_path_in(
+    temp_dir: std::path::PathBuf,
+    runtime_dir: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    per_user_socket_path_for(euid, runtime_dir, temp_dir, &dir_facts)
+}
+
 /// The SYSTEM socket path, used by a daemon privileged enough to bind it.
 #[cfg(unix)]
 pub fn system_socket_path() -> std::path::PathBuf {
@@ -4936,6 +5109,66 @@ pub fn no_per_user_socket_note() -> Option<String> {
 /// Windows has no per-user socket: the pipe is one name for every account.
 #[cfg(windows)]
 pub fn no_per_user_socket_note() -> Option<String> {
+    None
+}
+
+/// #3937 — the "not running" words for a client running as `euid` that
+/// found no socket at `tried`, in place of the plain line, or `None` to keep
+/// that line.
+///
+/// Root keeps only a socket that root serves ([`server_uid_trusted`]), the
+/// system daemon's, so a per-user daemon never answers it, and under `sudo`
+/// it has no per-user path to try ([`per_user_socket_path_for`]). Its words
+/// name the socket it tried, say whom a per-user daemon answers, and drop
+/// "is the service started?": on a per-user install the system unit has no
+/// config, and starting it loops (#3841). `sudo_user` (`SUDO_USER`) names
+/// the account `sudo` ran for when it is a portable user name
+/// ([`portable_user_name`]). It is only printed: never a path, never a
+/// socket to try (#3736). Every other account keeps its line: `None`.
+pub fn not_running_words_for(
+    euid: u32,
+    sudo_user: Option<&str>,
+    tried: &std::path::Path,
+) -> Option<String> {
+    if euid != 0 {
+        return None;
+    }
+    let who = sudo_user
+        .filter(|name| portable_user_name(name))
+        .unwrap_or("that account");
+    Some(format!(
+        "roomler daemon not running: no socket at {}, the system daemon's; a per-user \
+         daemon, if this host runs one, answers only its own account: run this as {who}, \
+         without `sudo`",
+        tried.display()
+    ))
+}
+
+/// #3937 — a POSIX portable user name: one or more of `A-Za-z0-9._-`, never
+/// `-` first. Any other value names no one, so a `SUDO_USER` can put neither
+/// a control character nor a second line on the terminal.
+fn portable_user_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// #3937 — [`not_running_words_for`] for this process: its effective uid,
+/// the `SUDO_USER` it was started with, and the system socket, the one a
+/// root daemon serves.
+#[cfg(unix)]
+pub fn not_running_words() -> Option<String> {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    not_running_words_for(euid, sudo_user.as_deref(), &system_socket_path())
+}
+
+/// Windows keeps its words: one pipe serves every account.
+#[cfg(windows)]
+pub fn not_running_words() -> Option<String> {
     None
 }
 
@@ -5281,17 +5514,17 @@ async fn serve_person_listener(
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             accept = listener.accept() => match accept {
                 Ok((stream, _addr)) => {
-                    let cred = stream.peer_cred().ok();
+                    let read = stream.peer_cred();
                     let peer = ClientPeer {
-                        uid: cred.map(|c| c.uid()),
-                        gid: cred.map(|c| c.gid()),
+                        uid: read.as_ref().ok().map(|c| c.uid()),
+                        gid: read.as_ref().ok().map(|c| c.gid()),
                         ..ClientPeer::UNKNOWN
                     };
                     if !person_peer_ok(&peer, owner_uid) {
-                        tracing::warn!(
-                            peer_uid = ?peer.uid, owner_uid,
-                            "localapi: person socket refused a caller that is neither its person nor root"
-                        );
+                        // #4202 — dropped either way, and only the line differs: a
+                        // caller that closed before it was read has gone, and is no
+                        // stranger ([`PersonDrop`]).
+                        PersonDrop::of(read.as_ref().err()).log(peer.uid, owner_uid);
                         continue;
                     }
                     let st = state.clone();
@@ -6521,6 +6754,25 @@ impl Client {
             other => Err(unexpected_response(other)),
         }
     }
+
+    /// FR-151 — what live work the daemon serves. A daemon older than FR-151
+    /// answers a bad-request [`Response::Error`], surfaced as `Err` with its
+    /// message kept, which [`is_unknown_verb`] recognises.
+    pub async fn live_work(&mut self) -> std::io::Result<LiveWorkInfo> {
+        match self.request(&Request::LiveWork).await? {
+            Response::LiveWork(info) => Ok(info),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-151 — record this person's own ask for an update in their daemon.
+    /// A refusal, or an older daemon, is `Err`.
+    pub async fn ask_for_update(&mut self) -> std::io::Result<()> {
+        match self.request(&Request::AskForUpdate).await? {
+            Response::UpdateAskRecorded => Ok(()),
+            other => Err(unexpected_response(other)),
+        }
+    }
 }
 
 /// FR-84 D3 — what a daemon said to [`Request::RestartDaemon`], classified
@@ -6875,6 +7127,59 @@ pub(crate) async fn endpoint_gone(path: &std::path::Path) -> bool {
     }
 }
 
+/// #4202 — why [`serve_person_listener`] drops a caller that [`person_peer_ok`]
+/// refused, from what `peer_cred` answered for it: `None` when it read the
+/// caller, else its error. It decides the line the drop is logged with and
+/// nothing else: every such caller is dropped before a byte of it is read. On
+/// plain facts, so it is tested on every platform.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[derive(Debug)]
+enum PersonDrop<'e> {
+    /// Read, and neither the socket's person nor root: another account. A WARN
+    /// that names its uid, as before #4202.
+    Stranger,
+    /// `ENOTCONN`: the caller closed its end before its credentials were read,
+    /// so nobody waits on the connection. A Mac answers so: tokio's `peer_cred`
+    /// asks `LOCAL_PEEREPID` first, and the kernel answers that with `ENOTCONN`
+    /// once the caller's end is gone, while Linux still reads such a caller from
+    /// what it saved at `connect`. The person's own `roomler status` leaves one
+    /// whenever the root half is slower than its check
+    /// ([`macos_root_half_serves_me`]). A debug line that says the caller left,
+    /// where a WARN called it a refused stranger with `peer_uid=None`.
+    Gone,
+    /// Any other error: a WARN that names it.
+    Unread(&'e std::io::Error),
+}
+
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+impl<'e> PersonDrop<'e> {
+    fn of(read_error: Option<&'e std::io::Error>) -> Self {
+        match read_error {
+            None => Self::Stranger,
+            Some(e) if e.kind() == std::io::ErrorKind::NotConnected => Self::Gone,
+            Some(e) => Self::Unread(e),
+        }
+    }
+
+    /// Logs the drop. `peer_uid` is the uid `peer_cred` read, if it read one.
+    fn log(self, peer_uid: Option<u32>, owner_uid: u32) {
+        match self {
+            Self::Stranger => tracing::warn!(
+                peer_uid = ?peer_uid, owner_uid,
+                "localapi: person socket refused a caller that is neither its person nor root"
+            ),
+            Self::Gone => tracing::debug!(
+                owner_uid,
+                "localapi: person socket: a caller closed its connection before it was read; nothing to serve"
+            ),
+            Self::Unread(e) => tracing::warn!(
+                error = %e, owner_uid,
+                "localapi: person socket refused a caller whose credentials could not be read"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6935,11 +7240,13 @@ mod tests {
             active: true,
             withheld_reason: None,
             v6_active: true,
+            v6_withheld_reason: None,
             dns_steered: true,
             socks5_port: None,
         };
         let json = serde_json::to_string(&os_tun).unwrap();
         assert!(!json.contains("socks5_port"), "{json}");
+        assert!(!json.contains("v6_withheld_reason"), "{json}");
         let older: ExitNodeStatus = serde_json::from_str(
             r#"{"selector":"exit","active":true,"v6_active":true,"dns_steered":true}"#,
         )
@@ -7098,6 +7405,7 @@ mod tests {
                     why: None,
                     probes: Vec::new(),
                     debug: None,
+                    control_down: None,
                 },
                 PeerInfo {
                     node_id: "n3".into(),
@@ -7120,6 +7428,7 @@ mod tests {
                     why: None,
                     probes: Vec::new(),
                     debug: None,
+                    control_down: None,
                 },
             ]
         }
@@ -7526,6 +7835,48 @@ mod tests {
         let s = serde_json::to_string(&p2).unwrap();
         assert!(s.contains(r#""stalled":true"#));
         assert!(serde_json::from_str::<PeerInfo>(&s).unwrap().stalled);
+    }
+
+    /// #4367 — `PeerInfo.control_down` is additive in both directions: an
+    /// older daemon's payload (no key) reads as no mark, an unset mark stays
+    /// off the wire, a set one round-trips with its time, a mark without a
+    /// time is still a mark, and an older reader parses a payload carrying it.
+    #[test]
+    fn peer_info_control_down_wire_compat() {
+        // Absent → None (an older daemon talking to a newer CLI).
+        let old = r#"{"node_id":"n1","name":"pc","online":true,"connection":"direct"}"#;
+        let p: PeerInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(p.control_down, None);
+        // Unset → off the wire: a connected daemon's `peers --json` is unchanged.
+        assert!(!serde_json::to_string(&p).unwrap().contains("control_down"));
+        // Set → round-trips with its time.
+        let mut kept = p.clone();
+        kept.control_down = Some(ControlDown {
+            since_ms: Some(1_764_000_000_000),
+        });
+        let s = serde_json::to_string(&kept).unwrap();
+        assert!(
+            s.contains(r#""control_down":{"since_ms":1764000000000}"#),
+            "{s}"
+        );
+        assert_eq!(serde_json::from_str::<PeerInfo>(&s).unwrap(), kept);
+        // A mark the daemon cannot time is still a mark.
+        let bare: PeerInfo = serde_json::from_str(
+            r#"{"node_id":"n1","name":"pc","online":true,"connection":"direct","control_down":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(bare.control_down, Some(ControlDown { since_ms: None }));
+        // An OLDER reader (no such field) still parses the newer payload.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OldPeerInfo {
+            node_id: String,
+            name: String,
+            online: bool,
+        }
+        let as_old: OldPeerInfo =
+            serde_json::from_str(&s).expect("a newer payload must not choke an older reader");
+        assert_eq!((as_old.node_id.as_str(), as_old.online), ("n1", true));
     }
 
     #[tokio::test]
@@ -8175,6 +8526,7 @@ mod tests {
             installer_exit_code: None,
             note: None,
             path: Some("/root/.local/share/roomler/logs/last-install.json".into()),
+            daemon: None,
         };
         st.last_install = Some(absent.clone());
         let with = serde_json::to_string(&st).unwrap();
@@ -8202,6 +8554,42 @@ mod tests {
         assert_ne!(back.status, absent.status, "the two words never collapse");
     }
 
+    /// FR-150 P1b — `daemon` is additive: a record without it parses and
+    /// writes no key, and one with it round-trips, its rungs in order.
+    #[test]
+    fn last_install_daemon_is_additive_and_round_trips() {
+        let old = r#"{"status":"SucceededVerified","expected_version":"agent-v0.4.228"}"#;
+        let back: LastInstallStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(back.daemon, None);
+        assert!(!serde_json::to_string(&back).unwrap().contains("daemon"));
+
+        let with = LastInstallStatus {
+            daemon: Some(InstallDaemon {
+                running: true,
+                how: Some(InstallDaemon::STARTED_THROUGH_THE_TASK.into()),
+                rungs: vec![
+                    "not up 120 s after the install".into(),
+                    "service start: asked".into(),
+                ],
+            }),
+            ..back
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.contains(
+                r#""daemon":{"running":true,"how":"started through the task","rungs":["not up"#
+            ),
+            "{json}"
+        );
+        let again: LastInstallStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(again, with);
+
+        let came_back_by_itself: InstallDaemon =
+            serde_json::from_str(r#"{"running":true}"#).unwrap();
+        assert_eq!(came_back_by_itself.how, None);
+        assert!(came_back_by_itself.rungs.is_empty());
+    }
+
     /// FR-67 P3 — `InProgress` is a verdict still being written only while
     /// the watcher can still be alive; past its whole budget it is an install
     /// that never reported, and a record with no start time cannot be fresh.
@@ -8217,6 +8605,7 @@ mod tests {
             installer_exit_code: None,
             note: None,
             path: None,
+            daemon: None,
         };
         assert!(li.in_progress());
         assert!(
@@ -10024,9 +10413,78 @@ mod tests {
             Request::KillFlow { id: "f".into() },
             Request::RouteRemove { id: "r".into() },
             Request::SetDeviceName { name: "x".into() },
+            // FR-151 — the root update helper's read, and a person's own ask,
+            // which must never reach a root daemon from a person.
+            Request::LiveWork,
+            Request::AskForUpdate,
         ];
         for req in refused {
             assert!(!person_may(&req), "the person socket must refuse {req:?}");
+        }
+    }
+
+    /// FR-151 L1 — `live_work` and `ask_for_update` on the wire, their
+    /// answers, and a node that serves neither says so as an error, which
+    /// the update helper counts as live work.
+    #[tokio::test]
+    async fn live_work_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&Request::LiveWork).unwrap(),
+            r#"{"t":"live_work"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::AskForUpdate).unwrap(),
+            r#"{"t":"ask_for_update"}"#
+        );
+        let info = LiveWorkInfo {
+            rc_sessions: 1,
+            ssh_connections: 2,
+            exec_runs: 3,
+            work: 4,
+            net_transition: true,
+            ask_age_secs: Some(5),
+        };
+        let j = serde_json::to_string(&Response::LiveWork(info)).unwrap();
+        assert_eq!(
+            j,
+            r#"{"t":"live_work","d":{"rc_sessions":1,"ssh_connections":2,"exec_runs":3,"work":4,"net_transition":true,"ask_age_secs":5}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&j).unwrap(),
+            Response::LiveWork(info)
+        );
+        // No ask recorded: the field is absent, and an absent field reads as none.
+        let idle = serde_json::to_string(&Response::LiveWork(LiveWorkInfo::default())).unwrap();
+        assert!(!idle.contains("ask_age_secs"), "{idle}");
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"t":"live_work","d":{}}"#).unwrap(),
+            Response::LiveWork(LiveWorkInfo::default())
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::UpdateAskRecorded).unwrap(),
+            r#"{"t":"update_ask_recorded"}"#
+        );
+        // The trait's defaults: neither is served by a node that does not say so.
+        match ask_scoped(Scope::Full, r#"{"t":"live_work"}"#).await {
+            Response::Error { message } => assert!(message.contains("not reported"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        match ask_scoped(Scope::Full, r#"{"t":"ask_for_update"}"#).await {
+            Response::Error { message } => assert!(message.contains("not served"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    /// FR-151 L2 — neither verb is served on the person socket: the read
+    /// lists the root half's SSH connections and runs, and a person's ask
+    /// recorded by a root daemon would let an update install over everything.
+    #[tokio::test]
+    async fn live_work_and_the_ask_are_not_on_the_person_socket() {
+        assert!(!person_may(&Request::LiveWork));
+        assert!(!person_may(&Request::AskForUpdate));
+        for j in [r#"{"t":"live_work"}"#, r#"{"t":"ask_for_update"}"#] {
+            let r = ask_scoped(SEAT, j).await;
+            assert!(is_person_refusal(&r), "{j}: {r:?}");
         }
     }
 
@@ -11622,6 +12080,10 @@ mod tests {
             rx_denied: 0,
             rx_denied_noroute: 0,
         });
+        // #4367 — a peer kept through the root half's control-socket outage.
+        p.control_down = Some(ControlDown {
+            since_ms: Some(1_764_000_000_000),
+        });
         let Response::Peers(out) = person_view(Response::Peers(vec![p.clone()])) else {
             panic!("a Peers answer stays a Peers answer");
         };
@@ -11640,6 +12102,10 @@ mod tests {
         assert_eq!(q.rtt_ms, p.rtt_ms);
         assert_eq!(q.relay_kind.as_deref(), Some("derp"));
         assert_eq!(q.relay_transport.as_deref(), Some("tcp"));
+        assert_eq!(
+            q.control_down, p.control_down,
+            "the mark crosses the person socket: it says how old the list is"
+        );
         let status = Response::Status(Box::new(Mock.status()));
         assert_eq!(person_view(status.clone()), status);
     }
@@ -12122,6 +12588,237 @@ mod tests {
             srv.await.unwrap().unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #4202 — binds a socket in a folder of the test's own, connects to it,
+    /// closes that connection, and only then accepts it. The result is the
+    /// daemon's end of a caller that has gone, as the person socket's accept
+    /// loop meets one when `roomler status` closes its check
+    /// (`macos_root_half_serves_me`) before the loop reads it. Nothing here
+    /// depends on timing: the close has returned before the accept is called.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn accepted_after_its_caller_closed(tag: &str) -> (std::path::PathBuf, tokio::net::UnixStream) {
+        let dir = std::env::temp_dir().join(format!("roomler-4202-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("person.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        let (gone, _) = listener.accept().unwrap();
+        gone.set_nonblocking(true).unwrap();
+        (dir, tokio::net::UnixStream::from_std(gone).unwrap())
+    }
+
+    /// #4202 — on a Mac the kernel names no peer for a caller that closed
+    /// before the accept. Tokio's `peer_cred` asks `LOCAL_PEEREPID` first, and
+    /// that answers `ENOTCONN` once the caller's end is gone, so the person
+    /// socket reads no uid for the caller. It drops it as a caller that has
+    /// gone ([`PersonDrop::Gone`], a debug line), where it used to log the
+    /// refusal #4202 is about. The caller's uid is still there: `getpeereid`
+    /// reads `LOCAL_PEERCRED`, which the kernel saved when the caller connected.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_mac_reads_no_credentials_for_a_caller_that_closed_before_the_accept() {
+        use std::os::unix::io::AsRawFd;
+        let me = own_uid().unwrap();
+        let (dir, gone) = accepted_after_its_caller_closed("mac");
+        let e = gone
+            .peer_cred()
+            .expect_err("a caller that closed has no process for the kernel to name");
+        assert_eq!(e.raw_os_error(), Some(libc::ENOTCONN), "{e}");
+        assert!(
+            matches!(PersonDrop::of(Some(&e)), PersonDrop::Gone),
+            "the kernel's own answer reads as a caller that has gone: {e}"
+        );
+        let (mut uid, mut gid) = (u32::MAX, u32::MAX);
+        // SAFETY: an open socket, and two out-params of the types it writes.
+        let rc = unsafe { libc::getpeereid(gone.as_raw_fd(), &mut uid, &mut gid) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(
+            uid, me,
+            "the credentials saved at connect still name the caller"
+        );
+        drop(gone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #4202 — on Linux the kernel keeps the credentials it saved when the
+    /// caller connected (`SO_PEERCRED`), so a caller that closed before the
+    /// accept is still read as itself. The person socket accepts it, and its
+    /// connection ends with nothing to read. That is why the refusal with
+    /// `peer_uid=None` was seen on a Mac only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_still_reads_a_caller_that_closed_before_the_accept() {
+        let me = own_uid().unwrap();
+        let (dir, gone) = accepted_after_its_caller_closed("linux");
+        let cred = gone
+            .peer_cred()
+            .expect("the credentials saved at connect are still read");
+        assert_eq!(cred.uid(), me);
+        drop(gone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #4202 — the person socket's accept loop meets a caller that has gone,
+    /// queued just ahead of the person's live connection. Both are queued
+    /// before the loop runs. The gone caller is dropped on a Mac, with a debug
+    /// line that says it left, and ends with nothing to read on Linux. On both,
+    /// the live one is answered and nothing is logged as a WARN, so a caller
+    /// that has gone costs a waiting caller nothing and reads as no stranger.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_caller_gone_before_the_accept_costs_the_live_person_nothing() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        // This test's thread runs the loop too (a current-thread runtime).
+        let logged = Logged::default();
+        let _logging = tracing::subscriber::set_default(logged.clone());
+        let me = own_uid().unwrap();
+        let dir = std::env::temp_dir().join(format!("roomler-4202-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("person.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        let live = tokio::net::UnixStream::connect(&path).await.unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let state: Arc<dyn LocalApiState> = Arc::new(Mock);
+        let (tx, mut rx) = watch::channel(false);
+        let srv = tokio::spawn(async move {
+            serve_person_listener(&listener, me, state, &mut rx, std::future::pending())
+                .await
+                .map(|_| ())
+        });
+        let (rd, mut wr) = tokio::io::split(live);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        wr.write_all(b"{\"t\":\"status\"}\n").await.unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the live person is answered")
+            .unwrap()
+            .expect("an answer, not a close");
+        let r: Response = serde_json::from_str(&line).unwrap();
+        assert!(matches!(r, Response::Status(_)), "{r:?}");
+        tx.send(true).unwrap();
+        srv.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let logged = logged.0.lock().unwrap().clone();
+        let loud: Vec<_> = logged
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN || *level == tracing::Level::ERROR)
+            .collect();
+        assert!(
+            loud.is_empty(),
+            "a caller that has gone is no WARN: {loud:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            logged
+                .iter()
+                .any(|(level, words)| *level == tracing::Level::DEBUG
+                    && words.contains("closed its connection before it was read")),
+            "the loop dropped the caller that had gone as gone: {logged:?}"
+        );
+    }
+
+    /// #4202 — every event's level and its words: the message, then each other
+    /// field as ` name=value`. A subscriber of the test's own, as tracing's
+    /// crate alone allows (this crate has no `tracing-subscriber`).
+    #[derive(Clone, Default)]
+    struct Logged(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl tracing::Subscriber for Logged {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Words(String);
+            impl tracing::field::Visit for Words {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = match field.name() {
+                        "message" => write!(self.0, "{value:?}"),
+                        name => write!(self.0, " {name}={value:?}"),
+                    };
+                }
+            }
+            let mut words = Words(String::new());
+            event.record(&mut words);
+            let level = *event.metadata().level();
+            self.0.lock().unwrap().push((level, words.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// #4202 — the person socket's line for a caller it drops, by what
+    /// `peer_cred` answered: another account's uid, and a read that failed,
+    /// are each a WARN naming what is known, and a caller that closed before
+    /// it was read (`ENOTCONN`) is a debug line that says it left, never a
+    /// refused stranger. Every platform.
+    #[test]
+    fn a_caller_that_left_before_it_was_read_is_logged_as_gone_not_refused() {
+        let left = std::io::Error::from(std::io::ErrorKind::NotConnected);
+        let unread = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(PersonDrop::of(None), PersonDrop::Stranger));
+        assert!(matches!(PersonDrop::of(Some(&left)), PersonDrop::Gone));
+        assert!(matches!(
+            PersonDrop::of(Some(&unread)),
+            PersonDrop::Unread(_)
+        ));
+        #[cfg(unix)]
+        {
+            let enotconn = std::io::Error::from_raw_os_error(libc::ENOTCONN);
+            assert!(matches!(PersonDrop::of(Some(&enotconn)), PersonDrop::Gone));
+            let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+            assert!(matches!(
+                PersonDrop::of(Some(&ebadf)),
+                PersonDrop::Unread(_)
+            ));
+        }
+
+        let logged = Logged::default();
+        tracing::subscriber::with_default(logged.clone(), || {
+            PersonDrop::of(None).log(Some(4242), 501);
+            PersonDrop::of(Some(&left)).log(None, 501);
+            PersonDrop::of(Some(&unread)).log(None, 501);
+        });
+        let logged = logged.0.lock().unwrap().clone();
+        let [stranger, gone, failed] = logged.as_slice() else {
+            panic!("one line a drop: {logged:?}");
+        };
+        assert_eq!(stranger.0, tracing::Level::WARN, "{stranger:?}");
+        assert!(
+            stranger.1.contains("neither its person nor root")
+                && stranger.1.contains("peer_uid=Some(4242)")
+                && stranger.1.contains("owner_uid=501"),
+            "{stranger:?}"
+        );
+        assert_eq!(
+            gone.0,
+            tracing::Level::DEBUG,
+            "a caller that left is no WARN: {gone:?}"
+        );
+        assert!(
+            gone.1.contains("closed its connection before it was read")
+                && !gone.1.contains("refused"),
+            "{gone:?}"
+        );
+        assert_eq!(failed.0, tracing::Level::WARN, "{failed:?}");
+        assert!(
+            failed.1.contains("could not be read") && failed.1.contains(" error="),
+            "{failed:?}"
+        );
     }
 
     /// FR-90 P1h-2 — a daemon that holds at once, counting holds and releases.
@@ -12851,6 +13548,94 @@ mod tests {
         // Control: a per-user daemon with its own runtime dir serves there.
         let own: std::path::PathBuf = "/run/user/1000/roomler.sock".into();
         assert_eq!(unix_endpoints(system, false, Some(own.clone())), vec![own]);
+    }
+
+    /// #3937 — root's "not running" line with the account `sudo` ran for.
+    const ROOT_NOT_RUNNING_ALICE: &str = "roomler daemon not running: no socket at \
+        /var/run/roomler/roomler.sock, the system daemon's; a per-user daemon, if this host \
+        runs one, answers only its own account: run this as alice, without `sudo`";
+
+    /// #3937 — root's "not running" line when no account can be named.
+    const ROOT_NOT_RUNNING_NO_NAME: &str = "roomler daemon not running: no socket at \
+        /var/run/roomler/roomler.sock, the system daemon's; a per-user daemon, if this host \
+        runs one, answers only its own account: run this as that account, without `sudo`";
+
+    /// #3937 — under `sudo`, the line names the socket root tried (the
+    /// system daemon's), drops "is the service started?", says that a
+    /// per-user daemon answers only its own account, and names the account
+    /// `sudo` ran for. Linux and macOS take the same words.
+    #[test]
+    fn not_running_under_sudo_names_the_socket_and_the_account() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        assert_eq!(
+            not_running_words_for(0, Some("alice"), system).as_deref(),
+            Some(ROOT_NOT_RUNNING_ALICE)
+        );
+        // Every character of the portable set is printed as it is.
+        let line = not_running_words_for(0, Some("_svc.deploy-2"), system).unwrap();
+        assert!(
+            line.ends_with("run this as _svc.deploy-2, without `sudo`"),
+            "{line}"
+        );
+        // The socket named is the one that was tried.
+        let line = not_running_words_for(0, Some("alice"), std::path::Path::new("/x/y.sock"));
+        assert!(
+            line.as_deref()
+                .is_some_and(|l| l.contains("no socket at /x/y.sock, the system daemon's;")),
+            "{line:?}"
+        );
+    }
+
+    /// #3937 — root with no `SUDO_USER` (`su`, a root login, cron) hears the
+    /// same words, naming no account.
+    #[test]
+    fn not_running_for_root_without_sudo_user_names_no_account() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        assert_eq!(
+            not_running_words_for(0, None, system).as_deref(),
+            Some(ROOT_NOT_RUNNING_NO_NAME)
+        );
+    }
+
+    /// #3937 — a `SUDO_USER` outside the POSIX portable user names
+    /// (`A-Za-z0-9._-`, never `-` first) is never printed, not even in part:
+    /// the words then name no account.
+    #[test]
+    fn not_running_never_prints_a_sudo_user_outside_the_portable_set() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        for odd in [
+            "",
+            "-alice",
+            "alice bob",
+            "alice\u{1b}[2J",
+            "alice\nError: forged",
+            "../alice",
+            "ålice",
+            "alice$",
+            "al:ice",
+        ] {
+            assert_eq!(
+                not_running_words_for(0, Some(odd), system).as_deref(),
+                Some(ROOT_NOT_RUNNING_NO_NAME),
+                "{odd:?}"
+            );
+        }
+    }
+
+    /// #3937 — every account but root keeps the line it had: `None` here,
+    /// whatever `SUDO_USER` holds.
+    #[test]
+    fn not_running_words_of_every_other_account_are_unchanged() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        for euid in [1, 501, 1000, 65534, u32::MAX] {
+            for sudo_user in [None, Some("alice")] {
+                assert_eq!(
+                    not_running_words_for(euid, sudo_user, system),
+                    None,
+                    "uid {euid}, SUDO_USER {sudo_user:?}"
+                );
+            }
+        }
     }
 
     /// A directory for one test's sockets: this account's, 0700.

@@ -39,7 +39,27 @@ struct Shared {
     stop_reading: AtomicBool,
     delay_next_reply_ms: AtomicU64,
     accepted: AtomicU64,
+    /// #3952 — accepted client connections the client has not closed yet.
+    live: AtomicU64,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// One accepted client connection that its client has not closed. It is held
+/// by the connection's client-to-Redis pump, so a close by the client, or an
+/// abort of the pump, gives it back.
+struct LiveConn(Arc<Shared>);
+
+impl LiveConn {
+    fn new(shared: Arc<Shared>) -> Self {
+        shared.live.fetch_add(1, Ordering::SeqCst);
+        Self(shared)
+    }
+}
+
+impl Drop for LiveConn {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Shared {
@@ -140,6 +160,13 @@ impl RedisBlackout {
         self.shared.accepted.load(Ordering::SeqCst)
     }
 
+    /// #3952 — how many of the accepted client connections are still open
+    /// from the client's side: a client that drops a connection, a deaf one
+    /// included, gives its count back.
+    pub fn live(&self) -> u64 {
+        self.shared.live.load(Ordering::SeqCst)
+    }
+
     /// Go away as a Redis process that stops does: close every connection
     /// (each client sees the close) and refuse every new one on the same port
     /// until [`RedisBlackout::listen_again`]. Returns once the port refuses.
@@ -220,13 +247,14 @@ fn accept_loop(listener: TcpListener, upstream: String, shared: Arc<Shared>) -> 
             let lost = Arc::new(AtomicBool::new(false));
             let (client_rx, client_tx) = client.into_split();
             let (server_rx, server_tx) = server.into_split();
-            let up = tokio::spawn(pump(
-                client_rx,
-                server_tx,
-                shared.clone(),
-                lost.clone(),
-                false,
-            ));
+            let live = LiveConn::new(shared.clone());
+            let up = tokio::spawn({
+                let (shared, lost) = (shared.clone(), lost.clone());
+                async move {
+                    let _live = live;
+                    pump(client_rx, server_tx, shared, lost, false).await;
+                }
+            });
             let down = tokio::spawn(pump(server_rx, client_tx, shared.clone(), lost, true));
             shared.keep(up);
             shared.keep(down);

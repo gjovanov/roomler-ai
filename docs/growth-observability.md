@@ -424,7 +424,7 @@ flowchart TD
 | Rule | Where |
 |---|---|
 | The setting: comma-separated CIDRs (`203.0.113.0/24`, `2001:db8::/32`) or bare addresses (their own `/32` / `/128`). A CIDR with host bits set, or a prefix shorter than /8 (IPv4) or /16 (IPv6), is refused, never widened. An IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`) is compared as the IPv4 it carries | `InternalNetworks::parse` / `contains` ([`growth.rs:171`](../crates/core/src/growth.rs), [`:221`](../crates/core/src/growth.rs)) |
-| Parsed once at boot. An entry it cannot use (not an address, host bits set, a prefix too short) is echoed in one warning with its reason and skipped, and the rest still apply. The networks in effect are logged as CIDRs | `internal_networks_from` ([`fleet/src/lib.rs:214`](../crates/modules/fleet/src/lib.rs)) |
+| Parsed once at boot. An entry it cannot use (not an address, host bits set, a prefix too short) is echoed in one warning with its reason and skipped, and the rest still apply. The networks in effect are logged as CIDRs | `internal_networks_from` ([`fleet/src/lib.rs:218`](../crates/modules/fleet/src/lib.rs)) |
 | **One client-address rule.** The `X-Forwarded-For` entry just left of our trusted hops' own (`app.rate_limit_trusted_hops`, 1 in production), the client the edge recorded, else the socket peer; `X-Real-IP` is never read. It moved from the api crate to core so `fleet` reads it exactly as the per-IP governor and the credential gate do. A client that seeds `X-Forwarded-For` with a lab address moves nobody: that entry sits left of the one our hop recorded | `client_ip_or_peer` ([`client_ip.rs:67`](../crates/core/src/client_ip.rs)); the handlers take `PeerAddr` ([`:90`](../crates/core/src/client_ip.rs)), an extractor that never refuses |
 | The class becomes `internal`; the asset and OS stay. The updater rule comes first, so a `roomlerd/` fetch from the lab still writes nothing | `fetch_dims` ([`install_trace.rs:188`](../crates/modules/fleet/src/install_trace.rs)), `count_fetch` ([`:211`](../crates/modules/fleet/src/install_trace.rs)) |
 | **Still no IP, anywhere.** The address is compared in memory and dropped; the row stays three enum-like dimensions and a count. The integration test scans every row for each address it used (the lab's, the outsider's, our hop's, the peer's) | `install_trace_tests::fetches_from_internal_networks_count_as_internal_and_store_no_address` |
@@ -499,7 +499,7 @@ not what the trace records. The token is minted at delivery by the admin route's
 `pairing::deliver` mints with `issue_enrollment_token_with` and writes
 `enroll_tokens.record_issued(jti, tenant_id, approver, now)`
 (`crates/modules/fleet/src/pairing.rs:992-1011`), the same call `POST …/agent/enroll-token`
-makes (`agent.rs:256-267`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
+makes (`agent.rs:260-271`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
 approver>, issued_at, kind: standard}`, one per half, and "tokens issued → redeemed" counts a
 paired token like any other. The tunnel kind writes no ledger row, as the tunnel route never
 has. The enroll is the ordinary one, so `agents.install` says who installed: `method: wizard`
@@ -681,7 +681,7 @@ self-host profile compiles `saas`, and without `ROOMLER__GROWTH__PURESTAT_API_KE
 | **A cycle** | starts at 01:00 UTC (purestat closes a visit 30 min after its last event); every day of the horizon is re-pulled once per cycle, which is what catches a late event | `CYCLE_HOUR_UTC` |
 | **A failure** | the day stays due, so the next hourly tick retries; after a fatal error (no key, 401, timeout, unreachable) the run stops asking and records the same reason for every day it owed | `run_once` ([`purestat_pull.rs:309`](../crates/modules/saas/src/purestat_pull.rs)) |
 | **Once across pods** | a DB-name-scoped Redis `NX` claim per tick (`roomler:growth-purestat-pull:<db>`), as the stats rollup and the reapers; without Redis the pod runs locally | `spawn_puller` ([`purestat_pull.rs:370`](../crates/modules/saas/src/purestat_pull.rs)) |
-| **Idempotent** | each row is `$set` on its own `_id` — a day pulled twice holds one copy; an unchanged row is not written; a row of the pulled metrics the pull no longer carries is deleted (write-then-prune, never an empty day) | `GrowthDao::replace_daily` ([`growth.rs:476`](../crates/services/src/dao/growth.rs)) |
+| **Idempotent** | each row is `$set` on its own `_id` — a day pulled twice holds one copy; an unchanged row is not written; a row of the pulled metrics the pull no longer carries is deleted (write-then-prune, never an empty day) | `GrowthDao::replace_daily` ([`growth.rs:482`](../crates/services/src/dao/growth.rs)) |
 
 A day is three purestat queries ([`pull_day`](../crates/modules/saas/src/purestat_pull.rs)),
 each row's `dims.by` naming its breakdown:
@@ -706,12 +706,12 @@ each row's `dims.by` naming its breakdown:
   pull stored are left as they were.
 - `reads` (pageviews visible ≥ 30 s) is the engagement purestat's v1 contract carries; it has
   **no engaged-visitor metric**, so the spec's "engaged visitors" are `reads` here.
-- The `_id` is escaped ([`daily_id`, growth.rs:151](../crates/services/src/dao/growth.rs)):
+- The `_id` is escaped ([`daily_id`, growth.rs:157](../crates/services/src/dao/growth.rs)):
   `%` `,` `=` `:` inside a value are percent-encoded, so a crafted UTM value cannot forge
   another row's id. P3's ids, which contain none of them, are unchanged.
 
 **`growth_pulls`** — one row per `(source, day)` attempted, `_id = "purestat:YYYY-MM-DD"`
-([`GrowthPull`, growth.rs:225](../crates/services/src/dao/growth.rs)):
+([`GrowthPull`, growth.rs:231](../crates/services/src/dao/growth.rs)):
 
 | Field | Meaning |
 |---|---|
@@ -724,7 +724,7 @@ each row's `dims.by` naming its breakdown:
 ### The Campaigns table
 
 `GET /api/admin/growth/campaigns?since&until&by&include_internal`
-([`campaigns.rs:586`](../crates/api/src/growth/campaigns.rs)) — platform admins only, **404**
+([`campaigns.rs:594`](../crates/api/src/growth/campaigns.rs)) — platform admins only, **404**
 otherwise and when `growth.enabled = false`, like every growth route.
 
 | Parameter | Values | Default |
@@ -753,11 +753,11 @@ otherwise and when `growth.enabled = false`, like every growth route.
   rows the open day showed at 19:57Z were gone from the closed day, while both accounts kept
   their keys.
 - **The account plane is P2's** — `funnel::read` and `funnel::group_by`
-  ([`funnel.rs:409`](../crates/api/src/growth/funnel.rs)), the same `outcome` the funnel
+  ([`funnel.rs:434`](../crates/api/src/growth/funnel.rs)), the same `outcome` the funnel
   tallies with, grouped by `CampaignKey::normalized` of the owner's `signup_attribution`; the
   exclusion set applies. A unit test asserts a grouping agrees with the funnel's own
   breakdown.
-- **Joined in code by the key** ([`join`, campaigns.rs:391](../crates/api/src/growth/campaigns.rs)):
+- **Joined in code by the key** ([`join`, campaigns.rs:398](../crates/api/src/growth/campaigns.rs)):
   a key on one plane only is still a row — a **measured zero** on the other when that plane
   answered. Sorted by visitors, then sign-ups; at most 500 rows (`rows_truncated` says so).
 
@@ -824,10 +824,10 @@ flowchart LR
 
 A platform admin mints it on `/observability/growth` → **Channels** → *Ingest keys*, or with
 `POST /api/admin/growth/keys` `{"kind": "ingest", "label": "…"}`
-([`keys.rs:140`](../crates/api/src/growth/keys.rs)). The answer carries the key **once**:
+([`keys.rs:143`](../crates/api/src/growth/keys.rs)). The answer carries the key **once**:
 `rgi_` and 32 random characters of nanoid's URL-safe alphabet (192 bits). The server stores
 only `hex(SHA-256(key))` and a display prefix (`rgi_AbCd1234`) in `growth_keys`
-([`growth_key.rs:97`](../crates/services/src/dao/growth_key.rs)); the list
+([`growth_key.rs:111`](../crates/services/src/dao/growth_key.rs)); the list
 (`GET /api/admin/growth/keys`) shows the prefix, the label, who minted it, when it was last
 used and whether it is revoked — never the key or its hash. `DELETE …/keys/{key_id}` revokes
 (a timestamp, so the row stays as the record); at most 10 live keys of a kind.
@@ -904,15 +904,15 @@ A body that is not JSON is `400 invalid_json`; one over 16 KiB is `413`. Each pu
 ### The Channels table
 
 `GET /api/admin/growth/channels?since&until&include_internal`
-([`channels.rs:583`](../crates/api/src/growth/channels.rs)) — platform admins only, 404
+([`channels.rs:589`](../crates/api/src/growth/channels.rs)) — platform admins only, 404
 otherwise and when `growth.enabled = false`. The range is UTC days, both inclusive (the
 Campaigns table's rules); a post is in it when it was **published** in it.
 
 | Level | Cells |
 |---|---|
-| **platform** (every one of the five; `instagram` only when it has data) | `posts`; **reach per snapshot age** — each age's raw metrics summed over the posts that have that snapshot, with their count, so a three-day-old post is never added to a month-old one ([`reach_at`, channels.rs:257](../crates/api/src/growth/channels.rs)); visitors and sign-ups → activated → first value summed over the posts' **distinct** keys (an upper bound on unique visitors); `paid` (P4); spend |
+| **platform** (every one of the five; `instagram` only when it has data) | `posts`; **reach per snapshot age** — each age's raw metrics summed over the posts that have that snapshot, with their count, so a three-day-old post is never added to a month-old one ([`reach_at`, channels.rs:261](../crates/api/src/growth/channels.rs)); visitors and sign-ups → activated → first value summed over the posts' **distinct** keys (an upper bound on unique visitors); `paid` (P4); spend |
 | **post** | its account, format, URL, publish time, key; every snapshot, and the oldest as `reach`; visitors (purestat, live, at the post's own depth — `content` when its link carried one, else `campaign`), sign-ups → activated → first value by the key; spend |
-| **spend** | `cost_cents` summed over the posts that declared one; `per_visitor` and `per_signup` as `{n, cents}` over those posts' visitors and sign-ups, `cents` only from n = 30 ([`cost_rate`, channels.rs:321](../crates/api/src/growth/channels.rs)) |
+| **spend** | `cost_cents` summed over the posts that declared one; `per_visitor` and `per_signup` as `{n, cents}` over those posts' visitors and sign-ups, `cents` only from n = 30 ([`cost_rate`, channels.rs:325](../crates/api/src/growth/channels.rs)) |
 
 Three cells, as everywhere: a platform with no post pushed in the range is
 `{"not_measured": "no posts pushed for this platform in the range"}` (and says when the ingest
@@ -922,7 +922,7 @@ per visitor — `not_measured`, while the reach and the account plane stand.
 
 The **Campaigns table's `reach` column** reads the same posts: per key at its depth, per
 platform, the posts with that key and their snapshots summed per age
-([`reach_by_key`, channels.rs:286](../crates/api/src/growth/channels.rs)); a key no post was
+([`reach_by_key`, channels.rs:290](../crates/api/src/growth/channels.rs)); a key no post was
 pushed with is `not_measured`.
 
 | Collection | Shape | Kept |
@@ -1047,7 +1047,7 @@ A digest stored before P7 reads both halves as `arrives_with: P7`.
 
 | Setting | Env | Default | Effect |
 |---|---|---|---|
-| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:889`](../crates/config/src/settings.rs#L889)) |
+| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:901`](../crates/config/src/settings.rs#L901)) |
 | `growth.github_api_url` | `ROOMLER__GROWTH__GITHUB_API_URL` | `https://api.github.com` | only a test changes it |
 | `growth.github_token` | `ROOMLER__GROWTH__GITHUB_TOKEN` | empty | the traffic's token, sent on the three traffic requests and nothing else; never logged, never in a pull row's error; empty ⇒ traffic "not measured" |
 
@@ -1131,7 +1131,7 @@ collection of `saas`'s own (its index set in the module, FR-69 rule 3), read by 
 - **The feed is the list.** No server record holds the posts: the blog is built by the docs
   generator and published by the blog lane. Its Atom feed, `{frontend_url}/blog/feed.xml`
   (`ROOMLER__GROWTH__BLOG_FEED_URL` overrides it), carries every post's permanent URL, title and
-  `published` time ([`parse_feed`, `content_pull.rs:165`](../crates/modules/saas/src/content_pull.rs)).
+  `published` time ([`parse_feed`, `content_pull.rs:166`](../crates/modules/saas/src/content_pull.rs)).
   It is read once a day (`growth_pulls content:<day>`) with no credential — it is the site's
   own. `_id` is the post's path, the key every reader joins on; a post that leaves the feed keeps
   its row with `in_feed: false`.
@@ -1140,8 +1140,8 @@ collection of `saas`'s own (its index set in the module, FR-69 rule 3), read by 
   SPA's index page served for any path, a site mid-deploy — or a feed none of whose entries parse
   is a **failed** read, recorded on `content:<day>` with its reason, and changes nothing: a post
   is marked out of the feed only by a feed that lacks it
-  ([`read_feed`, `content_pull.rs:258`](../crates/modules/saas/src/content_pull.rs),
-  [`is_atom_feed`, `:131`](../crates/modules/saas/src/content_pull.rs)). Only `https` entry
+  ([`read_feed`, `content_pull.rs:259`](../crates/modules/saas/src/content_pull.rs),
+  [`is_atom_feed`, `:132`](../crates/modules/saas/src/content_pull.rs)). Only `https` entry
   links are read, since the Content table renders them as links; the body is capped at 8 MiB.
 - **URL Inspection**, with the Search Console key: each post in the feed, at most 200 a day
   (`MAX_INSPECTIONS`, inside Google's 2,000), gets Google's `verdict` (`PASS` · `NEUTRAL` —
@@ -1153,7 +1153,7 @@ collection of `saas`'s own (its index set in the module, FR-69 rule 3), read by 
   the token, a 403, a quota, three timeouts) stops the day's inspections, is recorded on **every**
   post the run still owed, and fails `url_inspection:<day>` with its reason. A post inspected
   successfully in the cycle is not asked again when a later tick retries the day
-  ([`run_once`, `content_pull.rs:325`](../crates/modules/saas/src/content_pull.rs)).
+  ([`run_once`, `content_pull.rs:326`](../crates/modules/saas/src/content_pull.rs)).
 
 > ⚠️ **Restricted is enough for the numbers, maybe not for the index column.** Google's own
 > permission table gives a *Restricted* user Performance (Search Analytics) but only "fetch only"
@@ -1383,7 +1383,7 @@ the route agree on whether a configured key is usable
   arrives later, out of order, sometimes twice
   ([`DeliveryEvent`, newsletter_send.rs:31](../crates/services/src/dao/newsletter_send.rs)).
 - **Suppression** is the first reason, written once; the fan-out's per-recipient re-check
-  reads it ([newsletter_send.rs:175](../crates/modules/saas/src/newsletter_send.rs)) and marks
+  reads it ([newsletter_send.rs:176](../crates/modules/saas/src/newsletter_send.rs)) and marks
   the row `suppressed` without sending. Only fresh consent lifts it: subscribing again (the row
   is revived **unconfirmed** — the confirmation click is the proof the mailbox works) or the
   signed-in toggle on a verified account.
@@ -1407,14 +1407,14 @@ never blocking the boot; skipped without a SendGrid key.
 | This site | `roomler.ai`, `www.roomler.ai` and `app.frontend_url`'s host; anything else — a third party, a `mailto:`, a relative path, a URL with credentials — is left **byte-for-byte as written** (a third party learns nothing; a signed URL is not broken) | [`site_hosts`, newsletter.rs:66](../crates/services/src/newsletter.rs) |
 | An operator's own tag | kept; only the missing ones are added, after the query and before the fragment | `LinkTags::tag` |
 | The campaign | `nl-<slug>`, cut to the 64 characters a sign-up's attribution keeps — the one spelling both the links and every per-issue lookup use | [`issue_campaign`, newsletter.rs:57](../crates/services/src/newsletter.rs) |
-| The unsubscribe link | `…/api/subscribe/unsubscribe/{token}?i=<slug>` — the token is the one per-recipient thing; `i=` is the issue, the same for everyone. The `List-Unsubscribe` header carries the same link | [`unsubscribe_link`, saas newsletter.rs:218](../crates/modules/saas/src/newsletter.rs) |
+| The unsubscribe link | `…/api/subscribe/unsubscribe/{token}?i=<slug>` — the token is the one per-recipient thing; `i=` is the issue, the same for everyone. The `List-Unsubscribe` header carries the same link | [`unsubscribe_link`, saas newsletter.rs:259](../crates/modules/saas/src/newsletter.rs) |
 | The click | stamps `subscribers.unsubscribed_via = <slug>` with `unsubscribed_at` — once, by the click that ends a live subscription; a repeat (a prefetcher, a second issue's link) changes neither the time nor the issue. An `i=` naming no sent issue unsubscribes all the same and records none | [`via_issue`, subscribe.rs:214](../crates/modules/saas/src/subscribe.rs), [`SubscriberDao::unsubscribe`, subscriber.rs:180](../crates/services/src/dao/subscriber.rs) |
 | The stamp | when the fan-out starts, the issue records `campaign` (its links' tag; absent with the tags off) and `delivery_events` (this server verified the webhook when it sent) — what tells a later reader "not measured" from a zero | `NewsletterIssueDao::stamp_send_tags` |
 
 **AC15, as a test**: `every_link_but_the_unsubscribe_link_is_byte_identical_for_two_recipients`
 ([`newsletter_send.rs`](../crates/modules/saas/src/newsletter_send.rs), `tests`) renders an issue
 exactly as `run_send` does, composes it for two recipients with the same function the fan-out
-calls ([`compose`, newsletter.rs:244](../crates/modules/saas/src/newsletter.rs)), and asserts that
+calls ([`compose`, newsletter.rs:285](../crates/modules/saas/src/newsletter.rs)), and asserts that
 of every `href`/`src` in the two messages exactly one differs — the unsubscribe link — that
 with each recipient's unsubscribe link taken out the two bodies are the same bytes, and that
 the send options differ only in that link.
@@ -1422,7 +1422,7 @@ the send options differ only in that link.
 ### The per-issue table
 
 `GET /api/admin/growth/newsletter?since&until&include_internal`
-([`get_newsletter`, newsletter.rs:518](../crates/api/src/growth/newsletter.rs)) — platform admins
+([`get_newsletter`, newsletter.rs:526](../crates/api/src/growth/newsletter.rs)) — platform admins
 only, **404** otherwise and when `growth.enabled = false`. UTC days, both inclusive; the
 default is the **90** closed days ending yesterday (an issue is never more than monthly), at
 most 366.
@@ -1447,13 +1447,13 @@ flowchart LR
 | Cell | What | Not measured when |
 |---|---|---|
 | `ledger` | `recipients` (rows claimed), `accepted` (a SendGrid 202 — not delivered), `failed`, `suppressed`, `stale`: the stamped counts once completed, live while sending | — |
-| `delivery` | `delivered`, `bounced` (`hard_bounced`), `dropped`, `complaints` | this server verifies no webhook (no usable key), or the issue was sent before delivery events were recorded — **never 0** ([`delivery_cell`, newsletter.rs:485](../crates/api/src/growth/newsletter.rs)) |
+| `delivery` | `delivered`, `bounced` (`hard_bounced`), `dropped`, `complaints` | this server verifies no webhook (no usable key), or the issue was sent before delivery events were recorded — **never 0** ([`delivery_cell`, newsletter.rs:493](../crates/api/src/growth/newsletter.rs)) |
 | `unsubscribed_via` | subscribers whose current unsubscription came through this issue's link | — |
 | `web` | purestat's visitors, visits, pageviews, reads and goals for the issue's key `(newsletter, email, nl-<slug>)` over the range — one breakdown filtered on `utm_source = newsletter` | the issue's links carried no tags, or purestat cannot be asked (no key, 401, timeout) |
 | `signups` | sign-ups created in the range whose attribution normalises to the issue's key — the funnel's own read, so a link's spelling cased differently still counts, and the exclusion set applies | — |
 | `rates` | `delivered` (n = accepted), `hard_bounce` (n = accepted), `complaint` (n = delivered), `unsubscribe` (n = delivered, or accepted while delivery is unmeasured), `signup_per_visitor` (n = visitors); a value only from n = 30 | the side it rests on is not measured |
 
-**The list over time** ([`read_list`, newsletter.rs:255](../crates/api/src/growth/newsletter.rs)):
+**The list over time** ([`read_list`, newsletter.rs:260](../crates/api/src/growth/newsletter.rs)):
 new, confirmed, unsubscribed and suppressed per UTC day and by `source`, from the timestamps
 `subscribers` keeps, and the list's size now — mailable (confirmed, not withdrawn, not
 suppressed), awaiting confirmation, unsubscribed, suppressed. A subscriber carries no account
@@ -1507,7 +1507,7 @@ addresses plus one that bounces, sent twice — and the per-issue table marks it
 Billed revenue — paying orgs, billed MRR, its new / expansion / contraction / churned
 movements per month, trial → paid, `paid_since`, all of it by the owner's acquisition
 channel — read from **what Stripe billed**, never from the price list (§3g). The list-price
-figure (`Plan::price_monthly_cents` × seats, [`mrr_estimate_cents`, cost.rs:85](../crates/api/src/routes/cost.rs))
+figure (`Plan::price_monthly_cents` × seats, [`mrr_estimate_cents`, cost.rs:94](../crates/api/src/routes/cost.rs))
 stays beside it, labelled an ESTIMATE: for an org with no invoice yet it is the only figure
 there is. Rows carry the org's id and Stripe's ids and amounts — never a card, an address or a
 name — and go with the org.
@@ -1524,7 +1524,7 @@ sequenceDiagram
     W->>W: verify — refused (401) BEFORE the body is parsed
     W->>SE: insert {_id: evt_…} — a duplicate is a retry: skip
     W->>BE: one of the six kinds → a row (invoice amounts, plan, seats, period)
-    W->>T: plan · billing status (unchanged behaviour)
+    W->>T: plan · billing status (a first invoice's failed payment changes nothing)
     Note over W,SE: a processing failure removes the stripe_events marker,<br/>so Stripe's retry is processed, not skipped
     BF->>ST: GET /v1/invoices?status=paid (read-only, ≤ 100 pages)
     BF->>BE: invoice_paid rows, source: backfill — an invoice already on record is left as it was
@@ -1532,8 +1532,8 @@ sequenceDiagram
 
 ### The six kinds — `billing_events`
 
-[`process`, stripe.rs:1242](../crates/services/src/stripe.rs) records every billing kind
-before the tenant-state updates it always made; [`parse`, billing.rs:297](../crates/services/src/billing.rs)
+[`process`, stripe.rs:1310](../crates/services/src/stripe.rs) records every billing kind
+before the tenant-state updates it always made; [`parse`, billing.rs:340](../crates/services/src/billing.rs)
 reads Stripe's objects for both API versions in the field (the classic shape and the
 2025-03-31 "basil" one, which moved `invoice.subscription` under `parent`, a line's
 `proration` under `parent.subscription_item_details` and the subscription's period onto its
@@ -1543,18 +1543,18 @@ items).
 |---|---|---|
 | `customer.subscription.created` | `subscription_created` | plan (from the price id), seats (items' quantities), period, `status` — **no amount** (`null`, never 0) |
 | `customer.subscription.updated` | `subscription_updated` | the same, after the change — a seat change shows here |
-| `customer.subscription.deleted` | `subscription_deleted` | `ts` = `ended_at` — MRR is 0 from then |
-| `invoice.paid` | `invoice_paid` | `amount_cents` = `amount_paid` (what was billed, after coupons, before tax); `recurring_cents` = the subscription lines that are **not prorations**, after discounts ([`recurring_of`, billing.rs:188](../crates/services/src/billing.rs)); seats, period, interval; `ts` = `paid_at` |
-| `invoice.payment_failed` | `invoice_payment_failed` | `amount_cents` = `amount_due` |
+| `customer.subscription.deleted` | `subscription_deleted` | `ts` = `ended_at` — MRR is 0 from then, unless the subscription expired `incomplete`: it never paid, so it ends nothing ([`OrgBilling::of`, billing.rs:486](../crates/services/src/billing.rs), #4432) |
+| `invoice.paid` | `invoice_paid` | `amount_cents` = `amount_paid` (what was billed, after coupons, before tax); `recurring_cents` = the subscription lines that are **not prorations**, after discounts ([`recurring_of`, billing.rs:190](../crates/services/src/billing.rs)); seats, period, interval; `ts` = `paid_at` |
+| `invoice.payment_failed` | `invoice_payment_failed` | `amount_cents` = `amount_due`; one row per failed attempt, the attempts of a card waiting on 3-D Secure included (the counts take only an invoice never paid, [below](#billed-mrr-and-the-months)) |
 | `customer.subscription.trial_will_end` | `trial_will_end` | the trial's end |
 
-- **The org** ([`tenant_for`, stripe.rs:690](../crates/services/src/stripe.rs)): the
+- **The org** ([`tenant_for`, stripe.rs:1101](../crates/services/src/stripe.rs)): the
   `tenant_id` the checkout stamps on the **subscription's** metadata (from P4,
-  `subscription_data[metadata]`, [stripe.rs:210](../crates/services/src/stripe.rs)), else the
+  `subscription_data[metadata]`, [stripe.rs:425](../crates/services/src/stripe.rs)), else the
   org whose `billing.customer_id` / `billing.subscription_id` the object names. An object that
   names no org here is logged with its ids and not recorded — revenue nobody can be credited
   with is not a row.
-- **Recorded once** ([`BillingEventDao::record`, billing_event.rs:173](../crates/services/src/dao/billing_event.rs)):
+- **Recorded once** ([`BillingEventDao::record`, billing_event.rs:183](../crates/services/src/dao/billing_event.rs)):
   a webhook row is unique by `event_id` (sparse — a backfilled row has none), a paid invoice
   by `(kind, stripe_id)` across the webhook and the backfill, on top of `stripe_events`' own
   dedupe of Stripe's retries.
@@ -1573,37 +1573,46 @@ flowchart LR
 
 | Figure | Definition | Where |
 |---|---|---|
-| billed MRR at t | the recurring part of the org's newest paid invoice whose period covers t, normalised by the price's interval (a yearly invoice ÷ 12), 0 once a deletion at or before t came after that period began | [`OrgBilling::mrr_at`, billing.rs:498](../crates/services/src/billing.rs) |
+| billed MRR at t | the recurring part of the org's newest paid invoice whose period covers t, normalised by the price's interval (a yearly invoice ÷ 12), 0 once a deletion at or before t came after that period began. A subscription that expired `incomplete` is no deletion here: a checkout abandoned at 3-D Secure and paid on the retry keeps the retry's MRR when Stripe expires the abandoned one a day later | [`OrgBilling::mrr_at`, billing.rs:543](../crates/services/src/billing.rs) |
 | paying orgs | orgs with billed MRR > 0 | same |
-| new / expansion / contraction / churned | per month and currency, each org's MRR at the month's end against the end of the month before: from 0 = new, to 0 = churned, up = expansion, down = contraction | [`movements`, billing.rs:548](../crates/services/src/billing.rs) |
-| `paid_since` | the org's first invoice paid with an amount above 0 — also the funnel's **paid** step | [`OrgBilling::of`, billing.rs:446](../crates/services/src/billing.rs) |
-| trial → paid | trials started in the range (a `trialing` subscription or `trial_will_end`) and how many paid since | [`trial_to_paid`, billing.rs:948](../crates/services/src/billing.rs) |
+| new / expansion / contraction / churned | per month and currency, each org's MRR at the month's end against the end of the month before: from 0 = new, to 0 = churned, up = expansion, down = contraction | [`movements`, billing.rs:593](../crates/services/src/billing.rs) |
+| `paid_since` | the org's first invoice paid with an amount above 0 — also the funnel's **paid** step | [`OrgBilling::of`, billing.rs:486](../crates/services/src/billing.rs) |
+| trial → paid | trials started in the range (a `trialing` subscription or `trial_will_end`) and how many paid since | [`trial_to_paid`, billing.rs:993](../crates/services/src/billing.rs) |
 | invoices and billed cash | invoices paid in the month and every line they billed, prorations included — cash beside the MRR | `movements` |
+| failed payments | the `invoice_payment_failed` rows of an invoice **never paid**: no `invoice_paid` row with the same invoice id (`stripe_id`), at any time. A card that needs 3-D Secure fails once per attempt and then pays; those attempts are no failure (#4432: prod's first purchase read 3 failures beside 1 paid invoice). Each failed attempt of an unpaid invoice counts | [`unpaid_failures`, billing.rs:1014](../crates/services/src/billing.rs) |
 
 - ⚠️ **Billed, so a seat change moves MRR when an invoice bills it.** The proration invoice
   in between is cash (`billed_cents`), not MRR; the renewal that bills the new seat count is
   the expansion. A dunning gap (a renewal not paid yet) reads as 0 until the payment lands,
   and the live view corrects the history once it does.
-- **The record** ([`record_start`, billing.rs:758](../crates/services/src/billing.rs)): before
+- **The record** ([`record_start`, billing.rs:803](../crates/services/src/billing.rs)): before
   the first billing row (any org — or the first frozen month, whichever is older) nothing was
   recorded, so a month that ended before it is `on_record: false` — *not measured*, never a
-  month of zero revenue — and is never frozen ([`on_record`, billing.rs:750](../crates/services/src/billing.rs)).
+  month of zero revenue — and is never frozen ([`on_record`, billing.rs:795](../crates/services/src/billing.rs)).
   With no row at all, billed revenue is `not_measured` everywhere.
 - **Frozen once closed.** The nightly org-daily job ([`freeze_billing_months`, org_daily.rs:510](../crates/api/src/growth/org_daily.rs))
   writes every closed month of the last 13 that ended at least 3 days ago (Stripe retries a
   webhook for three days) and lies on the record into `growth_daily`, internal orgs left out,
   and marks it in `growth_pulls` (`billing:YYYY-MM-01`). A frozen month is never rewritten —
   except by the backfill, for the months it touched — so purging an org later does not
-  rewrite last year's MRR ([`freeze_closed_months`, billing.rs:840](../crates/services/src/billing.rs)).
+  rewrite last year's MRR ([`freeze_closed_months`, billing.rs:885](../crates/services/src/billing.rs)).
+- **A failed payment is judged against the whole record**, in the revenue view's totals
+  ([`range_totals`, revenue.rs:466](../crates/api/src/growth/revenue.rs)) and the digest
+  ([`billed_figures`, digest.rs:2093](../crates/api/src/growth/digest.rs)) alike: a payment
+  after the range or the day still clears a failure inside it. A frozen month holds no
+  failure count, so a late payment contradicts nothing frozen. A digest is computed once its
+  day has closed: a failure whose invoice is paid only later stays in that day's digest until
+  the day is recomputed (`POST …/digest/run?day=&send=false` refreshes it in place and mails
+  nothing).
 
 ### Upgrade intent: plan-limit collisions
 
 Every plan-limit check now goes through core ([`roomler_core::quota`, quota.rs:33](../crates/core/src/quota.rs))
 — thirteen call sites across `chat`, `conference`, `fleet`, `network` and the host. The
-decision stays `services::quota`'s, unchanged ([`evaluate`, quota.rs:258](../crates/services/src/quota.rs)),
+decision stays `services::quota`'s, unchanged ([`evaluate`, quota.rs:293](../crates/services/src/quota.rs)),
 with the FR-32 warn line written there exactly once. What core adds: a collision — refused in
 `enforce`, **or let through in `warn`** — bumps `growth_daily {source: quota, metric: collision,
-dims: {tenant, limit}}` for the UTC day ([`record_collision`, quota.rs:72](../crates/core/src/quota.rs)).
+dims: {tenant, limit}}` for the UTC day ([`record_collision`, quota.rs:86](../crates/core/src/quota.rs)).
 The org's id and the limit's wire spelling, never a person; spawned and best-effort (a refused
 request is answered at once), and nothing at all with `growth.enabled = false`. The rows carry
 the tenant, so they go with the org.
@@ -1614,13 +1623,13 @@ The cost to serve is FR-20's ledger priced by [`routes/cost.rs`](../crates/api/s
 — the same prices and the same meters as the Cost & usage tab, through one helper
 ([`org_costs`, cost.rs:189](../crates/api/src/routes/cost.rs)). Margin per org = billed MRR −
 the last 30 days' cost, **only** where both exist in the same currency
-([`margin_cents`, revenue.rs:386](../crates/api/src/growth/revenue.rs)); an unpriced meter is
+([`margin_cents`, revenue.rs:387](../crates/api/src/growth/revenue.rs)); an unpriced meter is
 "not priced", never 0.00 (which would read as free to serve).
 
 ### The revenue view
 
 `GET /api/admin/growth/revenue?since=YYYY-MM&until=YYYY-MM&include_internal`
-([`get_revenue`, revenue.rs:721](../crates/api/src/growth/revenue.rs)) — platform admins only,
+([`get_revenue`, revenue.rs:728](../crates/api/src/growth/revenue.rs)) — platform admins only,
 **404** otherwise and when `growth.enabled = false`. Months, both inclusive; the default is the
 12 months ending with the current one, at most 36, never before 2020-01, never past the
 current month.
@@ -1629,10 +1638,10 @@ current month.
 |---|---|---|
 | `billed.record` | `since` (the record's start), `last_event_at`, `backfilled_at` (absent = the backfill never ran, so figures start at the webhook), `rows`, `truncated` | — |
 | `billed.now` | billed MRR and paying orgs, per currency, at the request | `saas` not mounted; nothing on record |
-| `billed.months` | one block per month: `frozen`, `partial` (the open month), `on_record`, and per currency the movements, invoices and billed cash ([`month_blocks`, revenue.rs:503](../crates/api/src/growth/revenue.rs)) | a month before the record: `on_record: false` |
-| `billed.totals` | the range's invoices paid, billed cash per currency, first payments, failed payments, cancellations | as `billed` |
+| `billed.months` | one block per month: `frozen`, `partial` (the open month), `on_record`, and per currency the movements, invoices and billed cash ([`month_blocks`, revenue.rs:507](../crates/api/src/growth/revenue.rs)) | a month before the record: `on_record: false` |
+| `billed.totals` | the range's invoices paid, billed cash per currency, first payments, failed payments (of invoices never paid), cancellations | as `billed` |
 | `billed.trial_to_paid` | trials started in the range, converted, and the rate from n = 30 | as `billed` |
-| `billed.by_channel` | per owner's acquisition channel and currency: paying now, MRR now, first payments, churned, trials → paid ([`channel_rows`, revenue.rs:399](../crates/api/src/growth/revenue.rs)) | as `billed` |
+| `billed.by_channel` | per owner's acquisition channel and currency: paying now, MRR now, first payments, churned, trials → paid ([`channel_rows`, revenue.rs:400](../crates/api/src/growth/revenue.rs)) | as `billed` |
 | `estimate` | the list-price MRR over every live org, `estimate: true` | — |
 | `cost` | the cost basis: range, currency, whether anything is priced | the usage ledger is off (`stats.enabled = false`) |
 | `upgrade_intent` | the range's collisions, orgs, by limit, and the top 50 orgs with their limits and days | — (core's, read on every server) |
@@ -1650,7 +1659,7 @@ current month.
 > Before this, a fixed "the backfill has not run" outlived a real backfill. Production's first run
 > (2026-10-17) read Stripe's one paid invoice, whose customer is no org here, and recorded nothing.
 
-- **The funnel's `paid` step** ([funnel.rs:245](../crates/api/src/growth/funnel.rs)) is the org's
+- **The funnel's `paid` step** ([funnel.rs:244](../crates/api/src/growth/funnel.rs)) is the org's
   first invoice paid above 0. It has no window, so it hangs off the org step, not the value
   steps (an org that pays is counted whatever its path to value) and reads "paid so far": its
   `pending` is only the sign-ups still pending at the org step. The Campaigns and Channels
@@ -1658,11 +1667,11 @@ current month.
 - **The org timeline** gains `plan_history` (the org's billing rows, newest 200) and a
   `first_paid` milestone ([orgs.rs:667](../crates/api/src/growth/orgs.rs)).
 - **In the digest**, the revenue section gains `billed` — MRR at the day's end per currency;
-  the day's (and 7/28 days') invoices, billed cash, failed payments, first payments,
-  cancellations and trials; `record_since` and `backfilled`
-  ([`billed_figures`, digest.rs:2089](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
+  the day's (and 7/28 days') invoices, billed cash, failed payments (of invoices never
+  paid), first payments, cancellations and trials; `record_since` and `backfilled`
+  ([`billed_figures`, digest.rs:2093](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
   the windows' collisions and the orgs that hit hardest
-  ([`upgrade_intent_section`, digest.rs:2184](../crates/api/src/growth/digest.rs)). The
+  ([`upgrade_intent_section`, digest.rs:2188](../crates/api/src/growth/digest.rs)). The
   estimate keeps its line and its label.
 - The SPA's `/observability/growth` gains a **Revenue** tab
   ([`GrowthRevenue.vue`](../ui/src/components/growth/GrowthRevenue.vue)); the Overview's funnel
@@ -1671,11 +1680,11 @@ current month.
 ### The backfill — operator-run, once
 
 `POST /api/admin/growth/billing/backfill?since=YYYY-MM-DD` (`saas`,
-[`backfill`, saas stripe.rs:137](../crates/modules/saas/src/stripe.rs)) — platform admins only,
+[`backfill`, saas stripe.rs:291](../crates/modules/saas/src/stripe.rs)) — platform admins only,
 404 otherwise and with growth off. It reads Stripe's **paid** invoices (created since `since`
 when given; 100 a page, at most 100 pages) into `invoice_paid` rows with `source: backfill`
-([`backfill_paid_invoices`, stripe.rs:396](../crates/services/src/stripe.rs)), then refreezes the
-closed months those invoices touch ([`refreeze`, saas stripe.rs:190](../crates/modules/saas/src/stripe.rs))
+([`backfill_paid_invoices`, stripe.rs:808](../crates/services/src/stripe.rs)), then refreezes the
+closed months those invoices touch ([`refreeze`, saas stripe.rs:344](../crates/modules/saas/src/stripe.rs))
 and leaves a `growth_pulls` marker (`billing_backfill:YYYY-MM-DD`) the views read. It only
 reads Stripe. Idempotent: an invoice already on record (the webhook's, or an earlier run's) is
 counted under `already` and left as it was; one naming no org here under `no_org`.
@@ -2030,7 +2039,7 @@ addresses.
 ⚠️ **An overlay pair needs the device to allow it.** #1882's `access_policy.rc_overlay` is off unless
 the device opts in, and with it off the agent drops every overlay candidate. With it on, an agent
 whose overlay interface is named `roomler*` still never gathers on it: the interface-name rule
-(`is_overlay_iface`, [`peer.rs:13920`](../agents/roomlerd/src/peer.rs)) applies whatever
+(`is_overlay_iface`, [`peer.rs:14122`](../agents/roomlerd/src/peer.rs)) applies whatever
 `rc_overlay` says. So an overlay carrier comes from `rc_overlay` on AND either a macOS agent, whose
 `utunN` the name rule cannot see, or a controller whose route to the agent runs through the mesh.
 Measured on 2026-10-19 (FR-102 §8): a controller on the vmtest org's mesh viewing a Linux agent

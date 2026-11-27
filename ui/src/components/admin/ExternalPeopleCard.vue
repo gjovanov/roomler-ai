@@ -134,7 +134,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { useAgentStore } from '@/stores/agents'
 import { useTenantStore } from '@/stores/tenant'
@@ -179,36 +179,65 @@ function rowKey(p: ExternalPrincipal): string {
   return `${p.agent_id}:${p.user_id}`
 }
 
+// #4257 — only the latest load writes, and only while the org is still the
+// one it asked for: the previous org's people, or its refusal, landing after
+// a change of org are dropped.
+let loadSeq = 0
+
 async function load() {
+  const mine = ++loadSeq
+  const tenantId = props.tenantId
+  const current = () => mine === loadSeq && tenantId === props.tenantId
   loading.value = true
   error.value = null
   try {
-    const res = await agentStore.fetchExternalPrincipals(props.tenantId, { perPage: 100 })
-    people.value = res.items
+    const res = await agentStore.fetchExternalPrincipals(tenantId, { perPage: 100 })
+    if (current()) people.value = res.items
   } catch (e) {
-    error.value = (e as Error).message
-    people.value = []
+    if (current()) {
+      error.value = (e as Error).message
+      people.value = []
+    }
   } finally {
-    loading.value = false
+    if (current()) loading.value = false
   }
 }
 
-/** A refusal shows its message and changes nothing here: a 403 is an answer. */
+/** A refusal shows its message and changes nothing here: a 403 is an answer.
+ *  #4257 — an answer that arrives after the org changed is the previous
+ *  org's: it neither reloads nor tells the page, and its refusal shows
+ *  nothing under the new org. */
 async function setBarred(p: ExternalPrincipal, revoked: boolean) {
+  const tenantId = props.tenantId
   busy.value = rowKey(p)
   error.value = null
   try {
-    await agentStore.setExternalPrincipal(props.tenantId, p.agent_id, p.user_id, revoked)
+    await agentStore.setExternalPrincipal(tenantId, p.agent_id, p.user_id, revoked)
+    if (tenantId !== props.tenantId) return
     await load()
     emit('changed')
   } catch (e) {
-    error.value = (e as Error).message
+    if (tenantId === props.tenantId) error.value = (e as Error).message
   } finally {
-    busy.value = null
+    if (tenantId === props.tenantId) busy.value = null
   }
 }
 
-onMounted(() => void load())
+// #4257 — the page's org is a prop: the card follows it from the start. A
+// change clears the previous org's people, its error and the row a Bar was
+// in flight for.
+watch(
+  () => props.tenantId,
+  (_tenantId, previous) => {
+    if (previous !== undefined) {
+      people.value = []
+      busy.value = null
+      error.value = null
+    }
+    void load()
+  },
+  { immediate: true },
+)
 
 defineExpose({ load })
 </script>

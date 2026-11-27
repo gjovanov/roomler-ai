@@ -442,7 +442,7 @@ fn worker_elevation_requested() -> bool {
 /// # Safety
 /// `token` must be a valid, live Win32 token handle with `TOKEN_QUERY`
 /// access (the WTSQueryUserToken result qualifies).
-unsafe fn token_elevation_type(token: HANDLE) -> Result<TOKEN_ELEVATION_TYPE> {
+pub(crate) unsafe fn token_elevation_type(token: HANDLE) -> Result<TOKEN_ELEVATION_TYPE> {
     let mut ty: TOKEN_ELEVATION_TYPE = 0;
     let mut ret_len: u32 = 0;
     // SAFETY: `&mut ty` is a valid out-buffer of exactly the declared
@@ -967,9 +967,11 @@ pub(crate) fn want_system_worker(
 }
 
 /// #3387 — SYSTEM can open, for reading, an enrollment a SystemContext worker
-/// runs: the machine config, or the SYSTEM profile's own. The two rungs the
-/// worker's ladder takes, through the same resolvers, read by the same account
-/// (this host is LocalSystem), so the host and the worker cannot disagree.
+/// runs: the machine config, or the SYSTEM profile's own (#4176: or, third,
+/// the copy a worker's start restores a missing machine config from,
+/// [`config_opens_in`]). The two rungs the worker's ladder takes, through the
+/// same resolvers, read by the same account (this host is LocalSystem), so the
+/// host and the worker cannot disagree.
 /// #3702 — the profile rung only for a config in the service account's own
 /// profile as the system names it, the rule the worker's ladder keeps.
 fn sc_config_opens() -> bool {
@@ -980,7 +982,11 @@ fn sc_config_opens() -> bool {
     config_opens_in(&MachineTree::here(), Switches::from_env(), profile)
 }
 
-/// #3609 — the host's question over `tree`: does any rung open.
+/// #3609 — the host's question over `tree`: does any rung open. #4176 — in
+/// the worker's order: the machine config, then the SYSTEM profile's, then
+/// the copy a start restores a missing machine config from
+/// ([`restorable_copy`]), which the worker's ladder reaches last, at the
+/// machine path it names when no rung opens.
 pub(crate) fn config_opens_in(
     tree: &roomler_node_core::machine_tree::MachineTree,
     switches: roomler_node_core::machine_tree::Switches,
@@ -988,6 +994,7 @@ pub(crate) fn config_opens_in(
 ) -> bool {
     rung_opens(tree, switches, &tree.config())
         || profile.is_some_and(|p| rung_opens(tree, switches, &p))
+        || restorable_copy(tree)
 }
 
 /// #3609 — one rung of the SystemContext ladder, the ONE function the host
@@ -1009,6 +1016,19 @@ pub(crate) fn rung(
     } else {
         Err(Refusal::Absent)
     }
+}
+
+/// #4176 — the machine config under `tree` is not there (`exists`, as the
+/// start reads it, `app::config_at_start::of`): does its copy pass the checks
+/// the config itself would, and hold an enrollment? That is when the SYSTEM
+/// worker's start restores it at the machine path its ladder names last
+/// (`app::config_at_start`, which asks the same function through
+/// `config::previous_copy`), so the host starts that worker for it. Otherwise
+/// the host keeps waiting, as with no copy, and the copy's reason is logged
+/// once (`config::machine_previous_copy`).
+fn restorable_copy(tree: &roomler_node_core::machine_tree::MachineTree) -> bool {
+    !tree.config().exists()
+        && crate::config::machine_previous_copy(tree) == crate::config::PreviousCopy::Enrolled
 }
 
 /// [`rung`] as a yes or no.
@@ -1202,13 +1222,13 @@ pub fn next_backoff(consecutive_failures: u32) -> Duration {
 /// faster concern than version-rollback's longer clean-run threshold.
 pub const HEALTHY_UPTIME_THRESHOLD: Duration = Duration::from_secs(30);
 
-/// rc.51: once `consecutive_failures` reaches this, the supervisor
-/// emits a throttled `error!` so a crash-looping host surfaces in log
-/// aggregation. ~8 failures is roughly where `next_backoff` saturates
-/// at the 60 s cap. The supervisor never *gives up* (infinite respawn
-/// is the M3/M5 resilience design — a give-up would convert a
-/// recoverable loop into a permanently-dark host); this is purely an
-/// observability signal.
+/// rc.51: once the failures it counts reach this, the supervisor emits a
+/// throttled `error!` so a crash-looping host surfaces in log aggregation.
+/// #4324: a worker's exit with nothing to run counts toward none ([`ExitTally`]).
+/// ~8 failures is roughly where `next_backoff` saturates at the 60 s cap. The
+/// supervisor never *gives up* (infinite respawn is the M3/M5 resilience design —
+/// a give-up would convert a recoverable loop into a permanently-dark host); this
+/// is purely an observability signal.
 pub const RESPAWN_ALARM_THRESHOLD: u32 = 8;
 
 /// rc.51: should a worker exit reset the `consecutive_failures`
@@ -1219,6 +1239,113 @@ pub const RESPAWN_ALARM_THRESHOLD: u32 = 8;
 /// `consecutive_failures = 0` on every spawn pinned the counter at 1).
 pub fn reap_resets_counter(worker_uptime: Duration) -> bool {
     worker_uptime >= HEALTHY_UPTIME_THRESHOLD
+}
+
+/// #4324 — the worker had nothing to run: at its start its `run` found no config,
+/// nor a copy of one it may restore (`daemon_error::NO_ENROLLMENT_EXIT_CODE`, #4028,
+/// raised before the single-instance lock). That is the device's state, which an
+/// enrollment or the config put back ends, and not the worker failing: it counts
+/// toward no crash-loop alarm ([`ExitTally`]). The only such code: every other exit
+/// is a failure, or one the host already names.
+pub fn worker_had_nothing_to_run(code: u32) -> bool {
+    code == crate::daemon_error::NO_ENROLLMENT_EXIT_CODE as u32
+}
+
+/// #4324 — the reap's own count beside the backoff ladder, for the crash-loop
+/// alarm and the way-forward line. It follows the ladder (`consecutive_failures`)
+/// and never changes it, so the backoff and the respawns are what they were.
+///
+/// - **The alarm** counts the ladder's failures less the nothing-to-run exits
+///   among them ([`worker_had_nothing_to_run`]), and is due only at an exit it
+///   counts, or at AGENT_DELETED's as before. Such an exit neither adds to that
+///   count nor starts it again: only what starts the ladder again does (a run
+///   past [`HEALTHY_UPTIME_THRESHOLD`], an exit that resets it). A spawn that
+///   fails climbs the ladder, and the alarm counts it, as before.
+/// - **The way-forward line** ([`nothing_to_run_way_forward`]) is due at a
+///   nothing-to-run exit, unless the exit before it was one too and no worker
+///   ran past its start since: another code, or a run past the start
+///   ([`ExitTally::ran_past_start`]), says it again.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExitTally {
+    /// The nothing-to-run exits among the ladder's failures since it last
+    /// started again.
+    nothing_to_run: u32,
+    /// The way-forward line was said, and neither another exit nor a run past
+    /// its start came since.
+    said: bool,
+}
+
+/// What [`ExitTally::reap`] decides for one exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitNotice {
+    /// The failures the crash-loop alarm counts, which its line names.
+    pub alarm_failures: u32,
+    /// The crash-loop alarm is due, before its once-a-minute throttle.
+    pub alarm_due: bool,
+    /// The way-forward line is due ([`nothing_to_run_way_forward`]).
+    pub way_forward: bool,
+}
+
+impl ExitTally {
+    /// The host reaped `code`. `prior` is the ladder's count the exit was decided
+    /// on (0 after a run past the healthy threshold), `failures` its count after
+    /// the exit ([`decide_exit_reaction`]).
+    pub fn reap(&mut self, code: u32, prior: u32, failures: u32) -> ExitNotice {
+        let nothing = worker_had_nothing_to_run(code);
+        if prior == 0 {
+            // The ladder starts again at this exit, and the count with it.
+            *self = Self::default();
+        }
+        self.nothing_to_run = if failures == 0 {
+            0
+        } else {
+            self.nothing_to_run.saturating_add(u32::from(nothing))
+        };
+        let alarm_failures = failures.saturating_sub(self.nothing_to_run);
+        let alarm_due = code == crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
+            || (!nothing && alarm_failures >= RESPAWN_ALARM_THRESHOLD);
+        let way_forward = nothing && !self.said;
+        self.said = nothing;
+        ExitNotice {
+            alarm_failures,
+            alarm_due,
+            way_forward,
+        }
+    }
+
+    /// A worker this host started ran past its start ([`reap_resets_counter`]),
+    /// whether it exits later or the host ends it: the next nothing-to-run exit is
+    /// said again.
+    pub fn ran_past_start(&mut self) {
+        self.said = false;
+    }
+}
+
+/// #4324 — the way forward for a worker with nothing to run, from what the host
+/// knows: which worker it started. The SYSTEM worker runs the machine's own
+/// enrollment, every other the signed-in person's (`app.rs`, `pick_config_path`).
+/// #4411 — a person's worker the host started while SystemContext waited for a
+/// machine enrollment (`waiting`, [`system_context_waiting_args`]) names the
+/// machine's way first, and that person's own enrollment as the other. A SYSTEM
+/// worker is never started so, and its line is its own whatever `waiting` says.
+/// It names no path: the host never resolves the worker's config.
+pub fn nothing_to_run_way_forward(system_context: bool, waiting: bool) -> &'static str {
+    if system_context {
+        "SYSTEM can open no machine enrollment on this device, nor a copy of one to \
+         restore. Enroll the device for the machine (the setup wizard, or \
+         `roomlerd enroll --machine-global`), or put the machine config back"
+    } else if waiting {
+        "SystemContext is on, but SYSTEM can open no machine enrollment, so the \
+         worker runs as the account signed in at the console, and that account has \
+         no enrollment on this device either, nor a copy of one to restore. Enroll \
+         the device for the machine (the setup wizard, or \
+         `roomlerd enroll --machine-global`), or else as that account \
+         (`roomlerd enroll`), or put the account's config back"
+    } else {
+        "the account signed in at the console has no enrollment on this device, nor \
+         a copy of one to restore. Enroll the device as that account (the setup \
+         wizard, or `roomlerd enroll`), or put the account's config back"
+    }
 }
 
 /// rc.51: the supervisor's live worker handle plus the metadata that
@@ -1238,6 +1365,13 @@ struct ActiveWorker {
     /// The worker looks identical from outside (same binary, same PID)
     /// — only the spawn site knows which token was used.
     is_system_context: bool,
+    /// #4411 — started on the user-context arm while SystemContext waited for a
+    /// machine enrollment: the state the spawn logged and handed the worker
+    /// ([`system_context_waiting_args`]). Kept from the spawn, so the exit's
+    /// way-forward line reads the state this worker was started under, never the
+    /// host's at the exit, which may have changed since. `false` for the SYSTEM
+    /// worker.
+    system_context_waiting: bool,
     /// When the worker was spawned. Drives [`reap_resets_counter`].
     spawned_at: Instant,
     /// #1683 — the stop event this worker was told to wait on (`--stop-event`).
@@ -1246,6 +1380,17 @@ struct ActiveWorker {
     /// shutdown path then hard-terminates, exactly as before this change. Held
     /// here so its handle is closed (RAII) when the worker is reaped or swapped.
     stop_event: Option<HostStopEvent>,
+}
+
+impl ActiveWorker {
+    /// #4411 — the way forward this worker's exit with nothing to run names
+    /// ([`nothing_to_run_way_forward`]), from what the host started it as and
+    /// nothing else: not the host's state at the exit, and not
+    /// `win_service::system_context_waiting`, the worker's own note, which is
+    /// never set in this host.
+    fn way_forward(&self) -> &'static str {
+        nothing_to_run_way_forward(self.is_system_context, self.system_context_waiting)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1452,6 +1597,9 @@ pub fn run(
     // once per minute so a looping host surfaces in log aggregation
     // without flooding it.
     let mut last_alarm_at: Option<Instant> = None;
+    // #4324 — that alarm's own count beside the ladder, and the way-forward
+    // line's memory: a worker with nothing to run raises no alarm.
+    let mut exit_tally = ExitTally::default();
     // Most recent active console session id observed. Used by
     // `decide_spawn`'s SpawnSystemInSession arm when the active
     // session disappears mid-stream (sign-out / fast-user-switch
@@ -1583,6 +1731,12 @@ pub fn run(
 
         // Reap a finished worker.
         if let Some(w) = current.as_ref() {
+            // #4324 — a worker alive past its start says the way-forward line
+            // again at the next exit with nothing to run, even one this host
+            // ends (a sign-out, a session change), which no reap sees.
+            if reap_resets_counter(w.spawned_at.elapsed()) {
+                exit_tally.ran_past_start();
+            }
             match w.process.try_wait() {
                 Ok(Some(code)) => {
                     // rc.51: gate the counter reset on worker UPTIME,
@@ -1601,6 +1755,7 @@ pub fn run(
                     let (reaction, next_failures) = decide_exit_reaction(code, prior);
                     consecutive_failures = next_failures;
                     prior_end = worker_end_is_no_crash(code);
+                    let notice = exit_tally.reap(code, prior, next_failures);
                     match reaction {
                         ExitReaction::Respawn => {
                             // 0 = a clean exit (an auto-update's, or FR-84
@@ -1654,7 +1809,8 @@ pub fn run(
                                     code,
                                     orphan_check_complete = reap.complete(),
                                     "supervisor: another roomler daemon already holds this \
-                                     config's single-instance lock — this one is redundant. \
+                                     config's single-instance lock or the machine's guard — \
+                                     this one is redundant. \
                                      Stopping instead of respawning. Uninstall the duplicate \
                                      daemon flavour (perMachine service vs perUser task) to clear \
                                      this."
@@ -1696,11 +1852,13 @@ pub fn run(
                             //     backoff) while the operator is staring at the
                             //     wedge wondering why the host won't connect.
                             //
-                            //   * rc.51 generic crash-loop: consecutive_failures
-                            //     ≥ RESPAWN_ALARM_THRESHOLD (~ where backoff
+                            //   * rc.51 generic crash-loop: the failures the alarm
+                            //     counts ≥ RESPAWN_ALARM_THRESHOLD (~ where backoff
                             //     saturates at the 60 s cap). Any non-zero exit
-                            //     code; covers the boot-loop case where there is
-                            //     no Goodbye on the wire.
+                            //     code but a worker's with nothing to run (#4324,
+                            //     `ExitTally`), which neither counts nor raises it;
+                            //     covers the boot-loop case where there is no
+                            //     Goodbye on the wire.
                             //
                             // The supervisor NEVER gives up — infinite respawn is
                             // intentional (a re-enrol or auto-update can still
@@ -1709,9 +1867,7 @@ pub fn run(
                             // sane during a sustained loop.
                             let is_agent_deleted_exit =
                                 code == crate::watchdog::AGENT_DELETED_EXIT_CODE as u32;
-                            let alarm_due = is_agent_deleted_exit
-                                || consecutive_failures >= RESPAWN_ALARM_THRESHOLD;
-                            if alarm_due {
+                            if notice.alarm_due {
                                 let now = Instant::now();
                                 let throttle_passed = last_alarm_at.is_none_or(|t| {
                                     now.duration_since(t) >= Duration::from_secs(60)
@@ -1726,13 +1882,29 @@ pub fn run(
                                         );
                                     } else {
                                         tracing::error!(
-                                            consecutive_failures,
+                                            consecutive_failures = notice.alarm_failures,
                                             last_exit_code = code,
                                             "supervisor: worker has failed {} times in a row — host likely needs operator attention (still respawning)",
-                                            consecutive_failures
+                                            notice.alarm_failures
                                         );
                                     }
                                 }
+                            }
+
+                            // #4324 — a worker with nothing to run: one line
+                            // names the way forward, at the first such exit,
+                            // and again only after another code or a run past
+                            // its start (`ExitTally`). #4411 — the one for the
+                            // state the host started it under (`way_forward`).
+                            if notice.way_forward {
+                                tracing::warn!(
+                                    pid = w.process.pid,
+                                    code,
+                                    system_context = w.is_system_context,
+                                    "supervisor: the worker had no config to run (exit {}): {}. It is respawned on the usual backoff, with no crash-loop alarm; this line comes again only after another exit code or a run past its start",
+                                    code,
+                                    w.way_forward()
+                                );
                             }
 
                             // Phase 1B (Task 9): record a crash
@@ -1935,6 +2107,8 @@ pub fn run(
                                     process: p,
                                     session: sid,
                                     is_system_context: false,
+                                    // #4411 — what this spawn logged and handed it.
+                                    system_context_waiting,
                                     spawned_at: Instant::now(),
                                     stop_event: stop_ev,
                                 });
@@ -2104,6 +2278,7 @@ pub fn run(
                             process: p,
                             session: sid,
                             is_system_context: true,
+                            system_context_waiting: false,
                             spawned_at: Instant::now(),
                             stop_event: stop_ev,
                         });
@@ -4122,8 +4297,8 @@ mod tests {
     }
 
     /// The backoff is an exit 1's: the same arm and the same delays at every
-    /// rung of the ladder, the same uptime rule, the same alarm, and the next
-    /// worker is told the same of this end (nothing).
+    /// rung of the ladder, the same uptime rule, and the next worker is told the
+    /// same of this end (nothing). The alarm is not (#4324, the cells below).
     #[test]
     fn a_worker_with_no_enrollment_backs_off_exactly_as_an_exit_1() {
         for prior in (0..=12).chain([RESPAWN_ALARM_THRESHOLD, u32::MAX - 1, u32::MAX]) {
@@ -4166,8 +4341,8 @@ mod tests {
         // The next worker is told nothing of this end, as of an exit 1's.
         assert_eq!(worker_end_is_no_crash(NO_ENROLLMENT), None);
         assert_eq!(worker_end_is_no_crash(1), None);
-        // Only AGENT_DELETED takes the alarm's fast path; this code takes the
-        // count, as 1 does.
+        // Only AGENT_DELETED takes the alarm's fast path. This code takes no part
+        // in the alarm at all (#4324, `which_exits_raise_the_crash_loop_alarm`).
         assert_ne!(
             NO_ENROLLMENT,
             crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
@@ -4231,5 +4406,366 @@ mod tests {
             decide_exit_reaction(NO_ENROLLMENT, 0),
             (ExitReaction::Backoff(_), 1)
         ));
+    }
+
+    // ─── #4324: a worker with nothing to run raises no crash-loop alarm ─────
+
+    /// An exit a crash makes: an access violation.
+    const A_CRASH: u32 = 0xC000_0005;
+    /// A doomed worker's run, under the healthy threshold.
+    const DOOMED: Duration = Duration::from_millis(400);
+    /// A run past the healthy threshold.
+    const A_RUN: Duration = Duration::from_secs(600);
+
+    /// The reap's bookkeeping for one exit, in `run`'s order: the ladder decides
+    /// on the uptime rule, then the tally reads the ladder's two counts.
+    fn reap_as_the_host(
+        code: u32,
+        uptime: Duration,
+        failures: &mut u32,
+        tally: &mut ExitTally,
+    ) -> ExitNotice {
+        let prior = if reap_resets_counter(uptime) {
+            0
+        } else {
+            *failures
+        };
+        let (_, next) = decide_exit_reaction(code, prior);
+        *failures = next;
+        tally.reap(code, prior, next)
+    }
+
+    /// A doomed worker exiting `code` `exits` times in a row: the exits, numbered
+    /// from 1, at which the alarm is due, and the count its line names at each.
+    fn alarms_of(code: u32, exits: u32) -> (Vec<u32>, Vec<u32>) {
+        let (mut failures, mut tally) = (0, ExitTally::default());
+        let (mut due, mut counts) = (Vec::new(), Vec::new());
+        for exit in 1..=exits {
+            let notice = reap_as_the_host(code, DOOMED, &mut failures, &mut tally);
+            assert_eq!(failures, exit, "the ladder climbs for {code:#x} as before");
+            if notice.alarm_due {
+                due.push(exit);
+            }
+            counts.push(notice.alarm_failures);
+        }
+        (due, counts)
+    }
+
+    /// The alarm as `run` raised it before #4324, for every exit alike.
+    fn alarm_before_4324(code: u32, failures: u32) -> bool {
+        code == crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
+            || failures >= RESPAWN_ALARM_THRESHOLD
+    }
+
+    /// The field record (#4324): a per-Machine service installed and not yet
+    /// enrolled raised the alarm at its 8th exit 78, then once a minute. Exit 78
+    /// now raises it at no exit and counts toward it at none, while a crash and an
+    /// ordinary non-zero exit raise it from the 8th exit, naming the ladder's
+    /// count, as before, and AGENT_DELETED keeps its fast path.
+    #[test]
+    fn which_exits_raise_the_crash_loop_alarm() {
+        assert_eq!(
+            NO_ENROLLMENT, 78,
+            "#4028's no-enrollment code is the issue's 78"
+        );
+        assert!(worker_had_nothing_to_run(NO_ENROLLMENT));
+        let exits = 3 * RESPAWN_ALARM_THRESHOLD;
+        let from = |first: u32| (first..=exits).collect::<Vec<_>>();
+
+        let (due, counts) = alarms_of(NO_ENROLLMENT, exits);
+        assert_eq!(due, Vec::<u32>::new(), "no exit 78 raises the alarm");
+        assert_eq!(counts, vec![0; exits as usize], "and none counts toward it");
+
+        for code in [A_CRASH, 1] {
+            let (due, counts) = alarms_of(code, exits);
+            assert_eq!(due, from(RESPAWN_ALARM_THRESHOLD), "code {code:#x}");
+            assert_eq!(counts, from(1), "the ladder's count, code {code:#x}");
+        }
+        let agent_deleted = crate::watchdog::AGENT_DELETED_EXIT_CODE as u32;
+        assert_eq!(alarms_of(agent_deleted, exits).0, from(1), "the fast path");
+    }
+
+    /// Every exit but 78 keeps the alarm exactly as it was: each code up to 1024
+    /// and every Windows status a worker can die with, exit after exit past the
+    /// threshold, is due at the same exits with the same count, and never says
+    /// the way forward.
+    #[test]
+    fn every_exit_but_one_with_nothing_to_run_keeps_the_alarm_as_it_was() {
+        let statuses = [
+            0xC000_0005, // access violation
+            0xC000_00FD, // stack overflow
+            0xC000_0409, // fast fail: a Rust abort
+            0xC000_013A, // Ctrl+C
+            0x8000_0003, // breakpoint
+            0xE06D_7363, // a C++ exception
+            SESSION_TEARDOWN_EXIT_CODE,
+            u32::MAX,
+        ];
+        for code in (0..=1024).chain(statuses) {
+            assert_eq!(
+                worker_had_nothing_to_run(code),
+                code == NO_ENROLLMENT,
+                "code {code:#x}"
+            );
+            if code == NO_ENROLLMENT {
+                continue;
+            }
+            let (mut failures, mut tally) = (0, ExitTally::default());
+            for exit in 1..=2 * RESPAWN_ALARM_THRESHOLD {
+                let notice = reap_as_the_host(code, DOOMED, &mut failures, &mut tally);
+                let at = format!("code {code:#x}, exit {exit}");
+                assert_eq!(notice.alarm_due, alarm_before_4324(code, failures), "{at}");
+                assert_eq!(notice.alarm_failures, failures, "{at}");
+                assert!(!notice.way_forward, "{at}");
+            }
+        }
+    }
+
+    /// An exit 78 counts toward the alarm neither way: it adds nothing, and it
+    /// does not start the count again (only what starts the ladder again does).
+    /// A device that waited an hour for its enrollment, then ran a build that
+    /// crashes, raises the alarm at the 8th crash, as a fresh host does. Seven
+    /// crashes and then the config gone raise it at no exit 78, and the next
+    /// crash is the 8th failure counted. A spawn that fails counts, as before.
+    #[test]
+    fn exits_with_nothing_to_run_count_toward_no_alarm_among_other_exits() {
+        let (mut failures, mut tally) = (0, ExitTally::default());
+        for _ in 0..60 {
+            let notice = reap_as_the_host(NO_ENROLLMENT, DOOMED, &mut failures, &mut tally);
+            assert!(!notice.alarm_due, "{notice:?}");
+        }
+        let crashes: Vec<ExitNotice> = (0..10)
+            .map(|_| reap_as_the_host(A_CRASH, DOOMED, &mut failures, &mut tally))
+            .collect();
+        assert_eq!(failures, 70, "the ladder counts every exit, as before");
+        let due: Vec<bool> = crashes.iter().map(|n| n.alarm_due).collect();
+        let mut want = vec![false; 7];
+        want.extend([true; 3]);
+        assert_eq!(due, want, "from the 8th crash");
+        let counts: Vec<u32> = crashes.iter().map(|n| n.alarm_failures).collect();
+        assert_eq!(counts, (1..=10).collect::<Vec<_>>());
+
+        let (mut failures, mut tally) = (0, ExitTally::default());
+        for _ in 0..7 {
+            let notice = reap_as_the_host(A_CRASH, DOOMED, &mut failures, &mut tally);
+            assert!(!notice.alarm_due, "{notice:?}");
+        }
+        for _ in 0..20 {
+            let notice = reap_as_the_host(NO_ENROLLMENT, DOOMED, &mut failures, &mut tally);
+            assert_eq!((notice.alarm_due, notice.alarm_failures), (false, 7));
+        }
+        let eighth = reap_as_the_host(A_CRASH, DOOMED, &mut failures, &mut tally);
+        assert_eq!(
+            (failures, eighth.alarm_due, eighth.alarm_failures),
+            (28, true, 8)
+        );
+
+        // A run past the healthy threshold starts the ladder again, and the count.
+        let later = reap_as_the_host(A_CRASH, A_RUN, &mut failures, &mut tally);
+        assert_eq!(
+            (failures, later.alarm_due, later.alarm_failures),
+            (1, false, 1)
+        );
+        // A spawn that fails climbs the ladder between two reaps (`run`'s spawn
+        // arms), and the alarm counts it, as before; the exit 78 after it, not.
+        failures += 1;
+        let next = reap_as_the_host(NO_ENROLLMENT, DOOMED, &mut failures, &mut tally);
+        assert_eq!((failures, next.alarm_failures), (3, 2));
+    }
+
+    /// One step of the host's life, for the way-forward cells.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// The worker exited with this code, at its start.
+        Exit(u32),
+        /// The worker exited with this code after a run past its start.
+        ExitAfterARun(u32),
+        /// A spawn failed: the ladder climbs, and nothing is reaped.
+        SpawnFailed,
+        /// The host ended a worker that had run past its start (a session change,
+        /// a sign-out), seen by `run`'s tick ([`ExitTally::ran_past_start`]).
+        EndedAfterARun,
+    }
+
+    /// At each exit of `steps`, whether the way-forward line is said.
+    fn said_at(steps: &[Step]) -> Vec<bool> {
+        let (mut failures, mut tally) = (0, ExitTally::default());
+        let mut said = Vec::new();
+        for step in steps {
+            let notice = match *step {
+                Step::Exit(code) => reap_as_the_host(code, DOOMED, &mut failures, &mut tally),
+                Step::ExitAfterARun(code) => {
+                    reap_as_the_host(code, A_RUN, &mut failures, &mut tally)
+                }
+                Step::SpawnFailed => {
+                    failures += 1;
+                    continue;
+                }
+                Step::EndedAfterARun => {
+                    tally.ran_past_start();
+                    continue;
+                }
+            };
+            said.push(notice.way_forward);
+        }
+        said
+    }
+
+    /// The way-forward line: said at the first exit 78, not at the ones after
+    /// it, and again once the exit changes: another code, or a run past its
+    /// start, whether that run exits or the host ends it. A spawn that fails in
+    /// between changes nothing.
+    #[test]
+    fn the_way_forward_is_said_once_and_again_when_the_exit_changes() {
+        use Step::*;
+        let nothing = Exit(NO_ENROLLMENT);
+        let mut once = vec![true];
+        once.extend([false; 49]);
+        assert_eq!(said_at(&[nothing; 50]), once, "fifty exits 78, one line");
+        assert_eq!(
+            said_at(&[nothing, SpawnFailed, nothing, SpawnFailed, nothing]),
+            [true, false, false]
+        );
+        let agent_deleted = crate::watchdog::AGENT_DELETED_EXIT_CODE as u32;
+        for other in [A_CRASH, 1, 0, SESSION_TEARDOWN_EXIT_CODE, agent_deleted] {
+            assert_eq!(
+                said_at(&[nothing, nothing, Exit(other), nothing, nothing]),
+                [true, false, false, true, false],
+                "another code between, {other:#x}"
+            );
+            assert_eq!(
+                said_at(&[Exit(other), Exit(other), nothing]),
+                [false, false, true],
+                "{other:#x} says nothing, and the first 78 after it does"
+            );
+        }
+        assert_eq!(
+            said_at(&[nothing, nothing, EndedAfterARun, nothing, nothing]),
+            [true, false, true, false],
+            "a run the host ended"
+        );
+        assert_eq!(
+            said_at(&[nothing, ExitAfterARun(A_CRASH), nothing, nothing]),
+            [true, false, true, false],
+            "a run that exited"
+        );
+        assert_eq!(
+            said_at(&[nothing, ExitAfterARun(NO_ENROLLMENT), nothing]),
+            [true, true, false],
+            "the ladder starting again"
+        );
+    }
+
+    /// The line names the way forward for the worker the host started: enroll the
+    /// device, how, or put its config back. The SYSTEM worker's way is the
+    /// machine's own enrollment. #4411 — the three texts, pinned by the state each
+    /// is for: the SYSTEM worker's, and the person's on a host that does not wait,
+    /// as #4324 wrote them; and the person's worker the host started while
+    /// SystemContext waited for a machine enrollment, which names the machine's
+    /// way first and that person's own enrollment as the other.
+    #[test]
+    fn the_way_forward_names_how_to_enroll_and_the_config_to_put_back() {
+        const SYSTEM: &str = "SYSTEM can open no machine enrollment on this device, nor a copy of \
+                              one to restore. Enroll the device for the machine (the setup \
+                              wizard, or `roomlerd enroll --machine-global`), or put the \
+                              machine config back";
+        const PERSON: &str = "the account signed in at the console has no enrollment on this \
+                              device, nor a copy of one to restore. Enroll the device as that \
+                              account (the setup wizard, or `roomlerd enroll`), or put the \
+                              account's config back";
+        const WAITING: &str = "SystemContext is on, but SYSTEM can open no machine enrollment, \
+                               so the worker runs as the account signed in at the console, and \
+                               that account has no enrollment on this device either, nor a copy \
+                               of one to restore. Enroll the device for the machine (the setup \
+                               wizard, or `roomlerd enroll --machine-global`), or else as that \
+                               account (`roomlerd enroll`), or put the account's config back";
+        let machine = "(the setup wizard, or `roomlerd enroll --machine-global`)";
+        for (system_context, waiting, pinned, how) in [
+            (true, false, SYSTEM, machine),
+            (
+                false,
+                false,
+                PERSON,
+                "(the setup wizard, or `roomlerd enroll`)",
+            ),
+            (false, true, WAITING, machine),
+        ] {
+            let text = nothing_to_run_way_forward(system_context, waiting);
+            assert_eq!(
+                text, pinned,
+                "system_context={system_context} waiting={waiting}"
+            );
+            assert!(text.contains("Enroll the "), "{text:?}");
+            assert!(text.contains(how), "{text:?}");
+            assert!(text.contains("config back"), "{text:?}");
+        }
+        // While the host waits, the machine's way comes first, the person's after.
+        let at = |s: &str| {
+            WAITING
+                .find(s)
+                .unwrap_or_else(|| panic!("{s:?} in {WAITING:?}"))
+        };
+        assert!(at("`roomlerd enroll --machine-global`") < at("`roomlerd enroll`)"));
+        // A SYSTEM worker is never started while the host waits; were one, its
+        // line would be its own.
+        assert_eq!(nothing_to_run_way_forward(true, true), SYSTEM);
+    }
+
+    /// A worker's record as a spawn arm keeps it, on this test process's own
+    /// handles, duplicated so that the record's drop closes only its copies. No
+    /// test waits on, or ends, the process it names.
+    fn a_record(is_system_context: bool, system_context_waiting: bool) -> ActiveWorker {
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+        let copy = |pseudo: HANDLE| {
+            let mut handle: HANDLE = std::ptr::null_mut();
+            // SAFETY: a pseudo-handle of this process, duplicated into this
+            // process; `handle` is an owned out-param.
+            let ok = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    pseudo,
+                    GetCurrentProcess(),
+                    &mut handle,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            assert_ne!(ok, 0, "DuplicateHandle");
+            handle
+        };
+        // SAFETY: both return a pseudo-handle and take nothing.
+        let (process, thread) = unsafe { (copy(GetCurrentProcess()), copy(GetCurrentThread())) };
+        ActiveWorker {
+            process: OwnedProcess::from_raw_parts(process, thread, std::process::id()),
+            session: 1,
+            is_system_context,
+            system_context_waiting,
+            spawned_at: Instant::now(),
+            stop_event: None,
+        }
+    }
+
+    /// #4411 — the line reads the state the host started its worker under, which
+    /// the worker's record keeps from the spawn. Two records of a person's worker
+    /// in this one host at one moment, one started while SystemContext waited for
+    /// a machine enrollment and one not, name different ways forward: nothing the
+    /// host reads at the exit decides it, nor the worker's own note
+    /// (`win_service::system_context_waiting`), which is never set in a host.
+    #[test]
+    fn the_line_reads_the_state_its_worker_was_started_under() {
+        for (system_context, waiting) in [(true, false), (false, false), (false, true)] {
+            assert_eq!(
+                a_record(system_context, waiting).way_forward(),
+                nothing_to_run_way_forward(system_context, waiting),
+                "system_context={system_context} waiting={waiting}"
+            );
+        }
+        assert_ne!(
+            a_record(false, true).way_forward(),
+            a_record(false, false).way_forward(),
+            "a person's worker started while the host waited names its own way forward"
+        );
     }
 }

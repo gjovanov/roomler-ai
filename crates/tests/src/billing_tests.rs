@@ -298,6 +298,62 @@ async fn checkout_rejects_non_owner() {
     assert_eq!(resp.status().as_u16(), 403);
 }
 
+/// #4254: a pin, green before #4254's change and after it. The
+/// billing writes are on the gate guard's by-design list: their gate asks
+/// about the org their body names, and their routes carry no org in their
+/// path. What this pins is the rest of the order: a member of the org
+/// without MANAGE_TENANT, sending a body that parses and names their own
+/// org, is answered the gate's 403 before a field the handler judges itself,
+/// a bad `interval`, is judged.
+#[tokio::test]
+async fn the_checkout_gate_is_decided_before_a_bad_interval() {
+    use crate::tunnel_policy_permission_tests::{Gate, call};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("checkout-gate-first").await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/stripe/checkout",
+        &seeded.member.access_token,
+        Some(serde_json::json!({
+            "tenant_id": seeded.tenant_id,
+            "plan": "pro",
+            "interval": "fortnight",
+            "success_url": "http://localhost/success",
+            "cancel_url": "http://localhost/cancel",
+        })),
+    )
+    .await;
+    let problem = Gate::Bit("MANAGE_TENANT").problem(status, &body.to_string());
+    assert!(problem.is_none(), "{problem:?}");
+}
+
+/// #4254: the same pin for the plan change. A member of the org
+/// without MANAGE_TENANT, sending a body that parses and names their own
+/// org, is answered the gate's 403 before a bad `interval` is judged.
+#[tokio::test]
+async fn the_change_plan_gate_is_decided_before_a_bad_interval() {
+    use crate::tunnel_policy_permission_tests::{Gate, call};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("change-plan-gate-first").await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/stripe/change-plan",
+        &seeded.member.access_token,
+        Some(serde_json::json!({
+            "tenant_id": seeded.tenant_id,
+            "plan": "pro",
+            "interval": "fortnight",
+        })),
+    )
+    .await;
+    let problem = Gate::Bit("MANAGE_TENANT").problem(status, &body.to_string());
+    assert!(problem.is_none(), "{problem:?}");
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/stripe/portal — authentication & authorization
 // ---------------------------------------------------------------------------
@@ -342,6 +398,31 @@ async fn portal_fails_without_billing_account() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 400);
+}
+
+/// #4254: the portal's pin. Its gate asks about the org the body
+/// names, and the route carries no org in its path. A member of the org
+/// without MANAGE_TENANT, sending a body that parses and names their own
+/// org, is answered the gate's 403.
+#[tokio::test]
+async fn the_portal_gate_refuses_a_member_without_manage_tenant() {
+    use crate::tunnel_policy_permission_tests::{Gate, call};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("portal-gate-first").await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/stripe/portal",
+        &seeded.member.access_token,
+        Some(serde_json::json!({
+            "tenant_id": seeded.tenant_id,
+            "return_url": "http://localhost/billing",
+        })),
+    )
+    .await;
+    let problem = Gate::Bit("MANAGE_TENANT").problem(status, &body.to_string());
+    assert!(problem.is_none(), "{problem:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,7 +1100,7 @@ mod fr115 {
     use roomler_ai_services::stripe::StripeService;
 
     const SECRET: &str = "whsec_test_secret_for_billing_tests";
-    const PRICE_PRO: &str = "price_fr115_pro_month";
+    pub(super) const PRICE_PRO: &str = "price_fr115_pro_month";
     const PRICE_BIZ: &str = "price_fr115_biz_month";
     const PRICE_PRO_YEAR: &str = "price_fr115_pro_year";
     const PRICE_BIZ_YEAR: &str = "price_fr115_biz_year";
@@ -1042,7 +1123,7 @@ mod fr115 {
     }
 
     #[derive(Clone, Default)]
-    struct Fake {
+    pub(super) struct Fake {
         calls: Arc<Mutex<Vec<Call>>>,
         /// The subscription's item: (price, quantity).
         item: Arc<Mutex<(String, u32)>>,
@@ -1074,7 +1155,7 @@ mod fr115 {
     }
 
     /// A Stripe that answers the calls FR-115 makes and records each one.
-    async fn fake_stripe(fake: Fake) -> String {
+    pub(super) async fn fake_stripe(fake: Fake) -> String {
         let app = Router::new()
             .route(
                 "/v1/prices/{id}",
@@ -1151,7 +1232,7 @@ mod fr115 {
         format!("http://{addr}")
     }
 
-    fn configure(s: &mut roomler_ai_config::Settings, base: &str, annual: bool) {
+    pub(super) fn configure(s: &mut roomler_ai_config::Settings, base: &str, annual: bool) {
         s.stripe.secret_key = "sk_test_fr115_fake".into();
         s.stripe.webhook_secret = SECRET.into();
         s.stripe.price_pro = PRICE_PRO.into();
@@ -1250,7 +1331,7 @@ mod fr115 {
             .unwrap()
     }
 
-    async fn send_webhook(app: &TestApp, payload: serde_json::Value) {
+    pub(super) async fn send_webhook(app: &TestApp, payload: serde_json::Value) {
         let bytes = serde_json::to_vec(&payload).unwrap();
         let ts = now_ts();
         let sig = compute_hmac_sha256(SECRET, &format!("{ts}.{}", String::from_utf8_lossy(&bytes)));
@@ -1644,6 +1725,331 @@ mod fr115 {
         assert_eq!(s["subscribed"], true);
         assert_eq!(s["seats_billed"], 1);
         assert_eq!(s["currency"], "eur");
+    }
+
+    /// The summary as the browser receives it: the body as sent, and as JSON.
+    pub(super) async fn summary_of(
+        app: &TestApp,
+        t: &crate::fixtures::seed::SeededTenant,
+    ) -> (String, Value) {
+        let resp = app
+            .auth_get(
+                &format!("/api/stripe/summary?tenant_id={}", t.tenant_id),
+                &t.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "the summary was refused");
+        let text = resp.text().await.unwrap();
+        let json = serde_json::from_str(&text).unwrap();
+        (text, json)
+    }
+
+    /// The org's billing as the start of a checkout records it: a Stripe
+    /// customer, no subscription yet.
+    async fn set_customer(app: &TestApp, tenant_id: &str, customer: &str) {
+        let tid = ObjectId::parse_str(tenant_id).unwrap();
+        app.db
+            .collection::<bson::Document>("tenants")
+            .update_one(
+                doc! { "_id": tid },
+                doc! { "$set": { "billing": {
+                    "customer_id": customer, "subscription_id": Bson::Null,
+                    "current_period_end": Bson::Null, "status": "active",
+                    "cancel_at_period_end": false, "seats": Bson::Null,
+                    "interval": Bson::Null, "currency": Bson::Null,
+                } } },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// #4431 — the billing page's current-plan card reads the summary alone:
+    /// the status, the period end, "Cancels at period end", and "Manage
+    /// Subscription" from `has_billing_account`, which is true once the org
+    /// has a Stripe customer (subscribed or not) and false for an empty id.
+    /// The page lost all four for a paying org while it read them from
+    /// `GET /api/tenant`, which never carried them. The ids themselves never
+    /// reach the browser.
+    #[tokio::test]
+    async fn the_summary_says_a_billing_account_exists_without_naming_it() {
+        let base = fake_stripe(Fake::default()).await;
+        let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+        let t = app.seed_tenant("billing-account").await;
+
+        let (_, s) = summary_of(&app, &t).await;
+        assert_eq!(s["has_billing_account"], false, "a fresh org has none");
+
+        const CUSTOMER: &str = "cus_summary_never_names_it";
+        set_customer(&app, &t.tenant_id, CUSTOMER).await;
+        let (text, s) = summary_of(&app, &t).await;
+        assert_eq!(s["has_billing_account"], true, "{text}");
+        assert_eq!(s["subscribed"], false, "{text}");
+        assert!(
+            !text.contains(CUSTOMER),
+            "the summary names the customer: {text}"
+        );
+
+        set_customer(&app, &t.tenant_id, "").await;
+        let (text, s) = summary_of(&app, &t).await;
+        assert_eq!(s["has_billing_account"], false, "an empty id: {text}");
+
+        // The org the page failed: Pro, cancelled at the period's end.
+        subscribe(&app, &t.tenant_id, "pro").await;
+        app.db
+            .collection::<bson::Document>("tenants")
+            .update_one(
+                doc! { "_id": ObjectId::parse_str(&t.tenant_id).unwrap() },
+                doc! { "$set": {
+                    "billing.cancel_at_period_end": true,
+                    "billing.current_period_end": bson::DateTime::from_millis(1_900_000_000_000),
+                } },
+            )
+            .await
+            .unwrap();
+        let (text, s) = summary_of(&app, &t).await;
+        assert_eq!(s["plan"], "pro", "{text}");
+        assert_eq!(s["status"], "active", "{text}");
+        assert_eq!(s["subscribed"], true, "{text}");
+        assert_eq!(s["cancel_at_period_end"], true, "{text}");
+        assert!(s["current_period_end"].is_string(), "{text}");
+        assert_eq!(s["has_billing_account"], true, "{text}");
+        for id in ["cus_fake", "sub_fake"] {
+            assert!(!text.contains(id), "the summary names {id}: {text}");
+        }
+    }
+
+    /// #4431 — the summary is the only place the page reads an org's billing
+    /// from, so its gate is what keeps that billing from a member without
+    /// MANAGE_TENANT: such a member gets the gate's 403, and the page shows
+    /// none of it.
+    #[tokio::test]
+    async fn the_summary_gate_refuses_a_member_without_manage_tenant() {
+        use crate::tunnel_policy_permission_tests::{Gate, call};
+
+        let app = TestApp::spawn().await;
+        let t = app.seed_tenant("summary-gate").await;
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("/api/stripe/summary?tenant_id={}", t.tenant_id),
+            &t.member.access_token,
+            None,
+        )
+        .await;
+        let problem = Gate::Bit("MANAGE_TENANT").problem(status, &body.to_string());
+        assert!(problem.is_none(), "{problem:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // #4433 — a checkout never lowers a plan set outside billing
+    // -----------------------------------------------------------------------
+
+    /// #4433 — three orgs held `enterprise`, granted by hand with no
+    /// subscription, and their billing page offered "Upgrade to Pro". Paying
+    /// writes the plan the session sold (`checkout.session.completed`), so an
+    /// Enterprise org that bought Pro would have ended up on Pro. A checkout
+    /// that ranks below a plan the org holds without a live subscription is
+    /// refused 409 `plan_managed`, before anything reaches Stripe or the
+    /// org's billing.
+    mod granted_plan {
+        use super::*;
+
+        const PLAN_MANAGED: &str = "plan_managed";
+
+        /// The org on `plan`, written straight into its row as the operator
+        /// grants one by hand: no subscription, its billing left as it was.
+        async fn grant_plan(app: &TestApp, tenant_id: &str, plan: &str) {
+            let tid = ObjectId::parse_str(tenant_id).unwrap();
+            app.db
+                .collection::<bson::Document>("tenants")
+                .update_one(doc! { "_id": tid }, doc! { "$set": { "plan": plan } })
+                .await
+                .unwrap();
+        }
+
+        /// A checkout's status and body, the body as JSON when it is JSON.
+        async fn answer(resp: reqwest::Response) -> (u16, String, Value) {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            let json = serde_json::from_str(&text).unwrap_or(Value::Null);
+            (status, text, json)
+        }
+
+        /// The org's plan and billing as stored, read back after a refusal.
+        async fn plan_and_billing(app: &TestApp, tenant_id: &str) -> (String, Option<Bson>) {
+            let row = billing_of(app, tenant_id).await;
+            (
+                row.get_str("plan").unwrap().to_string(),
+                row.get("billing").cloned(),
+            )
+        }
+
+        /// (a) An Enterprise org with no billing: Pro and Business are both
+        /// below it. Each is refused with the code the page reads, nothing
+        /// reaches Stripe (not a customer, not a session, not even the
+        /// Price's currencies), and the org's billing is still null.
+        #[tokio::test]
+        async fn an_enterprise_org_without_billing_is_refused_a_lower_checkout() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-enterprise").await;
+            grant_plan(&app, &t.tenant_id, "enterprise").await;
+
+            for plan in ["pro", "business"] {
+                let (status, text, body) =
+                    answer(checkout(&app, &t, serde_json::json!({ "plan": plan })).await).await;
+                assert_eq!(status, 409, "{plan}: {text}");
+                assert_eq!(body["error"], PLAN_MANAGED, "{plan}: {text}");
+                assert!(
+                    body["message"].as_str().is_some_and(|m| !m.is_empty()),
+                    "{plan}: the refusal says why in words: {text}"
+                );
+            }
+            assert!(
+                fake.calls().is_empty(),
+                "a refused checkout reached Stripe: {:?}",
+                fake.calls()
+            );
+            let (plan, billing) = plan_and_billing(&app, &t.tenant_id).await;
+            assert_eq!(plan, "enterprise");
+            assert!(
+                matches!(billing, None | Some(Bson::Null)),
+                "a refused checkout wrote the org's billing: {billing:?}"
+            );
+        }
+
+        /// (b) A hand-granted Business org: Pro would lower it and is
+        /// refused; Business itself is its own plan and checks out (the org
+        /// starts paying for what it has).
+        #[tokio::test]
+        async fn a_granted_business_org_is_refused_pro_and_may_check_out_business() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-business").await;
+            grant_plan(&app, &t.tenant_id, "business").await;
+
+            let (status, text, body) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "pro" })).await).await;
+            assert_eq!(status, 409, "{text}");
+            assert_eq!(body["error"], PLAN_MANAGED, "{text}");
+            assert!(
+                fake.calls().is_empty(),
+                "a refused checkout reached Stripe: {:?}",
+                fake.calls()
+            );
+            let (plan, billing) = plan_and_billing(&app, &t.tenant_id).await;
+            assert_eq!(plan, "business");
+            assert!(matches!(billing, None | Some(Bson::Null)), "{billing:?}");
+
+            let (status, text, _) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "business" })).await).await;
+            assert_eq!(status, 200, "the org's own plan checks out: {text}");
+            let calls = fake.calls();
+            let session = calls
+                .iter()
+                .find(|c| c.path == "/v1/checkout/sessions")
+                .expect("no checkout session was created");
+            assert_eq!(session.field("metadata[plan]"), Some("business"));
+        }
+
+        /// (c) A hand-granted Pro org may buy Business: a higher plan is
+        /// never refused.
+        #[tokio::test]
+        async fn a_granted_pro_org_may_check_out_business() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-pro").await;
+            grant_plan(&app, &t.tenant_id, "pro").await;
+
+            let (status, text, _) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "business" })).await).await;
+            assert_eq!(status, 200, "{text}");
+            assert!(
+                fake.calls()
+                    .iter()
+                    .any(|c| c.path == "/v1/checkout/sessions"),
+                "no checkout session was created: {:?}",
+                fake.calls()
+            );
+        }
+
+        /// (d) A Free org buys Pro exactly as before.
+        #[tokio::test]
+        async fn a_free_org_still_checks_out_pro() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-free").await;
+
+            let (status, text, _) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "pro" })).await).await;
+            assert_eq!(status, 200, "{text}");
+            assert!(
+                fake.calls()
+                    .iter()
+                    .any(|c| c.path == "/v1/checkout/sessions"),
+                "no checkout session was created: {:?}",
+                fake.calls()
+            );
+        }
+
+        /// (e) A subscribed org is told it already has a subscription, as
+        /// before, even for a plan below its own: its plan changes through
+        /// change-plan, and the plan was bought, not granted.
+        #[tokio::test]
+        async fn a_subscribed_org_is_still_told_it_already_has_a_subscription() {
+            let fake = Fake::default();
+            let base = fake_stripe(fake.clone()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-subscribed").await;
+            subscribe(&app, &t.tenant_id, "business").await;
+
+            let (status, text, body) =
+                answer(checkout(&app, &t, serde_json::json!({ "plan": "pro" })).await).await;
+            assert_eq!(status, 409, "{text}");
+            assert_eq!(body["error"], "conflict", "{text}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("already has a subscription")),
+                "{text}"
+            );
+            assert!(
+                fake.calls()
+                    .iter()
+                    .all(|c| c.path != "/v1/checkout/sessions"),
+                "no second subscription may be started"
+            );
+        }
+
+        /// (f) The summary says whether the plan was set outside billing:
+        /// true for the Enterprise org without a subscription, false on Free
+        /// and false once a subscription bills the plan.
+        #[tokio::test]
+        async fn the_summary_says_whether_the_plan_was_set_outside_billing() {
+            let base = fake_stripe(Fake::default()).await;
+            let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+            let t = app.seed_tenant("granted-summary").await;
+
+            let (text, s) = summary_of(&app, &t).await;
+            assert_eq!(s["plan"], "free", "{text}");
+            assert_eq!(s["plan_managed"], false, "Free: {text}");
+
+            grant_plan(&app, &t.tenant_id, "enterprise").await;
+            let (text, s) = summary_of(&app, &t).await;
+            assert_eq!(s["plan"], "enterprise", "{text}");
+            assert_eq!(s["plan_managed"], true, "Enterprise by hand: {text}");
+
+            subscribe(&app, &t.tenant_id, "pro").await;
+            let (text, s) = summary_of(&app, &t).await;
+            assert_eq!(s["subscribed"], true, "{text}");
+            assert_eq!(s["plan_managed"], false, "a subscribed Pro org: {text}");
+        }
     }
 }
 
@@ -2157,5 +2563,541 @@ mod fr115_testmode {
             &[],
         )
         .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4432 — a card that needs 3-D Secure, replayed event by event
+// ---------------------------------------------------------------------------
+
+/// #4432 — the first real purchase on prod (2026-11-25) paid with a card that
+/// needed 3-D Secure, as most EU cards do. Stripe created the subscription
+/// `incomplete`, sent one `invoice.payment_failed` per authentication attempt
+/// on its FIRST invoice (`billing_reason: subscription_create`), and only then
+/// the completed checkout, `active` and the payment. The org read `past_due`
+/// for 16 minutes, Growth counted three failed payments beside the one paid
+/// invoice, and a buyer who abandoned the authentication would have left the
+/// org "subscribed" and been refused a new checkout for about a day.
+///
+/// No deployment runs Stripe's test mode, so these replays of Stripe's exact
+/// sequences are the verification. Each reads the org back after EVERY event:
+/// an org that ends right can still have been wrong in between.
+mod sca {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bson::{doc, oid::ObjectId};
+    use roomler_ai_services::dao::billing_event::BILLING_EVENTS;
+    use serde_json::{Value, json};
+
+    use super::fr115::{
+        Fake, PRICE_PRO, billing_of, checkout, configure, fake_stripe, send_webhook, summary_of,
+    };
+    use crate::fixtures::test_app::TestApp;
+
+    const DAY: i64 = 86_400;
+    /// Every event gets a fresh id: Stripe's retries are deduplicated by it.
+    static NEXT_EVENT: AtomicUsize = AtomicUsize::new(0);
+
+    /// The org as the webhook left it.
+    struct Org {
+        /// The event just delivered: its type and its object's id.
+        after: String,
+        plan: String,
+        status: String,
+        subscription: String,
+    }
+
+    impl Org {
+        /// Plan, `billing.status`, `billing.subscription_id`.
+        fn on(&self) -> (&str, &str, &str) {
+            (&self.plan, &self.status, &self.subscription)
+        }
+    }
+
+    impl std::fmt::Display for Org {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "after {}: plan {}, billing.status {}, billing.subscription_id {}",
+                self.after, self.plan, self.status, self.subscription
+            )
+        }
+    }
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    /// 10:00 UTC yesterday (Unix seconds), and that day: a closed day, so the
+    /// growth digest can be previewed for it.
+    fn yesterday_at_ten() -> (i64, chrono::NaiveDate) {
+        let day = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+        let at = day.and_hms_opt(10, 0, 0).unwrap().and_utc().timestamp();
+        (at, day)
+    }
+
+    /// A server on the fake Stripe, and a platform admin's token for the
+    /// growth views.
+    async fn spawn() -> (TestApp, String) {
+        let base = fake_stripe(Fake::default()).await;
+        let admin = ObjectId::new();
+        let app = TestApp::spawn_with_settings(|s| {
+            configure(s, &base, false);
+            s.stats.platform_admins = Some(admin.to_hex());
+        })
+        .await;
+        let token = app
+            .state
+            .auth
+            .generate_tokens(admin, "padmin@test.io", "padmin")
+            .unwrap()
+            .access_token;
+        (app, token)
+    }
+
+    /// Stripe, for one org: the events it sends about the org's subscriptions
+    /// and invoices, each dated `at` (Unix seconds).
+    struct Stripe<'a> {
+        app: &'a TestApp,
+        tenant: &'a str,
+        at: i64,
+    }
+
+    impl Stripe<'_> {
+        fn event(&self, kind: &str, object: Value) -> Value {
+            json!({
+                "id": format!("evt_4432_{}", NEXT_EVENT.fetch_add(1, Ordering::Relaxed)),
+                "object": "event", "type": kind, "created": self.at,
+                "data": { "object": object },
+            })
+        }
+
+        fn customer(&self) -> String {
+            format!("cus_{}", self.tenant)
+        }
+
+        /// `customer.subscription.*` for `sub`: one Pro seat a month in EUR,
+        /// with the `tenant_id` the checkout stamps on its metadata.
+        fn subscription(&self, kind: &str, sub: &str, status: &str) -> Value {
+            self.event(
+                kind,
+                json!({
+                    "id": sub, "object": "subscription", "status": status,
+                    "customer": self.customer(), "currency": "eur",
+                    "cancel_at_period_end": false,
+                    "metadata": { "tenant_id": self.tenant, "plan": "pro" },
+                    "items": { "data": [ {
+                        "id": format!("si_{sub}"), "quantity": 1,
+                        "price": { "id": PRICE_PRO, "recurring": { "interval": "month" } },
+                        "current_period_start": self.at,
+                        "current_period_end": self.at + 30 * DAY,
+                    } ] },
+                }),
+            )
+        }
+
+        /// `invoice.paid` or `invoice.payment_failed` for `invoice` of `sub`:
+        /// one Pro seat, 8.00 EUR, billed for `reason`.
+        fn invoice(&self, kind: &str, invoice: &str, sub: &str, reason: &str) -> Value {
+            let paid = kind == "invoice.paid";
+            self.event(
+                kind,
+                json!({
+                    "id": invoice, "object": "invoice", "customer": self.customer(),
+                    "subscription": sub, "billing_reason": reason,
+                    "status": if paid { "paid" } else { "open" },
+                    "currency": "eur", "amount_due": 800,
+                    "amount_paid": if paid { 800 } else { 0 },
+                    "status_transitions": {
+                        "paid_at": if paid { json!(self.at) } else { Value::Null },
+                    },
+                    "subscription_details": { "metadata": { "tenant_id": self.tenant } },
+                    "lines": { "data": [ {
+                        "object": "line_item", "type": "subscription", "amount": 800,
+                        "discount_amounts": [], "quantity": 1, "proration": false,
+                        "period": { "start": self.at, "end": self.at + 30 * DAY },
+                        "price": {
+                            "id": PRICE_PRO,
+                            "recurring": { "interval": "month", "interval_count": 1 },
+                        },
+                    } ] },
+                }),
+            )
+        }
+
+        /// The first invoice's payment failing: 3-D Secure not (yet) approved.
+        fn first_failed(&self, invoice: &str, sub: &str) -> Value {
+            self.invoice(
+                "invoice.payment_failed",
+                invoice,
+                sub,
+                "subscription_create",
+            )
+        }
+
+        /// `checkout.session.completed` for the checkout that started `sub`.
+        fn completed(&self, sub: &str) -> Value {
+            self.event(
+                "checkout.session.completed",
+                json!({
+                    "id": format!("cs_{sub}"), "object": "checkout.session",
+                    "customer": self.customer(), "subscription": sub, "currency": "eur",
+                    "metadata": {
+                        "tenant_id": self.tenant, "plan": "pro",
+                        "interval": "month", "currency": "eur", "seats": "1",
+                    },
+                }),
+            )
+        }
+
+        /// Deliver one event, signed, and read the org back.
+        async fn send(&self, e: Value) -> Org {
+            let after = format!(
+                "{} {}",
+                e["type"].as_str().unwrap_or_default(),
+                e["data"]["object"]["id"].as_str().unwrap_or_default()
+            );
+            send_webhook(self.app, e).await;
+            let doc = billing_of(self.app, self.tenant).await;
+            let billing = doc.get_document("billing").ok();
+            let field = |k: &str| {
+                billing
+                    .and_then(|b| b.get_str(k).ok())
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            Org {
+                plan: doc.get_str("plan").unwrap_or("-").to_string(),
+                status: field("status"),
+                subscription: field("subscription_id"),
+                after,
+            }
+        }
+
+        /// A checkout abandoned at 3-D Secure: Stripe creates the
+        /// subscription `incomplete` and fails its first invoice's payment,
+        /// and the buyer never approves.
+        async fn abandon(&self, sub: &str, invoice: &str) -> Vec<Org> {
+            let created = self.subscription("customer.subscription.created", sub, "incomplete");
+            vec![
+                self.send(created).await,
+                self.send(self.first_failed(invoice, sub)).await,
+            ]
+        }
+    }
+
+    async fn get(app: &TestApp, path: &str, token: &str) -> Value {
+        let resp = app.auth_get(path, token).send().await.unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 200, "{path}: {text}");
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// The Growth revenue view's totals over `day`'s month.
+    async fn revenue_totals(app: &TestApp, token: &str, day: chrono::NaiveDate) -> Value {
+        let month = day.format("%Y-%m");
+        let path = format!("/api/admin/growth/revenue?since={month}&until={month}");
+        get(app, &path, token).await["billed"]["totals"].clone()
+    }
+
+    /// The Growth digest's billed figures of `day` (a closed day).
+    async fn digest_billed(app: &TestApp, token: &str, day: chrono::NaiveDate) -> Value {
+        let path = format!(
+            "/api/admin/growth/digest/preview?day={}",
+            day.format("%Y-%m-%d")
+        );
+        get(app, &path, token).await["sections"]["revenue"]["billed"].clone()
+    }
+
+    /// (a) The sequence prod saw, approved: never past due, Pro and active at
+    /// the end, every failed attempt still on record, and Growth counting the
+    /// one paid invoice and no failed payment, in the revenue view's month and
+    /// in the digest's day. Before #4432: past due from the first failure,
+    /// and three failed payments counted.
+    #[tokio::test]
+    async fn an_approved_3ds_checkout_is_never_past_due_and_counts_no_failure() {
+        let (app, token) = spawn().await;
+        let t = app.seed_tenant("sca-approved").await;
+        let (at, day) = yesterday_at_ten();
+        let stripe = Stripe {
+            app: &app,
+            tenant: &t.tenant_id,
+            at,
+        };
+
+        let mut seen = Vec::new();
+        let created = stripe.subscription("customer.subscription.created", "sub_a", "incomplete");
+        seen.push(stripe.send(created).await);
+        for _ in 0..3 {
+            seen.push(stripe.send(stripe.first_failed("in_a", "sub_a")).await);
+        }
+        seen.push(stripe.send(stripe.completed("sub_a")).await);
+        let active = stripe.subscription("customer.subscription.updated", "sub_a", "active");
+        seen.push(stripe.send(active).await);
+        let paid = stripe.invoice("invoice.paid", "in_a", "sub_a", "subscription_create");
+        seen.push(stripe.send(paid).await);
+        for o in &seen {
+            assert_ne!(o.status, "past_due", "{o}");
+        }
+        let last = seen.last().unwrap();
+        assert_eq!(last.on(), ("pro", "active", "sub_a"), "{last}");
+
+        let failures = app
+            .db
+            .collection::<bson::Document>(BILLING_EVENTS)
+            .count_documents(doc! {
+                "tenant_id": ObjectId::parse_str(&t.tenant_id).unwrap(),
+                "kind": "invoice_payment_failed",
+            })
+            .await
+            .unwrap();
+        assert_eq!(failures, 3, "every failed attempt stays on record");
+
+        let totals = revenue_totals(&app, &token, day).await;
+        assert_eq!(totals["invoices_paid"], 1, "{totals}");
+        assert_eq!(totals["payment_failures"], 0, "{totals}");
+        let billed = digest_billed(&app, &token, day).await;
+        assert_eq!(billed["invoices_paid"]["day"], 1, "{billed}");
+        assert_eq!(billed["payment_failures"]["day"], 0, "{billed}");
+    }
+
+    /// (b) Abandoned: the buyer never approves. The org stays on Free with
+    /// its subscription `incomplete`, never past due and not subscribed, and
+    /// a new checkout is accepted at once. Before #4432 the first failure
+    /// marked it past due, which counts as subscribed: a new checkout was a
+    /// 409 until Stripe expired the subscription, about a day later.
+    #[tokio::test]
+    async fn an_abandoned_3ds_checkout_leaves_the_org_free_to_check_out_again() {
+        let (app, _) = spawn().await;
+        let t = app.seed_tenant("sca-abandoned").await;
+        let stripe = Stripe {
+            app: &app,
+            tenant: &t.tenant_id,
+            at: now(),
+        };
+
+        for o in stripe.abandon("sub_a", "in_a").await {
+            assert_eq!(o.on(), ("free", "incomplete", "sub_a"), "{o}");
+        }
+        let (text, s) = summary_of(&app, &t).await;
+        assert_eq!(s["subscribed"], false, "{text}");
+
+        let resp = checkout(&app, &t, json!({ "plan": "pro" })).await;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 200, "a new checkout was refused: {body}");
+        assert!(body.contains("https://checkout.example/"), "{body}");
+    }
+
+    /// (c) The buyer abandons A, checks out again, and B is paid; Stripe
+    /// expires A about 23 h after creating it. A's last events must never
+    /// land on the org that now pays for B: they would write A's id and
+    /// `canceled` over B, the page would offer a checkout again (a second
+    /// payment), and B's own deletion would no longer find the org.
+    #[tokio::test]
+    async fn a_stale_subscription_expiring_after_the_retry_is_paid_changes_nothing() {
+        let (app, _) = spawn().await;
+        let t = app.seed_tenant("sca-retry-paid").await;
+        let stripe = Stripe {
+            app: &app,
+            tenant: &t.tenant_id,
+            at: now(),
+        };
+
+        stripe.abandon("sub_a", "in_a").await;
+        let steps = [
+            (
+                stripe.subscription("customer.subscription.created", "sub_b", "incomplete"),
+                ("free", "incomplete", "sub_b"),
+            ),
+            (stripe.completed("sub_b"), ("pro", "active", "sub_b")),
+            (
+                stripe.subscription("customer.subscription.updated", "sub_b", "active"),
+                ("pro", "active", "sub_b"),
+            ),
+            (
+                stripe.invoice("invoice.paid", "in_b", "sub_b", "subscription_create"),
+                ("pro", "active", "sub_b"),
+            ),
+            // A expires.
+            (
+                stripe.subscription(
+                    "customer.subscription.updated",
+                    "sub_a",
+                    "incomplete_expired",
+                ),
+                ("pro", "active", "sub_b"),
+            ),
+            (
+                stripe.subscription(
+                    "customer.subscription.deleted",
+                    "sub_a",
+                    "incomplete_expired",
+                ),
+                ("pro", "active", "sub_b"),
+            ),
+            // B's own end still finds the org.
+            (
+                stripe.subscription("customer.subscription.deleted", "sub_b", "canceled"),
+                ("free", "canceled", "sub_b"),
+            ),
+        ];
+        for (e, want) in steps {
+            let o = stripe.send(e).await;
+            assert_eq!(o.on(), want, "{o}");
+        }
+    }
+
+    /// (c) The same, with A expiring before B is paid: the org holds B, still
+    /// `incomplete` and so not billing, and A's end is still no news for it.
+    /// It ends on B, active.
+    #[tokio::test]
+    async fn a_stale_subscription_expiring_before_the_retry_is_paid_changes_nothing() {
+        let (app, _) = spawn().await;
+        let t = app.seed_tenant("sca-retry-unpaid").await;
+        let stripe = Stripe {
+            app: &app,
+            tenant: &t.tenant_id,
+            at: now(),
+        };
+
+        stripe.abandon("sub_a", "in_a").await;
+        let steps = [
+            (
+                stripe.subscription("customer.subscription.created", "sub_b", "incomplete"),
+                ("free", "incomplete", "sub_b"),
+            ),
+            // A expires.
+            (
+                stripe.subscription(
+                    "customer.subscription.updated",
+                    "sub_a",
+                    "incomplete_expired",
+                ),
+                ("free", "incomplete", "sub_b"),
+            ),
+            (
+                stripe.subscription(
+                    "customer.subscription.deleted",
+                    "sub_a",
+                    "incomplete_expired",
+                ),
+                ("free", "incomplete", "sub_b"),
+            ),
+            // B is paid.
+            (stripe.completed("sub_b"), ("pro", "active", "sub_b")),
+            (
+                stripe.subscription("customer.subscription.updated", "sub_b", "active"),
+                ("pro", "active", "sub_b"),
+            ),
+            (
+                stripe.invoice("invoice.paid", "in_b", "sub_b", "subscription_create"),
+                ("pro", "active", "sub_b"),
+            ),
+        ];
+        for (e, want) in steps {
+            let o = stripe.send(e).await;
+            assert_eq!(o.on(), want, "{o}");
+        }
+    }
+
+    /// (d) A renewal that really fails still marks the org past due at once,
+    /// whether or not the subscription's own `past_due` update follows. The
+    /// subscription's `active` brings it back; the paid invoice alone does
+    /// not move the status, the subscription's own events do.
+    #[tokio::test]
+    async fn a_failed_renewal_still_marks_the_org_past_due() {
+        let (app, _) = spawn().await;
+        for (slug, with_update) in [("sca-renewal-update", true), ("sca-renewal-alone", false)] {
+            let t = app.seed_tenant(slug).await;
+            let stripe = Stripe {
+                app: &app,
+                tenant: &t.tenant_id,
+                at: now(),
+            };
+            let sub = format!("sub_{slug}");
+            let (first, renewal) = (format!("in_{slug}_1"), format!("in_{slug}_2"));
+            let paying = ("pro", "active", sub.as_str());
+            let past_due = ("pro", "past_due", sub.as_str());
+
+            // An org paying for its subscription: a checkout approved at once.
+            let mut steps = vec![
+                (
+                    stripe.subscription("customer.subscription.created", &sub, "active"),
+                    paying,
+                ),
+                (stripe.completed(&sub), paying),
+                (
+                    stripe.invoice("invoice.paid", &first, &sub, "subscription_create"),
+                    paying,
+                ),
+                // The renewal fails.
+                (
+                    stripe.invoice(
+                        "invoice.payment_failed",
+                        &renewal,
+                        &sub,
+                        "subscription_cycle",
+                    ),
+                    past_due,
+                ),
+            ];
+            if with_update {
+                steps.push((
+                    stripe.subscription("customer.subscription.updated", &sub, "past_due"),
+                    past_due,
+                ));
+            }
+            steps.extend([
+                (
+                    stripe.invoice("invoice.paid", &renewal, &sub, "subscription_cycle"),
+                    past_due,
+                ),
+                (
+                    stripe.subscription("customer.subscription.updated", &sub, "active"),
+                    paying,
+                ),
+            ]);
+            for (e, want) in steps {
+                let o = stripe.send(e).await;
+                assert_eq!(o.on(), want, "{slug}: {o}");
+            }
+        }
+    }
+
+    /// (e) A failure of an invoice that was never paid is still a failed
+    /// payment: the org's first invoice paid, its renewal failed and never
+    /// paid. One invoice paid and one failure, in the month and in the day.
+    #[tokio::test]
+    async fn a_failure_of_an_invoice_never_paid_is_still_counted() {
+        let (app, token) = spawn().await;
+        let t = app.seed_tenant("sca-unpaid-renewal").await;
+        let (at, day) = yesterday_at_ten();
+        let stripe = Stripe {
+            app: &app,
+            tenant: &t.tenant_id,
+            at,
+        };
+        for e in [
+            stripe.subscription("customer.subscription.created", "sub_e", "active"),
+            stripe.completed("sub_e"),
+            stripe.invoice("invoice.paid", "in_e_1", "sub_e", "subscription_create"),
+            stripe.invoice(
+                "invoice.payment_failed",
+                "in_e_2",
+                "sub_e",
+                "subscription_cycle",
+            ),
+        ] {
+            stripe.send(e).await;
+        }
+
+        let totals = revenue_totals(&app, &token, day).await;
+        assert_eq!(totals["invoices_paid"], 1, "{totals}");
+        assert_eq!(totals["payment_failures"], 1, "{totals}");
+        let billed = digest_billed(&app, &token, day).await;
+        assert_eq!(billed["invoices_paid"]["day"], 1, "{billed}");
+        assert_eq!(billed["payment_failures"]["day"], 1, "{billed}");
     }
 }

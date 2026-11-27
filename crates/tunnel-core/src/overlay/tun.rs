@@ -104,6 +104,43 @@ pub trait TunIo: Send + Sync {
     /// Remove a CIDR route installed by [`add_cidr_route`]. Best-effort.
     async fn del_cidr_route(&self, _cidr: &str) {}
 
+    /// #4279 — the route guard's re-assert of a router peer's subnet route,
+    /// one that [`add_cidr_route`](Self::add_cidr_route) installed: put ours
+    /// back via this device when it is MISSING, and never displace a route
+    /// that holds the prefix. Another interface may route the same range on
+    /// purpose: a sibling org's adapter (multi-org gives each org its own),
+    /// the host's own LAN, a corp VPN's split include. Two guards that each
+    /// took the prefix back would flip it on every wave.
+    ///
+    /// Install still takes the prefix (`replace` on Linux, delete-then-add on
+    /// macOS), so the last carrier install wins, as before. The guard only
+    /// fills a hole, on every OS:
+    ///
+    /// - Linux reads `ip route show exact <cidr> dev <if>`, and only when ours
+    ///   is not listed runs install's argv with `replace` → `add`, which a
+    ///   held key refuses.
+    /// - macOS reads install's `route -n get` three ways, as #4117 reads a
+    ///   utun's block (ours, held on another interface, absent), and only when
+    ///   nothing holds the prefix runs install's `add` alone, never its
+    ///   delete. Never an add over a holder: `route` exits 0 on a refused
+    ///   write, and the refusal still reaches the route monitor as an
+    ///   `RTM_ADD` with errno 17, which would arm the next wave.
+    /// - Windows `winroute::ensure` writes only this adapter's row, with the
+    ///   #1328 stand-down: a VPN whose route monitor keeps deleting the
+    ///   prefix gets it back for 4 waves, then not for a backoff of 1 to 15
+    ///   min, then one probe. Reachability through the overlay was lost
+    ///   either way, and the fight is what ran the guard at ~20 waves/min
+    ///   (#1282). `add_cidr_route` deliberately never stands down, because an
+    ///   exit client's `/1`s must not leave a hole that egress leaks through;
+    ///   a subnet route has no such duty.
+    ///
+    /// The default does nothing: only a device with OS routes has one to put
+    /// back. A wrapper device must forward this, or its OS device's subnet
+    /// routes go undefended.
+    async fn defend_subnet_route(&self, _cidr: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Change B (corp-gateway leak) — maintain the BLOCK-FLOOR routes: the
     /// four `plen+2` sub-prefixes of the connected overlay block, installed
     /// via this device. A full-tunnel VPN that claims a LONGER prefix than the
@@ -552,6 +589,271 @@ fn mask_plen(mask: std::net::IpAddr) -> Option<u8> {
     (ones == total).then_some(ones as u8)
 }
 
+/// Phase 1 — install's Linux write of a CIDR route on the overlay device,
+/// `ip [-6] route replace <cidr> dev <if>` (no metric, the main table). It
+/// takes the exact key (prefix, metric 0, main table) from whatever held it,
+/// so the last carrier install wins. The exit `/1`s are written this way too.
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+pub(crate) fn linux_cidr_install_args(cidr: &str, v6: bool, if_name: &str) -> Vec<String> {
+    linux_cidr_route_args("replace", cidr, v6, if_name)
+}
+
+/// #4279 — the route guard's Linux writes for a subnet route, given what
+/// [`linux_subnet_show_args`] read: `Some(true)` when our device holds the
+/// prefix, `None` when the read did not answer. Nothing when the route is
+/// ours, else install's argv with `replace` → `add`. `add` refuses (EEXIST,
+/// "File exists") whenever a route already holds the exact key, so the guard
+/// fills a hole and never displaces: a sibling org's adapter (multi-org gives
+/// each org its own) or another product keeps the prefix, where `replace`
+/// would take it back on every wave and two guards would flip it forever.
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+pub(crate) fn linux_subnet_restore_writes(
+    cidr: &str,
+    v6: bool,
+    if_name: &str,
+    ours_listed: Option<bool>,
+) -> Vec<Vec<String>> {
+    if ours_listed == Some(true) {
+        return Vec::new();
+    }
+    vec![linux_cidr_route_args("add", cidr, v6, if_name)]
+}
+
+/// #4279 — `ip [-6] route show exact <cidr> dev <if>`: the routes for exactly
+/// this prefix on OUR device. A read, so the guard's steady state (the route
+/// is ours) changes no table and arms no wave.
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+pub(crate) fn linux_subnet_show_args(cidr: &str, v6: bool, if_name: &str) -> Vec<String> {
+    let mut args = linux_family(v6);
+    args.extend([
+        "route".into(),
+        "show".into(),
+        "exact".into(),
+        cidr.into(),
+        "dev".into(),
+        if_name.into(),
+    ]);
+    args
+}
+
+/// #4279 — did [`linux_subnet_show_args`] list a route? Any non-blank line.
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+pub(crate) fn linux_route_listed(stdout: &str) -> bool {
+    stdout.lines().any(|l| !l.trim().is_empty())
+}
+
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+fn linux_cidr_route_args(verb: &str, cidr: &str, v6: bool, if_name: &str) -> Vec<String> {
+    let mut args = linux_family(v6);
+    args.extend([
+        "route".into(),
+        verb.into(),
+        cidr.into(),
+        "dev".into(),
+        if_name.into(),
+    ]);
+    args
+}
+
+#[cfg(any(all(target_os = "linux", feature = "overlay-l3"), test))]
+fn linux_family(v6: bool) -> Vec<String> {
+    if v6 { vec!["-6".into()] } else { Vec::new() }
+}
+
+/// Phase 1 — a CIDR as BSD `route` takes it: the network and the length, the
+/// length empty when the string carries none.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_cidr_parts(cidr: &str) -> (&str, &str) {
+    cidr.split_once('/').unwrap_or((cidr, ""))
+}
+
+/// Phase 1 — install's macOS lookup of a CIDR route, `route -n get <family>
+/// -net <net> -prefixlen <plen>`: an exact (destination, mask) lookup, read
+/// with [`bsd_route_is_ours`]. `None` when the CIDR does not parse, and then
+/// install writes without looking, as it always did.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_cidr_get_args(cidr: &str, v6: bool) -> Option<Vec<String>> {
+    let (net, plen) = bsd_cidr_parts(cidr);
+    net.parse::<std::net::IpAddr>().ok()?;
+    plen.parse::<u8>().ok()?;
+    Some(vec![
+        "-n".into(),
+        "get".into(),
+        bsd_cidr_family(v6).into(),
+        "-net".into(),
+        net.into(),
+        "-prefixlen".into(),
+        plen.into(),
+    ])
+}
+
+/// Phase 1 — install's macOS writes for a CIDR route, given what its lookup
+/// answered: nothing when the route is ours (#1856), else delete-then-add,
+/// because BSD `route` has no replace and `add` fails once the entry exists.
+/// The delete may find nothing, so only the add's answer counts. The last
+/// carrier install wins, as on Linux.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_cidr_install_writes(
+    cidr: &str,
+    v6: bool,
+    if_name: &str,
+    ours: bool,
+) -> Vec<Vec<String>> {
+    if ours {
+        return Vec::new();
+    }
+    vec![
+        bsd_cidr_route_args("delete", cidr, v6, None),
+        bsd_cidr_route_args("add", cidr, v6, Some(if_name)),
+    ]
+}
+
+/// #4279 — the route guard's macOS write for a subnet route, given install's
+/// exact lookup read three ways by #4117's [`utun_block_held`]: install's
+/// `add` ALONE, never its delete, and only when nothing holds the prefix
+/// ([`UtunBlockHeld::Absent`]). Nothing when the route is ours, when the
+/// lookup could not run, and when another interface holds the prefix (a
+/// sibling org's utun, the host's own LAN), which keeps it.
+///
+/// Never an add over a holder, as #4117 never adds a utun's block over one:
+/// macOS `route` exits 0 when the kernel refuses a write, and the refused add
+/// still reaches every routing-socket listener as an `RTM_ADD` carrying
+/// errno 17. The route monitor counts it as a table change, so an add over a
+/// holder would arm the next wave, be refused again, and arm the one after.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_subnet_restore_writes(
+    cidr: &str,
+    v6: bool,
+    if_name: &str,
+    held: &UtunBlockHeld,
+) -> Vec<Vec<String>> {
+    match held {
+        UtunBlockHeld::Absent => vec![bsd_cidr_route_args("add", cidr, v6, Some(if_name))],
+        UtunBlockHeld::Ours | UtunBlockHeld::Elsewhere(_) | UtunBlockHeld::Unread => Vec::new(),
+    }
+}
+
+/// #4279 — a subnet route's prefix as [`utun_block_held`] reads it. A router
+/// peer's approved subnets are IPv4 (`router::Cidr`), so anything else is
+/// `None`.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_subnet_prefix(cidr: &str) -> Option<(std::net::Ipv4Addr, u8)> {
+    let (net, plen) = bsd_cidr_parts(cidr);
+    let plen = plen.parse::<u8>().ok().filter(|p| *p <= 32)?;
+    Some((net.parse().ok()?, plen))
+}
+
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+fn bsd_cidr_route_args(verb: &str, cidr: &str, v6: bool, if_name: Option<&str>) -> Vec<String> {
+    let (net, plen) = bsd_cidr_parts(cidr);
+    let mut args: Vec<String> = vec![
+        "-n".into(),
+        verb.into(),
+        bsd_cidr_family(v6).into(),
+        "-net".into(),
+        net.into(),
+    ];
+    if !plen.is_empty() {
+        args.extend(["-prefixlen".into(), plen.into()]);
+    }
+    if let Some(if_name) = if_name {
+        args.extend(["-interface".into(), if_name.into()]);
+    }
+    args
+}
+
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+fn bsd_cidr_family(v6: bool) -> &'static str {
+    if v6 { "-inet6" } else { "-inet" }
+}
+
+/// #4279 — what one route-guard restore of a subnet route came to on Linux or
+/// macOS, where the guard reads before it writes.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "overlay-l3"),
+    test
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubnetRestore {
+    /// The read found ours in place, and nothing was written: the steady
+    /// state.
+    Ours,
+    /// Ours was missing and is back.
+    Restored,
+    /// Another route holds the exact key, on the interface named (empty when
+    /// the OS did not say which): a sibling org's adapter, another product,
+    /// the host's own LAN. It keeps it. Quiet: not an error, never a WARN per
+    /// wave, and nothing that arms another wave.
+    Held(String),
+}
+
+/// #4279 — read the guard's `add`: iproute2 says `RTNETLINK answers: File
+/// exists` and route(8) `…: File exists` (EEXIST) when the key is held, and
+/// anything else is a real failure.
+///
+/// On Linux a refused add is the held answer: the read looks at our device
+/// only, and the kernel tells whether anything else holds the key. A refused
+/// netlink write is answered to the writer alone, so no route monitor sees
+/// it. On macOS the add runs only on [`UtunBlockHeld::Absent`], so a refusal
+/// there is a holder that came between the read and the add.
+///
+/// iproute2 prints the C library's `strerror`, which a host with a localized
+/// libc translates. There a held key reads as a failure, which costs a debug
+/// line per wave and changes nothing.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "overlay-l3"),
+    test
+))]
+pub(crate) fn subnet_restore_outcome(res: std::io::Result<()>) -> std::io::Result<SubnetRestore> {
+    match res {
+        Ok(()) => Ok(SubnetRestore::Restored),
+        Err(e) if e.to_string().contains("File exists") => Ok(SubnetRestore::Held(String::new())),
+        Err(e) => Err(e),
+    }
+}
+
+/// #4279 — what one macOS restore came to: the three-way read, then what
+/// `route` complained about when it made the add, if it made one ([`None`]
+/// for no complaint; `route` exits 0 on a refused write, so the complaint is
+/// the answer). A lookup that could not run is a failure.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_subnet_outcome(
+    held: &UtunBlockHeld,
+    complaint: Option<&str>,
+) -> std::io::Result<SubnetRestore> {
+    match held {
+        UtunBlockHeld::Ours => Ok(SubnetRestore::Ours),
+        UtunBlockHeld::Elsewhere(on) => Ok(SubnetRestore::Held(on.clone())),
+        UtunBlockHeld::Unread => Err(std::io::Error::other("the subnet's lookup could not run")),
+        UtunBlockHeld::Absent => match complaint {
+            None => Ok(SubnetRestore::Restored),
+            Some(c) => subnet_restore_outcome(Err(std::io::Error::other(c.to_string()))),
+        },
+    }
+}
+
+/// #4279 — the subnet prefixes another route holds right now, so the guard
+/// names a holder once, when that starts, never on every wave. `true` when
+/// `cidr` has just become held by another route; ours again forgets it.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "overlay-l3"),
+    test
+))]
+pub(crate) fn note_subnet_holder(held: &mut Vec<String>, cidr: &str, by_another: bool) -> bool {
+    let at = held.iter().position(|c| c == cidr);
+    match (by_another, at) {
+        (true, None) => {
+            held.push(cidr.to_string());
+            true
+        }
+        (false, Some(i)) => {
+            held.remove(i);
+            false
+        }
+        _ => false,
+    }
+}
+
 /// #4117 — what an `inet` line of `ifconfig <utun>` says about one address:
 /// its peer (the `-->` address a point-to-point interface prints) and its
 /// netmask (printed in hex, `netmask 0xffc00000`).
@@ -879,6 +1181,9 @@ impl std::fmt::Display for UtunBlockHeld {
 /// measured on macOS 26 CI runners: `not in table` before the block had been
 /// routed, the default route right after the block's own route was deleted.
 /// So an answer that is not exactly the block is [`UtunBlockHeld::Absent`].
+///
+/// #4279 — the route guard reads a router peer's subnet route the same way,
+/// with install's lookup for exactly that prefix ([`bsd_subnet_restore_writes`]).
 #[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
 pub(crate) fn utun_block_held(
     got: Option<&BsdRouteGet>,
@@ -1995,6 +2300,398 @@ default                                 fe80::1%en0                             
             !bsd_pin_holds(iface, &up),
             "with no gateway flag it is no pin"
         );
+    }
+}
+
+/// #4279 — the route guard's subnet write on Linux and macOS puts back a
+/// route that is MISSING and never displaces one. Install keeps its write
+/// (`replace`, delete-then-add), so the last carrier install wins as before.
+/// Pure: the argv, the plan and the outcome are decided here, on every
+/// platform.
+#[cfg(test)]
+mod subnet_restore_tests {
+    use super::{
+        SubnetRestore, UtunBlockHeld, bsd_cidr_get_args, bsd_cidr_install_writes,
+        bsd_subnet_outcome, bsd_subnet_prefix, bsd_subnet_restore_writes, linux_cidr_install_args,
+        linux_route_listed, linux_subnet_restore_writes, linux_subnet_show_args,
+        note_subnet_holder, parse_bsd_route_get, subnet_restore_outcome, utun_block_held,
+    };
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Install's Linux write is unchanged: `replace` takes the exact key from
+    /// whatever held it. v6 too, because the exit `/1` halves ride this path.
+    #[test]
+    fn linux_install_still_replaces() {
+        assert_eq!(
+            linux_cidr_install_args("10.1.0.0/16", false, "roomler0"),
+            argv(&["route", "replace", "10.1.0.0/16", "dev", "roomler0"])
+        );
+        assert_eq!(
+            linux_cidr_install_args("::/1", true, "roomler0"),
+            argv(&["-6", "route", "replace", "::/1", "dev", "roomler0"])
+        );
+    }
+
+    /// The guard's Linux write is install's argv with `replace` → `add`, and
+    /// nothing else. `add` refuses when any route already holds the exact key
+    /// (prefix, metric 0, main table), so it only fills a hole: a sibling
+    /// org's adapter keeps what it holds, where `replace` would take it back
+    /// on every wave and the two guards would flip it forever.
+    #[test]
+    fn linux_guard_adds_where_install_replaces() {
+        for (cidr, v6) in [
+            ("10.1.0.0/16", false),
+            ("192.168.50.0/24", false),
+            ("fd00:1::/64", true),
+        ] {
+            let install = linux_cidr_install_args(cidr, v6, "roomler0-ab12cd");
+            let swapped: Vec<String> = install
+                .iter()
+                .map(|t| {
+                    if t == "replace" {
+                        "add".to_string()
+                    } else {
+                        t.clone()
+                    }
+                })
+                .collect();
+            let writes = linux_subnet_restore_writes(cidr, v6, "roomler0-ab12cd", Some(false));
+            assert_eq!(writes, [swapped], "{cidr}");
+            for verb in ["replace", "del", "delete", "change", "flush"] {
+                assert!(!writes[0].iter().any(|t| t == verb), "{cidr}: {writes:?}");
+            }
+        }
+    }
+
+    /// The guard reads first: does OUR device already hold exactly this
+    /// prefix? A read is never a table change, so the steady state (ours is
+    /// there) writes nothing and arms no wave. An unanswered read still
+    /// tries the add, which cannot displace anything.
+    #[test]
+    fn linux_guard_writes_only_when_ours_is_missing() {
+        assert_eq!(
+            linux_subnet_show_args("10.1.0.0/16", false, "roomler0"),
+            argv(&["route", "show", "exact", "10.1.0.0/16", "dev", "roomler0"])
+        );
+        assert_eq!(
+            linux_subnet_show_args("fd00:1::/64", true, "roomler0"),
+            argv(&[
+                "-6",
+                "route",
+                "show",
+                "exact",
+                "fd00:1::/64",
+                "dev",
+                "roomler0"
+            ])
+        );
+        assert!(
+            linux_subnet_restore_writes("10.1.0.0/16", false, "roomler0", Some(true)).is_empty()
+        );
+        let add = vec![argv(&["route", "add", "10.1.0.0/16", "dev", "roomler0"])];
+        assert_eq!(
+            linux_subnet_restore_writes("10.1.0.0/16", false, "roomler0", Some(false)),
+            add
+        );
+        assert_eq!(
+            linux_subnet_restore_writes("10.1.0.0/16", false, "roomler0", None),
+            add
+        );
+        assert!(linux_route_listed("10.1.0.0/16 scope link \n"));
+        assert!(!linux_route_listed(""));
+        assert!(!linux_route_listed("\n  \n"));
+    }
+
+    /// Install's macOS writes are unchanged: the exact lookup, then nothing
+    /// when the route is ours, else delete-then-add (BSD `route` has no
+    /// replace). v6 too, for the exit `/1` halves.
+    #[test]
+    fn bsd_install_still_deletes_then_adds() {
+        assert_eq!(
+            bsd_cidr_get_args("10.1.0.0/16", false),
+            Some(argv(&[
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                "10.1.0.0",
+                "-prefixlen",
+                "16"
+            ]))
+        );
+        assert_eq!(
+            bsd_cidr_install_writes("10.1.0.0/16", false, "utun4", false),
+            [
+                argv(&[
+                    "-n",
+                    "delete",
+                    "-inet",
+                    "-net",
+                    "10.1.0.0",
+                    "-prefixlen",
+                    "16"
+                ]),
+                argv(&[
+                    "-n",
+                    "add",
+                    "-inet",
+                    "-net",
+                    "10.1.0.0",
+                    "-prefixlen",
+                    "16",
+                    "-interface",
+                    "utun4",
+                ]),
+            ]
+        );
+        assert!(bsd_cidr_install_writes("10.1.0.0/16", false, "utun4", true).is_empty());
+        assert_eq!(
+            bsd_cidr_get_args("8000::/1", true),
+            Some(argv(&[
+                "-n",
+                "get",
+                "-inet6",
+                "-net",
+                "8000::",
+                "-prefixlen",
+                "1"
+            ]))
+        );
+        assert_eq!(
+            bsd_cidr_install_writes("8000::/1", true, "utun4", false),
+            [
+                argv(&[
+                    "-n",
+                    "delete",
+                    "-inet6",
+                    "-net",
+                    "8000::",
+                    "-prefixlen",
+                    "1"
+                ]),
+                argv(&[
+                    "-n",
+                    "add",
+                    "-inet6",
+                    "-net",
+                    "8000::",
+                    "-prefixlen",
+                    "1",
+                    "-interface",
+                    "utun4",
+                ]),
+            ]
+        );
+        // No length: no lookup, and the writes carry none either (as before).
+        assert_eq!(bsd_cidr_get_args("10.1.0.0", false), None);
+        assert_eq!(
+            bsd_cidr_install_writes("10.1.0.0", false, "utun4", false),
+            [
+                argv(&["-n", "delete", "-inet", "-net", "10.1.0.0"]),
+                argv(&[
+                    "-n",
+                    "add",
+                    "-inet",
+                    "-net",
+                    "10.1.0.0",
+                    "-interface",
+                    "utun4"
+                ]),
+            ]
+        );
+    }
+
+    /// The macOS guard's write is install's `add` ALONE, never the delete,
+    /// and only when the three-way read found nothing holding the prefix.
+    /// Ours, a holder on another interface (a sibling org's utun, the host's
+    /// own LAN) and a lookup that could not run all write nothing: macOS
+    /// `route` exits 0 on a refused add, and the refused add still reaches the
+    /// route monitor as an `RTM_ADD` with errno 17, which would arm the next
+    /// wave, so an add over a holder would be retried on every wave.
+    #[test]
+    fn bsd_guard_adds_without_a_delete() {
+        for (cidr, v6) in [("10.1.0.0/16", false), ("fd00:1::/64", true)] {
+            let install = bsd_cidr_install_writes(cidr, v6, "utun7", false);
+            let guard = bsd_subnet_restore_writes(cidr, v6, "utun7", &UtunBlockHeld::Absent);
+            assert_eq!(guard, [install[1].clone()], "{cidr}");
+            for step in &guard {
+                for verb in ["delete", "change", "flush"] {
+                    assert!(!step.iter().any(|t| t == verb), "{cidr}: {step:?}");
+                }
+            }
+            for held in [
+                UtunBlockHeld::Ours,
+                UtunBlockHeld::Elsewhere("utun9".into()),
+                UtunBlockHeld::Elsewhere(String::new()),
+                UtunBlockHeld::Unread,
+            ] {
+                assert!(
+                    bsd_subnet_restore_writes(cidr, v6, "utun7", &held).is_empty(),
+                    "{cidr}: {held:?}"
+                );
+            }
+        }
+    }
+
+    /// The macOS guard reads a subnet as #4117 reads a utun's block: install's
+    /// exact lookup, its answer parsed and read three ways, then the write.
+    /// Answers as `route -n get` prints them for a `/24` subnet.
+    #[test]
+    fn bsd_guard_reads_the_subnet_three_ways() {
+        let prefix = bsd_subnet_prefix("10.249.49.0/24").unwrap();
+        let answer = |destination: &str, mask: &str, interface: &str| {
+            [
+                format!("   route to: {destination}"),
+                format!("destination: {destination}"),
+                format!("       mask: {mask}"),
+                format!("  interface: {interface}"),
+                "      flags: <UP,DONE,STATIC>".to_string(),
+            ]
+            .join("\n")
+        };
+        let read = |out: &str| utun_block_held(parse_bsd_route_get(out).as_ref(), prefix, "utun7");
+        // Ours: nothing to write.
+        let ours = read(&answer("10.249.49.0", "255.255.255.0", "utun7"));
+        assert_eq!(ours, UtunBlockHeld::Ours);
+        // A sibling org's utun holds exactly the prefix: it keeps it.
+        let sibling = read(&answer("10.249.49.0", "255.255.255.0", "utun9"));
+        assert_eq!(sibling, UtunBlockHeld::Elsewhere("utun9".into()));
+        // Deleted: `not in table`, or the default route that covers it.
+        let gone = read("route: writing to routing socket: not in table\n");
+        let covered = read(&answer("default", "default", "en0"));
+        assert_eq!(gone, UtunBlockHeld::Absent);
+        assert_eq!(covered, UtunBlockHeld::Absent);
+        let add = bsd_subnet_restore_writes("10.249.49.0/24", false, "utun7", &gone);
+        assert_eq!(
+            add,
+            [vec![
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                "10.249.49.0",
+                "-prefixlen",
+                "24",
+                "-interface",
+                "utun7",
+            ]]
+        );
+        for held in [&ours, &sibling] {
+            assert!(bsd_subnet_restore_writes("10.249.49.0/24", false, "utun7", held).is_empty());
+        }
+        // The lookup is install's own.
+        assert_eq!(
+            bsd_cidr_get_args("10.249.49.0/24", false).unwrap(),
+            [
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                "10.249.49.0",
+                "-prefixlen",
+                "24"
+            ]
+        );
+    }
+
+    /// A router peer's subnets are IPv4 (`router::Cidr`); the macOS read takes
+    /// nothing else.
+    #[test]
+    fn bsd_subnet_prefix_is_an_ipv4_prefix() {
+        let v4 = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
+        assert_eq!(
+            bsd_subnet_prefix("10.249.49.0/24"),
+            Some((v4("10.249.49.0"), 24))
+        );
+        assert_eq!(bsd_subnet_prefix("10.0.0.0/32"), Some((v4("10.0.0.0"), 32)));
+        for bad in ["fd00:1::/64", "10.0.0.0/33", "10.0.0.0", "10.0.0.0/", "x/8"] {
+            assert_eq!(bsd_subnet_prefix(bad), None, "{bad}");
+        }
+    }
+
+    /// What a macOS restore came to. Ours and a holder elsewhere are quiet
+    /// `Ok`s that wrote nothing; the holder's interface is named. An add with
+    /// no complaint restored the route. A refused add ("File exists": a holder
+    /// came between the read and the add) is held, not an error. A lookup
+    /// that could not run, and any other complaint, are failures.
+    #[test]
+    fn bsd_outcome_reads_the_lookup_and_the_complaint() {
+        use UtunBlockHeld::{Absent, Elsewhere, Ours, Unread};
+        assert_eq!(
+            bsd_subnet_outcome(&Ours, None).unwrap(),
+            SubnetRestore::Ours
+        );
+        assert_eq!(
+            bsd_subnet_outcome(&Elsewhere("utun9".into()), None).unwrap(),
+            SubnetRestore::Held("utun9".into())
+        );
+        assert_eq!(
+            bsd_subnet_outcome(&Absent, None).unwrap(),
+            SubnetRestore::Restored
+        );
+        assert_eq!(
+            bsd_subnet_outcome(
+                &Absent,
+                Some("route: writing to routing socket: File exists")
+            )
+            .unwrap(),
+            SubnetRestore::Held(String::new())
+        );
+        assert!(bsd_subnet_outcome(&Unread, None).is_err());
+        assert!(
+            bsd_subnet_outcome(
+                &Absent,
+                Some("route: writing to routing socket: Network is unreachable")
+            )
+            .is_err()
+        );
+    }
+
+    /// "File exists" (EEXIST) is the quiet HELD outcome: another route holds
+    /// the key. Not an error, never a WARN, and no table change, so nothing
+    /// that arms another wave. Anything else is a real failure.
+    #[test]
+    fn file_exists_is_held_not_an_error() {
+        let err = |s: &str| -> std::io::Result<()> { Err(std::io::Error::other(s.to_string())) };
+        assert_eq!(
+            subnet_restore_outcome(Ok(())).unwrap(),
+            SubnetRestore::Restored
+        );
+        assert_eq!(
+            subnet_restore_outcome(err(
+                "ip [\"route\", \"add\", \"10.1.0.0/16\", \"dev\", \"roomler0\"] exited exit \
+                 status: 2: RTNETLINK answers: File exists"
+            ))
+            .unwrap(),
+            SubnetRestore::Held(String::new())
+        );
+        assert_eq!(
+            subnet_restore_outcome(err(
+                "route [\"-n\", \"add\"] exited exit status: 1: route: writing to routing \
+                 socket: File exists\nadd net 10.1.0.0: gateway utun4: File exists"
+            ))
+            .unwrap(),
+            SubnetRestore::Held(String::new())
+        );
+        assert!(subnet_restore_outcome(err("Cannot find device \"roomler0\"")).is_err());
+        assert!(subnet_restore_outcome(err("RTNETLINK answers: Network is unreachable")).is_err());
+    }
+
+    /// A key another route holds is named ONCE, when that starts, never per
+    /// wave; each prefix on its own; ours again re-arms it.
+    #[test]
+    fn a_foreign_holder_is_named_once_per_change() {
+        let mut held = Vec::new();
+        assert!(note_subnet_holder(&mut held, "10.1.0.0/16", true));
+        assert!(!note_subnet_holder(&mut held, "10.1.0.0/16", true));
+        assert!(note_subnet_holder(&mut held, "10.2.0.0/16", true));
+        assert!(!note_subnet_holder(&mut held, "10.1.0.0/16", false));
+        assert!(!note_subnet_holder(&mut held, "10.1.0.0/16", false));
+        assert!(note_subnet_holder(&mut held, "10.1.0.0/16", true));
+        assert_eq!(held, ["10.2.0.0/16", "10.1.0.0/16"]);
     }
 }
 
@@ -3572,6 +4269,15 @@ mod system {
         /// Windows. Seeded with the bring-up's decision, which logged its own.
         #[cfg(target_os = "macos")]
         utun_block_state: std::sync::Mutex<Vec<((Ipv4Addr, u8), bool)>>,
+        /// #4279 — the subnet prefixes another route holds on this host right
+        /// now ([`super::note_subnet_holder`]), so the route guard names a
+        /// holder once instead of on every wave.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        subnet_held: std::sync::Mutex<Vec<String>>,
+        /// #4125 — the read path's hand-back of a packet for this utun's own
+        /// address, and its count ([`Self::self_delivered`]).
+        #[cfg(target_os = "macos")]
+        self_delivery: SelfDelivery,
         /// WFP hard-permit guard. Holds a dynamic WFP session whose `Drop`
         /// reaps the `roomler`-adapter permit filters, so it must live as
         /// long as the device. `None` when disabled
@@ -5464,6 +6170,11 @@ mod system {
 
             own_adapters::register(&if_name, tun_luid, connected_v4_block);
 
+            // #4125 — the address is fixed for the device's life, so it is
+            // read once, here, with the kill switch.
+            #[cfg(target_os = "macos")]
+            let self_delivery = SelfDelivery::at_bring_up(opts.ip, &if_name);
+
             Ok(Self {
                 dev,
                 if_name,
@@ -5480,6 +6191,10 @@ mod system {
                 utun_block: utun_block.map(|(block, _)| block),
                 #[cfg(target_os = "macos")]
                 utun_block_state: std::sync::Mutex::new(utun_block.into_iter().collect()),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                subnet_held: std::sync::Mutex::new(Vec::new()),
+                #[cfg(target_os = "macos")]
+                self_delivery,
                 #[cfg(windows)]
                 _wfp,
                 #[cfg(windows)]
@@ -5534,6 +6249,77 @@ mod system {
         }
     }
 
+    /// #4279 — what the route guard's subnet restore came to, on the two OSes
+    /// where it reads before it writes. Windows has `winroute`'s strikes.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl SystemTun {
+        /// Our route for `cidr` is in place: a holder named earlier is gone.
+        fn subnet_is_ours(&self, cidr: &str) {
+            let mut held = self.subnet_held.lock().unwrap_or_else(|e| e.into_inner());
+            super::note_subnet_holder(&mut held, cidr, false);
+        }
+
+        /// Ours, restored and held are all `Ok`, and quiet: a restore is a
+        /// debug line (a VPN that deletes the route on every wave would make
+        /// an INFO one a flood), and a holder is named once, when it starts.
+        fn subnet_restored(
+            &self,
+            cidr: &str,
+            outcome: std::io::Result<super::SubnetRestore>,
+        ) -> std::io::Result<()> {
+            match outcome {
+                Ok(super::SubnetRestore::Ours) => {
+                    self.subnet_is_ours(cidr);
+                    Ok(())
+                }
+                Ok(super::SubnetRestore::Restored) => {
+                    self.subnet_is_ours(cidr);
+                    tracing::debug!(
+                        %cidr, dev = %self.if_name,
+                        "overlay: route guard restored a missing subnet route"
+                    );
+                    Ok(())
+                }
+                Ok(super::SubnetRestore::Held(on)) => {
+                    let named = {
+                        let mut held = self.subnet_held.lock().unwrap_or_else(|e| e.into_inner());
+                        super::note_subnet_holder(&mut held, cidr, true)
+                    };
+                    if named {
+                        say_subnet_held(cidr, &self.if_name, &on);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        %cidr, dev = %self.if_name, %e,
+                        "overlay: route guard could not restore a subnet route"
+                    );
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// #4279 — the INFO that names another route holding a subnet's prefix,
+    /// said once per hold ([`super::note_subnet_holder`]). `on` is the
+    /// interface that holds it, empty when the OS did not say. #4380 — on the
+    /// route guard's own target ([`crate::overlay::ROUTE_GUARD_LOG`]), which
+    /// the daemon keeps at INFO under every `RUST_LOG`, the packaged Linux
+    /// units' included.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn say_subnet_held(cidr: &str, dev: &str, on: &str) {
+        let holder = if on.is_empty() { "unnamed" } else { on };
+        tracing::info!(
+            target: crate::overlay::ROUTE_GUARD_LOG,
+            %cidr, %dev, %holder,
+            "overlay: another route holds this subnet's prefix (a sibling \
+             org's adapter, another product or the host's own LAN). The \
+             route guard leaves it, and puts ours back only once the prefix \
+             is free; the router peer's next carrier install takes it back."
+        );
+    }
+
     #[async_trait]
     impl TunIo for SystemTun {
         async fn read_packet(&self) -> std::io::Result<Vec<u8>> {
@@ -5545,6 +6331,10 @@ mod system {
                 .recv(&mut buf)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+            // #4125 — a packet for the utun's own address goes back to the
+            // kernel, and the read goes on to the next packet.
+            #[cfg(target_os = "macos")]
+            let n = self.past_own_packets(&mut buf, n).await?;
             buf.truncate(n);
             Ok(buf)
         }
@@ -5810,72 +6600,82 @@ mod system {
             }
             #[cfg(target_os = "linux")]
             {
-                let mut args: Vec<String> = Vec::new();
-                if v6 {
-                    args.push("-6".into());
-                }
-                args.extend([
-                    "route".into(),
-                    "replace".into(),
-                    cidr.to_string(),
-                    "dev".into(),
-                    self.if_name.clone(),
-                ]);
-                run_cmd("ip", args).await
+                run_cmd(
+                    "ip",
+                    super::linux_cidr_install_args(cidr, v6, &self.if_name),
+                )
+                .await
             }
             #[cfg(target_os = "macos")]
             {
                 // BSD `route` wants `-net <prefix> -prefixlen <n>`; the
                 // family flag picks v4 vs v6. Delete-then-add for the same
                 // reason as the peer `/32`s: `add` is not idempotent.
-                let (net, plen) = cidr.split_once('/').unwrap_or((cidr, ""));
-                let family = if v6 { "-inet6" } else { "-inet" };
                 // #1856 — and skipped for the same reason as the peer `/32`s:
                 // the exit `/1`s are re-asserted on every wave, and a hole in
                 // them sends that instant's egress out the physical uplink.
-                if let (Ok(dest), Ok(len)) = (net.parse::<std::net::IpAddr>(), plen.parse::<u8>()) {
-                    let got = bsd_route_get(vec![
-                        "-n".into(),
-                        "get".into(),
-                        family.into(),
-                        "-net".into(),
-                        net.into(),
-                        "-prefixlen".into(),
-                        plen.into(),
-                    ])
-                    .await;
-                    if super::bsd_route_is_ours(got.as_ref(), dest, len, &self.if_name) {
-                        return Ok(());
-                    }
+                let ours = bsd_cidr_is_ours(cidr, v6, &self.if_name).await;
+                // Only the add's answer counts: the delete finds nothing on
+                // the first install.
+                let mut answer = Ok(());
+                for step in super::bsd_cidr_install_writes(cidr, v6, &self.if_name, ours) {
+                    answer = run_cmd("route", step).await;
                 }
-                let mut del: Vec<String> = vec![
-                    "-n".into(),
-                    "delete".into(),
-                    family.into(),
-                    "-net".into(),
-                    net.into(),
-                ];
-                let mut add: Vec<String> = vec![
-                    "-n".into(),
-                    "add".into(),
-                    family.into(),
-                    "-net".into(),
-                    net.into(),
-                ];
-                if !plen.is_empty() {
-                    for v in [&mut del, &mut add] {
-                        v.push("-prefixlen".into());
-                        v.push(plen.into());
-                    }
-                }
-                add.push("-interface".into());
-                add.push(self.if_name.clone());
-                let _ = run_cmd("route", del).await;
-                run_cmd("route", add).await
+                answer
             }
             #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
             {
                 let _ = (cidr, v6);
+                Ok(())
+            }
+        }
+
+        /// #4279 — see [`TunIo::defend_subnet_route`]: ours back when it is
+        /// missing, and never a route that holds the prefix displaced.
+        async fn defend_subnet_route(&self, cidr: &str) -> std::io::Result<()> {
+            #[cfg(target_os = "windows")]
+            {
+                // `ensure` reads and writes exactly the row `add_cidr_route`
+                // makes (this LUID, on-link, metric 1) and never another
+                // interface's, so a route that is ours costs one in-memory
+                // `Get` and no write, and the #1328 stand-down bounds a VPN
+                // that keeps deleting it.
+                let (addr, plen) = parse_cidr(cidr).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad cidr")
+                })?;
+                winroute::ensure(self.dev.tun_luid(), addr, plen, 1)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let v6 = is_v6_cidr(cidr);
+                let listed =
+                    linux_route_shown(super::linux_subnet_show_args(cidr, v6, &self.if_name)).await;
+                let writes = super::linux_subnet_restore_writes(cidr, v6, &self.if_name, listed);
+                if writes.is_empty() {
+                    return self.subnet_restored(cidr, Ok(super::SubnetRestore::Ours));
+                }
+                let mut answer = Ok(());
+                for step in writes {
+                    answer = run_cmd("ip", step).await;
+                }
+                self.subnet_restored(cidr, super::subnet_restore_outcome(answer))
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let (subnet, if_name) = (cidr.to_string(), self.if_name.clone());
+                let outcome =
+                    tokio::task::spawn_blocking(move || bsd_subnet_restore(&subnet, &if_name))
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                        .and_then(|read| read)
+                        .and_then(|(held, complaint)| {
+                            super::bsd_subnet_outcome(&held, complaint.as_deref())
+                        });
+                self.subnet_restored(cidr, outcome)
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+            {
+                let _ = cidr;
                 Ok(())
             }
         }
@@ -7273,6 +8073,41 @@ mod system {
         super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout))
     }
 
+    /// macOS — is the route for `cidr` ours? Install's exact lookup
+    /// ([`super::bsd_cidr_get_args`]) read with [`super::bsd_route_is_ours`].
+    /// `false` when it cannot tell, which install reads as "write", as it
+    /// always did. The route guard reads three ways instead
+    /// ([`bsd_subnet_restore`]).
+    #[cfg(target_os = "macos")]
+    async fn bsd_cidr_is_ours(cidr: &str, v6: bool, if_name: &str) -> bool {
+        let (net, plen) = super::bsd_cidr_parts(cidr);
+        let (Ok(dest), Ok(len), Some(get)) = (
+            net.parse::<std::net::IpAddr>(),
+            plen.parse::<u8>(),
+            super::bsd_cidr_get_args(cidr, v6),
+        ) else {
+            return false;
+        };
+        super::bsd_route_is_ours(bsd_route_get(get).await.as_ref(), dest, len, if_name)
+    }
+
+    /// #4279 — run the route guard's `ip … route show exact <cidr> dev <if>`
+    /// and say whether it listed a route ([`super::linux_route_listed`]).
+    /// `None` when `ip` did not answer, which the guard reads as "try the
+    /// add": the add cannot displace anything.
+    #[cfg(target_os = "linux")]
+    async fn linux_route_shown(args: Vec<String>) -> Option<bool> {
+        tokio::task::spawn_blocking(move || {
+            let out = std::process::Command::new("ip").args(&args).output().ok()?;
+            out.status
+                .success()
+                .then(|| super::linux_route_listed(&String::from_utf8_lossy(&out.stdout)))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// FR-97 P1a — the routing table of one family, from `netstat -rnW`: where
     /// a pin is read (see [`super::BsdTableRow`]). Empty on any failure, which
     /// reads as "no pin" and so fails toward withhold.
@@ -7379,6 +8214,156 @@ mod system {
         crate::env::flag("OVERLAY_UTUN_BLOCK_ROUTE", true)
     }
 
+    /// #4125 — `ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0` stops the read path's
+    /// hand-back ([`SystemTun::past_own_packets`]): a packet the Mac sends to
+    /// its own overlay address is then read like any other, as with #4117
+    /// alone. Read once, at the bring-up. Default ON. With
+    /// `ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0` the hand-back never fires
+    /// either way: in that shape such a packet never enters the utun.
+    #[cfg(target_os = "macos")]
+    fn utun_self_delivery_enabled() -> bool {
+        crate::env::flag("OVERLAY_UTUN_SELF_DELIVERY", true)
+    }
+
+    /// #4125 — the shortest gap between two DEBUG lines for a failed
+    /// hand-back.
+    #[cfg(target_os = "macos")]
+    const SELF_DELIVERY_FAILED_LOG_MS: u64 = 60_000;
+
+    /// #4125 — a utun is point-to-point, and macOS adds no local route for a
+    /// utun's own address: with #4117's shape the address's host route is on
+    /// the utun, so a packet the Mac sends to its own overlay address goes
+    /// into the utun, and no peer holds that address. Linux and Windows
+    /// deliver such a packet through their kernel's local route, and the
+    /// daemon never sees it. Here the read path hands it back to the kernel
+    /// ([`SystemTun::past_own_packets`]), which delivers it as inbound.
+    #[cfg(target_os = "macos")]
+    struct SelfDelivery {
+        /// The utun's address, fixed for its life (a runtime whose netmap
+        /// names another one exits for a rebuild, and a device is reused
+        /// only for the same address). `None` with the kill switch off.
+        own: Option<Ipv4Addr>,
+        /// Packets handed back.
+        handed_back: std::sync::atomic::AtomicU64,
+        /// Packets whose write back failed, each dropped.
+        failed: std::sync::atomic::AtomicU64,
+        /// When a failed write last logged: ms after `since`, plus 1, so 0
+        /// is "never" and the first failure always logs.
+        failed_logged_at: std::sync::atomic::AtomicU64,
+        since: std::time::Instant,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl SelfDelivery {
+        /// The hand-back for a utun brought up with `ip`, unless the kill
+        /// switch is off, which one INFO says.
+        fn at_bring_up(ip: Ipv4Addr, if_name: &str) -> Self {
+            let on = utun_self_delivery_enabled();
+            if !on {
+                tracing::info!(
+                    utun = %if_name, addr = %ip,
+                    "overlay: packets to this node's own overlay address are not handed back to \
+                     the OS (ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0)"
+                );
+            }
+            Self {
+                own: on.then_some(ip),
+                handed_back: std::sync::atomic::AtomicU64::new(0),
+                failed: std::sync::atomic::AtomicU64::new(0),
+                failed_logged_at: std::sync::atomic::AtomicU64::new(0),
+                since: std::time::Instant::now(),
+            }
+        }
+
+        /// One more packet handed back. The first logs ONE INFO; the rest
+        /// are only counted.
+        fn note_handed_back(&self, if_name: &str) {
+            if self
+                .handed_back
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0
+                && let Some(own) = self.own
+            {
+                tracing::info!(
+                    utun = %if_name, addr = %own,
+                    "overlay: a packet to this node's own overlay address was handed back to \
+                     the OS; the next ones are counted, not logged"
+                );
+            }
+        }
+
+        /// A write back failed and its packet is dropped: counted, and a
+        /// DEBUG line at most once a [`SELF_DELIVERY_FAILED_LOG_MS`], with a
+        /// compare-and-swap so two readers never both log (as `wg.rs` throttles
+        /// its reverse-path line).
+        fn note_failed(&self, if_name: &str, e: &std::io::Error) {
+            use std::sync::atomic::Ordering::Relaxed;
+            let failed = self.failed.fetch_add(1, Relaxed) + 1;
+            let now = self.since.elapsed().as_millis() as u64 + 1;
+            let last = self.failed_logged_at.load(Relaxed);
+            if (last == 0 || now.saturating_sub(last) >= SELF_DELIVERY_FAILED_LOG_MS)
+                && self
+                    .failed_logged_at
+                    .compare_exchange(last, now, Relaxed, Relaxed)
+                    .is_ok()
+            {
+                tracing::debug!(
+                    utun = %if_name, error = %e, failed,
+                    "overlay: a packet to this node's own overlay address could not be handed \
+                     back to the OS; dropped"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl SystemTun {
+        /// #4125 — while the packet in `buf[..n]` is for this utun's own
+        /// address ([`super::utun_hands_back`]), write it back into the utun,
+        /// and read the next packet into `buf`. No TTL or hop-limit change:
+        /// the one change is an IPv6 TCP or UDP checksum, which is finished
+        /// first ([`super::finish_v6_transport_checksum`]). Returns the
+        /// length of the first packet that is not, which
+        /// [`TunIo::read_packet`] returns as before: a handed-back packet
+        /// never reaches the outbound path.
+        ///
+        /// The write is the device's own, the one under
+        /// [`TunIo::write_packet`], without the wait for writability that
+        /// `AsyncDevice::send` adds: the descriptor is non-blocking, so a
+        /// write the kernel does not take at once fails here. A failed write
+        /// drops its packet ([`SelfDelivery::note_failed`]), and nothing is
+        /// written twice: a hand-back never holds up the read.
+        async fn past_own_packets(&self, buf: &mut [u8], mut n: usize) -> std::io::Result<usize> {
+            let sd = &self.self_delivery;
+            while super::utun_hands_back(&buf[..n], sd.own) {
+                // An IPv6 TCP or UDP checksum macOS left for the device to
+                // finish is finished here, or the kernel drops the packet.
+                super::finish_v6_transport_checksum(&mut buf[..n]);
+                let device: &tun::Device = &self.dev;
+                match device.send(&buf[..n]) {
+                    Ok(_) => sd.note_handed_back(&self.if_name),
+                    Err(e) => sd.note_failed(&self.if_name, &e),
+                }
+                n = self
+                    .dev
+                    .recv(buf)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            Ok(n)
+        }
+
+        /// #4125 — how many packets this utun's read path has handed back to
+        /// the OS, each a packet for the utun's own address. A count, as
+        /// `SplitTun::intercepted` is, that a test or a diagnostic reads; only
+        /// the first hand-back logs a line.
+        pub fn self_delivered(&self) -> u64 {
+            self.self_delivery
+                .handed_back
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
     /// #4117 — the gate's address input ([`super::bsd_non_overlay_v4`]) as
     /// the interfaces show it right now. Ours are `overlay_if` and the names
     /// in `own_adapters`, where `up_with` registers each utun by the name the
@@ -7477,6 +8462,44 @@ mod system {
             step,
             complaint,
         }
+    }
+
+    /// #4279 — the route guard's restore of one subnet route on a Mac:
+    /// install's exact lookup ([`super::bsd_cidr_get_args`]) read three ways,
+    /// as #4117 reads a utun's block ([`super::utun_block_held`]), then at
+    /// most install's `add`, and only when nothing holds the prefix
+    /// ([`super::bsd_subnet_restore_writes`]). Returns the read and what
+    /// `route` complained about when it made the add, if anything: `route`
+    /// exits 0 when the kernel refuses a write, so a complaint is read from
+    /// stderr ([`run_bringup`]). The lookup and the add are separate `route`
+    /// runs, so it blocks: the wave runs it on the blocking pool.
+    #[cfg(target_os = "macos")]
+    fn bsd_subnet_restore(
+        cidr: &str,
+        if_name: &str,
+    ) -> std::io::Result<(super::UtunBlockHeld, Option<String>)> {
+        let (Some(prefix), Some(get)) = (
+            super::bsd_subnet_prefix(cidr),
+            super::bsd_cidr_get_args(cidr, false),
+        ) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("not an IPv4 subnet: {cidr}"),
+            ));
+        };
+        let held = match std::process::Command::new("route").args(&get).output() {
+            Ok(out) => super::utun_block_held(
+                super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout)).as_ref(),
+                prefix,
+                if_name,
+            ),
+            Err(_) => super::UtunBlockHeld::Unread,
+        };
+        let mut complaint = None;
+        for step in super::bsd_subnet_restore_writes(cidr, false, if_name, &held) {
+            complaint = run_bringup("route", &step).1;
+        }
+        Ok((held, complaint))
     }
 
     /// One command of the macOS bring-up or of a block decision: what it
@@ -8365,6 +9388,571 @@ mod system {
         }
     }
 }
+
+/// #4125 — whether a utun's read path hands `packet` back to the OS: its
+/// destination, as
+/// [`Router::dst_of_ip_packet`](crate::overlay::router::Router::dst_of_ip_packet)
+/// reads it (an IPv4 destination, or the IPv4 a derived overlay IPv6
+/// carries), is the utun's own address `own`. `None` is the kill switch off:
+/// then nothing is. One comparison, no allocation, no lock.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn utun_hands_back(packet: &[u8], own: Option<std::net::Ipv4Addr>) -> bool {
+    own.is_some_and(|own| crate::overlay::router::Router::dst_of_ip_packet(packet) == Some(own))
+}
+
+/// #4125 — finish, in place, the TCP or UDP checksum of an IPv6 packet the
+/// utun's read path hands back ([`utun_hands_back`]). On a packet to the
+/// node's own derived IPv6, macOS leaves that checksum for the network
+/// device to finish (the field holds the pseudo-header's sum alone), a utun
+/// finishes nothing, and the kernel drops the packet when it comes back in.
+/// One rule, with no test for "unfinished", because a complete checksum
+/// computes to itself:
+///
+/// * an IPv6 packet whose Next Header, right after the fixed header, is TCP
+///   (6) or UDP (17);
+/// * whose payload length is the rest of `packet` and holds the TCP or UDP
+///   header, and, for UDP, equals the UDP length field;
+/// * gets its checksum computed again, in full, over the pseudo-header
+///   (source, destination, upper-layer length, next header) and the whole
+///   segment with the field zeroed. A UDP checksum of 0 is written as
+///   `0xffff` (RFC 8200 §8.1); a TCP one stays 0.
+///
+/// Anything else, IPv4 included, is left as it came. No allocation.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn finish_v6_transport_checksum(packet: &mut [u8]) {
+    /// The fixed IPv6 header.
+    const FIXED: usize = 40;
+    /// `bytes` as 16-bit big-endian words, an odd last byte padded with a
+    /// zero, added to `sum` and not folded. A payload length is 16 bits, so
+    /// a packet this rule takes has at most 32 Ki words: a `u32` holds them.
+    fn add_words(bytes: &[u8], mut sum: u32) -> u32 {
+        let mut words = bytes.chunks_exact(2);
+        for w in &mut words {
+            sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+        }
+        if let [last] = words.remainder() {
+            sum += u32::from(*last) << 8;
+        }
+        sum
+    }
+
+    if packet.len() < FIXED || packet[0] >> 4 != 6 {
+        return;
+    }
+    let plen = u16::from_be_bytes([packet[4], packet[5]]);
+    if FIXED + usize::from(plen) != packet.len() {
+        return;
+    }
+    let next = packet[6];
+    let field = match next {
+        6 if plen >= 20 => FIXED + 16,
+        17 if plen >= 8 && u16::from_be_bytes([packet[FIXED + 4], packet[FIXED + 5]]) == plen => {
+            FIXED + 6
+        }
+        _ => return,
+    };
+    packet[field] = 0;
+    packet[field + 1] = 0;
+    // The pseudo-header: the source and destination addresses, then the
+    // upper-layer length and the next header, each in a 32-bit word.
+    let pseudo = add_words(&packet[8..FIXED], u32::from(plen) + u32::from(next));
+    let mut sum = add_words(&packet[FIXED..], pseudo);
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let checksum = match !(sum as u16) {
+        0 if next == 17 => 0xffff,
+        c => c,
+    };
+    packet[field..field + 2].copy_from_slice(&checksum.to_be_bytes());
+}
+
+#[cfg(test)]
+mod utun_self_delivery_tests {
+    use super::utun_hands_back;
+    use crate::overlay::router::derive_overlay_v6;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const OWN: Ipv4Addr = Ipv4Addr::new(100, 65, 0, 5);
+    const PEER: Ipv4Addr = Ipv4Addr::new(100, 65, 0, 9);
+
+    /// A UDP packet from `src` to `dst`, with a full IPv4 header.
+    fn v4(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let mut p = vec![0u8; 28];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&28u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p
+    }
+
+    /// A UDP packet from `src` to `dst`, with a full IPv6 header.
+    fn v6(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
+        let mut p = vec![0u8; 48];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&8u16.to_be_bytes());
+        p[6] = 17;
+        p[7] = 64;
+        p[8..24].copy_from_slice(&src.octets());
+        p[24..40].copy_from_slice(&dst.octets());
+        p
+    }
+
+    #[test]
+    fn a_packet_to_its_own_v4_is_handed_back_whatever_its_source() {
+        for src in [OWN, PEER, Ipv4Addr::new(192, 168, 1, 10)] {
+            assert!(utun_hands_back(&v4(src, OWN), Some(OWN)), "from {src}");
+        }
+    }
+
+    #[test]
+    fn a_packet_to_a_peer_the_block_or_the_internet_is_not() {
+        for dst in [
+            PEER,
+            Ipv4Addr::new(100, 65, 0, 4),
+            Ipv4Addr::new(100, 65, 0, 6),
+            Ipv4Addr::new(100, 65, 0, 0),
+            Ipv4Addr::new(100, 65, 3, 255),
+            Ipv4Addr::new(100, 64, 0, 5),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(224, 0, 0, 251),
+            Ipv4Addr::new(255, 255, 255, 255),
+        ] {
+            assert!(!utun_hands_back(&v4(OWN, dst), Some(OWN)), "to {dst}");
+        }
+    }
+
+    #[test]
+    fn a_packet_to_its_own_derived_v6_is_handed_back() {
+        let own6 = derive_overlay_v6(OWN);
+        for src in [own6, derive_overlay_v6(PEER)] {
+            assert!(utun_hands_back(&v6(src, own6), Some(OWN)), "from {src}");
+        }
+    }
+
+    #[test]
+    fn a_packet_to_any_other_v6_is_not() {
+        let own6 = derive_overlay_v6(OWN);
+        // The same low 32 bits under another prefix.
+        let mut s = own6.segments();
+        s[2] ^= 1;
+        let beside = Ipv6Addr::from(s);
+        for dst in [
+            derive_overlay_v6(PEER),
+            beside,
+            "fd00::6441:5".parse().unwrap(),
+            "fe80::6441:5".parse().unwrap(),
+            "ff02::1".parse().unwrap(),
+            "ff02::fb".parse().unwrap(),
+            "2001:db8::6441:5".parse().unwrap(),
+            Ipv6Addr::LOCALHOST,
+            OWN.to_ipv6_mapped(),
+        ] {
+            assert!(!utun_hands_back(&v6(own6, dst), Some(OWN)), "to {dst}");
+        }
+    }
+
+    #[test]
+    fn a_packet_shorter_than_its_header_is_not() {
+        let p4 = v4(OWN, OWN);
+        for len in 0..20 {
+            assert!(!utun_hands_back(&p4[..len], Some(OWN)), "IPv4, {len} bytes");
+        }
+        let own6 = derive_overlay_v6(OWN);
+        let p6 = v6(own6, own6);
+        for len in 0..40 {
+            assert!(!utun_hands_back(&p6[..len], Some(OWN)), "IPv6, {len} bytes");
+        }
+    }
+
+    #[test]
+    fn a_packet_of_another_version_is_not() {
+        let mut p = v4(OWN, OWN);
+        for version in [0u8, 5, 7, 15] {
+            p[0] = (version << 4) | 5;
+            assert!(!utun_hands_back(&p, Some(OWN)), "version {version}");
+        }
+    }
+
+    #[test]
+    fn with_the_kill_switch_off_nothing_is() {
+        let own6 = derive_overlay_v6(OWN);
+        assert!(!utun_hands_back(&v4(OWN, OWN), None));
+        assert!(!utun_hands_back(&v6(own6, own6), None));
+    }
+}
+
+#[cfg(test)]
+mod v6_transport_checksum_tests {
+    //! #4125 — the hand-back's checksum rule for a packet to the node's own
+    //! derived IPv6, against checksums computed here another way: the
+    //! pseudo-header written out in full and every 16-bit word summed in 64
+    //! bits.
+    use crate::overlay::router::derive_overlay_v6;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const OWN: Ipv4Addr = Ipv4Addr::new(100, 65, 0, 5);
+    const PEER: Ipv4Addr = Ipv4Addr::new(100, 65, 0, 9);
+    const UDP: u8 = 17;
+    const TCP: u8 = 6;
+    /// Where each checksum field sits in its segment.
+    const UDP_FIELD: usize = 6;
+    const TCP_FIELD: usize = 16;
+
+    /// The rule under test: the hand-back's own function.
+    fn finish(packet: &mut [u8]) {
+        super::finish_v6_transport_checksum(packet)
+    }
+
+    /// The 16-bit ones'-complement sum of `bytes`, padded with a zero to an
+    /// even length, summed in 64 bits and folded.
+    fn sum64(bytes: &[u8]) -> u16 {
+        let mut sum: u64 = bytes
+            .chunks(2)
+            .map(|w| (u64::from(w[0]) << 8) | u64::from(w.get(1).copied().unwrap_or(0)))
+            .sum();
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    /// The IPv6 pseudo-header, written out: source, destination, the
+    /// upper-layer length in 32 bits, three zero bytes and the next header.
+    fn pseudo(src: Ipv6Addr, dst: Ipv6Addr, len: usize, next: u8) -> Vec<u8> {
+        let mut p = Vec::with_capacity(40);
+        p.extend_from_slice(&src.octets());
+        p.extend_from_slice(&dst.octets());
+        p.extend_from_slice(&(len as u32).to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, next]);
+        p
+    }
+
+    /// The checksum `segment` should carry, its field (at `field`) taken
+    /// as zero: the complement of the sum over the pseudo-header and the
+    /// segment. A UDP 0 is `0xffff` (RFC 8200 §8.1).
+    fn reference(src: Ipv6Addr, dst: Ipv6Addr, next: u8, segment: &[u8], field: usize) -> u16 {
+        let mut bytes = pseudo(src, dst, segment.len(), next);
+        let at = bytes.len();
+        bytes.extend_from_slice(segment);
+        bytes[at + field] = 0;
+        bytes[at + field + 1] = 0;
+        match !sum64(&bytes) {
+            0 if next == UDP => 0xffff,
+            c => c,
+        }
+    }
+
+    /// What macOS leaves in the field for the device to finish: the
+    /// pseudo-header's sum alone.
+    fn unfinished(src: Ipv6Addr, dst: Ipv6Addr, next: u8, segment: &[u8]) -> u16 {
+        sum64(&pseudo(src, dst, segment.len(), next))
+    }
+
+    /// Whether an IPv6 packet's TCP or UDP checksum is valid: the sum over
+    /// the pseudo-header and the whole segment, its field included, is
+    /// `0xffff`.
+    fn valid(packet: &[u8]) -> bool {
+        let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap());
+        let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap());
+        let mut bytes = pseudo(src, dst, packet.len() - 40, packet[6]);
+        bytes.extend_from_slice(&packet[40..]);
+        sum64(&bytes) == 0xffff
+    }
+
+    /// An IPv6 packet from `src` to `dst` whose Next Header is `next`.
+    fn v6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0];
+        p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        p.extend_from_slice(&[next, 64]);
+        p.extend_from_slice(&src.octets());
+        p.extend_from_slice(&dst.octets());
+        p.extend_from_slice(payload);
+        p
+    }
+
+    /// An IPv4 packet from `src` to `dst` whose protocol is `proto`.
+    fn v4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x45, 0];
+        p.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0x40, 0, 64, proto, 0, 0]);
+        p.extend_from_slice(&src.octets());
+        p.extend_from_slice(&dst.octets());
+        p.extend_from_slice(payload);
+        p
+    }
+
+    /// A UDP header from port 53000 to 53 and `payload`, its checksum field
+    /// holding `field`.
+    fn udp(payload: &[u8], field: u16) -> Vec<u8> {
+        let mut s = Vec::with_capacity(8 + payload.len());
+        s.extend_from_slice(&53000u16.to_be_bytes());
+        s.extend_from_slice(&53u16.to_be_bytes());
+        s.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        s.extend_from_slice(&field.to_be_bytes());
+        s.extend_from_slice(payload);
+        s
+    }
+
+    /// A 20-byte TCP header (PSH and ACK, from port 53000 to 8080) and
+    /// `payload`, its checksum field holding `field`.
+    fn tcp(payload: &[u8], field: u16) -> Vec<u8> {
+        let mut s = vec![0u8; 20];
+        s[0..2].copy_from_slice(&53000u16.to_be_bytes());
+        s[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        s[4..8].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        s[8..12].copy_from_slice(&0x0a0b_0c0du32.to_be_bytes());
+        s[12] = 5 << 4;
+        s[13] = 0x18;
+        s[14..16].copy_from_slice(&0xffffu16.to_be_bytes());
+        s[16..18].copy_from_slice(&field.to_be_bytes());
+        s.extend_from_slice(payload);
+        s
+    }
+
+    /// The checksum field of an IPv6 packet's segment.
+    fn field_of(packet: &[u8], field: usize) -> u16 {
+        u16::from_be_bytes([packet[40 + field], packet[41 + field]])
+    }
+
+    /// `packet` after the rule, asserting that no byte outside the checksum
+    /// field changed.
+    fn finished(packet: &[u8], field: usize) -> Vec<u8> {
+        let mut p = packet.to_vec();
+        finish(&mut p);
+        assert_eq!(p.len(), packet.len());
+        let f = 40 + field;
+        assert_eq!(p[..f], packet[..f], "a byte before the field changed");
+        assert_eq!(
+            p[f + 2..],
+            packet[f + 2..],
+            "a byte after the field changed"
+        );
+        p
+    }
+
+    /// Payloads of an even and an odd length, empty and up to the overlay's
+    /// MTU.
+    fn payloads() -> Vec<Vec<u8>> {
+        [0usize, 1, 5, 6, 512, 1232 - 20]
+            .iter()
+            .map(|&n| (0..n).map(|i| (i * 7 + 3) as u8).collect())
+            .collect()
+    }
+
+    #[test]
+    fn udp_with_the_pseudo_header_sum_alone_is_finished() {
+        let own6 = derive_overlay_v6(OWN);
+        for (src, dst) in [(own6, own6), (derive_overlay_v6(PEER), own6)] {
+            for payload in payloads() {
+                let mut seg = udp(&payload, 0);
+                let left = unfinished(src, dst, UDP, &seg);
+                seg[UDP_FIELD..UDP_FIELD + 2].copy_from_slice(&left.to_be_bytes());
+                let p = finished(&v6(src, dst, UDP, &seg), UDP_FIELD);
+                let want = reference(src, dst, UDP, &seg, UDP_FIELD);
+                assert_eq!(
+                    field_of(&p, UDP_FIELD),
+                    want,
+                    "{} bytes from {src}: field {left:#06x} not finished",
+                    payload.len()
+                );
+                assert!(valid(&p), "{} bytes from {src}", payload.len());
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_with_the_pseudo_header_sum_alone_is_finished() {
+        let own6 = derive_overlay_v6(OWN);
+        for (src, dst) in [(own6, own6), (derive_overlay_v6(PEER), own6)] {
+            for payload in payloads() {
+                let mut seg = tcp(&payload, 0);
+                let left = unfinished(src, dst, TCP, &seg);
+                seg[TCP_FIELD..TCP_FIELD + 2].copy_from_slice(&left.to_be_bytes());
+                let p = finished(&v6(src, dst, TCP, &seg), TCP_FIELD);
+                let want = reference(src, dst, TCP, &seg, TCP_FIELD);
+                assert_eq!(
+                    field_of(&p, TCP_FIELD),
+                    want,
+                    "{} bytes from {src}: field {left:#06x} not finished",
+                    payload.len()
+                );
+                assert!(valid(&p), "{} bytes from {src}", payload.len());
+            }
+        }
+    }
+
+    #[test]
+    fn any_other_value_in_the_field_is_computed_over_too() {
+        let own6 = derive_overlay_v6(OWN);
+        for value in [0x0000, 0x1234, 0xffff] {
+            let seg = udp(b"query", value);
+            let p = finished(&v6(own6, own6, UDP, &seg), UDP_FIELD);
+            assert!(valid(&p), "UDP, field {value:#06x}");
+            let seg = tcp(b"query", value);
+            let p = finished(&v6(own6, own6, TCP, &seg), TCP_FIELD);
+            assert!(valid(&p), "TCP, field {value:#06x}");
+        }
+    }
+
+    #[test]
+    fn a_complete_checksum_is_left_byte_for_byte() {
+        let own6 = derive_overlay_v6(OWN);
+        for payload in payloads() {
+            let mut seg = udp(&payload, 0);
+            let sum = reference(own6, own6, UDP, &seg, UDP_FIELD);
+            seg[UDP_FIELD..UDP_FIELD + 2].copy_from_slice(&sum.to_be_bytes());
+            let p = v6(own6, own6, UDP, &seg);
+            assert!(valid(&p));
+            let mut again = p.clone();
+            finish(&mut again);
+            assert_eq!(again, p, "UDP, {} bytes", payload.len());
+
+            let mut seg = tcp(&payload, 0);
+            let sum = reference(own6, own6, TCP, &seg, TCP_FIELD);
+            seg[TCP_FIELD..TCP_FIELD + 2].copy_from_slice(&sum.to_be_bytes());
+            let p = v6(own6, own6, TCP, &seg);
+            assert!(valid(&p));
+            let mut again = p.clone();
+            finish(&mut again);
+            assert_eq!(again, p, "TCP, {} bytes", payload.len());
+        }
+    }
+
+    /// A packet whose checksum comes out 0, the field holding what macOS
+    /// leaves in it: the segment's last two payload bytes (a whole 16-bit
+    /// word) are set so that the sum over the pseudo-header and the segment
+    /// is `0xffff`.
+    fn summing_to_zero(next: u8, field: usize) -> Vec<u8> {
+        let own6 = derive_overlay_v6(OWN);
+        let mut seg = if next == UDP {
+            udp(b"query\0\0\0", 0)
+        } else {
+            tcp(b"query\0\0\0", 0)
+        };
+        let n = seg.len();
+        let mut bytes = pseudo(own6, own6, n, next);
+        bytes.extend_from_slice(&seg);
+        let fill = !sum64(&bytes);
+        seg[n - 2..].copy_from_slice(&fill.to_be_bytes());
+        let mut bytes = pseudo(own6, own6, n, next);
+        bytes.extend_from_slice(&seg);
+        assert_eq!(!sum64(&bytes), 0, "the segment's checksum comes out 0");
+        let left = unfinished(own6, own6, next, &seg);
+        seg[field..field + 2].copy_from_slice(&left.to_be_bytes());
+        v6(own6, own6, next, &seg)
+    }
+
+    #[test]
+    fn a_udp_checksum_of_zero_is_written_as_ffff_and_a_tcp_one_stays_zero() {
+        let p = finished(&summing_to_zero(UDP, UDP_FIELD), UDP_FIELD);
+        assert_eq!(
+            field_of(&p, UDP_FIELD),
+            0xffff,
+            "UDP over IPv6 never carries 0"
+        );
+        assert!(valid(&p));
+        let p = finished(&summing_to_zero(TCP, TCP_FIELD), TCP_FIELD);
+        assert_eq!(field_of(&p, TCP_FIELD), 0x0000, "TCP keeps its computed 0");
+        assert!(valid(&p));
+    }
+
+    /// `packet` is left exactly as it came.
+    fn left_alone(packet: &[u8], what: &str) {
+        let mut p = packet.to_vec();
+        finish(&mut p);
+        assert_eq!(p, packet, "{what}");
+    }
+
+    #[test]
+    fn ipv4_of_any_kind_is_left_as_it_came() {
+        let unfinished_udp = udp(b"query", 0x7d48);
+        let unfinished_tcp = tcp(b"query", 0x7d48);
+        let icmp = [8u8, 0, 0x12, 0x34, 0, 1, 0, 1];
+        for (proto, seg) in [
+            (UDP, &unfinished_udp[..]),
+            (TCP, &unfinished_tcp[..]),
+            (1, &icmp[..]),
+        ] {
+            left_alone(
+                &v4(OWN, OWN, proto, seg),
+                &format!("IPv4, protocol {proto}"),
+            );
+            left_alone(
+                &v4(PEER, OWN, proto, seg),
+                &format!("IPv4 from a peer, protocol {proto}"),
+            );
+        }
+    }
+
+    #[test]
+    fn icmpv6_and_any_other_next_header_are_left_as_they_came() {
+        let own6 = derive_overlay_v6(OWN);
+        let echo = [128u8, 0, 0x12, 0x34, 0, 1, 0, 1, 1, 2, 3, 4];
+        left_alone(&v6(own6, own6, 58, &echo), "ICMPv6");
+        // An extension header first, a UDP datagram after it.
+        let seg = udp(b"query", 0x7d48);
+        for next in [0u8, 43, 44, 50, 51, 59, 60, 135] {
+            let mut payload = vec![UDP, 0, 0, 0, 0, 0, 0, 0];
+            payload.extend_from_slice(&seg);
+            left_alone(
+                &v6(own6, own6, next, &payload),
+                &format!("Next Header {next}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_length_that_does_not_hold_leaves_it_as_it_came() {
+        let own6 = derive_overlay_v6(OWN);
+        for (next, seg) in [(UDP, udp(b"query", 0x7d48)), (TCP, tcp(b"query", 0x7d48))] {
+            let p = v6(own6, own6, next, &seg);
+            // Cut short: every length below the whole packet.
+            for len in 0..p.len() {
+                left_alone(
+                    &p[..len],
+                    &format!("Next Header {next}, cut to {len} bytes"),
+                );
+            }
+            // A payload length one more, or one less, than the buffer holds.
+            let plen = seg.len() as u16;
+            for wrong in [plen + 1, plen - 1, 0, u16::MAX] {
+                let mut q = p.clone();
+                q[4..6].copy_from_slice(&wrong.to_be_bytes());
+                left_alone(&q, &format!("Next Header {next}, payload length {wrong}"));
+            }
+            // A byte more in the buffer than the payload length says.
+            let mut q = p.clone();
+            q.push(0);
+            left_alone(&q, &format!("Next Header {next}, a byte past the payload"));
+        }
+        // A UDP length field that is not the payload length.
+        let seg = udp(b"query", 0x7d48);
+        let ulen = seg.len() as u16;
+        for wrong in [ulen + 1, ulen - 1, 0, u16::MAX] {
+            let mut s = seg.clone();
+            s[4..6].copy_from_slice(&wrong.to_be_bytes());
+            left_alone(&v6(own6, own6, UDP, &s), &format!("UDP length {wrong}"));
+        }
+        // A segment shorter than its header, its lengths consistent.
+        left_alone(&v6(own6, own6, UDP, &[0u8; 7]), "UDP, 7 bytes");
+        left_alone(&v6(own6, own6, TCP, &[0u8; 19]), "TCP, 19 bytes");
+    }
+
+    #[test]
+    fn a_packet_of_another_version_is_left_as_it_came() {
+        let own6 = derive_overlay_v6(OWN);
+        let p = v6(own6, own6, UDP, &udp(b"query", 0x7d48));
+        for version in [0u8, 4, 5, 7, 15] {
+            let mut q = p.clone();
+            q[0] = version << 4;
+            left_alone(&q, &format!("version {version}"));
+        }
+    }
+}
+
 /// macOS overlay networking against a REAL utun.
 ///
 /// Everything in the macOS arms — address aliasing, peer `/32`s, subnet
@@ -9431,6 +11019,189 @@ mod macos_kernel_tests {
         tun.del_peer_route(peer).await;
     }
 
+    /// #4279 — the words of the INFO that names a subnet's other holder.
+    const SUBNET_HELD: &str = "another route holds this subnet's prefix";
+
+    /// #4279 — three route-guard restores of `cidr` (`net`/24) under `route -n
+    /// monitor`, then a control write on `lo0` for `control` that the monitor
+    /// must see. Returns every write that names the subnet, as `net` or as
+    /// route(8) may shorten it (`short`): a refused add included, because the
+    /// kernel still reports it to every routing socket (`RTM_ADD` with errno
+    /// 17), and the daemon's route monitor would count it.
+    async fn subnet_writes_during_three_restores(
+        tun: &SystemTun,
+        cidr: &str,
+        (net, short): (&str, &str),
+        control: &str,
+    ) -> Vec<String> {
+        let mut mon = std::process::Command::new("route")
+            .args(["-n", "monitor"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("route monitor");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for _ in 0..3 {
+            tun.defend_subnet_route(cidr)
+                .await
+                .expect("a restore that finds ours or a holder is not an error");
+        }
+        sh(
+            "route",
+            &["-n", "add", "-inet", control, "-interface", "lo0"],
+        );
+        sh("route", &["-n", "delete", "-inet", control]);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = mon.kill();
+        let out = mon.wait_with_output().expect("route monitor output");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let blocks: Vec<&str> = text.split("got message of size").collect();
+        assert!(
+            blocks.iter().any(|b| is_write(b) && mentions(b, control)),
+            "the monitor did not even see the control write — this run proves nothing:\n{text}"
+        );
+        blocks
+            .iter()
+            .filter(|b| is_write(b) && (mentions(b, net) || mentions(b, short)))
+            .map(|b| b.to_string())
+            .collect()
+    }
+
+    /// #4279 — the route guard's restore of a router peer's subnet route, on
+    /// a real utun. Ours in place: no write. Deleted with nothing in its place
+    /// (what a route-reaping VPN does): back after one restore. Held exactly
+    /// by another interface (`lo0` stands in for a sibling org's utun): left
+    /// where it is with no write at all, not even an add the kernel refuses,
+    /// and the holder named once. The holder gone: ours back.
+    #[tokio::test]
+    async fn a_subnet_route_is_restored_when_missing_and_never_added_over_a_holder() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        const CIDR: &str = "10.249.49.0/24";
+        const NET: (&str, &str) = ("10.249.49.0", "10.249.49");
+        let delete = ["-n", "delete", "-inet", "-net", NET.0, "-prefixlen", "24"];
+        /// Whatever happens, no route for the subnet is left behind: the
+        /// stand-in's, ours, or one of each.
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for _ in 0..2 {
+                    let _ = std::process::Command::new("route")
+                        .args([
+                            "-n",
+                            "delete",
+                            "-inet",
+                            "-net",
+                            "10.249.49.0",
+                            "-prefixlen",
+                            "24",
+                        ])
+                        .output();
+                }
+            }
+        }
+        let _cleanup = Cleanup;
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        tun.add_cidr_route(CIDR).await.expect("install");
+        assert!(
+            block_is_ours(NET.0, 24, &iface),
+            "install routes the subnet on {iface}: {:?}",
+            block_route(NET.0, 24)
+        );
+
+        // The steady state: ours is in place, and a restore writes nothing.
+        let writes = subnet_writes_during_three_restores(&tun, CIDR, NET, "100.65.0.248").await;
+        assert!(
+            writes.is_empty(),
+            "restores that find ours must not write the table:\n{}",
+            writes.join("\n---\n")
+        );
+
+        // The incident: deleted, with nothing in its place.
+        sh("route", &delete);
+        assert_eq!(
+            held_exactly(NET.0, 24),
+            None,
+            "staging the delete failed: {:?}",
+            block_route(NET.0, 24)
+        );
+        tun.defend_subnet_route(CIDR).await.expect("restore");
+        assert!(
+            block_is_ours(NET.0, 24, &iface),
+            "one restore puts the subnet back on {iface}: {:?}\n{}",
+            block_route(NET.0, 24),
+            sh("netstat", &["-rn", "-f", "inet"])
+        );
+
+        // A holder: ours deleted, and exactly the prefix routed on lo0.
+        sh("route", &delete);
+        sh(
+            "route",
+            &[
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                NET.0,
+                "-prefixlen",
+                "24",
+                "-interface",
+                "lo0",
+            ],
+        );
+        assert_eq!(
+            held_exactly(NET.0, 24).as_deref(),
+            Some("lo0"),
+            "staging the holder failed: {:?}",
+            block_route(NET.0, 24)
+        );
+        let (logs, _logging) = Logs::start();
+        let writes = subnet_writes_during_three_restores(&tun, CIDR, NET, "100.65.0.249").await;
+        assert!(
+            writes.is_empty(),
+            "a restore beside a holder must write nothing, not even an add the kernel refuses:\n{}",
+            writes.join("\n---\n")
+        );
+        assert_eq!(
+            held_exactly(NET.0, 24).as_deref(),
+            Some("lo0"),
+            "the holder keeps the prefix: {:?}",
+            block_route(NET.0, 24)
+        );
+        let named = logs.lines_with(SUBNET_HELD);
+        assert_eq!(
+            named.len(),
+            1,
+            "the holder is named once, not per restore:\n{}",
+            logs.text()
+        );
+        assert!(
+            names(&named[0], "lo0"),
+            "the INFO names the holder: {}",
+            named[0]
+        );
+
+        // The holder goes: ours is back.
+        sh("route", &delete);
+        tun.defend_subnet_route(CIDR)
+            .await
+            .expect("restore after the holder");
+        assert!(
+            block_is_ours(NET.0, 24, &iface),
+            "with the holder gone the subnet is back on {iface}: {:?}",
+            block_route(NET.0, 24)
+        );
+        tun.del_cidr_route(CIDR).await;
+    }
+
     /// #1856 follow-up — route(8) prints ANY all-zeros destination as
     /// `default`, which is how an exit client's `0.0.0.0/1` reads back. A real
     /// `/1` would capture half of the runner's traffic, so this uses
@@ -9849,6 +11620,992 @@ mod macos_kernel_tests {
         assert!(
             super::bsd_pin_row(&table("inet"), ip).is_none(),
             "and nothing written"
+        );
+    }
+
+    // #4125 — a packet the Mac sends to its own overlay address goes into
+    // the utun (#4117's shape gives the address a host route there, and
+    // macOS adds no local route for a utun's own address). The read path
+    // hands it back to the kernel, which delivers it.
+
+    /// How long a datagram or a reply may take to arrive.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+    /// The window after an exchange in which nothing more may arrive.
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+    /// The words of the one INFO line a utun logs at its first hand-back.
+    const HANDED_BACK: &str = "was handed back to the OS";
+    /// The words of the INFO a bring-up logs with the kill switch off.
+    const SELF_DELIVERY_OFF: &str =
+        "are not handed back to the OS (ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0)";
+
+    /// How many packets `tun` has handed back to the kernel.
+    #[cfg(target_os = "macos")]
+    fn handed_back(tun: &SystemTun) -> u64 {
+        tun.self_delivered()
+    }
+
+    /// Off macOS every test here skips before it reads a count.
+    #[cfg(not(target_os = "macos"))]
+    fn handed_back(_tun: &SystemTun) -> u64 {
+        0
+    }
+
+    /// The read path as the runtime drives it: one task reads the utun for as
+    /// long as the receiver lives, and every packet `read_packet` returns
+    /// comes out of the receiver. A packet the read hands back never does.
+    fn read_utun(tun: std::sync::Arc<SystemTun>) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(p) = tun.read_packet().await {
+                if tx.send(p).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
+    /// How many of the packets read so far are addressed to `own`, by its
+    /// IPv4 or by its derived IPv6. Drains what it counts.
+    fn reads_to(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, own: Ipv4Addr) -> usize {
+        let mut n = 0;
+        while let Ok(p) = rx.try_recv() {
+            if crate::overlay::router::Router::dst_of_ip_packet(&p) == Some(own) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// A UDP socket on `ip`'s port 53, where the overlay's resolver binds, or
+    /// on a port the kernel picks when this runner cannot bind 53 (said on
+    /// stderr). A fresh IPv6 address cannot be bound until its duplicate
+    /// address check ends, so an unavailable address is tried again for a
+    /// few seconds.
+    async fn bind_port_53(ip: std::net::IpAddr) -> tokio::net::UdpSocket {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::UdpSocket::bind((ip, 53)).await {
+                Ok(s) => return s,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrNotAvailable
+                        && std::time::Instant::now() < until =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    let s = tokio::net::UdpSocket::bind((ip, 0))
+                        .await
+                        .unwrap_or_else(|e2| panic!("binding {ip}: {e2} (port 53: {e})"));
+                    eprintln!(
+                        "note: port 53 of {ip} cannot be bound on this runner ({e}); using port {}",
+                        s.local_addr().unwrap().port()
+                    );
+                    return s;
+                }
+            }
+        }
+    }
+
+    /// The echoes `ping`'s summary says came back (`3 packets received`).
+    fn echoes_received(summary: &str) -> Option<u32> {
+        let line = summary.lines().find(|l| l.contains("packets received"))?;
+        let head = line.split(" packets received").next()?;
+        head.rsplit(|c: char| !c.is_ascii_digit())
+            .find(|t| !t.is_empty())?
+            .parse()
+            .ok()
+    }
+
+    /// A DNS query for `name`'s A record.
+    fn dns_query(name: &str) -> Vec<u8> {
+        let mut m = vec![0x41, 0x25, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            m.push(label.len() as u8);
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.extend_from_slice(&[0, 0, 1, 0, 1]);
+        m
+    }
+
+    /// The next packet read from the utun that is IP version `version` and
+    /// addressed to `own` (its IPv4, or its derived IPv6), within [`WAIT`].
+    async fn next_read_to(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        own: Ipv4Addr,
+        version: u8,
+    ) -> Option<Vec<u8>> {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let p = rx.recv().await?;
+                if p.first().map(|b| b >> 4) == Some(version)
+                    && crate::overlay::router::Router::dst_of_ip_packet(&p) == Some(own)
+                {
+                    return Some(p);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Whether a datagram reaches `sock` within `within`.
+    async fn arrives(sock: &tokio::net::UdpSocket, within: std::time::Duration) -> bool {
+        let mut buf = [0u8; 64];
+        matches!(
+            tokio::time::timeout(within, sock.recv_from(&mut buf)).await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// The 16-bit ones'-complement sum of `bytes`, added to `sum` and folded.
+    fn ones_sum(bytes: &[u8], mut sum: u32) -> u16 {
+        let mut words = bytes.chunks_exact(2);
+        for w in &mut words {
+            sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+        }
+        if let [last] = words.remainder() {
+            sum += u32::from(*last) << 8;
+        }
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    /// A UDP datagram's pseudo-header sum, the offset of its UDP header and
+    /// the length its IP header gives it: IPv4, or IPv6 with no extension
+    /// header. `None` for anything else.
+    fn udp_pseudo(packet: &[u8]) -> Option<(u16, usize, usize)> {
+        let mut pseudo = Vec::with_capacity(40);
+        let (at, end) = match packet.first()? >> 4 {
+            4 => {
+                let at = usize::from(packet[0] & 0x0f) * 4;
+                let end = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
+                if at < 20 || packet.get(9) != Some(&17) || end > packet.len() || end < at + 8 {
+                    return None;
+                }
+                pseudo.extend_from_slice(&packet[12..20]);
+                pseudo.extend_from_slice(&[0, 17]);
+                pseudo.extend_from_slice(&((end - at) as u16).to_be_bytes());
+                (at, end)
+            }
+            6 => {
+                let plen = usize::from(u16::from_be_bytes([*packet.get(4)?, *packet.get(5)?]));
+                let end = 40 + plen;
+                if packet.get(6) != Some(&17) || end > packet.len() || plen < 8 {
+                    return None;
+                }
+                pseudo.extend_from_slice(&packet[8..40]);
+                pseudo.extend_from_slice(&(plen as u32).to_be_bytes());
+                pseudo.extend_from_slice(&[0, 0, 0, 17]);
+                (40, end)
+            }
+            _ => return None,
+        };
+        Some((ones_sum(&pseudo, 0), at, end))
+    }
+
+    /// What a UDP datagram's checksum holds: whether it is valid, and
+    /// whether it holds only the pseudo-header's sum, as a checksum left for
+    /// the network device to finish does.
+    fn udp_checksum_report(packet: &[u8]) -> String {
+        let Some((pseudo, at, end)) = udp_pseudo(packet) else {
+            return format!(
+                "not a UDP datagram: {:02x?}",
+                &packet[..packet.len().min(48)]
+            );
+        };
+        let field = u16::from_be_bytes([packet[at + 6], packet[at + 7]]);
+        let sum = ones_sum(&packet[at..end], u32::from(pseudo));
+        let none = field == 0 && packet[0] >> 4 == 4;
+        format!(
+            "checksum field {field:#06x}{}; over the pseudo-header and the datagram it sums to \
+             {sum:#06x} (valid: {}); the pseudo-header alone sums to {pseudo:#06x} (the field \
+             holds it: {})",
+            if none { " (none)" } else { "" },
+            none || sum == 0xffff,
+            field == pseudo
+        )
+    }
+
+    /// `packet` with its UDP checksum computed over its pseudo-header and
+    /// datagram.
+    fn with_udp_checksum(packet: &[u8]) -> Vec<u8> {
+        let mut p = packet.to_vec();
+        let (pseudo, at, end) = udp_pseudo(&p).expect("a UDP datagram");
+        p[at + 6] = 0;
+        p[at + 7] = 0;
+        let sum = match !ones_sum(&p[at..end], u32::from(pseudo)) {
+            0 => 0xffff,
+            s => s,
+        };
+        p[at + 6..at + 8].copy_from_slice(&sum.to_be_bytes());
+        p
+    }
+
+    /// A UDP-over-IPv6 datagram from `src` to `dst`, its checksum computed.
+    fn udp6_datagram(
+        src: std::net::Ipv6Addr,
+        sport: u16,
+        dst: std::net::Ipv6Addr,
+        dport: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let len = (8 + payload.len()) as u16;
+        let mut p = vec![0x60, 0, 0, 0];
+        p.extend_from_slice(&len.to_be_bytes());
+        p.extend_from_slice(&[17, 64]);
+        p.extend_from_slice(&src.octets());
+        p.extend_from_slice(&dst.octets());
+        p.extend_from_slice(&sport.to_be_bytes());
+        p.extend_from_slice(&dport.to_be_bytes());
+        p.extend_from_slice(&len.to_be_bytes());
+        p.extend_from_slice(&[0, 0]);
+        p.extend_from_slice(payload);
+        with_udp_checksum(&p)
+    }
+
+    /// #4125 (a) — a UDP datagram the Mac sends to its own overlay address
+    /// reaches a socket bound there, and its reply comes back.
+    #[tokio::test]
+    async fn a_datagram_to_its_own_address_is_delivered_and_answered() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        eprintln!(
+            "measure (#4125): route -n get {own}:\n{}",
+            sh("route", &["-n", "get", &own.to_string()])
+        );
+        let server = bind_port_53(own.into()).await;
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        client.send_to(b"query", to).await.expect("send");
+        let mut buf = [0u8; 64];
+        let (n, from) = tokio::time::timeout(WAIT, server.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("a datagram to {to} is not delivered within {WAIT:?}"))
+            .unwrap();
+        assert_eq!(&buf[..n], b"query");
+        server.send_to(b"answer", from).await.unwrap();
+        let (n, _) = tokio::time::timeout(WAIT, client.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("the reply from {to} to {from} never comes back"))
+            .unwrap();
+        assert_eq!(&buf[..n], b"answer");
+    }
+
+    /// #4125 (b) — `ping <own address>` on the Mac is answered, and each echo
+    /// is two hand-backs: the request and its reply.
+    #[tokio::test]
+    async fn a_ping_to_its_own_address_is_answered() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        let before = handed_back(&tun);
+        let target = own.to_string();
+        // On the blocking pool: this thread keeps polling the reader.
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("ping")
+                .args(["-c", "3", "-t", "5", target.as_str()])
+                .output()
+        })
+        .await
+        .unwrap()
+        .expect("ping runs");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            echoes_received(&text),
+            Some(3),
+            "ping {own} on the Mac is not answered:\n{text}"
+        );
+        assert_eq!(
+            handed_back(&tun) - before,
+            6,
+            "two hand-backs per echo, the request and its reply:\n{text}"
+        );
+    }
+
+    /// #4125 (c) — a handed-back packet is delivered, not forwarded: one
+    /// datagram is one hand-back and its reply one more, nothing addressed to
+    /// the utun comes out of the read, and nothing comes back into the utun
+    /// for two seconds after. One INFO line, at the first hand-back.
+    #[tokio::test]
+    async fn a_handed_back_packet_is_delivered_once_and_never_read_again() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let (logs, _guard) = Logs::start();
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let mut reads = read_utun(tun.clone());
+        let server = bind_port_53(own.into()).await;
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let before = handed_back(&tun);
+
+        client.send_to(b"query", to).await.expect("send");
+        let mut sbuf = [0u8; 64];
+        let got = tokio::time::timeout(WAIT, server.recv_from(&mut sbuf)).await;
+        let read = reads_to(&mut reads, own);
+        assert_eq!(
+            handed_back(&tun) - before,
+            1,
+            "one datagram, one hand-back (read_packet returned {read} packet(s) to {own}; \
+             delivered: {})",
+            got.is_ok()
+        );
+        assert_eq!(read, 0, "a packet to {own} came out of read_packet");
+        let (_, from) = got.expect("delivered").unwrap();
+
+        server.send_to(b"answer", from).await.unwrap();
+        let mut cbuf = [0u8; 64];
+        tokio::time::timeout(WAIT, client.recv_from(&mut cbuf))
+            .await
+            .expect("the reply comes back")
+            .unwrap();
+        assert_eq!(handed_back(&tun) - before, 2, "and one more for its reply");
+
+        let (s, c) = tokio::join!(
+            tokio::time::timeout(QUIET, server.recv_from(&mut sbuf)),
+            tokio::time::timeout(QUIET, client.recv_from(&mut cbuf)),
+        );
+        assert!(
+            s.is_err() && c.is_err(),
+            "a datagram arrived twice: {s:?} {c:?}"
+        );
+        assert_eq!(
+            handed_back(&tun) - before,
+            2,
+            "nothing came back into the utun for {QUIET:?}"
+        );
+        assert_eq!(
+            reads_to(&mut reads, own),
+            0,
+            "and nothing to {own} was read"
+        );
+        assert_eq!(
+            logs.lines_with(HANDED_BACK).len(),
+            1,
+            "one INFO line, at the first hand-back:\n{}",
+            logs.text()
+        );
+    }
+
+    /// #4175 — of the packets read so far, how many are the test's own
+    /// datagram (IPv4 UDP to `to`, from the port `from`, the payload exactly
+    /// `query`), and how many others are addressed to `own`, by its IPv4 or
+    /// by its derived IPv6. Drains the receiver.
+    fn its_own_and_others(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        own: Ipv4Addr,
+        from: u16,
+        to: std::net::SocketAddr,
+    ) -> (usize, usize) {
+        let (mut its_own, mut others) = (0, 0);
+        while let Ok(p) = rx.try_recv() {
+            let dst = crate::overlay::router::Router::dst_of_ip_packet(&p);
+            let is_its_own = p.first().map(|b| b >> 4) == Some(4)
+                && dst.map(std::net::IpAddr::V4) == Some(to.ip())
+                && udp_pseudo(&p).is_some_and(|(_, at, end)| {
+                    p[at..at + 2] == from.to_be_bytes()
+                        && p[at + 2..at + 4] == to.port().to_be_bytes()
+                        && &p[at + 8..end] == b"query"
+                });
+            if is_its_own {
+                its_own += 1;
+            } else if dst == Some(own) {
+                others += 1;
+            }
+        }
+        (its_own, others)
+    }
+
+    /// #4125 (d) — `ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0`: nothing is handed
+    /// back. The datagram is read from the utun, as before the hand-back, and
+    /// never delivered. Safe to set here, as the other kill-switch tests say.
+    #[tokio::test]
+    async fn the_kill_switch_hands_nothing_back() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let _restore = crate::env::test_env::Saved::cleared("OVERLAY_UTUN_SELF_DELIVERY");
+        // SAFETY: the kernel tests run on one thread; nothing else reads it.
+        unsafe { crate::env::test_env::set("OVERLAY_UTUN_SELF_DELIVERY", "0") };
+
+        let (logs, _guard) = Logs::start();
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let mut reads = read_utun(tun.clone());
+        let server = bind_port_53(own.into()).await;
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        // #4175 — first one stray, from a second socket to port 9 (discard),
+        // where nothing listens. The utun reads it as well, and only the
+        // test's own datagram may be counted.
+        let stray = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        stray
+            .send_to(b"stray", (own, 9))
+            .await
+            .expect("send the stray");
+        client.send_to(b"query", to).await.expect("send");
+        let mut buf = [0u8; 64];
+        let got = tokio::time::timeout(QUIET, server.recv_from(&mut buf)).await;
+        assert!(
+            got.is_err(),
+            "switched off, a datagram to {to} is not delivered: {got:?}"
+        );
+        let from = client.local_addr().unwrap().port();
+        let (its_own, others) = its_own_and_others(&mut reads, own, from, to);
+        eprintln!(
+            "measure (#4175): the test's one stray included, {others} other packet(s) to {own} \
+             were read"
+        );
+        assert_eq!(
+            its_own, 1,
+            "switched off, the datagram is read from the utun"
+        );
+        assert_eq!(handed_back(&tun), 0, "switched off, nothing is handed back");
+        let text = logs.text();
+        assert_eq!(
+            logs.lines_with(SELF_DELIVERY_OFF).len(),
+            1,
+            "one INFO at the bring-up says so:\n{text}"
+        );
+        assert!(
+            logs.lines_with(HANDED_BACK).is_empty(),
+            "and none for a hand-back:\n{text}"
+        );
+    }
+
+    /// #4125 (e) — the same exchange with the node's derived IPv6: a UDP
+    /// datagram the Mac sends to `[<own v6>]:53` reaches a socket bound
+    /// there, and its reply comes back. On #4117's code it was read from the
+    /// utun and never delivered. macOS leaves its checksum for the network
+    /// device to finish (the measurement below), so the hand-back finishes
+    /// it before the write. The route macOS answers for the address, and
+    /// what `ping6` gets, are printed.
+    #[tokio::test]
+    async fn a_datagram_to_its_own_derived_v6_is_delivered_and_answered() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let own_v6 = crate::overlay::router::derive_overlay_v6(own);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let iface = tun.if_name().to_string();
+        let mut reads = read_utun(tun.clone());
+        let server = bind_port_53(own_v6.into()).await;
+        eprintln!(
+            "measure (#4125 v6): ifconfig {iface}:\n{}\nroute -n get -inet6 {own_v6}:\n{}\n\
+             netstat -rn -f inet6, the overlay's lines:\n{}",
+            sh("ifconfig", &[&iface]),
+            sh("route", &["-n", "get", "-inet6", &own_v6.to_string()]),
+            sh("netstat", &["-rn", "-f", "inet6"])
+                .lines()
+                .filter(|l| l.contains("fd72:6f6f:6d6c"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let before = handed_back(&tun);
+        client.send_to(b"query", to).await.expect("send");
+        let mut buf = [0u8; 64];
+        let got = tokio::time::timeout(WAIT, server.recv_from(&mut buf)).await;
+        let (n, from) = got
+            .unwrap_or_else(|_| {
+                panic!(
+                    "a datagram to {to} is not delivered within {WAIT:?} (handed back {}, read \
+                     from the utun {})",
+                    handed_back(&tun) - before,
+                    reads_to(&mut reads, own)
+                )
+            })
+            .unwrap();
+        assert_eq!(&buf[..n], b"query");
+        server.send_to(b"answer", from).await.unwrap();
+        let (n, _) = tokio::time::timeout(WAIT, client.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("the reply from {to} to {from} never comes back"))
+            .unwrap();
+        assert_eq!(&buf[..n], b"answer");
+
+        // `ping6`: the kernel computes an ICMPv6 checksum itself.
+        let before = handed_back(&tun);
+        let target = own_v6.to_string();
+        // On the blocking pool: this thread keeps polling the reader.
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("ping6")
+                .args(["-c", "3", target.as_str()])
+                .output()
+        })
+        .await
+        .unwrap();
+        let text = match &out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Err(e) => format!("ping6 did not run: {e}"),
+        };
+        eprintln!(
+            "measure (#4125 v6): ping6 -c 3 {own_v6}: answered {:?} of 3, handed back {}, \
+             read from the utun {}:\n{text}",
+            echoes_received(&text),
+            handed_back(&tun) - before,
+            reads_to(&mut reads, own)
+        );
+    }
+
+    /// #4125 (g) — (e)'s count, as (c) reads it for IPv4: the datagram to
+    /// the derived IPv6 is one hand-back and its reply one more, no packet
+    /// to the address comes out of the read, and nothing more comes into the
+    /// utun in the two seconds after.
+    #[tokio::test]
+    async fn a_handed_back_v6_datagram_is_delivered_once_and_never_read_again() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let own_v6 = crate::overlay::router::derive_overlay_v6(own);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let mut reads = read_utun(tun.clone());
+        let server = bind_port_53(own_v6.into()).await;
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let before = handed_back(&tun);
+
+        client.send_to(b"query", to).await.expect("send");
+        let mut sbuf = [0u8; 64];
+        let got = tokio::time::timeout(WAIT, server.recv_from(&mut sbuf)).await;
+        let read = reads_to(&mut reads, own);
+        assert_eq!(
+            handed_back(&tun) - before,
+            1,
+            "one datagram, one hand-back (read_packet returned {read} packet(s) to {own_v6}; \
+             delivered: {})",
+            got.is_ok()
+        );
+        assert_eq!(read, 0, "a packet to {own_v6} came out of read_packet");
+        let (_, from) = got
+            .unwrap_or_else(|_| panic!("the handed-back datagram to {to} is not delivered"))
+            .unwrap();
+
+        server.send_to(b"answer", from).await.unwrap();
+        let mut cbuf = [0u8; 64];
+        tokio::time::timeout(WAIT, client.recv_from(&mut cbuf))
+            .await
+            .expect("the reply comes back")
+            .unwrap();
+        assert_eq!(handed_back(&tun) - before, 2, "and one more for its reply");
+
+        let (s, c) = tokio::join!(
+            tokio::time::timeout(QUIET, server.recv_from(&mut sbuf)),
+            tokio::time::timeout(QUIET, client.recv_from(&mut cbuf)),
+        );
+        assert!(
+            s.is_err() && c.is_err(),
+            "a datagram arrived twice: {s:?} {c:?}"
+        );
+        assert_eq!(
+            handed_back(&tun) - before,
+            2,
+            "nothing came back into the utun for {QUIET:?}"
+        );
+        assert_eq!(
+            reads_to(&mut reads, own),
+            0,
+            "and nothing to {own_v6} was read"
+        );
+    }
+
+    /// #4125 — what the utun reads for a datagram the Mac sends to its own
+    /// derived IPv6, with the hand-back off so that it comes out of the read,
+    /// and which of its variants macOS delivers when it is written back in:
+    /// as read, with its UDP checksum finished (what the hand-back writes),
+    /// and a datagram from a peer's derived address with a checksum computed
+    /// here. The IPv4 datagram's checksum is read too, for comparison. It is
+    /// the record of why the hand-back finishes an IPv6 checksum, and it
+    /// asserts only that both datagrams are read.
+    #[tokio::test]
+    async fn measure_what_the_utun_reads_for_a_datagram_to_its_own_derived_v6() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let _restore = crate::env::test_env::Saved::cleared("OVERLAY_UTUN_SELF_DELIVERY");
+        // SAFETY: the kernel tests run on one thread; nothing else reads it.
+        unsafe { crate::env::test_env::set("OVERLAY_UTUN_SELF_DELIVERY", "0") };
+
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let own_v6 = crate::overlay::router::derive_overlay_v6(own);
+        let peer_v6 = crate::overlay::router::derive_overlay_v6(Ipv4Addr::new(100, 65, 0, 9));
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let mut reads = read_utun(tun.clone());
+        let server4 = bind_port_53(own.into()).await;
+        let server6 = bind_port_53(own_v6.into()).await;
+        let client4 = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let client6 = tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+
+        client4
+            .send_to(b"query", server4.local_addr().unwrap())
+            .await
+            .expect("send");
+        let v4 = next_read_to(&mut reads, own, 4)
+            .await
+            .expect("switched off, the IPv4 datagram is read from the utun");
+        client6
+            .send_to(b"query", server6.local_addr().unwrap())
+            .await
+            .expect("send");
+        let v6 = next_read_to(&mut reads, own, 6)
+            .await
+            .expect("switched off, the IPv6 datagram is read from the utun");
+        eprintln!(
+            "measure (#4125 checksum): the IPv4 datagram as the utun reads it: {}\n\
+             the IPv6 datagram as the utun reads it: {}",
+            udp_checksum_report(&v4),
+            udp_checksum_report(&v6)
+        );
+
+        let counters = || {
+            sh("netstat", &["-s", "-p", "udp"])
+                .lines()
+                .filter(|l| l.contains("checksum"))
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let port = server6.local_addr().unwrap().port();
+        let counted_before = counters();
+        tun.write_packet(&v6).await.expect("write");
+        let as_read = arrives(&server6, QUIET).await;
+        let counted_after = counters();
+        tun.write_packet(&with_udp_checksum(&v6))
+            .await
+            .expect("write");
+        let finished = arrives(&server6, WAIT).await;
+        tun.write_packet(&udp6_datagram(peer_v6, 40000, own_v6, port, b"peer"))
+            .await
+            .expect("write");
+        let from_peer = arrives(&server6, WAIT).await;
+        eprintln!(
+            "measure (#4125 checksum): written into the utun to [{own_v6}]:{port}: as read: \
+             delivered={as_read} (the UDP counters before: {counted_before}; after: \
+             {counted_after}); with its checksum finished: delivered={finished}; from \
+             {peer_v6}, its checksum computed here: delivered={from_peer}"
+        );
+    }
+
+    /// #4125 — the overlay's own resolver, bound to the utun's address as the
+    /// runtime binds it, answers a lookup the Mac sends it: the MagicDNS case.
+    #[tokio::test]
+    async fn the_resolver_on_its_own_address_answers_a_lookup_from_the_mac() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let peer = Ipv4Addr::new(100, 65, 0, 9);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        let names = crate::overlay::dns::NameMap::default();
+        names.write().await.insert("peer".to_string(), peer);
+        let (bound_tx, mut bound_rx) = tokio::sync::watch::channel(false);
+        let resolver = tokio::spawn(crate::overlay::dns::run(
+            crate::overlay::dns::DnsConfig {
+                bind: std::net::SocketAddr::new(own.into(), 53),
+                magic_domain: "zone.test".to_string(),
+                upstream: "127.0.0.1:9".parse().unwrap(),
+                names,
+                answer_aaaa: false,
+            },
+            bound_tx,
+        ));
+        let bound = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if *bound_rx.borrow_and_update() {
+                    return true;
+                }
+                if bound_rx.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !bound {
+            eprintln!("skipping the lookup: the resolver did not bind {own}:53 on this runner");
+            resolver.abort();
+            return;
+        }
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        client
+            .send_to(&dns_query("peer.zone.test"), (own, 53))
+            .await
+            .expect("send");
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(WAIT, client.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("the resolver on {own}:53 gives the Mac no answer"))
+            .unwrap();
+        resolver.abort();
+        assert!(
+            buf[..n].ends_with(&peer.octets()),
+            "the answer is the peer's address: {:02x?}",
+            &buf[..n]
+        );
+    }
+
+    /// A TCP listener on `ip`, on a port the kernel picks. A fresh IPv6
+    /// address cannot be bound until its duplicate address check ends, so an
+    /// unavailable address is tried again for a few seconds.
+    async fn listen_tcp(ip: std::net::IpAddr) -> tokio::net::TcpListener {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpListener::bind((ip, 0)).await {
+                Ok(l) => return l,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrNotAvailable
+                        && std::time::Instant::now() < until =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("listening on {ip}: {e}"),
+            }
+        }
+    }
+
+    /// A TCP connection from the Mac to `listener`, and a few bytes each way,
+    /// each step within [`WAIT`]. `Err` names the step that did not happen.
+    /// Then, measured and not asserted, how many bytes of a 64 KiB write
+    /// arrive within [`WAIT`]: `Ok` carries that count.
+    async fn tcp_exchange(listener: &tokio::net::TcpListener) -> Result<usize, String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let to = listener.local_addr().unwrap();
+        let (accepted, connected) = tokio::join!(
+            tokio::time::timeout(WAIT, listener.accept()),
+            tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(to)),
+        );
+        let mut client = match connected {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(format!("the connect to {to} failed: {e}")),
+            Err(_) => return Err(format!("the connect to {to} got no answer within {WAIT:?}")),
+        };
+        let (mut server, from) = match accepted {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => return Err(format!("the accept on {to} failed: {e}")),
+            Err(_) => return Err(format!("nothing was accepted on {to} within {WAIT:?}")),
+        };
+        // #4175 — SO_LINGER 0: each end's drop sends one RST and frees it at
+        // once, so no FIN is left to be retransmitted once this utun is gone.
+        client
+            .set_zero_linger()
+            .and_then(|()| server.set_zero_linger())
+            .map_err(|e| format!("SO_LINGER 0 on {to}: {e}"))?;
+        client
+            .write_all(b"query")
+            .await
+            .map_err(|e| format!("the write to {to}: {e}"))?;
+        let mut q = [0u8; 5];
+        match tokio::time::timeout(WAIT, server.read_exact(&mut q)).await {
+            Ok(Ok(_)) if &q == b"query" => {}
+            other => return Err(format!("the bytes to {to} did not arrive: {other:?} {q:?}")),
+        }
+        server
+            .write_all(b"answer")
+            .await
+            .map_err(|e| format!("the write to {from}: {e}"))?;
+        let mut a = [0u8; 6];
+        match tokio::time::timeout(WAIT, client.read_exact(&mut a)).await {
+            Ok(Ok(_)) if &a == b"answer" => {}
+            other => {
+                return Err(format!(
+                    "the bytes back to {from} did not arrive: {other:?} {a:?}"
+                ));
+            }
+        }
+        let bulk = vec![0x5au8; 64 * 1024];
+        let mut rbuf = vec![0u8; 16 * 1024];
+        let mut arrived = 0usize;
+        let _ = tokio::time::timeout(WAIT, async {
+            let send = client.write_all(&bulk);
+            let recv = async {
+                while arrived < bulk.len() {
+                    match server.read(&mut rbuf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => arrived += n,
+                    }
+                }
+            };
+            tokio::join!(send, recv)
+        })
+        .await;
+        Ok(arrived)
+    }
+
+    /// #4125 (f) — a TCP connection the Mac opens to its own derived IPv6
+    /// carries a few bytes each way. Every segment of it goes through the
+    /// hand-back, with its checksum as macOS left it.
+    #[tokio::test]
+    async fn a_tcp_connection_to_its_own_derived_v6_carries_bytes_both_ways() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let own_v6 = crate::overlay::router::derive_overlay_v6(own);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        let listener = listen_tcp(own_v6.into()).await;
+        let before = handed_back(&tun);
+        let result = tcp_exchange(&listener).await;
+        let handed = handed_back(&tun) - before;
+        eprintln!(
+            "measure (#4125 v6 TCP): {result:?} (Ok: the bytes of a 64 KiB write that arrived \
+             within {WAIT:?}), segments handed back {handed}"
+        );
+        if let Err(e) = result {
+            panic!("TCP to [{own_v6}]: {e} (segments handed back {handed})");
+        }
+        assert!(handed > 0, "its segments go through the hand-back");
+    }
+
+    /// #4125 (f), the control — the same over the node's own IPv4 address,
+    /// whose checksums macOS finishes itself.
+    #[tokio::test]
+    async fn a_tcp_connection_to_its_own_address_carries_bytes_both_ways() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        let listener = listen_tcp(own.into()).await;
+        let before = handed_back(&tun);
+        let result = tcp_exchange(&listener).await;
+        let handed = handed_back(&tun) - before;
+        eprintln!(
+            "measure (#4125 v4 TCP): {result:?} (Ok: the bytes of a 64 KiB write that arrived \
+             within {WAIT:?}), segments handed back {handed}"
+        );
+        if let Err(e) = result {
+            panic!("TCP to {own}: {e} (segments handed back {handed})");
+        }
+        assert!(handed > 0, "its segments go through the hand-back");
+    }
+}
+
+/// #4380 — the INFO that names a subnet's other holder is said on the route
+/// guard's own target, which the daemon keeps at INFO under every `RUST_LOG`
+/// (`roomler_node_core::logging::filter_for`), where the packaged Linux units'
+/// spec drops this module's INFO. Pure: no device, no route is touched.
+#[cfg(all(
+    test,
+    feature = "overlay-l3",
+    any(target_os = "linux", target_os = "macos")
+))]
+mod subnet_held_line_tests {
+    use super::system::say_subnet_held;
+
+    /// It names the holder, or `unnamed` when the OS did not say, in the
+    /// words the cells under `route -n monitor` read.
+    #[test]
+    fn a_held_prefix_is_named_on_the_route_guards_target() {
+        const HELD: &str = "another route holds this subnet's prefix";
+        let (lines, _guard) = crate::overlay::said::Lines::start();
+        say_subnet_held("10.1.0.0/16", "roomler0", "eth0");
+        say_subnet_held("192.168.50.0/24", "roomler0", "");
+        let said = lines.with(HELD);
+        assert_eq!(said.len(), 2, "{said:?}");
+        for line in &said {
+            assert_eq!(
+                line.target, "tunnel_core::overlay::route_guard",
+                "the target roomler_node_core's filter_for appends at INFO: {line:?}"
+            );
+            assert_eq!(line.level, tracing::Level::INFO, "{line:?}");
+        }
+        assert!(
+            said[0]
+                .text
+                .contains("cidr=10.1.0.0/16 dev=roomler0 holder=eth0"),
+            "{said:?}"
+        );
+        assert!(
+            said[1]
+                .text
+                .contains("cidr=192.168.50.0/24 dev=roomler0 holder=unnamed"),
+            "{said:?}"
         );
     }
 }

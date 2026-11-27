@@ -1,0 +1,21 @@
+# FR-133 P4 — the baseline of scripts/says-roomlerd.cjs: the person-facing "agent"s that are
+# known and owned, as a count per FILE (never a line number), grouped by surface under the owner
+# that removes them. `--check` fails when a file holds more than its count; a PR that only removes
+# them never fails. A count moves only with `node scripts/says-roomlerd.cjs --update-baseline`,
+# committed with the reason. The quoted lines under a row are the words around each hit when it
+# was written (identities left out): a pointer for the owner, not part of the check.
+#
+## daemon · owner FR-133 follow-up · 0 files · 0 hits
+#
+## companion · owner FR-133 follow-up · 0 files · 0 hits
+#
+## server · owner FR-133 follow-up · 0 files · 0 hits
+#
+## install-scripts · owner FR-133 follow-up · 0 files · 0 hits
+#
+## display-identity · owner FR-133 follow-up · 0 files · 0 hits
+#
+## wizard · owner FR-129 phase C · 0 files · 0 hits
+#
+## docs-site · owner FR-133 P3 · 0 files · 0 hits
+#

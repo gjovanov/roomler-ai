@@ -74,7 +74,7 @@ its rolling log file. Confirm with:
     schtasks /Query /TN Roomler-<SID> /FO LIST
 
 If you ever need to manage the hook manually (e.g. after restoring a
-backup or recovering from the rare Win11 ACL-locked-task scenario):
+backup, or to repair a task an elevated install left, below):
 
     & $roomlerd service install     # register / re-register
     & $roomlerd service uninstall   # tear down
@@ -82,19 +82,27 @@ backup or recovering from the rare Win11 ACL-locked-task scenario):
 
 Earlier versions (0.1.49 and below) used a simpler `schtasks /Create
 /SC ONLOGON` registration without the resilience settings — those
-upgrade automatically once the new MSI lands. If your existing task
-has an ACL tightened so even the owner can't overwrite it (rare
-Win11 quirk), the MSI's RegisterAutostart custom action will silently
-skip (Return="ignore" so install completes), and the operator can
-delete the locked task from an elevated PowerShell once with:
+upgrade automatically once the new MSI lands.
 
-    schtasks /Delete /TN Roomler-<SID> /F
+Before FR-150, a task registered from an elevated prompt (the MSI or
+the wizard run as administrator, for instance) was owned by
+Administrators, and its own account could only read it. So the
+account's updates could not register it again: the MSI's
+RegisterAutostart failed (Return="ignore", so the install completed)
+and the daemon stayed down until the next sign-in. Each task now names
+a security descriptor of its account's own, so a new task stays that
+account's to replace, whichever prompt registered it. A task left like
+that before keeps its old descriptor until it is registered again from
+an elevated prompt, once, as the account whose task it is:
 
-with the SID of the account whose task it is (or `Roomler`, on an install
-from before the per-account name, after checking with
-`schtasks /Query /TN Roomler /XML` that its <UserId> is that account:
-every account's install used that one name), then re-run
-`service install` from a normal shell as that account.
+    & $roomlerd service install     # in an elevated prompt
+
+That deletes the task and registers it again, and deletes that
+account's legacy `Roomler` task too. Until then `service status` and
+the daemon's log name the task, and each update leaves a task named
+`Roomler start-<SID>` that starts the daemon one, three and ten minutes
+later and deletes itself within the hour. Setting `ROOMLERD_TASK_SD=0`
+in the environment of `service install` registers the task as before.
 
 Auto-update
 -----------

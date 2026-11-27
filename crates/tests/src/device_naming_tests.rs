@@ -16,7 +16,11 @@ use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
 use roomler_ai_services::dao::overlay_node::{NewOverlayNode, OverlayNodeDao};
 use serde_json::{Value, json};
 
+use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
+use crate::tunnel_policy_permission_tests::{
+    Gate, GatedWrite, assert_no_problems, call, gate_problems, holder_problems,
+};
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -110,8 +114,10 @@ async fn admin_rename_survives_reenroll_and_reports_in_responses() {
     // by staying null, not by claiming a rename that never happened.
     assert!(resp["dns_renamed"].is_null());
 
-    // Re-enroll the SAME machine with the machine-reported name + a newer
-    // version: the version half must refresh, the admin rename must survive.
+    // Re-enroll the SAME machine with the machine-reported name, from a
+    // program of a newer version: the admin rename must survive, and the row
+    // records that program. #3565: the row's version stays its daemon's own
+    // (none here: this device's daemon never connected).
     enroll(
         &app,
         &t.tenant_id,
@@ -128,7 +134,11 @@ async fn admin_rename_survives_reenroll_and_reports_in_responses() {
         Some("renamed-device"),
         "re-enroll clobbered an admin rename"
     );
-    assert_eq!(agent["agent_version"].as_str(), Some("0.3.1"));
+    assert_eq!(agent["agent_version"].as_str(), Some(""));
+    assert_eq!(
+        agent["enrolling_program"],
+        json!({ "name": "unknown", "version": "0.3.1" })
+    );
 }
 
 #[tokio::test]
@@ -276,6 +286,7 @@ async fn rename_propagates_to_live_overlay_node_with_dedup() {
         supports_org_relay: false,
         advertised_routes: vec![],
         route_offer_withheld: None,
+        exit_serves_v6: None,
     };
     // A neighbour already OWNS the label the rename will want — forces the
     // in-network de-dup onto the `-2` suffix.
@@ -406,6 +417,158 @@ async fn tunnel_client_update_renames_and_labels() {
     assert_eq!(resp.status().as_u16(), 403);
 }
 
+// ─── #4218: the tunnel-client update decides its bit before its body ───
+
+/// Enroll a tunnel client in `t` with a token its owner mints; returns the
+/// client's id.
+async fn enroll_tunnel_client(app: &TestApp, t: &SeededTenant, machine_id: &str) -> String {
+    let (s, et) = call(
+        app,
+        "POST",
+        &format!("/api/tenant/{}/tunnel-client/enroll-token", t.tenant_id),
+        &t.admin.access_token,
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "the owner mints a tunnel enrollment token: {et}");
+    let enrolled: Value = app
+        .client
+        .post(app.url("/api/tunnel-client/enroll"))
+        .json(&json!({
+            "enrollment_token": et["enrollment_token"].as_str().unwrap(),
+            "machine_id": machine_id,
+            "machine_name": "Operator Laptop",
+            "os": "linux",
+            "client_version": "0.3.0-test",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    enrolled["tunnel_client_id"]
+        .as_str()
+        .expect("tunnel_client_id")
+        .to_string()
+}
+
+/// The org's tunnel clients, as its owner lists them.
+async fn tunnel_clients(app: &TestApp, t: &SeededTenant) -> Value {
+    let (s, list) = call(
+        app,
+        "GET",
+        &format!("/api/tenant/{}/tunnel-client", t.tenant_id),
+        &t.admin.access_token,
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "{list}");
+    list["items"].clone()
+}
+
+/// #4218 — `PUT …/tunnel-client/{id}` decides `MANAGE_AGENTS` before it parses
+/// the client id or reads the body: a member without the bit gets the one 403
+/// `forbidden` for a body that does not parse and for a client id that is not
+/// an id, the answer a body the route reads gets, and someone outside the org
+/// the one `not_a_member`. While the route took `Json<T>` as an extractor,
+/// axum answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone, and the handler parsed the id (400) before the
+/// bit. Nothing they send is stored.
+#[tokio::test]
+async fn the_tunnel_client_update_decides_the_bit_before_a_body_that_does_not_parse() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("devname-unparsed").await;
+    let other = app.seed_tenant("devname-unparsed-b").await;
+    let cid = enroll_tunnel_client(&app, &t, "tunnel-mach-devname-unparsed").await;
+    let fresh = ObjectId::new().to_hex();
+    let before = tunnel_clients(&app, &t).await;
+
+    let mut wrong = Vec::new();
+    for client in [cid.as_str(), fresh.as_str(), "not-an-id"] {
+        let write = GatedWrite {
+            method: "PUT",
+            path: format!("/api/tenant/{}/tunnel-client/{client}", t.tenant_id),
+            reads: json!({ "name": "hijack" }),
+            refused_field: r#"{"tags": 7}"#,
+        };
+        for (who, token, gate) in [
+            (
+                "a member without the bit",
+                &t.member.access_token,
+                Gate::Bit("MANAGE_AGENTS"),
+            ),
+            (
+                "another org's owner",
+                &other.admin.access_token,
+                Gate::NotAMember,
+            ),
+        ] {
+            wrong.extend(gate_problems(&app, who, token, gate, &write).await);
+        }
+    }
+    assert_no_problems("answered before the bit", &wrong);
+    assert_eq!(
+        tunnel_clients(&app, &t).await,
+        before,
+        "the org's tunnel clients are as they were"
+    );
+}
+
+/// #4218's control. A holder of `MANAGE_AGENTS` is answered a tunnel-client
+/// update that does not parse exactly as axum's `Json` extractor answers it,
+/// the status and the plain-text words, whatever the client id: reading the
+/// body after the bit changes who is answered first, never what a holder is
+/// told. Nothing such a body names is stored.
+#[tokio::test]
+async fn a_holder_is_answered_a_tunnel_client_update_that_does_not_parse_as_the_json_extractor_answers_it()
+ {
+    use roomler_ai_mod_network::routes::tunnel::UpdateTunnelClientRequest;
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("devname-unparsed-holder").await;
+    let cid = enroll_tunnel_client(&app, &t, "tunnel-mach-devname-holder").await;
+    let fresh = ObjectId::new().to_hex();
+    let before = tunnel_clients(&app, &t).await;
+
+    let mut wrong = Vec::new();
+    for client in [cid.as_str(), fresh.as_str(), "not-an-id"] {
+        wrong.extend(
+            holder_problems::<UpdateTunnelClientRequest>(
+                &app,
+                &t.admin.access_token,
+                "PUT",
+                &format!("/api/tenant/{}/tunnel-client/{client}", t.tenant_id),
+                r#"{"tags": 7}"#,
+            )
+            .await,
+        );
+    }
+    assert_no_problems("a holder of the bit", &wrong);
+    assert_eq!(
+        tunnel_clients(&app, &t).await,
+        before,
+        "the org's tunnel clients are as they were"
+    );
+}
+
+/// Stamp the version a device's daemon would have reported in its hello onto
+/// its row: a device enrolled over HTTP never says hello, and since #3565 an
+/// enrollment writes no version, because a row's version is its daemon's own.
+async fn set_reported_version(app: &TestApp, agent_id: &str, version: &str) {
+    let aid = ObjectId::parse_str(agent_id).unwrap();
+    let res = app
+        .db
+        .collection::<bson::Document>("agents")
+        .update_one(
+            bson::doc! { "_id": aid },
+            bson::doc! { "$set": { "agent_version": version } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.matched_count, 1, "no agent row {agent_id}");
+}
+
 // ─── FR-2: pin-update downgrade guard (2026-08-27) ─────────────
 
 /// The incident this guards: a stale operator script pinned rc.484 at a
@@ -425,6 +588,7 @@ async fn stale_pin_is_refused_unless_forced() {
         "0.4.1",
     )
     .await;
+    set_reported_version(&app, &aid, "0.4.1").await;
 
     // Strictly older pin → 409 naming both versions.
     let resp = app
@@ -500,6 +664,8 @@ async fn bulk_stale_pin_skips_per_agent() {
         "0.4.2",
     )
     .await;
+    set_reported_version(&app, &old, "0.3.0-rc.400").await;
+    set_reported_version(&app, &new, "0.4.2").await;
 
     let resp: Value = app
         .auth_post(
@@ -567,6 +733,7 @@ async fn an_update_the_device_said_it_will_not_act_on_is_refused_with_why() {
         ("mach-p7-self", "Updating Box", Some("self")),
     ] {
         let aid = enroll(&app, &t.tenant_id, admin, mach, name, "0.4.146").await;
+        set_reported_version(&app, &aid, "0.4.146").await;
         set_update_mode(&app, &aid, mode).await;
         ids.push(aid);
     }

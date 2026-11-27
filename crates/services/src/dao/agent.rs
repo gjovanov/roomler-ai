@@ -5,14 +5,18 @@ use std::collections::HashMap;
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecAnchor,
-    ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, SshPolicy,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, EnrollingProgram,
+    ExecAnchor, ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, SshPolicy,
+    TokenRotation,
 };
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
 pub struct AgentDao {
     pub base: BaseDao<Agent>,
+    /// The same rows, read on the primary: the token rotation's reads
+    /// ([`Self::find_any_in_tenant_on_the_primary`]).
+    on_the_primary: BaseDao<Agent>,
 }
 
 /// FR-92 P7 — the slice of the agent row a heartbeat read BEFORE it wrote
@@ -39,12 +43,17 @@ impl AgentDao {
     pub fn new(db: &Database) -> Self {
         Self {
             base: BaseDao::new(db, Agent::COLLECTION),
+            on_the_primary: BaseDao::on_the_primary(db, Agent::COLLECTION),
         }
     }
 
     /// `install` is the enroll request's claim, already clamped by the route
     /// (FR-102 P3); `None` = the request did not say, stored as `unknown` so
     /// a row this code created can be told from one that predates it.
+    ///
+    /// `enrolling_program` (#3565) is the program that enrolled, already
+    /// clamped by the route. The row takes no version: only its daemon's
+    /// hello writes one ([`Self::update_hello`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
@@ -53,7 +62,7 @@ impl AgentDao {
         name: String,
         machine_id: String,
         os: OsKind,
-        agent_version: String,
+        enrolling_program: EnrollingProgram,
         agent_token_hash: String,
         install: Option<InstallInfo>,
     ) -> DaoResult<Agent> {
@@ -63,7 +72,7 @@ impl AgentDao {
             name,
             machine_id,
             os,
-            agent_version,
+            enrolling_program,
             agent_token_hash,
             install,
         );
@@ -85,7 +94,7 @@ impl AgentDao {
         name: String,
         machine_id: String,
         os: OsKind,
-        agent_version: String,
+        enrolling_program: EnrollingProgram,
         key_id: ObjectId,
         ttl_secs: Option<u64>,
         install: Option<InstallInfo>,
@@ -96,7 +105,7 @@ impl AgentDao {
             name,
             machine_id,
             os,
-            agent_version,
+            enrolling_program,
             String::new(),
             install,
         );
@@ -116,7 +125,7 @@ impl AgentDao {
         name: String,
         machine_id: String,
         os: OsKind,
-        agent_version: String,
+        enrolling_program: EnrollingProgram,
         agent_token_hash: String,
         install: Option<InstallInfo>,
     ) -> Agent {
@@ -141,7 +150,9 @@ impl AgentDao {
             // FR-97 P0d — the hello reports it; enrolment never does.
             arch: None,
             arch_emulated: false,
-            agent_version,
+            // #3565 — the daemon's hello reports it; an enrollment never does,
+            // whichever program enrolled. Not reported yet until then.
+            agent_version: None,
             // FR-27 — unknown until the device's first heartbeat, for the same
             // reason as the host key below: enrolment never reaches the machine.
             companion_version: None,
@@ -157,10 +168,11 @@ impl AgentDao {
             // first hello.
             peer_auth_key: String::new(),
             agent_token_hash,
-            // FR-103 — a new row starts at generation 0; only a removal
-            // advances it.
+            // FR-103 — a new row starts at generation 0; a removal and a
+            // token rotation (FR-155) advance it.
             token_gen: 0,
             token_exp: None,
+            token_rotation: None,
             status: AgentStatus::Offline,
             last_seen_at: now,
             last_presence: None,
@@ -183,6 +195,8 @@ impl AgentDao {
             // Always `Some` on a row this code creates: `None` is reserved
             // for rows that predate the install trace.
             install: Some(install.unwrap_or_else(InstallInfo::unknown)),
+            // #3565 — how the device was enrolled: the program and its version.
+            enrolling_program: Some(enrolling_program),
             ssh_policy: SshPolicy::default(),
             peer_relay_policy: Default::default(),
             // FR-52 gate 2 closed, and NO connect code. A code is minted on
@@ -231,8 +245,8 @@ impl AgentDao {
     }
 
     /// Refresh a LIVE agent row at re-enrollment time, for a device nobody
-    /// removed (a lost token, a reinstall): update os / agent_version from the
-    /// new enrollment payload, bump `updated_at`. Returns the updated row so
+    /// removed (a lost token, a reinstall): update os and the enrolling
+    /// program from the new enrollment payload, bump `updated_at`. Returns the updated row so
     /// the caller can issue a fresh agent token against it. Everything the
     /// device was allowed stays.
     ///
@@ -251,18 +265,23 @@ impl AgentDao {
     /// SAID how it was installed: a re-enroll by an agent from before P3, or
     /// a `roomlerd re-enroll` (which sends nothing), must not downgrade a
     /// known method to `unknown`.
+    ///
+    /// #3565: the row's version is left as it is. It is its daemon's own,
+    /// written by its hello ([`Self::update_hello`]), whichever program
+    /// enrolls the machine again. `enrolling_program` records the program of
+    /// this enrollment instead.
     pub async fn rehydrate(
         &self,
         agent_id: ObjectId,
         name: &str,
         os: OsKind,
-        agent_version: &str,
+        enrolling_program: &EnrollingProgram,
         install: Option<&InstallInfo>,
     ) -> DaoResult<Agent> {
         let os_bson = bson::to_bson(&os).unwrap_or(bson::Bson::Null);
         let mut set = doc! {
             "os": os_bson,
-            "agent_version": agent_version,
+            "enrolling_program": bson::to_bson(enrolling_program).unwrap_or(bson::Bson::Null),
             "updated_at": DateTime::now(),
         };
         if let Some(install) = install {
@@ -329,7 +348,7 @@ impl AgentDao {
         owner_user_id: ObjectId,
         name: String,
         os: OsKind,
-        agent_version: String,
+        enrolling_program: EnrollingProgram,
         install: Option<InstallInfo>,
     ) -> DaoResult<Option<Agent>> {
         let (Some(id), Some(removed_at)) = (tombstone.id, tombstone.deleted_at) else {
@@ -337,13 +356,15 @@ impl AgentDao {
                 "only a removed row with an id can be revived".to_string(),
             ));
         };
+        // #3565: like a new row, a revived one has no version until its
+        // daemon's hello reports one.
         let mut row = Self::new_row(
             tombstone.tenant_id,
             owner_user_id,
             name,
             tombstone.machine_id.clone(),
             os,
-            agent_version,
+            enrolling_program,
             String::new(),
             install,
         );
@@ -392,7 +413,7 @@ impl AgentDao {
         self.base
             .find_paginated(
                 doc! { "tenant_id": tenant_id, "deleted_at": null },
-                Some(doc! { "created_at": -1 }),
+                Some(doc! { "created_at": -1, "_id": -1 }),
                 params,
             )
             .await
@@ -498,6 +519,27 @@ impl AgentDao {
             .await
     }
 
+    /// [`Self::find_any_in_tenant`], read on the primary whatever the
+    /// connection string prefers. For the token rotation (FR-155): its
+    /// admission decides on the row's generation and last rotation as read,
+    /// its update compares against the primary's row ([`Self::rotate_token`]),
+    /// and after an update that matched nothing it reads the row again to say
+    /// why. Each read must see what the primary has applied, which a
+    /// secondary may not have yet.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the token rotation tells a removed device that it was removed, as the revocation checks do"
+    )]
+    pub async fn find_any_in_tenant_on_the_primary(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+    ) -> DaoResult<Agent> {
+        self.on_the_primary
+            .find_any_by_id_in_tenant(tenant_id, agent_id)
+            .await
+    }
+
     /// The filter every ADMIN-driven setter below writes through: this row,
     /// in this tenant, and LIVE (#1821). The routes look the device up live
     /// first; this closes the window between that read and the write, and
@@ -537,6 +579,8 @@ impl AgentDao {
             .await
     }
 
+    /// #3565: the one writer of the row's `agent_version`, from the daemon's
+    /// own hello. An enrollment never writes it.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_hello(
         &self,
@@ -1331,6 +1375,60 @@ impl AgentDao {
             .await
     }
 
+    /// FR-155 — commit one token rotation, as ONE conditional update: the row
+    /// moves from generation `from_gen` to `from_gen + 1` and records the
+    /// rotation (`token_rotation`) and the new token's `exp`, only when it is
+    /// at `from_gen`, live, not quarantined, and its last rotation is absent
+    /// or earlier than `last_rotation_before`. One rotation per generation: a
+    /// committed rotation leaves the row at `from_gen + 1`, which a filter at
+    /// `from_gen` does not match. The last condition is the once-an-hour
+    /// ceiling, so it needs no state of its own. `false` when nothing matched;
+    /// the caller reads the row again to say why.
+    ///
+    /// `deleted_at: null` is the live predicate, null or absent, as in every
+    /// live reader of this collection (`BaseDao::find_by_id_in_tenant`); a
+    /// tombstone carries a date. A row from before FR-103 has no `token_gen`
+    /// field, which the model reads as 0, so generation 0 also matches the
+    /// absent field, and `$inc` then writes 1.
+    pub async fn rotate_token(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        from_gen: u32,
+        rotation: &TokenRotation,
+        last_rotation_before: DateTime,
+        token_exp_unix: i64,
+    ) -> DaoResult<bool> {
+        let generation = if from_gen == 0 {
+            bson::Bson::Document(doc! { "$in": [0_i64, bson::Bson::Null] })
+        } else {
+            bson::Bson::Int64(i64::from(from_gen))
+        };
+        let filter = doc! {
+            "_id": agent_id,
+            "tenant_id": tenant_id,
+            "token_gen": generation,
+            "deleted_at": null,
+            "status": { "$ne": "quarantined" },
+            "$or": [
+                { "token_rotation.at": { "$exists": false } },
+                { "token_rotation.at": { "$lt": last_rotation_before } },
+            ],
+        };
+        self.base
+            .update_one(
+                filter,
+                doc! {
+                    "$inc": { "token_gen": 1 },
+                    "$set": {
+                        "token_rotation": bson::to_bson(rotation)?,
+                        "token_exp": DateTime::from_millis(token_exp_unix.saturating_mul(1000)),
+                    },
+                },
+            )
+            .await
+    }
+
     /// FR-51 — remove an EPHEMERAL row outright. The `(tenant_id, machine_id)`
     /// unique index is not partial on `deleted_at`, so a tombstoned ephemeral
     /// row would reserve its random, never-reused machine_id forever — every
@@ -1418,5 +1516,60 @@ impl AgentDao {
                 doc! { "$set": { "owner_user_id": owner_user_id } },
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mongodb::{
+        Client,
+        options::{ReadPreference, SelectionCriteria},
+    };
+
+    use super::*;
+
+    /// The token rotation decides on the row it reads and writes on a compare
+    /// with it, so its reads go to the primary whatever the connection string
+    /// prefers, while every other reader keeps the handle's preference. The
+    /// driver connects lazily: no server is needed to read where a handle
+    /// reads.
+    #[tokio::test]
+    async fn the_rotation_reads_its_row_on_the_primary() {
+        let client = Client::with_uri_str(
+            "mongodb://127.0.0.1:9/?readPreference=secondaryPreferred&w=majority",
+        )
+        .await
+        .unwrap();
+        let db = client.database("agent_reads");
+        let agents = AgentDao::new(&db);
+
+        // The control: the shared handle prefers a secondary, as the
+        // connection string says.
+        assert!(
+            matches!(
+                agents.base.collection().selection_criteria(),
+                Some(SelectionCriteria::ReadPreference(
+                    ReadPreference::SecondaryPreferred { .. }
+                ))
+            ),
+            "the shared handle reads {:?}",
+            agents.base.collection().selection_criteria()
+        );
+
+        let rotation = agents.on_the_primary.collection();
+        assert_eq!(rotation.name(), Agent::COLLECTION);
+        assert!(
+            matches!(
+                rotation.selection_criteria(),
+                Some(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+            ),
+            "the rotation reads {:?}",
+            rotation.selection_criteria()
+        );
+        assert_eq!(
+            format!("{:?}", rotation.write_concern()),
+            format!("{:?}", db.write_concern()),
+            "the rotation's handle keeps the write concern"
+        );
     }
 }

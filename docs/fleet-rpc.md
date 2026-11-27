@@ -29,7 +29,7 @@ twice (2026-08-07 and 2026-08-09); the verb existed both times.
 sets one, and otherwise by its default: `roomlerd` and `tunnel_core` at INFO,
 everything else at WARN (`crates/agent-core/src/logging.rs:411`). Either way it then
 keeps INFO from two targets that no shipped unit names
-(`crates/agent-core/src/logging.rs:494`, #1928):
+(`crates/agent-core/src/logging.rs:506`, #1928):
 
 | Target | Its INFO lines |
 |---|---|
@@ -41,9 +41,12 @@ directive for the target, for a module under it or for any prefix of its name
 (`EnvFilter` matches targets by prefix), or a bare level of `info` or finer. So
 `RUST_LOG=debug` still logs both at DEBUG, and `roomler_localapi=off` keeps the crate
 silent. An empty or wholly invalid `RUST_LOG` is left alone too: `EnvFilter` then
-logs ERROR from every target. Two directives are added whatever the spec says:
-`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:449`) and
-`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:460`).
+logs ERROR from every target. Three directives are added whatever the spec says:
+`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:449`),
+`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:460`) and
+`tunnel_core::overlay::route_guard=info` (`crates/agent-core/src/logging.rs:472`), the
+target of the overlay route guard's two INFO lines (#4380,
+[overlay-communication.md §8](overlay-communication.md#8-failure-handling)).
 
 ## Transport
 
@@ -104,7 +107,12 @@ Where the desktop app was up and a Mac's road from the question to it was
 closed (#4140), the sentence names that cause instead: "nobody could be asked
 at this device — the question could not reach the Roomler desktop app there
 (…); answer with `roomlerd consent` there, or set this device's execution
-policy to auto". One a surface showed, which nobody answered, ends "the
+policy to auto". Where the device's consent panel was showing another question
+and nothing else showed this one (#4164), it says so, whatever the app's side
+found: "nobody could be asked at this device — its consent panel was showing
+another question, and nothing else there could show this one; answer with
+`roomlerd consent` there, ask again once the panel is free, or set this
+device's execution policy to auto". One a surface showed, which nobody answered, ends "the
 operator at this device did not approve the command (Timeout)", as before. The
 chain and its log line are in [remote-control.md §11.2](remote-control.md#112-consent),
 its "Prompt surfaces" paragraph.
@@ -202,6 +210,15 @@ to a local pipe. What each attempt to get around that meets:
 | Squat the doorbell's pipe name | the worker refuses a pipe SYSTEM does not own; the service's `first_pipe_instance` refuses to share the name |
 | Read SYSTEM's output | it is posted from the service to the server over HTTPS |
 | An http origin, to rewrite the claim on the path | the anchor accepts https only (loopback excepted, for tests) |
+
+**An update waits for the command (#4244).** The worker's periodic update
+cannot see a command the service runs, so the service counts each one it
+holds, from its claim until its result is posted, and never past 8 min
+(`HeldRuns`, `agents/roomlerd/src/exec_service.rs:637`). Its health answer
+carries that count (`exec_runs`): a number, never which command or whose, to
+the callers the pipe already admits. The worker asks for it at each decision,
+and defers on it as on a command of its own
+([installation.md](installation.md#a-command-the-system-service-runs-4244)).
 
 ### Anchoring a device
 
@@ -526,10 +543,10 @@ run the command as root:
 
 | Where | What is checked | Source |
 |---|---|---|
-| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:975`](../crates/modules/fleet/src/agent_exec.rs#L975) |
+| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:981`](../crates/modules/fleet/src/agent_exec.rs#L981) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:371`](../crates/modules/fleet/src/agent_exec.rs#L371) |
 | The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3206`](../crates/modules/fleet/src/hub.rs#L3206) |
-| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5773`](../agents/roomlerd/src/signaling.rs#L5773) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5843`](../agents/roomlerd/src/signaling.rs#L5843) |
 
 The word is kept per connection, never read from the stored row, for the reason
 `ssh-grant-ack` is: after a rollback the row still promises what the running

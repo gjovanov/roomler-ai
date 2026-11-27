@@ -360,7 +360,7 @@ async fn admit(
         Err(_) => {
             return Response::builder()
                 .status(400)
-                .body("Invalid agent ID".into())
+                .body("Invalid device ID".into())
                 .unwrap();
         }
     };
@@ -401,10 +401,12 @@ async fn admit(
                     .body("Unauthorized (derp)".into())
                     .unwrap();
             }
-            // FR-103 — a token minted before the device was removed.
+            // FR-103 — a token minted before the device was removed, or
+            // before its token rotation (FR-155).
             if let Some(reason) = roomler_ai_mod_fleet::auth_agent::generation_refusal(
                 claims.generation,
                 agent.token_gen,
+                roomler_ai_mod_fleet::auth_agent::generation_from_rotation(&agent),
                 state.fleet.settings.rc.token_generation_check,
             ) {
                 info!(%agent_id, %tenant_id, reason, row_gen = agent.token_gen, "derp: REFUSED before upgrade");

@@ -72,7 +72,7 @@ impl TaskService {
             .db_dao
             .find_paginated(
                 doc! { "tenant_id": tenant_id, "user_id": user_id },
-                Some(doc! { "created_at": -1 }),
+                Some(doc! { "created_at": -1, "_id": -1 }),
                 params,
             )
             .await

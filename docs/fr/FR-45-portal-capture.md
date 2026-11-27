@@ -1,5 +1,7 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
+**Anchors:** master `8c154c2d9` (closed 2026-11-08): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 → P3c COMPLETE and field-verified — **a Wayland desktop is captured through the portal and delivered to the daemon as a correct picture**. **P4 (RemoteDesktop input) FIELD-VERIFIED** — injection lands to the exact requested pixel, scroll sign correct, restore round trip clean. **P5 (mutter direct) FIELD-VERIFIED on WSL2, through the daemon's own cascade, encoding with `av1_nvenc` at native 1920×1080 in 11.4 ms — AC2 met** (2026-09-25). **AC8 met 2026-11-02, on FR-93 P2c's pill; every criterion is ticked, and P5b is [#3343](https://github.com/gjovanov/roomler-ai/issues/3343).** **Docs:** [`docs/linux-capture.md`](../linux-capture.md) · **Owner:** agent / capture
 
 ## Goal
@@ -376,7 +378,7 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
       and it never captures a greeter. *Reworded 2026-11-02 from "attended-only — no
       greeter, no locked screen". The UI half is FR-93 P2c, this criterion's option (b):
       `rc:video-info` carries `capture_arm` and `attended`, and the viewer's pill reads
-      "desktop portal · allowed at the screen" (`useRemoteControl.ts:1331`), watched on
+      "desktop portal · allowed at the screen" (`useRemoteControl.ts:1282`), watched on
       P2d-3's build and on 0.4.138 (FR-93 §11, 2026-10-13 and 2026-10-16). "No locked screen" is
       not true of every desktop: KWin keeps streaming its lock screen, on a token a person
       granted (same rows). FR-93's D4 names option (b) as a recommendation and has no

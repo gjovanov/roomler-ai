@@ -72,6 +72,43 @@ describe('useRoomStore', () => {
     })
   })
 
+  // #4395 — the room a page shows, for the unread check.
+  describe('showRoom', () => {
+    it('names the room until its own release, and leaves current alone', () => {
+      const store = useRoomStore()
+      store.setCurrent(makeRoom({ id: 'r1' }), 'T')
+      const release = store.showRoom('r1')
+      expect(store.shownRoomId).toBe('r1')
+
+      release()
+
+      expect(store.shownRoomId).toBeNull()
+      expect(store.current?.id, 'the last opened room is kept').toBe('r1')
+      expect(store.currentTenantId).toBe('T')
+    })
+
+    it("a page's late release does not clear the next page's claim", () => {
+      const store = useRoomStore()
+      const releaseChat = store.showRoom('r1')
+      // The call page of the same room mounts before the chat page unmounts.
+      const releaseCall = store.showRoom('r1')
+      releaseChat()
+      expect(store.shownRoomId).toBe('r1')
+
+      releaseCall()
+      expect(store.shownRoomId).toBeNull()
+    })
+
+    it('a release after another room was claimed keeps that room', () => {
+      const store = useRoomStore()
+      const releaseA = store.showRoom('a')
+      store.showRoom('b')
+      releaseA()
+      releaseA()
+      expect(store.shownRoomId).toBe('b')
+    })
+  })
+
   describe('fetchRooms', () => {
     it('should populate rooms array from API', async () => {
       const rooms = [makeRoom({ id: 'r1' }), makeRoom({ id: 'r2' })]
@@ -307,5 +344,282 @@ describe('useRoomStore', () => {
 
       expect(mockApi.post).not.toHaveBeenCalled()
     })
+  })
+})
+
+// #4257 — the store holds one org's rooms at a time, and knows which. The
+// shell reloads them on every change of org (AppLayout); a page that only
+// lists or picks them asks with `ensureRooms`, which fetches only when the
+// store does not hold that org's rooms.
+describe('useRoomStore: one org at a time (#4257)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  const ids = () => useRoomStore().rooms.map((r) => r.id)
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+  /** Let every answer already handed over land. */
+  const settle = () => new Promise((r) => setTimeout(r, 0))
+  /** The next GET answers when the test says so. */
+  function heldGet() {
+    let resolve!: (v: unknown) => void
+    let reject!: (e: unknown) => void
+    mockApi.get.mockReturnValueOnce(
+      new Promise((res, rej) => {
+        resolve = res
+        reject = rej
+      }) as never,
+    )
+    return { resolve, reject }
+  }
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    // A test that stops before its held GET is sent must not hand it to the next.
+    mockApi.get.mockReset()
+  })
+
+  it("a fetch for org B drops org A's rooms at once, and org A's late answer", async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce([makeRoom({ id: 'ra', tenant_id: ORG_A })])
+    await s.fetchRooms(ORG_A)
+    const lateA = heldGet()
+    const refreshA = s.fetchRooms(ORG_A)
+    const answerB = heldGet()
+    const loadB = s.fetchRooms(ORG_B)
+    expect(s.rooms).toEqual([])
+
+    answerB.resolve([makeRoom({ id: 'rb', tenant_id: ORG_B })])
+    await loadB
+    lateA.resolve([makeRoom({ id: 'ra' }), makeRoom({ id: 'ra2' })])
+    await refreshA
+    expect(ids()).toEqual(['rb'])
+    expect(s.loading).toBe(false)
+  })
+
+  it("org A's late failure does not end org B's load", async () => {
+    const s = useRoomStore()
+    const failA = heldGet()
+    const loadA = s.fetchRooms(ORG_A).catch(() => undefined)
+    const answerB = heldGet()
+    const loadB = s.fetchRooms(ORG_B)
+    failA.reject(new Error('Missing permission'))
+    await settle()
+    expect(s.loading).toBe(true)
+
+    answerB.resolve([makeRoom({ id: 'rb', tenant_id: ORG_B })])
+    await loadB
+    await loadA
+    expect(ids()).toEqual(['rb'])
+    expect(s.loading).toBe(false)
+  })
+
+  it("a room created for org A once the list is org B's stays out of it", async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce([makeRoom({ id: 'ra', tenant_id: ORG_A })])
+    await s.fetchRooms(ORG_A)
+    let created!: (v: unknown) => void
+    mockApi.post.mockReturnValueOnce(new Promise((r) => (created = r)) as never)
+    const create = s.createRoom(ORG_A, { name: 'New' })
+    mockApi.get.mockResolvedValueOnce([makeRoom({ id: 'rb', tenant_id: ORG_B })])
+    await s.fetchRooms(ORG_B)
+    created(makeRoom({ id: 'ra-new', tenant_id: ORG_A }))
+    await create
+    expect(ids()).toEqual(['rb'])
+  })
+
+  // The welcome tour counts the rooms right after its await (AppLayout). A
+  // fetch whose own answer was dropped must not settle before the newest one
+  // has landed: the tour would count an empty list, and could send a new user
+  // to the tutorial in an org that has rooms.
+  it('a fetch superseded by a newer one for the same org settles once the newer one has landed', async () => {
+    const s = useRoomStore()
+    const first = heldGet()
+    let settled = false
+    const tour = s.fetchRooms(ORG_A).then(() => {
+      settled = true
+      return ids()
+    })
+    const second = heldGet()
+    const shell = s.fetchRooms(ORG_A)
+    first.resolve([makeRoom({ id: 'r1' })])
+    await settle()
+    expect(settled).toBe(false)
+
+    second.resolve([makeRoom({ id: 'r1' }), makeRoom({ id: 'r2' })])
+    await shell
+    expect(await tour).toEqual(['r1', 'r2'])
+  })
+
+  it("ensureRooms for org B while holding org A's: one fetch, for org B", async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce([makeRoom({ id: 'ra', tenant_id: ORG_A })])
+    await s.fetchRooms(ORG_A)
+    mockApi.get.mockResolvedValueOnce([makeRoom({ id: 'rb', tenant_id: ORG_B })])
+    await s.ensureRooms(ORG_B)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/room`, `/tenant/${ORG_B}/room`])
+    expect(ids()).toEqual(['rb'])
+    expect(s.roomsTenantId).toBe(ORG_B)
+  })
+
+  it("ensureRooms for org A while holding org A's: no fetch, for an org with no rooms too", async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce([])
+    await s.fetchRooms(ORG_A)
+    await s.ensureRooms(ORG_A)
+    await s.ensureRooms(ORG_A)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/room`])
+  })
+
+  it("ensureRooms while org A's fetch is in flight sends no second GET, and settles once org A's rooms have landed", async () => {
+    const s = useRoomStore()
+    const answer = heldGet()
+    const loading = s.fetchRooms(ORG_A)
+    let settled = false
+    const ensured = s.ensureRooms(ORG_A).then(() => {
+      settled = true
+      return ids()
+    })
+    await settle()
+    expect(settled).toBe(false)
+
+    answer.resolve([makeRoom({ id: 'ra', tenant_id: ORG_A })])
+    expect(await ensured).toEqual(['ra'])
+    await loading
+    expect(asked()).toEqual([`/tenant/${ORG_A}/room`])
+  })
+
+  it("ensureRooms while org A's fetch is in flight fails with it, so a count after it never reads a list that did not load", async () => {
+    const s = useRoomStore()
+    const answer = heldGet()
+    const loading = s.fetchRooms(ORG_A).catch(() => undefined)
+    const ensured = s.ensureRooms(ORG_A)
+    answer.reject(new Error('fail'))
+    await expect(ensured).rejects.toThrow('fail')
+    await loading
+  })
+
+  it('ensureRooms after a failed fetch: fetches', async () => {
+    const s = useRoomStore()
+    mockApi.get.mockRejectedValueOnce(new Error('network'))
+    await s.fetchRooms(ORG_A).catch(() => undefined)
+    mockApi.get.mockResolvedValueOnce([makeRoom({ id: 'ra', tenant_id: ORG_A })])
+    await s.ensureRooms(ORG_A)
+    expect(asked()).toHaveLength(2)
+    expect(ids()).toEqual(['ra'])
+  })
+
+  // #4257 (the review's F5) — the shell counts the unread messages of the rooms
+  // it fetched (`AppLayout.vue`: `fetchRooms(tid).then(() =>
+  // fetchAllUnreadCounts(tid))`). A superseded fetch settles with the newest
+  // one, so its count ran for the previous org over the new org's rooms: one
+  // request a room, each refused. A count runs over its own org's rooms only.
+  it('fetchAllUnreadCounts for an org the rooms are not of asks nothing', async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce([makeRoom({ id: 'rb', tenant_id: ORG_B })])
+    await s.fetchRooms(ORG_B)
+    mockApi.get.mockClear()
+    await s.fetchAllUnreadCounts(ORG_A)
+    await settle()
+    expect(asked()).toEqual([])
+  })
+
+  it("the shell's count after a fetch that the next org's superseded asks nothing for the previous org, and the next org's count runs", async () => {
+    const s = useRoomStore()
+    const answerA = heldGet()
+    const chainA = s.fetchRooms(ORG_A).then(() => s.fetchAllUnreadCounts(ORG_A))
+    const answerB = heldGet()
+    const chainB = s.fetchRooms(ORG_B).then(() => s.fetchAllUnreadCounts(ORG_B))
+    // Every later GET is an unread count.
+    mockApi.get.mockResolvedValue({ count: 3 })
+    answerA.resolve([makeRoom({ id: 'ra', tenant_id: ORG_A })])
+    answerB.resolve([makeRoom({ id: 'rb', tenant_id: ORG_B })])
+    await Promise.all([chainA, chainB])
+    await settle()
+    expect(asked().filter((p) => p.startsWith(`/tenant/${ORG_A}/room/`))).toEqual([])
+    expect(asked()).toContain(`/tenant/${ORG_B}/room/rb/message/unread-count`)
+    expect(s.unreadCounts.rb).toBe(3)
+  })
+})
+
+// #4332 — the current room is one org's too, and the store records which. The
+// API's room carries no org (`Room.tenant_id` is declared, never sent), so a
+// page that names the current room under an org (the Files page) asks
+// `currentTenantId`, never the room. Nothing clears `current` on a change of
+// org: a room opened in org A's chat is still current under org B.
+describe('useRoomStore: the current room records its org (#4332)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  /** Let every answer already handed over land. */
+  const settle = () => new Promise((r) => setTimeout(r, 0))
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    mockApi.get.mockReset()
+  })
+
+  it('fetchRoom records the org it asked with the room, once the answer has landed: until then the previous room keeps its own', async () => {
+    const s = useRoomStore()
+    // The answer's own `tenant_id` ('t1') is not the org: the store records the org it asked.
+    mockApi.get.mockResolvedValueOnce(makeRoom({ id: 'ra' }))
+    await s.fetchRoom(ORG_A, 'ra')
+    expect.soft(s.current?.id).toBe('ra')
+    expect.soft(s.currentTenantId).toBe(ORG_A)
+
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)) as never)
+    const loadB = s.fetchRoom(ORG_B, 'rb')
+    await settle()
+    expect.soft(s.current?.id, 'the previous room until the answer lands').toBe('ra')
+    expect.soft(s.currentTenantId, "the previous room's org until the answer lands").toBe(ORG_A)
+
+    answerB(makeRoom({ id: 'rb' }))
+    await loadB
+    expect.soft(s.current?.id).toBe('rb')
+    expect.soft(s.currentTenantId).toBe(ORG_B)
+  })
+
+  it('a fetchRoom that fails leaves the current room and its org', async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce(makeRoom({ id: 'ra' }))
+    await s.fetchRoom(ORG_A, 'ra')
+    mockApi.get.mockRejectedValueOnce(new Error('Not found'))
+    await expect(s.fetchRoom(ORG_B, 'rb')).rejects.toThrow('Not found')
+    expect.soft(s.current?.id).toBe('ra')
+    expect.soft(s.currentTenantId).toBe(ORG_A)
+  })
+
+  it('setCurrent records the org it is given, and none without one', () => {
+    const s = useRoomStore()
+    s.setCurrent(makeRoom({ id: 'ra' }), ORG_A)
+    expect.soft(s.current?.id).toBe('ra')
+    expect.soft(s.currentTenantId).toBe(ORG_A)
+
+    s.setCurrent(makeRoom({ id: 'rb' }))
+    expect.soft(s.current?.id).toBe('rb')
+    expect.soft(s.currentTenantId, 'a room set with no org is no org').toBeNull()
+  })
+
+  it('setCurrent(null) clears the room and its org', () => {
+    const s = useRoomStore()
+    s.setCurrent(makeRoom({ id: 'ra' }), ORG_A)
+    s.setCurrent(null)
+    expect.soft(s.current).toBeNull()
+    expect.soft(s.currentTenantId).toBeNull()
+  })
+
+  it('deleteRoom of the current room clears the room and its org; of another room, neither', async () => {
+    const s = useRoomStore()
+    mockApi.get.mockResolvedValueOnce(makeRoom({ id: 'ra' }))
+    await s.fetchRoom(ORG_A, 'ra')
+    mockApi.delete.mockResolvedValue(undefined as never)
+
+    await s.deleteRoom(ORG_A, 'other')
+    expect.soft(s.current?.id).toBe('ra')
+    expect.soft(s.currentTenantId).toBe(ORG_A)
+
+    await s.deleteRoom(ORG_A, 'ra')
+    expect.soft(s.current).toBeNull()
+    expect.soft(s.currentTenantId).toBeNull()
   })
 })

@@ -68,6 +68,19 @@ export interface FileEntry {
 export const useRoomStore = defineStore('rooms', () => {
   const rooms = ref<Room[]>([])
   const current = ref<Room | null>(null)
+  /** #4332 — which org `current` is of: the org `fetchRoom` asked, or the one
+   *  `setCurrent` was given; null when nobody said. The API's room carries no
+   *  org, and nothing clears `current` on a change of org, so a page that names
+   *  the current room under an org asks this, never `current.tenant_id`. */
+  const currentTenantId = ref<string | null>(null)
+  /** #4395 — the room a page shows now: the chat page or the call page,
+   *  while it is mounted on that room; null on every other page. The unread
+   *  check asks this, never `current`, which keeps naming the last opened
+   *  room after its page is left. Only the page that claimed it releases it
+   *  (`showRoom` hands back the release): the next page's claim can land
+   *  before the previous page unmounts. */
+  const shownRoomId = ref<string | null>(null)
+  let shownBy: symbol | null = null
   const participants = ref<Participant[]>([])
   const loading = ref(false)
   const roomFiles = ref<FileEntry[]>([])
@@ -91,14 +104,60 @@ export const useRoomStore = defineStore('rooms', () => {
   }
 
   // --- Room CRUD ---
-  async function fetchRooms(tenantId: string) {
+  /** #4257 — which org `rooms` describes: the org of the latest list fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's rooms never show (or fill a picker) under another org's page. */
+  const roomsTenantId = ref<string | null>(null)
+  // Only the latest list fetch writes: the answer for an org asked before it
+  // (the page moved on to another org) is dropped.
+  let listSeq = 0
+  // The latest list fetch failed: `ensureRooms` asks again.
+  let listFailed = false
+  // The latest list fetch. One that a newer fetch superseded settles with it,
+  // not with its own dropped answer: a caller that reads the rooms right
+  // after its await then reads the newest ones. The welcome tour counts them
+  // so (AppLayout), and an empty count could send a new user to the tutorial.
+  let latestFetch: Promise<void> = Promise.resolve()
+
+  function fetchRooms(tenantId: string): Promise<void> {
+    const mySeq = ++listSeq
+    if (roomsTenantId.value !== null && roomsTenantId.value !== tenantId) rooms.value = []
+    roomsTenantId.value = tenantId
+    listFailed = false
     loading.value = true
-    try {
-      rooms.value = await api.get<Room[]>(`/tenant/${tenantId}/room`)
-    } finally {
-      loading.value = false
-    }
+    const run = (async (): Promise<void> => {
+      try {
+        const list = await api.get<Room[]>(`/tenant/${tenantId}/room`)
+        if (mySeq !== listSeq) return latestFetch
+        rooms.value = list
+      } catch (e) {
+        if (mySeq !== listSeq) return latestFetch
+        listFailed = true
+        throw e
+      } finally {
+        if (mySeq === listSeq) loading.value = false
+      }
+    })()
+    latestFetch = run
+    return run
   }
+
+  /** #4257 — the org's rooms for a page that only lists, counts or picks
+   *  them, fetched only when the store does not hold them already: the shell
+   *  loads them on every change of org. A store that holds another org's
+   *  rooms, or whose last fetch failed, fetches. One that holds this org's
+   *  answers with that fetch, as `ensureAgents` does: it settles only once
+   *  the rooms have landed, and fails with it. It replaces a check of an
+   *  empty list, which never reloaded a list holding another org's rooms. */
+  function ensureRooms(tenantId: string): Promise<void> {
+    if (roomsTenantId.value === tenantId && !listFailed) return latestFetch
+    return fetchRooms(tenantId)
+  }
+
+  /** A room created for `tenantId` joins the list only when the list is not
+   *  another org's. */
+  const listIsOf = (tenantId: string) =>
+    roomsTenantId.value === null || roomsTenantId.value === tenantId
 
   /** Server-side sidebar search (`GET /room?q=…&page=…`) — respects
    *  secret-room visibility server-side and returns a bare page of rooms.
@@ -126,7 +185,7 @@ export const useRoomStore = defineStore('rooms', () => {
       delete body.has_media
     }
     const room = await api.post<Room>(`/tenant/${tenantId}/room`, body)
-    rooms.value.push(room)
+    if (listIsOf(tenantId)) rooms.value.push(room)
     return room
   }
 
@@ -135,6 +194,7 @@ export const useRoomStore = defineStore('rooms', () => {
     rooms.value = rooms.value.filter((r) => r.id !== roomId)
     if (current.value?.id === roomId) {
       current.value = null
+      currentTenantId.value = null
     }
     delete unreadCounts.value[roomId]
   }
@@ -149,7 +209,10 @@ export const useRoomStore = defineStore('rooms', () => {
 
   async function fetchRoom(tenantId: string, roomId: string) {
     const room = await api.get<Room>(`/tenant/${tenantId}/room/${roomId}`)
+    // The room and its org land together: until the answer, the previous room
+    // keeps its own org.
     current.value = room
+    currentTenantId.value = tenantId
     return room
   }
 
@@ -159,8 +222,24 @@ export const useRoomStore = defineStore('rooms', () => {
     )
   }
 
-  function setCurrent(room: Room | null) {
+  /** `tenantId` is the org the room is of. Without it the room's org is
+   *  unknown, and a page that names a room of its org does not use it. */
+  function setCurrent(room: Room | null, tenantId?: string) {
     current.value = room
+    currentTenantId.value = room ? (tenantId ?? null) : null
+  }
+
+  /** A page starts showing `roomId` (again, on an in-place room switch). The
+   *  release it returns clears the fact only while it is still this claim. */
+  function showRoom(roomId: string): () => void {
+    const by = Symbol('shown-room')
+    shownRoomId.value = roomId
+    shownBy = by
+    return () => {
+      if (shownBy !== by) return
+      shownRoomId.value = null
+      shownBy = null
+    }
   }
 
   // --- Call operations ---
@@ -303,6 +382,10 @@ export const useRoomStore = defineStore('rooms', () => {
   }
 
   async function fetchAllUnreadCounts(tenantId: string) {
+    // #4257 — over this org's rooms only: a fetch that a newer one superseded
+    // settles with it, and the shell's count after it would ask for the new
+    // org's rooms under the previous org.
+    if (!listIsOf(tenantId)) return
     for (const room of rooms.value) {
       fetchUnreadCount(tenantId, room.id)
     }
@@ -339,7 +422,10 @@ export const useRoomStore = defineStore('rooms', () => {
   return {
     // State
     rooms,
+    roomsTenantId,
     current,
+    currentTenantId,
+    shownRoomId,
     participants,
     loading,
     rootRooms,
@@ -349,6 +435,7 @@ export const useRoomStore = defineStore('rooms', () => {
     // Room operations
     childrenOf,
     fetchRooms,
+    ensureRooms,
     searchRooms,
     createRoom,
     deleteRoom,
@@ -357,6 +444,7 @@ export const useRoomStore = defineStore('rooms', () => {
     fetchRoom,
     explore,
     setCurrent,
+    showRoom,
     fetchMembers,
     // Call operations
     updateRoomCallStatus,

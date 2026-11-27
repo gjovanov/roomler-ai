@@ -48,6 +48,82 @@ async function mayReadDeviceDiagnostics(tenantId: string): Promise<boolean> {
   return canReadDeviceDiagnostics(tenants.myPermissions, tenants.isOwner)
 }
 
+/** #4257 — what one org setting needs to follow the page's org, as `agents`
+ *  does (#4248). It records the org the value describes (`null`: never
+ *  fetched, so a first or test-seeded value is not dropped). A fetch for
+ *  another org drops the value at once, back to unknown, and only the latest
+ *  fetch writes. A save writes its answer only while the value is its org's,
+ *  so a save answered after the page moved on to another org is dropped.
+ *  Made once per store instance, inside the store.
+ *
+ *  #4332 — a fetch made through `run` is also recorded for an ensure: its
+ *  promise, and whether it ended with an answer. A page asks the ensure
+ *  whether the store holds THIS org's value, never whether the value is
+ *  unset: a value that is another org's is not unset. */
+function orgSettingTracker(drop: () => void) {
+  let seq = 0
+  let valueTenantId: string | null = null
+  // #4332 — the latest fetch `run` made (`null`: none, or a newer `begin`),
+  // and how it ended: `null` while in flight, `true` with an answer, `false`
+  // unknown (refused, failed, or a caller who may not read org settings).
+  // Never read off the value: an answer can hold `null` (`orgExecRequireSystem`
+  // from an older server).
+  let latestRun: Promise<void> | null = null
+  let latestAnswered: boolean | null = null
+
+  /** A fetch for `tenantId` starts; the check it returns holds while that
+   *  fetch is the latest. */
+  function begin(tenantId: string): () => boolean {
+    const mine = ++seq
+    if (valueTenantId !== null && valueTenantId !== tenantId) drop()
+    valueTenantId = tenantId
+    latestRun = null
+    return () => mine === seq
+  }
+
+  return {
+    begin,
+    /** Whether the value held is `tenantId`'s (or no org's yet). */
+    holds(tenantId: string): boolean {
+      return valueTenantId === null || valueTenantId === tenantId
+    },
+    /** #4332 — a fetch for `tenantId`, begun at once (no `await` before the
+     *  drop). `fetch` writes only while its check holds, and answers whether
+     *  it ended with an answer. A fetch that a newer one superseded settles
+     *  with the newest, as `fetchAgents` does: a caller that awaits it then
+     *  reads the newest value. */
+    run(tenantId: string, fetch: (latest: () => boolean) => Promise<boolean>): Promise<void> {
+      const latest = begin(tenantId)
+      const settled: Promise<void> = fetch(latest).then(
+        (answered) => {
+          if (!latest()) return latestRun ?? undefined
+          latestAnswered = answered
+          return undefined
+        },
+        (e: unknown) => {
+          if (!latest()) return latestRun ?? undefined
+          latestAnswered = false
+          throw e
+        },
+      )
+      latestRun = settled
+      latestAnswered = null
+      return settled
+    },
+    /** #4332 — this org's value, or `fetch` for it: the latest fetch's
+     *  promise while that fetch is `tenantId`'s and is in flight or landed
+     *  with an answer. Otherwise it fetches: no fetch yet, a value no fetch
+     *  recorded (a test's seed), another org's value, or this org's latest
+     *  fetch ended unknown. */
+    ensure(tenantId: string, fetch: () => Promise<void>): Promise<void> {
+      if (valueTenantId === tenantId && latestRun !== null && latestAnswered !== false) {
+        return latestRun
+      }
+      return fetch()
+    },
+  }
+}
+
 /** FR-82 — a 403 is an answer: "you may not read this", never a failed
  *  session. Read structurally, so it holds for any client error that carries
  *  the status. */
@@ -190,7 +266,8 @@ export interface AgentCapabilities {
   supports_file_transfer: boolean
   max_simultaneous_sessions: number
   /** File-DC v2 (0.3.0+) per-feature capability list. Recognised
-   *  values: 'upload', 'download', 'download-folder', 'browse'.
+   *  values: 'upload', 'download', 'download-folder', 'resume', 'browse',
+   *  'dir-pages' (#4121: a large listing comes in pages; with 'browse').
    *  Empty / unset on older agents — browsers fall back to
    *  `supports_file_transfer` as the upload-only marker. */
   files?: string[]
@@ -308,6 +385,15 @@ export interface KeepBusyBrief {
   set_by?: string
 }
 
+/** #3565 — the program that enrolled a device and the version it was built
+ *  as. `name` is one of `roomlerd`, `roomler-setup`, `roomler-desktop`,
+ *  `other` (a name the server did not know) or `unknown` (an enroller from
+ *  before the field); `version` is `""` when the server kept none. */
+export interface EnrollingProgram {
+  name: string
+  version: string
+}
+
 export interface Agent {
   id: string
   tenant_id: string
@@ -320,7 +406,15 @@ export interface Agent {
   tags?: string[]
   machine_id: string
   os: AgentOs
+  /** The version the device's daemon reported in its hello. #3565: `""`
+   *  until the daemon first connects (an enrollment writes none): read it
+   *  through `utils/deviceVersion`, which shows "not reported yet". */
   agent_version: string
+  /** #3565 — the program that enrolled the device, and its version, as the
+   *  latest enrollment named them: how the device was enrolled, never its
+   *  version. `unknown` for an enroller from before the field; absent on a
+   *  row whose latest enrollment came before it. */
+  enrolling_program?: EnrollingProgram | null
   /** FR-27 — the `roomler-desktop` version installed on the host, reported on
    *  the heartbeat. Absent means one of three things and the UI must not
    *  flatten them: a pre-FR-27 agent, no companion installed, or a probe that
@@ -985,26 +1079,68 @@ export const useAgentStore = defineStore('agents', () => {
   const total = ref(0)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** #4248 — which org `agents` describes: the org of the latest list fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's devices never show (or fill a picker) under another org's page. */
+  const agentsTenantId = ref<string | null>(null)
+  // Only the latest list fetch writes: the answer for an org asked before it
+  // (the page moved on to another org) is dropped.
+  let listSeq = 0
+  // The latest list fetch failed: `ensureAgents` asks again.
+  let listFailed = false
+  // The latest list fetch. One that a newer fetch superseded settles with it,
+  // not with its own dropped answer, as in the rooms store (#4257): a caller
+  // that reads the devices right after its await then reads the newest ones.
+  // The remote viewer takes its device's row so, and the welcome tour counts.
+  let latestFetch: Promise<void> = Promise.resolve()
 
-  async function fetchAgents(tenantId: string) {
-    loading.value = true
-    error.value = null
-    try {
-      // per_page=100 (the server cap): with no param the server defaulted to
-      // 25 and every consumer of this store silently saw a truncated fleet —
-      // the devices grid's menus, the dashboard tile, the pickers. Above 100
-      // agents the rich-store lookups degrade again; the unified /device
-      // endpoint is the paginated path for that scale.
-      const resp = await api.get<AgentListResponse>(`/tenant/${tenantId}/agent?per_page=100`)
-      agents.value = resp.items
-      total.value = resp.total
-    } catch (e) {
-      error.value = (e as Error).message
+  function fetchAgents(tenantId: string): Promise<void> {
+    const mySeq = ++listSeq
+    if (agentsTenantId.value !== null && agentsTenantId.value !== tenantId) {
       agents.value = []
       total.value = 0
-    } finally {
-      loading.value = false
     }
+    agentsTenantId.value = tenantId
+    listFailed = false
+    loading.value = true
+    error.value = null
+    const run = (async (): Promise<void> => {
+      try {
+        // per_page=100 (the server cap): with no param the server defaulted to
+        // 25 and every consumer of this store silently saw a truncated fleet —
+        // the devices grid's menus, the dashboard tile, the pickers. Above 100
+        // agents the rich-store lookups degrade again; the unified /device
+        // endpoint is the paginated path for that scale.
+        const resp = await api.get<AgentListResponse>(`/tenant/${tenantId}/agent?per_page=100`)
+        if (mySeq !== listSeq) return latestFetch
+        agents.value = resp.items
+        total.value = resp.total
+      } catch (e) {
+        if (mySeq !== listSeq) return latestFetch
+        listFailed = true
+        error.value = (e as Error).message
+        agents.value = []
+        total.value = 0
+      } finally {
+        if (mySeq === listSeq) loading.value = false
+      }
+    })()
+    latestFetch = run
+    return run
+  }
+
+  /** #4248 — the org's devices for a page that only names or picks them,
+   *  fetched only when the store does not hold them already: the shell loads
+   *  them for its nav, and the Devices page with its grid. A store that holds
+   *  another org's devices, or whose last fetch failed, fetches. One that holds
+   *  this org's, or is loading them, answers with that fetch (#4257), as
+   *  `ensureRooms` does: it settles once the devices have landed, so the
+   *  remote viewer then takes the store's own row of its device. It replaces a
+   *  check of an empty list, which never reloaded a list holding another org's
+   *  devices. */
+  function ensureAgents(tenantId: string): Promise<void> {
+    if (agentsTenantId.value === tenantId && !listFailed) return latestFetch
+    return fetchAgents(tenantId)
   }
 
   /** FR-106 — the agent releases, newest first, each with its publish time:
@@ -1156,13 +1292,42 @@ export const useAgentStore = defineStore('agents', () => {
   /** Tenant members — for the owner-reassign picker + resolving an agent's
    *  `owner_user_id` to a display name. Fetched on demand by AgentsSection. */
   const tenantMembers = ref<TenantMember[]>([])
+  /** #4257 — which org `tenantMembers` describes: the org of the latest
+   *  fetch, answered or not. A fetch for another org drops the rows first, so
+   *  one org's people never fill a picker (or name a row) under another org. */
+  const tenantMembersTenantId = ref<string | null>(null)
+  // Only the latest fetch writes: the answer for an org asked before it is
+  // dropped, a failure too.
+  let membersSeq = 0
+  // The latest fetch failed: `ensureTenantMembers` asks again.
+  let membersFailed = false
   async function fetchTenantMembers(tenantId: string) {
-    try {
-      const resp = await api.get<{ items: TenantMember[] }>(`/tenant/${tenantId}/member`)
-      tenantMembers.value = resp.items
-    } catch {
+    const mySeq = ++membersSeq
+    if (tenantMembersTenantId.value !== null && tenantMembersTenantId.value !== tenantId) {
       tenantMembers.value = []
     }
+    tenantMembersTenantId.value = tenantId
+    membersFailed = false
+    try {
+      const resp = await api.get<{ items: TenantMember[] }>(`/tenant/${tenantId}/member`)
+      if (mySeq !== membersSeq) return
+      tenantMembers.value = resp.items
+    } catch {
+      if (mySeq !== membersSeq) return
+      membersFailed = true
+      tenantMembers.value = []
+    }
+  }
+
+  /** #4257 — the org's members for a dialog or a log that only names or picks
+   *  them, fetched only when the store does not hold them: AgentsSection loads
+   *  them with the Devices page. A store that holds another org's members, or
+   *  whose last fetch failed, fetches; one that holds this org's (or is
+   *  loading them) does not. It replaces a check of an empty list, which
+   *  never reloaded a list holding another org's people. */
+  function ensureTenantMembers(tenantId: string): Promise<void> {
+    if (tenantMembersTenantId.value === tenantId && !membersFailed) return Promise.resolve()
+    return fetchTenantMembers(tenantId)
   }
 
   /** S1a — push an immediate self-update to one agent (`rc:agent.update`).
@@ -1195,7 +1360,9 @@ export const useAgentStore = defineStore('agents', () => {
   /** S1a — push an immediate self-update to every agent in the tenant
    *  (or a selected subset via `agent_ids`). MANAGE_AGENTS. A row the server
    *  did not push carries `refused` (a sentence) and `refused_code`:
-   *  `pin_downgrade` (FR-2), `primary_org` or `auto_update_off` (FR-67 P7). */
+   *  `pin_downgrade` (FR-2), `version_unreported` (#3565: a pin to a row
+   *  with no reported version, unless forced), `primary_org` or
+   *  `auto_update_off` (FR-67 P7). */
   async function triggerUpdateAll(tenantId: string): Promise<BulkUpdateResponse> {
     return api.post<BulkUpdateResponse>(`/tenant/${tenantId}/agent/update`, {})
   }
@@ -1320,45 +1487,63 @@ export const useAgentStore = defineStore('agents', () => {
       typeof resp.exec_require_system === 'boolean' ? resp.exec_require_system : null
   }
 
-  async function fetchOrgExecEnabled(tenantId: string) {
-    if (!(await mayReadOrgSettings(tenantId))) {
-      orgExecEnabled.value = null
-      orgExecRequireSystem.value = null
-      return
-    }
-    try {
-      applyOrgExecSettings(await api.get<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`))
-    } catch {
-      // A 403 here means "not an admin", not "disabled" — leave it unknown
-      // rather than claiming the org is off.
-      orgExecEnabled.value = null
-      orgExecRequireSystem.value = null
-    }
+  const execSettings = orgSettingTracker(() => {
+    orgExecEnabled.value = null
+    orgExecRequireSystem.value = null
+  })
+
+  function fetchOrgExecEnabled(tenantId: string): Promise<void> {
+    return execSettings.run(tenantId, async (latest) => {
+      if (!(await mayReadOrgSettings(tenantId))) {
+        if (!latest()) return false
+        orgExecEnabled.value = null
+        orgExecRequireSystem.value = null
+        return false
+      }
+      try {
+        const resp = await api.get<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`)
+        if (latest()) applyOrgExecSettings(resp)
+        return true
+      } catch {
+        if (!latest()) return false
+        // A 403 here means "not an admin", not "disabled" — leave it unknown
+        // rather than claiming the org is off.
+        orgExecEnabled.value = null
+        orgExecRequireSystem.value = null
+        return false
+      }
+    })
+  }
+
+  /** #4332 — the org's exec switch for a dialog that shows it: fetched
+   *  unless the store holds this org's or is fetching it, and again after a
+   *  fetch that ended unknown. It replaces a check of `null`, which never
+   *  fetched while the switch held another org's value. */
+  function ensureOrgExecEnabled(tenantId: string): Promise<void> {
+    return execSettings.ensure(tenantId, () => fetchOrgExecEnabled(tenantId))
   }
 
   /** Flip gate 1. MANAGE_TENANT server-side. Names only the kill-switch: the
    *  server leaves `exec_require_system` as it is when a PUT omits it. */
   async function setOrgExecEnabled(tenantId: string, enabled: boolean) {
-    applyOrgExecSettings(
-      await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
-        remote_exec_enabled: enabled,
-      }),
-    )
+    const resp = await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
+      remote_exec_enabled: enabled,
+    })
+    if (execSettings.holds(tenantId)) applyOrgExecSettings(resp)
   }
 
   /** FR-94 — flip `exec_require_system`. The PUT must carry the kill-switch
    *  too (the server reads it as required), so this sends the value it holds
-   *  and refuses to guess one it does not. */
+   *  and refuses to guess one it does not, another org's included (#4257). */
   async function setOrgExecRequireSystem(tenantId: string, required: boolean) {
-    if (orgExecEnabled.value === null) {
+    if (orgExecEnabled.value === null || !execSettings.holds(tenantId)) {
       throw new Error('The organization settings are not loaded yet')
     }
-    applyOrgExecSettings(
-      await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
-        remote_exec_enabled: orgExecEnabled.value,
-        exec_require_system: required,
-      }),
-    )
+    const resp = await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
+      remote_exec_enabled: orgExecEnabled.value,
+      exec_require_system: required,
+    })
+    if (execSettings.holds(tenantId)) applyOrgExecSettings(resp)
   }
 
   /** Replace a device's exec policy (gate 3). MANAGE_AGENTS server-side. */
@@ -1389,19 +1574,31 @@ export const useAgentStore = defineStore('agents', () => {
    *  the org is off would send an admin hunting through device settings. */
   const orgSshEnabled = ref<boolean | null>(null)
 
-  async function fetchOrgSshEnabled(tenantId: string) {
-    if (!(await mayReadOrgSettings(tenantId))) {
-      orgSshEnabled.value = null
-      return
-    }
-    try {
-      const resp = await api.get<{ remote_ssh_enabled: boolean }>(
-        `/tenant/${tenantId}/ssh-settings`,
-      )
-      orgSshEnabled.value = resp.remote_ssh_enabled
-    } catch {
-      orgSshEnabled.value = null
-    }
+  const sshSettings = orgSettingTracker(() => (orgSshEnabled.value = null))
+
+  function fetchOrgSshEnabled(tenantId: string): Promise<void> {
+    return sshSettings.run(tenantId, async (latest) => {
+      if (!(await mayReadOrgSettings(tenantId))) {
+        if (latest()) orgSshEnabled.value = null
+        return false
+      }
+      try {
+        const resp = await api.get<{ remote_ssh_enabled: boolean }>(
+          `/tenant/${tenantId}/ssh-settings`,
+        )
+        if (latest()) orgSshEnabled.value = resp.remote_ssh_enabled
+        return true
+      } catch {
+        if (latest()) orgSshEnabled.value = null
+        return false
+      }
+    })
+  }
+
+  /** #4332 — the org's SSH switch for a dialog that shows it, as
+   *  `ensureOrgExecEnabled` asks for the exec switch. */
+  function ensureOrgSshEnabled(tenantId: string): Promise<void> {
+    return sshSettings.ensure(tenantId, () => fetchOrgSshEnabled(tenantId))
   }
 
   /** Flip gate 1. MANAGE_TENANT server-side. */
@@ -1410,7 +1607,7 @@ export const useAgentStore = defineStore('agents', () => {
       `/tenant/${tenantId}/ssh-settings`,
       { remote_ssh_enabled: enabled },
     )
-    orgSshEnabled.value = resp.remote_ssh_enabled
+    if (sshSettings.holds(tenantId)) orgSshEnabled.value = resp.remote_ssh_enabled
   }
 
   // ── FR-92 — keep busy, the org deny ─────────────────────────────
@@ -1442,19 +1639,26 @@ export const useAgentStore = defineStore('agents', () => {
    *  non-owner's card shows "unknown" and sends nothing. (Any member may
    *  read the route since P8 — `fetchKeepBusyDefaultPattern` is the
    *  ungated read a viewer uses.) */
+  const keepBusySettings = orgSettingTracker(() => {
+    orgKeepBusyDenied.value = null
+    orgKeepBusyDefaultPattern.value = null
+  })
+
   async function fetchOrgKeepBusyDenied(tenantId: string) {
+    const latest = keepBusySettings.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
-      orgKeepBusyDenied.value = null
+      if (latest()) orgKeepBusyDenied.value = null
       return
     }
     try {
       const resp = await api.get<OrgKeepBusySettingsResponse>(
         `/tenant/${tenantId}/keep-busy-settings`,
       )
+      if (!latest()) return
       orgKeepBusyDenied.value = resp.keep_busy_denied
       orgKeepBusyDefaultPattern.value = resp.keep_busy_default_pattern ?? null
     } catch {
-      orgKeepBusyDenied.value = null
+      if (latest()) orgKeepBusyDenied.value = null
     }
   }
 
@@ -1466,6 +1670,7 @@ export const useAgentStore = defineStore('agents', () => {
       `/tenant/${tenantId}/keep-busy-settings`,
       patch,
     )
+    if (!keepBusySettings.holds(tenantId)) return
     orgKeepBusyDenied.value = resp.keep_busy_denied
     orgKeepBusyDefaultPattern.value = resp.keep_busy_default_pattern ?? null
   }
@@ -1525,17 +1730,19 @@ export const useAgentStore = defineStore('agents', () => {
    *  settings — the "not an admin ≠ a value" rule of the switches above. */
   const orgRcSessionPolicy = ref<RcSessionPolicy | null>(null)
 
+  const rcSessionPolicy = orgSettingTracker(() => (orgRcSessionPolicy.value = null))
+
   async function fetchOrgRcSessionPolicy(tenantId: string) {
+    const latest = rcSessionPolicy.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
-      orgRcSessionPolicy.value = null
+      if (latest()) orgRcSessionPolicy.value = null
       return
     }
     try {
-      orgRcSessionPolicy.value = await api.get<RcSessionPolicy>(
-        `/tenant/${tenantId}/rc-session-policy`,
-      )
+      const resp = await api.get<RcSessionPolicy>(`/tenant/${tenantId}/rc-session-policy`)
+      if (latest()) orgRcSessionPolicy.value = resp
     } catch {
-      orgRcSessionPolicy.value = null
+      if (latest()) orgRcSessionPolicy.value = null
     }
   }
 
@@ -1600,10 +1807,8 @@ export const useAgentStore = defineStore('agents', () => {
   /** Set one or more features (MANAGE_TENANT server-side). The route leaves
    *  a feature the body does not name alone, and answers with all three. */
   async function setOrgRcSessionPolicy(tenantId: string, patch: Partial<RcSessionPolicy>) {
-    orgRcSessionPolicy.value = await api.put<RcSessionPolicy>(
-      `/tenant/${tenantId}/rc-session-policy`,
-      patch,
-    )
+    const resp = await api.put<RcSessionPolicy>(`/tenant/${tenantId}/rc-session-policy`, patch)
+    if (rcSessionPolicy.holds(tenantId)) orgRcSessionPolicy.value = resp
   }
 
   // ── FR-52 — cross-org remote access ──────────────────────────────
@@ -1622,15 +1827,33 @@ export const useAgentStore = defineStore('agents', () => {
    *  deliberately omits connect codes. */
   const externalDevices = ref<ExternalDevice[]>([])
 
-  async function fetchExternalAccess(tenantId: string) {
-    try {
-      const resp = await api.get<ExternalAccessSettings>(`/tenant/${tenantId}/external-access`)
-      orgExternalAccessEnabled.value = resp.enabled
-      externalDevices.value = resp.devices
-    } catch {
-      orgExternalAccessEnabled.value = null
-      externalDevices.value = []
-    }
+  const externalAccess = orgSettingTracker(() => {
+    orgExternalAccessEnabled.value = null
+    externalDevices.value = []
+  })
+
+  function fetchExternalAccess(tenantId: string): Promise<void> {
+    return externalAccess.run(tenantId, async (latest) => {
+      try {
+        const resp = await api.get<ExternalAccessSettings>(`/tenant/${tenantId}/external-access`)
+        if (!latest()) return true
+        orgExternalAccessEnabled.value = resp.enabled
+        externalDevices.value = resp.devices
+        return true
+      } catch {
+        if (!latest()) return false
+        orgExternalAccessEnabled.value = null
+        externalDevices.value = []
+        return false
+      }
+    })
+  }
+
+  /** #4332 — the org's external-access switch, and its approved devices, for
+   *  a dialog that shows the switch, as `ensureOrgExecEnabled` asks for the
+   *  exec switch. */
+  function ensureExternalAccess(tenantId: string): Promise<void> {
+    return externalAccess.ensure(tenantId, () => fetchExternalAccess(tenantId))
   }
 
   /** Flip gate 1. MANAGE_TENANT server-side. */
@@ -1638,7 +1861,7 @@ export const useAgentStore = defineStore('agents', () => {
     const resp = await api.put<{ enabled: boolean }>(`/tenant/${tenantId}/external-access`, {
       enabled,
     })
-    orgExternalAccessEnabled.value = resp.enabled
+    if (externalAccess.holds(tenantId)) orgExternalAccessEnabled.value = resp.enabled
   }
 
   /** Replace a device's external-access approval (gate 2).
@@ -1695,18 +1918,21 @@ export const useAgentStore = defineStore('agents', () => {
    *  and SSH switches. */
   const orgEphemeralKeysEnabled = ref<boolean | null>(null)
 
+  const ephemeralKeys = orgSettingTracker(() => (orgEphemeralKeysEnabled.value = null))
+
   async function fetchOrgEphemeralKeysEnabled(tenantId: string) {
+    const latest = ephemeralKeys.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
-      orgEphemeralKeysEnabled.value = null
+      if (latest()) orgEphemeralKeysEnabled.value = null
       return
     }
     try {
       const resp = await api.get<{ ephemeral_keys_enabled: boolean }>(
         `/tenant/${tenantId}/ephemeral-key-settings`,
       )
-      orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
+      if (latest()) orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
     } catch {
-      orgEphemeralKeysEnabled.value = null
+      if (latest()) orgEphemeralKeysEnabled.value = null
     }
   }
 
@@ -1717,7 +1943,7 @@ export const useAgentStore = defineStore('agents', () => {
       `/tenant/${tenantId}/ephemeral-key-settings`,
       { ephemeral_keys_enabled: enabled },
     )
-    orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
+    if (ephemeralKeys.holds(tenantId)) orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
   }
 
   // ── FR-101 P4b — the org's session limits ──────────────────────────
@@ -1739,41 +1965,43 @@ export const useAgentStore = defineStore('agents', () => {
     orgRcIdleSecs.value = resp.idle_secs ?? null
   }
 
+  function clearRcSessionLimits() {
+    orgRcMaxSessionSecs.value = undefined
+    orgRcIdleSecs.value = undefined
+  }
+  const rcSessionLimits = orgSettingTracker(clearRcSessionLimits)
+
   async function fetchOrgRcSessionLimits(tenantId: string) {
+    const latest = rcSessionLimits.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
-      orgRcMaxSessionSecs.value = undefined
-      orgRcIdleSecs.value = undefined
+      if (latest()) clearRcSessionLimits()
       return
     }
     try {
-      applyRcSessionLimits(
-        await api.get<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`),
-      )
+      const resp = await api.get<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`)
+      if (latest()) applyRcSessionLimits(resp)
     } catch {
-      orgRcMaxSessionSecs.value = undefined
-      orgRcIdleSecs.value = undefined
+      if (latest()) clearRcSessionLimits()
     }
   }
 
   /** Set the maximum length (`null` clears it). MANAGE_TENANT server-side;
    *  applies to sessions that go live after the change. */
   async function setOrgRcMaxSessionSecs(tenantId: string, maxSecs: number | null) {
-    applyRcSessionLimits(
-      await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
-        max_secs: maxSecs,
-      }),
-    )
+    const resp = await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
+      max_secs: maxSecs,
+    })
+    if (rcSessionLimits.holds(tenantId)) applyRcSessionLimits(resp)
   }
 
   /** P4b-2 — set the idle limit (`null` clears it). The body names only this
    *  limit, so the maximum length is left as it is. Kept by devices that
    *  advertise `idle-timeout`; applies to sessions requested after it. */
   async function setOrgRcIdleSecs(tenantId: string, idleSecs: number | null) {
-    applyRcSessionLimits(
-      await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
-        idle_secs: idleSecs,
-      }),
-    )
+    const resp = await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
+      idle_secs: idleSecs,
+    })
+    if (rcSessionLimits.holds(tenantId)) applyRcSessionLimits(resp)
   }
 
   /** List the org's keys (secrets are never in the list — mint-once only). */
@@ -1982,8 +2210,10 @@ export const useAgentStore = defineStore('agents', () => {
     total,
     loading,
     error,
+    agentsTenantId,
     releases,
     fetchAgents,
+    ensureAgents,
     fetchAgent,
     fetchReleases,
     applyPresence,
@@ -1994,7 +2224,9 @@ export const useAgentStore = defineStore('agents', () => {
     updateRoutes,
     updateOwner,
     tenantMembers,
+    tenantMembersTenantId,
     fetchTenantMembers,
+    ensureTenantMembers,
     triggerUpdate,
     triggerUpdateAll,
     rotateOverlayKey,
@@ -2005,6 +2237,7 @@ export const useAgentStore = defineStore('agents', () => {
     fetchLogs,
     orgExecEnabled,
     fetchOrgExecEnabled,
+    ensureOrgExecEnabled,
     setOrgExecEnabled,
     orgExecRequireSystem,
     setOrgExecRequireSystem,
@@ -2012,6 +2245,7 @@ export const useAgentStore = defineStore('agents', () => {
     unanchorDevice,
     orgSshEnabled,
     fetchOrgSshEnabled,
+    ensureOrgSshEnabled,
     setOrgSshEnabled,
     orgKeepBusyDenied,
     orgKeepBusyDefaultPattern,
@@ -2031,6 +2265,7 @@ export const useAgentStore = defineStore('agents', () => {
     orgExternalAccessEnabled,
     externalDevices,
     fetchExternalAccess,
+    ensureExternalAccess,
     setOrgExternalAccessEnabled,
     updateExternalAccessPolicy,
     fetchConnectCode,

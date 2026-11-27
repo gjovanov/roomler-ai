@@ -121,7 +121,7 @@
             as whoever is signed in at its own screen, and is refused when
             nobody is.
             <template v-if="!agentDropsToPerson">
-              This device's agent cannot do that yet: update it, or choose root.
+              This device's daemon cannot do that yet: update it, or choose root.
             </template>
           </div>
         </template>
@@ -331,12 +331,12 @@ watch(
   (v) => {
     if (!v) return
     draft.value = { ...emptyPolicy(), ...(agent.value?.exec_policy ?? {}) }
-    if (!agentStore.tenantMembers.length) {
-      void agentStore.fetchTenantMembers(props.tenantId)
-    }
-    if (agentStore.orgExecEnabled === null) {
-      void agentStore.fetchOrgExecEnabled(props.tenantId)
-    }
+    // #4257 — this org's people, not any: a list that holds another org's
+    // members is not empty.
+    void agentStore.ensureTenantMembers(props.tenantId)
+    // #4332 — this org's switch, not any: a switch that holds another org's
+    // value is not unset.
+    void agentStore.ensureOrgExecEnabled(props.tenantId)
   },
   { immediate: true },
 )

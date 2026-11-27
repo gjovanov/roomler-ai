@@ -1261,8 +1261,13 @@ pub struct OverlayRuntime {
     /// to: the host cannot forward or NAT for the overlay ([`super::nat::gate_offer`],
     /// run at the top of [`Self::run`], before the first join). Sent in the
     /// join and published for `roomler status`. `None` = offering as
-    /// configured.
+    /// configured. #3562 — also why a setup that failed withdrew the offer
+    /// ([`super::nat::OfferTracker`]).
     route_offer_withheld: Option<String>,
+    /// #3562 — whether this exit serves IPv6, as its join states it: `None`
+    /// for a node that offers no default route, or with
+    /// `ROOMLERD_EXIT_V6_STATEMENT=0`.
+    exit_serves_v6: Option<bool>,
     /// Unification P1 — where to publish this node's live overlay view (self
     /// IP + peers with connection type) for the daemon's LocalAPI. `None` in
     /// test / direct mode (nothing reads it there).
@@ -1479,6 +1484,9 @@ fn build_overlay_view(
                 // the pure builder cannot see the selector state.
                 why: None,
                 probes: Vec::new(),
+                // #4367 — the runtime knows nothing of the control socket; the
+                // DAEMON marks the rows it lists while that socket is down.
+                control_down: None,
             }
         })
         .collect();
@@ -1542,6 +1550,7 @@ impl OverlayRuntime {
             key_epoch: 0,
             advertised_routes: Vec::new(),
             route_offer_withheld: None,
+            exit_serves_v6: None,
             peer_view: None,
             org_primary: false,
             exit_node: None,
@@ -1578,6 +1587,7 @@ impl OverlayRuntime {
             key_epoch: 0,
             advertised_routes: Vec::new(),
             route_offer_withheld: None,
+            exit_serves_v6: None,
             peer_view: None,
             org_primary: false,
             exit_node: None,
@@ -2047,7 +2057,43 @@ impl OverlayRuntime {
             advertised_routes: self.advertised_routes.clone(),
             // FR-97 P0b — and, when we withheld them, why.
             route_offer_withheld: self.route_offer_withheld.clone(),
+            // #3562 — and whether this exit serves IPv6.
+            exit_serves_v6: self.exit_serves_v6,
         }
+    }
+
+    /// #3562 — publish the tracker's offer where the join, the view and the
+    /// ingress scope read it.
+    fn mirror_offer(&mut self, t: &super::nat::OfferTracker) {
+        self.advertised_routes = t.offer().routes.clone();
+        self.route_offer_withheld = t.offer().withheld.clone();
+        self.exit_serves_v6 = t.exit_serves_v6();
+    }
+
+    /// #3562 — run a [`rejoin_plan`] on the live socket. `false` when the
+    /// join itself could not be sent (the session died): the rest still runs,
+    /// as the Reattach arm always did, and the next session's Reattach
+    /// re-joins.
+    async fn run_rejoin_plan(
+        &self,
+        plan: Vec<RejoinStep>,
+        srflx_reattach_tx: &tokio::sync::watch::Sender<u64>,
+        netcheck_next: &mut Instant,
+    ) -> bool {
+        let mut joined = true;
+        for (i, step) in plan.into_iter().enumerate() {
+            match step {
+                RejoinStep::Send(m) => {
+                    let sent = self.outbound.send(*m).await.is_ok();
+                    if i == 0 {
+                        joined = sent;
+                    }
+                }
+                RejoinStep::SignalSrflxKeepalive => srflx_reattach_tx.send_modify(|n| *n += 1),
+                RejoinStep::ForceNetcheck => *netcheck_next = Instant::now(),
+            }
+        }
+        joined
     }
 
     /// `OverlayJoin`, waits for the first full netmap (which yields the
@@ -2069,8 +2115,16 @@ impl OverlayRuntime {
             warn!(reason = %why,
                 "overlay: route offer WITHHELD (no /0, no subnet route advertised): this host cannot forward or NAT for its peers");
         }
-        self.advertised_routes = offer.routes;
-        self.route_offer_withheld = offer.withheld;
+        // #3562 — the probe is not the outcome. From here the tracker holds
+        // the offer: the setup after the first netmap, and each retry of a
+        // failed one, may withdraw or restore it. An exit states that it does
+        // not serve IPv6 until its own setup says it does.
+        let mut offer_tracker = super::nat::OfferTracker::new(
+            offer,
+            crate::env::flag("EXIT_V6_STATEMENT", true),
+            crate::env::flag("ROUTE_OFFER_UNPROBED", false),
+        );
+        self.mirror_offer(&offer_tracker);
 
         // rc.131 — direct LAN path: bind a shared UDP socket + discover our
         // LAN endpoint so a same-subnet peer dials us directly and skips the
@@ -2204,12 +2258,39 @@ impl OverlayRuntime {
         // mesh; remote desktop's ICE reads them to keep a session off the
         // overlay when the device asks it to.
         crate::overlay_footprint::note_v4_nets(&nat_cidrs);
-        let _subnet_router = super::nat::enable(
-            nat_if.as_deref().unwrap_or(super::tun::IF_NAME),
-            &nat_cidrs,
-            &self.advertised_routes,
-        )
-        .await;
+        // #3562 — the setup's outcome decides the offer: a failed one
+        // withdraws it (re-sent to the server at once) and the loop retries it
+        // with a backoff; an exit whose own IPv6 NAT came up says so. It serves
+        // the tracker's `serve_routes` (what the probe passed), never
+        // `advertised_routes`, which a withdrawal empties.
+        let nat_if_name = nat_if.as_deref().unwrap_or(super::tun::IF_NAME).to_string();
+        let (mut subnet_router, setup_outcome) =
+            super::nat::enable(&nat_if_name, &nat_cidrs, offer_tracker.serve_routes()).await;
+        if offer_tracker.on_setup(&setup_outcome, Instant::now(), rand::random::<f64>()) {
+            self.mirror_offer(&offer_tracker);
+            log_offer_change(&offer_tracker);
+            if offer_tracker.withdrawn() {
+                // Revert what the failed setup left before anything uses it.
+                let failed = std::mem::replace(
+                    &mut subnet_router,
+                    super::nat::SubnetRouterGuard::inert(&nat_if_name, &nat_cidrs),
+                );
+                let _ = tokio::task::spawn_blocking(move || drop(failed)).await;
+            }
+            // Nothing but the first join has been advertised yet (srflx,
+            // relays and the netcheck come later), so the re-join alone brings
+            // the server, the admin row and every peer up to date.
+            if self
+                .outbound
+                .send(self.make_join(advertised.clone()))
+                .await
+                .is_err()
+            {
+                warn!(
+                    "overlay: the re-offer after setup could not be sent; the next join carries it"
+                );
+            }
+        }
 
         // P4 — publish the ingress destination scope from the SAME list that
         // just provisioned forwarding, so the filter and the forwarding it
@@ -2867,11 +2948,89 @@ impl OverlayRuntime {
             debug!("overlay: TUN reader ended; outbound pump exiting");
         });
 
+        // #3562 — a setup that failed is retried, with a backoff, only while
+        // the offer is withdrawn: a 5 s clock asks the tracker whether a retry
+        // is due, the retry runs off-loop (PowerShell takes seconds), and the
+        // failed guard's revert finishes before the retry adds rules (WinNAT
+        // skips an identical prefix, pf reuses the anchor's name). The netmap
+        // never runs setup, so a host that keeps failing never re-joins on it.
+        let mut nat_retry_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        nat_retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut nat_task: Option<
+            tokio::task::JoinHandle<(super::nat::SubnetRouterGuard, super::nat::SetupOutcome)>,
+        > = None;
+        let mut pending_revert: Option<tokio::task::JoinHandle<()>> = None;
+
         // Phase 2 — steady state. Control plane ONLY (P1): the data plane
         // runs reader → pump → carriers / demux → inbound writer, entirely
         // off-loop.
         loop {
             tokio::select! {
+                // #3562 — retry a failed setup once its backoff is due.
+                _ = nat_retry_tick.tick(), if nat_task.is_none() && offer_tracker.withdrawn() => {
+                    if offer_tracker.retry_due(Instant::now()) {
+                        let revert = pending_revert.take();
+                        let ifn = nat_if_name.clone();
+                        let cidrs = nat_cidrs.clone();
+                        let routes = offer_tracker.serve_routes().to_vec();
+                        nat_task = Some(tokio::spawn(async move {
+                            if let Some(r) = revert {
+                                let _ = r.await;
+                            }
+                            super::nat::enable(&ifn, &cidrs, &routes).await
+                        }));
+                    }
+                }
+                // #3562 — a retry's outcome. Still failing: revert off-loop,
+                // and re-join only if the failing step changed. Recovered: the
+                // new guard serves, and the offer goes back to the server at
+                // once, followed by what the server's rehydrate wipes.
+                res = async { nat_task.as_mut().expect("guarded by is_some").await }, if nat_task.is_some() => {
+                    nat_task = None;
+                    let (guard, outcome) = match res {
+                        Ok(done) => done,
+                        Err(e) => (
+                            super::nat::SubnetRouterGuard::inert(&nat_if_name, &nat_cidrs),
+                            super::nat::SetupOutcome {
+                                v4: Err(super::nat::SetupFailure {
+                                    step: super::nat::SetupStep::Task,
+                                    detail: e.to_string(),
+                                }),
+                                v6: false,
+                            },
+                        ),
+                    };
+                    let changed =
+                        offer_tracker.on_setup(&outcome, Instant::now(), rand::random::<f64>());
+                    if offer_tracker.withdrawn() {
+                        pending_revert = Some(tokio::task::spawn_blocking(move || drop(guard)));
+                    } else {
+                        // The guard it replaces is inert (retries run only
+                        // while withdrawn); dropped off-loop all the same.
+                        let old = std::mem::replace(&mut subnet_router, guard);
+                        drop(tokio::task::spawn_blocking(move || drop(old)));
+                    }
+                    if changed {
+                        self.mirror_offer(&offer_tracker);
+                        log_offer_change(&offer_tracker);
+                        wg.set_local_scope(Some(self_v4), &self.advertised_routes);
+                        let plan = rejoin_plan(
+                            self.make_join(advertised.clone()),
+                            srflx_keepalive.is_some(),
+                            &srflx_advertised,
+                            srflx_my_nat.clone(),
+                            super::dialer::advertised_dialer_ok(),
+                            relay.as_ref().map(|r| r.all_endpoints()),
+                            netcheck_enabled && !netcheck_pending,
+                        );
+                        if !self
+                            .run_rejoin_plan(plan, &srflx_reattach_tx, &mut netcheck_next)
+                            .await
+                        {
+                            warn!("overlay: the re-offer after a setup retry could not be sent; the next join carries it");
+                        }
+                    }
+                }
                 // P1 (S6) — the pump ending is the session-fatal signal the
                 // TUN-reader `None` used to be.
                 _ = &mut outbound_pump => {
@@ -3435,9 +3594,12 @@ impl OverlayRuntime {
                     if let Ok(guard) = route_reassert_lock.clone().try_lock_owned() {
                         let tun2 = tun.clone();
                         // rc.285 — the wave runs the DECLARATIVE defended set
-                        // (every peer /32, then our own /32 + v6 twins —
+                        // (every peer /32, every installed router peer's
+                        // subnets (#4279), then our own /32 + v6 twins —
                         // composed in one place, `route_guard::defended_routes`).
-                        let set = defended_routes(&by_node, self_v4);
+                        let set = defended_routes(&by_node, &current_peers, self_v4, |pk| {
+                            wg.peer_subnets(pk)
+                        });
                         // #1282 — attribute the wave to the TICK arm.
                         crate::evidence::ROUTE_WAVES_TICK
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3635,7 +3797,9 @@ impl OverlayRuntime {
                                     // route storm that re-adds the hijacking
                                     // /32 for our own address; evict it NOW
                                     // rather than waiting for the 2 s tick.
-                                    let set = defended_routes(&by_node, self_v4);
+                                    let set = defended_routes(&by_node, &current_peers, self_v4, |pk| {
+                                        wg.peer_subnets(pk)
+                                    });
                                     // #1282 — attribute the wave to the EVENT arm.
                                     crate::evidence::ROUTE_WAVES_EVENT
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3962,58 +4126,46 @@ impl OverlayRuntime {
                     Some(OverlayEvent::Reattach { outbound }) => {
                         let t_arm = Instant::now();
                         self.outbound.swap(outbound);
-                        // Join-send failure = the new session died within ms.
-                        // NEVER exit here (a rapid double-flap must not kill
-                        // the persistent runtime) — stay detached; the next
-                        // Reattach retries.
-                        if self
-                            .outbound
-                            .send(self.make_join(advertised.clone()))
-                            .await
-                            .is_err()
-                        {
-                            warn!("overlay: reattach join failed; awaiting the next session");
-                        } else {
-                            info!("overlay: control-WS reattached — re-joined with carriers intact");
-                        }
-                        // srflx restore: the re-join's server-side rehydrate
-                        // WIPED srflx_endpoints. The keepalive task owns the
-                        // EVOLVING advert — signal it; only when it doesn't
-                        // exist fall back to the startup snapshot.
-                        if srflx_keepalive.is_some() {
-                            srflx_reattach_tx.send_modify(|n| *n += 1);
-                        } else if !srflx_advertised.is_empty() {
-                            let _ = self
-                                .outbound
-                                .send(ClientMsg::OverlaySrflx {
-                                    candidates: srflx_advertised.clone(),
-                                    nat: srflx_my_nat.clone(),
-                                    udp_dialer_ok: Some(super::dialer::advertised_dialer_ok()),
-                                })
-                                .await;
-                        }
                         if let Some(r) = relay.as_mut() {
                             // A grant lost in flight (WS died between request
                             // and grant) would park its pair FOREVER now that
                             // the coordinator outlives sessions — `is_tracking`
                             // dedupes every later request. Forget ungranted
                             // pendings; the next netmap/sweep re-requests.
+                            // (It touches no advertised endpoint.)
                             let dropped = r.forget_ungranted_pending();
                             if dropped > 0 {
                                 info!(dropped, "overlay: reattach — re-requesting relays whose grant was lost in flight");
                             }
-                            // The rehydrate also replaced our endpoints with
-                            // the join's LAN-only list, wiping every LIVE
-                            // relayed address (surviving allocations don't
-                            // re-allocate, so nothing would re-trickle them).
-                            // Restore the full union; per-connection FIFO
-                            // guarantees it lands AFTER the join's rehydrate.
-                            let _ = self
-                                .outbound
-                                .send(ClientMsg::OverlayEndpoints {
-                                    candidates: r.all_endpoints(),
-                                })
-                                .await;
+                        }
+                        // The re-join, then what its server-side rehydrate
+                        // wipes ([`rejoin_plan`], shared with #3562's
+                        // re-offer): srflx (the keepalive task owns the
+                        // EVOLVING advert — signal it; only when it doesn't
+                        // exist fall back to the startup snapshot), and every
+                        // LIVE relayed address (surviving allocations don't
+                        // re-allocate, so nothing would re-trickle them);
+                        // per-connection FIFO lands them AFTER the rehydrate.
+                        // Join-send failure = the new session died within ms.
+                        // NEVER exit here (a rapid double-flap must not kill
+                        // the persistent runtime) — stay detached; the next
+                        // Reattach retries.
+                        let plan = rejoin_plan(
+                            self.make_join(advertised.clone()),
+                            srflx_keepalive.is_some(),
+                            &srflx_advertised,
+                            srflx_my_nat.clone(),
+                            super::dialer::advertised_dialer_ok(),
+                            relay.as_ref().map(|r| r.all_endpoints()),
+                            false,
+                        );
+                        if self
+                            .run_rejoin_plan(plan, &srflx_reattach_tx, &mut netcheck_next)
+                            .await
+                        {
+                            info!("overlay: control-WS reattached — re-joined with carriers intact");
+                        } else {
+                            warn!("overlay: reattach join failed; awaiting the next session");
                         }
                         // NB: peers see our endpoints wiped-then-restored and
                         // clear their path-monitor evidence for us twice
@@ -4455,6 +4607,18 @@ impl OverlayRuntime {
         self.teardown_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
             .await;
 
+        // #3562 — a setup retry or a revert still running finishes before the
+        // runtime returns: what a retry set up is reverted by its own guard,
+        // never left behind unguarded.
+        if let Some(t) = nat_task.take()
+            && let Ok((guard, _)) = t.await
+        {
+            let _ = tokio::task::spawn_blocking(move || drop(guard)).await;
+        }
+        if let Some(r) = pending_revert.take() {
+            let _ = r.await;
+        }
+
         inbound.abort();
         // rc.213 — stop the dedicated outbound TUN reader; aborting drops its
         // in-flight `read_packet()` future, and the TUN `Arc` it holds drops
@@ -4492,6 +4656,66 @@ impl OverlayRuntime {
             // successor cannot lose the race to its own aborted predecessor.
             let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
         }
+    }
+}
+
+/// #3562 — one step of a re-join. A join is an update on the server
+/// (`handle_overlay_join` rehydrates the row), and the rehydrate WIPES the
+/// srflx candidates, the NAT type, `udp_dialer_ok` and every relayed endpoint,
+/// so each re-join is followed by what puts them back. The Reattach arm and
+/// the re-offer after a setup retry run the same plan.
+pub(super) enum RejoinStep {
+    /// A frame for the control socket, in this order.
+    Send(Box<ClientMsg>),
+    /// The srflx keepalive task owns the EVOLVING advert: wake it to re-send.
+    SignalSrflxKeepalive,
+    /// The rehydrate wiped the measured capability vector: measure now.
+    ForceNetcheck,
+}
+
+/// #3562 — the frames that follow a re-join, in order: the join; srflx (the
+/// keepalive task re-sends its own advert, else the startup snapshot goes out
+/// once with the NAT type and the dialer bit); the full relayed endpoint
+/// union (surviving allocations do not re-allocate, so nothing would
+/// re-trickle them); and a fresh netcheck when one is asked for. Per-connection
+/// FIFO lands each AFTER the join's rehydrate.
+pub(super) fn rejoin_plan(
+    join: ClientMsg,
+    keepalive_live: bool,
+    srflx_snapshot: &[String],
+    nat: Option<String>,
+    udp_dialer_ok: bool,
+    relay_endpoints: Option<Vec<String>>,
+    force_netcheck: bool,
+) -> Vec<RejoinStep> {
+    let mut plan = vec![RejoinStep::Send(Box::new(join))];
+    if keepalive_live {
+        plan.push(RejoinStep::SignalSrflxKeepalive);
+    } else if !srflx_snapshot.is_empty() {
+        plan.push(RejoinStep::Send(Box::new(ClientMsg::OverlaySrflx {
+            candidates: srflx_snapshot.to_vec(),
+            nat,
+            udp_dialer_ok: Some(udp_dialer_ok),
+        })));
+    }
+    if let Some(candidates) = relay_endpoints {
+        plan.push(RejoinStep::Send(Box::new(ClientMsg::OverlayEndpoints {
+            candidates,
+        })));
+    }
+    if force_netcheck {
+        plan.push(RejoinStep::ForceNetcheck);
+    }
+    plan
+}
+
+/// #3562 — say what the exit setup made of the offer.
+fn log_offer_change(t: &super::nat::OfferTracker) {
+    match &t.offer().withheld {
+        Some(why) => warn!(reason = %why, exit_serves_v6 = ?t.exit_serves_v6(),
+            "overlay: route offer WITHDRAWN (no /0, no subnet route advertised): the exit setup failed; it is retried with a backoff"),
+        None => info!(routes = ?t.offer().routes, exit_serves_v6 = ?t.exit_serves_v6(),
+            "overlay: route offer follows the exit setup"),
     }
 }
 
@@ -4903,6 +5127,7 @@ mod tests {
             srflx_endpoints: srflx.iter().map(|s| s.to_string()).collect(),
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -5319,6 +5544,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             supports_quic: false,
@@ -5517,6 +5743,7 @@ mod tests {
                 srflx_endpoints: vec![],
                 srflx_nat: None,
                 udp_dialer_ok: None,
+                exit_serves_v6: None,
                 relay_home: None,
                 warm_relay_endpoint: None,
                 supports_quic: false,
@@ -5854,15 +6081,21 @@ mod tests {
     /// unobservable.
     struct RouteRecordingTun {
         routes: std::sync::Mutex<Vec<(&'static str, Ipv4Addr)>>,
+        /// #4279 — every subnet re-assert, as the exact string the device got.
+        subnets: std::sync::Mutex<Vec<String>>,
     }
     impl RouteRecordingTun {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 routes: std::sync::Mutex::new(Vec::new()),
+                subnets: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn calls(&self) -> Vec<(&'static str, Ipv4Addr)> {
             self.routes.lock().unwrap().clone()
+        }
+        fn subnet_calls(&self) -> Vec<String> {
+            self.subnets.lock().unwrap().clone()
         }
     }
     #[async_trait]
@@ -5883,6 +6116,17 @@ mod tests {
         }
         async fn defend_self_route(&self, ip: Ipv4Addr) {
             self.routes.lock().unwrap().push(("defend", ip));
+        }
+        async fn defend_subnet_route(&self, cidr: &str) -> io::Result<()> {
+            // #4279 — in the ordered log under the prefix's network address,
+            // and in full beside it.
+            let net = cidr
+                .split_once('/')
+                .and_then(|(ip, _)| ip.parse().ok())
+                .unwrap_or(Ipv4Addr::UNSPECIFIED);
+            self.routes.lock().unwrap().push(("subnet", net));
+            self.subnets.lock().unwrap().push(cidr.to_string());
+            Ok(())
         }
         async fn defend_block_floor(&self) {
             // Change B — recorded with the unspecified address (the step has
@@ -5922,7 +6166,12 @@ mod tests {
         }
 
         let t: Arc<dyn TunIo> = tun.clone();
-        run_defense_wave(t, defended_routes(&by_node, self_v4)).await;
+        // No router among them: the crypto-router holds no subnet for anyone.
+        run_defense_wave(
+            t,
+            defended_routes(&by_node, &HashMap::new(), self_v4, |_| Vec::new()),
+        )
+        .await;
 
         let got = tun.calls();
         // v3 (#23) — peers asserted, self defended, floor, then the ownership check
@@ -5989,7 +6238,10 @@ mod tests {
             by_node.insert(ObjectId::new(), installed_at([i as u8 + 1; 32], *ip));
         }
 
-        let set = defended_routes(&by_node, self_v4);
+        // #4279 — none of them is a router: a peer with no subnets adds
+        // nothing beyond its `/32`, so this is the set's shape before the
+        // subnet arm existed.
+        let set = defended_routes(&by_node, &HashMap::new(), self_v4, |_| Vec::new());
         assert_eq!(set.len(), ips.len() + 2);
         assert_eq!(set.last(), Some(&Defend::BlockFloor));
         assert_eq!(
@@ -6001,15 +6253,352 @@ mod tests {
             .iter()
             .filter_map(|d| match d {
                 Defend::AssertPeer(ip) => Some(*ip),
-                Defend::EvictSelf(_) | Defend::BlockFloor => None,
+                Defend::AssertSubnet(_) | Defend::EvictSelf(_) | Defend::BlockFloor => None,
             })
             .collect();
         assert_eq!(asserted, ips.iter().copied().collect::<HashSet<_>>());
 
         // An empty mesh still defends our own address + the floor.
         assert_eq!(
-            defended_routes(&HashMap::new(), self_v4),
+            defended_routes(&HashMap::new(), &HashMap::new(), self_v4, |_| Vec::new()),
             vec![Defend::EvictSelf(self_v4), Defend::BlockFloor]
+        );
+    }
+
+    /// #4279 — a mesh for the defended-set tests, as the select loop holds
+    /// it: each node's `(public key, overlay IP, the routes its netmap entry
+    /// approves)` becomes a `by_node` entry and a `current_peers` entry under
+    /// one node id.
+    #[allow(clippy::type_complexity)]
+    fn router_mesh(
+        nodes: &[([u8; 32], Ipv4Addr, &[&str])],
+    ) -> (HashMap<ObjectId, Installed>, HashMap<ObjectId, NetmapPeer>) {
+        let mut by_node = HashMap::new();
+        let mut current_peers = HashMap::new();
+        for (pk, ip, approved) in nodes {
+            let id = ObjectId::new();
+            by_node.insert(id, installed_at(*pk, *ip));
+            let routes = approved.iter().map(|r| r.to_string()).collect();
+            current_peers.insert(id, exit_np(id, "peer", routes));
+        }
+        (by_node, current_peers)
+    }
+
+    /// #4279 — a fixed `installed_subnets` for [`defended_routes`]: what the
+    /// crypto-router would hold for each peer public key.
+    fn subnets_held(
+        held: &[([u8; 32], &[&str])],
+    ) -> impl Fn(&[u8; 32]) -> Vec<crate::overlay::router::Cidr> + use<> {
+        let map: HashMap<[u8; 32], Vec<crate::overlay::router::Cidr>> = held
+            .iter()
+            .map(|(pk, cidrs)| {
+                let cidrs = cidrs
+                    .iter()
+                    .map(|c| crate::overlay::router::Cidr::parse(c).unwrap())
+                    .collect();
+                (*pk, cidrs)
+            })
+            .collect();
+        move |pk: &[u8; 32]| map.get(pk).cloned().unwrap_or_default()
+    }
+
+    /// #4279 — the subnet entries of a defended set, in order, as strings.
+    fn defended_subnets(set: &[Defend]) -> Vec<String> {
+        set.iter()
+            .filter_map(|d| match d {
+                Defend::AssertSubnet(c) => Some(c.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #4279 — a router peer's approved subnets are DEFENDED, as its `/32`
+    /// is. On 2026-11-21 something deleted every route on a Windows host's
+    /// overlay adapter: the guard put each peer `/32` back within seconds,
+    /// and a router peer's three subnet routes stayed missing for 35 minutes,
+    /// until the next carrier install for that peer ran `install_subnets`.
+    /// A peer with no subnets still contributes its `/32` and nothing else.
+    #[test]
+    fn defended_set_carries_a_router_peers_subnets() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let router = Ipv4Addr::new(100, 64, 0, 2);
+        let plain = Ipv4Addr::new(100, 64, 0, 4);
+        let two: &[&str] = &["10.1.0.0/16", "192.168.50.0/24"];
+        let (by_node, current_peers) =
+            router_mesh(&[([1; 32], router, two), ([2; 32], plain, &[])]);
+        let held = subnets_held(&[([1; 32], two)]);
+
+        let set = defended_routes(&by_node, &current_peers, self_v4, held);
+
+        assert_eq!(
+            defended_subnets(&set),
+            ["10.1.0.0/16", "192.168.50.0/24"],
+            "both of the router's subnets, once each"
+        );
+        // Every peer `/32` first, then the subnets, then self, the floor LAST.
+        assert_eq!(set.len(), 2 + 2 + 2, "{set:?}");
+        let peers: HashSet<Ipv4Addr> = set[..2]
+            .iter()
+            .map(|d| match d {
+                Defend::AssertPeer(ip) => *ip,
+                other => panic!("a peer /32 first, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(peers, HashSet::from([router, plain]));
+        assert!(matches!(set[2], Defend::AssertSubnet(_)), "{set:?}");
+        assert!(matches!(set[3], Defend::AssertSubnet(_)), "{set:?}");
+        assert_eq!(set[4], Defend::EvictSelf(self_v4));
+        assert_eq!(set[5], Defend::BlockFloor);
+    }
+
+    /// #4279 + P5/A1 — a default route never enters the defended set. An
+    /// exit peer's netmap entry approves `0.0.0.0/0`, and while it carries
+    /// this node's egress its crypto-router entry holds its real subnets AND
+    /// the split-default `/1` halves (`exit_peer_allowed_ips`). The `/1`s are
+    /// re-asserted INLINE on the select loop, never by the detached wave (see
+    /// [`Defend`]), and a `/0` is never routed by the generic path at all.
+    /// The real subnet is still defended.
+    #[test]
+    fn defended_set_never_carries_a_default_route() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let exit = Ipv4Addr::new(100, 64, 0, 7);
+        let (by_node, current_peers) =
+            router_mesh(&[([7; 32], exit, &["10.9.0.0/16", "0.0.0.0/0"])]);
+        let held = subnets_held(&[(
+            [7; 32],
+            &["10.9.0.0/16", "0.0.0.0/1", "128.0.0.0/1", "0.0.0.0/0"],
+        )]);
+
+        let set = defended_routes(&by_node, &current_peers, self_v4, held);
+
+        assert_eq!(
+            set,
+            vec![
+                Defend::AssertPeer(exit),
+                Defend::AssertSubnet(crate::overlay::router::Cidr::parse("10.9.0.0/16").unwrap()),
+                Defend::EvictSelf(self_v4),
+                Defend::BlockFloor,
+            ]
+        );
+    }
+
+    /// #4279 — a subnet is defended only while it is BOTH routed to the peer
+    /// (its crypto-router entry) AND still approved (its netmap entry). A
+    /// route approval reaches an installed peer's crypto-router only at its
+    /// next carrier install, so the two disagree for as long as a carrier
+    /// lives: a newly approved CIDR has no crypto-router entry yet (an OS
+    /// route for it would pull the range into the TUN and drop it there), and
+    /// a revoked one must not be kept alive by the guard. An approval is
+    /// matched as the router parses it, host bits masked; an entry that does
+    /// not parse approves nothing.
+    #[test]
+    fn a_subnet_is_defended_only_while_routed_and_approved() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let (by_node, current_peers) = router_mesh(&[(
+            [1; 32],
+            Ipv4Addr::new(100, 64, 0, 2),
+            &["10.1.2.3/16", "10.3.0.0/16", "not-a-cidr"],
+        )]);
+        let held = subnets_held(&[([1; 32], &["10.1.0.0/16", "10.2.0.0/16"])]);
+
+        let set = defended_routes(&by_node, &current_peers, self_v4, held);
+
+        assert_eq!(
+            defended_subnets(&set),
+            ["10.1.0.0/16"],
+            "10.2/16 was revoked, 10.3/16 is not routed yet"
+        );
+
+        // A peer the netmap no longer lists approves nothing.
+        let held = subnets_held(&[([1; 32], &["10.1.0.0/16"])]);
+        assert!(
+            defended_subnets(&defended_routes(&by_node, &HashMap::new(), self_v4, held)).is_empty()
+        );
+    }
+
+    /// #4279 — one OS route serves a CIDR however many routers claim it (the
+    /// crypto-router's tie-break picks the carrier; `warn_subnet_conflicts`
+    /// names the duplicate), so the wave writes it once.
+    #[test]
+    fn a_subnet_two_routers_claim_is_defended_once() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let one: &[&str] = &["10.1.0.0/16"];
+        let two: &[&str] = &["10.1.0.0/16", "10.2.0.0/16"];
+        let (by_node, current_peers) = router_mesh(&[
+            ([1; 32], Ipv4Addr::new(100, 64, 0, 2), one),
+            ([2; 32], Ipv4Addr::new(100, 64, 0, 3), two),
+        ]);
+        let held = subnets_held(&[([1; 32], one), ([2; 32], two)]);
+
+        let mut subnets =
+            defended_subnets(&defended_routes(&by_node, &current_peers, self_v4, held));
+        subnets.sort();
+
+        assert_eq!(subnets, ["10.1.0.0/16", "10.2.0.0/16"]);
+    }
+
+    /// P5/A1 in one place — `installable_subnets` is the filter both
+    /// `install_subnets` and the defended set apply: every default route out
+    /// (`/0` and both split-default `/1` halves), every real subnet kept, in
+    /// order.
+    #[test]
+    fn installable_subnets_drops_default_routes_only() {
+        let c = |s: &str| crate::overlay::router::Cidr::parse(s).unwrap();
+        assert_eq!(
+            installable_subnets(&[
+                c("0.0.0.0/0"),
+                c("10.1.0.0/16"),
+                c("0.0.0.0/1"),
+                c("128.0.0.0/1"),
+                c("192.168.50.0/24"),
+            ]),
+            vec![c("10.1.0.0/16"), c("192.168.50.0/24")]
+        );
+        assert!(installable_subnets(&[]).is_empty());
+    }
+
+    /// #4279 — the REAL wave (`defended_routes` → `run_defense_wave`, the code
+    /// both select-loop arms spawn) hands each subnet to the device in
+    /// canonical form, after every peer `/32` and before our own address. A
+    /// subnet is no peer: it never reaches `add_peer_route` or the ownership
+    /// check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_wave_reasserts_a_router_peers_subnets() {
+        let tun = RouteRecordingTun::new();
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let router = Ipv4Addr::new(100, 64, 0, 2);
+        let plain = Ipv4Addr::new(100, 64, 0, 4);
+        let two: &[&str] = &["10.1.0.0/16", "192.168.50.0/24"];
+        let (by_node, current_peers) =
+            router_mesh(&[([1; 32], router, two), ([2; 32], plain, &[])]);
+        let held = subnets_held(&[([1; 32], two)]);
+
+        let t: Arc<dyn TunIo> = tun.clone();
+        run_defense_wave(t, defended_routes(&by_node, &current_peers, self_v4, held)).await;
+
+        assert_eq!(tun.subnet_calls(), ["10.1.0.0/16", "192.168.50.0/24"]);
+        let got = tun.calls();
+        // 2 peer adds, 2 subnets, self, the floor, then one verify per peer.
+        assert_eq!(got.len(), 2 + 2 + 1 + 1 + 2, "{got:?}");
+        assert!(got[..2].iter().all(|(op, _)| *op == "add"), "{got:?}");
+        assert_eq!(
+            got[2..4],
+            [
+                ("subnet", Ipv4Addr::new(10, 1, 0, 0)),
+                ("subnet", Ipv4Addr::new(192, 168, 50, 0)),
+            ]
+        );
+        assert_eq!(got[4], ("defend", self_v4));
+        assert_eq!(got[5], ("floor", Ipv4Addr::UNSPECIFIED));
+        let verified: HashSet<Ipv4Addr> = got[6..]
+            .iter()
+            .map(|(op, ip)| {
+                assert_eq!(*op, "verify");
+                *ip
+            })
+            .collect();
+        assert_eq!(verified, HashSet::from([router, plain]), "peers only");
+    }
+
+    /// #4279 — `ROOMLERD_OVERLAY_SUBNET_GUARD=0`: a wave over a router peer's
+    /// missing subnets writes no subnet route, and every other arm runs as
+    /// before (the peer's `/32`, our own address, the floor, the ownership
+    /// check). With the default the same wave puts both back. The switch is
+    /// passed in, never set in the process environment, which the cells share
+    /// while they run in parallel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_subnet_guard_switch_off_writes_no_subnet_route() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let router = Ipv4Addr::new(100, 64, 0, 2);
+        let two: &[&str] = &["10.1.0.0/16", "192.168.50.0/24"];
+        let (by_node, current_peers) = router_mesh(&[([1; 32], router, two)]);
+        let set = || {
+            defended_routes(
+                &by_node,
+                &current_peers,
+                self_v4,
+                subnets_held(&[([1; 32], two)]),
+            )
+        };
+        assert_eq!(defended_subnets(&set()), two, "both subnets are defended");
+
+        let off = RouteRecordingTun::new();
+        let t: Arc<dyn TunIo> = off.clone();
+        let said = std::sync::atomic::AtomicBool::new(false);
+        run_defense_wave_with(t, set(), false, &said).await;
+        assert!(off.subnet_calls().is_empty(), "{:?}", off.subnet_calls());
+        assert_eq!(
+            off.calls(),
+            [
+                ("add", router),
+                ("defend", self_v4),
+                ("floor", Ipv4Addr::UNSPECIFIED),
+                ("verify", router),
+            ],
+            "every other arm as before"
+        );
+
+        let on = RouteRecordingTun::new();
+        let t: Arc<dyn TunIo> = on.clone();
+        run_defense_wave_with(t, set(), SUBNET_GUARD_DEFAULT, &said).await;
+        assert_eq!(on.subnet_calls(), two, "the default puts both back");
+    }
+
+    /// #4380 — the switch's INFO is said by the first wave that carries a
+    /// subnet while the switch is off, once per process (the flag a cell
+    /// passes in stands for the process's), and on the route guard's own
+    /// target. The daemon keeps that target at INFO under every `RUST_LOG`
+    /// (`roomler_node_core::logging::filter_for`), where the packaged Linux
+    /// units' spec drops this module's INFO. With the switch on, nothing of
+    /// it is said.
+    #[tokio::test]
+    async fn the_subnet_guard_switch_off_is_said_once_on_the_route_guards_target() {
+        const OFF: &str = "the route guard leaves subnet routes alone on this host";
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let router = Ipv4Addr::new(100, 64, 0, 2);
+        let two: &[&str] = &["10.1.0.0/16", "192.168.50.0/24"];
+        let (by_node, current_peers) = router_mesh(&[([1; 32], router, two)]);
+        let set = || {
+            defended_routes(
+                &by_node,
+                &current_peers,
+                self_v4,
+                subnets_held(&[([1; 32], two)]),
+            )
+        };
+        let (lines, _guard) = crate::overlay::said::Lines::start();
+
+        let on_said = std::sync::atomic::AtomicBool::new(false);
+        run_defense_wave_with(RouteRecordingTun::new(), set(), true, &on_said).await;
+        assert!(
+            lines.with(OFF).is_empty(),
+            "the switch on says nothing of it"
+        );
+
+        let off_said = std::sync::atomic::AtomicBool::new(false);
+        for _ in 0..3 {
+            run_defense_wave_with(RouteRecordingTun::new(), set(), false, &off_said).await;
+        }
+        let said = lines.with(OFF);
+        assert_eq!(
+            said.len(),
+            1,
+            "once, over three waves of two subnets: {said:?}"
+        );
+        assert_eq!(
+            said[0].target, "tunnel_core::overlay::route_guard",
+            "the target roomler_node_core's filter_for appends at INFO: {said:?}"
+        );
+        assert_eq!(said[0].level, tracing::Level::INFO, "{said:?}");
+        assert!(
+            said[0]
+                .text
+                .contains("(ROOMLERD_OVERLAY_SUBNET_GUARD is off)"),
+            "it names the switch: {said:?}"
+        );
+        assert!(
+            said[0].text.contains("cidr=10.1.0.0/16"),
+            "the first subnet the waves met: {said:?}"
         );
     }
 
@@ -7280,6 +7869,7 @@ mod tests {
                 srflx_endpoints: vec![],
                 srflx_nat: None,
                 udp_dialer_ok: None,
+                exit_serves_v6: None,
                 relay_home: None,
                 warm_relay_endpoint: None,
                 reachable,
@@ -7527,6 +8117,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -8087,6 +8678,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -8262,6 +8854,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            exit_serves_v6: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -8657,6 +9250,283 @@ mod tests {
             wg.peer_subnets(&pk)
         );
         assert!(st.split_default_installed);
+    }
+
+    /// #3562 AC U3 — the exit's IPv6 statement × the client's own v6 pins.
+    /// An exit that says nothing is an older exit: today's rule holds. One
+    /// that says no leaves v6 fail-closed and its reason wins, since it is
+    /// the stable one an operator can act on.
+    #[test]
+    fn the_exit_s_v6_statement_decides_with_the_client_s_pins() {
+        assert_eq!(v6_egress(None, true), Ok(()));
+        assert_eq!(v6_egress(None, false), Err(NO_V6_EXEMPTION));
+        assert_eq!(v6_egress(Some(false), true), Err(EXIT_SERVES_V4_ONLY));
+        assert_eq!(v6_egress(Some(false), false), Err(EXIT_SERVES_V4_ONLY));
+        assert_eq!(v6_egress(Some(true), true), Ok(()));
+        assert_eq!(v6_egress(Some(true), false), Err(NO_V6_EXEMPTION));
+        assert_eq!(EXIT_SERVES_V4_ONLY, "the exit serves IPv4 only");
+    }
+
+    /// #3562 AC U3 — end to end through the reconcile: the client's v6
+    /// exemptions pin (its server has an A and an AAAA), so the exit's
+    /// statement alone decides. Says nothing ⇒ v6 through the exit (today's
+    /// rule); yes ⇒ on; no ⇒ fail-closed with the reason in the status, while
+    /// IPv4 routes through the exit in every case. A statement that changes
+    /// under a live client is followed, both ways.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_follows_its_exit_s_ipv6_statement() {
+        let kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun = ExemptionTun::new();
+        let tf: TunFactory = {
+            let m = tun.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let id = exit_oid(0x34);
+        let servers: Vec<IpAddr> = vec![
+            "203.0.113.7".parse().unwrap(),
+            "2001:db8::7".parse().unwrap(),
+        ];
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280)
+            .with_exit_node(Some(id.to_hex()), servers);
+        let dev: Arc<dyn TunIo> = tun.clone();
+        let pk = [7u8; 32];
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            id,
+            Installed::base(
+                pk,
+                Ipv4Addr::new(100, 64, 0, 1),
+                DirectTier::Lan,
+                Instant::now(),
+            ),
+        );
+        let peers_saying = |stmt: Option<bool>| {
+            let mut np = exit_np(id, "exit-a", vec!["0.0.0.0/0".into()]);
+            np.exit_serves_v6 = stmt;
+            HashMap::from([(id, np)])
+        };
+
+        for (stmt, want) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+            let mut st = ExitRoutingState::default();
+            rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers_saying(stmt), &mut st)
+                .await;
+            assert!(st.split_default_installed, "{stmt:?}: v4 never waits on v6");
+            assert_eq!(st.v6_active, Some(want), "{stmt:?}");
+            assert_eq!(wg.v6_exit(), want.then_some(pk), "{stmt:?}");
+            let status = exit_node_status(Some("exit-a"), &st).unwrap();
+            assert!(status.active, "{stmt:?}");
+            assert_eq!(status.v6_active, want, "{stmt:?}");
+            assert_eq!(
+                status.v6_withheld_reason.as_deref(),
+                (!want).then_some(EXIT_SERVES_V4_ONLY),
+                "{stmt:?}"
+            );
+        }
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let mut st = ExitRoutingState::default();
+        for (stmt, want) in [
+            (Some(true), true),
+            (Some(false), false),
+            (Some(true), true),
+            (None, true),
+        ] {
+            rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers_saying(stmt), &mut st)
+                .await;
+            assert_eq!(st.v6_active, Some(want), "follows {stmt:?}");
+            assert_eq!(wg.v6_exit(), want.then_some(pk), "follows {stmt:?}");
+            assert!(st.split_default_installed, "follows {stmt:?}");
+        }
+    }
+
+    /// #3562 — a re-join on a live socket (a Reattach, or an exit re-sending
+    /// its offer) is followed, in order, by what the server's rehydrate
+    /// wiped: srflx (the keepalive's evolving advert, else the startup
+    /// snapshot), the relayed endpoints, and, for a re-offer only, a fresh
+    /// capability measurement. A Reattach never forces one: it keeps the
+    /// frames it sent before #3562.
+    #[test]
+    fn a_rejoin_restores_what_the_rehydrate_wiped() {
+        let kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun = ExemptionTun::new();
+        let tf: TunFactory = {
+            let m = tun.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp, out_tx, tf, 1280);
+        let join = rt.make_join(vec!["192.168.1.5:41641".into()]);
+        let j = serde_json::to_value(&join).unwrap();
+        let signal = serde_json::json!("signal the srflx keepalive");
+        let measure = serde_json::json!("force a netcheck");
+        let shape = |plan: Vec<RejoinStep>| -> Vec<serde_json::Value> {
+            plan.into_iter()
+                .map(|s| match s {
+                    RejoinStep::Send(m) => serde_json::to_value(&m).unwrap(),
+                    RejoinStep::SignalSrflxKeepalive => signal.clone(),
+                    RejoinStep::ForceNetcheck => measure.clone(),
+                })
+                .collect()
+        };
+        let relayed = vec!["198.51.100.9:3478".to_string()];
+        let endpoints = serde_json::to_value(ClientMsg::OverlayEndpoints {
+            candidates: relayed.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            shape(rejoin_plan(
+                join.clone(),
+                true,
+                &[],
+                None,
+                true,
+                Some(relayed.clone()),
+                true
+            )),
+            vec![
+                j.clone(),
+                signal.clone(),
+                endpoints.clone(),
+                measure.clone()
+            ]
+        );
+        assert_eq!(
+            shape(rejoin_plan(
+                join.clone(),
+                false,
+                &["1.2.3.4:5".to_string()],
+                Some("cone".into()),
+                true,
+                None,
+                false
+            )),
+            vec![
+                j.clone(),
+                serde_json::to_value(ClientMsg::OverlaySrflx {
+                    candidates: vec!["1.2.3.4:5".into()],
+                    nat: Some("cone".into()),
+                    udp_dialer_ok: Some(true),
+                })
+                .unwrap()
+            ]
+        );
+        assert_eq!(
+            shape(rejoin_plan(
+                join.clone(),
+                false,
+                &[],
+                None,
+                false,
+                None,
+                false
+            )),
+            vec![j.clone()]
+        );
+        assert_eq!(
+            shape(rejoin_plan(
+                join,
+                true,
+                &[],
+                None,
+                true,
+                Some(relayed),
+                false
+            )),
+            vec![j, signal, endpoints],
+            "a Reattach's frames, as before"
+        );
+    }
+
+    /// #4279 — the defended set read from the crypto-router the select loop
+    /// owns and the netmap it holds, exactly as both guard arms call it
+    /// (`&current_peers`, `|pk| wg.peer_subnets(pk)`): it carries what
+    /// `install_subnets` routed, never the approved `/0`, and while the peer
+    /// carries this node's egress, never the split-default `/1`s the exit
+    /// reconcile adds to its entry (those are re-asserted inline on the loop,
+    /// mutually exclusive with the teardown). A route the admin revokes stops
+    /// being defended at the netmap delta, although the crypto-router keeps
+    /// it until the peer's next carrier install.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_defended_subnets_are_what_install_subnets_routed() {
+        use crate::overlay::router::Cidr;
+        let kp = WgKeypair::generate();
+        let exit_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun = ExemptionTun::new();
+        let tf: TunFactory = {
+            let m = tun.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let id = exit_oid(0x33);
+        let server: IpAddr = "203.0.113.7".parse().unwrap();
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280)
+            .with_exit_node(Some(id.to_hex()), vec![server]);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let dev: Arc<dyn TunIo> = tun.clone();
+        let pk = crate::overlay::decode_public(&exit_kp.public_base64()).unwrap();
+        let routes = vec!["10.9.0.0/16".to_string(), "0.0.0.0/0".to_string()];
+        let mut peers = HashMap::new();
+        peers.insert(
+            id,
+            NetmapPeer {
+                wg_public_key: exit_kp.public_base64(),
+                ..exit_np(id, "exit-a", routes.clone())
+            },
+        );
+        let exit_ip = Ipv4Addr::new(100, 64, 0, 1);
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            id,
+            Installed::base(pk, exit_ip, DirectTier::Lan, Instant::now()),
+        );
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let subnets: Vec<Cidr> = routes.iter().map(|r| Cidr::parse(r).unwrap()).collect();
+
+        // The generic install, as every carrier install runs it.
+        rt.install_subnets(&mut wg, &dev, id, pk, &subnets).await;
+        let set = defended_routes(&by_node, &peers, self_v4, |k| wg.peer_subnets(k));
+        assert_eq!(defended_subnets(&set), ["10.9.0.0/16"], "{set:?}");
+
+        // This node now routes its egress through that peer.
+        let mut st = ExitRoutingState::default();
+        rt.reconcile_exit_routing(&mut wg, &dev, &by_node, &peers, &mut st)
+            .await;
+        assert!(st.split_default_installed);
+        assert!(
+            !split_default_missing(&wg.peer_subnets(&pk)),
+            "the crypto-router holds the /1s now: {:?}",
+            wg.peer_subnets(&pk)
+        );
+        let set = defended_routes(&by_node, &peers, self_v4, |k| wg.peer_subnets(k));
+        assert_eq!(
+            defended_subnets(&set),
+            ["10.9.0.0/16"],
+            "the /1s stay off the detached wave: {set:?}"
+        );
+
+        // The admin revokes the subnet: the netmap delta drops it from the
+        // peer's routes while its crypto-router entry still holds it.
+        peers.get_mut(&id).unwrap().routes = vec!["0.0.0.0/0".to_string()];
+        assert!(
+            wg.peer_subnets(&pk)
+                .contains(&Cidr::parse("10.9.0.0/16").unwrap()),
+            "the crypto-router keeps it until the next carrier install"
+        );
+        let set = defended_routes(&by_node, &peers, self_v4, |k| wg.peer_subnets(k));
+        assert!(
+            defended_subnets(&set).is_empty(),
+            "a revoked route is not kept alive: {set:?}"
+        );
+
+        // A peer that is no longer installed contributes nothing, even with
+        // its entry still in the crypto-router.
+        assert_eq!(
+            defended_routes(&HashMap::new(), &peers, self_v4, |k| wg.peer_subnets(k)),
+            vec![Defend::EvictSelf(self_v4), Defend::BlockFloor]
+        );
     }
 
     /// FR-97 P1a — the uplink moves under an active exit (Wi-Fi ↔ Ethernet).

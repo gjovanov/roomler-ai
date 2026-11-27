@@ -212,6 +212,31 @@ daemon_supervises_gui_worker() {
     /etc/roomler/config.toml
 }
 
+# FR-141 P2's follow-up — is this Mac one row (FR-43 P3d): its root daemon
+# holds its only enrollment, and the worker in the person's session holds
+# none (`macos_one_row = true`)? Read as the key above is read.
+root_config_is_one_row() {
+  [ -f /etc/roomler/config.toml ] || return 1
+  grep -qE '^[[:space:]]*macos_one_row[[:space:]]*=[[:space:]]*true' /etc/roomler/config.toml
+}
+
+# FR-141 P2's follow-up — the server the root daemon is enrolled with, for a
+# line a person can paste: the config's first server_url, which is the
+# top-level one (an org's tables come after it), when it is a plain URL, and
+# nothing otherwise. No pipe, so nothing can end it early, and it always
+# returns 0: its caller assigns its output under `set -euo pipefail`.
+root_server_url() {
+  local url nl re='^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~-]+)*$'
+  nl='
+'
+  url=$(sed -n 's/^[[:space:]]*server_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    /etc/roomler/config.toml 2>/dev/null) || url=""
+  url=${url%%"$nl"*}
+  url=${url%/}
+  if [[ $url =~ $re ]]; then printf '%s\n' "$url"; fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # The person's half: the two login items in the console user's
 # ~/Library/LaunchAgents, loaded into that user's gui/<uid> domain, and the
@@ -366,7 +391,7 @@ persons_half() {
     rm_err=$(as_person /bin/rm -f "$PLIST_TARGET" 2>&1) || true
     if [ -L "$PLIST_TARGET" ] || [ -e "$PLIST_TARGET" ]; then
       echo "WARNING: the account of $CONSOLE_USER could not remove \"$PLIST_TARGET\","
-      echo "  so launchd loads it at the next login and the per-user agent comes back."
+      echo "  so launchd loads it at the next login and the per-user roomlerd comes back."
       [ -z "$rm_err" ] || echo "  $rm_err"
       folder_said=0
       if folder_not_the_persons; then folder_said=1; fi
@@ -384,8 +409,27 @@ persons_half() {
     echo "  /etc/roomler/config.toml), so the per-user LaunchAgent was NOT loaded."
     echo "  The daemon spawns and babysits the worker itself; one device row both"
     echo "  holds the enrollment and serves the screen."
-    echo "  To go back to the per-user LaunchAgent, set that key false (or remove"
-    echo "  it) and re-run the installer."
+    if root_config_is_one_row; then
+      # FR-141 P2's follow-up — a one-row Mac holds no per-user enrollment, so
+      # the per-user LaunchAgent is no way back: it would come up with nothing
+      # to run, and the key set false would leave nothing serving the screen.
+      # A Mac `roomlerd one-row` made one row keeps root's copy from before,
+      # and its --revert puts the two rows back; any other one-row Mac's way
+      # out is the uninstall, from the server it is enrolled with.
+      if [ -f /etc/roomler/config.toml.pre-one-row ]; then
+        echo "  roomlerd one-row made this Mac one row; to put it back as it was, run:"
+        echo "    sudo roomlerd one-row --revert"
+      else
+        local one_row_server
+        one_row_server=$(root_server_url)
+        echo "  This Mac is one row (macos_one_row = true in the same file), so there"
+        echo "  is no per-user roomlerd to go back to. To remove Roomler from it, run:"
+        echo "    curl -fsSL ${one_row_server:-<your server>}/api/setup/install.sh | sh -s -- --uninstall"
+      fi
+    else
+      echo "  To go back to the per-user LaunchAgent, set that key false (or remove"
+      echo "  it) and re-run the installer."
+    fi
   elif ! place_login_item "$PLIST_SOURCE" "$PLIST_TARGET"; then
     echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but its login item"
     echo "  is not in place, so it was not loaded"
@@ -602,7 +646,7 @@ if daemon_is_enabled; then
       echo "    sudo launchctl kickstart -k system/com.roomler.daemon"
     fi
     echo "  Its LocalAPI lives at /var/run/roomler/roomler.sock — reach it with"
-    echo "  'sudo roomler …' (an unprivileged 'roomler' finds the user agent)."
+    echo "  'sudo roomler …' (an unprivileged 'roomler' finds the per-user roomlerd)."
   fi
 else
   # A previously-enabled daemon must go away when the marker does, or an

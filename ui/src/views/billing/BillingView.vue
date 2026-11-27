@@ -28,28 +28,41 @@
         <div>
           <div class="text-overline text-medium-emphasis">Current Plan</div>
           <div class="text-h5 font-weight-bold text-capitalize">{{ currentPlan }}</div>
-          <div v-if="billing?.status" class="mt-1">
+          <div v-if="status" class="mt-1">
             <v-chip
-              :color="billing.status === 'active' ? 'success' : 'warning'"
+              :color="status === 'active' ? 'success' : 'warning'"
               size="small"
               variant="tonal"
+              data-testid="billing-status"
             >
-              {{ billing.status }}
+              {{ status }}
             </v-chip>
-            <span v-if="billing.cancel_at_period_end" class="text-body-2 text-warning ml-2">
+            <span
+              v-if="summary?.cancel_at_period_end"
+              class="text-body-2 text-warning ml-2"
+              data-testid="billing-cancels"
+            >
               Cancels at period end
             </span>
           </div>
           <div class="text-body-2 text-medium-emphasis mt-1" data-testid="billing-seats">
             {{ seatsLine }}
           </div>
-          <div v-if="billing?.current_period_end" class="text-body-2 text-medium-emphasis mt-1">
-            Current period ends: {{ new Date(billing.current_period_end).toLocaleDateString() }}
+          <div v-if="planManaged" class="text-body-2 text-medium-emphasis mt-1" data-testid="billing-managed">
+            {{ MANAGED_NOTICE }}
+          </div>
+          <div
+            v-if="summary?.current_period_end"
+            class="text-body-2 text-medium-emphasis mt-1"
+            data-testid="billing-period-end"
+          >
+            Current period ends: {{ new Date(summary.current_period_end).toLocaleDateString() }}
           </div>
         </div>
         <v-btn
-          v-if="billing?.customer_id"
+          v-if="summary?.has_billing_account"
           variant="outlined"
+          data-testid="manage-subscription"
           @click="openPortal"
           :loading="portalLoading"
         >
@@ -168,6 +181,19 @@
           >
             Current Plan
           </v-btn>
+          <!-- #4433 — never a checkout that lowers a plan Roomler set. -->
+          <v-btn
+            v-else-if="plan.id !== 'free' && !subscribed && lowersPlan(plan)"
+            color="primary"
+            variant="tonal"
+            block
+            size="large"
+            class="mt-4"
+            disabled
+            :data-testid="`included-${plan.id}`"
+          >
+            Included in your plan
+          </v-btn>
           <v-btn
             v-else-if="plan.id !== 'free' && !subscribed"
             color="primary"
@@ -278,10 +304,21 @@ interface BillingSummary {
   current_period_end: string | null
   cancel_at_period_end: boolean
   subscribed: boolean
+  /** The org has a Stripe customer: "Manage Subscription" opens its portal. */
+  has_billing_account: boolean
+  /** #4433 — the plan was set by Roomler, not through billing (above Free, no
+   * live subscription). Absent from an older server, which reads as false. */
+  plan_managed?: boolean
 }
 
 const UNLIMITED = 4294967295
 const CURRENCY_KEY = 'roomler.billing.currency'
+/** #4433 — the plans in order (the server's `Plan::rank`). Enterprise is never
+ * on sale here, but an org can hold it. */
+const PLAN_RANK: Record<string, number> = { free: 0, pro: 1, business: 2, enterprise: 3 }
+const MANAGED_NOTICE = 'Your plan was set by Roomler, not through billing. To change it, contact Roomler.'
+const MANAGED_REFUSAL =
+  'Your plan was set by Roomler, not through billing, and this plan would lower it. To change your plan, contact Roomler.'
 
 const plans = ref<PlanInfo[]>([])
 const summary = ref<BillingSummary | null>(null)
@@ -295,8 +332,19 @@ const pending = ref<PlanInfo | null>(null)
 
 const currentTenant = computed(() => tenantStore.current)
 const currentPlan = computed(() => summary.value?.plan || currentTenant.value?.plan || 'free')
-const billing = computed(() => currentTenant.value?.billing || {})
 const subscribed = computed(() => summary.value?.subscribed === true)
+/** The current-plan card reads the org's billing from the summary alone:
+ * `GET /api/tenant` carries none, and a member without MANAGE_TENANT gets no
+ * summary, so sees none of it. The status chip shows only while the org is
+ * subscribed (`subscribed`: active, trialing or past due). Without a live
+ * subscription the stored status describes none the org has: the start of a
+ * checkout records `active` before any subscription exists, a checkout
+ * abandoned at 3-D Secure leaves `incomplete`, and an ended one `canceled`
+ * on a Free org (#4432). */
+const status = computed(() => {
+  const s = summary.value
+  return s?.subscribed && s.status ? s.status : null
+})
 const seatsNow = computed(() => Math.max(1, summary.value?.seats_now ?? 1))
 /** A PAID plan sells annually here (`utils/billingCurrency`). */
 const annualOnSale = computed(() => annualIn(plans.value))
@@ -416,6 +464,24 @@ function isCurrent(plan: PlanInfo): boolean {
   return (summary.value?.interval || 'month') === shownInterval(plan)
 }
 
+/** #4433 — the org's plan was set by Roomler, not through billing. */
+const planManaged = computed(() => summary.value?.plan_managed === true)
+
+/** #4433 — buying `plan` would lower a plan set outside billing: a paid
+ * checkout writes the plan it sold. The server refuses it (409
+ * `plan_managed`), and the page does not offer it. */
+function lowersPlan(plan: PlanInfo): boolean {
+  if (!planManaged.value) return false
+  return (PLAN_RANK[plan.id] ?? 0) < (PLAN_RANK[currentPlan.value] ?? 0)
+}
+
+/** The code a 409 carries in `error` (`plan_managed`, `conflict`), if any:
+ * the page decides on the code, never on the words. */
+function conflictCode(e: unknown): string | null {
+  const err = e as { status?: unknown; data?: { error?: unknown } } | null
+  return err?.status === 409 && typeof err.data?.error === 'string' ? err.data.error : null
+}
+
 function fail(e: unknown, what: string) {
   errorMessage.value = `${what}: ${(e as Error)?.message || String(e)}`
   console.error(what, e)
@@ -459,7 +525,14 @@ async function checkout(planId: string) {
     })
     if (result.url) window.location.href = result.url
   } catch (e) {
-    fail(e, 'Checkout failed')
+    if (conflictCode(e) === 'plan_managed') {
+      // #4433 — the page was older than the org's plan: say why, and read the
+      // org again so the card says who sets the plan and the offer goes.
+      errorMessage.value = MANAGED_REFUSAL
+      await fetchSummary()
+    } else {
+      fail(e, 'Checkout failed')
+    }
   } finally {
     busy.value = null
   }

@@ -348,8 +348,8 @@ give.
 A tunnel policy names who may reach which `host:port` through which of the org's
 devices, so writing one is granting access. Every `…/tunnel-policy` route needs
 **`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
-(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:800`; the
-overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:150`).
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:811`; the
+overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:157`).
 The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
 roles do not.
 
@@ -359,15 +359,27 @@ roles do not.
 - **The reads too.** The list is the org's whole tunnel ACL: every subject, every
   target device, and the internal hosts, ranges and ports behind them. A member
   learns what they may reach by reaching it; a refused forward says `acl_denied`.
-- **The bit is decided first**, before the policy id is parsed, the body validated or
-  a policy looked up. A member without it gets one 403 `forbidden` whatever the id
-  names (a policy of their org, another org's, nothing) or the body says, so the
+- **The bit is decided first**, before the policy id is parsed, the body read or a
+  policy looked up. A member without it gets one 403 `forbidden` whatever the id
+  names (a policy of their org, another org's, nothing) or the body is, so the
   refusal says nothing about which policies exist. It is never `not_a_member`, the
   one 403 the web app leaves the org on; someone outside the org is still told
   `not_a_member`. For a holder, another org's policy or an id that names nothing is
   a 404.
+- ⚠️ **A body that does not parse is no exception** (#4187). Taken as an extractor,
+  axum's `Json<T>` refuses such a body before the handler runs, so its 400, 415 or
+  422 came before the gate. The tunnel-policy writes, and the overlay ACL's create,
+  update and mode, take the body as `Result<Json<T>, JsonRejection>` and read it
+  with `let Json(body) = body?;` straight after the gate. `ApiError::JsonBody`
+  (`crates/core/src/error.rs:55`) answers it exactly as the extractor did, the
+  status and the plain-text words, so a holder sees no change. The extractor
+  still buffers and parses the bytes before the handler runs, as `Bytes` would;
+  what waits for the gate is its answer. The overlay ACL's half is pinned in
+  `crates/tests/src/overlay_tests.rs` (`overlay_acl_decides_the_bit_before_the_body`).
+  The rest of the network module's gated writes followed in #4218, and a guard now
+  holds the order in every module ([below](#a-gated-write-decides-its-gate-before-it-reads-its-body)).
 - ⚠️ **The forward itself reads no permission bit, and must not.**
-  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
+  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1035`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
   people who hold no management bit reach what a holder named them for, so a bit on
   the forward would either defeat it or repeat it. When a policy names a role, the
@@ -392,11 +404,12 @@ name upstream, and under an exit node the host's whole DNS goes there
 ([magicdns.md](magicdns.md#who-sets-the-domain-and-the-upstreams)). Changing them
 changes every node's DNS, so **`PUT …/magic-dns` needs `MANAGE_AGENTS`**, like the
 overlay ACL's mode and the retired-key switch (`set_magic_dns`,
-`crates/modules/network/src/routes/overlay_route.rs:552`):
+`crates/modules/network/src/routes/overlay_route.rs:564`):
 
-- **Decided first**, before the body is normalized, the plan gate or the domain
-  checks run. A member without the bit gets one 403 `forbidden` whatever the body
-  says, never `not_a_member`; someone outside the org still gets `not_a_member`.
+- **Decided first**, before the body is read (#4218), normalized, or the plan gate or
+  the domain checks run. A member without the bit gets one 403 `forbidden` whatever
+  the body says, one that does not parse included, never `not_a_member`; someone
+  outside the org still gets `not_a_member`.
   Switching MagicDNS off, or setting only the upstreams, is a change like any other.
 - **The read stays any member's**, unlike the tunnel ACL's above, and the difference
   is the content: every node of the org receives the domain and the resolvers in its
@@ -408,6 +421,83 @@ overlay ACL's mode and the retired-key switch (`set_magic_dns`,
   read-only rather than showing an error.
 
 `crates/tests/src/magic_dns_permission_tests.rs` pins each point.
+
+### A gated write decides its gate before it reads its body
+
+axum runs a handler's extractors before the handler's first line, and `Json<T>` as an
+extractor answers a body that does not parse there: 400, 413, 415 or 422. A write that
+takes `Json<T>` and decides its gate in its body therefore answers such a body before
+the gate. A caller the gate refuses is told about the body instead of being refused,
+and a platform-operator route, which answers anyone else 404 so that it stays unseen,
+is seen (#4187, #4218, #4254).
+
+- **The order.** A write gated on a permission bit or on the platform-operator
+  allowlist takes `Result<Json<T>, JsonRejection>` and unwraps it with
+  `let Json(body) = body?;` straight after its gate, before it parses or looks up any
+  id its gate does not need (a bit's gate asks about one org, so that org's id is
+  parsed first). A caller the gate refuses gets the gate's answer, whatever the body
+  is. A caller it lets through gets what the extractor answered, the status and the
+  plain-text words (`ApiError::JsonBody`, `crates/core/src/error.rs:55`), whatever the
+  id is, as before.
+- **Where it holds.** Every gated write of the api crate and of every module:
+  - `network` (#4187, #4218): the overlay ACL and tunnel-policy writes, the route and
+    exit-node approvals, `PUT …/magic-dns`, the retired-key switch, the peer-relay
+    mode, a device's SSH policy, the org's SSH settings, a tunnel client's update and
+    the block renumber, and the four platform-operator routes: block reclaim, host
+    reconcile, orphans and the tunnel-client prune.
+  - the api crate (#4254): an invite, a batch of invites and an added member
+    (`INVITE_MEMBERS`), a role's create and update (`MANAGE_ROLES`), and the growth
+    exclusions (platform operator).
+  - `chat` (#4254): a room's update (`MANAGE_CHANNELS`, after the room guard) and the
+    room-membership prune (platform operator). A message's edit answers its author
+    check before its body too, where the guard cannot see it (below).
+  - `fleet` (#4254): a device's settings, the forced self-update of one device and of
+    the fleet, a device's exec policy and an ephemeral enrollment key's mint
+    (`MANAGE_AGENTS`), and the org's exec switch, ephemeral-key settings, external
+    access and keep-busy settings (`MANAGE_TENANT`). Adding a device to a second org
+    is below.
+  - `remote` (#4254): the org's remote-session policy and limits (`MANAGE_TENANT`).
+  - `saas` (#4254): the newsletter's create, edit, test send and send (platform
+    operator). The send takes `Result<Option<Json<T>>, JsonRejection>`, so a request
+    with no content type still reaches it with no body.
+
+  The fleet module's `rc-resume-scope` and the remote module's `close-dead` read theirs
+  after the platform-operator check too, and answer an operator's malformed body a 400
+  JSON.
+- **A gate that needs the body comes after it.** Two such gates sit among these
+  writes:
+  - the billing writes, `POST /api/stripe/checkout`, `/change-plan` and `/portal`:
+    their gate asks about the org the body's `tenant_id` names, and their routes carry
+    no org in their path. They are on the guard's `BY_DESIGN` list.
+  - adding a device to a second org (`POST …/agent/{agent_id}/join-org`) asks
+    `MANAGE_AGENTS` of two orgs: of the path's org before the body, and of the org the
+    body names after it, since only the body names that org. A holder on the path's
+    org who sends a body that does not parse gets the extractor's answer, as no org
+    was named. The scan sees the first gate before the body, and no list holds it.
+- **The guard.** `gate_before_body` (`crates/api/src/gate_before_body.rs`), a unit
+  test of the api crate, reads the server's source: the api crate, `roomler-core` and
+  every module. It fails when a function takes its body as `Json<T>` or
+  `Option<Json<T>>` and calls a gate, or takes the `Result` of either and uses it
+  before its gate. A gate is a function, other than a handler, that checks a
+  permission bit (`permissions::has`) or the allowlist (`platform_admins.contains`),
+  or that calls a gate, so a new helper built on `require_permission` is one without
+  being named. Its `BY_DESIGN` list holds the checks that need the body, each with
+  why. It may only shrink: an entry the scan no longer flags fails the test until it
+  is removed.
+- ⚠️ **What it cannot see** is written in its header: an ownership or author check, a
+  check called as a method or through a macro, a handler a macro writes, and the other
+  extractors that answer before the handler runs (`Query<T>`, a typed `Path<T>`,
+  `Form<T>`, `Multipart`, a `Bytes` or `String` body's 413). Those stay the reviewer's.
+  A message's edit (`chat::message::update`) is one: since #4254 its author check is
+  answered before its body, so someone who is not the author gets the answer a missing
+  message gets, whatever the body holds. Only its integration test
+  (`crates/tests/src/room_access_tests.rs`) shows that order.
+
+The routes are pinned by the integration tests that cover them: each file has a test
+that a caller the gate refuses gets its answer for `{`, a field of the wrong type and
+a body sent as `text/plain` (`does_not_parse` in its name), and a control that a
+caller it lets through gets the extractor's answer
+(`crates/tests/src/tunnel_policy_permission_tests.rs`, `holder_problems`).
 
 ### A 403 is an answer, not an expired credential (FR-82)
 
@@ -509,12 +599,12 @@ is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.
   gone, and the pod serving the call ends it for everyone in it. That pod also ends it on its own when it
   finds the room's document gone in two reconcile reads in a row, so a lost word cannot
   keep the call alive. The same holds for one seat: the pod serving a call checks its own
-  seats every 10 s (`crates/modules/conference/src/seat_check.rs`), and a seat whose
-  admission (the org membership, and the room membership where the room's visibility wants
-  one) reads as gone in two complete reads in a row ends there, within 30 s, so a withdrawal
-  that did not reach that pod cannot keep it. ⚠️ The check re-reads the room guard's own
-  rule, never a second copy: wherever the guard admits, it keeps the seat, and a failed or
-  late read keeps every seat. `docs/real-time.md` has the flow.
+  seats every 10 s (`crates/modules/conference/src/seat_check.rs`, flow in `docs/real-time.md`).
+  A seat whose admission (the org membership, and the room membership where the room's
+  visibility wants one) reads as gone in two complete reads in a row is put to the room guard
+  `media:join` runs; only its refusal ends it there, within 40 s, so a withdrawal that did not
+  reach that pod cannot keep it. ⚠️ The guard's own answer decides each end, never a copy of
+  its rule; doubt (a failed or late read, a document that does not decode, no answer) keeps it.
 - **A room membership ends with the org membership.** Every room fan-out (messages,
   edits, reactions, pins, typing, mentions) reaches the people holding a row in
   `room_members`, so the same hook, run after the org membership row is gone, drops the
@@ -674,7 +764,7 @@ The sites on it since P1:
 | The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:1160` |
 | The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:1042`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
 | The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:349` |
-| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1449` |
+| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1650` |
 | The machine config's key files the daemon writes: a device key (`peer-auth\<tenant>.json`) and the browser keys (`<tenant>.controllers.json`), #3956 | `HeldPath::base(<machine folder>)`, then `open_or_make_dir("peer-auth", Seal::Private)`: opened as it is, or made sealed, with no leaf policy, since the keys folder is FR-94's to repair; then `write_file(.., Seal::Private)`, so each file comes out as that repair leaves it. A link at `peer-auth` leaves the key unwritten, and the hello offers none | `agents/roomlerd/src/peer_auth.rs:1193`, `crates/agent-core/src/machine_tree/held.rs:453` |
 
 P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
@@ -682,7 +772,7 @@ machine folder, with a test that fails on a new path-based one; until then those
 write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's environment
 sends the crash recorder and the machine config's key files back to their writes by
 path, each with one WARN naming the switch
-(`crates/agent-core/src/machine_tree.rs:377`). The clean-up's removals have no switch: a
+(`crates/agent-core/src/machine_tree.rs:381`). The clean-up's removals have no switch: a
 removal that follows a link has no safe old way to return to.
 
 ### A viewer's file transfer acts as the person at the screen (#3048, #3669, #3688)
@@ -731,7 +821,7 @@ environment (a systemd drop-in); remote config cannot reach it
 The viewer chooses an upload's `id`, and the daemon names the upload's staging
 folder after it. So the id is one plain name: letters, digits, `.`, `_` and
 `-`, not starting with `.`, at most 128 bytes (`transfer_id`,
-`agents/roomlerd/src/files.rs:1667`). Every entry that takes an id from the
+`agents/roomlerd/src/files.rs:1711`). Every entry that takes an id from the
 files channel checks it first, on every OS and before anything on disk is
 touched: `files:begin`, `files:resume`, `files:cancel` and `files:end`. Any
 other id is refused with a `files:error` the viewer shows. `partial_dir_for`,
@@ -746,7 +836,7 @@ check still builds no path from it. The viewer's own ids
 A viewer chooses every string it sends on a session's data channels, the
 channel's own name included, and the daemon's log writes one event a line. So
 on every channel the session's peer routes (`on_data_channel`,
-`agents/roomlerd/src/peer.rs:1216`: input, control, cursor, clipboard, files,
+`agents/roomlerd/src/peer.rs:1224`: input, control, cursor, clipboard, files,
 record, privacy, video-bytes, and a channel of any other name), a string the
 viewer sent, and a reason or an error built from one, is logged with Debug
 escaping (`?`), so a line break or another control character in it stays inside
@@ -758,8 +848,8 @@ as it is only after a check of its own shape:
 | Logged as it is | The check it passed |
 |---|---|
 | an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
-| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11451`) |
-| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10788`) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11465`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10799`) |
 
 The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
@@ -782,12 +872,12 @@ escaping, on every line that holds it:
 |---|---|---|
 | `user` | the name the client logs in as | `ssh: authenticated (server grant)`, `ssh: authenticated (ssh_authorized_keys)`, `ssh: rejected — no live grant …` |
 | `term` | the terminal the client asks for | `ssh: pty requested`, `ssh: interactive session started` |
-| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2223`) |
-| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2089`) | the four `ssh: forward …` lines |
+| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2370`) |
+| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2233`) | the four `ssh: forward …` lines |
 | `caller` | the grant's caller as the server words it; in a session `ssh:«caller»@«address»`, or `ssh:«user»@«address» (key-list)` with the client's own login name (`agents/roomlerd/src/ssh.rs:903`, `:926`) | the six `rc:ssh.grant` lines in `agents/roomlerd/src/signaling.rs`, the SYSTEM service's claim (`agents/roomlerd/src/ssh_service.rs:677`), every line of a session, the question to the person at the device, and the exec engine's lines for the command (`fleet-rpc: running command`, `exec: streaming command`, `exec: refusing to run …`, in `agents/roomlerd/src/exec.rs`) |
 | `run_as` | `daemon`, `console_user` or `named:«account»` (`RunAs::label`, `agents/roomlerd/src/exec.rs:791`) | `ssh: sftp session started`, `ssh: interactive session started`, `ssh: exec finished`, `exec: refusing to run …` |
 | `e` | the terminal's start error, which on Windows quotes `named:«account»` | `ssh: could not start the terminal session` |
-| `msg` | what `sftp-server` writes to its stderr, which can quote a path the client sent: its first 4 KiB, with `cut_bytes` counting the rest (`SftpStderr`, `agents/roomlerd/src/ssh.rs:2174`, #3890) | `ssh: sftp-server stderr`, one line a session, written when the child closes its stderr, from both spawns (a Windows `console_user` session's too) |
+| `msg` | what `sftp-server` writes to its stderr, which can quote a path the client sent: its first 4 KiB, with `cut_bytes` counting the rest (`SftpStderr`, `agents/roomlerd/src/ssh.rs:2318`, #3890) | `ssh: sftp-server stderr`, one line a session, written when the child closes its stderr, from both spawns (a Windows `console_user` session's too) |
 
 Logged as they are: the server's ids (`grant_id`) and the daemon's own (a
 question's id), which the SYSTEM service checks with `valid_object_id` before it
@@ -812,13 +902,13 @@ folder on its way is one another account can write
 
 - **Its default folder** is its XDG Downloads when that exists and passes, else
   `~/Downloads`, made 0700 when a file arrives, else a refusal the viewer shows
-  (`default_download_dir`, `agents/roomlerd/src/files.rs:5021`). The folder each
+  (`default_download_dir`, `agents/roomlerd/src/files.rs:5234`). The folder each
   is opened to must be the writer's own: for root, one no other account may
   write; for a per-user daemon, one not every account may, unless its file
   system keeps no owners or modes, where it need only be one the daemon can
   write into. Never the temp dir. Root's home is the one its account names,
   never `HOME`, and must pass root's rule itself
-  (`own_home_and_downloads`, `files.rs:5334`); FR-84's rule judges a
+  (`own_home_and_downloads`, `files.rs:5547`); FR-84's rule judges a
   configured or a chosen folder against that home too.
 - **Its staging** (`.roomler-partial`, `<id>`, `meta.json`, `data`) is made with
   explicit modes whatever the umask, and is used, resumed or registered by the
@@ -829,11 +919,11 @@ folder on its way is one another account can write
   mounted with fixed modes) cannot hold staging of the writer's own: its upload
   stages in the writer's own private folder, `~/.local/state/roomler/staging` or
   root's `/var/lib/roomler/staging`, and is copied across at its end
-  (`stage_held`, `files.rs:5115`). There root still never places into a
+  (`stage_held`, `files.rs:5328`). There root still never places into a
   folder another account can write, and its private folder sits only in a
   `/var/lib/roomler` that is root's and no other account may write.
 - **A root writer's resume and end** place only in a folder the rule gives it
-  now (`root_may_place_in`, `files.rs:5235`): the one the partial sits beside,
+  now (`root_may_place_in`, `files.rs:5448`): the one the partial sits beside,
   or, for one staged in root's private folder, the one its notes record. Never
   where its notes alone say.
 - **A transfer holds** its folders from its begin, or its resume, to its end, and
@@ -947,11 +1037,11 @@ A single-use enrollment token and an FR-51 ephemeral key act for the admin who m
 them (the token's `sub`, the key's `created_by`): the device they enroll is that
 person's, and an anchor records them as `anchored_by`. So every use asks again what the
 mint asked, whether that person holds `MANAGE_AGENTS` in the credential's org
-(`issuer_may_enroll`, `crates/modules/fleet/src/agent.rs:160`, the mint's own
+(`issuer_may_enroll`, `crates/modules/fleet/src/agent.rs:164`, the mint's own
 `require_permission`, which nobody outside the org passes):
 
 - **Both doors ask it**: `POST /api/agent/enroll`, for a token and a key alike
-  (`crates/modules/fleet/src/agent.rs:353`), and `POST /api/agent/anchor`
+  (`crates/modules/fleet/src/agent.rs:383`), and `POST /api/agent/anchor`
   (`crates/modules/fleet/src/exec_service.rs:151`). They ask after the archived-org
   gate and before the token's spend or the key's claim
   ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)). A token a
@@ -1004,7 +1094,7 @@ live rows only, and a tombstone gets `NotFound`, the answer an unknown id gets:
 | Lookup | Finds a tombstone | For |
 |---|---|---|
 | `BaseDao::find_by_id_in_tenant`, and each DAO's `find_live_in_tenant` | no: `NotFound`, like a bogus id | every GET of the thing itself, every write, every session start |
-| `BaseDao::find_any_by_id_in_tenant`, only through a DAO's named `find_any_in_tenant` | yes | a reader whose job is the tombstone, with the reason on the DAO method |
+| `BaseDao::find_any_by_id_in_tenant`, only through a DAO's named `find_any_in_tenant` (and `AgentDao::find_any_in_tenant_on_the_primary`, the token rotation's, which reads the primary) | yes | a reader whose job is the tombstone, with the reason on the DAO method |
 
 - **The live predicate is `deleted_at: null`**, which matches null and absent
   alike and is the one every live listing uses. `{"$type": "null"}` is the
@@ -1060,7 +1150,7 @@ Readers that keep the tombstone, and why:
 
 | Reader | Why it must see one |
 |---|---|
-| `auth_agent`, the agent socket upgrade, `/derp`, `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
+| `auth_agent`, the agent socket upgrade, `/derp`, the token rotation (`POST /api/agent/self/rotate`, FR-155), `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
 | `recording-activity`, `transfer-activity`, `privacy-activity`, `…/logs`, `…/crash` (both read under `MANAGE_AGENTS`, [below](#device-diagnostics-manage_agents-and-a-second-scrub)), the External access decision log and people list | an audit view of a removed device. Removing a device must not be the way to hide what it did |
 | External access's re-read of its gates as a session opens (`extauth::org_gates_open`) | a removed device is its removal's to end (`removal::kick`), not this read's, and a tombstone answering here keeps a removal that raced the open from reading as a failed read. It reached through `base` until #3327, and reads through `AgentDao::find_any_in_tenant` now |
 | `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone, and a device's row comes back with a new device's settings, everything else it was allowed staying with the removal ([#3627](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)). A tunnel client's tombstone revives only through a holder of `MANAGE_AGENTS` ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)) |
@@ -1121,7 +1211,7 @@ the daemon shows, below), and a consent answer
 (`ConsentDecide`, an approval or a denial) and a Disconnect (`RcDisconnect`) require the
 person at the screen the daemon shows, `SYSTEM` or an elevated administrator
 (`peer_may_decide_for_the_screen`,
-[`lib.rs:2679`](../crates/localapi/src/lib.rs#L2679)). An approval lets someone see and
+[`lib.rs:2795`](../crates/localapi/src/lib.rs#L2795)). An approval lets someone see and
 control the screen, and the pipe admits every interactive user, so the ACL alone does not
 say whose screen a caller is at. The peer is what the OS read at accept: the client's
 session, and its account and elevation from its token. `SYSTEM` is named by its SID
@@ -1131,10 +1221,10 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
   signed in, over RDP too. The person at the console is then someone else and is refused.
   A daemon in session 0 takes the console session; with neither known, only `SYSTEM` and
   an elevated administrator are taken (`screen_session`,
-  [`lib.rs:2652`](../crates/localapi/src/lib.rs#L2652)).
+  [`lib.rs:2768`](../crates/localapi/src/lib.rs#L2768)).
 - **Fail closed**: a peer whose session and account the pipe could not read is refused,
   in words, with a warn line, and nothing reaches the daemon (`not_the_screens_person`,
-  [`lib.rs:3925`](../crates/localapi/src/lib.rs#L3925)).
+  [`lib.rs:4061`](../crates/localapi/src/lib.rs#L4061)).
 - **On Unix nothing changes**: the daemon's own account or root are taken, who its
   owner-only socket admits. The person socket keeps its own seat check (below).
 - The tray's Approve, Deny and Disconnect and `roomlerd consent` run as the person in their
@@ -1143,8 +1233,8 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
 - **The console person's gates follow the same screen.** A console person's `ConfigSet`
   key (`CONSOLE_PERSON_KEYS`), the recording verbs, keep busy on and the external-access
   password's set and clear take, on Windows, a peer in the screen's session
-  (`peer_is_console_user`, [`lib.rs:2577`](../crates/localapi/src/lib.rs#L2577);
-  `peer_may_start_keep_busy`, [`lib.rs:2521`](../crates/localapi/src/lib.rs#L2521)).
+  (`peer_is_console_user`, [`lib.rs:2693`](../crates/localapi/src/lib.rs#L2693);
+  `peer_may_start_keep_busy`, [`lib.rs:2637`](../crates/localapi/src/lib.rs#L2637)).
   Nothing else about them changed: keep busy on still takes only a person's account
   (never root, `SYSTEM`, LocalService, NetworkService or an unreadable account),
   elevation passes none of them, and the person socket keeps its own rules. A machine-wide
@@ -1154,30 +1244,35 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
 
 **A LocalAPI client keeps an endpoint only when its own account or the system serves
 it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go
-through `localapi::connect()` ([`lib.rs:5542`](../crates/localapi/src/lib.rs#L5542)), and
+through `localapi::connect()` ([`lib.rs:5775`](../crates/localapi/src/lib.rs#L5775)), and
 each check runs on the connected endpoint, before the client sends anything:
 
 | OS | The endpoint is kept when | Otherwise |
 |---|---|---|
-| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4884`](../crates/localapi/src/lib.rs#L4884) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5568`](../crates/localapi/src/lib.rs#L5568) `connect_first_trusted`) |
-| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5817`](../crates/localapi/src/lib.rs#L5817) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5849`](../crates/localapi/src/lib.rs#L5849) `connect_windows_checked`) |
+| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:5057`](../crates/localapi/src/lib.rs#L5057) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5801`](../crates/localapi/src/lib.rs#L5801) `connect_first_trusted`) |
+| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:6050`](../crates/localapi/src/lib.rs#L6050) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:6082`](../crates/localapi/src/lib.rs#L6082) `connect_windows_checked`) |
 
 - **Where a per-user endpoint lives.** Only in a directory private to its account: a
   real directory, not a link, owned by that account and writable by neither its group nor
-  anyone else ([`lib.rs:4858`](../crates/localapi/src/lib.rs#L4858)
+  anyone else ([`lib.rs:5031`](../crates/localapi/src/lib.rs#L5031)
   `per_user_socket_path_for`). Off macOS that is `$XDG_RUNTIME_DIR` and nothing else; on
   macOS it is the per-user temp folder (`/var/folders/…/T`), and never for root. A caller
   with no such directory (root under `sudo`, a cron job, a system service) has no
   per-user candidate and goes straight to the system socket.
 - **What a daemon serves.** A system daemon serves `/var/run/roomler/roomler.sock`
   alone. A per-user daemon serves its own per-user socket, and with no private directory
-  it serves none and logs why ([`lib.rs:4898`](../crates/localapi/src/lib.rs#L4898)
+  it serves none and logs why ([`lib.rs:5071`](../crates/localapi/src/lib.rs#L5071)
   `unix_endpoints`); `roomler`'s "not running" line then says the same
-  ([`localclient.rs:2179`](../agents/roomler-cli/src/localclient.rs#L2179)).
+  ([`localclient.rs:2186`](../agents/roomler-cli/src/localclient.rs#L2186)).
+- **What root is told (#3937).** With no system socket, root's "not running" line names
+  that socket and says that a per-user daemon answers only its own account
+  ([`lib.rs:5128`](../crates/localapi/src/lib.rs#L5128) `not_running_words_for`). It
+  names the account `sudo` ran for only when `SUDO_USER` is a POSIX portable user name,
+  and only prints it: no path is built from it, and no other account's socket is tried.
 - **The pipe client's open.** `GENERIC_READ | FILE_WRITE_DATA`, at identification level
   (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`): read and write data, never the
   right to create an instance of the pipe, and the server may learn who the client is but
-  never act as it ([`lib.rs:5829`](../crates/localapi/src/lib.rs#L5829)). It works
+  never act as it ([`lib.rs:6062`](../crates/localapi/src/lib.rs#L6062)). It works
   against every daemon version.
 - ⚠️ **An attended Windows install whose person is a standard user.** There the worker,
   and so the pipe, runs as that person. A CLI run as another account, `SYSTEM` included
@@ -1191,7 +1286,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 `/run/user/<uid>/roomler.sock`:
 - it belongs to the person signed in at the machine's own screen: logind's active session
   on `seat0`, when that session is a person's (`companion::seat0_uid`,
-  `agents/roomlerd/src/companion.rs:5007` — the rule received files and `console_user`
+  `agents/roomlerd/src/companion.rs:5212` — the rule received files and `console_user`
   already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
   although logind calls it active. Until #2871's review the socket went to the first
   active graphical session anywhere, which on a host with remote logins could be one;
@@ -1211,11 +1306,11 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
   decision) `ConfigGet` — the listing, no secret being on that surface, with every key
   the socket will not set marked `read_only = "root_only"` — and `ConfigSet` of exactly
   the keys that are the console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
-  `crates/localapi/src/lib.rs:3497`): the keys the daemon's own endpoint already
+  `crates/localapi/src/lib.rs:3625`): the keys the daemon's own endpoint already
   gated to that person because Windows' pipe admits every interactive user.
   Never the device-owned gates `exec_enabled`, `ssh_enabled` and
   `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
-  administrator's command (`not_on_the_person_socket_for_key`, `:3708`).
+  administrator's command (`not_on_the_person_socket_for_key`, `:3984`).
   Since #3967 it also takes `ConsentRelaying`, from its own person only and never
   from root: a two-row Mac's per-user half saying it lists the root half's consent
   questions. It reads nothing and grants nothing. The root half keeps it in memory
@@ -1276,14 +1371,18 @@ new verb cannot reach it by default. Widening it is a security change and needs
 review like one — #2871's design A was one: it admitted `ConfigGet`, and `ConfigSet`
 for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and left
 `exec_enabled`, `ssh_enabled` and `remote_config_enabled` root's on every root-mode
-install pending a separate policy call. The dispatcher gates the peer again, three ways
+install pending a separate policy call. FR-151's two verbs stay off it: `live_work`
+lists the root half's SSH connections and runs, and `ask_for_update` recorded by a
+root daemon would let the Mac's update helper install over everything, so a person
+records it only in the daemon behind their own socket
+(`live_work_and_the_ask_are_not_on_the_person_socket`). The dispatcher gates the peer again, three ways
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
-  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2620`, by
-  `person_peer_ok`, `:4903`). The listener makes that check before a byte is read, and a
+  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2736`, by
+  `person_peer_ok`, `:5341`). The listener makes that check before a byte is read, and a
   test drives the listener itself over a real socket: another account's connection is
   closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
-  (`serve_person_listener`, `:4967`). The gate makes the check again where the decision
+  (`serve_person_listener`, `:5492`). The gate makes the check again where the decision
   is, so the rule does not rest on that one call site. An unknown peer is refused;
 - **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
   and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the
@@ -1305,11 +1404,11 @@ install pending a separate policy call. The dispatcher gates the peer again, thr
   `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
   widen this one, so a new key reaches the person socket only by a decision.
 
-An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:4318`),
+An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:4465`),
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would
-leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:494`, #3525). A
+leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:506`, #3525). A
 spec that names the crate keeps its say: `RUST_LOG=debug` keeps its DEBUG lines, and
 `roomler_localapi=off` silences it. Only root sets a root daemon's `RUST_LOG`, so the
 person at the device cannot turn the record off.
@@ -1317,9 +1416,9 @@ person at the device cannot turn the record off.
 The value in the daemon's line is never a secret, because no secret is on the config surface:
 `agent_token`, `ssh_host_key`, `overlay_wg_secret_key`, each `[[orgs]]` entry's own, and FR-52's
 password record have no row there, and `apply` refuses them like any unknown key
-(`crates/agent-core/src/config_surface.rs:2936`). Two tests lock it:
-`secrets_and_identity_are_not_exposed` (`:4790`) and
-`no_external_credential_key_is_editable_through_the_config_surface` (`:5449`).
+(`crates/agent-core/src/config_surface.rs:2914`). Two tests lock it:
+`secrets_and_identity_are_not_exposed` (`:5021`) and
+`no_external_credential_key_is_editable_through_the_config_surface` (`:5811`).
 
 #3831 widened the allowlist by one read: `EncoderCaps`, the companion's encoder matrix. The
 daemon answers it from the probe's cached summary alone (`caps::summarize_cached`,

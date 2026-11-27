@@ -4,7 +4,7 @@ use bson::{Document, doc, oid::ObjectId};
 use mongodb::{Collection, Database};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::debug;
+use tracing::trace;
 
 #[derive(Debug, Error)]
 pub enum DaoError {
@@ -135,10 +135,28 @@ fn default_per_page() -> u64 {
 
 const MAX_PER_PAGE: u64 = 100;
 
+/// The page parameters a list is read with, kept within their range: `page`
+/// counts from 1, and `per_page` runs from 1 to [`MAX_PER_PAGE`].
+/// [`BaseDao::find_paginated`] reads them only through these, so every paged
+/// list gets the same range without a bound of its own in each route.
 impl PaginationParams {
-    /// Clamp per_page to MAX_PER_PAGE to prevent abuse
+    /// `page`, the first page at least.
+    pub fn clamped_page(&self) -> u64 {
+        self.page.max(1)
+    }
+
+    /// `per_page`, within `1..=MAX_PER_PAGE`.
     pub fn clamped_per_page(&self) -> u64 {
-        self.per_page.min(MAX_PER_PAGE)
+        self.per_page.clamp(1, MAX_PER_PAGE)
+    }
+
+    /// The rows before the page, `(page - 1) * per_page` over the kept
+    /// values, and at most the largest skip MongoDB takes: a page past the
+    /// last one reads empty.
+    fn skip(&self) -> u64 {
+        (self.clamped_page() - 1)
+            .saturating_mul(self.clamped_per_page())
+            .min(i64::MAX as u64)
     }
 }
 
@@ -261,17 +279,24 @@ where
         sort: Option<Document>,
         params: &PaginationParams,
     ) -> DaoResult<PaginatedResult<T>> {
+        let page = params.clamped_page();
         let per_page = params.clamped_per_page();
         let total = self.collection.count_documents(filter.clone()).await?;
-        let skip = (params.page - 1) * per_page;
 
-        let sort = sort.unwrap_or_else(|| doc! { "created_at": -1 });
+        // A paged list needs one stable order: rows that share every sort key
+        // but `_id` would otherwise come back in whatever order the server
+        // picks per page, so one row can land on two pages and another on
+        // none (#4215). A caller whose sort no index orders ends it with
+        // `_id` in its last key's direction; the default does the same. An
+        // index-ordered sort keeps its keys as they are, because `_id` past
+        // that index's keys turns the read into an in-memory sort.
+        let sort = sort.unwrap_or_else(|| doc! { "created_at": -1, "_id": -1 });
 
         let mut cursor = self
             .collection
             .find(filter)
             .sort(sort)
-            .skip(skip)
+            .skip(params.skip())
             .limit(per_page as i64)
             .await?;
 
@@ -281,18 +306,12 @@ where
             items.push(doc);
         }
 
-        let total_pages = if per_page > 0 {
-            total.div_ceil(per_page)
-        } else {
-            0
-        };
-
         Ok(PaginatedResult {
             items,
             total,
-            page: params.page,
+            page,
             per_page,
-            total_pages,
+            total_pages: total.div_ceil(per_page),
         })
     }
 
@@ -338,7 +357,9 @@ where
             .inserted_id
             .as_object_id()
             .expect("inserted_id should be ObjectId");
-        debug!(?id, "Inserted document");
+        // #4402 — TRACE: one line per insert, with no collection, was 13 % of
+        // the busier pod's log; the row itself is the record.
+        trace!(?id, "Inserted document");
         Ok(id)
     }
 
@@ -428,6 +449,23 @@ where
 
     pub async fn count(&self, filter: Document) -> DaoResult<u64> {
         Ok(self.collection.count_documents(filter).await?)
+    }
+
+    /// [`Self::new`], reading the primary whatever the connection string
+    /// prefers: a `readPreference` in it moves `db`'s default, and the
+    /// collection would inherit it. Its write and read concerns stay `db`'s.
+    /// For a reader that decides on what it reads and then writes on a
+    /// compare with it (`AgentDao::find_any_in_tenant_on_the_primary`).
+    pub fn on_the_primary(db: &Database, collection_name: &str) -> Self {
+        use mongodb::options::{CollectionOptions, ReadPreference, SelectionCriteria};
+        Self {
+            collection: db.collection_with_options(
+                collection_name,
+                CollectionOptions::builder()
+                    .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+                    .build(),
+            ),
+        }
     }
 }
 
@@ -530,5 +568,52 @@ index: email_verified_1 dup key: { email_verified: true }";
             "username"
         ));
         assert!(!duplicate_key_is_on("", "username"));
+    }
+}
+
+#[cfg(test)]
+mod page_range_tests {
+    use super::PaginationParams;
+
+    fn asked(page: u64, per_page: u64) -> PaginationParams {
+        PaginationParams {
+            page,
+            per_page,
+            before: None,
+        }
+    }
+
+    /// Each case is (page, per_page) as asked, then (page, per_page, skip)
+    /// as `find_paginated` reads them.
+    #[test]
+    fn page_parameters_are_kept_within_their_range() {
+        for ((page, per_page), kept) in [
+            ((1, 25), (1, 25, 0)),
+            ((3, 25), (3, 25, 50)),
+            ((4, 100), (4, 100, 300)),
+            ((0, 25), (1, 25, 0)),
+            ((1, 0), (1, 1, 0)),
+            ((0, 0), (1, 1, 0)),
+            ((2, 1000), (2, 100, 100)),
+            ((0, 1000), (1, 100, 0)),
+            // A page far past the last one reads empty.
+            ((u64::MAX, 100), (u64::MAX, 100, i64::MAX as u64)),
+        ] {
+            let p = asked(page, per_page);
+            assert_eq!(
+                (p.clamped_page(), p.clamped_per_page(), p.skip()),
+                kept,
+                "asked page={page} per_page={per_page}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_is_the_first_page_of_25() {
+        let p = PaginationParams::default();
+        assert_eq!(
+            (p.clamped_page(), p.clamped_per_page(), p.skip()),
+            (1, 25, 0)
+        );
     }
 }

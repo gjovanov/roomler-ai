@@ -1,5 +1,7 @@
 # FR-62 — Encoder rate changes without an IDR
 
+**Anchors:** master `7b5c4a9cb` (closed 2026-11-05): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** **complete 2026-11-05**: AC1–AC3, AC5 and AC6 met; AC4 moved to FR-63 (its B4 and AC7) · A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR · **VideoToolbox measured 2026-11-05** (Apple M5 Pro, 0.4.201): a rebuild on every rung, 8–12 ms, 20/20 IDRs · NVENC re-read on the released 0.4.187: **0/20** · **AC2/AC3 met on 0.4.201** (2026-11-05): a relayed `av1_nvenc` session under a window drag made 13 in-place rate moves, none with an IDR of its own, and each saturated window after a move landed at 0.97–1.00 of the new rung; the three unexplained IDRs of the 2026-11-03 passive read did not recur · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 ## Progress
@@ -60,7 +62,7 @@
     | 18:58:49 | +1 | our `rc:keyframe` at 18:58:48.3, the positive control; a move 1.5 M → 1 M shares the window and adds nothing |
     | 18:59:01 | +1 | the resize to 1600×900, `dims_swaps` +1, the positive control |
     | 18:59:15 | +1 | the resize back, `dims_swaps` +1 |
-    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11469`) |
+    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11382`) (2026-11-24) |
 
     The other 12 moves sit in windows where `idr_count` did not move: 216 windows judged, none
     unexplained. The inequality holds as written: 4 ≤ 2 dims changes + 2 keyframe requests.
@@ -108,18 +110,18 @@
   - 🔑 **The carrier line is not a source.** Each of the three came 1–3 s after an agent line
     `overlay carrier under the nominated pair is not direct`. The code read here is master's,
     and none of these paths has changed since 0.4.199, the build that ran. The line comes from
-    `overlay_remote_is_relay_tier` (`peer.rs:2291`), a LocalAPI read that changes nothing. The
+    `overlay_remote_is_relay_tier` (`peer.rs:2236`), a LocalAPI read that changes nothing. The (2026-11-24)
     FFmpeg DC pump calls it on its transport recheck, every 5 s (`TRANSPORT_RECHECK_INTERVAL`,
-    `peer.rs:2176`; the recheck at `:7816`). The answer goes two places:
+    `peer.rs:2121`; the recheck at `:7753`). The answer goes two places: (2026-11-24)
     - into `constrained`, which sets the rate ceiling and, on a flip, re-sends `rc:video-info`
-      (`:7681`);
+      (`:7767`); (2026-11-24)
     - into `FlipTracker` (`encode/rate_profile.rs:81`). It rebuilds the encoder only after two
       consecutive checks disagree with the state the pump was built for, at least 60 s after
       the last rebuild, and only when the frame rate changes. That rebuild logs its own line
-      (`peer.rs:7848`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
-      bumps, only the inline open's (`:9012`) can follow from this path, through that rebuild.
-      The others are a dims swap (`:7515`), a rate swap (`:7593`) and a deferred rebuild
-      (`:9571`).
+      (`peer.rs:7781`), re-opens the encoder and restarts the counters. Of the four `send_epoch` (2026-11-24)
+      bumps, only the inline open's (`:9098`) can follow from this path, through that rebuild. (2026-11-23)
+      The others are a dims swap (`:7597`), a rate swap (`:7675`) and a deferred rebuild (2026-11-23)
+      (`:9641`). (2026-11-23)
 
     Neither happened: every heartbeat read `constrained=true`, and `idr_count` never restarted.
     The 1–3 s is the line's cadence. The heartbeat's `constrained` is the variable the recheck
@@ -159,7 +161,7 @@
     and a second viewer's requests never show on the reading tab. The next read searches the
     agent log for every line in the table right after the session ends, because the log
     listing returns only a device's newest 500 batches
-    (`crates/modules/fleet/src/agent_log.rs:226`).
+    (`crates/modules/fleet/src/agent_log.rs:262`).
 
 - **2026-10-31 22:47Z — the first relayed NVENC read: the cell works, and nothing was tested.**
   CORPLAP-2 on 0.4.191, `hevc_nvenc` 1920×1200, `constrained=true` on all 158 heartbeats over
@@ -177,7 +179,7 @@
   - **Bytes per frame ran at p50 0.063, max 0.491, of the cap.** An idle desktop, no overshoot.
   - 🔑 **The encoder's maxrate is not always the rung.** It held the 3,677,739 it opened with:
     `set_bitrate` compares the two values' rungs and returns when they match
-    (`encode/ffmpeg/encoder.rs:3025`), so the opening value stands until the first rung crossing.
+    (`encode/ffmpeg/encoder.rs:3013`), so the opening value stands until the first rung crossing.
     The read's denominator follows it.
   - **Not run:** the positive controls and the motion. A scripted timeline (one keyframe request,
     one resize and back, a window drag, dial moves) was refused by the automation's permission
@@ -191,11 +193,11 @@
     `InPlaceVbr` for every `*_nvenc` whatever `encoder_inplace_rate` says, and
     `NVENC_RECONFIG_FORCES_IDR` (`:893`) has been `false` since patch 0001 shipped
     (0.4.51). On NVENC the flag only sizes the VBV window that a move writes
-    (`inplace_rate_bufsize`, `encode/mod.rs:365`). So a constrained NVENC session needs
+    (`inplace_rate_bufsize`, `encode/mod.rs:358`). So a constrained NVENC session needs
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
-    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7631`), which
+    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7569`), which (2026-11-24)
     keeps the encoder's counters. A read that cannot see that IDR cannot vouch for the
     absence of the others.
   - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
@@ -220,18 +222,18 @@
     the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
     Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
     An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
-    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9209`)
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9056`) (2026-11-24)
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
     - `target_bps` is `governor.applied_bps()`, the raw target. The encoder runs at the maxrate
       it opened with until the first rung crossing, then at that target's nearest rung
-      (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in `set_bitrate`, `encoder.rs:3024`).
+      (`coarsen_bitrate`, `encode/aimd.rs:527`, applied in `set_bitrate`, `encoder.rs:3024`).
       So the read is against that maxrate ÷ `target_fps` ÷ 8. Against the raw target a
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
       and move nothing. Δ`rate_moves` marks a real move. The read judges the first
-      complete 2 s heartbeat window (`peer.rs:7133`) after a Δ`rate_moves`, on
+      complete 2 s heartbeat window (`peer.rs:7080`) after a Δ`rate_moves`, on (2026-11-24)
       Δ`bytes_written` ÷ Δ`frames_encoded`. A window that starts at most 2 s after the
       move and holds the ratio shows the encoder had tracked by then.
     - ≈ 1.0 is a CBR's contract. NVENC is quality-capped VBR and sits under its cap on
@@ -252,7 +254,7 @@
     flip plus one release soak (Sequencing row 5), and every A4 row's precondition is
     unmet: row 1 needs "A0 passes on QSV", which failed; row 2 needs VideoToolbox
     measured, and QSV still needs the ladder; row 3 is marked "a behavioral decision for
-    the post-soak pass" in the code (`encode/governor.rs:1189`). Found on the way:
+    the post-soak pass" in the code (`encode/governor.rs:1254`). Found on the way:
     B3b deletes `aimd.rs` whole, the coarsen ladder included, and the plan predates
     A0-QSV. Whatever replaces the AIMD must carry QSV's rationing forward.
 
@@ -373,7 +375,7 @@ the only route by which `global_quality` stops being inert.
 
 ## Goal
 
-A remote-desktop encoder follows the rate controller's target **without an IDR and without a rebuild**. Today `FfmpegEncoder::set_bitrate` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3013–3143`) costs an IDR on every move: NVENC through FFmpeg's `reconfig_encoder` (n8.1.2 sets `resetEncoder=1; forceIDR=1` on a bitrate-only change), QSV/AMF/VideoToolbox through a full encoder rebuild under a comment that predates FFmpeg 6.0's runtime `update_bitrate()`. Nine of the 34 rate/quality heuristics in `encode/` exist only to ration that cost (coarsen ladder, deferred applies, 15-s thrift, background swap, settle-KF thrift, refine-vs-cap fight, opener grace, FlipTracker and kf_gate cooldowns); on LAN pairs the AIMD crosses a rung nearly every window — 44 swap IDRs in one day on one host (2026-09-02).
+A remote-desktop encoder follows the rate controller's target **without an IDR and without a rebuild**. Today `FfmpegEncoder::set_bitrate` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1585–1671`) costs an IDR on every move: NVENC through FFmpeg's `reconfig_encoder` (n8.1.2 sets `resetEncoder=1; forceIDR=1` on a bitrate-only change), QSV/AMF/VideoToolbox through a full encoder rebuild under a comment that predates FFmpeg 6.0's runtime `update_bitrate()`. Nine of the 34 rate/quality heuristics in `encode/` exist only to ration that cost (coarsen ladder, deferred applies, 15-s thrift, background swap, settle-KF thrift, refine-vs-cap fight, opener grace, FlipTracker and kf_gate cooldowns); on LAN pairs the AIMD crosses a rung nearly every window — 44 swap IDRs in one day on one host (2026-09-02).
 
 Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`select_rc_mode` tests `rc_max_rate == bit_rate` first and we set both to the cap), which is why every 0.4.49 frame on CORPLAP-1 was exactly `target ÷ fps ÷ 8` bytes; and the existing NVENC in-place write sizes `rc_buffer_size = target` while the open used `maxrate × hrd_pct` — every move silently resizes the HRD window.
 

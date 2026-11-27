@@ -9,6 +9,8 @@ paths:
   - "crates/modules/fleet/src/setup_release.rs"
   - "crates/modules/fleet/src/agent_release.rs"
   - "agents/roomlerd/Cargo.toml"
+  - "agents/roomlerd/src/updater.rs"
+  - "agents/roomlerd/src/post_install.rs"
   - "agents/roomler-desktop/Cargo.toml"
   - "scripts/install.sh"
   - "scripts/deb-bare-check.sh"
@@ -134,6 +136,20 @@ name before it), so a task under one of those is acted on only when its principa
 definition this process is refused, one that does not parse, or one that names another account is left.
 Never delete, end or `/Create /F` a task by a shared name, and match a task's name whole: `Roomler` is a
 prefix of every account's own name (`account_of`).
+⚠️ **Every per-user task definition names its account's own security descriptor, and only a delete and a
+create repair a task that lacks it** (FR-150, `agents/roomlerd/src/service/user_task.rs`,
+`docs/installation.md`). A task registered from an elevated token without one is owned by Administrators
+with read for its account, so every self-update's registration, at medium, is refused and the device stays
+down until the next sign-in (#3507). Task Scheduler applies a descriptor only when it creates a task: a
+`/Create /F` over a task keeps the old one, whoever asks. A medium process may still `/Run` and `/End` such a
+task, which is what `Roomler start-<SID>` relies on. The SDDL stays exactly
+`O:<sid>D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<sid>)`: the owner and access a medium registration already gives,
+never a grant to anyone else. The start task is no account's autostart, so `account_of` must keep reading no
+account in its name.
+⚠️ **Every custom action of the per-user MSI runs a step that writes its start and end lines in the person's
+log** (FR-150, `is_per_user_step` in `agents/roomlerd/src/app.rs`), because Windows Installer throws a custom
+action's output away. `every_per_user_msi_step_writes_its_record` holds a new per-user action to it, as
+`the_installer_role_is_what_each_msi_runs_as_local_system` holds the per-Machine ones.
 ⚠️ **The per-user arm of `cleanup-legacy-install` ends a task before it deletes it, and stops the account's
 daemon only after the delete** (#3885, `docs/installation.md`): deleting a task leaves its process running,
 which made two daemons on one machine, and until the delete a one-shot, logon or boot trigger or `service
@@ -156,6 +172,17 @@ log: the properties are hidden, the lines name entries.
 over any entry of the same name, so a new installer-written value would lose to the old one on every
 upgrade. And a carried entry the NEW release cannot start with now fails the upgrade where it used to be
 dropped: `EnableSystemContext` is `Return="check"` and waits 120 s for RUNNING (`docs/installation.md`).
+⚠️ **The per-Machine MSI takes the boot-time deletes of the files it leaves in place back out of
+`PendingFileRenameOperations` and `PendingFileRenameOperations2`** (#4196, `docs/installation.md`). A handle
+that does not share delete on `roomlerd.exe` during the old product's removal makes Windows Installer schedule
+a delete of the install path, and the new product's copy does not cancel it: the next boot deleted the daemon
+(SCM 7000). `ListInstalledFiles` (immediate, after `InstallValidate`) and `SpareInstalledFiles` (deferred,
+LocalSystem, after `InstallFiles`) stay `Return="ignore"` and never run on an uninstall. The spare takes out a
+DELETE only, and only of a listed path compared by EQUALITY (a prefix match would take `roomlerd.exe2`); it
+keeps a delete that a later rename onto the same path completes, never touches a rename, and writes every other
+operation back byte for byte. Read the values raw: their empty strings are the deletes, which `split_multi_sz`
+drops. Its name sorts after `RegisterService` on purpose (WiX numbers the actions after `InstallFiles` by
+name), and installer-smoke's held upgrade fails on any boot-time delete it leaves in the install folder.
 ⚠️ **`RegisterAutostart` stays the last action before `InstallFinalize`.** The task names the
 launcher, and a rollback onto a release without one would leave a task that starts nothing.
 ⚠️ **`AutostartBackOnRollback` and `DaemonBackOnRollback` stay ahead of `RemoveExistingProducts`.** A
@@ -188,9 +215,23 @@ an ephemeral device removes itself, and it stays before `UnregisterAutostart`, w
 fallback needs. `StopOldDaemon` is the upgrade's, from the NEW product, with `--for-upgrade`, which
 records an update attempt first: ⚠️ a plain stop during an upgrade deletes an ephemeral device (#1683,
 `docs/ephemeral-nodes.md`).
+⚠️ **The post-install watcher stays out of Restart Manager's way, and never hides from it (#4302).** The
+installer's Restart Manager session ends a console program that holds a file the install replaces, and one
+that shares a console with such a program. So the staged watcher has everything it loads beside it, in the
+updater's own staging folder, and a console of its own: `CREATE_NO_WINDOW` alone (`watcher_creation_flags`,
+`agents/roomlerd/src/updater.rs`). Never `CREATE_NEW_PROCESS_GROUP` (it turns Ctrl+C off for the watcher)
+and never a console handler that answers TRUE (it keeps the watcher through every event): the installer must
+still be able to stop it. Never `DETACHED_PROCESS`: a console tool the watcher runs (`taskkill` on a wedge,
+spawned by `run_recovery_cmd` with no flags of its own) would open a window on the signed-in desktop. Its handler only notes the stop in `last-install.json`,
+waiting at most 200 ms for the record (`console_event_answer`, `agents/roomlerd/src/post_install.rs`).
+`docs/update-outcome.md` §3.
 ⚠️ **`<RestartOnFailure>` is not a supervisor**: it restarted nothing after exit 1 or
-`0xC000013A` (a crash stays down, #3295). What brings a device back after a self-update is the one-shot `<TimeTrigger>`s
-`service install` adds when a config exists. A repeating trigger would cover a crash too, and was
+`0xC000013A`. The launcher the task runs is, since FR-150 P2 (#3295): `roomlerdw.exe` starts a daemon that
+crashed, or whose start failed, again with the service supervisor's backoff, and leaves on the deliberate ends
+(0, 7, 8, 9, 75, 78, or the session ending), which stay down (`end_of`, `agents/roomlerdw/src/ends.rs`). It
+supervises only the exact `run --supervisor task`, compared by equality, and `ROOMLERDW_SUPERVISE=0` turns it
+off. What brings a device back after a self-update is the one-shot `<TimeTrigger>`s `service install` adds when a
+config exists, and since FR-150 P1b the watcher's ladder. A repeating trigger would cover a crash too, and was
 rejected: it fires inside the installer's window on the old files, and needs a latch for
 `service stop` and for a removed row.
 
@@ -206,3 +247,12 @@ simplifying: unversioned, a stub that lacks the daemon's symbols satisfies it, a
 dependency it removes the package and exits 0: over a working install that deletes a
 running daemon. `deb_install` in `scripts/install.sh` names the package, so apt
 refuses instead.
+
+⚠️ **`scripts/install.sh` is one function, `main`, and its last line is the only call** (#3931,
+`docs/installation.md`, "Nothing the script starts reads the piped script"). Piped from curl, the
+script is the shell's stdin, and a command it starts that reads stdin eats the lines not yet read.
+The function makes the shell read every byte first, its first statement `exec </dev/null` covers
+every command, present and future, and a download cut short never reaches the call. So: no code
+outside `main`, nothing after `main "$@"`, `exit` stays main's last statement, and never call it as
+`main || …`, `if main` or `! main` (each turns `set -e` off). A question for the person goes to
+`/dev/tty`. The harness pins the shape.

@@ -99,7 +99,9 @@
             />
             <div class="text-caption text-medium-emphasis mb-3 ml-1">
               Leave the box untouched to keep whatever the device already has.
-              An empty list means <strong>nobody</strong>.
+              These keys are the break-glass route, for when the server cannot
+              be reached: an empty list removes the device’s own, and then only
+              server grants (<code>roomler ssh</code>) can sign in.
             </div>
 
             <v-select
@@ -221,7 +223,7 @@
           list, never turn a new stage on early, so no extra permission bit; it
           applies from the device's next session, with no restart. Turning a new
           stage on early is the device's own setting, and cannot be pushed. A
-          device whose agent predates this key ignores it and reports the push
+          device whose roomlerd predates this key ignores it and reports the push
           applied.
         </div>
         <!-- FR-130 P1b — four states, because a tribool key has three and a
@@ -241,16 +243,16 @@
           Whether the device's encoders tell the decoder the colour (BT.601,
           limited range) they converted with. <strong>Off</strong> is the
           kill switch for a viewer or player that misreads it: the stream goes
-          back to what agents sent before. Cleared = not managed, and the
+          back to what roomlerd sent before. Cleared = not managed, and the
           device keeps its own value, so after an Off choose the default
           before you stop managing it. It grants nothing, so no extra
           permission bit; takes effect at the next daemon restart.
         </div>
 
-        <!-- The combination checks. Each of these produces a device that is
-             "on" and reaches nobody — the exact silent-nothing this feature
-             exists to remove, so it must be caught here rather than discovered
-             later by someone whose ssh just hangs up on them. -->
+        <!-- The combination checks. Each is a key-list session that would sign
+             in and then run nothing, caught here rather than discovered later
+             by someone whose ssh does nothing. An empty key list is not one:
+             server grants (`roomler ssh`) still sign in (#4325). -->
         <v-alert
           v-for="w in combinationWarnings"
           :key="w"
@@ -328,6 +330,7 @@ import { useAgentStore, type Agent, type DesiredConfig } from '@/stores/agents'
 import { useTenantStore } from '@/stores/tenant'
 import { canGrantDeviceExec, canGrantDeviceSsh } from '@/utils/permissions'
 import { triboolChoice, triboolWord } from '@/utils/managedTribool'
+import { VERSION_NOT_REPORTED, reportedVersion } from '@/utils/deviceVersion'
 import ManagedSwitch from './ManagedSwitch.vue'
 
 const props = defineProps<{
@@ -354,6 +357,11 @@ const clearing = ref(false)
 const error = ref('')
 const sshDetailsTouched = ref(false)
 const agent = computed(() => props.agent)
+/** #3565 — the daemon's own version for the explanations below, or a plain
+ *  "not reported yet" while it has not reported one. */
+const daemonVersion = computed(
+  () => reportedVersion(agent.value?.agent_version) ?? `(version ${VERSION_NOT_REPORTED})`,
+)
 
 /** Only the managed keys. `undefined` is "leave the device alone", which is
  *  why every field is optional rather than defaulted — a struct of plain
@@ -464,34 +472,32 @@ const status = computed<{ type: 'success' | 'info' | 'warning' | 'error'; icon: 
         type: 'info',
         icon: 'mdi-help-circle-outline',
         title: 'This device cannot report back',
-        detail: `Agent ${agent.value?.agent_version ?? '?'} understands a pushed configuration but not how to say what it did with it. It may well have applied this — there is no way to tell from here. Update the device to find out.`,
+        detail: `roomlerd ${daemonVersion.value} understands a pushed configuration but not how to say what it did with it. It may well have applied this — there is no way to tell from here. Update the device to find out.`,
       }
     case 'push_unsupported':
       return {
         type: 'warning',
         icon: 'mdi-update',
         title: 'This device is too old',
-        detail: `Agent ${agent.value?.agent_version ?? '?'} predates remote configuration, so nothing is sent to it at all. Update it, or set these keys on the host directly.`,
+        detail: `roomlerd ${daemonVersion.value} predates remote configuration, so nothing is sent to it at all. Update it, or set these keys on the host directly.`,
       }
     default:
       return null
   }
 })
 
-/** Combinations that produce a device which is "on" and reaches nobody. */
+/** Combinations whose key-list sessions sign in and then run nothing. A
+ *  server grant (`roomler ssh`) is tried before the key list and needs no key
+ *  and no account mode on the device, so an empty key list is not one of them
+ *  (#4325): it leaves the device to server grants, its default. */
 const combinationWarnings = computed<string[]>(() => {
   const out: string[] = []
   const d = draft.value
   if (d.ssh_enabled === true) {
     const keys = d.ssh_authorized_keys
-    if (keys && keys.length === 0) {
-      out.push(
-        'SSH is on with an empty key list, which means nobody can connect. Add a key, or leave the key list unmanaged to keep the device’s own.',
-      )
-    }
     if (keys === undefined && !d.ssh_account_mode) {
       out.push(
-        'Turning SSH on grants nothing by itself: the device also needs authorized keys and an account mode. If it already has them, ignore this.',
+        'If the device lists keys of its own and has no account mode, a key-list session authenticates and then runs nothing. Server grants (roomler ssh) need neither keys nor an account mode.',
       )
     } else if (keys && keys.length > 0 && !d.ssh_account_mode) {
       out.push(
@@ -572,13 +578,13 @@ const colorDescriptionChoice = computed({
   },
 })
 const colorDescriptionOptions = [
-  { title: 'Off: no colour description, as earlier agents sent', value: 'off' },
+  { title: 'Off: no colour description, as earlier roomlerd versions sent', value: 'off' },
   { title: 'On: describe the colour', value: 'on' },
   { title: 'The device’s built-in default (on)', value: 'default' },
 ]
 const accountOptions = [
   { title: 'The signed-in user at the device', value: 'console_user' },
-  { title: 'The daemon account (root, or on Windows the agent\'s own)', value: 'daemon' },
+  { title: 'The daemon account (root, or on Windows roomlerd\'s own)', value: 'daemon' },
 ]
 
 const dirty = computed(() => JSON.stringify(draft.value) !== original.value)
@@ -608,8 +614,10 @@ watch(
       rc_media_legacy: d?.rc_media_legacy,
     }
     original.value = JSON.stringify(draft.value)
-    if (agentStore.orgExecEnabled === null) void agentStore.fetchOrgExecEnabled(props.tenantId)
-    if (agentStore.orgSshEnabled === null) void agentStore.fetchOrgSshEnabled(props.tenantId)
+    // #4332 — this org's switches, not any: a switch that holds another org's
+    // value is not unset.
+    void agentStore.ensureOrgExecEnabled(props.tenantId)
+    void agentStore.ensureOrgSshEnabled(props.tenantId)
   },
   { immediate: true },
 )

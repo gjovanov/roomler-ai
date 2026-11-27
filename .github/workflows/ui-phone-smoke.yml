@@ -65,7 +65,18 @@ jobs:
         # Not cached on purpose: the Actions cache is shared and nearly full,
         # and PR-ref saves are what evicted master's entries before. The
         # install is ~30–60 s.
-        run: bunx playwright install --with-deps chromium
+        #
+        # `--with-deps` runs apt itself (Playwright 1.62: `apt-get update`, then
+        # `apt-get install -y --no-install-recommends <its list>`, through sudo),
+        # so its set stays Playwright's own and ci-apt.sh only reaches the
+        # mirrors first: the probe, and the public-resolver failover when the
+        # runner's resolver cannot resolve them (#3698, #3710). The timeout
+        # bounds the whole install, apt and the browser download, which takes
+        # ~1 min when healthy; a dead resolver now fails it in seconds with one
+        # ::error instead of waiting out the job's 20 minutes.
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/actions/ci-linux-system-deps/ci-apt.sh" reach
+          timeout --kill-after=30 600 bunx playwright install --with-deps chromium
 
       - name: Run the smoke
         run: bunx playwright test -c playwright.phone.config.ts

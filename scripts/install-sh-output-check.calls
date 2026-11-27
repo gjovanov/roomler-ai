@@ -106,6 +106,7 @@ deb-user rc: 0
 pkg-dl curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/releases.json] [https://roomler.example/api/agent/latest-release]
 pkg-dl curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/roomlerd.pkg] [https://dl.example/roomlerd-aarch64-apple-darwin.pkg]
 pkg-dl rc: 0
+pkg-one-row-refused rc: 1
 pkg-one-row calls: sudo [test] [-f] [/etc/roomler/config.toml]
 pkg-one-row calls: sudo [installer] [-pkg] [/tmp/roomler-install.000001/roomlerd.pkg] [-target] [/]
 pkg-one-row calls: sudo [mkdir] [-p] [/etc/roomler]
@@ -130,6 +131,36 @@ pkg-two-row curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/roomlerd.pkg] [
 pkg-two-row roomlerd: roomlerd [enroll] [--server] [https://roomler.example] [--token] [check-token] [--name] [check-host]
 pkg-two-row roomlerd: roomlerd [--version]
 pkg-two-row rc: 0
+pkg-wizard-one-row-over-another curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/releases.json] [https://roomler.example/api/agent/latest-release]
+pkg-wizard-one-row-over-another curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/roomlerd.pkg] [https://dl.example/roomlerd-aarch64-apple-darwin.pkg]
+pkg-wizard-one-row-over-another rc: 1
+pkg-wizard-one-row-own-row curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/releases.json] [https://roomler.example/api/agent/latest-release]
+pkg-wizard-one-row-own-row curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/roomlerd.pkg] [https://dl.example/roomlerd-aarch64-apple-darwin.pkg]
+pkg-wizard-one-row-own-row rc: 1
+pkg-wizard-one-row-retry calls: installer [-pkg] [/tmp/roomler-install.000001/roomlerd.pkg] [-target] [/]
+pkg-wizard-one-row-retry curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/releases.json] [https://roomler.example/api/agent/latest-release]
+pkg-wizard-one-row-retry curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/roomlerd.pkg] [https://dl.example/roomlerd-aarch64-apple-darwin.pkg]
+pkg-wizard-one-row-retry roomlerd: roomlerd [enroll] [--help]
+pkg-wizard-one-row-retry roomlerd: roomlerd [--version]
+pkg-wizard-one-row-retry rc: 0
+pkg-wizard-one-row calls: install [-m] [600] [-o] [root] [-g] [0] [/standin/enrolled.toml] [/etc/roomler/config.toml]
+pkg-wizard-one-row calls: installer [-pkg] [/tmp/roomler-install.000001/roomlerd.pkg] [-target] [/]
+pkg-wizard-one-row curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/releases.json] [https://roomler.example/api/agent/latest-release]
+pkg-wizard-one-row curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/roomlerd.pkg] [https://dl.example/roomlerd-aarch64-apple-darwin.pkg]
+pkg-wizard-one-row roomlerd: roomlerd [enroll] [--help]
+pkg-wizard-one-row roomlerd: roomlerd [--version]
+pkg-wizard-one-row rc: 0
+pkg-wizard-two-rows-over-one-row curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/releases.json] [https://roomler.example/api/agent/latest-release]
+pkg-wizard-two-rows-over-one-row curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/roomlerd.pkg] [https://dl.example/roomlerd-aarch64-apple-darwin.pkg]
+pkg-wizard-two-rows-over-one-row rc: 1
+pkg-wizard-two-rows calls: installer [-pkg] [/tmp/roomler-install.000001/roomlerd.pkg] [-target] [/]
+pkg-wizard-two-rows calls: launchctl [kickstart] [-k] [system/com.roomler.daemon]
+pkg-wizard-two-rows curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/releases.json] [https://roomler.example/api/agent/latest-release]
+pkg-wizard-two-rows curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/roomlerd.pkg] [https://dl.example/roomlerd-aarch64-apple-darwin.pkg]
+pkg-wizard-two-rows roomlerd: roomlerd [adopt-enrollment] [--help]
+pkg-wizard-two-rows roomlerd: roomlerd [--config] [/etc/roomler/config.toml] [adopt-enrollment] [--from] [/standin/enrolled.toml]
+pkg-wizard-two-rows roomlerd: roomlerd [--version]
+pkg-wizard-two-rows rc: 0
 pkg calls: sudo [installer] [-pkg] [/tmp/roomler-install.000001/roomlerd.pkg] [-target] [/]
 pkg calls: launchctl [kickstart] [-k] [gui/1000/com.roomler.agent]
 pkg curl: curl [-fsSL] [-o] [/tmp/roomler-install.000001/releases.json] [https://roomler.example/api/agent/latest-release]

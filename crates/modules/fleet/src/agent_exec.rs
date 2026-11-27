@@ -40,7 +40,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -555,9 +555,9 @@ pub async fn dispatch(
                     audit,
                     ExecDenyReason::Unsupported,
                     format!(
-                        "device runs agent {} which predates Fleet RPC — update it to use \
+                        "device runs roomlerd {} which predates Fleet RPC — update it to use \
                          the device console",
-                        agent.agent_version
+                        agent.reported_version().unwrap_or("(unknown version)")
                     ),
                 ),
                 Err(HubError::ExecTimeout(_)) => deny(
@@ -724,8 +724,8 @@ fn deny_message(reason: ExecDenyReason, os: OsKind) -> String {
         // FR-97 P5a — off Windows the daemon itself drops to that person, and
         // only a build that advertises `console-user` does.
         ExecDenyReason::RunAsUnavailable => {
-            "this device's policy runs commands as the person at its screen, and the agent it \
-             runs cannot: update the agent"
+            "this device's policy runs commands as the person at its screen, and the daemon it \
+             runs cannot: update roomlerd"
                 .to_string()
         }
     }
@@ -940,11 +940,16 @@ pub async fn cancel(
 /// `MANAGE_AGENTS`, like every other device-policy edit. Note this does NOT
 /// require `EXEC_DEVICE`: deciding a device may be exec'd is a management act,
 /// performing the exec is a separate power.
+///
+/// The bit is decided before the body is read, and the body before the
+/// device is looked up (#4254): a caller without the bit gets the gate's
+/// answer whatever the body is, and a holder is answered one that does not
+/// parse as the `Json` extractor answered it, whatever the device id.
 pub async fn set_policy(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    Json(body): Json<ExecPolicyBody>,
+    body: Result<Json<ExecPolicyBody>, JsonRejection>,
 ) -> Result<Json<ExecPolicyBody>, ApiError> {
     let tid = tenant_of(&tenant_id).await?;
     require_permission(
@@ -955,6 +960,7 @@ pub async fn set_policy(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
     let agent = load_agent(&state, tid, &agent_id).await?;
 
     let parse_ids = |v: &[String], what: &str| -> Result<Vec<ObjectId>, ApiError> {
@@ -977,7 +983,7 @@ pub async fn set_policy(
         && !agent.capabilities.has_rpc(RpcCap::ConsoleUser)
     {
         return Err(ApiError::BadRequest(
-            "this device's agent cannot run commands as the person at its screen: update it, \
+            "this device's daemon cannot run commands as the person at its screen: update it, \
              or run commands as root"
                 .into(),
         ));
@@ -1052,12 +1058,15 @@ pub async fn get_org_settings(
 ///
 /// `MANAGE_TENANT`, not `MANAGE_AGENTS`: this one switch decides whether the
 /// org's devices can be shelled into at all, which is an org-owner decision
-/// rather than a fleet-admin one.
+/// rather than a fleet-admin one. It is decided before the body is read
+/// (#4254): a caller without it gets the gate's answer whatever the body is,
+/// and a holder is answered one that does not parse as the `Json` extractor
+/// answered it.
 pub async fn set_org_settings(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<OrgExecSettings>,
+    body: Result<Json<OrgExecSettings>, JsonRejection>,
 ) -> Result<Json<OrgExecSettings>, ApiError> {
     let tid = tenant_of(&tenant_id).await?;
     require_permission(
@@ -1068,6 +1077,7 @@ pub async fn set_org_settings(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     let mut tenant = state
         .tenants
         .set_remote_exec_enabled(tid, body.remote_exec_enabled)
@@ -1281,5 +1291,41 @@ mod tests {
             assert!(m.contains("person at its screen"), "{m}");
             assert!(!m.contains("anchor"), "{m}");
         }
+    }
+
+    /// FR-133 P2e: every exec refusal reaches a person (the device console
+    /// and `roomler exec` print it), on every OS, so none calls the daemon an
+    /// "agent". The one that says what to update names roomlerd.
+    #[test]
+    fn exec_refusals_say_device_or_roomlerd_never_agent() {
+        for r in [
+            ExecDenyReason::OrgDisabled,
+            ExecDenyReason::NoPermission,
+            ExecDenyReason::DeviceDisabled,
+            ExecDenyReason::CallerNotAllowed,
+            ExecDenyReason::ShellNotAllowed,
+            ExecDenyReason::OriginNotAllowed,
+            ExecDenyReason::Unsupported,
+            ExecDenyReason::Offline,
+            ExecDenyReason::ConsentDenied,
+            ExecDenyReason::RateLimited,
+            ExecDenyReason::AgentDisabled,
+            ExecDenyReason::SystemRequired,
+            ExecDenyReason::ClaimRefused,
+            ExecDenyReason::RunAsUnavailable,
+        ] {
+            for os in [OsKind::Windows, OsKind::Linux, OsKind::Macos] {
+                let m = deny_message(r, os);
+                assert!(
+                    !m.to_ascii_lowercase().contains("agent"),
+                    "{r:?} on {os:?} says agent: {m}"
+                );
+            }
+        }
+        assert_eq!(
+            deny_message(ExecDenyReason::RunAsUnavailable, OsKind::Linux),
+            "this device's policy runs commands as the person at its screen, and the daemon it \
+             runs cannot: update roomlerd"
+        );
     }
 }

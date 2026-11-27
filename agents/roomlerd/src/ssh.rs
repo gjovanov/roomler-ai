@@ -552,9 +552,9 @@ mod sshd {
     /// built rather than per connection.
     pub struct Ctx {
         pub config: Arc<russh::server::Config>,
-        /// Keys allowed to authenticate. Empty is a valid, safe state: the
-        /// transport answers, every authentication attempt fails, and the
-        /// operator sees exactly why in the log.
+        /// The break-glass keys, read only when no server grant matches. Empty
+        /// is the default and a safe state: a grant still signs in, a key-list
+        /// session is refused, and the start-up log says so (#4325).
         pub authorized: Vec<PublicKey>,
         /// What a key-list session runs as, resolved once from
         /// `ssh_account_mode`.
@@ -651,11 +651,11 @@ mod sshd {
                     ),
                 }
             }
-            if authorized.is_empty() {
-                warn!(
-                    "ssh: no usable entries in ssh_authorized_keys — the port will answer \
-                     but every authentication attempt will be refused"
-                );
+            // #4325 — what the list as a whole leaves able to sign in.
+            match super::key_list_line(cfg.ssh_authorized_keys.len(), authorized.len()) {
+                Some(super::KeyListLine::Info(line)) => info!("{line}"),
+                Some(super::KeyListLine::Warn(line)) => warn!("{line}"),
+                None => {}
             }
 
             let config = russh::server::Config {
@@ -993,6 +993,34 @@ mod sshd {
         }
     }
 
+    /// One channel's own state: the terminal its `pty_request` asked for, the
+    /// input of the process it started, and that process's terminal.
+    ///
+    /// One connection carries several channels at once (commands, a terminal,
+    /// `sftp`, `direct-tcpip` forwards), and russh names the channel on every
+    /// callback. Each of these belongs to the channel that asked for it, so a
+    /// channel's data, EOF, window change and pty request act on that
+    /// channel's entry alone, never on another channel's process.
+    #[derive(Default)]
+    struct ChannelState {
+        /// Terminal type and geometry from this channel's `pty_request`, held
+        /// until its shell starts. `Some` is also what distinguishes an
+        /// interactive request from a one-shot command.
+        pty_req: Option<(String, crate::pty::WinSize)>,
+        /// The client's bytes for this channel's process: keystrokes for a
+        /// terminal, stdin for a command, the protocol for `sftp-server`.
+        /// Dropped at this channel's EOF, which ends that input alone.
+        input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+        /// Resize half of this channel's terminal.
+        terminal: Option<crate::pty::PtyHandle>,
+        /// Set when the channel was opened as a `direct-tcpip` forward, the
+        /// one kind besides `session` this server accepts, and alive while
+        /// its splice runs. RFC 4254 §6 gives pty-req, shell, exec, subsystem
+        /// and env to session channels only, so each of them on a forward is
+        /// answered with a failure and starts nothing.
+        forward: Option<std::sync::Weak<()>>,
+    }
+
     /// Per-connection state.
     pub struct Handler {
         ctx: Arc<Ctx>,
@@ -1008,15 +1036,9 @@ mod sshd {
         /// Whether the session-deadline watchdog is running; armed on the
         /// first channel open so multiplexed channels share one timer.
         deadline_armed: bool,
-        /// Terminal type and geometry from `pty_request`, held until the shell
-        /// starts. `Some` is also what distinguishes an interactive session
-        /// from a one-shot command.
-        pty_req: Option<(String, crate::pty::WinSize)>,
-        /// Sink for client keystrokes, live only while a terminal is. Cleared
-        /// on EOF so the shell sees end-of-input.
-        channel_input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-        /// Resize half of the live terminal.
-        pty_handle: Option<crate::pty::PtyHandle>,
+        /// Each channel's pty request, process input and terminal, by the
+        /// channel that asked for them ([`ChannelState`]).
+        channels: std::collections::HashMap<ChannelId, ChannelState>,
         /// FR-89 — one abort per exec channel (FR-97 P4b: and per Windows console-user
         /// sftp channel), fired when the client closes that channel
         /// ([`channel_close`](russh::server::Handler::channel_close)) or when the session
@@ -1036,6 +1058,15 @@ mod sshd {
         /// Who asks the person before anything runs: this process, or
         /// (FR-105) the worker that carried this connection.
         asker: Asker,
+        /// #4168 — refused channels ([`answer_refusal`](Self::answer_refusal))
+        /// whose close russh still holds behind the reason: the client's
+        /// window had no room for all of it, or a key exchange was running.
+        /// Until that close goes out, russh still delivers what the client
+        /// sends on the channel; here a request on it is answered with a
+        /// failure, and its data, EOF and window changes are dropped. A
+        /// channel whose close went out at once is not kept: russh drops what
+        /// arrives after it.
+        refused: std::collections::HashSet<ChannelId>,
     }
 
     impl Handler {
@@ -1052,12 +1083,11 @@ mod sshd {
                 peer,
                 policy: None,
                 deadline_armed: false,
-                pty_req: None,
-                channel_input: None,
-                pty_handle: None,
+                channels: std::collections::HashMap::new(),
                 exec_aborts: std::collections::HashMap::new(),
                 _awake: awake,
                 asker,
+                refused: std::collections::HashSet::new(),
             }
         }
 
@@ -1126,6 +1156,35 @@ mod sshd {
             });
         }
 
+        /// A channel opens: the state of every channel russh no longer holds
+        /// goes. A channel the server closed (its process ended, or it was
+        /// refused) is one of them: russh forgets a channel it closed, so the
+        /// client's answering close never reaches `channel_close`, and its
+        /// state, a finished terminal included, would stay until the
+        /// connection ends. The channel opening now is not held until it is
+        /// accepted, so it starts with no state either.
+        ///
+        /// russh has no `is_open`. The packet size it reports is 0 for a
+        /// channel it does not hold, and this server's own (32 KiB, never 0)
+        /// for one it does. A forward stays while its splice runs as well:
+        /// russh holds an accepted channel only once its answer has gone
+        /// out, which can come after the next open, and the forward's mark
+        /// must be there for every request on it.
+        fn channel_opens(&mut self, session: &Session) {
+            self.channels.retain(|id, state| {
+                session.max_packet_size(id) > 0
+                    || state.forward.as_ref().is_some_and(|f| f.strong_count() > 0)
+            });
+        }
+
+        /// A channel opened as a forward, not a session
+        /// ([`ChannelState::forward`]).
+        fn is_forward(&self, channel: ChannelId) -> bool {
+            self.channels
+                .get(&channel)
+                .is_some_and(|c| c.forward.is_some())
+        }
+
         /// Serve the `sftp` subsystem — which is also how modern `scp` moves
         /// files (OpenSSH 9 replaced the old rcp-over-exec protocol).
         ///
@@ -1147,12 +1206,12 @@ mod sshd {
             session: &mut Session,
         ) -> Result<(), russh::Error> {
             let Some(policy) = &self.policy else {
-                return refuse(session, channel, self.peer, "sftp", "no session policy");
+                return self.refuse(session, channel, "sftp", "no session policy");
             };
             let run_as = match policy.run_as.clone() {
                 Ok(r) => r,
                 Err(why) => {
-                    return refuse(session, channel, self.peer, "sftp", &why);
+                    return self.refuse(session, channel, "sftp", &why);
                 }
             };
 
@@ -1163,10 +1222,9 @@ mod sshd {
             // everywhere on Windows: becoming one needs its credentials.
             #[cfg(windows)]
             if let crate::exec::RunAs::Named(account) = &run_as {
-                return refuse(
+                return self.refuse(
                     session,
                     channel,
-                    self.peer,
                     "sftp",
                     &format!(
                         "cannot transfer files as the local account {account:?}: becoming an \
@@ -1177,10 +1235,9 @@ mod sshd {
             }
             #[cfg(windows)]
             if matches!(run_as, crate::exec::RunAs::ConsoleUser) && !sftp_as_user_enabled() {
-                return refuse(
+                return self.refuse(
                     session,
                     channel,
-                    self.peer,
                     "sftp",
                     "SFTP as the signed-in user is switched off on this device \
                      (ROOMLERD_SFTP_AS_USER=0).",
@@ -1190,10 +1247,9 @@ mod sshd {
             let program = match sftp_server_path() {
                 Some(p) => p,
                 None => {
-                    return refuse(
+                    return self.refuse(
                         session,
                         channel,
-                        self.peer,
                         "sftp",
                         "no `sftp-server` binary on this device. roomler serves SFTP by \
                          handing the channel to OpenSSH's own server so transfers run as \
@@ -1277,9 +1333,9 @@ mod sshd {
 
             // Bounded, for the same reason the pty's queue is: a client
             // streaming a large upload must not grow the daemon's memory
-            // faster than sftp-server drains it.
+            // faster than sftp-server drains it. This channel's own input.
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-            self.channel_input = Some(tx);
+            self.channels.entry(channel).or_default().input = Some(tx);
 
             let mut stdin = child.stdin.take().expect("stdin was piped");
             tokio::spawn(async move {
@@ -1396,7 +1452,7 @@ mod sshd {
             caller: String,
         ) {
             let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-            self.channel_input = Some(tx);
+            self.channels.entry(channel).or_default().input = Some(tx);
             let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<crate::exec::Chunk>(4);
             let abort = tokio_util::sync::CancellationToken::new();
             self.exec_aborts.insert(channel, abort.clone());
@@ -1446,8 +1502,8 @@ mod sshd {
             });
         }
 
-        /// Start an interactive session on the terminal `pty_request` asked
-        /// for.
+        /// Start an interactive session on the terminal this channel's
+        /// `pty_request` asked for.
         ///
         /// Runs the SAME two gates a one-shot command does, in the same order:
         /// resolve the identity from the server (never from the client), then
@@ -1459,11 +1515,11 @@ mod sshd {
             command: Option<String>,
             session: &mut Session,
         ) -> Result<(), russh::Error> {
-            let Some((term, size)) = self.pty_req.clone() else {
-                return refuse(
+            let Some((term, size)) = self.channels.get(&channel).and_then(|c| c.pty_req.clone())
+            else {
+                return self.refuse(
                     session,
                     channel,
-                    self.peer,
                     "shell",
                     "no terminal was requested for this session",
                 );
@@ -1473,19 +1529,14 @@ mod sshd {
             // only READ it. Absent means unauthenticated, which russh does
             // not deliver requests for — refuse rather than reason about it.
             let Some(policy) = &self.policy else {
-                return refuse(session, channel, self.peer, "shell", "no session policy");
+                return self.refuse(session, channel, "shell", "no session policy");
             };
             let run_as = match policy.run_as.clone() {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(peer = %self.peer, %e, "ssh: refusing a shell — unusable account mode");
-                    let _ = session.extended_data(
-                        channel,
-                        1,
-                        format!("roomler-ssh: {e}\r\n").into_bytes(),
-                    );
-                    session.channel_failure(channel)?;
-                    return Ok(());
+                    // #4168 — answered as `refuse` answers, so `ssh` shows it.
+                    return self.answer_refusal(session, channel, &e.to_string());
                 }
             };
 
@@ -1544,9 +1595,11 @@ mod sshd {
 
             // A bounded queue: an operator holding a key down must not be able
             // to grow the daemon's memory faster than the shell drains it.
+            // This channel's own input and terminal.
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-            self.channel_input = Some(tx);
-            self.pty_handle = Some(pty.handle());
+            let state = self.channels.entry(channel).or_default();
+            state.input = Some(tx);
+            state.terminal = Some(pty.handle());
 
             let writer = pty.handle();
             tokio::spawn(async move {
@@ -1710,6 +1763,11 @@ mod sshd {
             reply: russh::server::ChannelOpenHandle,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // #4168 — a refused channel whose close has gone out since is let
+            // go, so `refused` never holds more than the channels russh itself
+            // still holds, and an id russh hands out again starts clean.
+            self.refused.retain(|&c| session.has_pending_data(c));
+            self.channel_opens(session);
             reply.accept().await;
             self.arm_session_deadline(session);
             Ok(())
@@ -1739,10 +1797,14 @@ mod sshd {
             _originator_address: &str,
             _originator_port: u32,
             reply: russh::server::ChannelOpenHandle,
-            _session: &mut Session,
+            session: &mut Session,
         ) -> Result<(), Self::Error> {
             use russh::ChannelOpenFailure;
 
+            // A channel opening all the same. A forward's bytes go to its own
+            // stream (below); its only state here is its mark, set once the
+            // forward is accepted.
+            self.channel_opens(session);
             let host = host_to_connect.to_string();
             // A u32 on the wire; anything above 65535 is a malformed request,
             // not a port we should try.
@@ -1811,6 +1873,11 @@ mod sshd {
             };
             let _ = target.set_nodelay(true);
 
+            // Marked before the answer goes out, so the first request on it
+            // finds it: no session request runs on a forward.
+            let splicing = std::sync::Arc::new(());
+            self.channels.entry(channel.id()).or_default().forward =
+                Some(std::sync::Arc::downgrade(&splicing));
             reply.accept().await;
             info!(peer = %self.peer, ?caller, ?host, port, "ssh: forward opened");
             self.report(
@@ -1827,6 +1894,7 @@ mod sshd {
                 // hand-rolled select! gets wrong (see `sshcmd::pump`).
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
                 drop(permit);
+                drop(splicing);
             });
             Ok(())
         }
@@ -1837,6 +1905,14 @@ mod sshd {
             data: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // #4168 — nothing runs on a refused channel (see `refused`).
+            if self.refused.contains(&channel) {
+                return session.channel_failure(channel);
+            }
+            // Nor on a forward (see `ChannelState::forward`).
+            if self.is_forward(channel) {
+                return session.channel_failure(channel);
+            }
             // The SSH exec payload is bytes, not necessarily UTF-8. Refuse
             // rather than lossily convert: a command with replacement
             // characters in it is not the command the caller asked for.
@@ -1900,8 +1976,9 @@ mod sshd {
             // streaming into a command that is not reading is held back by
             // SSH flow control rather than by the daemon's memory. Bytes that
             // arrive while consent is pending wait here; a refusal drops them.
+            // This channel's own stdin: another channel's bytes never reach it.
             let (tx, stdin) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-            self.channel_input = Some(tx);
+            self.channels.entry(channel).or_default().input = Some(tx);
             // FR-89 — minted HERE, before the consent wait, so a channel that
             // closes while the operator is being asked leaves nothing to run.
             let abort = tokio_util::sync::CancellationToken::new();
@@ -1924,25 +2001,36 @@ mod sshd {
             Ok(())
         }
 
-        /// A shell request without a prior PTY request is a non-interactive
-        /// shell — rare, and not what this exists to serve. Refused with a
-        /// reason rather than silently handed a terminal the client never
-        /// asked for.
+        /// A shell request without a prior PTY request on its own channel is
+        /// a non-interactive shell — rare, and not what this exists to serve.
+        /// Refused with a reason rather than silently handed a terminal the
+        /// client never asked for, or one another channel asked for.
         async fn shell_request(
             &mut self,
             channel: ChannelId,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            if self.pty_req.is_some() {
+            // #4168 — nor does a shell (see `refused`).
+            if self.refused.contains(&channel) {
+                return session.channel_failure(channel);
+            }
+            // Nor on a forward (see `ChannelState::forward`).
+            if self.is_forward(channel) {
+                return session.channel_failure(channel);
+            }
+            if self
+                .channels
+                .get(&channel)
+                .is_some_and(|c| c.pty_req.is_some())
+            {
                 // The shell's CONTENTS are never recorded; this row exists so
                 // a reader can see that an interactive session happened.
                 self.report(SshActivityKind::Shell, None, None, true);
                 self.start_pty_session(channel, None, session).await
             } else {
-                refuse(
+                self.refuse(
                     session,
                     channel,
-                    self.peer,
                     "shell",
                     "a shell needs a terminal here — drop `-T`, or use \
                      `ssh <node> <command>` for a one-shot command.",
@@ -1962,12 +2050,21 @@ mod sshd {
             _modes: &[(russh::Pty, u32)],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // #4168 — a refused channel gets no terminal (see `refused`).
+            if self.refused.contains(&channel) {
+                return session.channel_failure(channel);
+            }
+            // Nor does a forward (see `ChannelState::forward`).
+            if self.is_forward(channel) {
+                return session.channel_failure(channel);
+            }
             // Recorded, not acted on: the terminal is allocated when the
             // shell starts, because that is when the identity it runs as
             // is known and when consent has been settled. Allocating here
             // would leave a pty (and later a shell) alive for a session
-            // that is about to be refused.
-            self.pty_req = Some((
+            // that is about to be refused. Recorded for THIS channel: a
+            // shell on another channel never takes it.
+            self.channels.entry(channel).or_default().pty_req = Some((
                 term.to_string(),
                 crate::pty::WinSize {
                     cols: col_width as u16,
@@ -1979,36 +2076,50 @@ mod sshd {
             Ok(())
         }
 
-        /// Client bytes for the channel's process: keystrokes for a terminal,
+        /// Client bytes for this channel's process: keystrokes for a terminal,
         /// the client's stdin for an exec'd command, the protocol for
-        /// `sftp-server`. With nothing to deliver to (no process yet, or the
-        /// session has ended) the send fails and the data is dropped.
+        /// `sftp-server`. Never another channel's. With nothing to deliver
+        /// to (no process yet, a forward, whose bytes russh hands to its own
+        /// stream, or a process that has ended) the data is dropped.
         async fn data(
             &mut self,
-            _channel: ChannelId,
+            channel: ChannelId,
             data: &[u8],
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            if let Some(tx) = &self.channel_input {
+            // #4168 — a refused channel's bytes reach no process (see `refused`).
+            if self.refused.contains(&channel) {
+                return Ok(());
+            }
+            if let Some(tx) = self.channels.get(&channel).and_then(|c| c.input.as_ref()) {
                 let _ = tx.send(data.to_vec()).await;
             }
             Ok(())
         }
 
-        /// The client's window changed. Resizing the terminal is what makes
-        /// the far side reflow. On Unix the kernel also SIGWINCHes the
-        /// foreground group, which is how a full-screen application learns to
-        /// redraw; ConPTY delivers the equivalent through the console host.
+        /// The client's window changed. Resizing this channel's terminal is
+        /// what makes the far side reflow. On Unix the kernel also SIGWINCHes
+        /// the foreground group, which is how a full-screen application learns
+        /// to redraw; ConPTY delivers the equivalent through the console host.
+        /// A channel with no terminal of its own resizes nothing.
         async fn window_change_request(
             &mut self,
-            _channel: ChannelId,
+            channel: ChannelId,
             col_width: u32,
             row_height: u32,
             _pix_width: u32,
             _pix_height: u32,
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            if let Some(h) = &self.pty_handle {
+            // #4168 — nor resize a terminal (see `refused`).
+            if self.refused.contains(&channel) {
+                return Ok(());
+            }
+            if let Some(h) = self
+                .channels
+                .get(&channel)
+                .and_then(|c| c.terminal.as_ref())
+            {
                 let size = crate::pty::WinSize {
                     cols: col_width as u16,
                     rows: row_height as u16,
@@ -2020,15 +2131,22 @@ mod sshd {
             Ok(())
         }
 
-        /// The client stopped sending. Close the terminal's input side so the
-        /// shell sees end-of-input and exits on its own, rather than being
-        /// killed — a shell that exits normally runs its logout hooks.
+        /// The client stopped sending on this channel: its process's input
+        /// ends, and no other's. A command or `sftp-server` reads end-of-input
+        /// and finishes on its own; a terminal takes no more keystrokes, and
+        /// its shell runs until it exits or the channel closes.
         async fn channel_eof(
             &mut self,
-            _channel: ChannelId,
+            channel: ChannelId,
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            self.channel_input = None;
+            // #4168 — nor end a process's input (see `refused`).
+            if self.refused.contains(&channel) {
+                return Ok(());
+            }
+            if let Some(state) = self.channels.get_mut(&channel) {
+                state.input = None;
+            }
             Ok(())
         }
 
@@ -2037,7 +2155,8 @@ mod sshd {
         /// closed channel, so the pump cannot tell — and no wall clock would
         /// end it, so it is ended here: the abort kills the process tree.
         /// A channel whose command already finished has a token that fires
-        /// into nothing.
+        /// into nothing. The channel's input, terminal and pty request go
+        /// with it.
         async fn channel_close(
             &mut self,
             channel: ChannelId,
@@ -2046,6 +2165,7 @@ mod sshd {
             if let Some(abort) = self.exec_aborts.remove(&channel) {
                 abort.cancel();
             }
+            self.channels.remove(&channel);
             Ok(())
         }
 
@@ -2055,19 +2175,43 @@ mod sshd {
             name: &str,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // #4168 — nor a subsystem (see `refused`).
+            if self.refused.contains(&channel) {
+                return session.channel_failure(channel);
+            }
+            // Nor on a forward (see `ChannelState::forward`).
+            if self.is_forward(channel) {
+                return session.channel_failure(channel);
+            }
             if name == "sftp" {
                 // File operations happen inside `sftp-server`; this records
                 // only that a transfer channel was opened.
                 self.report(SshActivityKind::Sftp, None, None, true);
                 return self.start_sftp_session(channel, session).await;
             }
-            refuse(
+            self.refuse(
                 session,
                 channel,
-                self.peer,
                 name,
                 "only the `sftp` subsystem is implemented.",
             )
+        }
+
+        /// A variable for the session's environment. Nothing here takes one,
+        /// and a session channel's request is left unanswered, as russh's
+        /// default leaves it. On a forward it is answered with a failure
+        /// (see [`ChannelState::forward`]).
+        async fn env_request(
+            &mut self,
+            channel: ChannelId,
+            _variable_name: &str,
+            _variable_value: &str,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if self.is_forward(channel) {
+                return session.channel_failure(channel);
+            }
+            Ok(())
         }
     }
 
@@ -2208,22 +2352,58 @@ mod sshd {
         tunnel_core::env::flag("SFTP_AS_USER", true)
     }
 
-    /// Tell the client no, in a way a human reads on their terminal.
-    ///
-    /// A bare `channel_failure` surfaces as a blank "administratively
-    /// prohibited", which is indistinguishable from a policy denial — so send
-    /// the reason on stderr first.
-    fn refuse(
-        session: &mut Session,
-        channel: ChannelId,
-        peer: std::net::SocketAddr,
-        what: &str,
-        why: &str,
-    ) -> Result<(), russh::Error> {
-        warn!(%peer, request = ?what, "ssh: refused an unsupported request");
-        let _ = session.extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes());
-        session.channel_failure(channel)?;
-        Ok(())
+    /// #4168 — the exit status a refused request ends with: what sshd ends a
+    /// session with when it cannot serve it, and what a command here that
+    /// never ran already ends with ([`run_exec`]).
+    const REFUSED_EXIT_STATUS: u32 = 1;
+
+    impl Handler {
+        /// Tell the client no, in a way a human reads on their terminal: log
+        /// the refusal, then [`answer_refusal`](Self::answer_refusal).
+        fn refuse(
+            &mut self,
+            session: &mut Session,
+            channel: ChannelId,
+            what: &str,
+            why: &str,
+        ) -> Result<(), russh::Error> {
+            warn!(peer = %self.peer, request = ?what, "ssh: refused an unsupported request");
+            self.answer_refusal(session, channel, why)
+        }
+
+        /// The answer to a request this channel will not serve, for a caller
+        /// that has logged its own line.
+        ///
+        /// The request is answered with success, then `why` on stderr,
+        /// [`REFUSED_EXIT_STATUS`], EOF and the close: how a program that
+        /// could not start ends (#4168). A failure would be the plain answer,
+        /// but OpenSSH's client takes a failed shell or subsystem request as
+        /// fatal: it prints `shell request failed on channel 0` (`subsystem`
+        /// under `sftp` and `scp`) and exits 255 without writing the stderr it
+        /// was sent first, so the reason never reached the person.
+        ///
+        /// The success starts nothing. The close goes out right behind the
+        /// reason, and russh drops whatever the client sends on a channel it
+        /// has closed. Where russh holds the close back behind the reason,
+        /// `refused` keeps the channel until it goes, and the handlers turn
+        /// away what arrives on it.
+        fn answer_refusal(
+            &mut self,
+            session: &mut Session,
+            channel: ChannelId,
+            why: &str,
+        ) -> Result<(), russh::Error> {
+            session.channel_success(channel)?;
+            let _ =
+                session.extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes());
+            session.exit_status_request(channel, REFUSED_EXIT_STATUS)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            if session.has_pending_data(channel) {
+                self.refused.insert(channel);
+            }
+            Ok(())
+        }
     }
 
     /// Ask the operator at this device, and say so on stderr first.
@@ -2470,7 +2650,11 @@ mod sshd {
             org: String::new(),
             expires_at: std::time::Instant::now() + timeout,
         };
-        let native = indicator.show_prompt(view.clone());
+        // FR-149 P1 — on a one-row Mac's root daemon the screen worker's
+        // panel first, `PANEL_WITHIN` at most (`companion::COMPANION_START_BUDGET`'s
+        // assertion counts it).
+        let on_screen = indicator.show_prompt(view.clone()).await;
+        let native = on_screen.native;
         let mut prompt = crate::consent::PendingPrompt {
             kind: crate::consent::PromptKind::Ssh,
             asked_by: caller,
@@ -2487,7 +2671,10 @@ mod sshd {
                 crate::consent::PromptSurface::Companion
             },
         };
-        let marker = match broker.write_prompt(sentinel, &prompt) {
+        // FR-149 P1 — and read on the session panel's books after it.
+        let marker = match crate::indicator::session_panel::write_marker(
+            broker, sentinel, &prompt, &on_screen,
+        ) {
             Ok(_) => true,
             Err(e) => {
                 warn!(?caller, %sentinel, %e, native, "ssh: could not write the .pending consent marker");
@@ -2522,9 +2709,16 @@ mod sshd {
             // this read `native` alone, so a question the companion showed
             // and nobody answered was reported as one nobody could be asked.
             have_surface = (companion_up && marker) || notified;
-            why_not = tray.why_not_shown(marker);
+            // #4164 — a panel busy with another question wins over the app's
+            // cause (`session_panel::Prompted::why_not_shown`).
+            why_not = on_screen.why_not_shown(tray.why_not_shown(marker));
         }
-        info!(?caller, %sentinel, native, notified, have_surface, "consent prompt surface (ssh)");
+        info!(
+            ?caller, %sentinel, native, panel = on_screen.panel(),
+            session_panel = on_screen.session_panel(), why = on_screen.why(),
+            panel_busy = on_screen.panel_busy(), notified, have_surface,
+            "consent prompt surface (ssh)"
+        );
 
         let decision = asking.await;
         // The single convergence point: answered, timed out, or resolved from
@@ -2934,10 +3128,10 @@ pub async fn serve_for_service<S>(
     }
 }
 
-/// FR-96 P2b — SSH connections open on this device right now. A daemon
-/// restart ends every one of them, so the restart onto a replaced binary
-/// waits while any is open: the likeliest way that binary gets replaced is an
-/// admin's `apt upgrade` typed INTO one of these sessions.
+/// FR-96 P2b, #3429 — SSH connections open on this device right now. A
+/// restart ends every one of them, so the restart onto a replaced binary and
+/// the periodic update wait while any is open: the likeliest way a binary gets
+/// replaced is an admin's `apt upgrade` typed INTO one of these sessions.
 static LIVE_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// How many SSH connections are open right now; zero in a build without the
@@ -2947,13 +3141,13 @@ pub fn live_connections() -> usize {
 }
 
 /// Counts one connection in [`LIVE_CONNECTIONS`] for as long as it lives,
-/// whichever way `serve_conn` returns.
+/// whichever way `serve_conn`, or the carry to the SYSTEM service, returns.
 #[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
-struct LiveConnection;
+pub(crate) struct LiveConnection;
 
 #[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
 impl LiveConnection {
-    fn open() -> Self {
+    pub(crate) fn open() -> Self {
         LIVE_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self
     }
@@ -3047,6 +3241,10 @@ const MAX_PENDING_GRANTS: usize = 16;
 pub enum GrantRejected {
     /// The key the server validated does not parse here.
     UnparseableKey(String),
+    /// #3558 — a copy of a grant id this process still holds, or let go of
+    /// inside [`GRANT_ID_HORIZON`]. It is not recorded, so the first copy's
+    /// entry, window and acknowledgement stay exactly as they were.
+    Duplicate(GrantSeen),
 }
 
 #[cfg(feature = "ssh-server")]
@@ -3055,7 +3253,13 @@ impl GrantRejected {
     pub fn refusal(&self) -> roomler_ai_remote_control::models::SshGrantRefusal {
         use roomler_ai_remote_control::models::SshGrantRefusal;
         match self {
-            Self::UnparseableKey(_) => SshGrantRefusal::Invalid,
+            // `Invalid` is "the device could not use what the server
+            // validated", which the caller hears as `grant_refused`. A copy
+            // is not `Other`, a reason this build would not know, and not
+            // `Expired`, which #3511 retired. On the worker's own path the
+            // copy's refusal reaches no waiter anyway: the first copy's
+            // acknowledgement already removed it (`SshGrantAcks::deliver`).
+            Self::UnparseableKey(_) | Self::Duplicate(_) => SshGrantRefusal::Invalid,
         }
     }
 }
@@ -3065,6 +3269,9 @@ impl std::fmt::Display for GrantRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnparseableKey(e) => write!(f, "grant carries an unparseable public key: {e}"),
+            Self::Duplicate(seen) => {
+                write!(f, "a grant id is honoured at most once, and {seen}")
+            }
         }
     }
 }
@@ -3137,13 +3344,31 @@ pub fn record_grant(
     };
 
     let mut grants = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
-    prune(&mut grants);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    prune(&mut grants, &mut spent, now);
+    // #3558 — a grant id is honoured at most once. Checked before the drop
+    // below, so a copy never evicts a live grant, and before the push, so it
+    // never becomes a second redeemable entry with a window of its own.
+    let seen = if grants.iter().any(|g| g.grant_id == grant.grant_id) {
+        Some(GrantSeen::Pending)
+    } else {
+        spent.recall(&grant.grant_id, now)
+    };
+    if let Some(seen) = seen {
+        return Err(GrantRejected::Duplicate(seen));
+    }
     if grants.len() >= MAX_PENDING_GRANTS {
         // Drop the OLDEST rather than refusing the newest: the newest is the
         // one a caller is actively waiting on, and the oldest is within
         // seconds of expiring anyway.
-        grants.remove(0);
-        tracing::warn!("ssh: pending-grant table full — dropped the oldest");
+        let dropped = grants.remove(0);
+        tracing::warn!(
+            grant_id = %dropped.grant_id,
+            "ssh: pending-grant table full — dropped the oldest"
+        );
+        // Burned, as an expired one is: a late copy gets no window of its own.
+        spent.remember(dropped.grant_id, GrantSeen::Dropped, now);
     }
     tracing::info!(
         grant_id = %grant.grant_id, caller = ?grant.caller,
@@ -3155,14 +3380,15 @@ pub fn record_grant(
     Ok(())
 }
 
-/// Drop everything past its deadline.
+/// Drop everything past its deadline, and remember each dropped id (#3558):
+/// a grant that timed out unredeemed is burned, as a redeemed one is.
 #[cfg(feature = "ssh-server")]
-fn prune(grants: &mut Vec<Grant>) {
-    let now = std::time::Instant::now();
+fn prune(grants: &mut Vec<Grant>, spent: &mut RememberedIds<GrantSeen>, now: std::time::Instant) {
     grants.retain(|g| {
         let live = g.deadline > now;
         if !live {
             tracing::debug!(grant_id = %g.grant_id, "ssh: grant expired unredeemed");
+            spent.remember(g.grant_id.clone(), GrantSeen::Expired, now);
         }
         live
     });
@@ -3170,31 +3396,188 @@ fn prune(grants: &mut Vec<Grant>) {
 
 /// Consume the live grant admitting `key`, if any. Single use: a redeemed
 /// grant is gone, so a captured public key cannot be replayed into a second
-/// session.
+/// session — and its id is remembered (#3558), so a copy of the grant that
+/// arrives later is not recorded as new.
 #[cfg(feature = "ssh-server")]
 fn take_grant_for(key: &russh::keys::ssh_key::PublicKey) -> Option<Grant> {
     let mut grants = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
-    prune(&mut grants);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    prune(&mut grants, &mut spent, now);
     let idx = grants.iter().position(|g| {
         russh::keys::ssh_key::PublicKey::from_openssh(&g.public_key)
             .is_ok_and(|k| k.key_data() == key.key_data())
     })?;
-    Some(grants.remove(idx))
+    let grant = grants.remove(idx);
+    spent.remember(grant.grant_id.clone(), GrantSeen::Redeemed, now);
+    Some(grant)
 }
 
 /// How many grants are pending — surfaced in diagnostics.
 #[cfg(feature = "ssh-server")]
 pub fn pending_grants() -> usize {
     let mut grants = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
-    prune(&mut grants);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    prune(&mut grants, &mut spent, std::time::Instant::now());
     grants.len()
 }
 
-/// Test-only: empty the table so cases cannot leak into each other through
-/// process-global state.
+// ── #3558: a grant id is honoured at most once ──────────────────────────────
+//
+// A grant delivered twice used to become two redeemable entries, and a copy
+// that arrived after its grant was redeemed was recorded as new, with a fresh
+// window of its own (#3511): a captured key could open a second session. Now
+// a process refuses a copy whose id it still holds, or let go of within
+// `GRANT_ID_HORIZON`, whichever way the first copy left: redeemed, expired
+// unredeemed, or dropped from a full table.
+
+/// How long a grant id is remembered after it left the table, so that a copy
+/// of it is refused. While the grant is pending the table itself refuses a
+/// copy, so an id is refused for its whole window and this long after: ten
+/// windows (`ssh_limits::GRANT_TTL_SECS`, 60 s), at least one by construction.
+#[cfg(feature = "ssh-server")]
+const GRANT_ID_HORIZON: std::time::Duration = std::time::Duration::from_secs(
+    10 * roomler_ai_remote_control::models::ssh_limits::GRANT_TTL_SECS,
+);
+
+/// Most grant ids one memory holds; when it is full the oldest is forgotten
+/// first. An id is a few dozen bytes, so this is a few KiB, and the server
+/// mints one grant per session asked for: 256 inside the horizon is a scripted
+/// loop, not a person.
+#[cfg(feature = "ssh-server")]
+const MAX_REMEMBERED_GRANTS: usize = 256;
+
+/// What became of the first copy of a grant id, when a second one arrives.
+#[cfg(feature = "ssh-server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantSeen {
+    /// It is in the table, waiting for its connection.
+    Pending,
+    /// A connection redeemed it.
+    Redeemed,
+    /// Its window ended with nobody redeeming it.
+    Expired,
+    /// A full table dropped it to make room for a newer grant.
+    Dropped,
+}
+
+#[cfg(feature = "ssh-server")]
+impl std::fmt::Display for GrantSeen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "its first copy is still pending",
+            Self::Redeemed => "its first copy was redeemed",
+            Self::Expired => "its first copy expired unredeemed",
+            Self::Dropped => "its first copy was dropped from a full table",
+        })
+    }
+}
+
+/// Grant ids a process is done with, each until its time to be forgotten,
+/// oldest first. Every entry is kept for the same horizon, so the order of
+/// arrival is the order of forgetting, by age or by the bound alike.
+#[cfg(feature = "ssh-server")]
+#[derive(Debug)]
+struct RememberedIds<T> {
+    entries: std::collections::VecDeque<(String, T, std::time::Instant)>,
+}
+
+#[cfg(feature = "ssh-server")]
+impl<T> RememberedIds<T> {
+    const fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+#[cfg(feature = "ssh-server")]
+impl<T: Copy> RememberedIds<T> {
+    /// What is remembered about `grant_id`, if it is still remembered.
+    fn recall(&mut self, grant_id: &str, now: std::time::Instant) -> Option<T> {
+        self.forget_past(now);
+        self.entries
+            .iter()
+            .find(|(id, _, _)| id == grant_id)
+            .map(|(_, what, _)| *what)
+    }
+
+    /// Remember `grant_id` for [`GRANT_ID_HORIZON`] from `now`. A full
+    /// memory forgets its oldest id first.
+    fn remember(&mut self, grant_id: String, what: T, now: std::time::Instant) {
+        self.forget_past(now);
+        if self.entries.len() >= MAX_REMEMBERED_GRANTS
+            && let Some((oldest, _, _)) = self.entries.pop_front()
+        {
+            tracing::debug!(grant_id = %oldest, "ssh: grant-id memory full — forgot the oldest");
+        }
+        self.entries
+            .push_back((grant_id, what, now + GRANT_ID_HORIZON));
+    }
+
+    fn forget_past(&mut self, now: std::time::Instant) {
+        self.entries.retain(|(_, _, forget_at)| *forget_at > now);
+    }
+}
+
+/// The ids that left [`GRANTS`]: redeemed, expired unredeemed, or dropped.
+///
+/// Locked only while `GRANTS` is held, and always after it: one lock order,
+/// and no moment at which a grant has left the table and its id is not yet
+/// remembered.
+#[cfg(feature = "ssh-server")]
+static SPENT: std::sync::Mutex<RememberedIds<GrantSeen>> =
+    std::sync::Mutex::new(RememberedIds::new());
+
+/// The worker's memory of the grants it was asked to hand to this device's
+/// SYSTEM service (FR-105). Never [`GRANTS`] or [`SPENT`]: those back the
+/// table this process's own server reads, and a via-service grant is never
+/// redeemable here.
+#[cfg(feature = "ssh-server")]
+static SEEN_VIA_SERVICE: std::sync::Mutex<RememberedIds<()>> =
+    std::sync::Mutex::new(RememberedIds::new());
+
+/// #3558 — whether this is the first copy of a via-service grant this worker
+/// has seen. On `false` the caller logs the copy and drops it: no second ring,
+/// no acknowledgement.
+///
+/// A copy answers nothing on this path, where the worker's own path refuses
+/// one ([`GrantRejected::Duplicate`]), because here a refusal could undo the
+/// first copy's outcome. The service's claim is single use on the server, so
+/// a copy's ring ends in a refused claim, and the worker would acknowledge
+/// that as a refusal. With two server instances, the first copy's claim can
+/// land on the one that does not hold the caller's wait: that wait then stays
+/// open and still takes a worker's refusal, and the caller is denied while
+/// the service holds the grant.
+///
+/// Remembered at first sight, before any outcome: a grant the worker refused
+/// is as dead as one the service took, and the first refusal already
+/// answered.
+#[cfg(feature = "ssh-server")]
+pub(crate) fn first_sight_via_service(grant_id: &str) -> bool {
+    let mut seen = SEEN_VIA_SERVICE.lock().unwrap_or_else(|e| e.into_inner());
+    first_sight(&mut seen, grant_id, std::time::Instant::now())
+}
+
+#[cfg(feature = "ssh-server")]
+fn first_sight(seen: &mut RememberedIds<()>, grant_id: &str, now: std::time::Instant) -> bool {
+    if seen.recall(grant_id, now).is_some() {
+        return false;
+    }
+    seen.remember(grant_id.to_owned(), (), now);
+    true
+}
+
+/// Test-only: empty the table, and the ids it let go of, so cases cannot
+/// leak into each other through process-global state.
 #[cfg(all(test, feature = "ssh-server"))]
 fn clear_grants() {
     GRANTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SPENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .clear();
 }
 
 #[cfg(all(test, feature = "ssh-server"))]
@@ -3394,7 +3777,16 @@ mod tests {
         addr: std::net::SocketAddr,
         key: PrivateKey,
     ) -> russh::client::Handle<TestClient> {
-        let config = Arc::new(russh::client::Config::default());
+        connect_with(addr, key, russh::client::Config::default()).await
+    }
+
+    /// [`connect`], as a client configured with `config`.
+    async fn connect_with(
+        addr: std::net::SocketAddr,
+        key: PrivateKey,
+        config: russh::client::Config,
+    ) -> russh::client::Handle<TestClient> {
+        let config = Arc::new(config);
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut session = russh::client::connect_stream(config, stream, TestClient)
             .await
@@ -3452,9 +3844,9 @@ mod tests {
         );
     }
 
-    /// An empty list is the default, and it must deny rather than allow.
+    /// An empty list is the default, and with no grant to redeem it must deny.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_empty_authorized_list_denies_everyone() {
+    async fn an_empty_authorized_list_denies_a_key_with_no_grant() {
         let (key, _) = client_key(3);
         let addr = serve_one(&cfg_with(Vec::new())).await;
 
@@ -3777,6 +4169,117 @@ mod tests {
         );
     }
 
+    /// #4168 — one message a client reads on a channel.
+    #[derive(Debug, PartialEq)]
+    enum Read {
+        Success,
+        Failure,
+        Stdout(String),
+        /// Stderr messages that came one after another, run together.
+        Stderr(String),
+        Exit(u32),
+        Eof,
+        Close,
+    }
+
+    /// The next message `channel` reads, passing over those a refusal never
+    /// sends (a window adjustment, say); `None` once the channel has ended.
+    async fn next_read(channel: &mut russh::Channel<russh::client::Msg>) -> Option<Read> {
+        loop {
+            let read = match channel.wait().await? {
+                russh::ChannelMsg::Success => Read::Success,
+                russh::ChannelMsg::Failure => Read::Failure,
+                russh::ChannelMsg::Data { ref data } => {
+                    Read::Stdout(String::from_utf8_lossy(data).into_owned())
+                }
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    Read::Stderr(String::from_utf8_lossy(data).into_owned())
+                }
+                russh::ChannelMsg::ExitStatus { exit_status } => Read::Exit(exit_status),
+                russh::ChannelMsg::Eof => Read::Eof,
+                russh::ChannelMsg::Close => Read::Close,
+                _ => continue,
+            };
+            return Some(read);
+        }
+    }
+
+    /// [`next_read`], within 10 s; `what` names the read for a timeout.
+    async fn next_read_soon(
+        channel: &mut russh::Channel<russh::client::Msg>,
+        what: &str,
+    ) -> Option<Read> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), next_read(channel))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the channel said nothing within 10 s"))
+    }
+
+    /// What a client reads on `channel`, in order, until the channel ends or
+    /// answers with a failure: a channel that answered a failure stays open,
+    /// as one a refusal answered did before #4168. Within 30 s.
+    async fn read_in_order(mut channel: russh::Channel<russh::client::Msg>) -> Vec<Read> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+            let mut reads: Vec<Read> = Vec::new();
+            while let Some(read) = next_read(&mut channel).await {
+                let failed = read == Read::Failure;
+                let merged = match (&read, reads.last_mut()) {
+                    (Read::Stderr(more), Some(Read::Stderr(said))) => {
+                        said.push_str(more);
+                        true
+                    }
+                    _ => false,
+                };
+                if !merged {
+                    reads.push(read);
+                }
+                if failed {
+                    break;
+                }
+            }
+            reads
+        })
+        .await
+        .expect("the channel ends, or answers with a failure, within 30 s")
+    }
+
+    /// #4168 — `reads` is a refusal as OpenSSH's client can show it: success,
+    /// the reason on stderr (holding `says`), exit-status 1, EOF and close,
+    /// in that order. A failure instead is fatal to `ssh`, which then exits
+    /// 255 without writing the reason it was sent.
+    fn assert_refused_in_order(reads: &[Read], says: &str) {
+        match reads {
+            [
+                Read::Success,
+                Read::Stderr(said),
+                Read::Exit(1),
+                Read::Eof,
+                Read::Close,
+            ] if said.starts_with("roomler-ssh: ") && said.contains(says) => {}
+            _ => panic!(
+                "a refusal is read as success, the reason on stderr (naming {says:?}), \
+                 exit-status 1, EOF and close, in that order; the client read {reads:?}"
+            ),
+        }
+    }
+
+    /// The line a refusal logs holds the peer and the request it refused,
+    /// and the server wrote no `started` line (one is written once a
+    /// process is up).
+    fn assert_refused_and_nothing_started(log: &str, request: &str, started: &str) {
+        let refused = log
+            .lines()
+            .find(|l| l.contains("ssh: refused an unsupported request"))
+            .unwrap_or_else(|| panic!("no refusal line in:\n{log}"));
+        let request = format!("request={request:?}");
+        for field in ["peer=", request.as_str()] {
+            assert!(refused.contains(field), "{field} on {refused:?}");
+        }
+        assert!(
+            !log.contains(started),
+            "a refused request started something ({started:?}):\n{log}"
+        );
+    }
+
     /// A refused request must say why. `scp` turning into a silent hang is the
     /// specific failure this guards against.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3785,40 +4288,16 @@ mod tests {
         let addr = serve_one(&cfg_with(vec![line])).await;
         let session = connect(addr, key).await;
 
-        let mut channel = session.channel_open_session().await.unwrap();
+        let channel = session.channel_open_session().await.unwrap();
         // `request_subsystem` only reports that the request was *sent*; the
         // verdict comes back on the channel, so read it rather than trusting
         // the send to mean acceptance.
         // `sftp` is served since P7, so the unsupported case needs a
         // subsystem we genuinely do not implement. The point of the test is
-        // unchanged: a refusal must arrive WITH a reason.
+        // unchanged: a refusal must arrive WITH a reason, and (#4168) in the
+        // order a client can show it in.
         channel.request_subsystem(true, "netconf").await.unwrap();
-
-        let mut refused = false;
-        let mut reason = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Failure => {
-                    refused = true;
-                    break;
-                }
-                russh::ChannelMsg::Success => panic!("an unknown subsystem must not be accepted"),
-                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                    reason.extend_from_slice(data)
-                }
-                _ => {}
-            }
-        }
-
-        assert!(
-            refused,
-            "the server must answer sftp with a channel failure"
-        );
-        let reason = String::from_utf8_lossy(&reason);
-        assert!(
-            reason.contains("subsystem"),
-            "the refusal must say why — a silent failure is how a client turns into a hang; got {reason:?}"
-        );
+        assert_refused_in_order(&read_in_order(channel).await, "subsystem");
     }
 
     /// SFTP inherits the session's identity, so a session that resolved to NO
@@ -3829,38 +4308,126 @@ mod tests {
     /// than quietly taking SYSTEM/root. File transfer is the subsystem where
     /// getting that wrong would be worst, so it is asserted separately
     /// instead of assumed to follow.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    ///
+    /// #4168 — the refusal reads as success, the reason, exit-status 1, EOF
+    /// and close, so `sftp` and `scp` show the reason before they stop, and
+    /// no `sftp-server` starts. One thread, so the log is the server's.
+    #[tokio::test]
     async fn sftp_is_refused_when_the_session_resolved_to_no_account() {
+        let log = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
         let (key, line) = client_key(9);
         // `cfg_with` leaves `ssh_account_mode` unset — the default.
         let addr = serve_one(&cfg_with(vec![line])).await;
         let session = connect(addr, key).await;
 
-        let mut channel = session.channel_open_session().await.unwrap();
+        let channel = session.channel_open_session().await.unwrap();
         channel.request_subsystem(true, "sftp").await.unwrap();
+        assert_refused_in_order(&read_in_order(channel).await, "ssh_account_mode");
+        assert_refused_and_nothing_started(&log.text(), "sftp", "ssh: sftp session started");
+    }
 
-        let mut refused = false;
-        let mut reason = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Failure => {
-                    refused = true;
-                    break;
-                }
-                russh::ChannelMsg::Success => {
-                    panic!("sftp must not open for a session with no account")
-                }
-                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                    reason.extend_from_slice(data)
-                }
-                _ => {}
-            }
-        }
-        assert!(refused, "sftp must be refused without a resolved account");
-        assert!(
-            !reason.is_empty(),
-            "and the refusal must explain itself, or scp just hangs"
+    /// #4168 — a refused channel takes nothing more while its close waits
+    /// behind the reason. A client window with no room for the reason holds
+    /// russh's EOF and close back, and russh still delivers what the client
+    /// sends on that channel meanwhile. A command, a terminal and a second
+    /// shell asked for there are each answered with a failure, and none
+    /// starts; the data and EOF sent there reach no process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_channel_takes_nothing_more_while_its_close_waits() {
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(160);
+        let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+        // No window: the server can send no data on any channel, so the
+        // reason waits, and the EOF and close wait behind it.
+        let no_window = russh::client::Config {
+            window_size: 0,
+            ..Default::default()
+        };
+        let session = connect_with(addr, key, no_window).await;
+        let marks = tempfile::tempdir().expect("a temp dir");
+        let ran = marks.path().join("ran");
+        let kept = marks.path().join("kept");
+        let done = marks.path().join("done");
+
+        let mut refused = session.channel_open_session().await.unwrap();
+        refused.request_shell(true).await.unwrap();
+        // Neither is data, so both arrive.
+        let answer = next_read_soon(&mut refused, "the shell's answer").await;
+        assert_eq!(answer, Some(Read::Success));
+        let status = next_read_soon(&mut refused, "the shell's exit status").await;
+        assert_eq!(status, Some(Read::Exit(1)));
+
+        let touch = if cfg!(windows) {
+            format!("Set-Content -LiteralPath '{}' -Value ran", ran.display())
+        } else {
+            format!(": > '{}'", ran.display())
+        };
+        refused.exec(true, touch.as_str()).await.unwrap();
+        assert_eq!(
+            next_read_soon(&mut refused, "a command's answer").await,
+            Some(Read::Failure),
+            "a command on the refused channel"
         );
+        refused
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            next_read_soon(&mut refused, "a terminal's answer").await,
+            Some(Read::Failure),
+            "a terminal on the refused channel"
+        );
+        refused.request_shell(true).await.unwrap();
+        assert_eq!(
+            next_read_soon(&mut refused, "a second shell's answer").await,
+            Some(Read::Failure),
+            "a second shell on the refused channel"
+        );
+
+        // A command on a channel of its own keeps what it reads on its stdin,
+        // then leaves a mark. The mark, not its exit status: while a
+        // channel's data waits on the window, russh sends nothing that a
+        // session's task hands it, on any channel.
+        let keep = if cfg!(windows) {
+            format!(
+                "[Console]::In.ReadToEnd() | Set-Content -LiteralPath '{}' -NoNewline; \
+                 Set-Content -LiteralPath '{}' -Value done",
+                kept.display(),
+                done.display()
+            )
+        } else {
+            format!("cat > '{}'; : > '{}'", kept.display(), done.display())
+        };
+        let mut command = session.channel_open_session().await.unwrap();
+        command.exec(true, keep.as_str()).await.unwrap();
+        assert_eq!(
+            next_read_soon(&mut command, "the other channel's command").await,
+            Some(Read::Success)
+        );
+        refused
+            .data(&b"from-the-refused-channel"[..])
+            .await
+            .unwrap();
+        command.data(&b"from-its-own"[..]).await.unwrap();
+        refused.eof().await.unwrap();
+        command.data(&b"-channel"[..]).await.unwrap();
+        command.eof().await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command on its own channel did not finish within 30 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let kept = std::fs::read_to_string(&kept).expect("the command wrote what it read");
+        assert_eq!(
+            kept.trim_start_matches('\u{feff}').trim(),
+            "from-its-own-channel",
+            "the refused channel's data or EOF reached a process"
+        );
+        assert!(!ran.exists(), "a command on the refused channel ran");
     }
 
     /// #3822 — a `console_user` session this device cannot serve says why on
@@ -4228,6 +4795,257 @@ mod tests {
             super::pending_grants() <= super::MAX_PENDING_GRANTS,
             "pending grants must stay capped, got {}",
             super::pending_grants()
+        );
+    }
+
+    // ── #3558: a grant id is honoured at most once ───────────────────────
+
+    /// Record a grant under a FIXED id, as a duplicated or replayed
+    /// `rc:ssh.grant` carries it. [`grant_for`] draws a fresh id on every
+    /// call, which is exactly what these cases must not do.
+    fn record_copy(grant_id: &str, line: &str) -> Result<(), super::GrantRejected> {
+        super::record_grant(
+            grant_id.to_string(),
+            line.to_string(),
+            "alice@example.com".into(),
+            "daemon".into(),
+            None,
+            Some(roomler_ai_remote_control::models::ConsentMode::Auto),
+            now_ms() + 30_000,
+            0,
+        )
+    }
+
+    /// Whether a connection authenticating with `key` gets in. Unlike
+    /// [`connect`], a refusal is an answer here, not a failed test.
+    async fn admits(addr: std::net::SocketAddr, key: PrivateKey) -> bool {
+        let config = Arc::new(russh::client::Config::default());
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut session = russh::client::connect_stream(config, stream, TestClient)
+            .await
+            .expect("ssh handshake");
+        let hash = session.best_supported_rsa_hash().await.unwrap().flatten();
+        session
+            .authenticate_publickey(
+                "roomler",
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+            .expect("auth exchange")
+            .success()
+    }
+
+    /// #3558 — a grant delivered twice is held once. The copy is refused
+    /// while its id is pending, so the table holds one entry and the key opens
+    /// one session. Before the fix the copy was a second redeemable entry, and
+    /// a second connection with the same key got in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_same_grant_twice_is_held_once_and_admits_one_session() {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(13);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        let addr2 = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-twice", &line).expect("the first copy is held");
+        let copy = record_copy("g-3558-twice", &line);
+        let held = super::pending_grants();
+
+        let _first = connect(addr, key.clone()).await;
+        assert!(
+            !admits(addr2, key).await,
+            "a second connection with the same key is refused after the first redeems"
+        );
+        assert_eq!(held, 1, "the table holds one entry for the two copies");
+        let refused = copy.expect_err("a copy whose id is pending is refused");
+        assert_eq!(refused.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — a copy that arrives after its grant was redeemed is refused,
+    /// and the key opens nothing more. Before the fix redemption removed the
+    /// entry, so the copy was recorded as new, with a fresh window of its own
+    /// (#3511).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copy_of_a_redeemed_grant_is_refused() {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(14);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        let addr2 = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-redeemed", &line).expect("the grant is held");
+        let _first = connect(addr, key.clone()).await;
+        assert_eq!(
+            super::pending_grants(),
+            0,
+            "redeeming the grant consumed it"
+        );
+
+        let copy = record_copy("g-3558-redeemed", &line);
+        assert!(
+            !admits(addr2, key).await,
+            "a connection with the key is refused after its grant was redeemed"
+        );
+        let refused = copy.expect_err("a copy of a redeemed grant is refused");
+        assert_eq!(refused.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — a second copy does not extend the first one's window. The copy
+    /// arrives while the first is pending and is refused, and it leaves the
+    /// first copy's deadline as it was. Once that deadline passes, nothing
+    /// admits the key. The deadline is driven as in
+    /// [`an_expired_grant_admits_nobody`]. Before the fix the copy was held
+    /// with a window from its OWN arrival, so the key outlived the first one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_copy_does_not_extend_the_first_ones_window() {
+        let _lock = grant_test().await;
+        let (key, line) = client_key(15);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-window", &line).expect("the first copy is held");
+        let deadline = super::GRANTS.lock().unwrap()[0].deadline;
+        let copy = record_copy("g-3558-window", &line);
+        assert_eq!(
+            super::GRANTS.lock().unwrap()[0].deadline,
+            deadline,
+            "the copy leaves the first copy's window as it was"
+        );
+
+        // The first copy's window ends. Entry 0 is the oldest: the first copy.
+        super::GRANTS.lock().unwrap()[0].deadline = std::time::Instant::now();
+        assert!(
+            !admits(addr, key).await,
+            "once the first copy's window ends, the key opens nothing"
+        );
+        assert!(copy.is_err(), "the copy was refused on arrival");
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — a grant that timed out unredeemed is burned as well: a late
+    /// copy of it is refused, not given a fresh window from its own arrival.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copy_of_a_grant_that_expired_unredeemed_is_refused() {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(16);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-expired", &line).expect("the grant is held");
+        super::GRANTS.lock().unwrap()[0].deadline = std::time::Instant::now();
+        assert_eq!(super::pending_grants(), 0, "its window ended unredeemed");
+
+        let copy = record_copy("g-3558-expired", &line);
+        assert!(
+            !admits(addr, key).await,
+            "a late copy of an expired grant opens nothing"
+        );
+        let refused = copy.expect_err("a late copy of an expired grant is refused");
+        assert_eq!(refused.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — recording many distinct ids, each followed by a copy, keeps
+    /// both tables within their bounds: the pending grants and the ids that
+    /// left them, some redeemed and the rest pushed out of the full table.
+    #[tokio::test]
+    async fn both_tables_stay_within_their_bounds() {
+        use super::{MAX_PENDING_GRANTS, MAX_REMEMBERED_GRANTS};
+
+        let _lock = grant_test().await;
+        let (_key, line) = client_key(17);
+        let parsed = russh::keys::ssh_key::PublicKey::from_openssh(&line).unwrap();
+        let remembered = || super::SPENT.lock().unwrap().entries.len();
+
+        let ids = MAX_REMEMBERED_GRANTS + 4 * MAX_PENDING_GRANTS;
+        for i in 0..ids {
+            let id = format!("g-3558-bound-{i}");
+            record_copy(&id, &line).expect("a new id is held");
+            assert!(
+                record_copy(&id, &line).is_err(),
+                "{id}: its copy is refused"
+            );
+            if i % 3 == 0 {
+                assert!(
+                    super::take_grant_for(&parsed).is_some(),
+                    "{id}: one redeems"
+                );
+            }
+            assert!(
+                super::pending_grants() <= MAX_PENDING_GRANTS,
+                "{id}: pending"
+            );
+            assert!(remembered() <= MAX_REMEMBERED_GRANTS, "{id}: remembered");
+        }
+        // 320 ids, 16 of them still pending: 304 left the table, more than
+        // the memory holds.
+        assert_eq!(super::pending_grants(), MAX_PENDING_GRANTS);
+        assert_eq!(remembered(), MAX_REMEMBERED_GRANTS);
+    }
+
+    /// #3558 — the worker hands a grant for the SYSTEM service on at first
+    /// sight only (FR-105): a copy of an id it has seen is dropped, whether
+    /// the first copy rang the service or was refused here.
+    #[test]
+    fn a_via_service_grant_is_handed_on_at_first_sight_only() {
+        let now = std::time::Instant::now();
+        let mut seen = super::RememberedIds::new();
+        assert!(super::first_sight(&mut seen, "g-a", now), "the first copy");
+        assert!(!super::first_sight(&mut seen, "g-a", now), "a copy of it");
+        assert!(super::first_sight(&mut seen, "g-b", now), "another grant");
+
+        // The worker's own memory, under an id no other case uses.
+        let id = format!("g-3558-service-{}", rand::random::<u64>());
+        assert!(super::first_sight_via_service(&id), "the first copy");
+        assert!(!super::first_sight_via_service(&id), "a copy of it");
+    }
+
+    /// #3558 — the via-service memory holds at most `MAX_REMEMBERED_GRANTS`
+    /// ids, and forgets the oldest first.
+    #[test]
+    fn the_via_service_memory_stays_within_its_bound() {
+        use super::MAX_REMEMBERED_GRANTS;
+
+        let now = std::time::Instant::now();
+        let mut seen = super::RememberedIds::new();
+        let ids = MAX_REMEMBERED_GRANTS + 50;
+        for i in 0..ids {
+            assert!(super::first_sight(&mut seen, &format!("g-{i}"), now));
+            assert!(seen.entries.len() <= MAX_REMEMBERED_GRANTS);
+        }
+        assert_eq!(seen.entries.len(), MAX_REMEMBERED_GRANTS);
+        assert!(
+            !super::first_sight(&mut seen, &format!("g-{}", ids - 1), now),
+            "the newest id is still remembered"
+        );
+        assert!(
+            super::first_sight(&mut seen, "g-0", now),
+            "the oldest was forgotten first"
+        );
+    }
+
+    /// #3558 — an id is remembered for the whole horizon, and forgotten once
+    /// it has passed.
+    #[test]
+    fn a_via_service_id_is_forgotten_after_the_horizon() {
+        use super::GRANT_ID_HORIZON;
+        use std::time::Duration;
+
+        let now = std::time::Instant::now();
+        let mut seen = super::RememberedIds::new();
+        assert!(super::first_sight(&mut seen, "g-h", now));
+        let inside = now + GRANT_ID_HORIZON - Duration::from_millis(1);
+        assert!(
+            !super::first_sight(&mut seen, "g-h", inside),
+            "still remembered just inside the horizon"
+        );
+        assert!(
+            super::first_sight(&mut seen, "g-h", now + GRANT_ID_HORIZON),
+            "forgotten once the horizon has passed"
         );
     }
 
@@ -5011,10 +5829,16 @@ mod tests {
             if pids.len() == reports {
                 break pids;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the shell never reported itself"
-            );
+            if std::time::Instant::now() >= deadline {
+                // #4444 — on Windows, where its line stopped.
+                #[cfg(windows)]
+                panic!(
+                    "the shell never reported itself\n{}",
+                    crate::exec::session_lifetime::where_a_command_stopped(&dir)
+                );
+                #[cfg(unix)]
+                panic!("the shell never reported itself");
+            }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
         let _ = std::fs::remove_dir_all(&dir);
@@ -5030,6 +5854,9 @@ mod tests {
     /// nothing, and it ran on for as long as the daemon lived.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_client_vanishing_ends_a_quiet_interactive_shell() {
+        // #4444 — one PowerShell `Start-Process` cell at a time.
+        #[cfg(windows)]
+        let _turn = crate::exec::session_lifetime::Turn::wait_async().await;
         let (session, channel, processes) = a_client_on_a_quiet_shell(47).await;
         drop(channel);
         drop(session);
@@ -5045,6 +5872,9 @@ mod tests {
     /// does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_client_closing_the_channel_ends_a_quiet_interactive_shell() {
+        // #4444 — one PowerShell `Start-Process` cell at a time.
+        #[cfg(windows)]
+        let _turn = crate::exec::session_lifetime::Turn::wait_async().await;
         let (session, channel, processes) = a_client_on_a_quiet_shell(48).await;
         channel.close().await.unwrap();
         for p in &processes {
@@ -5058,47 +5888,88 @@ mod tests {
 
     /// A shell without a terminal is refused with a reason rather than handed
     /// one it never asked for. Both platforms, one code path (P4b).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    ///
+    /// #4168 — read as success, the reason, exit-status 1, EOF and close, so
+    /// `ssh -T` prints the reason and exits 1, and no shell starts. One
+    /// thread, so the log is the server's.
+    #[tokio::test]
     async fn a_shell_without_a_pty_is_refused_with_a_reason() {
+        let log = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
         let (key, line) = client_key(41);
         let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
         let session = connect(addr, key).await;
 
-        let mut channel = session.channel_open_session().await.unwrap();
+        let channel = session.channel_open_session().await.unwrap();
         channel.request_shell(true).await.unwrap();
-
-        let mut refused = false;
-        let mut reason = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Failure => {
-                    refused = true;
-                    break;
-                }
-                russh::ChannelMsg::Success => panic!("a shell with no pty must not be accepted"),
-                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                    reason.extend_from_slice(data)
-                }
-                _ => {}
-            }
-        }
-        assert!(refused, "expected a channel failure");
-        assert!(
-            String::from_utf8_lossy(&reason).contains("terminal"),
-            "the refusal must explain itself, got {:?}",
-            String::from_utf8_lossy(&reason)
+        assert_refused_in_order(&read_in_order(channel).await, "terminal");
+        assert_refused_and_nothing_started(
+            &log.text(),
+            "shell",
+            "ssh: interactive session started",
         );
     }
 
     /// The identity gate applies to interactive sessions exactly as it does to
     /// one-shot commands: an unset key-list account mode means the client gets
-    /// a channel failure and a reason, not a root shell. Both platforms —
-    /// the refusal happens before any terminal is allocated.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// a reason, not a root shell. Both platforms — the refusal happens before
+    /// any terminal is allocated.
+    ///
+    /// #4168 — the shell is answered as `refuse` answers: success, the
+    /// reason, exit-status 1, EOF and close, so `ssh` prints the reason and
+    /// exits 1. Its log line is still the account-mode one, and no terminal
+    /// or shell starts. One thread, so the log is the server's.
+    #[tokio::test]
     async fn an_interactive_session_without_an_account_mode_gets_no_shell() {
+        let log = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
         let (key, line) = client_key(42);
         let addr = serve_one(&cfg_with_mode(vec![line], None)).await;
         let session = connect(addr, key).await;
+
+        let channel = session.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+
+        let reads = read_in_order(channel).await;
+        // `pty_request` only records the terminal; it is allocated when the
+        // shell starts, so this success allocates nothing.
+        assert_eq!(
+            reads.first(),
+            Some(&Read::Success),
+            "the terminal's answer, in {reads:?}"
+        );
+        assert_refused_in_order(&reads[1..], "ssh_account_mode");
+        let log = log.text();
+        assert!(
+            log.contains("ssh: refusing a shell — unusable account mode"),
+            "no account-mode refusal in:\n{log}"
+        );
+        for started in [
+            "ssh: interactive session started",
+            "ssh: could not start the terminal session",
+        ] {
+            assert!(
+                !log.contains(started),
+                "a refused shell got as far as {started:?}:\n{log}"
+            );
+        }
+    }
+
+    /// #4168 — a shell refused for its account mode holds its channel as a
+    /// `refuse` does. With a client window of 0 holding the close back, a
+    /// second shell, a command and `sftp` asked for on that channel are each
+    /// answered with a failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shell_refused_for_its_account_mode_takes_nothing_more() {
+        let (key, line) = client_key(161);
+        let addr = serve_one(&cfg_with_mode(vec![line], None)).await;
+        let no_window = russh::client::Config {
+            window_size: 0,
+            ..Default::default()
+        };
+        let session = connect_with(addr, key, no_window).await;
 
         let mut channel = session.channel_open_session().await.unwrap();
         channel
@@ -5106,28 +5977,31 @@ mod tests {
             .await
             .unwrap();
         channel.request_shell(true).await.unwrap();
-
-        let mut reason = Vec::new();
-        let mut out = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
-                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                    reason.extend_from_slice(data)
-                }
-                russh::ChannelMsg::Failure => break,
-                _ => {}
-            }
+        for what in ["the terminal's answer", "the shell's answer"] {
+            assert_eq!(
+                next_read_soon(&mut channel, what).await,
+                Some(Read::Success)
+            );
         }
-        assert!(
-            out.is_empty(),
-            "no shell output may reach a session with no account mode, got {:?}",
-            String::from_utf8_lossy(&out)
+        assert_eq!(
+            next_read_soon(&mut channel, "the shell's exit status").await,
+            Some(Read::Exit(1))
         );
-        assert!(
-            String::from_utf8_lossy(&reason).contains("ssh_account_mode"),
-            "the refusal must name the key to set, got {:?}",
-            String::from_utf8_lossy(&reason)
+
+        channel.request_shell(true).await.unwrap();
+        assert_eq!(
+            next_read_soon(&mut channel, "a second shell's answer").await,
+            Some(Read::Failure)
+        );
+        channel.exec(true, "whoami").await.unwrap();
+        assert_eq!(
+            next_read_soon(&mut channel, "a command's answer").await,
+            Some(Read::Failure)
+        );
+        channel.request_subsystem(true, "sftp").await.unwrap();
+        assert_eq!(
+            next_read_soon(&mut channel, "sftp's answer").await,
+            Some(Read::Failure)
         );
     }
 
@@ -5964,4 +6838,761 @@ mod tests {
             }
         }
     }
+
+    /// One connection carries several channels, and each channel's data, EOF,
+    /// window change and pty request act on that channel alone: never on a
+    /// process, a terminal or a pty request of another channel. At the end of
+    /// the file, so no line above moves.
+    mod channel_scope_tests {
+        use super::*;
+
+        /// How long a test waits for what a channel should say: long, because
+        /// a loaded runner starts PowerShell slowly. A channel that has not
+        /// said it by then fails the test.
+        const WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+        /// [`exec_slot`], for a test that runs `n` commands at once.
+        async fn exec_slots(n: u32) -> tokio::sync::SemaphorePermit<'static> {
+            EXEC_TEST_SLOTS
+                .acquire_many(n)
+                .await
+                .expect("the slot semaphore is never closed")
+        }
+
+        /// A key-list session that runs as the daemon's own account.
+        async fn a_connection(seed: u8) -> russh::client::Handle<TestClient> {
+            let (key, line) = client_key(seed);
+            let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+            connect(addr, key).await
+        }
+
+        /// A command that writes back its stdin once its stdin ends.
+        fn echo_stdin() -> &'static str {
+            if cfg!(windows) {
+                "[Console]::In.ReadToEnd()"
+            } else {
+                "cat"
+            }
+        }
+
+        /// `line` as typed at a terminal, Enter included.
+        fn typed(line: &str) -> Vec<u8> {
+            let enter = if cfg!(windows) { "\r\n" } else { "\n" };
+            format!("{line}{enter}").into_bytes()
+        }
+
+        /// A command the shell answers with `<tag>-42`. The terminal's echo
+        /// of the command itself never holds that, so a test that sees it
+        /// knows the shell ran the command.
+        fn computed(tag: &str) -> String {
+            if cfg!(windows) {
+                format!("echo {tag}-$(6*7)")
+            } else {
+                format!("echo {tag}-$((6*7))")
+            }
+        }
+
+        /// A command the shell answers with its terminal's size, as `tag`,
+        /// the size in [`size`]'s form, then `:END`.
+        fn size_query(tag: &str) -> String {
+            if cfg!(windows) {
+                format!(
+                    "echo (\"{tag}\" + [Console]::WindowWidth + \"x\" + \
+                     [Console]::WindowHeight + \":END\")"
+                )
+            } else {
+                format!("echo {tag}$(stty size):END")
+            }
+        }
+
+        /// A terminal's size as [`size_query`] reports it.
+        fn size(cols: u32, rows: u32) -> String {
+            if cfg!(windows) {
+                format!("{cols}x{rows}")
+            } else {
+                format!("{rows} {cols}")
+            }
+        }
+
+        /// A channel with a terminal of `cols` × `rows` and a shell on it.
+        async fn open_terminal(
+            session: &russh::client::Handle<TestClient>,
+            cols: u32,
+            rows: u32,
+        ) -> russh::Channel<russh::client::Msg> {
+            let channel = session.channel_open_session().await.unwrap();
+            channel
+                .request_pty(true, "xterm", cols, rows, 0, 0, &[])
+                .await
+                .unwrap();
+            channel.request_shell(true).await.unwrap();
+            channel
+        }
+
+        /// What a channel has said so far.
+        #[derive(Default)]
+        struct Heard {
+            out: Vec<u8>,
+            err: Vec<u8>,
+            exit: Option<u32>,
+            /// A request on it was answered with a failure.
+            failed: bool,
+            /// The server closed it.
+            ended: bool,
+        }
+
+        impl Heard {
+            fn out(&self) -> String {
+                String::from_utf8_lossy(&self.out).into_owned()
+            }
+
+            fn err(&self) -> String {
+                String::from_utf8_lossy(&self.err).into_owned()
+            }
+        }
+
+        /// Read `channel` into `heard` until `enough` holds, the channel ends,
+        /// or [`WITHIN`] passes. True if `enough` held.
+        async fn hear(
+            channel: &mut russh::Channel<russh::client::Msg>,
+            heard: &mut Heard,
+            enough: impl Fn(&Heard) -> bool,
+        ) -> bool {
+            let deadline = tokio::time::Instant::now() + WITHIN;
+            while !enough(heard) {
+                if heard.ended {
+                    return false;
+                }
+                match tokio::time::timeout_at(deadline, channel.wait()).await {
+                    Err(_) => return false,
+                    Ok(None) => heard.ended = true,
+                    Ok(Some(msg)) => match msg {
+                        russh::ChannelMsg::Data { ref data } => heard.out.extend_from_slice(data),
+                        russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                            heard.err.extend_from_slice(data)
+                        }
+                        russh::ChannelMsg::ExitStatus { exit_status } => {
+                            heard.exit = Some(exit_status)
+                        }
+                        russh::ChannelMsg::Failure => heard.failed = true,
+                        _ => {}
+                    },
+                }
+            }
+            true
+        }
+
+        /// What the shell printed after `tag`, up to `:END`. Only plain text
+        /// counts, so the terminal's echo of the typed command (`$(…)`,
+        /// quotes, colour codes) is never taken for the answer.
+        fn answer(text: &str, tag: &str) -> Option<String> {
+            text.match_indices(tag).find_map(|(at, _)| {
+                let rest = &text[at + tag.len()..];
+                let value = &rest[..rest.find(":END")?];
+                let plain = !value.is_empty()
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-'));
+                plain.then(|| value.to_string())
+            })
+        }
+
+        /// Ask the shell on `terminal` a [`size_query`] under `tag`, and read
+        /// its answer.
+        async fn size_of(
+            terminal: &mut russh::Channel<russh::client::Msg>,
+            heard: &mut Heard,
+            tag: &str,
+        ) -> Option<String> {
+            terminal.data(&typed(&size_query(tag))[..]).await.unwrap();
+            hear(terminal, heard, |h| answer(&h.out(), tag).is_some()).await;
+            answer(&heard.out(), tag)
+        }
+
+        /// End the shell on `terminal` and read the channel to its end.
+        async fn exit_shell(terminal: &mut russh::Channel<russh::client::Msg>, heard: &mut Heard) {
+            terminal.data(&typed("exit 0")[..]).await.unwrap();
+            hear(terminal, heard, |h| h.ended).await;
+        }
+
+        /// Two commands on one connection, each on a channel of its own: each
+        /// reads only its own channel's bytes, and only its own channel's EOF
+        /// ends its input.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn two_commands_on_one_connection_each_read_only_their_own_input() {
+            let _slots = exec_slots(2).await;
+            let session = a_connection(170).await;
+            let mut first = session.channel_open_session().await.unwrap();
+            let mut second = session.channel_open_session().await.unwrap();
+            first.exec(true, echo_stdin()).await.unwrap();
+            second.exec(true, echo_stdin()).await.unwrap();
+            first.data(&b"first-channel-bytes"[..]).await.unwrap();
+            second.data(&b"second-channel-bytes"[..]).await.unwrap();
+            first.eof().await.unwrap();
+
+            let mut heard = Heard::default();
+            hear(&mut first, &mut heard, |h| h.ended).await;
+            let out = heard.out();
+            assert!(
+                out.contains("first-channel-bytes"),
+                "the first command never read its own channel's bytes: {out:?}"
+            );
+            assert!(
+                !out.contains("second-channel"),
+                "the first command read the second channel's bytes: {out:?}"
+            );
+            assert_eq!(heard.exit, Some(0));
+
+            // The first channel's EOF was the first channel's: the second
+            // command still reads.
+            second.data(&b"-and-after"[..]).await.unwrap();
+            second.eof().await.unwrap();
+            let mut heard = Heard::default();
+            hear(&mut second, &mut heard, |h| h.ended).await;
+            let out = heard.out();
+            assert!(
+                out.contains("second-channel-bytes-and-after"),
+                "the second command's input ended before its own channel's EOF: {out:?}"
+            );
+            assert!(
+                !out.contains("first-channel"),
+                "the second command read the first channel's bytes: {out:?}"
+            );
+            assert_eq!(heard.exit, Some(0));
+        }
+
+        /// A forward beside a command on one connection: the forward's bytes
+        /// and its EOF reach the forward's destination and never the command,
+        /// which reads its own channel up to its own EOF.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_forwards_bytes_and_eof_reach_no_command_on_its_connection() {
+            use tokio::io::AsyncReadExt;
+
+            let _slot = exec_slot().await;
+            let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = destination.local_addr().unwrap().port();
+            let arrived = tokio::spawn(async move {
+                let (mut stream, _) = destination.accept().await.unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await.unwrap();
+                got
+            });
+            let (key, line) = client_key(171);
+            let mut cfg = cfg_with_mode(vec![line], Some("daemon"));
+            cfg.forward_acl = acl_allowing("127.0.0.1", port, port);
+            let session = connect(serve_one(&cfg).await, key).await;
+
+            let mut command = session.channel_open_session().await.unwrap();
+            command.exec(true, echo_stdin()).await.unwrap();
+            command.data(&b"command-bytes"[..]).await.unwrap();
+            let forward = session
+                .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 5555)
+                .await
+                .expect("the allowlist names the destination");
+            forward.data(&b"forward-bytes"[..]).await.unwrap();
+            forward.eof().await.unwrap();
+            let arrived = tokio::time::timeout(WITHIN, arrived)
+                .await
+                .expect("the forward's EOF reached its destination")
+                .unwrap();
+            assert_eq!(
+                arrived, b"forward-bytes",
+                "the forward carries its own bytes"
+            );
+
+            command.data(&b"-and-after"[..]).await.unwrap();
+            command.eof().await.unwrap();
+            let mut heard = Heard::default();
+            hear(&mut command, &mut heard, |h| h.ended).await;
+            let out = heard.out();
+            assert!(
+                !out.contains("forward-bytes"),
+                "the forward's bytes reached the command: {out:?}"
+            );
+            assert!(
+                out.contains("command-bytes-and-after"),
+                "the command's input ended before its own channel's EOF: {out:?}"
+            );
+            assert_eq!(heard.exit, Some(0));
+        }
+
+        /// A window change on another channel leaves a terminal its size, and
+        /// the terminal's own window change still resizes it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_window_change_on_another_channel_leaves_a_terminal_its_size() {
+            let session = a_connection(172).await;
+            let mut terminal = open_terminal(&session, 100, 30).await;
+            let other = session.channel_open_session().await.unwrap();
+            other.window_change(50, 10, 0, 0).await.unwrap();
+
+            let mut heard = Heard::default();
+            assert_eq!(
+                size_of(&mut terminal, &mut heard, "SIZE-A:").await,
+                Some(size(100, 30)),
+                "another channel's window change resized this terminal: {:?}",
+                heard.out()
+            );
+
+            // A console applies a resize on its own time, so this asks until
+            // the answer changes.
+            terminal.window_change(132, 43, 0, 0).await.unwrap();
+            let mut resized = None;
+            for attempt in 0..20 {
+                resized = size_of(&mut terminal, &mut heard, &format!("SIZE-B{attempt}:")).await;
+                if resized.is_none() || resized == Some(size(132, 43)) {
+                    break;
+                }
+            }
+            assert_eq!(
+                resized,
+                Some(size(132, 43)),
+                "the terminal's own window change did not resize it: {:?}",
+                heard.out()
+            );
+            exit_shell(&mut terminal, &mut heard).await;
+            assert_eq!(heard.exit, Some(0));
+        }
+
+        /// A pty request on another channel changes neither the request this
+        /// channel recorded nor the terminal its shell then starts on, and
+        /// that channel's own terminal is what it asked for.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_pty_request_on_another_channel_leaves_a_terminals_own_alone() {
+            let session = a_connection(173).await;
+            let mut first = session.channel_open_session().await.unwrap();
+            first
+                .request_pty(true, "xterm", 100, 30, 0, 0, &[])
+                .await
+                .unwrap();
+            let mut second = session.channel_open_session().await.unwrap();
+            second
+                .request_pty(true, "vt100", 60, 20, 0, 0, &[])
+                .await
+                .unwrap();
+            first.request_shell(true).await.unwrap();
+
+            let mut heard_first = Heard::default();
+            assert_eq!(
+                size_of(&mut first, &mut heard_first, "SIZE-A:").await,
+                Some(size(100, 30)),
+                "the first terminal started on the second channel's pty request: {:?}",
+                heard_first.out()
+            );
+            // A Windows console has no terminal type.
+            #[cfg(unix)]
+            {
+                first
+                    .data(&typed("echo TERM-A:$TERM:END")[..])
+                    .await
+                    .unwrap();
+                hear(&mut first, &mut heard_first, |h| {
+                    answer(&h.out(), "TERM-A:").is_some()
+                })
+                .await;
+                assert_eq!(
+                    answer(&heard_first.out(), "TERM-A:").as_deref(),
+                    Some("xterm"),
+                    "the first terminal took the second channel's terminal type: {:?}",
+                    heard_first.out()
+                );
+            }
+
+            second.request_shell(true).await.unwrap();
+            let mut heard_second = Heard::default();
+            assert_eq!(
+                size_of(&mut second, &mut heard_second, "SIZE-B:").await,
+                Some(size(60, 20)),
+                "the second terminal is not the one its channel asked for: {:?}",
+                heard_second.out()
+            );
+            #[cfg(unix)]
+            {
+                second
+                    .data(&typed("echo TERM-B:$TERM:END")[..])
+                    .await
+                    .unwrap();
+                hear(&mut second, &mut heard_second, |h| {
+                    answer(&h.out(), "TERM-B:").is_some()
+                })
+                .await;
+                assert_eq!(
+                    answer(&heard_second.out(), "TERM-B:").as_deref(),
+                    Some("vt100"),
+                    "the second terminal is not the type its channel asked for: {:?}",
+                    heard_second.out()
+                );
+            }
+
+            assert_eq!(
+                size_of(&mut first, &mut heard_first, "SIZE-C:").await,
+                Some(size(100, 30)),
+                "the second terminal's start changed the first: {:?}",
+                heard_first.out()
+            );
+            exit_shell(&mut second, &mut heard_second).await;
+            exit_shell(&mut first, &mut heard_first).await;
+            assert_eq!(heard_first.exit, Some(0));
+            assert_eq!(heard_second.exit, Some(0));
+        }
+
+        /// A shell on a channel that asked for no terminal is refused even
+        /// while another channel's pty request stands, and that request is
+        /// still there for its own channel's shell. Read whether the refusal
+        /// is a failure or the reason, an exit status and a close.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_shell_never_takes_another_channels_pty_request() {
+            let session = a_connection(174).await;
+            let mut terminal = session.channel_open_session().await.unwrap();
+            terminal
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            let mut bare = session.channel_open_session().await.unwrap();
+            bare.request_shell(true).await.unwrap();
+
+            let mut heard = Heard::default();
+            hear(&mut bare, &mut heard, |h| h.failed || !h.out.is_empty()).await;
+            assert!(
+                heard.out.is_empty(),
+                "a channel that asked for no terminal got a shell: {:?}",
+                heard.out()
+            );
+            assert!(
+                heard.err().contains("terminal"),
+                "the refusal must say why, got {:?}",
+                heard.err()
+            );
+
+            terminal.request_shell(true).await.unwrap();
+            let line = format!("{}; exit 0", computed("terminal-shell"));
+            terminal.data(&typed(&line)[..]).await.unwrap();
+            let mut heard = Heard::default();
+            hear(&mut terminal, &mut heard, |h| h.ended).await;
+            assert!(
+                heard.out().contains("terminal-shell-42"),
+                "the channel's own pty request no longer stood: {:?}",
+                heard.out()
+            );
+            assert_eq!(heard.exit, Some(0));
+        }
+
+        /// A second terminal on one connection is a terminal of its own: each
+        /// shell reads only the keystrokes typed on its own channel.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_second_terminal_on_one_connection_gets_input_of_its_own() {
+            let session = a_connection(175).await;
+            let mut first = open_terminal(&session, 80, 24).await;
+            let mut second = open_terminal(&session, 80, 24).await;
+            let line = format!("{}; exit 0", computed("first-terminal"));
+            first.data(&typed(&line)[..]).await.unwrap();
+            let line = format!("{}; exit 0", computed("second-terminal"));
+            second.data(&typed(&line)[..]).await.unwrap();
+
+            let mut heard_second = Heard::default();
+            hear(&mut second, &mut heard_second, |h| h.ended).await;
+            let out = heard_second.out();
+            assert!(
+                !out.contains("first-terminal"),
+                "the second terminal read the first's keystrokes: {out:?}"
+            );
+            assert!(
+                out.contains("second-terminal-42"),
+                "the second terminal never ran what was typed on it: {out:?}"
+            );
+            assert_eq!(heard_second.exit, Some(0));
+
+            let mut heard_first = Heard::default();
+            hear(&mut first, &mut heard_first, |h| h.ended).await;
+            let out = heard_first.out();
+            assert!(
+                !out.contains("second-terminal"),
+                "the first terminal read the second's keystrokes: {out:?}"
+            );
+            assert!(
+                out.contains("first-terminal-42"),
+                "the first terminal never ran what was typed on it: {out:?}"
+            );
+            assert_eq!(heard_first.exit, Some(0));
+        }
+
+        /// A terminal's EOF ends its input and nothing more: what was typed
+        /// before it still reaches the shell, which finishes by itself with
+        /// its own status.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_terminals_eof_leaves_its_shell_to_finish_by_itself() {
+            let session = a_connection(176).await;
+            let mut terminal = open_terminal(&session, 80, 24).await;
+            let line = format!("{}; exit 3", computed("typed-before-eof"));
+            terminal.data(&typed(&line)[..]).await.unwrap();
+            terminal.eof().await.unwrap();
+
+            let mut heard = Heard::default();
+            hear(&mut terminal, &mut heard, |h| h.ended).await;
+            assert!(
+                heard.out().contains("typed-before-eof-42"),
+                "what was typed before the EOF never ran: {:?}",
+                heard.out()
+            );
+            assert_eq!(heard.exit, Some(3), "the shell's own exit status");
+        }
+
+        /// The next answer to a request on `channel`, passing over what else
+        /// it carries; `None` once the channel has ended.
+        async fn next_answer(channel: &mut russh::Channel<russh::client::Msg>) -> Option<bool> {
+            let wait = async {
+                loop {
+                    match channel.wait().await? {
+                        russh::ChannelMsg::Success => return Some(true),
+                        russh::ChannelMsg::Failure => return Some(false),
+                        _ => {}
+                    }
+                }
+            };
+            tokio::time::timeout(WITHIN, wait)
+                .await
+                .expect("the server answers a request within the wait")
+        }
+
+        /// A channel opened as a forward takes no session request (RFC 4254
+        /// §6): a command, a terminal, a shell, a subsystem and a variable
+        /// asked for on it are each answered with a failure, nothing starts,
+        /// and the forward still carries its own bytes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_forward_takes_no_session_request() {
+            use tokio::io::AsyncReadExt;
+
+            let _slot = exec_slot().await;
+            let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = destination.local_addr().unwrap().port();
+            let arrived = tokio::spawn(async move {
+                let (mut stream, _) = destination.accept().await.unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await.unwrap();
+                got
+            });
+            let (key, line) = client_key(177);
+            let mut cfg = cfg_with_mode(vec![line], Some("daemon"));
+            cfg.forward_acl = acl_allowing("127.0.0.1", port, port);
+            let session = connect(serve_one(&cfg).await, key).await;
+            let marks = tempfile::tempdir().expect("a temp dir");
+            let ran = marks.path().join("ran");
+            let touch = if cfg!(windows) {
+                format!("Set-Content -LiteralPath '{}' -Value ran", ran.display())
+            } else {
+                format!(": > '{}'", ran.display())
+            };
+
+            let mut forward = session
+                .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 5555)
+                .await
+                .expect("the allowlist names the destination");
+            forward.exec(true, touch.as_str()).await.unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a command");
+            forward
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a terminal");
+            forward.request_shell(true).await.unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a shell");
+            forward.request_subsystem(true, "sftp").await.unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a subsystem");
+            forward.set_env(true, "ROOMLER_TEST", "1").await.unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a variable");
+
+            forward.data(&b"forward-bytes"[..]).await.unwrap();
+            forward.eof().await.unwrap();
+            let arrived = tokio::time::timeout(WITHIN, arrived)
+                .await
+                .expect("the forward's EOF reached its destination")
+                .unwrap();
+            assert_eq!(
+                arrived, b"forward-bytes",
+                "the forward carries its own bytes"
+            );
+            assert!(!ran.exists(), "a command asked for on the forward ran");
+        }
+    }
+
+    // ── #4325: the start-up line about the key list as a whole ────────────
+    //
+    // A server grant is tried before the list and needs no entry in it
+    // (`a_grant_admits_its_key_exactly_once` signs in with the list EMPTY),
+    // so the line says which sign-ins remain, never that every attempt is
+    // refused. Each case reads the line `Ctx::build` writes, level first.
+
+    /// What `f` logs, as the daemon's log file writes it.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// What the worker's server logs as it is built for `cfg`.
+    fn build_log(cfg: &crate::config::AgentConfig) -> String {
+        logged(|| {
+            super::sshd::Ctx::build(cfg, test_services()).expect("a usable host key");
+        })
+    }
+
+    /// The lines of `log` at `level` that name `ssh_authorized_keys`, trimmed,
+    /// so each reads `LEVEL message fields`.
+    fn key_list_lines<'a>(log: &'a str, level: &str) -> Vec<&'a str> {
+        log.lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with(level) && l.contains("ssh_authorized_keys"))
+            .collect()
+    }
+
+    /// The default: no break-glass key. A server grant still signs in, so the
+    /// line says that at INFO, and nothing about the list is a WARN.
+    #[test]
+    fn an_empty_key_list_says_only_server_grants_sign_in_at_info() {
+        let log = build_log(&cfg_with(Vec::new()));
+        assert_eq!(
+            key_list_lines(&log, "INFO"),
+            [
+                "INFO ssh: no break-glass key is set (ssh_authorized_keys is empty), so only \
+                 server grants (roomler ssh) can sign in"
+            ],
+            "the start line, at INFO:\n{log}"
+        );
+        assert_eq!(
+            key_list_lines(&log, "WARN"),
+            Vec::<&str>::new(),
+            "no WARN about the list:\n{log}"
+        );
+    }
+
+    /// Entries, and none parses: the operator meant to set a break-glass key
+    /// and none works. Each entry is still warned about by its index alone,
+    /// and the summary is a WARN that counts them.
+    #[test]
+    fn a_key_list_where_no_entry_parses_warns_with_the_count() {
+        // Shaped like a key, so the parse fails on the key data. Its comment
+        // must not reach the log: a malformed entry is still key material.
+        let bad = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL4325notakey i4325-entry-comment";
+        let cases = [
+            (
+                vec![bad.to_string()],
+                "WARN ssh: ssh_authorized_keys has 1 entry and it does not parse, so no \
+                 break-glass key works: only server grants (roomler ssh) can sign in",
+            ),
+            (
+                vec![bad.to_string(), "not a key".to_string()],
+                "WARN ssh: ssh_authorized_keys has 2 entries and none parses, so no \
+                 break-glass key works: only server grants (roomler ssh) can sign in",
+            ),
+        ];
+        for (entries, summary) in cases {
+            let n = entries.len();
+            let log = build_log(&cfg_with(entries));
+            let warns = key_list_lines(&log, "WARN");
+            assert_eq!(
+                warns
+                    .iter()
+                    .filter(|l| l.contains("ignoring an unparseable ssh_authorized_keys entry"))
+                    .count(),
+                n,
+                "one WARN per entry, as before:\n{log}"
+            );
+            assert!(
+                warns.contains(&summary),
+                "the summary WARN, counting {n}:\n{log}"
+            );
+            assert_eq!(key_list_lines(&log, "INFO"), Vec::<&str>::new(), "{log}");
+            assert!(
+                !log.contains("i4325-entry-comment"),
+                "an entry's text reached the log:\n{log}"
+            );
+        }
+    }
+
+    /// One key that parses: the list works as the fallback, so no summary is
+    /// added (`ssh: server ready` counts the keys), whatever else it holds.
+    #[test]
+    fn a_key_list_with_one_good_key_adds_no_summary_line() {
+        let (_, good) = client_key(43);
+        let log = build_log(&cfg_with_mode(vec![good.clone()], Some("console_user")));
+        assert_eq!(key_list_lines(&log, "WARN"), Vec::<&str>::new(), "{log}");
+        assert_eq!(key_list_lines(&log, "INFO"), Vec::<&str>::new(), "{log}");
+        assert!(log.contains("authorized_keys=1"), "{log}");
+
+        // Beside an entry that does not parse: that entry's own WARN only.
+        let log = build_log(&cfg_with_mode(
+            vec!["not a key".to_string(), good],
+            Some("console_user"),
+        ));
+        let warns = key_list_lines(&log, "WARN");
+        assert_eq!(warns.len(), 1, "{log}");
+        assert!(
+            warns[0].contains("ignoring an unparseable ssh_authorized_keys entry"),
+            "{log}"
+        );
+        assert!(log.contains("authorized_keys=1"), "{log}");
+    }
+}
+
+// ===========================================================================
+// #4325 — the start-up line about `ssh_authorized_keys` as a whole.
+// ===========================================================================
+
+/// The line `sshd::Ctx::build` logs about `ssh_authorized_keys` as a whole,
+/// at the level it is logged at.
+#[cfg(feature = "ssh-server")]
+enum KeyListLine {
+    Info(String),
+    Warn(String),
+}
+
+/// What `listed` entries, `usable` of which parse, leave able to sign in.
+/// A server grant is tried before the list and needs no entry in it
+/// (`auth_publickey`), so whatever the list holds, a grant still signs in.
+/// `None` adds no line: `ssh: server ready` counts the usable keys.
+#[cfg(feature = "ssh-server")]
+fn key_list_line(listed: usize, usable: usize) -> Option<KeyListLine> {
+    const ONLY_GRANTS: &str = "only server grants (roomler ssh) can sign in";
+    if usable > 0 {
+        return None;
+    }
+    Some(match listed {
+        // The default. Nobody asked for a break-glass key, so this is no
+        // warning.
+        0 => KeyListLine::Info(format!(
+            "ssh: no break-glass key is set (ssh_authorized_keys is empty), so {ONLY_GRANTS}"
+        )),
+        // Someone wrote these entries to have a break-glass key, and none
+        // works: they would find out when the server cannot mint grants, the
+        // one time that route is for. Each entry has its own WARN, from
+        // `Ctx::build`.
+        1 => KeyListLine::Warn(format!(
+            "ssh: ssh_authorized_keys has 1 entry and it does not parse, so no break-glass key \
+             works: {ONLY_GRANTS}"
+        )),
+        n => KeyListLine::Warn(format!(
+            "ssh: ssh_authorized_keys has {n} entries and none parses, so no break-glass key \
+             works: {ONLY_GRANTS}"
+        )),
+    })
 }

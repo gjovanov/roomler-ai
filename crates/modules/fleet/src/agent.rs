@@ -8,13 +8,13 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentStatus, ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind,
-    PeerRelayPolicy, SshPolicy,
+    AccessPolicy, Agent, AgentStatus, ConsentMode, EnrollingProgram, ExecPolicy,
+    ExternalAccessPolicy, InputMode, InstallInfo, LockOnEnd, OsKind, PeerRelayPolicy, SshPolicy,
 };
 use roomler_ai_services::auth::{AgentEnrollment, EnrollmentCredential, SpendPurpose};
 use roomler_ai_services::dao::base::{DaoError, PaginationParams};
@@ -22,7 +22,11 @@ use roomler_ai_services::dao::tenant::TenantDao;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
-use roomler_core::{ApiError, extractors::auth::AuthUser};
+use roomler_core::{
+    ApiError,
+    client_ip::{PeerAddr, client_ip_or_peer},
+    extractors::auth::AuthUser,
+};
 
 use crate::FleetState;
 
@@ -292,12 +296,37 @@ pub struct EnrollRequest {
     pub machine_id: String,
     pub machine_name: String,
     pub os: OsKind,
+    /// The version the ENROLLING program was built as, which need not be the
+    /// daemon's. #3565: it is never written as the row's version (only the
+    /// daemon's hello writes that). It is read only as the enrolling
+    /// program's version, and only when `enrolling_program` is absent (an
+    /// enroller from before that field). Still required here, as on every
+    /// older server, so every enroller keeps sending it.
     pub agent_version: String,
     /// FR-102 P3 — how the device was installed (`{method, scope, run}`).
     /// Additive: absent on every agent from before P3, which records as
     /// `unknown`. Clamped, never refused ([`InstallInfo::clamped`]).
     #[serde(default)]
     pub install: Option<InstallInfo>,
+    /// #3565 — the program that enrolled (`{name, version}`), stored on the
+    /// row as `enrolling_program`. Additive: absent from every enroller
+    /// before the field ([`Self::enrolling_program`]). Clamped, never
+    /// refused ([`EnrollingProgram::clamped`]).
+    #[serde(default)]
+    pub enrolling_program: Option<EnrollingProgram>,
+}
+
+impl EnrollRequest {
+    /// #3565 — the program that enrolled, as the row stores it: the request's
+    /// own field, clamped, or for an enroller from before that field,
+    /// `unknown` with the request's `agent_version`, which is that program's
+    /// own version.
+    pub fn enrolling_program(&self) -> EnrollingProgram {
+        match &self.enrolling_program {
+            Some(program) => program.clamped(),
+            None => EnrollingProgram::older_enroller(&self.agent_version),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -305,9 +334,10 @@ pub struct EnrollResponse {
     pub agent_id: String,
     pub tenant_id: String,
     pub agent_token: String,
-    /// FR-51 — true when this enrollment arrived on an ephemeral key: the
-    /// row will be reaped after its inactivity TTL, and re-enrolling later
-    /// creates a NEW device rather than reviving this one.
+    /// FR-51 — the ROW's nature, which the daemon records (#4331): true for a
+    /// row an ephemeral key made. Nothing after enrollment flips a row, and a
+    /// standard token never refreshes a live ephemeral one (409, #4352), so a
+    /// standard token's answer is false. Reaped on its TTL.
     pub ephemeral: bool,
 }
 
@@ -368,11 +398,16 @@ pub async fn enroll_agent(
     // unique index on the pair covers soft-deleted rows too, so the lookup
     // takes tombstones and the row comes back in place rather than a second
     // one being made. A LIVE row is refreshed and keeps everything; a REMOVED
-    // one comes back as a new device (`enroll_row`).
+    // one comes back as a new device (`enroll_row`). A LIVE EPHEMERAL row is
+    // refused (#4352), before the cap and the spend, as the cap is: the token
+    // stays usable for the retry once the device is removed.
     let existing = state
         .agents
         .find_by_tenant_and_machine(tid, &body.machine_id)
         .await?;
+    if let Some(row) = &existing {
+        refuse_live_ephemeral(row, false)?;
+    }
     // S5 — plan device cap. Only a NEW row consumes a slot; a known machine
     // rehydrates below regardless of the cap (re-enrolling your existing
     // fleet must never brick). Checked BEFORE the single-use claim on
@@ -420,7 +455,7 @@ pub async fn enroll_agent(
 
     let agent_id = agent
         .id
-        .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
     // FR-104 — which token enrolled this device, so an `anchor: true` token
     // can anchor exactly this one afterwards. Best-effort: a failure here
     // costs only that second use (the anchor then needs a fresh token).
@@ -459,7 +494,7 @@ pub async fn enroll_agent(
         agent_id: agent_id.to_hex(),
         tenant_id: tid.to_hex(),
         agent_token,
-        ephemeral: false,
+        ephemeral: agent.ephemeral,
     }))
 }
 
@@ -476,7 +511,10 @@ const ENROLL_ROUNDS: usize = 3;
 ///   read, the one the plan cap was checked against.
 /// * A live row: a device nobody removed enrolls again (a lost token, a
 ///   reinstall). It is refreshed and keeps everything it was allowed
-///   ([`AgentDao::rehydrate`], live-only).
+///   ([`AgentDao::rehydrate`], live-only). A live EPHEMERAL row is refused
+///   instead ([`refuse_live_ephemeral`], #4352), in every round: the route
+///   refused the row it read before the spend, and a later round's read
+///   answers the same 409.
 /// * A removed row: the machine id of a device its org removed. It comes back
 ///   as a NEW device ([`AgentDao::revive`], #3627): what the removed device was
 ///   allowed stays with the removal. First the holders drop what they hold
@@ -501,6 +539,9 @@ async fn enroll_row(
     body: &EnrollRequest,
     install: Option<InstallInfo>,
 ) -> Result<Agent, ApiError> {
+    // #3565: every branch stores the program that enrolled, and none writes
+    // the row's version, which is its daemon's own.
+    let program = body.enrolling_program();
     let mut row = existing;
     for round in 0..ENROLL_ROUNDS {
         match row.take() {
@@ -513,7 +554,7 @@ async fn enroll_row(
                         body.machine_name.clone(),
                         body.machine_id.clone(),
                         body.os,
-                        body.agent_version.clone(),
+                        program,
                         String::new(), // agent_token_hash unused in JWT-only scheme
                         install,
                     )
@@ -524,18 +565,13 @@ async fn enroll_row(
             // enrolls again from the start instead.
             None => break,
             Some(live) if live.deleted_at.is_none() => {
+                refuse_live_ephemeral(&live, true)?;
                 let id = live
                     .id
-                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                    .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
                 match state
                     .agents
-                    .rehydrate(
-                        id,
-                        &body.machine_name,
-                        body.os,
-                        &body.agent_version,
-                        install.as_ref(),
-                    )
+                    .rehydrate(id, &body.machine_name, body.os, &program, install.as_ref())
                     .await
                 {
                     Ok(agent) => return Ok(agent),
@@ -547,7 +583,7 @@ async fn enroll_row(
             Some(removed) => {
                 let id = removed
                     .id
-                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                    .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
                 if let Err(e) = state
                     .hooks
                     .agent_revived(tid, id, &removed.machine_id)
@@ -568,7 +604,7 @@ async fn enroll_row(
                         enroller,
                         body.machine_name.clone(),
                         body.os,
-                        body.agent_version.clone(),
+                        program.clone(),
                         install.clone(),
                     )
                     .await?
@@ -593,6 +629,30 @@ async fn enroll_row(
          at the same moment). Enroll it again with a new enrollment token."
             .to_string(),
     ))
+}
+
+/// #4352 — a standard token over a LIVE EPHEMERAL row: 409. A refresh would
+/// keep the row ephemeral ([`AgentDao::rehydrate`] never changes its kind), and
+/// the device, which records the row's kind (#4331), would remove it at its
+/// next stop: a person who meant to make it permanent would lose it at the
+/// next reboot. `spent` says whether the single-use token is spent already (a
+/// later round of [`enroll_row`]), which decides how the retry is worded.
+///
+/// [`AgentDao::rehydrate`]: roomler_ai_services::dao::agent::AgentDao::rehydrate
+fn refuse_live_ephemeral(row: &Agent, spent: bool) -> Result<(), ApiError> {
+    if row.deleted_at.is_some() || !row.ephemeral {
+        return Ok(());
+    }
+    let retry = if spent {
+        " with a new enrollment token."
+    } else {
+        ". This enrollment token was not used: it works until it expires."
+    };
+    Err(ApiError::Conflict(format!(
+        "This machine is enrolled in this organization as an ephemeral device, which removes \
+         itself when it stops, and a standard enrollment token cannot make it permanent. \
+         Remove the device on the Devices page first, then enroll it again{retry}"
+    )))
 }
 
 /// The grants a removed device still held, by name, for the line a revive
@@ -697,6 +757,8 @@ async fn enroll_agent_ephemeral(
 
     // FR-102 P3 — the same install claim as the standard path records.
     let install = body.install.as_ref().map(InstallInfo::clamped);
+    // #3565 — the same enrolling program too, and no version for the row.
+    let program = body.enrolling_program();
     let agent = match state
         .agents
         .create_ephemeral(
@@ -705,7 +767,7 @@ async fn enroll_agent_ephemeral(
             body.machine_name,
             body.machine_id,
             body.os,
-            body.agent_version,
+            program,
             key_id,
             key.ephemeral_ttl_secs,
             install,
@@ -724,7 +786,7 @@ async fn enroll_agent_ephemeral(
     };
     let agent_id = agent
         .id
-        .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("device missing _id".to_string()))?;
 
     // Control 4 — the per-use audit row: the record that outlives the device
     // row (which will hard-delete). Best-effort — the atomic claim above is
@@ -822,6 +884,384 @@ pub async fn self_renew(
     }))
 }
 
+/// FR-155 — what `POST /api/agent/self/rotate` takes.
+#[derive(Debug, Deserialize)]
+pub struct RotateRequest {
+    /// Base64 of 32 random bytes. The server keeps only its sha256, which
+    /// lets the device ask again for an answer that was lost.
+    pub rotation_key: String,
+}
+
+/// The rotation key's sha256 as lowercase hex, or `None` unless it is the
+/// standard base64 of exactly 32 bytes.
+fn rotation_key_sha256(rotation_key: &str) -> Option<String> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(rotation_key)
+        .ok()?;
+    (key.len() == 32).then(|| hex::encode(sha2::Sha256::digest(&key)))
+}
+
+/// A first commit waits this long after the device's last rotation.
+const ROTATION_INTERVAL_MS: i64 = 60 * 60 * 1000;
+
+/// What `POST /api/agent/self/rotate` answers when it mints nothing: an
+/// [`ApiError`], or 429 for a first call within the hour of the device's last
+/// rotation.
+#[derive(Debug)]
+pub enum RotateError {
+    Api(ApiError),
+    RateLimited,
+}
+
+impl From<ApiError> for RotateError {
+    fn from(e: ApiError) -> Self {
+        Self::Api(e)
+    }
+}
+
+impl axum::response::IntoResponse for RotateError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Api(e) => e.into_response(),
+            Self::RateLimited => (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "rate_limited",
+                    "message": "this device rotated its token less than an hour ago; try again later",
+                })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// One rotation decision's audit row: who asked, from where, with which
+/// generation. Every outcome of the route goes through [`Self::record`].
+struct RotationAudit<'a> {
+    state: &'a FleetState,
+    caller: crate::auth_agent::RotationCaller,
+    client_ip: Option<String>,
+}
+
+impl RotationAudit<'_> {
+    /// Best-effort: a failed write is logged and never changes the answer.
+    async fn record(&self, decision: &str, reason: Option<&str>, gen_to: Option<u32>) {
+        let event = roomler_ai_remote_control::models::TokenRotationAuditEvent {
+            id: None,
+            tenant_id: self.caller.tenant_id,
+            agent_id: self.caller.agent_id,
+            at: DateTime::now(),
+            decision: decision.to_string(),
+            reason: reason.map(str::to_string),
+            client_ip: self.client_ip.clone(),
+            gen_from: self.caller.generation,
+            gen_to,
+        };
+        if let Err(e) = self.state.token_rotation_audit.record(&event).await {
+            tracing::warn!(
+                agent_id = %self.caller.agent_id, decision, %e,
+                "fr-155: could not record the rotation decision"
+            );
+        }
+    }
+}
+
+/// POST /api/agent/self/rotate — FR-155: a device trades its agent token for
+/// one of the next generation, and a token of any generation below it is
+/// refused from then on (`generation_refusal`). Body
+/// `{"rotation_key": "<base64 of 32 random bytes>"}`; the answer is the
+/// renewal's shape, minted at G+1.
+///
+/// Admission is its own path (`auth_agent::authenticate_for_rotation`, then
+/// the row and `auth_agent::rotation_admission`). A token of the row's
+/// generation is a first call, committed by one conditional update
+/// (`AgentDao::rotate_token`): one rotation per generation, and at most one
+/// first rotation an hour per device (429 above it). A token one generation
+/// below, with the rotation key of the rotation that made the row's
+/// generation, asks again for an answer that was lost: it is minted at the
+/// row's generation, nothing else changes, and the hour does not apply.
+///
+/// 404 to a first call while `rc.agent_token_rotation` is off (a call asking
+/// again is answered either way, so switching it off never leaves a device
+/// without the answer to a rotation already made), and to every call while
+/// `rc.token_generation_check` is off. Each decision is audited
+/// (`token_rotation_audit`) with the caller's address and the generations.
+pub async fn self_rotate(
+    State(state): State<FleetState>,
+    headers: axum::http::HeaderMap,
+    PeerAddr(peer): PeerAddr,
+    body: Result<Json<RotateRequest>, JsonRejection>,
+) -> Result<Json<RenewedAgentToken>, RotateError> {
+    let client_ip = client_ip_or_peer(&headers, peer, state.settings.app.rate_limit_trusted_hops)
+        .map(|ip| ip.to_string());
+    let caller = crate::auth_agent::authenticate_for_rotation(&state, &headers);
+
+    // Before anything else, as renewal's switch is: a rotation that refuses
+    // nothing must never be recorded as done on a device.
+    if !state.settings.rc.token_generation_check {
+        if let Ok(caller) = caller {
+            let audit = RotationAudit {
+                state: &state,
+                caller,
+                client_ip,
+            };
+            audit
+                .record("unsupported", Some("token_generation_check"), None)
+                .await;
+        }
+        return Err(ApiError::NotFound(
+            "token rotation is switched off on this server".to_string(),
+        )
+        .into());
+    }
+    // A token that does not verify names no device: refused, with no row.
+    let caller = caller?;
+    let audit = RotationAudit {
+        state: &state,
+        caller,
+        client_ip,
+    };
+
+    // The row on the primary, tombstone included, so a removed device is told so.
+    let agent = match state
+        .agents
+        .find_any_in_tenant_on_the_primary(caller.tenant_id, caller.agent_id)
+        .await
+    {
+        Ok(agent) => agent,
+        Err(DaoError::NotFound) => {
+            audit.record("refused", Some("row_gone"), None).await;
+            return Err(ApiError::Unauthorized("no such device".to_string()).into());
+        }
+        Err(e) => return Err(ApiError::Internal(format!("device lookup: {e}")).into()),
+    };
+    if let Some(reason) = crate::auth_agent::refusal_reason(&agent) {
+        let code = if agent.deleted_at.is_some() {
+            "removed"
+        } else {
+            "quarantined"
+        };
+        audit
+            .record("refused", Some(code), Some(agent.token_gen))
+            .await;
+        return Err(ApiError::Unauthorized(reason.to_string()).into());
+    }
+
+    // The body, once the caller is known (#4187's order).
+    let key_sha256 = match body {
+        Err(rejection) => {
+            audit
+                .record("refused", Some("invalid_request"), Some(agent.token_gen))
+                .await;
+            return Err(ApiError::from(rejection).into());
+        }
+        Ok(Json(request)) => match rotation_key_sha256(&request.rotation_key) {
+            Some(hash) => hash,
+            None => {
+                audit
+                    .record("refused", Some("invalid_request"), Some(agent.token_gen))
+                    .await;
+                return Err(ApiError::BadRequest(
+                    "rotation_key must be the base64 of 32 bytes".to_string(),
+                )
+                .into());
+            }
+        },
+    };
+
+    let now = chrono::Utc::now();
+    match crate::auth_agent::rotation_admission(
+        caller.generation,
+        caller.exp,
+        now.timestamp(),
+        agent.token_gen,
+        agent.token_rotation.as_ref(),
+        &key_sha256,
+    ) {
+        crate::auth_agent::RotationAdmission::Replay => {
+            return answer_again(&state, &audit, &agent).await;
+        }
+        crate::auth_agent::RotationAdmission::Refused(refusal) => {
+            return refuse_rotation(&audit, refusal, agent.token_gen).await;
+        }
+        crate::auth_agent::RotationAdmission::First => {}
+    }
+    if !state.settings.rc.agent_token_rotation {
+        audit
+            .record(
+                "unsupported",
+                Some("agent_token_rotation"),
+                Some(agent.token_gen),
+            )
+            .await;
+        return Err(ApiError::NotFound(
+            "token rotation is switched off on this server".to_string(),
+        )
+        .into());
+    }
+    let Some(next_gen) = caller.generation.checked_add(1) else {
+        return refuse_rotation(
+            &audit,
+            crate::auth_agent::RotationRefusal::Generation,
+            agent.token_gen,
+        )
+        .await;
+    };
+
+    let ttl = state.settings.rc.agent_token_ttl_secs;
+    let expires = now + chrono::Duration::seconds(ttl as i64);
+    let rotation = roomler_ai_remote_control::models::TokenRotation {
+        generation: next_gen,
+        key_sha256,
+        at: DateTime::from_millis(now.timestamp_millis()),
+    };
+    let last_rotation_before = DateTime::from_millis(now.timestamp_millis() - ROTATION_INTERVAL_MS);
+    let committed = state
+        .agents
+        .rotate_token(
+            caller.tenant_id,
+            caller.agent_id,
+            caller.generation,
+            &rotation,
+            last_rotation_before,
+            expires.timestamp(),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("token rotation: {e}")))?;
+    if committed {
+        audit.record("first", None, Some(next_gen)).await;
+        let agent_token = state
+            .auth
+            .renew_agent_token(caller.agent_id, caller.tenant_id, next_gen, Some(ttl))
+            .map_err(ApiError::from)?;
+        let expires_at = expires.to_rfc3339();
+        tracing::info!(
+            tenant_id = %caller.tenant_id, agent_id = %caller.agent_id,
+            from = caller.generation, to = next_gen, %expires_at,
+            "fr-155: agent token rotated"
+        );
+        return Ok(Json(RenewedAgentToken {
+            agent_token,
+            expires_at,
+        }));
+    }
+
+    // The update matched nothing: read the row again, on the primary, and
+    // say why. The answer to a rotation made with this same key is given; a
+    // row that meets every condition of the update but the hour waits (429);
+    // anything else is refused.
+    let row = match state
+        .agents
+        .find_any_in_tenant_on_the_primary(caller.tenant_id, caller.agent_id)
+        .await
+    {
+        Ok(row) => row,
+        Err(DaoError::NotFound) => {
+            audit.record("refused", Some("row_gone"), None).await;
+            return Err(ApiError::Unauthorized("no such device".to_string()).into());
+        }
+        Err(e) => return Err(ApiError::Internal(format!("device lookup: {e}")).into()),
+    };
+    if let Some(reason) = crate::auth_agent::refusal_reason(&row) {
+        let code = if row.deleted_at.is_some() {
+            "removed"
+        } else {
+            "quarantined"
+        };
+        audit
+            .record("refused", Some(code), Some(row.token_gen))
+            .await;
+        return Err(ApiError::Unauthorized(reason.to_string()).into());
+    }
+    match crate::auth_agent::rotation_admission(
+        caller.generation,
+        caller.exp,
+        now.timestamp(),
+        row.token_gen,
+        row.token_rotation.as_ref(),
+        &rotation.key_sha256,
+    ) {
+        crate::auth_agent::RotationAdmission::Replay => answer_again(&state, &audit, &row).await,
+        crate::auth_agent::RotationAdmission::Refused(refusal) => {
+            refuse_rotation(&audit, refusal, row.token_gen).await
+        }
+        crate::auth_agent::RotationAdmission::First => {
+            let within_the_hour = row
+                .token_rotation
+                .as_ref()
+                .is_some_and(|last| last.at >= last_rotation_before);
+            if within_the_hour {
+                audit
+                    .record("rate_limited", None, Some(row.token_gen))
+                    .await;
+                tracing::info!(
+                    agent_id = %caller.agent_id, row_gen = row.token_gen,
+                    "fr-155: a first rotation within the hour of the last one waits"
+                );
+                return Err(RotateError::RateLimited);
+            }
+            // Every condition holds as read, yet the update matched nothing.
+            audit
+                .record("refused", Some("not_committed"), Some(row.token_gen))
+                .await;
+            tracing::warn!(
+                agent_id = %caller.agent_id, row_gen = row.token_gen,
+                "fr-155: the rotation's update matched nothing on a row that meets its conditions"
+            );
+            Err(ApiError::Unauthorized("the rotation was not committed".to_string()).into())
+        }
+    }
+}
+
+/// The answer to the row's last rotation, asked again: minted at the row's
+/// generation, and the row is not written.
+async fn answer_again(
+    state: &FleetState,
+    audit: &RotationAudit<'_>,
+    row: &Agent,
+) -> Result<Json<RenewedAgentToken>, RotateError> {
+    let ttl = state.settings.rc.agent_token_ttl_secs;
+    let agent_token = state
+        .auth
+        .renew_agent_token(
+            audit.caller.agent_id,
+            audit.caller.tenant_id,
+            row.token_gen,
+            Some(ttl),
+        )
+        .map_err(ApiError::from)?;
+    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(ttl as i64)).to_rfc3339();
+    audit.record("replay", None, Some(row.token_gen)).await;
+    tracing::info!(
+        tenant_id = %audit.caller.tenant_id, agent_id = %audit.caller.agent_id,
+        token_gen = row.token_gen, %expires_at,
+        "fr-155: the answer to the device's last rotation, asked again"
+    );
+    Ok(Json(RenewedAgentToken {
+        agent_token,
+        expires_at,
+    }))
+}
+
+/// A 401 for a token the rotation's admission does not admit, audited.
+async fn refuse_rotation(
+    audit: &RotationAudit<'_>,
+    refusal: crate::auth_agent::RotationRefusal,
+    row_gen: u32,
+) -> Result<Json<RenewedAgentToken>, RotateError> {
+    audit
+        .record("refused", Some(refusal.code()), Some(row_gen))
+        .await;
+    tracing::info!(
+        agent_id = %audit.caller.agent_id, reason = refusal.code(),
+        token_gen = audit.caller.generation, row_gen,
+        "fr-155: refusing a token rotation"
+    );
+    Err(ApiError::Unauthorized(refusal.message().to_string()).into())
+}
+
 /// POST /api/agent/self/unenroll — an EPHEMERAL device removes itself
 /// (FR-51 P3): the daemon calls this on SIGTERM/SIGINT so a clean stop
 /// reaps in seconds instead of on the inactivity deadline.
@@ -895,7 +1335,15 @@ pub struct AgentResponse {
     pub tags: Vec<String>,
     pub machine_id: String,
     pub os: OsKind,
+    /// The version the device's daemon reported in its hello, and `""` while
+    /// it has not reported one yet (#3565: an enrollment writes none). Kept a
+    /// string on the wire, so a client that reads it as one keeps working.
     pub agent_version: String,
+    /// #3565 — the program that enrolled the device, and its version
+    /// (`{name, version}`). Omitted for a row whose latest enrollment came
+    /// before the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enrolling_program: Option<EnrollingProgram>,
     /// FR-27 — the `roomler-desktop` version installed on the host, as the
     /// device last reported it. Omitted when there is none / it could not be
     /// read / the agent predates the field: the grid must not turn three
@@ -933,7 +1381,8 @@ pub struct AgentResponse {
     /// which is what showed green on dead sockets).
     pub is_online: bool,
     pub last_seen_at: String,
-    pub access_policy: AccessPolicy,
+    /// The device's [`AccessPolicy`], its ids as 24-hex strings (#4189).
+    pub access_policy: AccessPolicyView,
     /// Subnet-router CIDRs this agent advertises for the mesh (Phase 2). The
     /// `roomler socks5` mesh longest-prefix-matches a LAN target IP
     /// against these to pick the covering agent, which then dials the real
@@ -1036,6 +1485,56 @@ pub struct AgentResponse {
     pub peer_auth_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_auth_fingerprint: Option<String>,
+}
+
+/// A device's [`AccessPolicy`] as its detail and the device list answer it
+/// (#4189): `allowed_role_ids` and `allowed_user_ids` as 24-hex strings, where
+/// the model serialises bson's `{"$oid": …}`. Every other field is the
+/// model's, under the same key. A save sends this shape straight back: the
+/// request reads an [`AccessPolicy`], whose ids take the hex as well as
+/// `{"$oid": …}`, so the same ObjectIds are stored.
+#[derive(Debug, Serialize)]
+pub struct AccessPolicyView {
+    pub consent_mode: Option<ConsentMode>,
+    pub prompt_owner: Option<bool>,
+    pub allowed_role_ids: Vec<String>,
+    pub allowed_user_ids: Vec<String>,
+    pub auto_terminate_idle_minutes: Option<u32>,
+    pub input_mode: Option<InputMode>,
+    pub rc_overlay: Option<bool>,
+    pub rc_overlay_auto: Option<bool>,
+    pub lock_on_end: Option<LockOnEnd>,
+}
+
+impl From<AccessPolicy> for AccessPolicyView {
+    fn from(policy: AccessPolicy) -> Self {
+        // Every field by name: one added to the model stops this compiling,
+        // so it cannot reach the answer in its bson form unseen.
+        let AccessPolicy {
+            consent_mode,
+            prompt_owner,
+            allowed_role_ids,
+            allowed_user_ids,
+            auto_terminate_idle_minutes,
+            input_mode,
+            rc_overlay,
+            rc_overlay_auto,
+            lock_on_end,
+        } = policy;
+        let hex =
+            |ids: Vec<ObjectId>| -> Vec<String> { ids.into_iter().map(|id| id.to_hex()).collect() };
+        Self {
+            consent_mode,
+            prompt_owner,
+            allowed_role_ids: hex(allowed_role_ids),
+            allowed_user_ids: hex(allowed_user_ids),
+            auto_terminate_idle_minutes,
+            input_mode,
+            rc_overlay,
+            rc_overlay_auto,
+            lock_on_end,
+        }
+    }
 }
 
 /// FR-40 — one device's overlay-key rotation as the dashboard reads it:
@@ -1495,16 +1994,20 @@ pub fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, ApiError> {
     Ok(out)
 }
 
+/// `PUT /api/tenant/{tenant_id}/agent/{agent_id}`. `MANAGE_AGENTS` is decided
+/// before the body is read and before the device's id is (#4254): a caller
+/// without it gets the gate's answer whatever the body and the id are. A
+/// holder is answered a body that does not parse as the `Json` extractor
+/// answered it, whatever the id, since the extractor answered before any id
+/// was read. Only the org's id, which the gate needs, is parsed first.
 pub async fn update_agent(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    Json(body): Json<UpdateAgentRequest>,
+    body: Result<Json<UpdateAgentRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let aid = ObjectId::parse_str(&agent_id)
-        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     require_permission(
         &state,
@@ -1514,6 +2017,9 @@ pub async fn update_agent(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
+    let aid = ObjectId::parse_str(&agent_id)
+        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     // LIVE, before anything below writes (#1821): this handler used to go
     // straight to the setters, so a stale page holding a removed device's id
@@ -1670,7 +2176,8 @@ pub struct TriggerUpdateRequest {
     /// rollback, repro of an old build). FR-2: on 2026-08-27 a stale
     /// operator script pinned rc.484 at a fleet already on 0.4.1 and five
     /// hosts downgraded; the server is the one place that always knows both
-    /// versions at push time.
+    /// versions at push time. #3565: a pin to a row with no reported version
+    /// is refused unless this is set.
     #[serde(default)]
     pub force: bool,
 }
@@ -1710,10 +2217,31 @@ pub(crate) fn release_ord(v: &str) -> Option<(u64, u64, u64, u64)> {
 fn pin_downgrade(pin: &str, agent_version: &str) -> Option<String> {
     match (release_ord(pin), release_ord(agent_version)) {
         (Some(p), Some(c)) if p < c => Some(format!(
-            "pin {pin} is older than the agent's current {agent_version} — a stale pin \
-             would DOWNGRADE this device; pass force=true to do it deliberately"
+            "pin {pin} is older than this device's daemon version {agent_version} — a stale \
+             pin would DOWNGRADE this device; pass force=true to do it deliberately"
         )),
         _ => None,
+    }
+}
+
+/// The update push's check of a pin against the row, before anything is
+/// sent: `Some((refused_code, reason))` refuses the pin unless the caller
+/// forced it. `reported` is [`Agent::reported_version`].
+///
+/// #3565: a pin to a row with no reported version is refused unless it is
+/// forced (`version_unreported`). A row's version is its daemon's own, so a
+/// row has one from its daemon's first hello on. With a reported version,
+/// FR-2's guard decides (`pin_downgrade`).
+fn pin_refusal(pin: &str, reported: Option<&str>) -> Option<(&'static str, String)> {
+    match reported {
+        None => Some((
+            "version_unreported",
+            format!(
+                "this device has not reported its version yet, so a pin ({pin}) to it is \
+                 refused unless it is forced (force=true)"
+            ),
+        )),
+        Some(current) => pin_downgrade(pin, current).map(|reason| ("pin_downgrade", reason)),
     }
 }
 
@@ -1732,7 +2260,8 @@ pub struct TriggerUpdateResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
     /// FR-67 P7 — the refusal as a stable code a client branches on:
-    /// `pin_downgrade`, `primary_org` or `auto_update_off`.
+    /// `pin_downgrade`, `version_unreported` (#3565: a pin to a device that
+    /// has not reported its version yet), `primary_org` or `auto_update_off`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused_code: Option<&'static str>,
 }
@@ -1751,19 +2280,22 @@ fn device_refusal(
 /// POST /api/tenant/{tid}/agent/{agent_id}/update — push `rc:agent.update`
 /// to one agent. MANAGE_AGENTS. Pre-S1a agents ignore the unknown message
 /// (decode-and-drop, same contract as `rc:goodbye`).
+///
+/// The bit is decided before the body is read and before the device's id is
+/// (#4254): a caller without it gets the gate's answer whatever the body and
+/// the id are. A holder is answered a body that does not parse as the `Json`
+/// extractor answered it, whatever the id.
 pub async fn trigger_agent_update(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    // Body is required (send `{}` for defaults) — plain `Json` keeps us off
-    // axum 0.8's `OptionalFromRequest` surface, which the codebase doesn't
-    // use anywhere else.
-    Json(body): Json<TriggerUpdateRequest>,
+    // Body is required (send `{}` for defaults): a `Json`, not an
+    // `Option<Json<_>>`, so a request without one is refused as the
+    // extractor refuses it.
+    body: Result<Json<TriggerUpdateRequest>, JsonRejection>,
 ) -> Result<Json<TriggerUpdateResult>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let aid = ObjectId::parse_str(&agent_id)
-        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     require_permission(
         &state,
@@ -1773,15 +2305,19 @@ pub async fn trigger_agent_update(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
+    let aid = ObjectId::parse_str(&agent_id)
+        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     // Tenant-scope the target (404 for a foreign agent id) — LIVE, because an
     // update order for a removed device has nowhere to go (#1821).
     let agent = state.agents.find_live_in_tenant(tid, aid).await?;
 
     // FR-2: refuse a stale pin that would downgrade, unless forced.
+    // #3565: a pin to a row with no reported version is refused unless forced.
     if let Some(pin) = body.pin.as_deref()
         && !body.force
-        && let Some(reason) = pin_downgrade(pin, &agent.agent_version)
+        && let Some((_, reason)) = pin_refusal(pin, agent.reported_version())
     {
         return Err(ApiError::Conflict(reason));
     }
@@ -1834,19 +2370,24 @@ pub struct BulkTriggerUpdateResponse {
     pub requested: usize,
     pub delivered: usize,
     /// How many targets were skipped, each with its `refused` reason and
-    /// `refused_code`: FR-2's downgrade guard (0 when force or no pin), and
-    /// FR-67 P7's devices that said they would not act on the push.
+    /// `refused_code`: FR-2's downgrade guard and #3565's devices with no
+    /// reported version (both 0 when force or no pin), and FR-67 P7's
+    /// devices that said they would not act on the push.
     pub refused: usize,
 }
 
 /// POST /api/tenant/{tid}/agent/update — push `rc:agent.update` to selected
 /// (or all) agents in the tenant. MANAGE_AGENTS. Fleet-side stampede control
 /// is the agents' own 5-min install-storm cooldown + the release proxy cache.
+///
+/// The bit is decided before the body is read (#4254): a caller without it
+/// gets the gate's answer whatever the body is, and a holder is answered one
+/// that does not parse as the `Json` extractor answered it.
 pub async fn trigger_agents_update(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<BulkTriggerUpdateRequest>,
+    body: Result<Json<BulkTriggerUpdateRequest>, JsonRejection>,
 ) -> Result<Json<BulkTriggerUpdateResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -1859,10 +2400,12 @@ pub async fn trigger_agents_update(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
 
-    // (id, running version, the device's own refusal) — the FR-2 guard needs
-    // the version per target, FR-67 P7 what the device's hello said.
-    type Target = (ObjectId, String, Option<(&'static str, String)>);
+    // (id, reported version, the device's own refusal) — the FR-2 guard needs
+    // the version per target (#3565: `None` while the daemon has not reported
+    // one), FR-67 P7 what the device's hello said.
+    type Target = (ObjectId, Option<String>, Option<(&'static str, String)>);
     let targets: Vec<Target> = match body.agent_ids {
         Some(ids) if !ids.is_empty() => {
             let mut out = Vec::with_capacity(ids.len());
@@ -1873,7 +2416,7 @@ pub async fn trigger_agents_update(
                 // "all devices" arm below, which lists live rows only.
                 let a = state.agents.find_live_in_tenant(tid, aid).await?;
                 let refusal = device_refusal(&a.capabilities);
-                out.push((aid, a.agent_version, refusal));
+                out.push((aid, a.reported_version().map(str::to_string), refusal));
             }
             out
         }
@@ -1893,7 +2436,8 @@ pub async fn trigger_agents_update(
                 .into_iter()
                 .filter_map(|a| {
                     let refusal = device_refusal(&a.capabilities);
-                    a.id.map(|i| (i, a.agent_version, refusal))
+                    let version = a.reported_version().map(str::to_string);
+                    a.id.map(|i| (i, version, refusal))
                 })
                 .collect()
         }
@@ -1904,17 +2448,18 @@ pub async fn trigger_agents_update(
     let mut refused = 0usize;
     for (aid, version, device) in &targets {
         // FR-2: skip (never fail the batch) targets a stale pin would
-        // downgrade.
+        // downgrade. #3565: skip, unless forced, targets with no reported
+        // version.
         if let Some(pin) = body.pin.as_deref()
             && !body.force
-            && let Some(reason) = pin_downgrade(pin, version)
+            && let Some((code, reason)) = pin_refusal(pin, version.as_deref())
         {
             refused += 1;
             results.push(TriggerUpdateResult {
                 agent_id: aid.to_hex(),
                 delivered: false,
                 refused: Some(reason),
-                refused_code: Some("pin_downgrade"),
+                refused_code: Some(code),
             });
             continue;
         }
@@ -2047,6 +2592,8 @@ fn to_agent_response(
 ) -> AgentResponse {
     let id = a.id.map(|i| i.to_hex()).unwrap_or_default();
     let (presence, is_online) = derive_agent_presence(state, &a, redis_fresh);
+    // #3565: "" while the daemon has not reported a version.
+    let agent_version = a.reported_version().unwrap_or_default().to_string();
     // Resolved before the struct literal moves `capabilities`: the
     // remote-config state depends on which verbs this device advertises.
     let remote_config = remote_config_view(a.desired_config, a.config_report, &a.capabilities);
@@ -2077,7 +2624,8 @@ fn to_agent_response(
         tags: a.tags,
         machine_id: a.machine_id,
         os: a.os,
-        agent_version: a.agent_version,
+        agent_version,
+        enrolling_program: a.enrolling_program,
         companion_version: a.companion_version,
         keep_busy: a.keep_busy,
         power: a.power,
@@ -2087,7 +2635,7 @@ fn to_agent_response(
         ephemeral_ttl_secs: a.ephemeral_ttl_secs,
         is_online,
         last_seen_at: fmt_dt(a.last_seen_at),
-        access_policy: a.access_policy,
+        access_policy: a.access_policy.into(),
         routes: a.routes,
         advertised_routes: a.advertised_routes,
         capabilities: a.capabilities,
@@ -2505,7 +3053,7 @@ mod tests {
 
 #[cfg(test)]
 mod fr2_downgrade_guard_tests {
-    use super::{pin_downgrade, release_ord};
+    use super::{pin_downgrade, pin_refusal, release_ord};
 
     #[test]
     fn ordering_matches_the_agent_updater() {
@@ -2531,6 +3079,23 @@ mod fr2_downgrade_guard_tests {
         // "downgrade" about what it cannot compare.
         assert!(pin_downgrade("agent-vNEXT", "0.4.1").is_none());
         assert!(pin_downgrade("agent-v0.4.0", "custom-build").is_none());
+    }
+
+    /// #3565: a pin to a row with no reported version is refused unless it
+    /// is forced. With a reported version, FR-2's guard decides, under its
+    /// own code.
+    #[test]
+    fn a_pin_to_a_row_with_no_reported_version_is_refused() {
+        let (code, reason) = pin_refusal("agent-v0.4.215", None).expect("refused");
+        assert_eq!(code, "version_unreported");
+        assert!(reason.contains("not reported"), "{reason}");
+        assert!(reason.contains("force=true"), "{reason}");
+
+        assert_eq!(pin_refusal("agent-v0.4.1", Some("0.4.1")), None);
+        assert_eq!(
+            pin_refusal("agent-v0.4.0", Some("0.4.1")).map(|(code, _)| code),
+            Some("pin_downgrade")
+        );
     }
 }
 
@@ -2595,5 +3160,86 @@ mod enrollment_token_request_tests {
         );
         assert_eq!(read(Some("application/json"), "{}"), Some(false));
         assert_eq!(read(Some("application/json"), "{not json"), None, "a 400");
+    }
+}
+
+/// #4189 — the device answer's `access_policy` is the model field for field,
+/// but for its two id lists, which are 24-hex strings. A save sends that
+/// answer back, and the request reads it as the same policy.
+#[cfg(test)]
+mod access_policy_view_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn hex(ids: &[ObjectId]) -> Value {
+        ids.iter().map(|id| Value::String(id.to_hex())).collect()
+    }
+
+    /// What is wrong with the view of `policy`, if anything.
+    fn problems(what: &str, policy: AccessPolicy) -> Vec<String> {
+        let mut wrong = Vec::new();
+        let mut want = serde_json::to_value(&policy).expect("the model serialises");
+        want["allowed_role_ids"] = hex(&policy.allowed_role_ids);
+        want["allowed_user_ids"] = hex(&policy.allowed_user_ids);
+        let got = serde_json::to_value(AccessPolicyView::from(policy.clone()))
+            .expect("the view serialises");
+        if got != want {
+            wrong.push(format!(
+                "{what}: the view {got} is not the model with hex ids {want}"
+            ));
+        }
+        // The save: the answer, sent back as the request's `access_policy`.
+        match serde_json::from_value::<AccessPolicy>(got) {
+            Err(e) => wrong.push(format!("{what}: the answer does not read back: {e}")),
+            Ok(back) => {
+                let (back, before) = (
+                    serde_json::to_value(&back).expect("the model serialises"),
+                    serde_json::to_value(&policy).expect("the model serialises"),
+                );
+                if back != before {
+                    wrong.push(format!("{what}: it reads back as {back}, not {before}"));
+                }
+            }
+        }
+        wrong
+    }
+
+    #[test]
+    fn the_view_changes_nothing_but_the_ids_and_reads_back_as_the_same_policy() {
+        let every_field = AccessPolicy {
+            consent_mode: Some(ConsentMode::Push),
+            prompt_owner: Some(true),
+            allowed_role_ids: vec![ObjectId::new(), ObjectId::new()],
+            allowed_user_ids: vec![ObjectId::new()],
+            auto_terminate_idle_minutes: Some(30),
+            input_mode: Some(InputMode::Exclusive),
+            rc_overlay: Some(false),
+            rc_overlay_auto: Some(true),
+            lock_on_end: Some(LockOnEnd::Always),
+        };
+        let mut wrong = problems("every field set", every_field);
+        wrong.extend(problems("the default", AccessPolicy::default()));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}
+
+/// FR-133 P2e: one device's 409 shows this reason to the person who pinned
+/// (the bulk push shows its own words for the `pin_downgrade` code), so it
+/// names the device's daemon version, never "the agent's". A tag pin carries
+/// `agent-v`, the release tags' own spelling and an identity, so the test pins
+/// bare versions.
+#[cfg(test)]
+mod pin_downgrade_words_tests {
+    use super::pin_downgrade;
+
+    #[test]
+    fn the_downgrade_refusal_names_the_daemon_version() {
+        let reason = pin_downgrade("0.4.200", "0.4.237").expect("a downgrade");
+        assert_eq!(
+            reason,
+            "pin 0.4.200 is older than this device's daemon version 0.4.237 — a stale pin \
+             would DOWNGRADE this device; pass force=true to do it deliberately"
+        );
+        assert!(!reason.to_ascii_lowercase().contains("agent"), "{reason}");
     }
 }

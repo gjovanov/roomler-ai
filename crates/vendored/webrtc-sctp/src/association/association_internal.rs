@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod association_internal_test;
+#[cfg(test)]
+mod deadline_test; // roomler (FR-148 P4b-1)
 
 use async_trait::async_trait;
 use portable_atomic::AtomicBool;
@@ -50,6 +52,15 @@ pub struct AssociationInternal {
     cumulative_tsn_ack_point: u32,
     advanced_peer_tsn_ack_point: u32,
     use_forward_tsn: bool,
+    // roomler (FR-148 P4b-1, D55): a stream is marked deadline-limited
+    // (`mark_deadline_stream`); never cleared. Unset, every path is today's.
+    deadline_marked: bool,
+    // roomler (FR-148 P4b-1, D55): the last FORWARD TSN sent: the point it
+    // carried, and `my_next_tsn` when it went (`forward_tsn_due`).
+    last_forward_tsn: Option<(u32, u32)>,
+    // roomler (FR-148 P0, D43): the pacer; off unless a writer turns it on
+    // (`Association::pacer`), and then inert.
+    pacer: super::pacer::Pacer,
 
     // Congestion control parameters
     pub(crate) max_receive_buffer_size: u32,
@@ -162,6 +173,9 @@ impl AssociationInternal {
             cumulative_tsn_ack_point: tsn - 1,
             advanced_peer_tsn_ack_point: tsn - 1,
             use_forward_tsn: false,
+            deadline_marked: false,    // roomler (FR-148 P4b-1)
+            last_forward_tsn: None,    // roomler (FR-148 P4b-1)
+            pacer: Default::default(), // roomler (FR-148 P0, D43)
 
             max_receive_buffer_size,
             cwnd,
@@ -346,6 +360,18 @@ impl AssociationInternal {
     /// without this struct's lock.
     pub(crate) fn gauge_reader(&self) -> super::gauges::GaugeReader {
         self.pending_queue.gauge_reader()
+    }
+
+    /// roomler (FR-148 P0, D43): the pacer's switch, which `Association`
+    /// keeps to set without this struct's lock.
+    pub(crate) fn pace_switch(&self) -> super::pacer::PaceSwitch {
+        self.pacer.switch(Arc::clone(&self.awake_write_loop_ch))
+    }
+
+    /// roomler (FR-148 P0, D43): when the chunk the last send held for the
+    /// pacer may leave; `None` when it held none, and always while it is off.
+    pub(crate) fn take_pace_wake(&mut self) -> Option<tokio::time::Instant> {
+        self.pacer.take_wake()
     }
 
     /// roomler (FR-148 P0): the windows and the bytes in flight into the
@@ -563,6 +589,10 @@ impl AssociationInternal {
                 self.cumulative_tsn_ack_point,
             ) {
                 let fwd_tsn = self.create_forward_tsn();
+                // roomler (FR-148 P4b-1, D55): what `forward_tsn_due` compares
+                // the next SACK with, and the gauge.
+                self.last_forward_tsn = Some((fwd_tsn.new_cumulative_tsn, self.my_next_tsn));
+                self.pending_queue.gauges().on_forward_tsn();
                 let p = self.create_packet(vec![Box::new(fwd_tsn)]);
                 raw_packets.push(p);
             }
@@ -1099,6 +1129,73 @@ impl AssociationInternal {
         }
     }
 
+    /// roomler (FR-148 P4b-1, D55): marks stream `stream_identifier`
+    /// deadline-limited, for the deadline video channel: unordered with
+    /// `maxRetransmits: 0`, on carriers that deliver in order.
+    /// - Marking any stream makes the association serve ordered and unordered
+    ///   messages in the order they were written
+    ///   (`PendingQueue::set_arrival_order`).
+    /// - A chunk of a marked stream whose reliability is Rexmit 0 is abandoned
+    ///   when a SACK reports it missing, or when T3-rtx expires while it is
+    ///   out, not at its first send. It is never retransmitted, and its loss
+    ///   never halves the window. A FORWARD TSN covers only what is abandoned,
+    ///   and goes again only when it carries something new or was lost.
+    ///
+    /// The mark is never cleared. False when there is no such stream: nothing
+    /// is marked.
+    pub(crate) fn mark_deadline_stream(&mut self, stream_identifier: u16) -> bool {
+        let Some(s) = self.streams.get(&stream_identifier) else {
+            return false;
+        };
+        s.deadline.store(true, Ordering::SeqCst);
+        self.deadline_marked = true;
+        self.pending_queue.set_arrival_order();
+        log::debug!(
+            "[{}] stream {} marked deadline-limited",
+            self.name,
+            stream_identifier
+        );
+        true
+    }
+
+    /// roomler (FR-148 P4b-1, D55): abandons each deadline chunk that SACK `d`
+    /// reports missing: not acknowledged, below the highest TSN it
+    /// acknowledges. One report is enough on the in-order carriers the
+    /// deadline channel runs on. The abandoned flag is the message's, so its
+    /// other fragments go with it.
+    fn abandon_deadline_chunks_reported_missing(&self, d: &ChunkSelectiveAck) {
+        let Some(highest) = d.gap_ack_blocks.iter().map(|g| g.end).max() else {
+            return; // no gap, nothing reported missing
+        };
+        let highest = d.cumulative_tsn_ack.wrapping_add(u32::from(highest));
+        let mut tsn = self.cumulative_tsn_ack_point.wrapping_add(1);
+        while sna32lt(tsn, highest) {
+            let Some(c) = self.inflight_queue.get(tsn) else {
+                break;
+            };
+            if !c.acked && abandons_on_loss(&self.streams, self.use_forward_tsn, c) {
+                c.set_abandoned(true);
+                log::trace!("[{}] abandoned on loss: tsn={}", self.name, tsn);
+            }
+            tsn = tsn.wrapping_add(1);
+        }
+    }
+
+    /// roomler (FR-148 P4b-1, D55): on an association with a deadline stream,
+    /// whether rule C3 sends a FORWARD TSN on SACK `d`: when it carries a new
+    /// point, or when `d` reports a chunk sent after the last one went, which
+    /// on the in-order carriers the channel runs on means that one was lost.
+    /// Today every SACK sends one while the point is ahead of the peer's,
+    /// though the last is still on its way. T3-rtx still sends one (A5).
+    fn forward_tsn_due(&self, d: &ChunkSelectiveAck) -> bool {
+        let Some((point, next)) = self.last_forward_tsn else {
+            return true;
+        };
+        let highest = d.gap_ack_blocks.iter().map(|g| g.end).max().unwrap_or(0);
+        let highest = d.cumulative_tsn_ack.wrapping_add(u32::from(highest));
+        point != self.advanced_peer_tsn_ack_point || sna32gte(highest, next)
+    }
+
     /// create_stream creates a stream. The caller should hold the lock and check no stream exists for this id.
     fn create_stream(&mut self, stream_identifier: u16, accept: bool) -> Option<Arc<Stream>> {
         let s = Arc::new(Stream::new(
@@ -1316,6 +1413,9 @@ impl AssociationInternal {
         if let Some((_, since)) = newest_sent_once {
             if let Ok(delay) = SystemTime::now().duration_since(since) {
                 self.pending_queue.gauges().on_ack_delay(delay);
+                // roomler (FR-148 P0, D43): the pacer's round trip, kept only
+                // while it is on.
+                self.pacer.on_rtt(delay);
             }
         }
 
@@ -1431,7 +1531,12 @@ impl AssociationInternal {
             let mut tsn = cum_tsn_ack_point + 1;
             while sna32lt(tsn, max_tsn) {
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    if !c.acked && !c.abandoned() && c.miss_indicator < 3 {
+                    // roomler (FR-148 P4b-1, D55): a deadline chunk's miss
+                    // abandons it instead, so it never counts toward fast
+                    // recovery (`abandon_deadline_chunks_reported_missing`).
+                    let deadline = self.deadline_marked
+                        && abandons_on_loss(&self.streams, self.use_forward_tsn, c);
+                    if !c.acked && !c.abandoned() && c.miss_indicator < 3 && !deadline {
                         c.miss_indicator += 1;
                         if c.miss_indicator == 3 && !self.in_fast_recovery {
                             // 2)  If not in Fast Recovery, adjust the ssthresh and cwnd of the
@@ -1553,6 +1658,12 @@ impl AssociationInternal {
             self.rwnd = d.advertised_receiver_window_credit - bytes_outstanding;
         }
 
+        // roomler (FR-148 P4b-1, D55): a deadline chunk this SACK reports
+        // missing is abandoned before the miss indications and rules C1 to C3.
+        if self.deadline_marked {
+            self.abandon_deadline_chunks_reported_missing(d);
+        }
+
         self.process_fast_retransmission(d.cumulative_tsn_ack, htna, cum_tsn_ack_point_advanced)?;
 
         if self.use_forward_tsn {
@@ -1575,10 +1686,13 @@ impl AssociationInternal {
             }
 
             // RFC 3758 Sec 3.5 C3
+            // roomler (FR-148 P4b-1, D55): with a deadline stream, only when
+            // `forward_tsn_due`.
             if sna32gt(
                 self.advanced_peer_tsn_ack_point,
                 self.cumulative_tsn_ack_point,
-            ) {
+            ) && (!self.deadline_marked || self.forward_tsn_due(d))
+            {
                 self.will_send_forward_tsn = true;
                 log::debug!(
                     "[{}] handleSack {}: sna32GT({}, {})",
@@ -2004,6 +2118,12 @@ impl AssociationInternal {
         let mut chunks = vec![];
         let mut sis_to_reset = vec![]; // stream identifiers to reset
 
+        // roomler (FR-148 P0, D43): whether the pacer gates this send's new
+        // data. Off, false, and nothing below changes.
+        let paced = self
+            .pacer
+            .begin(tokio::time::Instant::now(), self.cwnd, self.ssthresh);
+
         if self.pending_queue.len() == 0 {
             return (chunks, sis_to_reset);
         }
@@ -2043,6 +2163,18 @@ impl AssociationInternal {
                 break; // no more rwnd
             }
 
+            // roomler (FR-148 P0, D43): new data waits for the pacer's tokens
+            // while it is on, and while in flight is at or above the cap its
+            // writer set; the write loop wakes when the tokens come, or at the
+            // next SACK.
+            if paced
+                && !self
+                    .pacer
+                    .admit(data_len, self.inflight_queue.get_num_bytes())
+            {
+                break;
+            }
+
             self.rwnd -= data_len as u32;
 
             if let Some(chunk) = self
@@ -2063,6 +2195,11 @@ impl AssociationInternal {
                     .move_pending_data_chunk_to_inflight_queue(beginning_fragment, unordered)
                     .await
                 {
+                    // roomler (FR-148 P0, D43): the probe never waits for the
+                    // pacer, which counts its bytes.
+                    if paced {
+                        self.pacer.spend(chunk.user_data.len());
+                    }
                     chunks.push(chunk);
                 }
             }
@@ -2127,7 +2264,9 @@ impl AssociationInternal {
             let reliability_value = s.reliability_value.load(Ordering::SeqCst);
 
             if reliability_type == ReliabilityType::Rexmit {
-                if c.nsent >= reliability_value {
+                // roomler (FR-148 P4b-1, D55): a deadline stream's chunk is
+                // abandoned on loss instead, never at its send.
+                if c.nsent >= reliability_value && !(self.deadline_marked && s.abandons_on_loss()) {
                     c.set_abandoned(true);
                     log::trace!(
                         "[{}] marked as abandoned: tsn={} ppi={} (remix: {})",
@@ -2375,6 +2514,22 @@ impl AssociationInternal {
     }
 }
 
+/// roomler (FR-148 P4b-1, D55): whether `c` is abandoned on loss instead of at
+/// its first send (`Stream::abandons_on_loss`). Without FORWARD TSN nothing is
+/// abandoned, and a DCEP message is always reliable, as
+/// `check_partial_reliability_status` has it.
+fn abandons_on_loss(
+    streams: &HashMap<u16, Arc<Stream>>,
+    use_forward_tsn: bool,
+    c: &ChunkPayloadData,
+) -> bool {
+    use_forward_tsn
+        && c.payload_type != PayloadProtocolIdentifier::Dcep
+        && streams
+            .get(&c.stream_identifier)
+            .is_some_and(|s| s.abandons_on_loss())
+}
+
 #[async_trait]
 impl AckTimerObserver for AssociationInternal {
     async fn on_ack_timeout(&mut self) {
@@ -2475,6 +2630,17 @@ impl RtxTimerObserver for AssociationInternal {
                     self.inflight_queue.get_num_bytes()
                 );
 
+                // roomler (FR-148 P4b-1, D55): a deadline chunk out at the
+                // expiry is abandoned, not marked for retransmission, so the
+                // FORWARD TSN below covers it.
+                if self.deadline_marked {
+                    for c in self.inflight_queue.chunk_map.values() {
+                        if !c.acked && abandons_on_loss(&self.streams, self.use_forward_tsn, c) {
+                            c.set_abandoned(true);
+                        }
+                    }
+                }
+
                 // RFC 3758 sec 3.5
                 //  A5) Any time the T3-rtx timer expires, on any destination, the sender
                 //  SHOULD try to advance the "Advanced.Peer.Ack.Point" by following
@@ -2514,7 +2680,16 @@ impl RtxTimerObserver for AssociationInternal {
                     self.ssthresh
                 );
 
-                self.inflight_queue.mark_all_to_retrasmit();
+                if self.deadline_marked {
+                    // roomler (FR-148 P4b-1, D55): never a deadline chunk,
+                    // whose message may still have fragments to send.
+                    let (streams, use_forward_tsn) = (&self.streams, self.use_forward_tsn);
+                    self.inflight_queue.mark_all_to_retransmit_except(|c| {
+                        abandons_on_loss(streams, use_forward_tsn, c)
+                    });
+                } else {
+                    self.inflight_queue.mark_all_to_retrasmit();
+                }
                 self.awake_write_loop();
             }
 

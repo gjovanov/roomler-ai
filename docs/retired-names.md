@@ -52,7 +52,7 @@ flowchart TD
 |---|---|---|---|
 | **ANCHOR** | `RETIRED-NAME-ANCHOR` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | code that resolves, matches or writes the retired name at runtime — a read-fallback over a pre-rename tree, a sweep that deletes the old unit, a wire value a deployed peer still sends | `anchors` must equal the baseline in both directions (`:563`, `:581`): a deleted anchor and a stale floor both fail |
 | **RECORD** | `RETIRED-NAME-RECORD` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | prose and fixtures that name the retired thing *in order to explain it* — a field log quoting real output, a migration note, the table above | `records` must equal the baseline in both directions (`:595`) |
-| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:609`); the `name-audit` job in `.github/workflows/ci.yml:2806` runs it on every PR (`:2848`) |
+| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:609`); the `name-audit` job in `.github/workflows/ci.yml:2816` runs it on every PR (`:2858`) |
 
 🔑 **The falsifiable rule**: *if deleting the live code would also delete this
 occurrence, it is an ANCHOR; if the occurrence would survive, it is a RECORD.*
@@ -70,7 +70,7 @@ comment would otherwise have exempted the regression.
 Both counts move only with `scripts/name-audit.sh --update-baseline`, committed
 in the same PR, whose body says which anchor retired (and which field state no
 longer exists) or which record was added (and what it records). The CI job
-prints the summary beside its verdict (`ci.yml:2851`), so a reviewer can diff
+prints the summary beside its verdict (`ci.yml:2861`), so a reviewer can diff
 the number against the claim. A marker that covers nothing fails `--check`
 (`:555`): an empty exemption is the one that silently widens.
 
@@ -83,8 +83,8 @@ on a *condition*, each one named:
 
 | Class | Site | Goes when |
 |---|---|---|
-| appdirs read-fallback | `crates/agent-core/src/appdirs.rs:525`, `:591` | **kept on purpose** — `migrate_legacy_trees` skips whenever the desktop companion is running, and the daemon respawns that companion, so on a GUI host the fallback is the *primary* path, not a safety net |
-| already-published release assets | `agents/roomlerd/src/updater.rs:806`, `agents/roomler-cli/src/update.rs:391` | no picker matches them. The daemon lane has published `roomlerd-*` since 0.4.38 (field-proven across the rename on 0.4.40). The **tunnel lane still publishes the retired prefix** (`.github/workflows/release-tunnel.yml:165`), and the CLI's updater refuses a tarball whose inner directory is not that spelling — so that rename is its own two-release migration: a CLI that accepts both first, the rename once no tunnel-only host runs an older one |
+| appdirs read-fallback | `crates/agent-core/src/appdirs.rs:811`, `:877` | **kept on purpose** — `migrate_legacy_trees` skips whenever the desktop companion is running, and the daemon respawns that companion, so on a GUI host the fallback is the *primary* path, not a safety net. The one-time move converges (#3746): a data folder whose move failed, or whose new folder was already there, is merged into the new one at a later start; of a name both hold, the copy modified last keeps the name and the other is kept beside it as `<name>.older`, nothing overwritten ([installation.md](installation.md#where-a-step-on-the-service-account-finds-its-folders-3702), *How the folder move runs*) |
+| already-published release assets | `agents/roomlerd/src/updater.rs:808`, `agents/roomler-cli/src/update.rs:395` | no picker matches them. The daemon lane has published `roomlerd-*` since 0.4.38 (field-proven across the rename on 0.4.40). The **tunnel lane still publishes the retired prefix** (`.github/workflows/release-tunnel.yml:178`), and that rename is its own two-release migration (FR-46 P1c): the CLI's updater took a tarball only under that spelling of its inner directory, and since step 1 it takes both, the current one first; the rename waits until no tunnel-only host runs a CLI older than step 1 |
 | sweeps that delete the old thing | `agents/roomlerd/src/win_service/mod.rs:105`, `agents/roomlerd/packaging/macos/postinstall`, `scripts/install.sh --uninstall` | no host can still have the thing swept — a sweep must *name* what it removes |
 | MSI installer identity | the WiX FileKeys, the Component and Feature Ids and the UpgradeCodes | a major-upgrade decision, not a rename. The ProductName (what Apps & Features lists) was only ever a display name, since an upgrade matches the UpgradeCode: FR-133 P1 renamed it |
 | the Apps & Features names from before FR-133 P1 | `scripts/install.ps1:109`, `agents/roomlerd/scripts/m3-a1-verify-win11.ps1:387` | no machine still carries an install from before P1: its next update replaces the entry, under the new name |
@@ -137,6 +137,25 @@ its memory limit — an 80-second read outage, self-healed.
 | a sweep rewrote an anchor's own explanation | the sentence saying a name must not be rewritten had it rewritten; the count went *down*, which reads as progress | no guard can verify a prose claim — read the anchor |
 | a span marker inside a BEGIN/END region | never staleness-checked; four kept claiming the bundle was TCC-frozen a phase after it moved | none, by decision: inside a region an inner marker is decorative |
 
+## The sister guard: the word "agent" (FR-133)
+
+The `name-audit` job runs a second guard as its last step (`.github/workflows/ci.yml:2864`):
+`scripts/says-roomlerd.cjs`, FR-133 P4's. It hunts a retired *word*, not a retired name: nothing a
+person reads calls the daemon an "agent", except the wire and OS identities FR-133 keeps, each
+listed in the script with its reason. It has this page's shape (one script, a committed baseline
+that only `--update-baseline` moves, an inline marker that must carry a reason and fails when it
+covers nothing), with two differences: it counts per file rather than per marker, and a PR that
+only removes hits never fails. It reads the text a person can meet in each kind of file (string
+literals, a page's text, installer output, package metadata), never comments or log lines. How it
+reads and the baseline per surface: [FR-133 § The guard (P4)](fr/FR-133-roomlerd-not-agent.md#the-guard-p4).
+
+| | `scripts/name-audit.sh` | `scripts/says-roomlerd.cjs` |
+|---|---|---|
+| hunts | the retired names (`name-audit.sh:142`) | the word "agent" in text a person reads |
+| reads | every tracked file holding a name or a marker | the person-facing surfaces, a reader per kind of file |
+| marker | `RETIRED-NAME-ANCHOR` / `-RECORD`, colon required | `AGENT-WORD-KEPT`, colon and a reason required |
+| baseline | anchors and records pinned both ways | a count per file; only a rise fails |
+
 ## Reserved after FR-90 was parked (FR-137)
 
 FR-90 (Hive: agent sessions, the vault, knowhow) is parked on
@@ -151,11 +170,11 @@ build and no test. It surfaces in the field. Before you add a permission bit, an
 |---|---|---|---|
 | Role bits 32–34 (`HIVE_RUN`, `KNOWHOW_VIEW`, `KNOWHOW_EDIT`), reserved | [permissions.md](permissions.md#reserved-bits-32-34-fr-137) | `RESERVED` (`crates/db/src/models/role.rs:122`) | never (D1): stored roles hold them, and the reconcile only adds |
 | FR-90's collections (13 in production, 48 indexes), with their TTLs still running | [data-model.md](data-model.md#parked-fr-90-data-fr-137) | nothing: no code reads or writes them | the operator decides (D2) |
-| The 21 `RpcCap` spellings, the tag families `rc:hive.` · `rc:vault.` · `rc:knowhow.`, the user socket's `hive:` and the module ids `hive` · `vault` · `knowhow` | [real-time.md](real-time.md#the-rc-plane-agents-tunnel-clients-controllers), the `rc:*` table | `RETIRED_RPC_VERBS` and its siblings (`crates/remote_control/src/models.rs:1186`) | never |
-| A 0.4.199 peer's `RMHIVE01` DERP frame, dropped and counted first | [overlay-nat-traversal.md](overlay-nat-traversal.md#path-selection-the-two-plane-pathmonitor-cc1-lives-on) | `HIVE_MAGIC` (`crates/tunnel-core/src/transport/derp.rs:166`) | no deployed agent can send it: past the rollback reach of the last release that compiled Hive |
-| `ssh_ticket` on `rc:ssh.request`, refused, and the deny reasons `ticket_refused` · `session_not_allowed` · `target_too_old` | [roomler-ssh.md](roomler-ssh.md#what-parked-agent-sessions-left-behind-fr-137) | `crates/remote_control/src/signaling.rs:858`, `models.rs:5163` | the field: when the last ≤0.4.199 agent is gone (D8). The reasons: no sooner than 90 days after P1's roll (D7) |
+| The 21 `RpcCap` spellings, the tag families `rc:hive.` · `rc:vault.` · `rc:knowhow.`, the user socket's `hive:` and the module ids `hive` · `vault` · `knowhow` | [real-time.md](real-time.md#the-rc-plane-agents-tunnel-clients-controllers), the `rc:*` table | `RETIRED_RPC_VERBS` and its siblings (`crates/remote_control/src/models.rs:1297`) | never |
+| A 0.4.199 peer's `RMHIVE01` DERP frame, dropped and counted first | [overlay-nat-traversal.md](overlay-nat-traversal.md#path-selection-the-two-plane-pathmonitor-cc1-lives-on) | `HIVE_MAGIC` (`crates/tunnel-core/src/transport/derp.rs:171`) | no deployed agent can send it: past the rollback reach of the last release that compiled Hive |
+| `ssh_ticket` on `rc:ssh.request`, refused, and the deny reasons `ticket_refused` · `session_not_allowed` · `target_too_old` | [roomler-ssh.md](roomler-ssh.md#what-parked-agent-sessions-left-behind-fr-137) | `crates/remote_control/src/signaling.rs:858`, `models.rs:5305` | the field: when the last ≤0.4.199 agent is gone (D8). The reasons: no sooner than 90 days after P1's roll (D7) |
 | `net_grant` on `rc:tunnel.open`, refused | [tunnels.md](tunnels.md#a-retired-agent-session-grant-is-refused-fr-137) | `NET_GRANT_REFUSED` (`signaling.rs:102`), the field at `:1380` | when the last ≤0.4.199 agent is gone (D8) |
-| The 23 agent-config keys (`hive_*`, `vault_*`, `knowhow_*`), kept through every save and never warned about | the [public configuration reference](../ui/docs/content/reference/configuration.md) | `RETIRED_KEYS` (`crates/agent-core/src/config.rs:4363`) and the unknown-key merge (`:4184`) | never: and never add `deny_unknown_fields` to `AgentConfig` |
+| The 23 agent-config keys (`hive_*`, `vault_*`, `knowhow_*`), kept through every save and never warned about | the [public configuration reference](../ui/docs/content/reference/configuration.md) | `RETIRED_KEYS` (`crates/agent-core/src/config.rs:4477`) and the unknown-key merge (`:4298`) | never: and never add `deny_unknown_fields` to `AgentConfig` |
 | `roomler hive hook`, hidden, exits 0 | its doc comment (`agents/roomler-cli/src/cli.rs:342`) | adopted terminals' Claude Code hooks | those accounts are unadopted (D6) |
 
 ```mermaid

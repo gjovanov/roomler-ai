@@ -119,7 +119,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useInviteStore } from '@/stores/invite'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
@@ -179,7 +179,23 @@ function removeRow(idx: number) {
   rows.value.splice(idx, 1)
 }
 
+// #4257 — the rows, their roles and a result belong to the org the dialog was
+// filled under. When the page moves on to another org (which closes the
+// dialog without `close()`), none of them is kept for the next opening.
+watch(
+  () => props.tenantId,
+  () => {
+    rows.value = [{ email: '', role_id: '' }]
+    expiresInHours.value = undefined
+    results.value = []
+    resultMessage.value = ''
+  },
+)
+
 async function send() {
+  // #4257 — the org the batch was sent for. Its answer, landing after the page
+  // moved on to another org, shows no result or toast there.
+  const tid = props.tenantId
   sending.value = true
   results.value = []
   resultMessage.value = ''
@@ -190,7 +206,8 @@ async function send() {
       assign_role_ids: row.role_id ? [row.role_id] : [],
     }))
 
-    const response = await inviteStore.batchCreateInvites(props.tenantId, params)
+    const response = await inviteStore.batchCreateInvites(tid, params)
+    if (tid !== props.tenantId) return
     results.value = response.results.map((r) => ({
       target_email: r.target_email,
       error: r.error,
@@ -224,6 +241,7 @@ async function send() {
       resultMessage.value = `${response.created} created, ${response.failed} failed.${sentNote}`
     }
   } catch {
+    if (tid !== props.tenantId) return
     resultType.value = 'error'
     resultMessage.value = 'Failed to send batch invites.'
     showError('Failed to send batch invites')

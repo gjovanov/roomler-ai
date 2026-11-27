@@ -2,6 +2,8 @@
 
 > **CLOSED 2026-09-01** — issue #1130 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
+**Anchors:** master `251abf817` (closed 2026-09-01): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1130](https://github.com/gjovanov/roomler-ai/issues/1130) ·
 **Status:** closed 2026-09-01 (#1130), three of four criteria ticked; the fourth is a wording gap, not behaviour (`scripts/fr-ac-debt-baseline.txt` C.11) · **Owner:** overlay/networking
 

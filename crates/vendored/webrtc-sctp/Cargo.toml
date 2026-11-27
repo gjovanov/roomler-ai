@@ -140,6 +140,63 @@
 #     hold its tests (a channel's close and the association's close, each
 #     landing between a read's check and its wait; a chunk that races a
 #     read for the queue's lock, both ways round).
+#   - src/association/association_internal.rs, src/association/mod.rs,
+#     src/stream/mod.rs, src/queue/pending_queue.rs,
+#     src/queue/payload_queue.rs, src/chunk/chunk_payload_data.rs and
+#     src/association/gauges.rs (FR-148 P4b-1, D55): a stream can be marked
+#     deadline-limited (`Association::mark_deadline_stream`, by stream id;
+#     the vendored webrtc crate's `RTCSctpTransport::mark_deadline_stream`
+#     reaches it), for the agent's deadline video channel: unordered with
+#     `maxRetransmits: 0`, on carriers that deliver in order (the mesh relay,
+#     TURN over TCP or TLS). Nothing sets the mark yet, and an association
+#     with no marked stream sends what it sent before, byte for byte. Once a
+#     stream is marked, the association:
+#     - serves ordered and unordered messages in the order they were written
+#       (each chunk carries the order the pending queue took it in). Upstream
+#       serves the unordered queue first at every message boundary, so video
+#       on an unordered channel would go ahead of control, cursor and files;
+#     - abandons a chunk of a marked stream whose reliability is Rexmit 0
+#       when a SACK reports it missing, or when T3-rtx expires while it is
+#       out, not at its first send. Upstream abandons every such chunk as it
+#       sends it, so a FORWARD TSN followed nearly every SACK and covered
+#       chunks still in flight. The chunk is never retransmitted, its loss
+#       never counts toward fast recovery (a T3-rtx expiry still cuts the
+#       window), and #3980's clock still leaves it out of `delivered`;
+#     - sends a FORWARD TSN again only when its point moved, or when a SACK
+#       reports a chunk sent after the last one went (so that one was lost);
+#       T3-rtx still sends one (RFC 3758 A5).
+#     A gauge, `Gauges::forward_tsns`, counts the FORWARD TSN packets sent,
+#     marked or not. Upstream's `maxRetransmits: N`, which allows N - 1
+#     retransmissions, is left as it is.
+#     src/association/association_internal/deadline_test.rs holds its tests:
+#     twin associations over an in-order pipe with a delay (the order
+#     written, with and without a mark; one chunk lost and nothing lost;
+#     T3-rtx, marked and not; FORWARD TSNs per SACK under a steady load; four
+#     seeds of random traffic, each the same digest as before).
+#   - src/association/pacer.rs, src/association/association_internal.rs and
+#     src/association/mod.rs (FR-148 P0, D43, D64, D65): a pacer, off unless a
+#     writer turns it on (`Association::pacer`, a lock-free `PaceSwitch`).
+#     While it is on, new data moves from the pending queue into flight at
+#     the share of the congestion window its writer steers it to over the
+#     least round trip seen since it was turned on, in slow start, and the
+#     whole window above the threshold; and it waits while in flight is at
+#     or above a cap the writer may set. A pause saves up 2 ms of the rate,
+#     a late wake lets out up to 17 ms of it. It never changes cwnd,
+#     ssthresh, the growth rule or a retransmission, and before its first
+#     round-trip sample it gates nothing. Off, it keeps no state and arms no
+#     timer: every byte and every timer is as before. The agent's open-time
+#     train turns it on while it runs: unpaced, a flight left back to back,
+#     every later one reached the bottleneck at twice the link, and a queue
+#     shorter than half the pipe overflowed before a round carried the link.
+#     src/association/pacer/pacer_test.rs holds its tests (off, before a
+#     round trip, the share in slow start and the whole window above it, the
+#     least round trip, a pause, a late wake, the cap, a cap that rises, the
+#     switch off and on again, a switch of no association). The three
+#     `test_pacer_*` in association_internal_test.rs run it in the send path
+#     (off and before a round trip, a SACK's round trip, the cap and a
+#     retransmission that never waits for it), and association_test.rs's
+#     `test_assoc_pacer_*` runs the write loop, which wakes for the chunk the
+#     pacer held with no SACK to wake it.
 
 [package]
 edition = "2021"

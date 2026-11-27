@@ -224,7 +224,7 @@ row's `agent_version`. And an environment variable beats the file
 for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
 daemon's environment reads `applied` after a restart while the environment's value
 is in force, and no restart changes that. A supervised Mac worker gets the root's
-value that way (`agents/roomlerd/src/macos_supervisor.rs:303`).
+value that way (`agents/roomlerd/src/macos_supervisor.rs:309`).
 
 ⚠️ **`config-report` is a SEPARATE capability verb from `config`**, and this is
 the `ssh` / `ssh-consent` split recurring exactly as that doc predicted it
@@ -304,7 +304,7 @@ key, recording nothing (`pushed_tribool`,
 `crates/modules/fleet/src/remote_config.rs:235`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
-(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:2947`), and a test
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3089`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
 keys beside it (`agents/roomlerd/src/remote_config.rs:557`).
@@ -329,7 +329,11 @@ read it through the config fallbacks
 (`crates/modules/fleet/src/remote_config.rs:342`): an entry the gate cannot read
 denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
 It exists so that a GPU-input cell can be turned off from the server before any
-cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
+cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)). It binds a
+cell on the built-in default list exactly as it binds one a device turned on by
+hand: the deny is read after the switch's gate, whichever way that gate let the
+cell through (FR-132 P2,
+[encoders.md](encoders.md#the-default-list-fr-132-p2)).
 
 | pushed `zero_copy_deny` | what the device's key becomes |
 |---|---|
@@ -342,7 +346,7 @@ cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:9690`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:9967`); a prefix match would refuse the
 kill switch along with the switch. `qsv_rate_mode`, FR-148 P2's switch that opens a QSV encoder off constant bitrate ([encoders.md](encoders.md#qsv-off-constant-bitrate-fr-148-p2)), is not pushable for the same reason: `DesiredConfig` has no such field, and it is not one of `DeviceSwitch`'s keys yet, so a push naming it is dropped unread with the body's other unknown keys and answers 200 having changed nothing. `rc_carrier_rank`, FR-148 P4's switch that ranks a session's mesh candidates below every TURN relay ([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)), is not pushable the same way, and neither is `path_model`, FR-148 P1's switch that lets the path memory open a relayed session ([rate-control.md](rate-control.md#the-switch-d28)), nor `inflight_budget`, FR-148 D46's switch that computes the in-flight budget on the data-channel pumps and, under `on`, lets it hold a relayed session's frames in place of the relay byte gate and the VP9-444 watermark ([rate-control.md](rate-control.md#the-budgets-switch)).
 
 ⚠️ **A push reaches a connected device within seconds, and takes effect at the
@@ -366,7 +370,7 @@ sessions back to code the device already ran, or clears the list back to the
 built-in defaults, and never further, because nothing pushed can turn a path's new
 code on ahead of its default. The server checks the value's shape and refuses a
 spelling no device could read with a 400 (`check_media_path_list`,
-`crates/remote_control/src/models.rs:2971`, called at
+`crates/remote_control/src/models.rs:3113`, called at
 `crates/modules/fleet/src/remote_config.rs:317`), so `media-plan` or `Media_Plan`
 never reads as applied while doing nothing. It does not check the names, which
 belong to the device's build: it stores the value as given
@@ -396,7 +400,7 @@ opt-in's bargain (§2), and it is why the owner's lasting remedy is the opt-in.
 **On a supervised Mac** the GUI worker builds each session from its own file,
 which a push to the root's row never reaches. So the daemon sends its entries
 along with each session (`SessionParams::media_legacy`,
-`agents/roomlerd/src/delegate.rs:731`, from `media_legacy_for_delegate`,
+`agents/roomlerd/src/delegate.rs:774`, from `media_legacy_for_delegate`,
 `agents/roomlerd/src/remote_config.rs:310`). The worker adds them to its own
 before it decides the session's paths. Adding legacy entries can only send a path
 back, so this never turns code on, and a daemon older than the field sends
@@ -430,7 +434,7 @@ the plan's `refused`.
 session through the loss of the control socket, is not pushable either.** It
 stays the device's decision, as `ws_flat_redial` and
 `tunnel_peers_survive_reattach` do: `DesiredConfig` has no such field
-(`crates/remote_control/src/models.rs:2777`), and the daemon reads the key when it
+(`crates/remote_control/src/models.rs:2919`), and the daemon reads the key when it
 starts (`crates/agent-core/src/config_surface.rs:726`). A body that names it is
 refused as one naming `rc_media_canary` is: a 403 whose message names this key,
 audited as `device_owned_switch`, by whole name, so a key that only starts like it
@@ -567,7 +571,7 @@ flowchart TD
 
 **A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
 daemon whose binary was replaced restarts through the same door once nothing it
-serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:359-418`).
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:371-430`).
 It runs the same supervisor proof, record and systemd read-back, but not
 `local_restart_enabled`, because no local client is asking. It is not a server
 lever: what sets it off is a file replaced ON the device, by the root update
@@ -611,12 +615,16 @@ which the daemon still refuses on the same terms as a local request.
      wire has three states and a switch has two — `undefined` means the device
      keeps what it has, and an operator toggling exec must not silently assert
      a value for every other key.
-   - **Combination warnings.** `ssh_enabled` alone grants nothing: without
-     `ssh_authorized_keys` nobody can connect, and with an unset
-     `ssh_account_mode` a key-list session authenticates and then runs nothing.
-     Both produce a device that is "on" and unreachable — the same
-     silent-nothing this whole feature exists to remove, so the dialog says so
-     before you save rather than leaving you to find out by `ssh`ing at it.
+   - **Combination warnings.** An empty `ssh_authorized_keys` is not one. A
+     server grant (`roomler ssh`) is tried before the list and needs no key in
+     it and no `ssh_account_mode`: it runs as the device's SSH policy says. So
+     the empty default still reaches every caller the server grants, and it
+     refuses only a key-list session, the break-glass route (#4325). The dialog
+     warns where a key-list session would authenticate and then run nothing:
+     keys with an unset `ssh_account_mode`. That is a device "on" for that
+     route and doing nothing — the same silent-nothing this whole feature
+     exists to remove, so the dialog says so before you save rather than
+     leaving you to find out by `ssh`ing at it.
    - **Grant bits mirrored** (`canGrantDeviceExec` / `canGrantDeviceSsh`), so a
      caller without `EXEC_DEVICE` sees a disabled control and the reason,
      rather than a 403 they cannot attribute to themselves or to the device.
@@ -648,25 +656,25 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3497`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3625`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check
    of the folder each time a recording starts. **Gate 4 is not among them.**
    `exec_enabled`, `ssh_enabled` and `remote_config_enabled` are served
    read-only there (`ConfigEntry::read_only = "root_only"`, `person_view`,
-   `:3664`), and a `ConfigSet` of them is refused by name with the
-   administrator's command (`not_on_the_person_socket_for_key`, `:3708`): on a
+   `:3753`), and a `ConfigSet` of them is refused by name with the
+   administrator's command (`not_on_the_person_socket_for_key`, `:3797`): on a
    root-mode install gate 4 stays `sudo roomler config set exec_enabled true`,
    on both OSes. The pane shows the root daemon's value of the switch, marked,
    instead of another daemon's — on a two-half Mac the machine-side rows come
    from the root half and the session rows from the worker
    (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`;
-   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:861`; the table
+   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:883`; the table
    in [desktop-companion.md](desktop-companion.md) §5) — and a daemon older
    than design A, which still refuses the listing, gets the administrator's
    path in place of rows (`root_daemon_only`,
-   `agents/roomler-desktop/src/commands.rs:1279`). Whether the person at the
+   `agents/roomler-desktop/src/commands.rs:1301`). Whether the person at the
    seat may switch gate 4 on a root-mode install — Windows' pipe lets every
    interactive user — is the policy call still open on #2871.
 

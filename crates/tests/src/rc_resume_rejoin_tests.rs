@@ -32,8 +32,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::fixtures::test_app::TestApp;
 use crate::rc_resume_claim_tests::{
     QUIET, REMOTE_CONTROL, RESUME, WINDOW, WITHIN, Ws, answer_for, attach_seq, detached,
-    drop_socket, end_reason, ended, enroll, give_member, hello, hello_with, insert, leftover,
-    next_of, now_ms, oid, one, open, pair, row, scope_all, tenant_of, urlencode, wait_row,
+    drop_socket, end_reason, ended, enroll, give_member, hello, hello_frame, hello_with, insert,
+    leftover, next_of, now_ms, oid, one, open, pair, registered, row, scope_all, tenant_of,
+    urlencode, wait_row,
 };
 
 pub(crate) async fn send(ws: &mut Ws, v: Value) {
@@ -113,7 +114,7 @@ pub(crate) async fn request(ctl: &mut Ws, agent_id: ObjectId, replaces: Option<O
 /// Drive `sid` live the way the two ends do: the device consents (the hub
 /// takes it whether or not the device has read its `rc:request` yet), the
 /// viewer offers, the device answers.
-async fn drive_live(ctl: &mut Ws, agent: &mut Ws, sid: ObjectId) {
+pub(crate) async fn drive_live(ctl: &mut Ws, agent: &mut Ws, sid: ObjectId) {
     let hex = sid.to_hex();
     send(
         agent,
@@ -139,6 +140,22 @@ async fn drive_live(ctl: &mut Ws, agent: &mut Ws, sid: ObjectId) {
         .expect("the viewer's answer: the session is live");
 }
 
+/// A session from a new viewer socket of `token`, asked for once `app`'s hub
+/// holds the device ([`registered`]), created and not yet live: the socket,
+/// the session id and the `rc:session.created` the viewer was sent.
+pub(crate) async fn open_session(
+    app: &TestApp,
+    token: &str,
+    agent_id: ObjectId,
+) -> (Ws, ObjectId, Value) {
+    registered(app, agent_id).await;
+    let mut ctl = controller(app, token).await;
+    let created = request(&mut ctl, agent_id, None).await;
+    assert_eq!(created["t"], "rc:session.created", "{created}");
+    let sid = oid(created["session_id"].as_str().expect("a session id"));
+    (ctl, sid, created)
+}
+
 /// A live session from a new viewer socket of `token`: the socket, the
 /// session id and the `rc:session.created` the viewer was sent.
 pub(crate) async fn live_session(
@@ -147,10 +164,7 @@ pub(crate) async fn live_session(
     agent_id: ObjectId,
     agent: &mut Ws,
 ) -> (Ws, ObjectId, Value) {
-    let mut ctl = controller(app, token).await;
-    let created = request(&mut ctl, agent_id, None).await;
-    assert_eq!(created["t"], "rc:session.created", "{created}");
-    let sid = oid(created["session_id"].as_str().expect("a session id"));
+    let (mut ctl, sid, created) = open_session(app, token, agent_id).await;
     drive_live(&mut ctl, agent, sid).await;
     (ctl, sid, created)
 }
@@ -883,4 +897,35 @@ async fn with_the_window_at_zero_the_viewers_side_is_as_today() {
         before,
         "nothing new writes a row at 0"
     );
+}
+
+/// #4383 — a session asked for while the device's hello is still on its way
+/// is created once the pod has registered the device. The pod registers a
+/// device only after it has read the hello and finished its database calls,
+/// so a request that reaches the hub first is answered `agent_offline`,
+/// which is true at that moment. Here the hello goes out 500 ms after the
+/// device's socket opened, from a task that holds the socket meanwhile, and
+/// the session is asked for at once.
+#[tokio::test]
+async fn open_session_waits_until_the_pod_holds_a_device_whose_hello_is_late() {
+    const LATE: Duration = Duration::from_millis(500);
+    let app = one(WINDOW).await;
+    let seeded = app.seed_tenant("latehello").await;
+    scope_all(&app).await;
+    let (agent_id, token) = enroll(&app, &seeded, "late-hello").await;
+    let url = format!(
+        "ws://{}/ws?token={}&role=agent",
+        app.addr,
+        urlencode(&token)
+    );
+    let (mut agent, _) = connect_async(&url).await.expect("agent ws");
+    let late = tokio::spawn(async move {
+        tokio::time::sleep(LATE).await;
+        send(&mut agent, hello_frame(&[RESUME], &[], 2)).await;
+        agent
+    });
+    let (mut ctl, sid, _) = open_session(&app, &seeded.admin.access_token, agent_id).await;
+    let mut agent = late.await.expect("the late hello is sent");
+    drive_live(&mut ctl, &mut agent, sid).await;
+    wait_row(&app, sid, "the session goes live", open).await;
 }

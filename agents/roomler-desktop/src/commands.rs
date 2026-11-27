@@ -641,11 +641,24 @@ pub async fn cmd_enroll(
             enrollment::InstallMethod::Manual,
             enrollment::InstallScope::Unknown,
         )),
+        // #3565 — the companion names itself, with its own version, which
+        // need not be the daemon's.
+        program: companion_program(),
     })
     .await
     .map_err(|e| format!("Enrollment failed: {e:#}"))?;
     config::save(&path, &cfg).map_err(|e| format!("Saving config: {e}"))?;
     Ok(status_report())
+}
+
+/// #3565 — the companion's enroll and re-enroll name the companion, with the
+/// version it was built as. The server keeps it as how the device was
+/// enrolled; the device's version is its daemon's own, from its hello.
+fn companion_program() -> enrollment::EnrollingProgram {
+    enrollment::EnrollingProgram::new(
+        enrollment::EnrollingProgramName::RoomlerDesktop,
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// FR-43 P3a, #3996 — what a re-enroll says when this account's config holds
@@ -698,6 +711,7 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
         // A token refresh says nothing about how the binary got here; the
         // server keeps the row's recorded install.
         install: None,
+        program: companion_program(),
     })
     .await
     .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;
@@ -714,8 +728,16 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     // `roomlerd re-enroll` does. Saving the fresh, default-everything config
     // wholesale dropped every operator setting and every `[[orgs]]`
     // enrollment on the machine.
-    let (merged, _outcome) = enrollment::apply_enrollment(Some(existing), fresh, None, false)
-        .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;
+    // #4352 — a refused fold writes nothing and removes the row the
+    // enrollment made, as every caller of the fold does.
+    let (merged, _outcome) = match enrollment::apply_enrollment(Some(existing), fresh, None, false)
+    {
+        Ok(folded) => folded,
+        Err(e) => {
+            let e = enrollment::remove_refused_row(e).await;
+            return Err(format!("Re-enrollment failed: {e:#}"));
+        }
+    };
     config::save(&path, &merged).map_err(|e| explain_save_error(e, &path, machine_global))?;
     Ok(status_report())
 }
@@ -2143,7 +2165,7 @@ pub async fn cmd_open_remote(
 ) -> Result<(), String> {
     let aid = agent_id.trim().to_ascii_lowercase();
     if aid.len() != 24 || !aid.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("invalid agent id".to_string());
+        return Err("invalid device id".to_string());
     }
     let url = tokio::task::spawn_blocking(move || {
         let is_scm = probe_service_state().0 == "scmService";
@@ -4365,6 +4387,24 @@ mod tests {
         // `--as-service` failing outright (no answer line at all) is the same.
         let got = classify_service_state(Some(&out("Auto-start: installed")), Some(NOISE));
         assert_eq!(got, ("scheduledTask".to_string(), false));
+    }
+
+    /// FR-150 P1a (#3507) — a daemon whose task its account cannot replace
+    /// prints a `Note:` line after its answer (roomlerd's `print_status`). The
+    /// answer is read all the same, and the note's own words ("its auto-start
+    /// task") are never taken for an answer.
+    #[test]
+    fn a_note_after_the_answer_line_changes_nothing() {
+        let said = out("Auto-start: installed\n\
+             Note: this account cannot replace its auto-start task Roomler-S-1-5-21-1-2-3-1001: \
+             an elevated registration owns it, so a self-update cannot register it again \
+             (#3507). Run `roomlerd service install` once from an elevated prompt, or the \
+             installer as administrator, to repair it.");
+        let got = classify_service_state(Some(&said), Some(&out("Roomler: NotInstalled")));
+        assert_eq!(got, ("scheduledTask".to_string(), false));
+        let said = out("Auto-start: not installed\nNote: an elevated task.");
+        let got = classify_service_state(Some(&said), Some(&out("Roomler: NotInstalled")));
+        assert_eq!(got, ("none".to_string(), false));
     }
 
     #[test]
@@ -6653,6 +6693,249 @@ mod tests {
                 !onboarding.contains("btn.disabled = false;"),
                 "a finished click leaves the form as the status says"
             );
+        }
+    }
+
+    /// FR-133 — the companion calls the daemon `roomlerd`, "the daemon" or the
+    /// device it runs on, never an agent. The front is static HTML and JS the
+    /// app embeds as it is, so the files are the surface a person reads; every
+    /// one of them is read, a file added later included. The Rust half is the
+    /// text the app hands the page (an error a tooltip shows, a menu, a notice).
+    mod says_roomlerd {
+        use std::path::Path;
+
+        /// `agent` or `agents`, any case, with no letter, digit or `_` on either
+        /// side: `agent_id` and `agent_version` are wire fields, not the word.
+        fn says_agent(text: &str) -> bool {
+            let lower = text.to_ascii_lowercase();
+            let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            lower.match_indices("agent").any(|(at, _)| {
+                let after = &lower[at + 5..];
+                let after = after.strip_prefix('s').unwrap_or(after);
+                !word(lower[..at].chars().next_back()) && !word(after.chars().next())
+            })
+        }
+
+        /// Every quoted string in `js`, outside comments, each `${…}` taken out
+        /// (a template's interpolation is code). Rough, but the front holds no
+        /// quote inside a regex literal.
+        fn js_strings(js: &str) -> Vec<String> {
+            let b = js.as_bytes();
+            let (mut out, mut i) = (Vec::new(), 0);
+            while i < b.len() {
+                match b[i] {
+                    b'/' if b.get(i + 1) == Some(&b'/') => {
+                        i = js[i..].find('\n').map_or(b.len(), |n| i + n);
+                    }
+                    b'/' if b.get(i + 1) == Some(&b'*') => {
+                        i = js[i + 2..].find("*/").map_or(b.len(), |n| i + n + 4);
+                    }
+                    quote @ (b'"' | b'\'' | b'`') => {
+                        let start = i + 1;
+                        i += 1;
+                        while i < b.len() && b[i] != quote {
+                            i += if b[i] == b'\\' { 2 } else { 1 };
+                        }
+                        let mut shown = String::new();
+                        let mut rest = &js[start..i.min(b.len())];
+                        while let Some(at) = rest.find("${") {
+                            shown.push_str(&rest[..at]);
+                            rest = rest[at..].split_once('}').map_or("", |(_, r)| r);
+                        }
+                        shown.push_str(rest);
+                        out.push(shown);
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            out
+        }
+
+        /// What a person meets in `html`: the text between tags, and what an
+        /// element shows or speaks (`placeholder`, `title`, `aria-label`, `alt`).
+        /// Comments, scripts and styles are not shown.
+        fn html_words(html: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut rest = html;
+            while !rest.is_empty() {
+                if let Some(after) = rest.strip_prefix("<!--") {
+                    rest = after.split_once("-->").map_or("", |(_, r)| r);
+                } else if let Some(tag) = rest.strip_prefix('<') {
+                    let (inside, after) = tag.split_once('>').unwrap_or((tag, ""));
+                    for name in ["placeholder", "title", "aria-label", "alt"] {
+                        let at = format!(" {name}=\"");
+                        if let Some((_, value)) = inside.split_once(at.as_str()) {
+                            out.push(value.split('"').next().unwrap_or("").to_string());
+                        }
+                    }
+                    rest = after;
+                    let name = inside.split_whitespace().next().unwrap_or("");
+                    if name.eq_ignore_ascii_case("script") || name.eq_ignore_ascii_case("style") {
+                        let close = format!("</{}", name.to_ascii_lowercase());
+                        rest = rest.find(&close).map_or("", |n| &rest[n..]);
+                    }
+                } else {
+                    let next = rest.find('<').unwrap_or(rest.len());
+                    out.push(rest[..next].to_string());
+                    rest = &rest[next..];
+                }
+            }
+            out
+        }
+
+        /// Every string literal in `code` (comments skipped), and whether a log
+        /// macro (`trace!` … `error!`) holds it: a log line is engineering text,
+        /// not this FR's. The same lexer as the daemon's `notice_text_tests.rs`.
+        fn literals(code: &str) -> Vec<(&str, bool)> {
+            const LOG: [&str; 5] = ["trace!", "debug!", "info!", "warn!", "error!"];
+            let b = code.as_bytes();
+            let (mut out, mut i, mut depth, mut log_at) = (Vec::new(), 0, 0usize, None);
+            while i < b.len() {
+                match b[i] {
+                    b'/' if b.get(i + 1) == Some(&b'/') => {
+                        i = code[i..].find('\n').map_or(b.len(), |n| i + n);
+                    }
+                    b'/' if b.get(i + 1) == Some(&b'*') => {
+                        i = code[i + 2..].find("*/").map_or(b.len(), |n| i + n + 4);
+                    }
+                    b'(' | b'[' | b'{' => {
+                        if log_at.is_none() && LOG.iter().any(|m| code[..i].ends_with(m)) {
+                            log_at = Some(depth);
+                        }
+                        depth += 1;
+                        i += 1;
+                    }
+                    b')' | b']' | b'}' => {
+                        depth = depth.saturating_sub(1);
+                        if log_at == Some(depth) {
+                            log_at = None;
+                        }
+                        i += 1;
+                    }
+                    // A char literal (`'"'`, `'\''`) or a lifetime (`'a`).
+                    b'\'' => {
+                        if b.get(i + 1) == Some(&b'\\') {
+                            i = code[i + 3..].find('\'').map_or(b.len(), |n| i + n + 4);
+                        } else {
+                            let c = code[i + 1..].chars().next().map_or(1, char::len_utf8);
+                            i += if b.get(i + 1 + c) == Some(&b'\'') {
+                                c + 2
+                            } else {
+                                1
+                            };
+                        }
+                    }
+                    // A raw string: `r"…"`, `r#"…"#`.
+                    b'r' if matches!(b.get(i + 1), Some(b'"' | b'#'))
+                        && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+                    {
+                        let hashes = code[i + 1..].bytes().take_while(|&c| c == b'#').count();
+                        let open = i + 1 + hashes;
+                        if b.get(open) != Some(&b'"') {
+                            i += 1;
+                            continue;
+                        }
+                        let close = format!("\"{}", "#".repeat(hashes));
+                        let end = code[open + 1..]
+                            .find(&close)
+                            .map_or(b.len(), |n| open + 1 + n);
+                        out.push((&code[open + 1..end], log_at.is_some()));
+                        i = end + close.len();
+                    }
+                    b'"' => {
+                        let start = i + 1;
+                        i += 1;
+                        while i < b.len() && b[i] != b'"' {
+                            i += if b[i] == b'\\' { 2 } else { 1 };
+                        }
+                        out.push((&code[start..i.min(b.len())], log_at.is_some()));
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            out
+        }
+
+        /// The files of `dir` that end in one of `exts`, each with its text.
+        fn files(dir: &Path, exts: &[&str]) -> Vec<(String, String)> {
+            let mut out: Vec<(String, String)> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+                .map(|entry| entry.unwrap().path())
+                .filter(|p| exts.iter().any(|x| p.extension().is_some_and(|e| e == *x)))
+                .map(|p| {
+                    let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                    let text = std::fs::read_to_string(&p).unwrap().replace("\r\n", "\n");
+                    (name, text)
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        #[test]
+        fn the_pages_never_call_the_daemon_an_agent() {
+            let front = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/front");
+            let pages = files(&front, &["html", "js"]);
+            let found = pages.iter().any(|(name, _)| name == "index.html");
+            assert!(found, "no index.html in {}", front.display());
+            let mut said = Vec::new();
+            for (name, text) in &pages {
+                let words = if name.ends_with(".html") {
+                    html_words(text)
+                } else {
+                    // A string with no space is a key, a kind or an id
+                    // (`kind === 'agent'`), not a sentence.
+                    js_strings(text)
+                        .into_iter()
+                        .filter(|s| s.contains(' '))
+                        .collect()
+                };
+                for shown in words.into_iter().filter(|w| says_agent(w)) {
+                    said.push(format!("{name}: {}", shown.trim()));
+                }
+            }
+            assert!(said.is_empty(), "the companion says agent: {said:#?}");
+        }
+
+        #[test]
+        fn the_text_the_app_hands_the_page_never_says_agent() {
+            let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+            let mut said = Vec::new();
+            for (name, text) in files(&src, &["rs"]) {
+                let code = text
+                    .split("\n#[cfg(test)]\nmod tests {")
+                    .next()
+                    .unwrap_or("");
+                for (lit, log) in literals(code) {
+                    if !log && lit.contains(' ') && says_agent(lit) {
+                        said.push(format!("{name}: {lit}"));
+                    }
+                }
+            }
+            assert!(
+                said.is_empty(),
+                "the companion's Rust says agent: {said:#?}"
+            );
+        }
+
+        /// The readers themselves, on the shapes they have to get right.
+        #[test]
+        fn the_readers_read_what_a_person_sees() {
+            assert!(says_agent("enter its agent id") && says_agent("Agents:"));
+            assert!(!says_agent("agent_id") && !says_agent("useragent") && !says_agent(""));
+            let js = "// 'a comment'\nconst a = `${x} is the agent`; f('two words', \"x\");";
+            assert_eq!(js_strings(js), [" is the agent", "two words", "x"]);
+            let html = "<!-- agent --><p title=\"a b\">Hi <b>there</b></p>\
+                        <script>var s = 'agent';</script><input placeholder=\"24-hex id\">";
+            let words: Vec<String> = html_words(html)
+                .into_iter()
+                .filter(|w| !w.trim().is_empty())
+                .collect();
+            assert_eq!(words, ["a b", "Hi ", "there", "24-hex id"]);
+            let rust = "let c = '\"'; fn f<'a>() {} warn!(\"a log\"); bail!(\"an error\");";
+            assert_eq!(literals(rust), [("a log", true), ("an error", false)]);
         }
     }
 }

@@ -128,3 +128,123 @@ describe('role store', () => {
     expect(store.colorHex(undefined)).toBeUndefined()
   })
 })
+
+// #4248 — the store holds one org's roles at a time, and knows which.
+describe('role store: one org at a time (#4248)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+
+  it("a fetch for org B drops org A's roles at once; a refresh of org A keeps them while it loads", async () => {
+    const store = useRoleStore()
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'ra' })])
+    await store.fetchRoles(ORG_A)
+
+    let again!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (again = r)))
+    const refreshA = store.fetchRoles(ORG_A)
+    expect(store.roles.map((r) => r.id)).toEqual(['ra'])
+    again([mkRole({ id: 'ra' })])
+    await refreshA
+
+    mockApi.get.mockReturnValueOnce(new Promise(() => {}))
+    void store.fetchRoles(ORG_B)
+    expect(store.roles).toEqual([])
+    expect(store.rolesTenantId).toBe(ORG_B)
+  })
+
+  it("org A's late failure lands on nothing: org B's roles stay, with no error", async () => {
+    const store = useRoleStore()
+    let failA!: (e: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((_, reject) => (failA = reject)))
+    const loadA = store.fetchRoles(ORG_A)
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'rb', tenant_id: ORG_B })])
+    await store.fetchRoles(ORG_B)
+
+    failA(new Error('Missing MANAGE_ROLES permission'))
+    await loadA
+    expect(store.roles.map((r) => r.id)).toEqual(['rb'])
+    expect(store.error).toBeNull()
+    expect(store.loading).toBe(false)
+  })
+})
+
+// #4257 — a dialog or a list that only names or picks the org's roles asks
+// with `ensureRoles`, which fetches only when the store does not hold them.
+describe('role store: ensureRoles (#4257)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+
+  // A test that stops before its held GET is sent must not hand it to the next.
+  beforeEach(() => mockApi.get.mockReset())
+
+  it("asked for org B while holding org A's: one fetch, for org B", async () => {
+    const store = useRoleStore()
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'ra' })])
+    await store.fetchRoles(ORG_A)
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'rb', tenant_id: ORG_B })])
+    await store.ensureRoles(ORG_B)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/role`, `/tenant/${ORG_B}/role`])
+    expect(store.roles.map((r) => r.id)).toEqual(['rb'])
+  })
+
+  it("asked for org A while holding org A's, or loading them: no fetch, for an org with none too", async () => {
+    const store = useRoleStore()
+    let answer!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answer = r)))
+    const first = store.fetchRoles(ORG_A)
+    await store.ensureRoles(ORG_A)
+    answer([])
+    await first
+    await store.ensureRoles(ORG_A)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/role`])
+  })
+
+  it('asked again after a failed fetch: fetches', async () => {
+    const store = useRoleStore()
+    mockApi.get.mockRejectedValueOnce(new Error('network'))
+    await store.fetchRoles(ORG_A)
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'ra' })])
+    await store.ensureRoles(ORG_A)
+    expect(asked()).toHaveLength(2)
+    expect(store.roles.map((r) => r.id)).toEqual(['ra'])
+    expect(store.error).toBeNull()
+  })
+})
+
+// #4257 — a role created for an org the page has left stays out of the list,
+// which may already hold another org's roles (the Roles page's create, when
+// its answer lands after the page moved on).
+describe('role store: a create answered for another org (#4257)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+
+  beforeEach(() => {
+    mockApi.get.mockReset()
+    mockApi.post.mockReset()
+  })
+
+  it("a role created for org A after a fetch for org B stays out of org B's list", async () => {
+    const store = useRoleStore()
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'ra' })])
+    await store.fetchRoles(ORG_A)
+    let created!: (v: unknown) => void
+    mockApi.post.mockReturnValueOnce(new Promise((r) => (created = r)))
+    const create = store.createRole(ORG_A, { name: 'Auditors' })
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'rb', tenant_id: ORG_B })])
+    await store.fetchRoles(ORG_B)
+
+    created(mkRole({ id: 'ra-new', name: 'Auditors' }))
+    await create
+    expect(store.roles.map((r) => r.id)).toEqual(['rb'])
+  })
+
+  it('a role created for the org the list holds joins it', async () => {
+    const store = useRoleStore()
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'ra' })])
+    await store.fetchRoles(ORG_A)
+    mockApi.post.mockResolvedValueOnce(mkRole({ id: 'ra-new', name: 'Auditors' }))
+    await store.createRole(ORG_A, { name: 'Auditors' })
+    expect(store.roles.map((r) => r.id)).toEqual(['ra', 'ra-new'])
+  })
+})

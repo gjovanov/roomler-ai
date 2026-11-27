@@ -22,6 +22,8 @@ diagrams, under the standing rule that closing an FR requires its docs (CLAUDE.m
 [#1311](https://github.com/gjovanov/roomler-ai/pull/1311) · P0 contract + baseline
 [#1312](https://github.com/gjovanov/roomler-ai/pull/1312)
 
+**Anchors:** master `a21afd6ee` (closed 2026-09-05): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Decouple the server into pillar modules behind one small core, as a **modular monolith**:
@@ -54,7 +56,7 @@ places where the pillars are actually coupled.
 |---|---|---|
 | `roomler-ai-api` | 46 250 lines; `[features] default = []` (`crates/api/Cargo.toml:17`); depends on `mediasoup`, `roomler-ai-tunnel-core` and `roomler-ai-remote-control` unconditionally | Every server build compiles every pillar. |
 | `AppState` | **83** public fields (`crates/api/src/state.rs:58`), a 1 497-line file; **216** `State<AppState>` and **206** `&AppState` sites | Every handler takes everything; the crate recompiles as one unit. |
-| `build_router` | `crates/api/src/lib.rs:94–882`, ~790 lines nesting 48 route files (24 072 lines) | Every route in the product is edited in one function. |
+| `build_router` | (2026-09-04, at `08ceb7ba`, before FR-69 split it) `crates/api/src/lib.rs:94–882`, ~790 lines nesting 48 route files (24 072 lines) | Every route in the product is edited in one function. |
 | WebSocket | `ws/` 14 747 lines; one upgrade with a role gate (`ws/handler.rs:68`) for user, agent and tunnel-client; the user socket dispatches typing, presence, `media:*` and `rc:*` (`handler.rs:661`, `:777`, `:695`); ~750 lines of media signalling inline from `handler.rs:895`; `overlay.rs` 3 330 · `remote_control.rs` 2 507 · `tunnel.rs` 1 948 · `org_relay.rs` 1 019 · `derp.rs` 1 002 | The socket and gate are the right shape; only the arms need to move. |
 | Media | `crates/services/src/media/` (1 047 lines) is the only mediasoup consumer, yet `services/Cargo.toml` links `mediasoup` unconditionally; `mediasoup-sys 0.10` **compiles the C++ worker from source** during `cargo build` (pip → meson → ninja — the reason the Dockerfile installs `cmake` and `python3-pip`) | The single largest build-time lever for any profile without conferencing. |
 
@@ -66,7 +68,7 @@ Two more measurements shaped the design rather than motivating it:
   consent and cluster metrics. It is the device control-plane multiplexer, not a remote-desktop
   object — which is why device management becomes a module of its own (D3).
 - **The wire already groups by pillar.** `ClientMsg`/`ServerMsg`
-  (`crates/remote_control/src/signaling.rs:503`, `:2363`) carry ~134 variants; the `rc:` names
+  (`crates/remote_control/src/signaling.rs:525`, `:2315`) carry ~134 variants; the `rc:` names (2026-11-04)
   group as tunnel 35 · overlay 18 · agent 8 · rpc 5 · ssh 4 · sdp 4 · relay 4 · session 3 ·
   consent 3. The namespaces map onto modules without touching a byte (D7).
 

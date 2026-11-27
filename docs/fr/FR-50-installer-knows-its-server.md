@@ -2,6 +2,8 @@
 
 > **CLOSED 2026-09-01** — issue #1083 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
+**Anchors:** master `9bcb6ed4e` (closed 2026-09-01): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1083](https://github.com/gjovanov/roomler-ai/issues/1083) ·
 Status: **P0 — spec** (2026-08-31) · Child of
 [FR-42](FR-42-selfhost-verified-on-a-clean-box.md) (#967), which found this by
@@ -84,7 +86,7 @@ there — but the request is made.
 **Substitute at serve time from `app.frontend_url`.**
 
 `frontend_url` is already the canonical "which server am I" value: it builds
-OAuth returns (`routes/auth.rs:173`), invite links (`routes/invite.rs:671`),
+OAuth returns (`routes/auth.rs:167`), invite links (`routes/invite.rs:636`),
 subscriber confirm/unsubscribe links (`routes/subscribe.rs:157,204`) and — since
 the 2026-07-28 tightening — the **CORS origin policy** itself
 (`crates/api/src/origin.rs:37`). A deployment whose `frontend_url` is wrong has

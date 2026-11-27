@@ -36,13 +36,13 @@ organization" is not an authorisation check for anything addressed by id.
 |---|---|
 | A browser session | An `HttpOnly` session cookie |
 | A script or integration | A bearer token |
-| An agent | Its own long-lived agent credential |
+| A device's daemon (`roomlerd`) | Its own long-lived device credential |
 
-Tokens are audience-checked: a user token is refused where an agent token is
+Tokens are audience-checked: a user token is refused where a device credential is
 required, and the reverse.
 
 :::warning A deleted device's credential stops working immediately
-Agent-authenticated routes load the device row and refuse a revoked or removed
+Device-authenticated routes load the device row and refuse a revoked or removed
 one. A **lookup failure** is deliberately a server error rather than a 401 — a
 database blip must not tell a healthy fleet its credentials were revoked, which
 would turn a wobble into an enrollment storm.
@@ -89,8 +89,8 @@ Useful for a self-hosted deployment's monitoring.
 
 ## Realtime
 
-A websocket at `/ws` carries chat, presence, call signalling and the agent
-protocol. The same endpoint serves users and agents with different credential
+A websocket at `/ws` carries chat, presence, call signalling and the daemon's
+protocol. The same endpoint serves users and daemons with different credential
 audiences.
 
 ## Full route list

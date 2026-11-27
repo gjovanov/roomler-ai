@@ -57,15 +57,15 @@ sequenceDiagram
     Note over V,A: the session's end, or {enable:false}, restores the mode (only the session that applied it)
 ```
 
-[`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch` is the decision, pure and
-unit-tested. [`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` runs it,
+[`display_match.rs:1336`](../agents/roomlerd/src/display_match.rs#L1336) `may_switch` is the decision, pure and
+unit-tested. [`display_match.rs:1381`](../agents/roomlerd/src/display_match.rs#L1381) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:11075`](../agents/roomlerd/src/peer.rs#L11075)).
+control-channel arm sends the answer ([`peer.rs:11085`](../agents/roomlerd/src/peer.rs#L11085)).
 
 ### The answers
 
 Every request gets exactly one `rc:display-match.state`
-([`display_match.rs:1691`](../agents/roomlerd/src/display_match.rs#L1691) `state_json`):
+([`display_match.rs:1696`](../agents/roomlerd/src/display_match.rs#L1696) `state_json`):
 
 | `refused` | It means | The viewer says |
 |---|---|---|
@@ -81,11 +81,11 @@ Every request gets exactly one `rc:display-match.state`
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
 ([`displayMatch.ts:39`](../ui/src/composables/displayMatch.ts#L39) `describeDisplayMatchRefusal`). The viewer
-puts the answer under the toggle ([`RemoteControl.vue:4612`](../ui/src/views/remote/RemoteControl.vue#L4612)
+puts the answer under the toggle ([`RemoteControl.vue:4626`](../ui/src/views/remote/RemoteControl.vue#L4626)
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored
-([`display_match.rs:1368`](../agents/roomlerd/src/display_match.rs#L1368) `hands_the_screen_back`). `locked`
+([`display_match.rs:1373`](../agents/roomlerd/src/display_match.rs#L1373) `hands_the_screen_back`). `locked`
 does not, because the worker cannot touch the secure desktop (below). `recording` does not either: the
 recording's hold handed the screen back before its recorder launched (P1c).
 
@@ -102,13 +102,13 @@ roomler config set display_match auto     # auto (default) | always | never
 | `never` | never |
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
-  ([`lib.rs:3561`](../crates/localapi/src/lib.rs#L3561), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:9768`](../crates/remote_control/src/models.rs#L9768)). A server that could set it could
+  ([`lib.rs:3689`](../crates/localapi/src/lib.rs#L3689), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
+  push it ([`models.rs:10045`](../crates/remote_control/src/models.rs#L10045)). A server that could set it could
   take every screen it reaches.
-- **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
+- **Read live** at every request ([`display_match.rs:1259`](../agents/roomlerd/src/display_match.rs#L1259)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
-  ([`config.rs:2749`](../crates/agent-core/src/config.rs#L2749) `DisplayMatchPolicy`).
+  ([`config.rs:2823`](../crates/agent-core/src/config.rs#L2823) `DisplayMatchPolicy`).
 
 ## Who is at the screen
 
@@ -125,7 +125,7 @@ That clock moves for every input, and FR-108's P0 measured both kinds moving it:
 |---|---|---|
 | the controller's injected events | the input arbiter ([`keep_busy/mod.rs:92`](../agents/roomlerd/src/keep_busy/mod.rs#L92) `note_remote_input`) | the machine's |
 | keep busy's own pointer moves | keep busy's mover ([`keep_busy/mod.rs:103`](../agents/roomlerd/src/keep_busy/mod.rs#L103) `note_own_move`) | the machine's |
-| the X server clamping the pointer into a smaller mode, during our own switch (FR-97) | each mode set's run ([`display_match.rs:646`](../agents/roomlerd/src/display_match.rs#L646) `own_switch_explains`) | the machine's |
+| the X server clamping the pointer into a smaller mode, during our own switch (FR-97) | each mode set's run ([`display_match.rs:651`](../agents/roomlerd/src/display_match.rs#L651) `own_switch_explains`) | the machine's |
 | anything else | — | **a person's** |
 
 A move within 250 ms of a machine input is that input
@@ -145,12 +145,12 @@ so a request mid-session still tells the controller's input from a person's.
 
 P0 tried it: on the lock screen the worker's `ChangeDisplaySettingsExW` returns `-1`, and the screen stays as
 it was. So a locked host answers `locked`, and the request waits
-([`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` keeps it per session).
+([`display_match.rs:1381`](../agents/roomlerd/src/display_match.rs#L1381) `request_for` keeps it per session).
 An unattended office PC is usually locked, so this is the main path, not an edge.
 
 At the session's unlock the device decides again
-([`display_match.rs:1601`](../agents/roomlerd/src/display_match.rs#L1601) `on_unlock`, called from the
-session's lock watcher, [`peer.rs:1433`](../agents/roomlerd/src/peer.rs#L1433)):
+([`display_match.rs:1606`](../agents/roomlerd/src/display_match.rs#L1606) `on_unlock`, called from the
+session's lock watcher, [`peer.rs:1460`](../agents/roomlerd/src/peer.rs#L1460)):
 
 | Who unlocked it | What the clock shows | The answer |
 |---|---|---|
@@ -165,8 +165,8 @@ read as `attended` for four more minutes, and the request would be refused for n
 ## The person comes back (P1b)
 
 While a session holds a mode it applied, a watcher checks four times a second
-([`peer.rs:1531`](../agents/roomlerd/src/peer.rs#L1531), wherever display match runs). It hands the screen
-back at once and tells the viewer ([`display_match.rs:1651`](../agents/roomlerd/src/display_match.rs#L1651)
+([`peer.rs:1558`](../agents/roomlerd/src/peer.rs#L1558), wherever display match runs). It hands the screen
+back at once and tells the viewer ([`display_match.rs:1656`](../agents/roomlerd/src/display_match.rs#L1656)
 `on_tick`):
 
 | What changed | The answer | Restored |
@@ -177,7 +177,7 @@ back at once and tells the viewer ([`display_match.rs:1651`](../agents/roomlerd/
 | a recording started (P1c) | `refused: recording`, said by this watcher | yes, by the recording's start, before its recorder launched |
 
 The mode is not re-applied until the viewer asks again (toggle off and on): a returning person never fights a
-timer for their own screen ([`display_match.rs:1630`](../agents/roomlerd/src/display_match.rs#L1630)
+timer for their own screen ([`display_match.rs:1635`](../agents/roomlerd/src/display_match.rs#L1635)
 `hand_back`). A recording's end is the exception, because nobody came back: the request it refused is
 decided again, through the whole guard (P1c, below).
 
@@ -214,21 +214,21 @@ sequenceDiagram
 
 | When | What happens | Code |
 |---|---|---|
-| a recorder is about to launch: the person's `RecordStart`, or a remote controller's start | the hold is taken after the one-at-a-time check and before the launch. A mode a session switched goes back first, logged `the screen is handed back … why="recording"`, and that session's request then waits for the recording's end | [`manager.rs:650`](../agents/roomlerd/src/recording/manager.rs#L650) (in `start_inner`), [`display_match.rs:1491`](../agents/roomlerd/src/display_match.rs#L1491) `hold_for_recording` |
-| a request while the recording runs: a viewer that connects, a second viewer, an unlock | `refused: recording`, and the request waits | [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch`, [`display_match.rs:1389`](../agents/roomlerd/src/display_match.rs#L1389) `waits_for` |
-| the session whose mode went back | its watcher tells its viewer once, within a quarter second | [`display_match.rs:1581`](../agents/roomlerd/src/display_match.rs#L1581) `recording_turn`, [`peer.rs:1535`](../agents/roomlerd/src/peer.rs#L1535) |
-| the recorder stopped: it reported `stopped`, `refused` or `error`, or its output closed | the hold is let go, and each waiting request is decided again within a quarter second through the whole guard, so an attended screen still refuses | [`manager.rs:775`](../agents/roomlerd/src/recording/manager.rs#L775), [`display_match.rs:1651`](../agents/roomlerd/src/display_match.rs#L1651) `on_tick` |
-| a session that ends during the recording | what it waited for is dropped, and its close restores nothing, since the mode went back already | [`display_match.rs:1677`](../agents/roomlerd/src/display_match.rs#L1677) `forget` |
-| the viewer turns display match off | what it waited for is dropped. Before this a `locked` wait survived it, and the unlock switched a screen whose viewer had turned the match off | [`display_match.rs:1685`](../agents/roomlerd/src/display_match.rs#L1685) `turn_off` |
+| a recorder is about to launch: the person's `RecordStart`, or a remote controller's start | the hold is taken after the one-at-a-time check and before the launch. A mode a session switched goes back first, logged `the screen is handed back … why="recording"`, and that session's request then waits for the recording's end | [`manager.rs:650`](../agents/roomlerd/src/recording/manager.rs#L650) (in `start_inner`), [`display_match.rs:1496`](../agents/roomlerd/src/display_match.rs#L1496) `hold_for_recording` |
+| a request while the recording runs: a viewer that connects, a second viewer, an unlock | `refused: recording`, and the request waits | [`display_match.rs:1336`](../agents/roomlerd/src/display_match.rs#L1336) `may_switch`, [`display_match.rs:1394`](../agents/roomlerd/src/display_match.rs#L1394) `waits_for` |
+| the session whose mode went back | its watcher tells its viewer once, within a quarter second | [`display_match.rs:1586`](../agents/roomlerd/src/display_match.rs#L1586) `recording_turn`, [`peer.rs:1562`](../agents/roomlerd/src/peer.rs#L1562) |
+| the recorder stopped: it reported `stopped`, `refused` or `error`, or its output closed | the hold is let go, and each waiting request is decided again within a quarter second through the whole guard, so an attended screen still refuses | [`manager.rs:775`](../agents/roomlerd/src/recording/manager.rs#L775), [`display_match.rs:1656`](../agents/roomlerd/src/display_match.rs#L1656) `on_tick` |
+| a session that ends during the recording | what it waited for is dropped, and its close restores nothing, since the mode went back already | [`display_match.rs:1682`](../agents/roomlerd/src/display_match.rs#L1682) `forget` |
+| the viewer turns display match off | what it waited for is dropped. Before this a `locked` wait survived it, and the unlock switched a screen whose viewer had turned the match off | [`display_match.rs:1690`](../agents/roomlerd/src/display_match.rs#L1690) `turn_off` |
 
 - ⚠️ **A recording wins under `always` too** (FR-108 decision 7, settled by the operator on 2026-11-05). A
   switch under a recording freezes it or ends its file, and the session's end would change the display under
   it anyway. Only the owner's `never` answers first, because it outlasts the recording. One function decides
-  it ([`display_match.rs:1356`](../agents/roomlerd/src/display_match.rs#L1356) `a_recording_wins`), so
+  it ([`display_match.rs:1361`](../agents/roomlerd/src/display_match.rs#L1361) `a_recording_wins`), so
   giving `always` its rc.191 meaning back is a one-line change.
 - ⚠️ **One change of the mode at a time.** A decision with its switch, an owner's restore, and the hold
   with its hand-back take one lock
-  ([`display_match.rs:1467`](../agents/roomlerd/src/display_match.rs#L1467) `DECIDING`). A request that
+  ([`display_match.rs:1472`](../agents/roomlerd/src/display_match.rs#L1472) `DECIDING`). A request that
   read "no recording" has switched before the hold hands the screen back, never after it, and no restore
   is still running when the recorder launches.
 - **The hold is a count**, the shape of `recording::manager::is_recording`: each recording's hold adds one
@@ -245,7 +245,7 @@ sequenceDiagram
 
 A daemon started with `ROOMLERD_VIRTUAL_DESKTOP=1` runs a desktop of its own: an X server, a window manager
 and the startup apps. Nobody sits at that screen, since it is the daemon's own, so display match switches it
-without asking who is there ([`display_match.rs:1405`](../agents/roomlerd/src/display_match.rs#L1405)). The
+without asking who is there ([`display_match.rs:1410`](../agents/roomlerd/src/display_match.rs#L1410)). The
 owner's `never` still holds.
 
 ```mermaid
@@ -289,10 +289,10 @@ sequenceDiagram
   refuses to delete the mode in use ([`display_match.rs:303`](../agents/roomlerd/src/display_match.rs#L303)).
 - **The capture opens again at the new size.** X11's capturer takes its size when it opens, so every switch
   and restore bumps a counter the capture worker watches
-  ([`scrap_backend.rs:287`](../agents/roomlerd/src/capture/scrap_backend.rs#L287)). The encoder already
+  ([`scrap_backend.rs:289`](../agents/roomlerd/src/capture/scrap_backend.rs#L289)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb, on
-  the same display ([`virtual_desktop.rs:1602`](../agents/roomlerd/src/virtual_desktop.rs#L1602) `start_server`). An
+  the same display ([`virtual_desktop.rs:1712`](../agents/roomlerd/src/virtual_desktop.rs#L1712) `start_server`). An
   Xorg that hung is not tried again while the daemon runs; one that exited is tried again at the next
   start of the desktop.
 - Kill switches: `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb` keeps the desktop on Xvfb; `display_match = never`
@@ -331,9 +331,9 @@ sequenceDiagram
 | Who is at the screen | `GetLastInputInfo`, and the secure desktop | the X server's idle clock (MIT-SCREEN-SAVER), which XTest input moves as injected input moves Windows' clock, and logind's `LockedHint` ([`presence.rs:211`](../agents/roomlerd/src/presence.rs#L211)) |
 | The modes | the display's own list | the one active output's list in `xrandr --current`; none is added, this is someone's monitor ([`display_match.rs:370`](../agents/roomlerd/src/display_match.rs#L370) `parse_xrandr_outputs`) |
 | Several displays | the primary only | more than one active output answers `unsupported` |
-| After a crash | `CDS_FULLSCREEN`: Windows reverts the mode itself | a restore guard in `$XDG_RUNTIME_DIR`, written before the switch; the next start puts the start mode back, only while the screen still shows the mode display match set ([`display_match.rs:425`](../agents/roomlerd/src/display_match.rs#L425) `guard_undoes`, [`display_match.rs:605`](../agents/roomlerd/src/display_match.rs#L605) `recover`) |
-| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1478`](../agents/roomlerd/src/peer.rs#L1478)) |
-| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1518`](../agents/roomlerd/src/peer.rs#L1518)) |
+| After a crash | `CDS_FULLSCREEN`: Windows reverts the mode itself | a restore guard in `$XDG_RUNTIME_DIR`, written before the switch; the next start puts the start mode back, only while the screen still shows the mode display match set ([`display_match.rs:425`](../agents/roomlerd/src/display_match.rs#L425) `guard_undoes`, [`display_match.rs:610`](../agents/roomlerd/src/display_match.rs#L610) `recover`) |
+| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1505`](../agents/roomlerd/src/peer.rs#L1505)) |
+| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1545`](../agents/roomlerd/src/peer.rs#L1545)) |
 | Kill switch | `display_match = never` | `ROOMLERD_X11_DISPLAY_MATCH=0`, and `display_match = never` |
 
 - ⚠️ **The X server says how long ago, not when.** "Now minus the idle time" moves by each read's latency,
@@ -350,11 +350,14 @@ sequenceDiagram
 - ⚠️ **Our own switch is not a person.** A switch to a mode smaller than where the pointer sits makes the X server
   clamp the pointer into the new screen, and the clamp resets the X idle clock as an input would. Each mode set
   records its run, and presence counts an idle-clock move inside it, give or take `MACHINE_SLACK_MS`, as the
-  machine's ([`display_match.rs:646`](../agents/roomlerd/src/display_match.rs#L646) `own_switch_explains`). Until
+  machine's ([`display_match.rs:651`](../agents/roomlerd/src/display_match.rs#L651) `own_switch_explains`). Until
   #2644, presence read the clamp as a person and handed the screen back 0.2 s after every such switch
   (FR-97 §8, 0.4.148's release check).
 - **The guard needs somewhere to live.** No `$XDG_RUNTIME_DIR`, no switch: an X11 mode outlives the process
   that set it, and a mode a crash stranded would be the person's screen until they fixed it themselves.
+  The guard's folder is the account's own runtime folder, a person's `$XDG_RUNTIME_DIR` where it names an
+  absolute folder. A root process has none, whatever it was started with, so it keeps no guard and makes no
+  switch (#3866, [`display_match.rs:497`](../agents/roomlerd/src/display_match.rs#L497) `guard_path`).
 
 ## A Mac's main display (FR-97 P2d-2b)
 
@@ -388,9 +391,9 @@ sequenceDiagram
 | Who is at the screen | the X idle clock | the HID idle clock (`CGEventSourceSecondsSinceLastEventType` over the HID system state), which injected input moves as it moves Windows' clock, and the session's lock as keep busy reads it ([`presence.rs:277`](../agents/roomlerd/src/presence.rs#L277)) |
 | The modes | the active output's list | the display's own list with its low-resolution duplicates, at the scale it shows, so a HiDPI desktop stays HiDPI and its text keeps the size the person reads it at; at the chosen size, its refresh rate where offered, else the highest ([`display_match.rs:119`](../agents/roomlerd/src/display_match.rs#L119) `pick_mac_mode`) |
 | Several displays | more than one active output answers `unsupported` | the same, for more than one active display |
-| After a crash | a restore guard in `$XDG_RUNTIME_DIR` | nothing to do: a mode set by `CGDisplaySetDisplayMode` lasts only as long as the process that set it ([`display_match.rs:672`](../agents/roomlerd/src/display_match.rs#L672)) |
+| After a crash | a restore guard in `$XDG_RUNTIME_DIR` | nothing to do: a mode set by `CGDisplaySetDisplayMode` lasts only as long as the process that set it ([`display_match.rs:677`](../agents/roomlerd/src/display_match.rs#L677)) |
 | Our own switch | an idle-clock move inside it is the machine's (`own_switch_explains`) | never seen: the pointer clamp moves the session's combined clock, not the HID one |
-| A supervised Mac | — | the root hands its worker its kill switch and its `display_match`, and the worker keeps the stricter of that policy and its own ([`display_match.rs:1239`](../agents/roomlerd/src/display_match.rs#L1239) `with_root_floor`; FR-43's `WORKER_ENV_FORWARD`) |
+| A supervised Mac | — | the root hands its worker its kill switch and its `display_match`, and the worker keeps the stricter of that policy and its own ([`display_match.rs:1244`](../agents/roomlerd/src/display_match.rs#L1244) `with_root_floor`; FR-43's `WORKER_ENV_FORWARD`) |
 | Kill switch | `ROOMLERD_X11_DISPLAY_MATCH=0` | `ROOMLERD_MAC_DISPLAY_MATCH=0`, and `display_match = never` |
 
 - 🔍 **Measured before it was built** (FR-97 §8, a tart Mac, macOS 15.7.7). A mode set by `CGDisplaySetDisplayMode`
@@ -403,7 +406,7 @@ sequenceDiagram
   with the tracker it shares with Windows, with no exception for the switch itself.
 - **The capture follows the mode.** A Mac's stream is a `CGDisplayStream` opened at a size, so after a switch it
   opens again, as X11's capturer does
-  ([`capture/scrap_backend.rs:334`](../agents/roomlerd/src/capture/scrap_backend.rs#L334)).
+  ([`capture/scrap_backend.rs:336`](../agents/roomlerd/src/capture/scrap_backend.rs#L336)).
 - **Off the main thread.** `CGDisplaySetDisplayMode` from a second thread switched the mode and returned 0
   (measured), so the switch does not wait on the AppKit pump.
 

@@ -19,7 +19,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
@@ -40,8 +40,8 @@ pub struct OverlayPolicyResponse {
     pub tenant_id: String,
     pub name: String,
     pub enabled: bool,
-    pub sources: Vec<OverlaySelector>,
-    pub via: Vec<OverlayTarget>,
+    pub sources: Vec<OverlaySelectorView>,
+    pub via: Vec<OverlayTargetView>,
     pub destinations: Vec<OverlayRule>,
     pub created_at: String,
     pub updated_at: String,
@@ -54,8 +54,8 @@ impl From<OverlayPolicy> for OverlayPolicyResponse {
             tenant_id: p.tenant_id.to_hex(),
             name: p.name,
             enabled: p.enabled,
-            sources: p.sources,
-            via: p.via,
+            sources: p.sources.into_iter().map(Into::into).collect(),
+            via: p.via.into_iter().map(Into::into).collect(),
             destinations: p.destinations,
             created_at: p.created_at.try_to_rfc3339_string().unwrap_or_default(),
             updated_at: p.updated_at.try_to_rfc3339_string().unwrap_or_default(),
@@ -147,6 +147,13 @@ fn source_role_ids(sources: &[OverlaySelector]) -> Vec<ObjectId> {
         .collect()
 }
 
+/// The gate on every route here: `MANAGE_AGENTS` in the path org, decided
+/// FIRST, before a policy id is parsed, a body read or a policy looked up
+/// (#4187), as its tunnel-policy twin `tunnel_policy_manager` is. A member
+/// without the bit gets one 403 `forbidden` whatever the body is, so the
+/// writes take their body as `Result<Json<T>, JsonRejection>` and read it
+/// after this; a holder is answered one that does not parse as before
+/// (`ApiError::JsonBody`).
 async fn gate(
     state: &NetworkState,
     tenant_id: &str,
@@ -187,9 +194,10 @@ pub async fn create(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<UpsertOverlayPolicyRequest>,
+    body: Result<Json<UpsertOverlayPolicyRequest>, JsonRejection>,
 ) -> Result<Json<OverlayPolicyResponse>, ApiError> {
     let tid = gate(&state, &tenant_id, &auth).await?;
+    let Json(body) = body?;
     validate(&body)?;
     // A role source names a role of this org, or the body is a 400.
     roomler_core::guards::require_org_roles(&state, tid, &source_role_ids(&body.sources), &[])
@@ -237,9 +245,12 @@ pub async fn update(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
-    Json(body): Json<UpsertOverlayPolicyRequest>,
+    body: Result<Json<UpsertOverlayPolicyRequest>, JsonRejection>,
 ) -> Result<Json<OverlayPolicyResponse>, ApiError> {
     let tid = gate(&state, &tenant_id, &auth).await?;
+    // Read straight after the gate, before the id: a holder is answered a
+    // body that does not parse as before, whatever the id (#4187).
+    let Json(body) = body?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
     // Resolve the target LIVE before touching it — a removed policy is a 404
@@ -316,9 +327,10 @@ pub async fn set_mode(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<SetAclModeRequest>,
+    body: Result<Json<SetAclModeRequest>, JsonRejection>,
 ) -> Result<Json<AclModeResponse>, ApiError> {
     let tid = gate(&state, &tenant_id, &auth).await?;
+    let Json(body) = body?;
     state.overlay_networks.set_acl_mode(tid, body.mode).await?;
     refan_tenant(&state, tid).await;
     Ok(Json(AclModeResponse { mode: body.mode }))
@@ -378,4 +390,286 @@ async fn refan_tenant(state: &NetworkState, tenant_id: ObjectId) {
     crate::derp_acl::rebuild(state, tenant_id, network_id).await;
     // FR-19 — a policy edit can un-grant a live relay session; revoke those.
     crate::org_relay::reconcile_acl(state, tenant_id).await;
+}
+
+/// An overlay rule's source as an overlay-acl answer carries it (#3636): its
+/// id the 24-hex string `docs/api.md` promises, never bson's `{"$oid": …}`,
+/// by which the Overlay ACL tab could name no node, member or role. The kinds
+/// and the `id` key are the model's (`OverlaySelector`), so what a page saves
+/// back is what `UpsertOverlayPolicyRequest` reads. Serialize only, built at
+/// the route: what Mongo stores and what the netmap compile reads stay the
+/// model's.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OverlaySelectorView {
+    NodeId {
+        #[serde(rename = "id")]
+        node_id: String,
+    },
+    UserId {
+        #[serde(rename = "id")]
+        user_id: String,
+    },
+    RoleId {
+        #[serde(rename = "id")]
+        role_id: String,
+    },
+    AllNodes,
+}
+
+/// No `_` arm and no `..`: a source kind or field the model gains does not
+/// compile until its answer is written here.
+impl From<OverlaySelector> for OverlaySelectorView {
+    fn from(source: OverlaySelector) -> Self {
+        match source {
+            OverlaySelector::NodeId { node_id } => Self::NodeId {
+                node_id: node_id.to_hex(),
+            },
+            OverlaySelector::UserId { user_id } => Self::UserId {
+                user_id: user_id.to_hex(),
+            },
+            OverlaySelector::RoleId { role_id } => Self::RoleId {
+                role_id: role_id.to_hex(),
+            },
+            OverlaySelector::AllNodes => Self::AllNodes,
+        }
+    }
+}
+
+/// A rule's via node as an answer carries it; see [`OverlaySelectorView`].
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OverlayTargetView {
+    NodeId {
+        #[serde(rename = "id")]
+        node_id: String,
+    },
+    AllNodes,
+}
+
+impl From<OverlayTarget> for OverlayTargetView {
+    fn from(target: OverlayTarget) -> Self {
+        match target {
+            OverlayTarget::NodeId { node_id } => Self::NodeId {
+                node_id: node_id.to_hex(),
+            },
+            OverlayTarget::AllNodes => Self::AllNodes,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! #3636 — what an overlay-ACL answer carries on the wire. Every id is the
+    //! 24-hex string `docs/api.md` promises: the Overlay ACL tab names a
+    //! source or a via node by it, and its editor sends it back when it saves.
+
+    use super::*;
+    use bson::DateTime;
+    use roomler_ai_remote_control::models::{PortRange, ProtocolKind};
+    use serde_json::{Value, json};
+
+    /// A stored rule that names every source and via kind there is: a node,
+    /// a user and a role as sources, then the catch-all; the node as the via,
+    /// then the catch-all. The three ids, in that order.
+    fn every_kind() -> (OverlayPolicy, [ObjectId; 3]) {
+        let ids = [ObjectId::new(), ObjectId::new(), ObjectId::new()];
+        let [node, user, role] = ids;
+        let now = DateTime::now();
+        let policy = OverlayPolicy {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            name: "every kind".into(),
+            enabled: true,
+            sources: vec![
+                OverlaySelector::NodeId { node_id: node },
+                OverlaySelector::UserId { user_id: user },
+                OverlaySelector::RoleId { role_id: role },
+                OverlaySelector::AllNodes,
+            ],
+            via: vec![
+                OverlayTarget::NodeId { node_id: node },
+                OverlayTarget::AllNodes,
+            ],
+            destinations: vec![OverlayRule {
+                cidr: "192.0.2.1/32".into(),
+                port_range: PortRange { low: 9, high: 9 },
+                proto: ProtocolKind::Tcp,
+            }],
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        (policy, ids)
+    }
+
+    fn is_hex24(s: &str) -> bool {
+        s.len() == 24 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// What is wrong with `entries` as the browser reads them, against
+    /// `want`: `(kind, the id)`, `None` for a catch-all. An id must be the
+    /// 24-hex string of the stored one; a catch-all is the single key `kind`;
+    /// nothing is lost, added or reordered.
+    fn wire_problems(
+        what: &str,
+        entries: &Value,
+        want: &[(&str, Option<ObjectId>)],
+    ) -> Vec<String> {
+        let Some(got) = entries.as_array() else {
+            return vec![format!("{what}: not an array: {entries}")];
+        };
+        let mut wrong = Vec::new();
+        if got.len() != want.len() {
+            wrong.push(format!(
+                "{what}: {} entries, want {}: {entries}",
+                got.len(),
+                want.len()
+            ));
+        }
+        for (i, (entry, (kind, id))) in got.iter().zip(want).enumerate() {
+            let at = format!("{what}[{i}] ({kind})");
+            if entry["kind"] != *kind {
+                wrong.push(format!("{at}: the kind is {}", entry["kind"]));
+            }
+            let keys = entry.as_object().map_or(0, |o| o.len());
+            match id {
+                None if keys != 1 => wrong.push(format!(
+                    "{at}: a catch-all is the single key `kind`: {entry}"
+                )),
+                None => {}
+                Some(id) => match entry["id"].as_str() {
+                    None => wrong.push(format!("{at}: the id is not a string: {entry}")),
+                    Some(s) if !is_hex24(s) => {
+                        wrong.push(format!("{at}: the id is not 24 lowercase hex: {s}"))
+                    }
+                    Some(s) if s != id.to_hex() => {
+                        wrong.push(format!("{at}: the id {s} is not the stored {id}"))
+                    }
+                    Some(_) if keys != 2 => {
+                        wrong.push(format!("{at}: `kind` and `id` only: {entry}"))
+                    }
+                    Some(_) => {}
+                },
+            }
+        }
+        wrong
+    }
+
+    /// The answer of every overlay-acl route that returns a rule (create,
+    /// list, get, update) is an `OverlayPolicyResponse`: its source and via
+    /// ids are hex strings, never bson's extended JSON `{"$oid": …}`, by
+    /// which the Overlay ACL tab could name no node, user or role.
+    #[test]
+    fn an_overlay_policy_answer_names_every_source_and_via_id_as_a_hex_string() {
+        let (policy, [node, user, role]) = every_kind();
+        let answer = serde_json::to_value(OverlayPolicyResponse::from(policy)).expect("serialises");
+        let mut wrong = wire_problems(
+            "sources",
+            &answer["sources"],
+            &[
+                ("node_id", Some(node)),
+                ("user_id", Some(user)),
+                ("role_id", Some(role)),
+                ("all_nodes", None),
+            ],
+        );
+        wrong.extend(wire_problems(
+            "via",
+            &answer["via"],
+            &[("node_id", Some(node)), ("all_nodes", None)],
+        ));
+        let text = answer.to_string();
+        if text.contains("$oid") {
+            wrong.push(format!("the answer carries `$oid`: {text}"));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Every source kind, with the JSON an answer carries for it, written
+    /// out: the kind strings are a compatibility surface the web app matches.
+    fn every_source() -> Vec<(OverlaySelector, Value)> {
+        let [node, user, role] = [(); 3].map(|()| ObjectId::new());
+        vec![
+            (
+                OverlaySelector::NodeId { node_id: node },
+                json!({ "kind": "node_id", "id": node.to_hex() }),
+            ),
+            (
+                OverlaySelector::UserId { user_id: user },
+                json!({ "kind": "user_id", "id": user.to_hex() }),
+            ),
+            (
+                OverlaySelector::RoleId { role_id: role },
+                json!({ "kind": "role_id", "id": role.to_hex() }),
+            ),
+            (OverlaySelector::AllNodes, json!({ "kind": "all_nodes" })),
+        ]
+    }
+
+    /// Every via kind, as [`every_source`].
+    fn every_via() -> Vec<(OverlayTarget, Value)> {
+        let node = ObjectId::new();
+        vec![
+            (
+                OverlayTarget::NodeId { node_id: node },
+                json!({ "kind": "node_id", "id": node.to_hex() }),
+            ),
+            (OverlayTarget::AllNodes, json!({ "kind": "all_nodes" })),
+        ]
+    }
+
+    fn source_answer(source: &OverlaySelector) -> Value {
+        serde_json::to_value(OverlaySelectorView::from(source.clone())).expect("serialises")
+    }
+
+    fn via_answer(via: &OverlayTarget) -> Value {
+        serde_json::to_value(OverlayTargetView::from(via.clone())).expect("serialises")
+    }
+
+    #[test]
+    fn each_source_and_via_kind_answers_its_kind_and_its_hex_id() {
+        for (source, want) in every_source() {
+            assert_eq!(source_answer(&source), want, "{source:?}");
+        }
+        for (via, want) in every_via() {
+            assert_eq!(via_answer(&via), want, "{via:?}");
+        }
+    }
+
+    /// The view writes the model's own kind and keys, so a kind the model
+    /// renamed or a key it moved cannot leave the answers behind.
+    #[test]
+    fn an_answer_names_the_kind_and_the_keys_the_model_writes() {
+        fn keys(v: &Value) -> Vec<&String> {
+            v.as_object().expect("an object").keys().collect()
+        }
+        for (source, _) in every_source() {
+            let (answer, model) = (
+                source_answer(&source),
+                serde_json::to_value(&source).unwrap(),
+            );
+            assert_eq!(answer["kind"], model["kind"], "{source:?}");
+            assert_eq!(keys(&answer), keys(&model), "{source:?}");
+        }
+        for (via, _) in every_via() {
+            let (answer, model) = (via_answer(&via), serde_json::to_value(&via).unwrap());
+            assert_eq!(answer["kind"], model["kind"], "{via:?}");
+            assert_eq!(keys(&answer), keys(&model), "{via:?}");
+        }
+    }
+
+    /// What an answer carries reads back through the request type as the
+    /// stored value it came from: the editor's save is a round trip.
+    #[test]
+    fn an_answer_reads_back_as_the_source_or_via_it_came_from() {
+        for (source, _) in every_source() {
+            let back: OverlaySelector = serde_json::from_value(source_answer(&source)).unwrap();
+            assert_eq!(back, source);
+        }
+        for (via, _) in every_via() {
+            let back: OverlayTarget = serde_json::from_value(via_answer(&via)).unwrap();
+            assert_eq!(back, via);
+        }
+    }
 }

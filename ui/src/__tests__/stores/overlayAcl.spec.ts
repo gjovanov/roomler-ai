@@ -9,6 +9,7 @@ vi.mock('@/api/client', () => ({
 
 import { useOverlayAclStore, type OverlayPolicy } from '@/stores/overlayAcl'
 import { api } from '@/api/client'
+import { pagedRoute, rowId } from './pagedRoute'
 
 const mockApi = vi.mocked(api)
 const TENANT_ID = '69a1dbbad2000f26adc875ce'
@@ -47,7 +48,9 @@ describe('overlayAcl store', () => {
     const store = useOverlayAclStore()
     await store.fetchPolicies(TENANT_ID)
 
-    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/overlay-acl`)
+    expect(mockApi.get).toHaveBeenCalledWith(
+      `/tenant/${TENANT_ID}/overlay-acl?page=1&per_page=100`,
+    )
     expect(store.policies).toHaveLength(1)
     expect(store.total).toBe(1)
     // The posture rides the list response so the UI can render the banner
@@ -152,5 +155,145 @@ describe('overlayAcl store', () => {
       { mode: 'enforce' },
     )
     expect(store.mode).toBe('enforce')
+  })
+})
+
+// #4188 — the route answers one page at a time: 25 rows unless the request
+// asks for more, and never more than 100. It answers no `total_pages`.
+describe('overlayAcl store: an org with more rules than one page holds', () => {
+  const named = (i: number) => mkPolicy({ id: rowId(i), name: `rule-${i}` })
+
+  it('lists every rule, in the server order, each once, with the server total and posture', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 101, row: named, extra: { mode: 'enforce' } }),
+    )
+    const store = useOverlayAclStore()
+    await store.fetchPolicies(TENANT_ID)
+
+    expect(store.error).toBeNull()
+    expect(store.policies).toHaveLength(101)
+    expect(store.policies.map((p) => p.name)).toEqual(
+      Array.from({ length: 101 }, (_, i) => `rule-${i}`),
+    )
+    expect(store.total).toBe(101)
+    expect(store.mode).toBe('enforce')
+  })
+
+  it('stops at the page cap, keeps what it read, and says the cap cut the list', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 5001, row: named, extra: { mode: 'warn' } }),
+    )
+    const store = useOverlayAclStore()
+    await store.fetchPolicies(TENANT_ID)
+
+    expect(mockApi.get).toHaveBeenCalledTimes(50)
+    expect(store.policies).toHaveLength(5000)
+    expect(store.total).toBe(5001)
+    expect(store.truncated).toBe(true)
+    expect(store.mode).toBe('warn')
+    expect(store.error).toBeNull()
+
+    // A later read that gets the whole list clears it.
+    mockApi.get.mockImplementation(pagedRoute({ total: 3, row: named, extra: { mode: 'warn' } }))
+    await store.fetchPolicies(TENANT_ID)
+    expect(store.policies).toHaveLength(3)
+    expect(store.truncated).toBe(false)
+  })
+
+  it('stops at a failed page: the error shows, no part of the list is kept, the posture stays', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({
+        total: 250,
+        row: named,
+        extra: { mode: 'enforce' },
+        fail: { page: 2, error: new Error('API error 500') },
+      }),
+    )
+    const store = useOverlayAclStore()
+    store.mode = 'warn'
+    await store.fetchPolicies(TENANT_ID)
+
+    expect(mockApi.get).toHaveBeenCalledTimes(2)
+    expect(store.error).toBe('API error 500')
+    expect(store.policies).toEqual([])
+    expect(store.total).toBe(0)
+    expect(store.truncated).toBe(false)
+    expect(store.mode).toBe('warn')
+    expect(store.loading).toBe(false)
+  })
+})
+
+// #4248 — the store holds one org's rules and posture at a time, and knows
+// which. TENANT_ID is org A.
+describe('overlayAcl store: one org at a time (#4248)', () => {
+  const ORG_B = '69a1dbbad2000f26adc875cf'
+  const answer = (ids: string[], mode: 'off' | 'warn' | 'enforce') => ({
+    items: ids.map((id) => mkPolicy({ id })),
+    total: ids.length,
+    page: 1,
+    per_page: 100,
+    mode,
+  })
+
+  it("a fetch for org B drops org A's rules and posture at once, and org A's late answer", async () => {
+    const store = useOverlayAclStore()
+    mockApi.get.mockResolvedValueOnce(answer(['pa'], 'enforce'))
+    await store.fetchPolicies(TENANT_ID)
+    let lateA!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (lateA = r)))
+    const refreshA = store.fetchPolicies(TENANT_ID)
+    // A refresh of the same org keeps what it shows while it loads.
+    expect(store.policies.map((p) => p.id)).toEqual(['pa'])
+    expect(store.mode).toBe('enforce')
+
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)))
+    const loadB = store.fetchPolicies(ORG_B)
+    expect(store.policies).toEqual([])
+    expect(store.total).toBe(0)
+    expect(store.mode).toBe('off')
+    expect(store.policiesTenantId).toBe(ORG_B)
+
+    answerB(answer(['pb'], 'warn'))
+    await loadB
+    lateA(answer(['pa', 'pa2'], 'enforce'))
+    await refreshA
+    expect(store.policies.map((p) => p.id)).toEqual(['pb'])
+    expect(store.mode).toBe('warn')
+    expect(store.loading).toBe(false)
+  })
+
+  it("a save, a delete or a posture change answered for org A leaves org B's as they are", async () => {
+    const store = useOverlayAclStore()
+    mockApi.get.mockResolvedValueOnce(answer(['pb'], 'warn'))
+    await store.fetchPolicies(ORG_B)
+    const pb = store.policies[0]
+    const nameB = pb.name
+
+    mockApi.post.mockResolvedValueOnce(mkPolicy({ id: 'pa' }))
+    await store.createPolicy(TENANT_ID, {
+      name: 'from org A',
+      enabled: true,
+      sources: [{ kind: 'all_nodes' }],
+      via: [{ kind: 'all_nodes' }],
+      destinations: [],
+    })
+    mockApi.put.mockResolvedValueOnce(mkPolicy({ id: 'pb', name: 'renamed in org A' }))
+    await store.updatePolicy(TENANT_ID, 'pb', {
+      name: 'renamed in org A',
+      enabled: true,
+      sources: pb.sources,
+      via: pb.via,
+      destinations: pb.destinations,
+    })
+    mockApi.delete.mockResolvedValueOnce({ deleted: true })
+    await store.deletePolicy(TENANT_ID, 'pb')
+    mockApi.put.mockResolvedValueOnce({ mode: 'enforce' })
+    await store.setMode(TENANT_ID, 'enforce')
+
+    expect(store.policies.map((p) => p.id)).toEqual(['pb'])
+    expect(store.policies[0].name).toBe(nameB)
+    expect(store.total).toBe(1)
+    expect(store.mode).toBe('warn')
   })
 })

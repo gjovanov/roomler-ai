@@ -74,8 +74,8 @@ pub enum RejectKind {
 /// forever. Tunnel clients match on it (`RejectKind::AgentError` + this
 /// substring) and treat it as session death — end the session so the flow
 /// supervisor re-opens with fresh state instead of failing every local
-/// connection. Wire-stable: the string predates the client-side match, so
-/// rejects from older agents match too. Do not reword.
+/// connection. Wire-stable: the string predates the client-side match, so rejects from older
+/// agents match too. AGENT-WORD-KEPT: released tunnel clients match it; do not reword.
 pub const REJECT_REASON_SESSION_GONE: &str = "tunnel session not open on agent";
 
 /// Reject reason the SERVER sends when it holds NO tunnel session for the
@@ -1704,9 +1704,16 @@ pub enum ClientMsg {
         /// overlay (a Mac; Windows Home, #2077). The server can show it beside
         /// the route approval, so an admin sees "cannot serve" rather than
         /// nothing at all. Additive both ways: an older agent never sends it,
-        /// an older server ignores it.
+        /// an older server ignores it. #3562 — also the reason a setup that
+        /// failed withdrew the offer, re-sent at once by a re-join.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route_offer_withheld: Option<String>,
+        /// #3562 — whether this exit serves IPv6. Absent = an agent from before
+        /// #3562 (its clients keep the old rule), `false` = IPv4 only, `true` =
+        /// its own IPv6 NAT came up. Stated only by a node that offers a
+        /// default route. Absent stays absent on the wire, never `null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_serves_v6: Option<bool>,
     },
 
     /// Node trickles updated connectivity candidates; the server fans a
@@ -4073,6 +4080,12 @@ pub struct NetmapPeer {
     /// capability signal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udp_dialer_ok: Option<bool>,
+    /// #3562 — whether this exit serves IPv6, as its last join stated it:
+    /// absent = an exit (or a server) from before #3562, and a client then
+    /// keeps the old rule; `false` = IPv4 only, so a client keeps its IPv6
+    /// fail-closed and says why; `true` = its own IPv6 NAT came up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_serves_v6: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
     /// C4 stage 2 — this peer's STANDING warm TURN allocation's relayed
@@ -7456,6 +7469,7 @@ mod tests {
             supports_derp_floor: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
             route_offer_withheld: Some("WinNAT is not available".into()),
+            exit_serves_v6: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.join""#));
@@ -8284,6 +8298,7 @@ mod tests {
                 srflx_nat: Some("cone".into()),
                 caps: None,
                 udp_dialer_ok: None,
+                exit_serves_v6: None,
                 relay_home: None,
                 warm_relay_endpoint: None,
                 reachable: true,
@@ -8698,6 +8713,72 @@ mod tests {
                 assert_eq!(udp_dialer_ok, Some(false));
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// #3562 AC W4 — an exit's IPv6 statement has three states on every hop,
+    /// and absent stays ABSENT on the wire, never `null`: an older exit sends
+    /// no key, an older server stores none, and every peer then reads `None`
+    /// and keeps the pre-#3562 rule.
+    #[test]
+    fn exit_serves_v6_round_trips_and_is_absent_when_unset() {
+        let json = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert_eq!(p.exit_serves_v6, None, "an older server's peer");
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(
+            !s.contains("exit_serves_v6"),
+            "absent is omitted, never null: {s}"
+        );
+        for v in [false, true] {
+            let mut p2 = p.clone();
+            p2.exit_serves_v6 = Some(v);
+            let s2 = serde_json::to_string(&p2).unwrap();
+            assert!(s2.contains(&format!(r#""exit_serves_v6":{v}"#)), "{s2}");
+            assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
+        }
+
+        let join = |exit_serves_v6: Option<bool>| ClientMsg::OverlayJoin {
+            network_hint: None,
+            wg_public_key: "cHVia2V5".into(),
+            key_epoch: 0,
+            supported: vec!["wireguard-v1".into()],
+            mtu: 1280,
+            endpoints: vec![],
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            supports_forced_derp: false,
+            supports_overlay_echo: false,
+            supports_org_relay: false,
+            supports_join_refusal: true,
+            org_primary: None,
+            relay_port: None,
+            supports_server_relay_strategy: false,
+            supports_derp_floor: false,
+            advertised_routes: vec!["0.0.0.0/0".into()],
+            route_offer_withheld: None,
+            exit_serves_v6,
+        };
+        let stated = |wire: &str| match serde_json::from_str::<ClientMsg>(wire).unwrap() {
+            ClientMsg::OverlayJoin { exit_serves_v6, .. } => exit_serves_v6,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        let older = serde_json::to_string(&join(None)).unwrap();
+        assert!(
+            !older.contains("exit_serves_v6"),
+            "absent is omitted, never null: {older}"
+        );
+        assert_eq!(stated(&older), None);
+        for v in [false, true] {
+            let wire = serde_json::to_string(&join(Some(v))).unwrap();
+            assert!(wire.contains(&format!(r#""exit_serves_v6":{v}"#)), "{wire}");
+            assert_eq!(stated(&wire), Some(v));
         }
     }
 

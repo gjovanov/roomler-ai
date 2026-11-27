@@ -78,7 +78,7 @@ sequenceDiagram
 
 ### On a 401: recover before backing off
 
-When the server refuses the token at the socket (`agents/roomlerd/src/signaling.rs:1311`), the loop tries two things before its back-off ladder:
+When the server refuses the token at the socket (`agents/roomlerd/src/signaling.rs:1337`), the loop tries two things before its back-off ladder:
 
 1. **A newer token in the config file**, matched by server, tenant *and* device id. `roomlerd re-enroll` (or the companion's Re-enroll) wrote it while the daemon ran. Before FR-103 the daemon ignored it until a restart.
 2. **A renewal**, which the server grants up to **90 days past `exp`** (`RENEWAL_GRACE_SECS`, `crates/services/src/auth/mod.rs:116`). On the renew routes only; every other route enforces `exp` as before.
@@ -91,15 +91,15 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328), and comes back as that holder's: its new token acts for them.
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1309`; tunnel clients `crates/services/src/dao/tunnel_client.rs:369`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1353`; tunnel clients `crates/services/src/dao/tunnel_client.rs:369`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
 |---|---|
-| `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:96` |
+| `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:103` |
 | the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1425` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
-| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2168` |
+| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2170` |
 | the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:412` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
@@ -111,13 +111,13 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 The row comes back, but not what the removed device was allowed. Before #3627 a revive cleared `deleted_at` and nothing else, so the row came back with its SSH, exec and access policies, the org-relay and External access approvals, its connect code, approved routes, owner and labels, a pending config (pushed to the machine again on its first connect) and a standing key-rotation order, and the org's tunnel policies that named it applied to it again.
 
-`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:496`):
+`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:534`):
 
 | The row for `(tenant_id, machine_id)` | What the enrollment does |
 |---|---|
 | none | a new device (`AgentDao::create`), after the plan cap |
 | live: a device nobody removed (a lost token, a reinstall, `roomlerd re-enroll`) | refreshes it (`AgentDao::rehydrate`): os, version, the name unless an admin renamed it, the install method if the request says. **Everything it was allowed stays** |
-| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:326`) |
+| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:345`) |
 
 What a revive keeps, and nothing else:
 
@@ -146,7 +146,7 @@ The server logs each revive: `enroll: a removed device enrolled again and starts
 
 ### A connected device is told at once (#2267)
 
-A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1275`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1439`).
+A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1275`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1451`).
 
 Before #2267 the kick only took the device out of the hub. The device kept its socket and heard nothing. It learned of its removal at its next connection, after a network change or a pod roll, and on a stable network that could take days. Nothing could be done through that socket, because every action re-checks the row, but the device's own status read "connected" throughout.
 
@@ -176,8 +176,8 @@ What happens after exit 7 depends on how the daemon is installed. The device sta
 
 | Install | After exit 7 | After `roomlerd re-enroll` |
 |---|---|---|
-| Windows, the `Roomler` service (machine installs, attended or not) | its supervisor starts the worker again with a backoff of up to 60 s, for good; each start is refused and exits 7 (`decide_exit_reaction`, `agents/roomlerd/src/win_service/supervisor.rs:1103`) | the next start connects with the new token, with no hand |
-| Windows, the per-user Scheduled Task | stays down until the next sign-in: `<RestartOnFailure>` restarts no exit, measured (#3292) | `roomlerd service start` |
+| Windows, the `Roomler` service (machine installs, attended or not) | its supervisor starts the worker again with a backoff of up to 60 s, for good; each start is refused and exits 7 (`decide_exit_reaction`, `agents/roomlerd/src/win_service/supervisor.rs:1123`) | the next start connects with the new token, with no hand |
+| Windows, the per-user Scheduled Task | stays down until the next sign-in: `<RestartOnFailure>` restarts no exit, measured (#3292), and the launcher, which starts a crashed daemon again since FR-150 P2, leaves on exit 7 (`agents/roomlerdw/src/ends.rs:65-79`) | `roomlerd service start` |
 | macOS (launchd, `KeepAlive` on a failed exit) | relaunched at most every 10 s | the next relaunch, with no hand |
 | Linux, the system unit `roomlerd` | stays stopped: `RestartPreventExitStatus=7 8`, because restarting only hammers a server that already said no (`agents/roomlerd/packaging/linux/roomlerd.service:72`) | `sudo systemctl start roomlerd` |
 | Linux, the per-user unit `roomler` | stays stopped, by the same rule | `roomlerd service start` |

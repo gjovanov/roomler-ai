@@ -298,7 +298,7 @@ fn record_inner_at(
         log_tail: scrubbed_tail,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
-        hostname: detect_hostname(),
+        hostname: crate::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
         pid,
         suppressed_since_last,
     };
@@ -1436,29 +1436,6 @@ fn estimate_json_size(payload: &AgentCrashPayload) -> usize {
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-fn detect_hostname() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "unknown".to_string())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Read /etc/hostname; on most Linux/macOS this is the same
-        // as `hostname(1)`. Falls back to env-var HOSTNAME if not.
-        // `.ok()` collapses the Result so `.filter` (Option) is
-        // applicable; without it CI's Linux clippy step blows up
-        // with E0599 (Result is not an iterator).
-        std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("HOSTNAME").ok())
-            .unwrap_or_else(|| "unknown".to_string())
-    }
-}
-
 /// How much of the rolling log's end a crash sidecar reads. Its callers run in a
 /// dying process, and a per-user Windows daemon's stderr reaches this file, up to
 /// 256 MiB a day (`logging::send_stderr_to_the_log`, #3292).
@@ -1989,6 +1966,62 @@ mod tests {
         let _ = record_with_log_tail as fn(CrashReason, &str, WriterContext, Option<String>);
         let _ = record as fn(CrashReason, &str, WriterContext);
         let _ = record_with_appendix as fn(CrashReason, &str, WriterContext, &str);
+    }
+
+    // ─── #3934: the host a record names ─────────────────────────────────────
+
+    /// Set in the child [`a_crash_record_names_its_host_from_the_os`] starts.
+    const CHILD_3934: &str = "ROOMLER_TEST_3934_CHILD";
+
+    /// #3934 — a crash record names its host as the OS names it
+    /// ([`crate::machine::hostname`]). The record is written in a child of
+    /// this test binary with no `HOSTNAME`, as launchd and systemd start the
+    /// daemon: the recorder's own reader tried `/etc/hostname`, which a Mac
+    /// does not have, then `HOSTNAME`, so every record a Mac wrote said
+    /// `unknown`. The macOS job runs this case.
+    #[test]
+    fn a_crash_record_names_its_host_from_the_os() {
+        if std::env::var_os(CHILD_3934).is_some() {
+            let dir = tempdir_for_test();
+            let written = record_inner_at(
+                dir.path(),
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            )
+            .expect("a record in the test's own folder");
+            let record: AgentCrashPayload =
+                serde_json::from_slice(&fs::read(&written).expect("the record")).expect("JSON");
+            let os = crate::machine::hostname().expect("the OS names this host");
+            println!("3934|{}|{os}|", record.hostname);
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash_recorder::tests::a_crash_record_names_its_host_from_the_os",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_3934, "1")
+            .env_remove("HOSTNAME")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "the child failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // libtest prints the test's name on the line the child's row starts.
+        let row: Vec<&str> = stdout
+            .split_once("3934|")
+            .map_or(Vec::new(), |(_, rest)| rest.split('|').take(2).collect());
+        assert_eq!(row.len(), 2, "the child printed: {stdout}");
+        assert_eq!(
+            row[0], row[1],
+            "the record's host (left) is the OS's (right)"
+        );
     }
 
     // ─── #3018: an appendix after the tail ──────────────────────────────────

@@ -98,6 +98,11 @@ claims, no lock). Freed blocks are **quarantined, never re-issued**: a device th
 missed the migration still believes it holds an address there.
 ⚠️ Joining a **secondary** org does not start its WS loop — the daemon must be
 restarted. Signature: `last_seen_at == created_at` forever.
+⚠️ **One daemon per machine is enforced at `run`'s gate** (`start_gate`, #4280,
+`docs/multi-org.md` §2): the machine's guard is taken before the start's purge of
+the overlay's routes, the LocalAPI pipe and the first connect, and a run that
+finds it held leaves with 8 (0 on macOS), having marked, saved and counted
+nothing. New host-global work at start goes AFTER the gate, never ahead of it.
 
 **Peer relays** (FR-19) — a tenant-owned `roomlerd` forwards **ciphertext** between
 two nodes of the same tenant over UDP **3478** (the one port the symmetric-NAT corp
@@ -119,8 +124,8 @@ DERP floor won't re-request until it churns.
 by `SplitTun`. That is not an elegance choice: binding `overlay:22` fails
 EADDRINUSE wherever sshd covers `0.0.0.0:22`, and a corp-managed laptop cannot have
 sshd at all. Interception also leaves nothing for an EDR agent to terminate. Four
-default-deny gates; `ssh_enabled` alone grants nothing (empty `ssh_authorized_keys`
-= nobody).
+default-deny gates; `ssh_enabled` alone grants nothing: a session needs a server grant
+(`roomler ssh`) or a key in `ssh_authorized_keys`, the break-glass route, empty by default (#4325).
 ⚠️ `-R` is **deliberately not implemented** — it would make the device bind a
 listening socket, the one thing this design exists to avoid.
 ⚠️ `direct-tcpip` reads `forward_acl` **default-DENY, the opposite sense to the

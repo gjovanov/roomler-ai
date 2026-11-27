@@ -2,6 +2,8 @@
 
 > **CLOSED 2026-08-27** — issue #783 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
+**Anchors:** master `9e0063b4d` (closed 2026-08-27): this spec is the record of the work, and its line anchors read at that commit.
+
 **Status:** shipped in `agent-v0.4.5` (#785); field gate pending.
 Tracking issue: `FR-10` in gjovanov/roomler-ai/issues. Child of FR-1 (#767), which
 gated the direct-path rate machinery off relay and left goodput observe-only there.

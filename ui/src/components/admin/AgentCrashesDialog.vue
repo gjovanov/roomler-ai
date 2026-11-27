@@ -103,7 +103,7 @@
                   <div class="text-caption mb-2">{{ fmtAbsolute(c.crashedAtUnix) }}</div>
                   <div class="text-caption text-medium-emphasis mb-2">
                     <strong>Host:</strong> {{ c.hostname }} ·
-                    <strong>Agent:</strong> v{{ c.agentVersion }} ·
+                    <strong>roomlerd:</strong> {{ c.agentVersion }} ·
                     <strong>OS:</strong> {{ c.os }} ·
                     <strong>PID:</strong> {{ c.pid }} ·
                     <strong>Reported:</strong> {{ fmtRelative(reportedAtUnix(c)) }}

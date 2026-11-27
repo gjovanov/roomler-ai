@@ -1,11 +1,11 @@
 # FR-150: A per-user daemon is never left down by its own update or by a crash
 
-**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20; P0 read on a lab guest the same day; P1a in review (#4135). P1b and P2 follow, each its own pull request
+**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20; P0 read on a lab guest the same day; P1a merged (#4135, `e4160fa1c`), its cells read on candidates the same day; P1b merged (#4159, `29214ffc4`), its cells read on candidates the same day; P2 merged (#4199, `3cad49ba3`), its cells to come on candidates
 **Absorbs:** [#3507](https://github.com/gjovanov/roomler-ai/issues/3507) (the update path) and [#3295](https://github.com/gjovanov/roomler-ai/issues/3295) (the crash path), with the 2026-11-08 triage's re-spec of both
 **Builds on:** #3292 and #3296 (the launcher `roomlerdw.exe` and the one-shot time triggers), #3801 and #3852 (each account's own task, `Roomler-<SID>`), #3230 (the per-Machine MSI's steps write a record), #3289 and #3323 (a Windows crash loop raises `rollback_failed` and stays up), #3302 and #3345 (the install record), [FR-67](FR-67-update-outcome-observability.md) (#1267, the install verdict)
 **Related:** #3535 (two daemons on one host: closed as not planned, out of scope), #3509, #3340
 
-**Anchors:** master `73f341a94` (2026-11-20), read in the tree.
+**Anchors:** master `73f341a94` (2026-11-20), read in the tree. The Evidence keeps them: it is the code before P1a. From Design on, the anchors into the code P1a, P1b and P2 move follow it, since master was merged into #4135 (2026-11-20).
 
 ## Goal
 
@@ -131,8 +131,8 @@ offline, cannot happen on master for the same reason.
 
 ### P1a: the task names its own security descriptor
 
-`render_task_xml` (`service.rs:1285-1349`) writes a `<SecurityDescriptor>` into `<RegistrationInfo>`, after `<URI>`.
-Its SDDL is built from the SID of the account the process runs as (`own_account`, `service.rs:713-715`), the account
+`render_task_xml` (`service.rs:1543-1607`) writes a `<SecurityDescriptor>` into `<RegistrationInfo>`, after `<URI>`.
+Its SDDL is built from the SID of the account the process runs as (`own_account`, `service.rs:751-753`), the account
 the task runs as:
 
 ```text
@@ -159,7 +159,7 @@ P0 read what Task Scheduler does with it (the field log has each cell):
 | elevated, P1a, a new task | the account (C3) | full | yes |
 | elevated, P1a, over a task an elevated master registered | Administrators: the replace keeps it (C5) | read | not until the repair below |
 
-**Why full access is safe.** The task runs as the account itself, at `LeastPrivilege` (`service.rs:1310-1316`). At
+**Why full access is safe.** The task runs as the account itself, at `LeastPrivilege` (`service.rs:1568-1574`). At
 medium, Task Scheduler refuses a document at `HighestAvailable` (C4), and one whose principal is SYSTEM or another
 account, as a new task and over a task the account has full access to (C4b). So full access gives the account nothing
 beyond what every medium registration gives it today.
@@ -170,18 +170,18 @@ shell) replaces the task, and the task keeps its descriptor (C5). So when the ac
 cannot replace it, `register` deletes the task and registers it again, and the descriptor applies (C5c).
 `IRegisteredTask::SetSecurityDescriptor` repairs it in place too (C5b), but needs Task Scheduler's COM bindings, which
 the agent does not carry; the delete and the create go through the `Library` seam `register` already uses
-(`user_task.rs:91-113`). A daemon running under the deleted task keeps running (C5d), and a one-shot of the new task
+(`user_task.rs:115-158`). A daemon running under the deleted task keeps running (C5d), and a one-shot of the new task
 finds the instance lock held (`instance_lock.rs`) and exits. `register` then deletes the account's legacy `Roomler`
-too (`user_task.rs:159-174`), which no medium process can.
+too (`user_task.rs:246-257`), which no medium process can.
 
 **A self-update over a task its account cannot replace still comes back.** The update's `RegisterAutostart` runs the
 new package's launcher (`main.wxs:403-409`), so the first hop onto P1a already runs P1a's `service install`. At medium
 its replace is refused, but a medium process may still run that task (C2) and register a task of its own. So
 `service install` then registers `Roomler start-<SID>`, a task of the account's own:
 
-- the same three one-shots as the task's own (`service.rs:1266`), each with an end boundary an hour after the
+- the same three one-shots as the task's own (`service.rs:1439`), each with an end boundary an hour after the
   registration, so a sleep inside that hour keeps them (`StartWhenAvailable`);
-- one action, the launcher with `service start` (`service.rs:844-864`): a `/Run` of the account's task, so the daemon
+- one action, the launcher with `service start` (`service.rs:992-1012`): a `/Run` of the account's task, so the daemon
   runs under its own task, and its `IgnoreNew` drops the later starts (C6b);
 - `DeleteExpiredTaskAfter`, so it deletes itself once it has expired (C6b, C6c).
 
@@ -193,7 +193,9 @@ exists); the step names the repair only where the account cannot replace its tas
 **The daemon names such a task at its start.** A per-user daemon reads its own task's descriptor from the task's file
 under `%SystemRoot%\System32\Tasks` (the scheduler's copy in the registry is not readable at medium, C6) and checks it
 with a medium copy of its own token (`win_token::restricted_medium_copy`, `AccessCheck`). When its account cannot
-replace the task, it logs one WARN at start with the repair, and `service status` says so. Nothing is sent to the
+replace the task, it logs one WARN at start with the repair, and `service status` says so in a `Note:` line after its
+answer (`print_status`, `service.rs:2845-2851`). The companion's probe answers a plain `service status` with the same
+lines, and reads its answer by the `Auto-start:` prefix, so the note changes nothing there. Nothing is sent to the
 server (D5). `register` asks the same check.
 
 **Kill switch:** `ROOMLERD_TASK_SD=0` in the environment of `service install`. It registers master's task: no
@@ -202,20 +204,20 @@ descriptor in the XML, no repair and no `Roomler start-<SID>`.
 ### P1a: the per-user MSI's steps write their record
 
 #3230 gave the per-Machine MSI's steps a start line and an end line (`crates/agent-core/src/logging.rs:602-660`, begun
-at `app.rs:1608-1622`, ended at `app.rs:1405-1409`), because Windows Installer throws a custom action's stdout and
-stderr away. The per-user steps keep the profile's log (`app.rs:1430-1436`) and write no record. So a refused
+at `app.rs:1637-1654`, ended at `app.rs:1409-1413`), because Windows Installer throws a custom action's stdout and
+stderr away. The per-user steps keep the profile's log (`app.rs:1434-1440`) and write no record. So a refused
 registration leaves nothing but the MSI log's `returned actual error code 1`.
 
 P1a gives the per-user steps the same record, in the person's own log, the dated file the daemon writes:
 `service install`, `service uninstall`, `service start` (what `Roomler start-<SID>` runs), `service stop` with and
 without `--for-upgrade`, and `cleanup-legacy-install --target-flavour perUser`. They get it through a predicate of
-their own, so that `is_installer_step` and #3702's migration rule (`app.rs:1560-1571`) are unchanged. A person who
+their own, so that `is_installer_step` and #3702's migration rule (`app.rs:1589-1600`) are unchanged. A person who
 runs the same verb by hand gets the same two lines.
 
 ### P1b: the watcher owns the per-user relaunch
 
-`ensure_service_running` (`post_install.rs:668-697`) settles the per-Machine service after every verdict. For per-user
-it asks the task for a start only after a failed install (`:707-735`), because "exit 0 means the new task is
+`ensure_service_running` (`post_install.rs:679-713`) settles the per-Machine service after every verdict. For per-user
+it asks the task for a start only after a failed install (`:726-757`), because "exit 0 means the new task is
 registered … and its one-shots do this". #3507 is a successful install that registered nothing. P1b gives the per-user
 arm the service's contract: after every verdict, the daemon runs, or the record says why not.
 
@@ -236,14 +238,14 @@ flowchart TD
     W4 -- no --> R5["daemon: not running, with each rung's answer"]
 ```
 
-- **Up** is the daemon's stop event held for this config (`user_stop_event_held`, `service.rs:877-881`, FR-97 P4d). The
+- **Up** is the daemon's stop event held for this config (`user_stop_event_held`, `service.rs:1025-1029`, FR-97 P4d). The
   daemon creates it at start, in the person's session, where the watcher runs too.
-- **120 s** is past the first one-shot, which fires 60 s after `RegisterAutostart` (`service.rs:1266`), with room for
+- **120 s** is past the first one-shot, which fires 60 s after `RegisterAutostart` (`service.rs:1439`), with room for
   a slow guest.
-- **The first update onto P1b runs the old release's watcher.** `post_install.rs:703-705` says the same of #3292. So
+- **The first update onto P1b runs the old release's watcher.** `post_install.rs:719-721` says the same of #3292. So
   P1b protects the hops after it, and P1a protects the first one: through the task's own one-shots where the account
   can replace it, and through `Roomler start-<SID>` where it cannot (D1).
-- **The record.** `last-install.json` (`post_install.rs:125-137`) gets a field `daemon`: running or not running, how it
+- **The record.** `last-install.json` (`post_install.rs:125-142`) gets a field `daemon`: running or not running, how it
   came back, and each rung's answer. It is additive in the file and on the wire (`NodeStatus.last_install`, FR-67 P3),
   and the verdict words stay what they are.
 
@@ -252,8 +254,13 @@ arm is then master's: a start only after a failure.
 
 ### P2: the launcher supervises the daemon
 
-`roomlerdw.exe` (`agents/roomlerdw/src/main.rs:65-102`) waits for the daemon once and leaves with its code. P2 makes it a
-loop. The launcher's choices become one more row of `Install`'s table (`service.rs:29-43`), on purpose:
+The anchors in this section follow P2's tree (#4199, 2026-11-21).
+
+Before P2, `roomlerdw.exe` waited for the daemon once and left with its code. P2 makes it a loop over a seam
+(`agents/roomlerdw/src/ends.rs:110-123`), whose Windows side is the launcher itself (`agents/roomlerdw/src/main.rs:76-159`):
+`supervise` (`ends.rs:149-180`) starts the daemon, waits for it, and reads its end from one table (`end_of`,
+`ends.rs:65-79`). The table is one more row of `Install`'s (`service.rs:29-43`), on purpose, and
+`the_launchers_ends_agree_with_the_install_table` holds the two together:
 
 | The daemon's end | The launcher | Why |
 |---|---|---|
@@ -261,26 +268,59 @@ loop. The launcher's choices become one more row of `Install`'s table (`service.
 | 7 | leaves (D3) | the server removed the device, as the Linux units do |
 | 8 | leaves | another daemon holds the lock |
 | 9 | leaves | a requested restart, whose caller starts the task again (`service.rs:293-308`) |
-| 78 | leaves | no enrollment: P2 makes the task's `run` exit 78 for it too (`daemon_error.rs:106-137`) |
-| the install-in-flight code (new) | leaves | the daemon found an install in flight at its start (below) |
+| 78 | leaves | no enrollment: P2 makes the task's `run` exit 78 for it too (`daemon_error.rs:122-171`) |
+| 75 | leaves | an install in flight at the daemon's start (below, `daemon_error.rs:200-298`) |
 | any code while the session ends (`SM_SHUTTINGDOWN`) | leaves | never start into a closing session |
-| anything else: 1, 2 (a stall), a panic's 101, an exception code | restarts after the service supervisor's backoff, 2 s doubling to 60 s (`supervisor.rs:1103-1124`), reset after a run of 5 minutes | a crash. The watchdog's stall exit relies on this |
+| anything else: 1, 2 (a stall), a panic's 101, an exception code | restarts after the service supervisor's backoff, 2 s doubling to 60 s (`next_backoff`, `supervisor.rs:1175-1191`), reset after a run of 5 minutes | a crash. The watchdog's stall exit relies on this |
 | a spawn that fails (127 on master) | tries again with the same backoff | an EDR that holds the replaced file only delays the start |
 
+- **Only the daemon's own run is supervised.** Task Scheduler runs the launcher for three verbs: the account's task
+  (`run --supervisor task`), the launcher check (`--version`, `service.rs:1414-1417`) and the start task
+  (`service start`, `service.rs:1468`). The Start menu entry (`service start`, `main.wxs:352-353`) and each of the
+  MSI's custom actions (`:403-505`) run it too, each with a verb of its own. A loop around `--version` would retry a
+  failed spawn for ever, and the check
+  would read "running" instead of a result; around `service start` it would re-run a failed start. So the launcher
+  supervises only when its arguments are exactly `run --supervisor task`, an equality and never a prefix
+  (`is_the_daemons_run`, `ends.rs:98-101`). Every other run is waited for once, as before P2. Which tasks carry that
+  command: every release since 0.4.198 registers `roomlerdw.exe run --supervisor task` (#3296). From 0.4.103 to
+  0.4.197 the task ran `roomlerd.exe run --supervisor task` itself (#1663), and before 0.4.103 `roomlerd.exe run`.
+  Those tasks have no launcher, so nothing restarts their daemon, as today, until an update registers the task again.
+  A task an update could not register again (C11's case) keeps the command its release wrote, and when that command
+  is the launcher, the update has replaced the launcher's file, so P2's launcher supervises it.
 - **The crash ladder.** A launcher restart counts as a crash, because it is one. Three inside ten minutes on a version
   not yet promoted trip `should_rollback` (`crates/agent-core/src/config.rs:2705`), and on Windows the daemon raises
-  `rollback_failed` and stays up, with no download (`app.rs:4440-4451`).
+  `rollback_failed` and stays up, with no download (`app.rs:4479-4490`).
 - **An install in flight.** The launcher must not touch the data tree (`.claude/rules/installers.md`), so the daemon
   decides. A `run --supervisor task` that starts while the update-attempt marker is fresh (`updater.rs:230-256`; the
-  MSI's `service stop --for-upgrade` touches it too) and Windows Installer's execution mutex is held exits with a new
-  stay-down code before it takes the lock. The new task's one-shots start it after the install.
-- **Sign-out.** The launcher is shut down after the daemon (`main.rs:138-149`). After the daemon's exit it reads
-  `GetSystemMetrics(SM_SHUTTINGDOWN)` and leaves while the session ends.
+  MSI's `service stop --for-upgrade` touches it too) and Windows Installer's execution mutex, `Global\_MSIExecute`, is
+  held exits 75 before it takes the lock (`app.rs:3960-3961`, `daemon_error.rs:244-298`). Its stderr goes to the
+  person's log under the task (`app.rs:1656-1661`), so the log says why. Neither sign alone is enough: the marker stays
+  fresh for ten minutes after an install that has ended, and any install on the machine holds the mutex. No other code
+  in the tree is 75, and no Windows status is
+  (`the_install_in_flight_code_is_pinned_and_collides_with_nothing`); it is `sysexits.h`'s `EX_TEMPFAIL`, a mnemonic
+  only. The new task's one-shots start the daemon after the install.
+- **The backstop is the task's last one-shot, +600 s.** An unrelated install can hold the mutex for longer than ten
+  minutes, so a daemon that left with 75 at the first one-shots could stay down. The last one starts it whatever runs,
+  because by then the marker is no longer fresh. That holds only while three things hold, and
+  `the_tasks_last_start_is_after_the_update_window` pins each of them:
+  - the last offset (`service.rs:1439`) is not shorter than the marker's window, `UPDATE_STOP_WINDOW`
+    (`updater.rs:428`);
+  - each one-shot fires at or after its offset. A `StartBoundary` names whole seconds, so before P2 a one-shot could
+    fire up to a second early; P2 rounds the registration's clock up to a whole second (`whole_second_at_or_after`,
+    `service.rs:3359-3373`);
+  - the per-user MSI touches the marker before it writes the task. `StopOldDaemon` (`main.wxs:565`) runs after
+    `CleanupLegacyPerMachine`, which runs after `InstallFiles` (`:555`). Its `service stop --for-upgrade` records the
+    attempt before it stops anything (`app.rs:5974-5988`). `RegisterAutostart` runs last, before the commit (`:542`).
+
+  So the last one-shot comes more than ten minutes after the marker's last touch, and the freshness test reads it as
+  stale. That the test is strict, `elapsed < cooldown` (`updater.rs:268-279`), is only a second margin.
+- **Sign-out.** The launcher is shut down after the daemon (`main.rs:198-206`). After the daemon's exit it reads
+  `GetSystemMetrics(SM_SHUTTINGDOWN)` (`main.rs:146-150`) and leaves while the session ends.
 - **`schtasks /End` stays a hard stop.** It ends the launcher, and the launcher's kill-on-close job takes the daemon
-  (`main.rs:104-136`). Nothing restarts it, because the launcher has gone.
+  (`main.rs:166-193`). Nothing restarts it, because the launcher has gone.
 
 **Kill switch:** `ROOMLERDW_SUPERVISE=0` in the person's environment, which the task's process inherits (D4). The
-launcher then waits once and leaves with the daemon's code, as on master.
+launcher then waits once and leaves with the daemon's code, as on master (`supervise_wanted`, `ends.rs:105-107`).
 
 ### Tests
 
@@ -293,11 +333,14 @@ launcher then waits once and leaves with the daemon's code, as on master.
 | P1a | `the_start_task_runs_the_launchers_start_and_goes_by_itself` | its XML: the one-shots with their end boundaries, `DeleteExpiredTaskAfter`, the launcher with `service start`, no logon or boot trigger |
 | P1a | `every_per_user_msi_step_writes_its_record` | every per-user custom action of `main.wxs` is a step that writes the record, as `the_installer_role_is_what_each_msi_runs_as_local_system` holds the per-Machine ones |
 | P1a | `a_task_the_account_cannot_replace_is_named_at_start` | the access check's answer, with a medium copy of the test's own token, over C2's descriptor (no), C1's and P1a's (yes) |
-| P1b | the relaunch ladder over a seam (look, start, register, launch, clock), as `settle_service` is over `ServiceHandle` (`post_install.rs:902-904`) | each rung; a daemon that comes up at each rung; none; the failed-install entry |
+| P1b | the relaunch ladder over a seam (look, start, register, launch, clock), as `settle_service` is over `ServiceHandle` (`post_install.rs:1203-1205`) | each rung; a daemon that comes up at each rung; none; the failed-install entry |
 | P1b | the record's `daemon` field | round-trips, and a record without it still parses |
-| P2 | `the_launchers_ends_agree_with_the_install_table` | every code in the table above, against `Install`'s doc table and `worker_end_is_no_crash` (`supervisor.rs:1078-1090`) |
-| P2 | the loop over a seam (spawn, wait, session ending, sleep) | the backoff and its reset, a failed spawn retried, an ending session leaves |
-| P2 | `a_task_run_with_no_config_exits_78`, `a_start_inside_an_install_stays_down` | the daemon's two new stay-down ends |
+| P2 | `the_launchers_ends_agree_with_the_install_table` | every named code in the table above against the daemon's own constant; `Install`'s row for the task (exit 7 stays down); on Windows, `worker_end_is_no_crash` (`supervisor.rs:1078-1090`) over every code 0–255 and three exception codes: the launcher starts again exactly what the service host counts as a crash, but the session teardown |
+| P2 | the loop over a seam (`ends.rs:110-123`), in `agents/roomlerdw/src/main.rs`: `every_deliberate_end_leaves_with_its_code`, `a_stall_a_panic_and_an_exception_are_crashes`, `a_crash_is_started_again_after_the_service_supervisors_backoff`, `the_backoff_is_the_service_supervisors`, `a_run_of_five_minutes_starts_the_backoff_again`, `a_start_that_fails_is_tried_again`, `an_ending_session_leaves` | the table's ends; the backoff and its reset after a run of 5 minutes; a failed start tried again; no start into an ending session, before the first start, after an exit and during a backoff |
+| P2 | `only_the_daemons_run_is_supervised`, `the_switch_waits_once` | `run --supervisor task` supervised, and every near miss waited for once: `--version`, `service start`, `run`, `run --supervisor tasks`, `run --supervisor scm`, the run with more arguments, `RUN`, none; `ROOMLERDW_SUPERVISE=0` waits once, any other value supervises |
+| P2 | `a_task_run_with_no_config_exits_78`, `only_a_windows_supervisors_run_with_no_config_has_its_own_code` | the task's `run` with no config exits 78 on Windows, with the words `run` has always said; a bare `run` and every other OS still exit 1 |
+| P2 | `a_start_inside_an_install_stays_down`, `the_install_in_flight_code_is_pinned_and_collides_with_nothing` | only both signs together send the task's daemon away with 75, and no other `run` asks; 75 is no other code in the tree and no Windows status |
+| P2 | `the_tasks_last_start_is_after_the_update_window` | the backstop's four conditions: the last offset not shorter than `UPDATE_STOP_WINDOW`, each boundary of both renderers in [offset, offset + 1 s) from a clock at `…:59.900`, and the per-user MSI's order of steps |
 
 A test over behaviour master already has is shown failing on master first.
 
@@ -327,34 +370,47 @@ corporate laptops, and this FR makes no per-user install on them.
 | C6b | P0 | a medium task whose one-shots `/Run` a task the account cannot replace, with end boundaries and `DeleteExpiredTaskAfter` | **read**: the first one-shot started the task; the second was dropped by its `IgnoreNew` (`0x800710E0`); the medium task was gone after its last end boundary | |
 | C6c | P0 | how such a task goes, read by its query, COM, its file and its registry key | **read**: query, COM and file gone within seconds of its end boundary; the registry key stays until a `/Delete` of the name, which succeeds | |
 | C6d | P0 | the same name registered again at medium after it went | **read**: accepted over the key it left; it ran its one-shot and went again | |
-| C7 | P1a | per-user installed from an elevated token, then a self-update | **RED**: 0.4.227 → 0.4.228, no daemon at +10 min, the record says success | candidate A → B: back within the one-shots; the task's descriptor gives the account full access |
-| C7b | P1a | the first hop: a task 0.4.228 registered elevated, updated to candidate A | the same RED | back within the one-shots, through `Roomler start-<SID>`, which is gone an hour later |
-| C8 | P1a | the same from a medium token (control): an administrator's filtered token, and a standard account signed in at the console | back at the first one-shot | the same |
-| C9 | P1a | a refused registration | **RED**: no line in any log of ours | `step failed` with `Access is denied` in the person's log; the daemon's start WARN |
-| C10 | P1a | the repair: an elevated `service install` from A over a task 0.4.228 registered elevated | | the task registered again with the descriptor, the legacy task gone, the running daemon left running, and the next update comes back |
-| C11 | P1b | the second hop on a task the account cannot replace, with `ROOMLERD_TASK_SD=0` so no `Roomler start-<SID>` is left: registered elevated by 0.4.228, updated to A, then to B | offline until the next sign-in | back within 5 min; the record says how |
-| C12 | P1b | the task deleted after a successful install | offline, even at the next sign-in | back; the record says the watcher registered the task again |
-| C13 | P2 | `taskkill /F` of the daemon | **RED**: no daemon at +5 min | the row back online within a minute, with no window and no sign-in |
-| C14 | P2 | `service stop`, a removal (exit 7), an update | stays down | stays down; after the update the new task's one-shot starts it |
-| C15 | P2 | three forced kills inside 10 min on a version not yet promoted | | `rollback_failed` raised, the daemon runs, nothing downloaded |
-| C16 | P2 | a sign-out and a sign-in; a restart | | `crash_count` stays 0, and no daemon starts into a closing session |
-| C17 | P2 | the daemon's file held at sign-in, so the launcher cannot start it | **RED**: `LastTaskResult 127`, offline until the next sign-in | the daemon starts once the file is free |
-| C18 | P2 | a fresh per-user MSI with no enrollment, at sign-in | the daemon exits 1 once | it exits 78, the launcher leaves, no loop |
-| C19 | all | a real self-update from released 0.4.228 to candidate A and on to B, per-Machine and per-user | | both flavours on B and online; each record right |
+| C7 | P1a | per-user installed from an elevated token, then a self-update | **RED**, read: 0.4.227 → 0.4.228, no daemon at +16 min, the record `SucceededVerified` | **GREEN**, read on A3 → B3: back at B3's first one-shot, 60 s after its install; A3's task owned by the account, with full access for it; B3's `service stop --for-upgrade` exit 0, no ERROR |
+| C7b | P1a | the first hop: a task 0.4.228 registered elevated, updated to candidate A | the same RED | **GREEN**, read on A, A2 and A3: back at the first one-shot (61 s, 60 s and 61 s), through `Roomler start-<SID>`, which is gone after its end; on A2's hop it was gone 4 min after it was registered (field log) |
+| C8 | P1a | the same from a medium token (control): an administrator's filtered token, and a standard account signed in at the console | **read**: 0.4.227 → 0.4.228 back at the first one-shot from both accounts, the MSI log still reading `StopOldDaemon returned actual error code 1` | **GREEN**, read on A3 → B3 from both accounts: every hop back at the new version's first one-shot, 60 s after its install, each step exit 0 and no ERROR |
+| C9 | P1a | a refused registration | **RED**, read: no line in any log of ours | **GREEN**, read on A and on A3: `installer step failed` in the person's log, its error naming the task the account cannot replace, the elevated registration that owns it and the repair; the daemon's start WARN |
+| C10 | P1a | the repair: an elevated `service install` from A over a task a release before P1a registered elevated | | **GREEN**, read: the task registered again with the descriptor, the legacy task gone, the running daemon left running, and the next update (A → B) came back at the first one-shot |
+| C11 | P1b | the second hop on a task the account cannot replace, with `ROOMLERD_TASK_SD=0` so no `Roomler start-<SID>` is left: registered elevated by 0.4.228, updated to A, then to B | **RED**, read on A → B: offline at +15 min, and no log line after the install | **GREEN**, read on A2 → B2: back 122 s after the install, through the account's task; the record `"how": "started through the task"` |
+| C12 | P1b | the task deleted after a successful install | **RED**, read on A → B: no daemon and no task at +10 min, the row offline, the record silent on the daemon (the next sign-in not tried) | **GREEN**, read on A2 → B2: back 153 s after the install; the record `"how": "after the task was registered again"` |
+| C13 | P2 | `taskkill /F` of the daemon | **RED**, read on 0.4.230: no daemon at +5 min, the task `Ready` with `0x1`, the row offline | **GREEN**, read on 0.4.231's release rehearsal: a new `roomlerd.exe` about 2 s after the kill, under the same launcher; the row online throughout, with no window and no sign-in |
+| C14 | P2 | `service stop`, a removal (exit 7), an update | stays down | **GREEN**, read on 0.4.231: no daemon at +5 min after the stop (`0x0`) or after the removal (`0x7`); on the update to A none from the installer's end to the new task's first one-shot, which started A 60 s after its registration |
+| C14b | P2 | a self-update whose daemon the watcher brings back (P1b), on candidates built from P1b and P2: the watcher that runs is the old release's | | **GREEN**, read on 0.4.231 → A, the person's task deleted once after A registered it: A back through the watcher's rungs, its task registered again, the record `"how": "after the task was registered again"`; no `an install of Roomler is running` line after the installer exited |
+| C15 | P2 | three forced kills inside 10 min on a version not yet promoted | | **GREEN**, read on A after a fresh hop from 0.4.231: `crash_count` 1, 2 and 3, then `crash loop detected` and `rollback_failed` raised once; A ran on under its launcher; nothing downloaded or installed |
+| C16 | P2 | a sign-out and a sign-in; a restart | | **GREEN**, read on 0.4.231: `crash_count` 0 after each, and no `agent starting` into the closing session |
+| C17 | P2 | the daemon's file held at sign-in, so the launcher cannot start it | **RED**, read on 0.4.230: `LastTaskResult 127`, offline until the next sign-in | **GREEN**, read on 0.4.231: the launcher waited out the hold and started the daemon 40 s after the file was free, with no sign-in |
+| C18 | P2 | a fresh per-user MSI with no enrollment, at sign-in | **RED**, read on 0.4.230: the run exits 1 once | **GREEN**, read on 0.4.231: it exits 78 (`0x4E`), the launcher leaves, no loop |
+| C19 | all | a real self-update from released 0.4.228 to candidate A and on to B, per-Machine and per-user | | **GREEN**, read from 0.4.231, the release that carries all three phases (the cell was written when 0.4.228 was current), to A and on to B: per-user each hop back at the new task's first one-shot, the record `"how": "by the task"`; per-Machine the service back on each version, each record `SucceededVerified` once the new daemon settled it at its clean-run mark (#3302); both online on B |
 
 Candidates are built with `release-agent.yml` and `publish_release=false`, from a throwaway branch, with versions
 the release owner names.
+
+C11's RED is read before C10, because C10 unlocks the task. The repair runs from an elevated prompt in the person's
+own session: from an elevated Windows OpenSSH session on a workgroup machine, `USERDOMAIN` reads `WORKGROUP`, the
+task's principal becomes `WORKGROUP\<user>`, which maps to no SID, and the registration fails (master's
+`current_user_qualified`, field log).
+
+A known limit, read before C8: on a host where a release before P1a registered the task elevated, a per-user
+uninstall from a normal prompt cannot delete that task. Its `service uninstall` logs `ERROR installer step failed:
+roomlerd service uninstall exit_code=1 … schtasks /Delete failed … Access is denied`, and the task stays behind. That
+is C2's refused `/Delete`, which P1a does not change, and not a cell failure. The remedy is the uninstall from an
+elevated prompt; after P1a's repair (C10) the task is the account's own, and a removal from a normal prompt deletes
+it (C5c).
 
 ## Phases
 
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
 | P0 | C1–C6 on a lab guest, read before P1a is built | read only | **read** on 2026-11-20, with C1b–C6d and the standard account's C3c (field log) |
-| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | in review (#4135) |
-| P1b | the watcher's relaunch ladder; the record's `daemon` field; their tests | `ROOMLERD_WATCHER_RELAUNCH=0` | not started; after P1a |
-| P2 | the launcher's loop and its ends; exit 78 for the task's `run` with no config; the install-in-flight end; their tests | `ROOMLERDW_SUPERVISE=0` | not started; after P1a, independent of P1b |
-| Field | each phase's cells on its candidates, then C19 on the release | read only | not started |
-| Docs | each phase's docs in its own pull request | none | not started |
+| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | merged (#4135, `e4160fa1c`); C7 RED on the release; C7, C7b, C8, C9 and C10 GREEN on candidates, C7 and C8 on its head's A3 and B3 (field log) |
+| P1b | the watcher's relaunch ladder; the record's `daemon` field; their tests | `ROOMLERD_WATCHER_RELAUNCH=0` | merged (#4159, `29214ffc4`); C11 and C12 GREEN on candidates (field log) |
+| P2 | the launcher's loop and its ends; exit 78 for the task's `run` with no config; the install-in-flight end; their tests | `ROOMLERDW_SUPERVISE=0` | merged (#4199, `3cad49ba3`) and released in 0.4.231; C13 read on its rehearsal, C14, C16, C17 and C18 on the release, C14b and C15 on candidate A (field log) |
+| Field | each phase's cells on its candidates, then C19 on the release | read only | P1a's and P1b's cells read on candidates, P2's on 0.4.231 and on candidate A, and C19 from 0.4.231 through A and B in both flavours (field log) |
+| Docs | each phase's docs in its own pull request | none | P1a's merged in #4135, P1b's in #4159 and P2's in #4199; the rule's launcher bullet, the module comments and `docs/README.md`'s row with the field log's last rows (AC11) |
 
 - **P1a leaves working by itself**: no new task is registered that its account cannot replace, a self-update over
   one that was still brings the daemon back, a registration that is refused says so in the person's log, and an
@@ -367,14 +423,17 @@ The docs:
 
 - `docs/installation.md`, "What the per-user Scheduled Task runs (#3292)" (`docs/installation.md:939-1031`): the
   descriptor and the repair; the watcher's ladder as a mermaid flow; the launcher's ends as a table; "The task is not
-  a supervisor" (`:1012-1016`) and the known gap of the held file (`:1022`) rewritten. "A self-update whose install
+  a supervisor" (`:1012-1016`) and the known gap of the held file (`:1022`) rewritten: P2 makes them "The launcher
+  starts a daemon that crashed again" (`:1154-1210` in P2's tree), its flow, its ends and the gap's row gone. "A self-update whose install
   succeeds brings the device back by itself" (`:969-978`) says what it takes. The wizard's "Run as administrator"
-  (`:343-345`) says what it does to a per-user task until P1a, and that P1a's release repairs it.
+  (`:343-345`) keeps its text. A line there would move 13 line anchors that 8 FR specs pin below it, and the
+  per-user section's FR-150 paragraph already names the wizard run as administrator among the registrations P1a
+  repairs.
 - `agents/roomlerd/packaging/windows/README.txt:76-97`: "the rare Win11 ACL-locked-task scenario" is named for what it
   is, with P1a's repair.
 - `.claude/rules/installers.md`: the per-user task and `<RestartOnFailure>` bullets.
 - The module docs: `main.wxs:24-50` (`Return="ignore"` and "Why this works without UAC"), `service.rs:29-43` (the
-  launcher's row), `agents/roomlerdw/src/main.rs:1-44`.
+  launcher's row), `agents/roomlerdw/src/main.rs:1-55`.
 - `docs/README.md`: the `installation.md` row names the per-user lifecycle.
 
 ## Acceptance criteria
@@ -382,23 +441,57 @@ The docs:
 - [x] **AC1** (P0): C1–C6 are read, the field log says what each read, and P1a's descriptor gives the account the
   owner and the full access C1 reads a medium registration gives it. Read 2026-11-20, with C1b–C6d and C3c:
   [#4128's P0 comment](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7035472044) and the field log.
-- [ ] **AC2** (#3507 RED): C7 fails on the current release: a self-update of a per-user install registered from an
-  elevated token leaves no daemon at +10 min while the record reads success.
-- [ ] **AC3** (#3507 GREEN, P1a): C7 and C8 pass on candidates: a self-update brings the daemon back within the
-  one-shots, with the task registered elevated and at medium.
-- [ ] **AC4** (P1a, the log): C9 passes: a refused registration reaches the person's log with its error, instead of
-  being discarded, and the daemon names at its start a task its account cannot replace.
-- [ ] **AC5** (P1a, the repair): C10 passes.
-- [ ] **AC6** (P1b): C11 and C12 pass, and the record says whether the daemon runs and how it came back, not only
-  whether the binary is right.
-- [ ] **AC7** (#3295 RED then GREEN, P2): C13 fails on the current release and passes on the candidate: a per-user
-  daemon that crashes is back online within a minute, with no window and no sign-in.
-- [ ] **AC8** (P2): C14–C18 pass, and a real crash loop still ends in #3289's handling.
-- [ ] **AC9** (tests): the tests above pass in CI on the lanes that build them, and those over master's behaviour are
-  shown failing on master first.
-- [ ] **AC10** (the update path stays whole): C19 passes.
-- [ ] **AC11** — Docs updated in house style (tables, the watcher's ladder as a mermaid flow, `file:line` anchors):
-  the sections above in `docs/installation.md`, the rule and the module docs, linked from `docs/README.md`.
+- [x] **AC2** (#3507 RED): C7 fails on the current release: a self-update of a per-user install registered from an
+  elevated token leaves no daemon at +10 min while the record reads success. Read 2026-11-20 on 0.4.227 → 0.4.228:
+  no daemon at +16 min, the record `SucceededVerified`
+  ([P1a's cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7047442304)).
+- [x] **AC3** (#3507 GREEN, P1a): C7 and C8 pass on candidates: a self-update brings the daemon back within the
+  one-shots, with the task registered elevated and at medium. Read 2026-11-20 on candidates A3 → B3 (P1a at
+  `b08045b5b`): C7 from an elevated install, C8 from an administrator's filtered token and from a standard account,
+  each hop back at the new version's first one-shot, 60 s after its install
+  ([the cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7052262225)).
+- [x] **AC4** (P1a, the log): C9 passes: a refused registration reaches the person's log with its error, instead of
+  being discarded, and the daemon names at its start a task its account cannot replace. Read 2026-11-20 on
+  candidate A ([P1a's cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7047442304)).
+- [x] **AC5** (P1a, the repair): C10 passes. Read 2026-11-20 on candidates A and B
+  ([P1a's cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7047442304)).
+- [x] **AC6** (P1b): C11 and C12 pass, and the record says whether the daemon runs and how it came back, not only
+  whether the binary is right. Read 2026-11-20 on candidates A2 → B2 (P1b at `faca24a26`): C11 back 122 s after the
+  install, `"how": "started through the task"`; C12 back 153 s after it, `"how": "after the task was registered
+  again"`, after its RED on A → B
+  ([P1b's cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7048905691)).
+- [x] **AC7** (#3295 RED then GREEN, P2): C13 fails on the current release and passes on the candidate: a per-user
+  daemon that crashes is back online within a minute, with no window and no sign-in. Read 2026-11-21: RED on 0.4.230
+  (no daemon at +5 min, the task `Ready` with `0x1`, the row offline) and GREEN on 0.4.231's release rehearsal (a new
+  `roomlerd.exe` about 2 s after the kill under the same `roomlerdw.exe`, the row online throughout, no sign-in)
+  ([C13 on 0.4.231](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7070440494)).
+- [x] **AC8** (P2): C14–C18 and C14b pass, and a real crash loop still ends in #3289's handling. Read 2026-11-22:
+  C14 (a stop, a removal with exit 7 and an update each keep the old daemon down), C16, C17 and C18 on 0.4.231, C17 and
+  C18 RED on 0.4.230 first; C14b on 0.4.231 → A (0.4.256); and C15 on A after a fresh hop: three kills in its first
+  5 min took `crash_count` to 1, 2 and 3, then `crash loop detected; the installer here refuses a downgrade` and
+  `rollback_failed` raised once, A kept up by its launcher, nothing downloaded
+  ([the cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7082711161)).
+- [x] **AC9** (tests): the tests above pass in CI on the lanes that build them, and those over master's behaviour are
+  shown failing on master first. Green on each phase's final head: #4135 at `409c6e839`
+  ([run](https://github.com/gjovanov/roomler-ai/actions/runs/44900865689)), #4159 at `ea2636212`
+  ([run](https://github.com/gjovanov/roomler-ai/actions/runs/44909372642)) and #4199 at `9bf2719c3`
+  ([run](https://github.com/gjovanov/roomler-ai/actions/runs/44914023040)). The tests over master's code failed with
+  master's lines put back: P1a's three, `the_task_names_its_own_descriptor`,
+  `a_refused_replace_leaves_a_start_of_the_accounts_own` and `an_elevated_install_registers_a_locked_task_again`, at
+  `dba74677c` on master ([#4135's comment](https://github.com/gjovanov/roomler-ai/pull/4135#issuecomment-7067926396)),
+  and P2's three ([#4199's comment](https://github.com/gjovanov/roomler-ai/pull/4199#issuecomment-7055246347)). P1a's
+  other tests pin master's own behaviour (the switch, the fake's model of #3507) or run over the code P1a adds, and
+  P1b's run over the code P1b adds: the relaunch ladder over its seam, and the record's new field.
+- [x] **AC10** (the update path stays whole): C19 passes. Read 2026-11-22 from 0.4.231, the release with all three
+  phases, to A (0.4.256) and on to B (0.4.257), each hop through the daemon's own updater. Per-user: each new version
+  started by the new task's first one-shot, both records `SucceededVerified` with
+  `"daemon": {"running": true, "how": "by the task"}`. Per-Machine: the service back on each version, each record
+  `SucceededVerified` once the new daemon settled it at its clean-run mark (#3302). Both online on B
+  ([the cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7082711161)).
+- [x] **AC11** — Docs updated in house style (tables, the watcher's ladder as a mermaid flow, `file:line` anchors):
+  the sections above in `docs/installation.md`, the rule and the module docs, linked from `docs/README.md`. The phases'
+  docs merged with #4135, #4159 and #4199. The rule's launcher bullet, the module comments, `docs/README.md`'s row, the
+  cells table's reads and the field log through C19 followed once the cells were read.
 
 ## Decisions (operator, 2026-11-20)
 
@@ -448,3 +541,31 @@ recommendation is now the decision.
 | 2026-11-20 | P0's follow-ups, the same guest: C1b, C3b, C4b, C5b–C5d, C6b–C6d | as the cells table says. The repair works by a delete and a create (C5c) and by `SetSecurityDescriptor` (C5b); a medium task of the account's own brings back a daemon whose task the account cannot replace, and goes by itself (C6b–C6d). So P1a gains the repair and `Roomler start-<SID>` (Design), and D1's stay-down is avoided |
 | 2026-11-20 | C3c, a standard account (a throwaway local user in Users only) | **not read**: its process never started. From a task with a stored password it did not run within 120 s (no batch logon right), and `Start-Process -Credential` from the person's session answered `Access is denied`. Owed before P1a ships: the standard account's own registration with the descriptor |
 | 2026-11-20 | C3c, read: the same throwaway standard account, given the batch logon right for this cell only, its process started by a task with its stored password (medium, no Administrators in its token, a batch logon in session 0). The right, the account and the tasks were removed after it | as the cells table says: P1a's descriptor goes into a standard account's own registration and is applied, owner included, and every later replace and delete of its own succeeds. The caller's logon was a batch one, not an interactive one: C3b read an interactive caller (an administrator's filtered token), and C8 reads a standard account signed in at the console |
+| 2026-11-20 | C7 RED and C9 RED: on a second throwaway guest (Windows 11, build 26200), the released 0.4.227 installed per-user from an elevated prompt, then self-updated to the released 0.4.228 from the production feed | the MSI completed, and its `UnregisterAutostart` and `RegisterAutostart` returned 1, which it translated to success. The record read `SucceededVerified`. The task stayed 0.4.227's, owned by Administrators and readable only by the person. There was no daemon from +30 s to +16 min, the row stayed offline, and no log of ours said the registration was refused ([P1a's cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7047442304)) |
+| 2026-11-20 | C7b and C9 GREEN: candidate A (P1a at `2408d7948`) updated over that task, and later B → A2 (P1b at `faca24a26`) over the same task | A's `service install` was refused, logged `installer step failed` with the task and the repair, and registered `Roomler start-<SID>`, owned by the account. Its first one-shot started the daemon 61 s after the old one stopped, and its `IgnoreNew` dropped the later two. The daemon's start WARN named the elevated owner. B → A2 came back the same way, at the first one-shot |
+| 2026-11-20 | C11 RED: A → B with `ROOMLERD_TASK_SD=0`, over the same task | the record read `SucceededVerified` for B. B's `service install` failed with `Access is denied`, which is now in the person's log. No start task was registered. At +15 min there was no daemon and no log line after the install, and the row was offline |
+| 2026-11-20 | C10 GREEN: the repair, A's `service install` from an elevated prompt in the person's session, over the same task, with a legacy `Roomler` task registered elevated beside it | it exited 0 and registered the task again with the descriptor. The account owns the task with full access, the start task and the legacy task are gone, and the running daemon ran on. The next update (A → B, at medium) registered the task with exit 0, and the daemon was back at the first one-shot. A first try from an elevated Windows OpenSSH session failed: there the account read `WORKGROUP\<user>`, which maps to no SID (Lab cells) |
+| 2026-11-20 | C10's A → B: on a healthy per-user update, the person's log read `ERROR installer step failed: roomlerd service stop --for-upgrade exit_code=1` | the old release's `UnregisterAutostart` had already ended and deleted the task, so `StopOldDaemon` found nothing to stop, and its hard stop failed. The MSI ignores that exit code, but P1a's step record made it an ERROR. Fixed on #4135 (`618b0c2a3`): with nothing left to stop, the step is done. Over a task the account cannot replace, that step exited 0 (C7b, C11), since the old daemon was up |
+| 2026-11-20 | P1b's cells, the same guest: 0.4.228 installed per-user elevated over B, so its task is locked again, then C7b on A2 (P1b at `faca24a26`) | A2's `service install` was refused and registered `Roomler start-<SID>`, and the daemon was back by its +1 one-shot, 60 s after the install. The start task's file, `TaskCache\Tasks` key and COM entry were gone 4 min after it was registered, a minute after its +3 one-shot, while its `TaskCache\Tree` key stayed and its +10 one-shot still ran `service start`. The cause is not known; no code of ours deletes a task by its prefix. An hour later it was still gone, elevated and as the person ([P1b's cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7048905691)) |
+| 2026-11-20 | C7c: A2's `service install` at medium over the same locked task, an hour later | refused (exit 1) as in C7b, and it registered `Roomler start-<SID>` again over the `Tree` key the first one left. Its one-shots ran `service start` at +1, +3 and +10 min, each `0x0`. It was still there at +12 min, and the next update's `service uninstall` deleted it |
+| 2026-11-20 | C11 GREEN: A2 → B2 with `ROOMLERD_TASK_SD=0`, over the same task | B2's `service install` was refused with `Access is denied`, and no start task was registered. P1b's watcher found no daemon 120 s after the install and ran `service start`. The daemon 0.4.253 was up 122 s after the install, as the person, under the account's task, and the row came online. The record read `SucceededVerified` with `"daemon": {"running": true, "how": "started through the task"}` |
+| 2026-11-20 | C12 RED: A, installed at medium so the account owns its task, updated to B; a lab task running as SYSTEM deleted `Roomler-<SID>` as soon as the record's verdict was written | B's install succeeded and the record read `SucceededVerified`, with no word on the daemon. The task was deleted 0.06 s after the verdict, before its first one-shot. There was no daemon and no task to +10 min, and the row stayed offline on A. The next sign-in was not tried |
+| 2026-11-20 | C12 GREEN: A2 → B2, with the same deletion | P1b's watcher: not up 120 s after the install; `service start` refused, since no auto-start task is registered; not up 30 s later; `service install`, which registered the task again, owned by the account; `service start`. The daemon 0.4.253 was up 153 s after the MSI ended, as the person, and the row came online. The record read `"daemon": {"running": true, "how": "after the task was registered again"}`. Both of C12's hops logged the false `service stop --for-upgrade` ERROR above: they start from a task the account owns, and their candidates predate `618b0c2a3` |
+| 2026-11-20 | C7 GREEN on candidates from P1a's head with the fix, A3 (0.4.254) and B3 (0.4.255) at `b08045b5b`, the same guest: A3 installed per-user from an elevated prompt on a clean guest, then self-updated to B3 | A3's task was owned by the account with full access, with one-shots at +1, +3 and +10 min, and the daemon came up at the first. On the hop, B3's `service stop --for-upgrade` exited 0 with no ERROR, while the same log holds the RED of the hop to 0.4.253, built before the fix. The daemon was back at B3's first one-shot, 60 s after its `service install`, `service status` read `Auto-start: installed`, and the row came online on B3 ([the cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7052262225)) |
+| 2026-11-20 | C7b and C9 on A3: 0.4.228 installed per-user from an elevated prompt, then self-updated to A3 | as on A: A3's `service install` was refused, logged `installer step failed` with the task and the repair, and registered `Roomler start-<SID>`, whose first one-shot started the daemon 61 s after the old one stopped. The start WARN and `service status`'s `Note:` named the elevated owner and the repair, and the row came online on A3 |
+| 2026-11-20 | Before C8a: A3 removed from a normal prompt over the task 0.4.228 had registered elevated | its `service uninstall` failed with `Access is denied`, logged as `ERROR installer step failed: roomlerd service uninstall exit_code=1 … schtasks /Delete failed`, and the task stayed behind until an elevated delete. A known limit, not a cell failure (Lab cells) |
+| 2026-11-20 | C8 GREEN on A3 and B3, from an administrator's filtered token (C8a) and from a standard account signed in at the console (C8b, a local user in Users only, its token at medium): 0.4.227 installed per-user, then self-updated to the released 0.4.228 (the control), to A3 and to B3 | every hop was back at the new version's first one-shot, 60 s after its install, the release's too. On the hops to A3 and to B3, `service stop --for-upgrade` and `service install` exited 0 with no ERROR, while the release's own MSI log still reads `StopOldDaemon returned actual error code 1 but will be translated to success`. Each task stayed the account's own, `Limited`, with full access for it, `service status` read `Auto-start: installed`, and both rows came online on B3. C8b's 0.4.227 was installed before its enrollment, so its task had no one-shots (they are added only for an enrolled account), and its daemon first ran at the hop's `service start` |
+| 2026-11-21 | AC9's P1a RED, natively on Windows at `dba74677c` on master, with master's lines put back in `definitions` (the task as `render_task_xml` renders it) and in `user_task::register` (one `create`, with no repair and no start task) | 3 of the 12 roomlerd tests of #4135's table failed: `the_task_names_its_own_descriptor` (`left: 0, right: 1`), `a_refused_replace_leaves_a_start_of_the_accounts_own` (the refusal reads `Access is denied` and nothing more) and `an_elevated_install_registers_a_locked_task_again` (one `create`, and the locked task never deleted and registered again). The other nine passed, as tests of master's own behaviour or of code P1a adds. Restored, all 12 pass ([#4135's comment](https://github.com/gjovanov/roomler-ai/pull/4135#issuecomment-7067926396)) |
+| 2026-11-21 | C13 RED and GREEN before 0.4.231's tag, on a fresh lab guest: the released 0.4.230 per-user at medium and enrolled, then 0.4.231's release rehearsal served by a feed on the guest and taken by 0.4.230's own updater; one `taskkill /F /IM roomlerd.exe` on each, read to +5 min | 0.4.230: no daemon from +14 s to +5 min, the task `Ready` with `0x1`, the row offline until `service start` 5 min 40 s later. The hop to 0.4.231 then landed at the new task's first one-shot, 69 s after that start, with `StopOldDaemon` and `RegisterAutostart` at exit 0. 0.4.231: a new `roomlerd.exe` about 2 s after the kill, under the same `roomlerdw.exe`, the task `Running` throughout and the row online at every read ([C13 on 0.4.231](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7070440494)) |
+| 2026-11-21 | #4135's holder cell on the same rehearsal: 0.4.230's task registered once from an administrator prompt in the person's session (owner `BUILTIN\Administrators`, only read for the person), then a self-update to 0.4.231 | 0.4.231's `service install` was refused and logged with the task and the repair, `Roomler start-<SID>` ran at its first one-shot, and the row was online at 0.4.231 63 s after the install, with no sign-in. `service status` printed the `Note:` line with the repair (the same comment) |
+| 2026-11-22 | C18 RED and GREEN on lab guests: the released per-user MSI with no enrollment, then a restart, so the sign-in's task runs `run --supervisor task` with no config | 0.4.230: the run ended `0x1` with one `no config found` line, and nothing ran at +1 and +5 min. 0.4.231, the release: `0x4E` (78) with one `no config found` line, no `roomlerd.exe` or `roomlerdw.exe` 58 s after the sign-in, and the same at six reads 24 s apart and at +5 min: the launcher left once, with no loop |
+| 2026-11-22 | C17's first try on 0.4.230: a SYSTEM task at startup holding the daemon's file for 210 s, then a restart | **void**. The autologon's task ran at 11:37:05Z and the daemon started at 11:37:08Z, before the hold opened at 11:37:10.902Z, so the daemon ran through the hold: autologon outruns a task at startup. The hop meant to follow never ran either: the feed was set and `service start` met the running daemon, whose task's `IgnoreNew` refused the run (`0x800710E0`), so the daemon never read the feed. Redone with the hold opened first (next row) |
+| 2026-11-22 | C17 RED and GREEN on one lab guest, the released 0.4.230 per-user at medium and enrolled: a SYSTEM task run at once holds the person's `roomlerd.exe` with no sharing for 210 s (the running daemon keeps running; only a new start fails), then the person signs out and Winlogon's `ForceAutoLogon` signs them in again inside the hold. Between the two, a hop to the released 0.4.231 taken by 0.4.230's own updater from a feed on the guest | 0.4.230: the sign-in's task ran at 12:06:05Z and ended `0x7F` (127), `Ready` with no next run; no `roomlerd.exe` or `roomlerdw.exe` from 12:06:11Z to the next sign-in at 12:17:52Z, though the hold closed at 12:09:28Z; the row offline throughout. The hop: the record `SucceededVerified` for `agent-v0.4.231`, `service stop --for-upgrade` exit 0, the first one-shot started 0.4.231 60 s after the registration. 0.4.231: the sign-in's task started the launcher at 12:27:44Z inside the hold and stayed `Running` (`0x41301`); the hold closed at 12:31:07Z and the launcher started the daemon, its own child, at 12:31:47Z (40 s later; the +600 s one-shot at 12:31:39Z was refused by `IgnoreNew`); the row online on 0.4.231 from 12:31:53Z. **RED, then GREEN** |
+| 2026-11-22 | C16 on the same guest, now 0.4.231: a sign-out followed by `ForceAutoLogon`'s sign-in, then a restart | **GREEN**. The sign-out at 12:37:19Z ended the launcher and the daemon with the session, and no `agent starting` went into it; the sign-in's task started them again at 12:37:22Z, and the restart's at 12:41:06Z. `crash_count` read 0 before, after the sign-in and after the restart, and the row was online on 0.4.231 at every read after each. `last_run_unhealthy` reads `true` after each start: the run's provisional mark until its clean-run threshold, not a crash |
+| 2026-11-22 | C14 on the same guest, 0.4.231: `service stop` in the person's session, then the device deleted on the server while the daemon was online, so it ends with 7 | **GREEN** for both: each end stays down. The stop at 12:43:39Z exited 0; at +5 min no daemon, the task `Ready` with `0x0`, `crash_count` 0 and `last_run_unhealthy` false (a clean end), and the row offline from 12:44:06Z. The deletion at 12:50:38Z: the daemon wrote its `needs-attention` sentinel for `FatalGoodbye` (`AgentDeleted`) at 12:50:42Z and left; at +5 min no daemon and the task `Ready` with `0x7`. Enrolled again for C14b, the next run started with `crash_count` 1: the removed run was counted as a crash (#4292, outside this FR's cells). C14's update column is read in C19's per-user hops |
+| 2026-11-22 | C14b on candidate A (0.4.256, from master `8003b6a67` with only the version changed), the same guest: 0.4.231 updated itself to A from a feed on the guest, and a lab task running as SYSTEM deleted the person's task once, after A had registered it and the watcher had written its verdict, so 0.4.231's watcher had to bring A back | **GREEN**. The watcher: not up 120 s after the install; `service start` refused, since no auto-start task is registered; then `service install` of 0.4.256 registered the task again, and the launcher and the daemon were up at 13:02:21Z. The record: the daemon runs, `"how": "after the task was registered again"`, with the rungs. The row online on 0.4.256 at 13:03:02Z. No `an install of Roomler is running` line in the person's log after the installer ended at 12:59:48Z |
+| 2026-11-22 | C15, supplementary, on A right after C14b: three `taskkill /F /IM roomlerd.exe` about 60 s apart inside A's first 5 min, A not promoted (`last_known_good_version` 0.4.231) | The kills at 13:03:19Z, 13:04:18Z and 13:05:18Z took `crash_count` from 1 (#4292's carry) to 2, 3 and 4: each kill added exactly one. At 3: `crash loop detected; the installer here refuses a downgrade, so no rollback runs`, and `rollback_failed` raised, once. The daemon ran on A afterwards, started again by its launcher, and the row was online at every read to +5 min. Nothing was downloaded or installed after the first kill: the feed served only the manifest, no installer step ran, and no update folder was made. Supplementary, since the carry reached the threshold at the second kill; the clean read follows |
+| 2026-11-22 | C19's per-user half on a fresh lab guest, which also reads C14's update column: the released 0.4.231 per-user at medium and enrolled fresh, then two real self-updates through the daemon's own updater from a feed on the guest, to A (0.4.256) and on to B (0.4.257). The guest's hosts file pointed GitHub's names at `0.0.0.0` and `::` for the whole chain, so nothing could come from GitHub while 0.4.232 was being published | **GREEN**. Each hop: the installer ran about 5 s, and `service stop --for-upgrade` and `service install` exited 0. No `roomlerd.exe` or `roomlerdw.exe` ran from 4 s after the installer ended to the new task's first one-shot (ten reads): nothing restarted the old daemon. The one-shot started the new version as the launcher's child: A at 15:46:24Z, 60 s after `service install` ended, and B at 15:57:18Z. Both records read `SucceededVerified`, `installer_exit_code` 0, `new_binary_version` the hop's and `"daemon": {"running": true, "how": "by the task"}`. The row was online on A, then on B, at every read, and A was promoted to `last_known_good_version` after its first 5 min, with `crash_count` 0 |
+| 2026-11-22 | C15, clean, on the same guest between C19's halves: the person's data removed, the released 0.4.231 per-user installed, enrolled fresh and promoted after its first 5 min (`last_known_good_version` 0.4.231, `crash_count` 0), then a fresh self-update to A; three `taskkill /F /IM roomlerd.exe` 57 s apart inside A's first 5 min | **GREEN**. The kills at 16:15:04Z, 16:16:01Z and 16:16:58Z, 27 s, 84 s and 142 s after A's first start, took `crash_count` to 1, 2 and 3, and each time the launcher started A again within 8 s. At 3: one `crash loop detected; the installer here refuses a downgrade, so no rollback runs`, and `rollback_failed` raised for 0.4.256, with no second attempt. A ran on under its launcher and the row was online on A at every read to +5 min; after 5 clean minutes A was promoted (`last_known_good_version` 0.4.256, `crash_count` 0), and the sentinel stayed. Nothing was downloaded or installed after the first kill: the feed served only the manifest, no installer step ran, and no update folder was made. A real crash loop still ends in #3289's handling |
+| 2026-11-22 | C19's per-Machine half, a first run on the same guest after C15: the released 0.4.231 per-Machine MSI installed elevated with `ENABLE_SYSTEM_CONTEXT=1` and enrolled machine-global, then the service's own updater to A and on to B, from the feed named in the service's environment | the update path **GREEN** at both hops: the installer's signature verified, the artifact's own version bound, `ENABLE_SYSTEM_CONTEXT=1` passed on, the service back under the SCM at each version with its environment kept, and the row online on B to the end. The block mattered: the fresh 0.4.231 service's startup check, on the default source before the feed was set, tried GitHub for the published 0.4.232 and failed. The records were **not read**: a per-Machine install's record is in SYSTEM's profile (its watcher has no service role, #3302) and still read `InProgress` 2 min 40 s after B's install; the new daemon settles it at its clean-run threshold, 5 min after its start, and each hop's read came before that. The rows at 0.4.231 and at A were not read either: the lab's enroll helper lost the device's id. Redone on a fresh guest (next row) |
+| 2026-11-22 | C19's per-Machine half again, on a second fresh lab guest: the released 0.4.231 per-Machine MSI installed elevated with `ENABLE_SYSTEM_CONTEXT=1` and enrolled machine-global, then the service's own updater to A and on to B from the feed named in the service's environment, GitHub's names blocked as in the per-user half. Each hop held 6.5 min past its restart, so past the new daemon's clean-run mark | **GREEN**. At 0.4.231 the row was online, with no record in either folder (the MSI ran by hand). At each hop the service and its worker ran the new version as SYSTEM 7–8 s after the restart (A from 16:52:25Z, B from 17:00:01Z), and the row came online on it. Each record, in SYSTEM's profile, read `InProgress` after its install, and the new daemon settled it at its clean-run mark (16:57:26Z and 17:05:03Z): `SucceededVerified`, `expected_version` and `new_binary_version` the hop's, the note "the watcher left no verdict", and no `daemon` field, since only the per-user arm writes one. A's restarted daemon read its own record `SucceededVerified` before it took B. The service's environment kept the feed across both upgrades, and the row was online on B to the end. The block mattered again: the fresh service's startup check tried GitHub for the published 0.4.232 and failed. At both hops the watcher, the old worker's child, was gone within about 5 s of the install and wrote no verdict, so its service check did not run; the SCM brought the service back by itself (#4302, outside this FR's cells) ([the cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7082711161)) |

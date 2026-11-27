@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::ws::redis_conn::RedisConnection;
+use crate::ws::sub_probe::{Lifetime, ProbeSettings, Prober, Subscriber};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -99,11 +100,15 @@ pub struct PodBus {
 impl PodBus {
     /// Construct + spawn the subscriber and the pod-alive heartbeat.
     /// `redis_url` gets its own subscription connection (a pub/sub
-    /// connection can't multiplex commands).
+    /// connection can't multiplex commands). #3952 — the subscription
+    /// probes its own connection every `probe` over `publisher`
+    /// (`crate::ws::sub_probe`), and a deaf one is subscribed again; the
+    /// connect and each subscribe are bounded by `publisher`'s bounds.
     pub fn start(
         identity: PodIdentity,
         publisher: RedisConnection,
         redis_url: String,
+        probe: ProbeSettings,
     ) -> Arc<Self> {
         let bus = Arc::new(Self {
             identity,
@@ -124,13 +129,16 @@ impl PodBus {
             let bus = bus.clone();
             tokio::spawn(async move {
                 let channel = pod_channel(&bus.identity.pod_id);
+                let mut prober = Prober::new(Subscriber::Bus, bus.publisher.clone(), probe);
                 let mut backoff = 1u64;
                 loop {
-                    match Self::run_subscription(&bus, &redis_url, &channel).await {
-                        Ok(()) => {
+                    match Self::run_subscription(&bus, &redis_url, &channel, &mut prober).await {
+                        Ok(Lifetime::Ended) => {
                             backoff = 1;
                             warn!(%channel, "pod bus subscription ended; reconnecting");
                         }
+                        // Deaf: the verdict wrote its own line.
+                        Ok(Lifetime::Deaf) => backoff = 1,
                         Err(e) => {
                             warn!(%channel, %e, "pod bus subscribe failed; retrying in {backoff}s");
                         }
@@ -249,81 +257,90 @@ impl PodBus {
         }
     }
 
+    /// One subscription lifetime. Nothing in it awaits but the stream: a
+    /// reply completes its waiter, and a request is handled on a task of its
+    /// own, so the probe (matched by its channel first) is never held up.
     async fn run_subscription(
         bus: &Arc<Self>,
         redis_url: &str,
         channel: &str,
-    ) -> Result<(), redis::RedisError> {
+        prober: &mut Prober,
+    ) -> Result<Lifetime, redis::RedisError> {
         let client = redis::Client::open(redis_url)?;
-        let mut pubsub = client.get_async_pubsub().await?;
-        pubsub.subscribe(channel).await?;
+        let subscription = prober.subscribe(&client, &[channel], &[]).await?;
         bus.sub_alive.store(true, Ordering::Relaxed);
-        info!(%channel, pod = %bus.identity.pod_id, "pod bus subscribed");
+        info!(
+            %channel,
+            pod = %bus.identity.pod_id,
+            probe_ms = prober.interval_ms(),
+            "pod bus subscribed"
+        );
+        Ok(prober
+            .run(subscription, |msg| Self::handle_message(bus, msg))
+            .await)
+    }
 
-        use futures::StreamExt;
-        let mut stream = pubsub.on_message();
-        while let Some(msg) = stream.next().await {
-            let Ok(payload) = msg.get_payload::<String>() else {
-                continue;
-            };
-            let Ok(env) = serde_json::from_str::<Envelope>(&payload) else {
-                debug!("pod bus: undecodable envelope dropped");
-                continue;
-            };
-            // A restarted process must ignore ITS OWN stale in-flight
-            // messages only by corr-miss; same-origin reqs are legal
-            // (self-RPC is pointless but harmless).
-            match env.kind.as_str() {
-                "rep" => {
-                    if let Some((_, tx)) = bus.pending.remove(&env.corr) {
-                        let res = if let Some(nack) = env.body.get("nack").and_then(|n| n.as_str())
-                        {
-                            Err(nack.to_string())
-                        } else {
-                            Ok(env.body)
-                        };
-                        let _ = tx.send(res);
-                    }
-                }
-                "req" => {
-                    let Some(reply_to) = env.reply_to.clone() else {
-                        continue;
+    /// One message on this pod's channel: a reply completes its waiter, a
+    /// request is handled on a task of its own. Never waits.
+    fn handle_message(bus: &Arc<Self>, msg: redis::Msg) {
+        let Ok(payload) = msg.get_payload::<String>() else {
+            return;
+        };
+        let Ok(env) = serde_json::from_str::<Envelope>(&payload) else {
+            debug!("pod bus: undecodable envelope dropped");
+            return;
+        };
+        // A restarted process must ignore ITS OWN stale in-flight
+        // messages only by corr-miss; same-origin reqs are legal
+        // (self-RPC is pointless but harmless).
+        match env.kind.as_str() {
+            "rep" => {
+                if let Some((_, tx)) = bus.pending.remove(&env.corr) {
+                    let res = if let Some(nack) = env.body.get("nack").and_then(|n| n.as_str()) {
+                        Err(nack.to_string())
+                    } else {
+                        Ok(env.body)
                     };
-                    let handler = bus.handlers.get(&env.class).map(|h| h.clone());
-                    let bus2 = bus.clone();
-                    tokio::spawn(async move {
-                        let body = match handler {
-                            Some(h) => h(env.body).await,
-                            // Unknown class / entity ⇒ structured NACK, so
-                            // a caller learns "not here" instead of eating
-                            // the deadline (and can prune stale records).
-                            None => Err(format!("no handler for class {}", env.class)),
-                        };
-                        let rep = Envelope {
-                            v: 1,
-                            origin: bus2.identity.origin(),
-                            kind: "rep".into(),
-                            class: env.class,
-                            corr: env.corr,
-                            reply_to: None,
-                            conn: None,
-                            body: match body {
-                                Ok(v) => v,
-                                Err(nack) => serde_json::json!({ "nack": nack }),
-                            },
-                        };
-                        let payload = serde_json::to_string(&rep).expect("envelope serializes");
-                        let mut conn = bus2.publisher.clone();
-                        let _ = redis::cmd("PUBLISH")
-                            .arg(pod_channel(&reply_to))
-                            .arg(&payload)
-                            .query_async::<()>(&mut conn)
-                            .await;
-                    });
+                    let _ = tx.send(res);
                 }
-                _ => {}
             }
+            "req" => {
+                let Some(reply_to) = env.reply_to.clone() else {
+                    return;
+                };
+                let handler = bus.handlers.get(&env.class).map(|h| h.clone());
+                let bus2 = bus.clone();
+                tokio::spawn(async move {
+                    let body = match handler {
+                        Some(h) => h(env.body).await,
+                        // Unknown class / entity ⇒ structured NACK, so
+                        // a caller learns "not here" instead of eating
+                        // the deadline (and can prune stale records).
+                        None => Err(format!("no handler for class {}", env.class)),
+                    };
+                    let rep = Envelope {
+                        v: 1,
+                        origin: bus2.identity.origin(),
+                        kind: "rep".into(),
+                        class: env.class,
+                        corr: env.corr,
+                        reply_to: None,
+                        conn: None,
+                        body: match body {
+                            Ok(v) => v,
+                            Err(nack) => serde_json::json!({ "nack": nack }),
+                        },
+                    };
+                    let payload = serde_json::to_string(&rep).expect("envelope serializes");
+                    let mut conn = bus2.publisher.clone();
+                    let _ = redis::cmd("PUBLISH")
+                        .arg(pod_channel(&reply_to))
+                        .arg(&payload)
+                        .query_async::<()>(&mut conn)
+                        .await;
+                });
+            }
+            _ => {}
         }
-        Ok(())
     }
 }

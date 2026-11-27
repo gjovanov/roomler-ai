@@ -1088,3 +1088,778 @@ describe('useAgentStore', () => {
     expect(rc.state).toBe('needs_restart')
   })
 })
+
+// #4248 — the store holds one org's devices at a time, and knows which. A
+// page that only names or picks devices asks with `ensureAgents`, which
+// fetches only when the store does not hold that org's devices.
+describe('useAgentStore: one org at a time (#4248)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  const listOf = (ids: string[]) => ({
+    items: ids.map((id) => mkAgent({ id })),
+    total: ids.length,
+    page: 1,
+    per_page: 100,
+    total_pages: 1,
+  })
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+
+  it("asked for org B while holding org A's: one fetch, for org B", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(listOf(['a1']))
+    await s.fetchAgents(ORG_A)
+    mockApi.get.mockResolvedValueOnce(listOf(['b1']))
+    await s.ensureAgents(ORG_B)
+    expect(asked()).toEqual([
+      `/tenant/${ORG_A}/agent?per_page=100`,
+      `/tenant/${ORG_B}/agent?per_page=100`,
+    ])
+    expect(s.agents.map((a) => a.id)).toEqual(['b1'])
+    expect(s.agentsTenantId).toBe(ORG_B)
+  })
+
+  it("asked for org A while holding org A's, or loading them: no fetch", async () => {
+    const s = useAgentStore()
+    let answer!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answer = r)))
+    const first = s.fetchAgents(ORG_A)
+    // Not awaited before the answer: the ensure may answer with the fetch in
+    // flight (#4257, slice 7), and then settles only once it has landed.
+    const whileLoading = s.ensureAgents(ORG_A)
+    answer(listOf(['a1']))
+    await first
+    await whileLoading
+    await s.ensureAgents(ORG_A)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/agent?per_page=100`])
+    expect(s.agents.map((a) => a.id)).toEqual(['a1'])
+  })
+
+  it('an org with no devices is held too; the empty-list check it replaces asked every time', async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(listOf([]))
+    await s.ensureAgents(ORG_A)
+    await s.ensureAgents(ORG_A)
+    expect(mockApi.get).toHaveBeenCalledTimes(1)
+  })
+
+  it('asked again after a failed fetch: fetches', async () => {
+    const s = useAgentStore()
+    mockApi.get.mockRejectedValueOnce(new Error('network'))
+    await s.fetchAgents(ORG_A)
+    mockApi.get.mockResolvedValueOnce(listOf(['a1']))
+    await s.ensureAgents(ORG_A)
+    expect(mockApi.get).toHaveBeenCalledTimes(2)
+    expect(s.agents.map((a) => a.id)).toEqual(['a1'])
+    expect(s.error).toBeNull()
+  })
+
+  it("a fetch for org B drops org A's devices at once, and org A's late answer", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(listOf(['a1']))
+    await s.fetchAgents(ORG_A)
+    let lateA!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (lateA = r)))
+    const refreshA = s.fetchAgents(ORG_A)
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)))
+    const loadB = s.fetchAgents(ORG_B)
+    expect(s.agents).toEqual([])
+    expect(s.total).toBe(0)
+
+    answerB(listOf(['b1']))
+    await loadB
+    lateA(listOf(['a1', 'a2']))
+    await refreshA
+    expect(s.agents.map((a) => a.id)).toEqual(['b1'])
+    expect(s.total).toBe(1)
+    expect(s.loading).toBe(false)
+  })
+})
+
+// #4257 — the org's members (the device owner picker, the audit logs' names,
+// the policy dialogs' pickers) are one org's at a time too, and the store
+// knows which. A dialog or a log that only names or picks them asks with
+// `ensureTenantMembers`, which fetches only when the store does not hold them.
+describe("useAgentStore: the org's members, one org at a time (#4257)", () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  const membersOf = (ids: string[]) => ({
+    items: ids.map((user_id) => ({ user_id, display_name: user_id, nickname: null })),
+  })
+  const userIds = () => useAgentStore().tenantMembers.map((m) => m.user_id)
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    // A test that stops before its held GET is sent must not hand it to the next.
+    mockApi.get.mockReset()
+  })
+
+  it("a fetch for org B drops org A's members at once, and org A's late answer", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(membersOf(['ua']))
+    await s.fetchTenantMembers(ORG_A)
+    let lateA!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (lateA = r)))
+    const refreshA = s.fetchTenantMembers(ORG_A)
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)))
+    const loadB = s.fetchTenantMembers(ORG_B)
+    expect(userIds()).toEqual([])
+
+    answerB(membersOf(['ub']))
+    await loadB
+    lateA(membersOf(['ua', 'ua2']))
+    await refreshA
+    expect(userIds()).toEqual(['ub'])
+  })
+
+  it("org A's late failure leaves org B's members", async () => {
+    const s = useAgentStore()
+    let failA!: (e: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((_, reject) => (failA = reject)))
+    const loadA = s.fetchTenantMembers(ORG_A)
+    mockApi.get.mockResolvedValueOnce(membersOf(['ub']))
+    await s.fetchTenantMembers(ORG_B)
+
+    failA(new Error('Missing permission'))
+    await loadA
+    expect(userIds()).toEqual(['ub'])
+  })
+
+  it("ensureTenantMembers for org B while holding org A's: one fetch, for org B", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(membersOf(['ua']))
+    await s.fetchTenantMembers(ORG_A)
+    mockApi.get.mockResolvedValueOnce(membersOf(['ub']))
+    await s.ensureTenantMembers(ORG_B)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/member`, `/tenant/${ORG_B}/member`])
+    expect(userIds()).toEqual(['ub'])
+    expect(s.tenantMembersTenantId).toBe(ORG_B)
+  })
+
+  it("ensureTenantMembers for org A while holding org A's, or loading them: no fetch, for an org with none too", async () => {
+    const s = useAgentStore()
+    let answer!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answer = r)))
+    const first = s.fetchTenantMembers(ORG_A)
+    await s.ensureTenantMembers(ORG_A)
+    answer(membersOf([]))
+    await first
+    await s.ensureTenantMembers(ORG_A)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/member`])
+  })
+
+  it('ensureTenantMembers after a failed fetch: fetches', async () => {
+    const s = useAgentStore()
+    mockApi.get.mockRejectedValueOnce(new Error('network'))
+    await s.fetchTenantMembers(ORG_A)
+    mockApi.get.mockResolvedValueOnce(membersOf(['ua']))
+    await s.ensureTenantMembers(ORG_A)
+    expect(asked()).toHaveLength(2)
+    expect(userIds()).toEqual(['ua'])
+  })
+})
+
+// #4257 — the org settings the Settings page reads (exec, SSH, keep busy, the
+// session policy, external access, ephemeral keys, the session limits) are one
+// org's at a time too. A fetch for another org drops the value at once (back
+// to unknown), only the latest fetch writes, and a save answered for an org
+// the value no longer describes leaves the value alone.
+describe("useAgentStore: the org's settings, one org at a time (#4257)", () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+
+  type Store = ReturnType<typeof useAgentStore>
+  interface Setting {
+    name: string
+    route: string
+    fetch: (s: Store, tenantId: string) => Promise<void>
+    /** The server's answer: org A's switches are on, org B's off. */
+    answer: (on: boolean) => unknown
+    held: (s: Store) => unknown
+    /** What the store holds after the org's answer, and while unknown. */
+    of: (on: boolean) => unknown
+    unknown: unknown
+    /** A save for the org; the server answers it with org A's values. */
+    save: (s: Store, tenantId: string) => Promise<void>
+  }
+  const SETTINGS: Setting[] = [
+    {
+      name: 'exec',
+      route: 'exec-settings',
+      fetch: (s, t) => s.fetchOrgExecEnabled(t),
+      answer: (on) => ({ remote_exec_enabled: on, exec_require_system: on }),
+      held: (s) => [s.orgExecEnabled, s.orgExecRequireSystem],
+      of: (on) => [on, on],
+      unknown: [null, null],
+      save: (s, t) => s.setOrgExecEnabled(t, true),
+    },
+    {
+      name: 'SSH',
+      route: 'ssh-settings',
+      fetch: (s, t) => s.fetchOrgSshEnabled(t),
+      answer: (on) => ({ remote_ssh_enabled: on }),
+      held: (s) => s.orgSshEnabled,
+      of: (on) => on,
+      unknown: null,
+      save: (s, t) => s.setOrgSshEnabled(t, true),
+    },
+    {
+      name: 'keep busy',
+      route: 'keep-busy-settings',
+      fetch: (s, t) => s.fetchOrgKeepBusyDenied(t),
+      answer: (on) => ({ keep_busy_denied: on, keep_busy_default_pattern: on ? 'heart' : null }),
+      held: (s) => [s.orgKeepBusyDenied, s.orgKeepBusyDefaultPattern],
+      of: (on) => [on, on ? 'heart' : null],
+      unknown: [null, null],
+      save: (s, t) => s.setOrgKeepBusyDenied(t, true),
+    },
+    {
+      name: 'the session policy',
+      route: 'rc-session-policy',
+      fetch: (s, t) => s.fetchOrgRcSessionPolicy(t),
+      answer: (on) =>
+        on
+          ? { clipboard: 'off', files: 'off', audio: 'off' }
+          : { clipboard: 'on', files: 'ask', audio: 'on' },
+      held: (s) => s.orgRcSessionPolicy,
+      of: (on) =>
+        on
+          ? { clipboard: 'off', files: 'off', audio: 'off' }
+          : { clipboard: 'on', files: 'ask', audio: 'on' },
+      unknown: null,
+      save: (s, t) => s.setOrgRcSessionPolicy(t, { clipboard: 'off' }),
+    },
+    {
+      name: 'external access',
+      route: 'external-access',
+      fetch: (s, t) => s.fetchExternalAccess(t),
+      answer: (on) => ({ enabled: on, devices: on ? [{ id: 'dev_a' }] : [] }),
+      held: (s) => [s.orgExternalAccessEnabled, s.externalDevices.map((d) => d.id)],
+      of: (on) => [on, on ? ['dev_a'] : []],
+      unknown: [null, []],
+      save: (s, t) => s.setOrgExternalAccessEnabled(t, true),
+    },
+    {
+      name: 'ephemeral keys',
+      route: 'ephemeral-key-settings',
+      fetch: (s, t) => s.fetchOrgEphemeralKeysEnabled(t),
+      answer: (on) => ({ ephemeral_keys_enabled: on }),
+      held: (s) => s.orgEphemeralKeysEnabled,
+      of: (on) => on,
+      unknown: null,
+      save: (s, t) => s.setOrgEphemeralKeysEnabled(t, true),
+    },
+    {
+      name: 'the session limits',
+      route: 'rc-session-limits',
+      fetch: (s, t) => s.fetchOrgRcSessionLimits(t),
+      answer: (on) => ({ max_secs: on ? 3600 : null, idle_secs: on ? 600 : null }),
+      held: (s) => [s.orgRcMaxSessionSecs, s.orgRcIdleSecs],
+      of: (on) => (on ? [3600, 600] : [null, null]),
+      unknown: [undefined, undefined],
+      save: (s, t) => s.setOrgRcMaxSessionSecs(t, 3600),
+    },
+  ]
+
+  /** The server's answer to a GET: the caller owns both orgs. */
+  function answerFor(path: string): unknown {
+    const m = /^\/tenant\/([^/]+)\/(.+)$/.exec(path)
+    if (m?.[2] === 'member/me') return { permissions: 0, is_owner: true }
+    const x = SETTINGS.find((y) => y.route === m?.[2])
+    if (!m || !x) throw new Error(`unexpected GET ${path}`)
+    return x.answer(m[1] === ORG_A)
+  }
+
+  /** A GET whose answer (or failure) the test hands over later. */
+  interface Held {
+    path: string
+    taken: boolean
+    release: () => void
+    fail: (e: unknown) => void
+  }
+  let held: Held[] = []
+  function hold(tenant: string, route: string): Held {
+    const never = () => {
+      throw new Error(`the held GET of ${route} was never sent`)
+    }
+    const h: Held = { path: `/tenant/${tenant}/${route}`, taken: false, release: never, fail: never }
+    held.push(h)
+    return h
+  }
+  /** Every pending promise has settled. */
+  const settle = () => new Promise((r) => setTimeout(r, 0))
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    // A test that stops before its held GET is sent must not hand it to the next.
+    mockApi.get.mockReset()
+    mockApi.put.mockReset()
+    held = []
+    mockApi.get.mockImplementation(async (path: string) => {
+      const h = held.find((x) => !x.taken && x.path === path)
+      if (!h) return answerFor(path) as never
+      h.taken = true
+      return new Promise((resolve, reject) => {
+        h.release = () => resolve(answerFor(path) as never)
+        h.fail = reject
+      }) as never
+    })
+    const t = useTenantStore()
+    t.isOwner = true
+    t.myPermissions = 0
+    t.myPermissionsTenantId = ORG_A
+  })
+
+  for (const x of SETTINGS) {
+    it(`${x.name}: a fetch for org B drops org A's value at once, and org A's late answer`, async () => {
+      const s = useAgentStore()
+      await x.fetch(s, ORG_A)
+      expect(x.held(s)).toEqual(x.of(true))
+      const lateA = hold(ORG_A, x.route)
+      const refreshA = x.fetch(s, ORG_A)
+      await settle()
+
+      const loadB = x.fetch(s, ORG_B)
+      expect(x.held(s)).toEqual(x.unknown)
+      await loadB
+      expect(x.held(s)).toEqual(x.of(false))
+      lateA.release()
+      await refreshA
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}: org A's late failure leaves org B's value`, async () => {
+      const s = useAgentStore()
+      const lateA = hold(ORG_A, x.route)
+      const loadA = x.fetch(s, ORG_A)
+      await settle()
+      await x.fetch(s, ORG_B)
+
+      lateA.fail(new Error('network'))
+      await loadA
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}: a save answered for org A after a fetch for org B leaves org B's value`, async () => {
+      const s = useAgentStore()
+      await x.fetch(s, ORG_A)
+      let saved!: (v: unknown) => void
+      mockApi.put.mockReturnValueOnce(new Promise((r) => (saved = r)) as never)
+      const save = x.save(s, ORG_A)
+      await x.fetch(s, ORG_B)
+
+      saved(x.answer(true))
+      await save
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+  }
+
+  it("setOrgExecRequireSystem for org B while holding org A's settings refuses, and sends nothing: it would send org A's kill switch to org B", async () => {
+    const s = useAgentStore()
+    await s.fetchOrgExecEnabled(ORG_A)
+    await expect(s.setOrgExecRequireSystem(ORG_B, true)).rejects.toThrow('not loaded yet')
+    expect(mockApi.put).not.toHaveBeenCalled()
+  })
+})
+
+// #4257 (the review's F1) — the remote viewer's load. On a fresh load the
+// shell's list fetch is in flight when the page asks (`RemoteControl.vue`
+// `loadAgent`: `await ensureAgents(tid)`, then the row from the list, else the
+// single-device GET). An ensure that answers at once lets the page take the
+// single-device row, which the list's answer then replaces in the store: the
+// page holds a row that presence updates no longer reach. An ensure answers
+// with the fetch in flight, as `ensureRooms` does, and a superseded fetch
+// settles with the newest one.
+describe('useAgentStore: an ensure answers with the fetch in flight (#4257)', () => {
+  const ORG_A = 'org_a'
+  const DEVICE = 'dev_1'
+  const LIST_A = `/tenant/${ORG_A}/agent?per_page=100`
+  const ONE_A = `/tenant/${ORG_A}/agent/${DEVICE}`
+  const listOf = (ids: string[]) => ({
+    items: ids.map((id) => mkAgent({ id })),
+    total: ids.length,
+    page: 1,
+    per_page: 100,
+    total_pages: 1,
+  })
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+  /** Every pending microtask, and the ones they queue, run. */
+  const flush = () => new Promise((r) => setTimeout(r, 0))
+
+  /** Each list GET of org A, held until the test answers it, in order. */
+  let lists: Array<(ids: string[]) => void>
+  /** The single-device GET's answer. */
+  let one: () => Promise<unknown>
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    lists = []
+    one = async () => mkAgent({ id: DEVICE })
+    mockApi.get.mockImplementation((async (path: string) => {
+      if (path === LIST_A) return new Promise((r) => lists.push((ids) => r(listOf(ids))))
+      if (path === ONE_A) return one()
+      throw new Error(`unexpected GET ${path}`)
+    }) as never)
+  })
+
+  /** What `loadAgent` does once the org is known: the row from the list, else
+   *  the single-device GET; nothing on a failed one. */
+  async function loadAgent(s: ReturnType<typeof useAgentStore>): Promise<Agent | null> {
+    await s.ensureAgents(ORG_A)
+    try {
+      return s.agents.find((a) => a.id === DEVICE) ?? (await s.fetchAgent(ORG_A, DEVICE))
+    } catch {
+      return null
+    }
+  }
+
+  it('settles only once the devices have landed, and asks nothing more', async () => {
+    const s = useAgentStore()
+    void s.fetchAgents(ORG_A)
+    let settled = false
+    const ensured = s.ensureAgents(ORG_A).then(() => (settled = true))
+    await flush()
+    expect(settled).toBe(false)
+
+    lists[0]!([DEVICE])
+    await ensured
+    expect(s.agents.map((a) => a.id)).toEqual([DEVICE])
+    expect(asked()).toEqual([LIST_A])
+  })
+
+  it("the remote viewer's load, with the shell's list in flight, holds the store's own row: a presence update reaches it", async () => {
+    const s = useAgentStore()
+    void s.fetchAgents(ORG_A)
+    const load = loadAgent(s)
+    // A single-device answer, if one was asked, lands before the list's, and
+    // the list's answer lands before the presence update.
+    await flush()
+    lists[0]!([DEVICE])
+    await flush()
+    const agent = await load
+    expect(agent?.id).toBe(DEVICE)
+
+    s.applyPresence([{ agent_id: DEVICE, presence: 'online' }])
+    expect(agent!.presence).toBe('online')
+    expect(agent!.is_online).toBe(true)
+    expect(asked().filter((p) => p === LIST_A)).toHaveLength(1)
+  })
+
+  it('a device the list holds is resolved from the list, whatever the single-device request does', async () => {
+    const s = useAgentStore()
+    one = async () => {
+      throw Object.assign(new Error('Service Unavailable'), { status: 503 })
+    }
+    void s.fetchAgents(ORG_A)
+    const load = loadAgent(s)
+    await flush()
+    lists[0]!([DEVICE])
+    const agent = await load
+    expect(agent?.id).toBe(DEVICE)
+    expect(asked()).not.toContain(ONE_A)
+  })
+
+  it('a superseded fetch settles with the newest one: a caller that reads the devices after its await reads the newest (the welcome tour counts them so)', async () => {
+    const s = useAgentStore()
+    const tourCount = s.fetchAgents(ORG_A).then(() => s.total)
+    // A page's fetch for the same org supersedes the tour's.
+    void s.fetchAgents(ORG_A)
+    await flush()
+    lists[0]!(['dropped'])
+    await flush()
+    lists[1]!([DEVICE, 'dev_2'])
+    expect(await tourCount).toBe(2)
+    expect(s.agents.map((a) => a.id)).toEqual([DEVICE, 'dev_2'])
+  })
+})
+
+// #4332 — a device dialog asks whether the store holds THIS org's switch,
+// never whether the switch is unset: a switch that holds another org's value
+// is not unset. Each switch has an ensure beside its fetcher, in the shape of
+// `ensureAgents`: it answers with this org's fetch, in flight or landed, and
+// starts one otherwise. One test per state of the ensure, for each switch:
+//   1. no fetch yet, or a value no fetch recorded (a test's seed): it fetches;
+//   2. the value is another org's: it fetches, and that value is gone at once;
+//   3. this org's fetch is in flight: no second GET, and it settles only once
+//      the answer has landed;
+//   4. this org's latest fetch landed with an answer: no GET;
+//   5. this org's latest fetch ended unknown (refused, failed, or a caller who
+//      may not read org settings): it asks again, and for exec and SSH
+//      `mayReadOrgSettings` still decides whether a GET goes out.
+describe("useAgentStore: an org switch's ensure asks for THIS org's value (#4332)", () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+
+  type Store = ReturnType<typeof useAgentStore>
+  interface Switch {
+    name: string
+    route: string
+    fetch: (s: Store, tenantId: string) => Promise<void>
+    ensure: (s: Store, tenantId: string) => Promise<void>
+    /** The server's answer: org A's switch is on, org B's off. */
+    answer: (on: boolean) => unknown
+    held: (s: Store) => unknown
+    /** What the store holds after the org's answer, and while unknown. */
+    of: (on: boolean) => unknown
+    unknown: unknown
+    /** A value set with no fetch, as a test seeds one. */
+    seed: (s: Store) => void
+    /** Its fetch asks `mayReadOrgSettings` first. */
+    gated: boolean
+  }
+  const SWITCHES: Switch[] = [
+    {
+      name: 'exec',
+      route: 'exec-settings',
+      fetch: (s, t) => s.fetchOrgExecEnabled(t),
+      ensure: (s, t) => s.ensureOrgExecEnabled(t),
+      answer: (on) => ({ remote_exec_enabled: on, exec_require_system: on }),
+      held: (s) => [s.orgExecEnabled, s.orgExecRequireSystem],
+      of: (on) => [on, on],
+      unknown: [null, null],
+      seed: (s) => {
+        s.orgExecEnabled = true
+      },
+      gated: true,
+    },
+    {
+      name: 'SSH',
+      route: 'ssh-settings',
+      fetch: (s, t) => s.fetchOrgSshEnabled(t),
+      ensure: (s, t) => s.ensureOrgSshEnabled(t),
+      answer: (on) => ({ remote_ssh_enabled: on }),
+      held: (s) => s.orgSshEnabled,
+      of: (on) => on,
+      unknown: null,
+      seed: (s) => {
+        s.orgSshEnabled = true
+      },
+      gated: true,
+    },
+    {
+      name: 'external access',
+      route: 'external-access',
+      fetch: (s, t) => s.fetchExternalAccess(t),
+      ensure: (s, t) => s.ensureExternalAccess(t),
+      answer: (on) => ({ enabled: on, devices: on ? [{ id: 'dev_a' }] : [] }),
+      held: (s) => [s.orgExternalAccessEnabled, s.externalDevices.map((d) => d.id)],
+      of: (on) => [on, on ? ['dev_a'] : []],
+      unknown: [null, []],
+      seed: (s) => {
+        s.orgExternalAccessEnabled = true
+      },
+      gated: false,
+    },
+  ]
+
+  /** The server's answer to a GET: the caller owns both orgs. */
+  function answerFor(path: string): unknown {
+    const m = /^\/tenant\/([^/]+)\/(.+)$/.exec(path)
+    if (m?.[2] === 'member/me') return { permissions: 0, is_owner: true }
+    const x = SWITCHES.find((y) => y.route === m?.[2])
+    if (!m || !x) throw new Error(`unexpected GET ${path}`)
+    return x.answer(m[1] === ORG_A)
+  }
+
+  /** A GET whose answer (or failure) the test hands over later. */
+  interface Held {
+    path: string
+    taken: boolean
+    release: () => void
+    fail: (e: unknown) => void
+  }
+  let held: Held[] = []
+  function hold(tenant: string, route: string): Held {
+    const never = () => {
+      throw new Error(`the held GET of ${route} was never sent`)
+    }
+    const h: Held = { path: `/tenant/${tenant}/${route}`, taken: false, release: never, fail: never }
+    held.push(h)
+    return h
+  }
+  /** Every pending promise has settled. */
+  const settle = () => new Promise((r) => setTimeout(r, 0))
+  /** How many GETs of the switch were sent for `tenant`. */
+  const gets = (x: Switch, tenant: string) =>
+    mockApi.get.mock.calls.filter((c) => c[0] === `/tenant/${tenant}/${x.route}`).length
+  const refusal = () => Object.assign(new Error('Forbidden'), { status: 403 })
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    // A test that stops before its held GET is sent must not hand it to the next.
+    mockApi.get.mockReset()
+    mockApi.put.mockReset()
+    held = []
+    mockApi.get.mockImplementation(async (path: string) => {
+      const h = held.find((x) => !x.taken && x.path === path)
+      if (!h) return answerFor(path) as never
+      h.taken = true
+      return new Promise((resolve, reject) => {
+        h.release = () => resolve(answerFor(path) as never)
+        h.fail = reject
+      }) as never
+    })
+    const t = useTenantStore()
+    t.isOwner = true
+    t.myPermissions = 0
+    t.myPermissionsTenantId = ORG_A
+  })
+
+  for (const x of SWITCHES) {
+    it(`${x.name}, state 1: with no fetch yet, it fetches`, async () => {
+      const s = useAgentStore()
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 1: a value no fetch recorded (a test's seed) is no org's, so it fetches`, async () => {
+      const s = useAgentStore()
+      x.seed(s)
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 2: holding org A's value, it fetches org B's, and org A's is gone at once, before any answer`, async () => {
+      const s = useAgentStore()
+      await x.fetch(s, ORG_A)
+      expect(x.held(s)).toEqual(x.of(true))
+      const answerB = hold(ORG_B, x.route)
+      const ensured = x.ensure(s, ORG_B)
+      expect(x.held(s)).toEqual(x.unknown)
+      await settle()
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.unknown)
+
+      answerB.release()
+      await ensured
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 3: with this org's fetch in flight, it sends no second GET, and settles only once the answer has landed`, async () => {
+      const s = useAgentStore()
+      const answerB = hold(ORG_B, x.route)
+      void x.fetch(s, ORG_B)
+      // Asked at once, before the fetch's GET is sent, and again after it is.
+      let settled = 0
+      const first = x.ensure(s, ORG_B).then(() => settled++)
+      await settle()
+      const second = x.ensure(s, ORG_B).then(() => settled++)
+      await settle()
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(settled).toBe(0)
+      expect(x.held(s)).toEqual(x.unknown)
+
+      answerB.release()
+      await Promise.all([first, second])
+      expect(settled).toBe(2)
+      expect(x.held(s)).toEqual(x.of(false))
+      expect(gets(x, ORG_B)).toBe(1)
+    })
+
+    it(`${x.name}, state 3: a fetch that a newer one superseded settles with the newest, so the ensure settles once the newest answer has landed`, async () => {
+      const s = useAgentStore()
+      const firstB = hold(ORG_B, x.route)
+      const newestB = hold(ORG_B, x.route)
+      void x.fetch(s, ORG_B)
+      await settle()
+      let settled = false
+      const ensured = x.ensure(s, ORG_B).then(() => (settled = true))
+      // A page's refresh for the same org (Settings' org watch) supersedes it.
+      void x.fetch(s, ORG_B)
+      await settle()
+      expect(gets(x, ORG_B)).toBe(2)
+
+      firstB.release()
+      await settle()
+      expect(settled).toBe(false)
+      expect(x.held(s)).toEqual(x.unknown)
+      newestB.release()
+      await ensured
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 4: with this org's answer landed, it sends no GET`, async () => {
+      const s = useAgentStore()
+      await x.fetch(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      await x.ensure(s, ORG_B)
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 5: after this org's fetch was refused, it asks again`, async () => {
+      const s = useAgentStore()
+      const refused = hold(ORG_B, x.route)
+      const first = x.ensure(s, ORG_B)
+      await settle()
+      refused.fail(refusal())
+      await first
+      expect(x.held(s)).toEqual(x.unknown)
+
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(2)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+
+    it(`${x.name}, state 5: after this org's fetch failed, it asks again`, async () => {
+      const s = useAgentStore()
+      const failed = hold(ORG_B, x.route)
+      const first = x.ensure(s, ORG_B)
+      await settle()
+      failed.fail(new Error('network'))
+      await first
+      expect(x.held(s)).toEqual(x.unknown)
+
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(2)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+  }
+
+  for (const x of SWITCHES.filter((y) => y.gated)) {
+    it(`${x.name}, state 5: for a caller who may not read org settings no GET goes out at all, and once they may, it asks`, async () => {
+      // MANAGE_AGENTS | REMOTE_CONTROL: the Devices page, but not MANAGE_TENANT.
+      const t = useTenantStore()
+      t.isOwner = false
+      t.myPermissions = (1 << 24) | (1 << 25)
+      t.myPermissionsTenantId = ORG_B
+      const s = useAgentStore()
+      await x.ensure(s, ORG_B)
+      await x.ensure(s, ORG_B)
+      expect(mockApi.get).not.toHaveBeenCalled()
+      expect(x.held(s)).toEqual(x.unknown)
+
+      t.isOwner = true
+      await x.ensure(s, ORG_B)
+      expect(gets(x, ORG_B)).toBe(1)
+      expect(x.held(s)).toEqual(x.of(false))
+    })
+  }
+
+  it("exec, state 4: an older server's answer, which names no exec_require_system, is an answer: no GET again", async () => {
+    // Never read "known" off a ref: `orgExecRequireSystem` stays null in it.
+    mockApi.get.mockImplementation(async (path: string) => {
+      if (path === `/tenant/${ORG_B}/exec-settings`) return { remote_exec_enabled: false } as never
+      return answerFor(path) as never
+    })
+    const s = useAgentStore()
+    await s.ensureOrgExecEnabled(ORG_B)
+    expect([s.orgExecEnabled, s.orgExecRequireSystem]).toEqual([false, null])
+    await s.ensureOrgExecEnabled(ORG_B)
+    expect(gets(SWITCHES[0]!, ORG_B)).toBe(1)
+  })
+})

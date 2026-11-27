@@ -6,6 +6,8 @@
 [#1035](https://github.com/gjovanov/roomler-ai/issues/1035) (a route port held by a companion the daemon spawned) ·
 FR-11 (server-side grids) · FR-27 (consent surfaces) · FR-61 (vmtest)
 
+**Anchors:** master `1d1b2b2c4` (closed 2026-09-26): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 **Installing Roomler ends with the companion open in front of the person who installed it,
@@ -58,7 +60,7 @@ curl -sI https://roomler.ai/api/setup/macos   → 404
 ```
 
 The agent lane is at `agent-v0.4.102`. The resolver is correct — it serves the newest
-`setup-v*` that exists (`crates/modules/fleet/src/setup_release.rs:474-493`); nothing has
+`setup-v*` that exists (`crates/modules/fleet/src/setup_release.rs:474-493`); nothing has (2026-11-21)
 cut one since 0.4.48, which shipped without macOS (`skip_macos`, before Apple signing).
 
 ## The mechanism, in the code (master `31cb9510e`)
@@ -68,8 +70,8 @@ it. Do not shift these anchors with code that moved later.*
 
 | Surface | Where | What it does today |
 |---|---|---|
-| Routes poll | `agents/roomler-desktop/src/front/tunnels.js:285`, `app.js:171-173` | two 2 s intervals armed at load: device view (1 connection) + routes + flows (2 more) |
-| swallowed errors | `agents/roomler-desktop/src/commands.rs:1143-1147`, `:1188-1193` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
+| Routes poll | `agents/roomler-desktop/src/front/tunnels.js:285`, `app.js:166-168` | two 2 s intervals armed at load: device view (1 connection) + routes + flows (2 more) |
+| swallowed errors | `agents/roomler-desktop/src/commands.rs:1007-1011`, `:1052-1057` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
 | empty paint | `tunnels.js:126-129`, `:176-179` | `paintRoutes([])` hides the table; `paintFlows([])` hides the card |
 | pipe server | `crates/localapi/src/lib.rs:1833-1908` | ONE listening instance; the next is created only after `connect()` returns |
 | pipe client | `crates/localapi/src/lib.rs:2151-2171` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
@@ -77,8 +79,8 @@ it. Do not shift these anchors with code that moved later.*
 | live keys | `agents/roomler-desktop/src/front/settings.js:60-63` | a hand-kept `LIVE_KEYS` list the daemon does not know about |
 | restart | — | nothing in the desktop or on the LocalAPI can restart the daemon |
 | encoder caps | `agents/roomlerd/src/encode/caps.rs:37, 548-559` | a process OnceLock filled at the first `rc:agent.hello`; never on the LocalAPI |
-| drop folder | `agents/roomlerd/src/files.rs:1981-2045` | SystemContext → the active user's Downloads; else the process owner's; Windows fallback `%PROGRAMDATA%\roomler\<segment>\uploads`; not configurable |
-| devices | `agents/roomler-desktop/src/front/devices.js:60, 179` | LocalAPI `Peers` (netmap) every 2 s, `p.name` only, no `display_name`, orgs mixed |
+| drop folder | `agents/roomlerd/src/files.rs:1966-2030` | SystemContext → the active user's Downloads; else the process owner's; Windows fallback `%PROGRAMDATA%\roomler\<segment>\uploads`; not configurable |
+| devices | `agents/roomler-desktop/src/front/devices.js:58, 179` | LocalAPI `Peers` (netmap) every 2 s, `p.name` only, no `display_name`, orgs mixed |
 | agent-token routes | `crates/modules/fleet/src/lib.rs:334-343` | crash / self-unenroll / logs; nothing lists devices; the web grid and mesh are `AuthUser` |
 | launch after install | `scripts/install.ps1:283-305`; `agents/roomler-setup/src/orchestrator_agent.rs:501-610`; `agents/roomlerd/wix*/main.wxs` | copy the EXE, launch nothing, register nothing |
 | first launch | `agents/roomler-desktop/src/main.rs:57-75`; `tauri.conf.json:26` | `--view=` handled only in the single-instance callback; the window starts hidden |
@@ -216,7 +218,7 @@ which can create a folder) and Use default.
 - **Server** — `GET /api/agent/self/devices` and `/api/agent/self/mesh`, host-owned (the
   network module is optional), agent-token authenticated through the fleet extractor's
   shared `authenticate()`. The visible set is **self ∪ the join-time netmap shaping**,
-  extracted as `shape_full_netmap` from `crates/modules/network/src/overlay.rs:624-647` and
+  extracted as `shape_full_netmap` from `crates/modules/network/src/overlay.rs:624-647` and (2026-11-04)
   reused by `handle_overlay_join`, so the list can never show a peer the netmap withholds:
   `off`/`warn` list every live node, `enforce` only the shaped set. The device's own live node
   is found **before** any ACL read (`try_load_acl` creates the network on miss and must never

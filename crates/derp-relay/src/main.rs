@@ -389,11 +389,39 @@ async fn collect_turn_usage(url: String, usage: Arc<TurnUsage>) {
     }
 }
 
+/// #3952 — the most the statistics subscription waits for this PoP's Redis
+/// to answer its connect (TCP and the handshake) or one PSUBSCRIBE: the
+/// server's own defaults for #3840's two bounds. The relay has no Redis
+/// settings. A Redis that takes the connection and never answers then costs
+/// this and a retry, never a subscriber parked for as long as the socket
+/// lives. Unlike the server's subscribers, this one does not probe its own
+/// connection: its Redis runs on the same host, so a connection gone deaf
+/// there is a frozen Redis, which coturn cannot publish to either.
+const STATS_REDIS_BOUND: Duration = Duration::from_secs(3);
+
+/// `fut` within [`STATS_REDIS_BOUND`]; elapsed, an io `TimedOut` error that
+/// names the step, so the failed line says what got no answer.
+async fn within_stats_bound<T>(
+    step: &str,
+    fut: impl std::future::Future<Output = redis::RedisResult<T>>,
+) -> redis::RedisResult<T> {
+    match tokio::time::timeout(STATS_REDIS_BOUND, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "no answer within {} ms ({step})",
+                STATS_REDIS_BOUND.as_millis()
+            ),
+        ))),
+    }
+}
+
 async fn subscribe_turn_usage(url: &str, usage: &TurnUsage) -> Result<(), redis::RedisError> {
     let client = redis::Client::open(url)?;
-    let mut pubsub = client.get_async_pubsub().await?;
+    let mut pubsub = within_stats_bound("connect", client.get_async_pubsub()).await?;
     for channel in turn_stats::CHANNELS {
-        pubsub.psubscribe(channel).await?;
+        within_stats_bound(&format!("PSUBSCRIBE {channel}"), pubsub.psubscribe(channel)).await?;
     }
     info!("derp-relay: subscribed to coturn's statistics");
     let mut stream = pubsub.on_message();
@@ -530,6 +558,8 @@ struct RelayState {
     turn_usage: Option<Arc<TurnUsage>>,
     /// FR-76 P3 — the networks `DERP_NETWORKS` names; unset, every network.
     scope: Arc<NetworkScope>,
+    /// FR-148 D52 — what `forward_frame` drops for want of a destination.
+    drops: Arc<ForwardDrops>,
 }
 
 #[derive(Deserialize)]
@@ -583,6 +613,7 @@ async fn main() {
         region,
         turn_usage,
         scope: Arc::new(scope),
+        drops: Arc::new(ForwardDrops::default()),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -900,6 +931,7 @@ async fn handle_socket(state: RelayState, socket: WebSocket, network: String, ti
                         &state.registry,
                         &state.network_bytes,
                         &state.allowance,
+                        &state.drops,
                         &network,
                         &self_pubkey,
                         &frame[..],
@@ -921,13 +953,127 @@ async fn handle_socket(state: RelayState, socket: WebSocket, network: String, ti
     info!(%network, "derp-relay: node disconnected");
 }
 
+/// FR-148 D52 — one drop line per network and destination per this long, as
+/// the central relay paces its own (`DROP_LOG_INTERVAL` in
+/// `modules/network/src/derp.rs`).
+const DROP_LOG_EVERY: Duration = Duration::from_secs(30);
+/// FR-148 D52 — the most (network, destination) pairs one cause's line book
+/// holds (a race can add one more per thread in flight). Past it the counts
+/// still move, and a new pair's line waits for the next sweep, which runs at
+/// most once per [`DROP_LOG_EVERY`] and removes the pairs whose last line is
+/// older than that.
+const DROP_LOG_KEYS: usize = 4096;
+
+/// The first 8 hex characters of a pubkey: enough to match a drop line here
+/// with the node's own lines and the central relay's, never a whole key.
+fn pk8(pk: &DerpPubKey) -> String {
+    pk.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// FR-148 D52 — when each (network, destination) last had a drop line, for
+/// one cause.
+#[derive(Default)]
+struct DropLines {
+    at: DashMap<DerpKey, Instant>,
+    /// When a full book was last swept.
+    swept: Mutex<Option<Instant>>,
+}
+
+/// FR-148 D52 — the frames [`forward_frame`] drops once the allowance has
+/// passed them, which it dropped in silence before: one for a destination
+/// with no registration on this relay (the peer is offline, or registered on
+/// another relay), one for a destination whose send queue refused it (a slow
+/// or half-open consumer). Each is counted for the life of the process and
+/// logged at most once per network and destination per [`DROP_LOG_EVERY`],
+/// with both keys as [`pk8`]: the central relay's two lines, under this
+/// binary's prefix.
+///
+/// Held once per process in [`RelayState`], as [`Allowance`] and
+/// [`NetworkScope`] are, rather than in statics, so a test reads its own
+/// relay's counts.
+#[derive(Default)]
+struct ForwardDrops {
+    miss_total: AtomicU64,
+    full_total: AtomicU64,
+    miss_lines: DropLines,
+    full_lines: DropLines,
+}
+
+impl ForwardDrops {
+    /// Count a frame for a destination this relay holds no registration for,
+    /// and log it when due; `true` when this one was logged.
+    fn missed(&self, key: &DerpKey, src: &DerpPubKey) -> bool {
+        let total = self.miss_total.fetch_add(1, Ordering::Relaxed) + 1;
+        let due = drop_log_due(&self.miss_lines, key, Instant::now());
+        if due {
+            info!(
+                network = %key.0,
+                src = %pk8(src),
+                dst = %pk8(&key.1),
+                derp_miss_total = total,
+                "derp-relay: dropped a frame for an unregistered dst (peer offline, or registered on another relay)"
+            );
+        }
+        due
+    }
+
+    /// Count a frame its destination's queue refused, and log it when due;
+    /// `true` when this one was logged.
+    fn full(&self, key: &DerpKey, src: &DerpPubKey) -> bool {
+        let total = self.full_total.fetch_add(1, Ordering::Relaxed) + 1;
+        let due = drop_log_due(&self.full_lines, key, Instant::now());
+        if due {
+            warn!(
+                network = %key.0,
+                src = %pk8(src),
+                dst = %pk8(&key.1),
+                derp_full_total = total,
+                "derp-relay: dropped a frame on a full destination queue (slow or half-open consumer)"
+            );
+        }
+        due
+    }
+}
+
+/// FR-148 D52 — `true` at most once per [`DROP_LOG_EVERY`] per `key`, and
+/// books the slot when it is. A pair not yet in a full book waits for a
+/// sweep, which frees the pairs whose window has passed and runs at most
+/// once per window.
+fn drop_log_due(lines: &DropLines, key: &DerpKey, now: Instant) -> bool {
+    // Copied out, so no shard guard is held across the calls below.
+    let booked = lines.at.get(key).map(|at| *at);
+    match booked {
+        Some(at) if now.duration_since(at) < DROP_LOG_EVERY => return false,
+        Some(_) => {}
+        None if lines.at.len() >= DROP_LOG_KEYS => {
+            let mut swept = lines.swept.lock().unwrap_or_else(|p| p.into_inner());
+            if swept.is_some_and(|at| now.duration_since(at) < DROP_LOG_EVERY) {
+                return false;
+            }
+            *swept = Some(now);
+            lines
+                .at
+                .retain(|_, at| now.duration_since(*at) < DROP_LOG_EVERY);
+            if lines.at.len() >= DROP_LOG_KEYS {
+                return false;
+            }
+        }
+        None => {}
+    }
+    lines.at.insert(key.clone(), now);
+    true
+}
+
 /// `[dst_pk(32)‖payload]` from `src` → `[src_pk(32)‖payload]` to dst, only
-/// within `network`. Drops silently on short/oversized frames, unknown dst,
-/// or a full destination queue (the carrier is loss-tolerant).
+/// within `network`. Drops silently on short/oversized frames (the carrier is
+/// loss-tolerant). FR-148 D52 — a frame for an unknown dst, or one a full
+/// destination queue refuses, is dropped too, but counted and paced into a
+/// line ([`ForwardDrops`]).
 fn forward_frame(
     registry: &Registry,
     network_bytes: &NetworkBytes,
     allowance: &Allowance,
+    drops: &ForwardDrops,
     network: &str,
     src_pubkey: &DerpPubKey,
     frame: &[u8],
@@ -949,9 +1095,13 @@ fn forward_frame(
         allowance.shaped(network, rate);
         return;
     }
-    let sender = match registry.get(&(network.to_string(), dst)) {
+    let key: DerpKey = (network.to_string(), dst);
+    let sender = match registry.get(&key) {
         Some(r) => r.clone(),
-        None => return,
+        None => {
+            drops.missed(&key, src_pubkey);
+            return;
+        }
     };
     let mut out = Vec::with_capacity(32 + payload.len());
     out.extend_from_slice(src_pubkey);
@@ -969,6 +1119,10 @@ fn forward_frame(
                 .or_insert_with(|| AtomicU64::new(0))
                 .fetch_add(n, Ordering::Relaxed);
         }
+    } else {
+        // Full, or closed by a consumer whose registration is not yet gone:
+        // either way the frame is lost here, as on the central relay.
+        drops.full(&key, src_pubkey);
     }
 }
 
@@ -1030,6 +1184,7 @@ mod tests {
             region: "us-east".into(),
             turn_usage,
             scope: Arc::new(NetworkScope::new(networks)),
+            drops: Arc::new(ForwardDrops::default()),
         };
         let (registry, scope) = (state.registry.clone(), state.scope.clone());
         let app = router(state);
@@ -1430,6 +1585,151 @@ mod tests {
         assert_eq!(scope.shown, NET_B);
     }
 
+    // ── FR-148 D52 — the drops `forward_frame` counts ───────────────────
+
+    /// A relay's forwarding state without a socket: what `forward_frame`
+    /// takes.
+    #[derive(Default)]
+    struct Forwarder {
+        registry: Registry,
+        bytes: NetworkBytes,
+        allowance: Allowance,
+        drops: ForwardDrops,
+    }
+
+    impl Forwarder {
+        /// One WireGuard-shaped frame from `[1; 32]` to `dst` within `network`.
+        fn send(&self, network: &str, dst: DerpPubKey) {
+            let mut frame = dst.to_vec();
+            frame.extend_from_slice(&[1, 0, 0, 0]);
+            forward_frame(
+                &self.registry,
+                &self.bytes,
+                &self.allowance,
+                &self.drops,
+                network,
+                &[1u8; 32],
+                &frame,
+            );
+        }
+
+        /// `(miss, full)` drops so far.
+        fn counts(&self) -> (u64, u64) {
+            (
+                self.drops.miss_total.load(Ordering::Relaxed),
+                self.drops.full_total.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    /// FR-148 D52 — a frame for a destination with no registration in its
+    /// network is dropped and counted, once per frame, and a pair's first
+    /// miss books its line: an unknown key, and a registered key seen from
+    /// another network, are two pairs.
+    #[test]
+    fn a_frame_for_an_unknown_destination_is_counted() {
+        let relay = Forwarder::default();
+        let (tx, _rx) = mpsc::channel(DERP_SEND_QUEUE);
+        relay.registry.insert((NET_A.to_string(), [2u8; 32]), tx);
+        relay.send(NET_A, [3u8; 32]);
+        relay.send(NET_A, [3u8; 32]);
+        relay.send(NET_B, [2u8; 32]);
+        assert_eq!(relay.counts(), (3, 0));
+        assert_eq!(
+            relay.drops.miss_lines.at.len(),
+            2,
+            "one line slot per network and destination"
+        );
+    }
+
+    /// FR-148 D52 — a frame its destination's full queue refuses is dropped
+    /// and counted, once per frame; a delivered frame is not.
+    #[test]
+    fn a_frame_a_full_destination_queue_refuses_is_counted() {
+        let relay = Forwarder::default();
+        let (tx, _rx) = mpsc::channel(DERP_SEND_QUEUE);
+        relay.registry.insert((NET_A.to_string(), [2u8; 32]), tx);
+        for _ in 0..DERP_SEND_QUEUE {
+            relay.send(NET_A, [2u8; 32]);
+        }
+        assert_eq!(
+            relay.counts(),
+            (0, 0),
+            "a queue filled to its bound has refused nothing"
+        );
+        for _ in 0..3 {
+            relay.send(NET_A, [2u8; 32]);
+        }
+        assert_eq!(relay.counts(), (0, 3));
+        assert_eq!(relay.drops.full_lines.at.len(), 1);
+    }
+
+    /// FR-148 D52 — a drop line is due once per window per network and
+    /// destination: the next inside the window is counted only, while
+    /// another destination, or the same key in another network, has its own
+    /// window.
+    #[test]
+    fn a_drop_line_is_due_once_per_window_per_network_and_destination() {
+        let lines = DropLines::default();
+        let t0 = Instant::now();
+        let a1 = (NET_A.to_string(), [1u8; 32]);
+        let a2 = (NET_A.to_string(), [2u8; 32]);
+        let b1 = (NET_B.to_string(), [1u8; 32]);
+        let soon = t0 + Duration::from_secs(1);
+        assert!(
+            drop_log_due(&lines, &a1, t0),
+            "a pair's first drop is logged"
+        );
+        assert!(
+            !drop_log_due(&lines, &a1, soon),
+            "the next, inside the window, is not"
+        );
+        assert!(
+            drop_log_due(&lines, &a2, soon),
+            "another destination has its own window"
+        );
+        assert!(
+            drop_log_due(&lines, &b1, soon),
+            "and so does the same key in another network"
+        );
+        assert!(
+            !drop_log_due(&lines, &a1, t0 + DROP_LOG_EVERY - Duration::from_millis(1)),
+            "the window holds to its end"
+        );
+        assert!(
+            drop_log_due(&lines, &a1, t0 + DROP_LOG_EVERY),
+            "and the pair is due again once it has passed"
+        );
+    }
+
+    /// FR-148 D52 — a full line book takes no new pair until a sweep frees a
+    /// slot, and sweeps at most once a window.
+    #[test]
+    fn a_full_drop_line_book_sweeps_once_a_window() {
+        let lines = DropLines::default();
+        let t0 = Instant::now();
+        for k in 0..DROP_LOG_KEYS {
+            let mut dst = [0u8; 32];
+            dst[..8].copy_from_slice(&(k as u64).to_le_bytes());
+            assert!(drop_log_due(&lines, &(NET_A.to_string(), dst), t0));
+        }
+        let late = (NET_A.to_string(), [0xEE; 32]);
+        let swept_at = t0 + Duration::from_secs(1);
+        assert!(
+            !drop_log_due(&lines, &late, swept_at),
+            "a book full of fresh pairs has no slot"
+        );
+        assert!(
+            !drop_log_due(&lines, &late, t0 + DROP_LOG_EVERY),
+            "and is not swept again inside the window"
+        );
+        assert!(
+            drop_log_due(&lines, &late, swept_at + DROP_LOG_EVERY),
+            "a sweep a window later frees the pairs whose window passed"
+        );
+        assert_eq!(lines.at.len(), 1);
+    }
+
     // ── FR-115 P4a-2 — the relay allowance on a PoP ─────────────────────
 
     use roomler_ai_remote_control::derp_ticket::jsonwebtoken::{
@@ -1770,5 +2070,51 @@ mod tests {
             serde_json::from_str(&reqwest_lite(plain, "/stats").await).unwrap();
         assert!(v["turn_usage"].is_null(), "no totals kept, no marker: {v}");
         assert_eq!(get_lite(plain, "/stats/turn-usage", Some(&ok)).await.0, 404);
+    }
+
+    /// #3952 (T6) — a Redis that takes the connection and never answers fails
+    /// the statistics subscription within the bound, so the loop tries again,
+    /// instead of waiting in the handshake for as long as the socket lives.
+    #[tokio::test]
+    async fn a_statistics_subscribe_to_a_silent_listener_gives_up_within_the_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Taken, never read, never answered, never closed.
+        let accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let usage = TurnUsage::new();
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            subscribe_turn_usage(&format!("redis://{addr}"), &usage),
+        )
+        .await;
+        let took = started.elapsed();
+        eprintln!(
+            "W18-RESULT T6 relay statistics subscribe to a silent listener: {} after {took:?}",
+            match &res {
+                Ok(Ok(())) => "ended",
+                Ok(Err(_)) => "failed",
+                Err(_) => "still waiting",
+            }
+        );
+        accept.abort();
+        assert!(
+            res.is_ok(),
+            "W18-RED the relay's statistics subscribe to a listener that never answers was \
+             still waiting after {took:?}: nothing bounds its connect or its subscribe"
+        );
+        assert!(
+            res.unwrap().is_err(),
+            "a listener that never answers cannot have taken the subscription"
+        );
+        assert!(
+            took <= Duration::from_secs(5),
+            "it failed after {took:?}; the bound is 3 s"
+        );
     }
 }

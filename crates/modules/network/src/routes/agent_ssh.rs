@@ -68,7 +68,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::oid::ObjectId;
@@ -845,7 +845,7 @@ async fn load_agent(
     agent_id: &str,
 ) -> Result<Agent, ApiError> {
     let aid = ObjectId::parse_str(agent_id)
-        .map_err(|_| ApiError::BadRequest("Invalid agent id".into()))?;
+        .map_err(|_| ApiError::BadRequest("Invalid device id".into()))?;
     // LIVE: the session target and the policy write both come through here,
     // and neither has a meaning for a removed device (#1821).
     state
@@ -853,7 +853,7 @@ async fn load_agent(
         .agents
         .find_live_in_tenant(tenant_id, aid)
         .await
-        .map_err(|_| ApiError::NotFound("Agent not found".into()))
+        .map_err(|_| ApiError::NotFound("Device not found".into()))
 }
 
 async fn http_caller(state: &NetworkState, auth: &AuthUser) -> Caller {
@@ -927,11 +927,16 @@ pub async fn request_session(
 ///
 /// `MANAGE_AGENTS`, not `SSH_DEVICE`: deciding a device may be SSHed into is a
 /// management act, distinct from being allowed to do it. Same split exec uses.
+///
+/// The bit is decided before the body is read or the device looked up
+/// (#4218): a caller without it gets the gate's answer whatever the body and
+/// the device id are. A holder is answered a body that does not parse as the
+/// `Json` extractor answered it (`ApiError::JsonBody`), whatever the id.
 pub async fn set_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    Json(body): Json<SshPolicyBody>,
+    body: Result<Json<SshPolicyBody>, JsonRejection>,
 ) -> Result<Json<SshPolicyBody>, ApiError> {
     let tid = tenant_of(&tenant_id).await?;
     require_permission(
@@ -942,6 +947,7 @@ pub async fn set_policy(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
     let agent = load_agent(&state, tid, &agent_id).await?;
 
     let parse_ids = |v: &[String], what: &str| -> Result<Vec<ObjectId>, ApiError> {
@@ -973,7 +979,7 @@ pub async fn set_policy(
     // is how the default reached Linux devices in the first place (#1557).
     if console_user_unsupported(body.account_mode, agent.os, &agent.capabilities) {
         return Err(ApiError::BadRequest(
-            "this device's agent cannot run SSH sessions as the person at its screen: update \
+            "this device's daemon cannot run SSH sessions as the person at its screen: update \
              it, or name a local account instead"
                 .into(),
         ));
@@ -986,7 +992,7 @@ pub async fn set_policy(
     // to remove, so the server must not be able to recreate it per-device.
     if consent_mode_would_be_ignored(&agent.capabilities, body.consent_mode) {
         return Err(ApiError::BadRequest(format!(
-            "this device's agent does not honour consent_mode yet (needs the P5d agent); \
+            "this device's daemon does not honour consent_mode yet (needs the P5d daemon); \
              it would accept `{:?}` and ignore it. Update the device, or set `auto`.",
             body.consent_mode.unwrap_or(ConsentMode::Auto)
         )));
@@ -1054,12 +1060,15 @@ pub async fn get_org_settings(
 /// `PUT /api/tenant/{tenant_id}/ssh-settings` — flip gate 1.
 ///
 /// `MANAGE_TENANT`, the highest bar of the three, because this one switch
-/// governs the whole org.
+/// governs the whole org. Decided before the body is read (#4218): a caller
+/// without it gets the gate's answer whatever the body is, and a holder is
+/// answered one that does not parse as the `Json` extractor answered it
+/// (`ApiError::JsonBody`).
 pub async fn set_org_settings(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<OrgSshSettings>,
+    body: Result<Json<OrgSshSettings>, JsonRejection>,
 ) -> Result<Json<OrgSshSettings>, ApiError> {
     let tid = tenant_of(&tenant_id).await?;
     require_permission(
@@ -1070,6 +1079,7 @@ pub async fn set_org_settings(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     let tenant = state
         .tenants
         .set_remote_ssh_enabled(tid, body.remote_ssh_enabled)

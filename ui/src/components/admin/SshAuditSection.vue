@@ -142,7 +142,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { useAgentStore, type SshAuditEntry } from '@/stores/agents'
 import { deviceLabel } from '@/composables/useHideDeviceName'
@@ -176,7 +176,7 @@ const DENY_LABEL: Record<string, string> = {
   device_disabled: 'device switched off',
   caller_not_allowed: 'caller not allowed',
   origin_not_allowed: 'origin not allowed',
-  unsupported: 'agent too old',
+  unsupported: 'roomlerd too old',
   offline: 'device offline',
   no_overlay_address: 'not on the mesh',
   rate_limited: 'rate limited',
@@ -237,29 +237,47 @@ function fmtWhen(at: string): string {
   return Number.isNaN(d.getTime()) ? at : d.toLocaleString()
 }
 
+// #4257 — only the latest load writes, and only while the org is still the
+// one it asked for: a log or a refusal for the previous org that lands after
+// a change of org is dropped.
+let loadSeq = 0
+
 async function load() {
+  const mine = ++loadSeq
+  const tenantId = props.tenantId
+  const current = () => mine === loadSeq && tenantId === props.tenantId
   loading.value = true
   error.value = null
   try {
-    const res = await agentStore.fetchSshAudit(props.tenantId, {
+    const res = await agentStore.fetchSshAudit(tenantId, {
       agentId: props.agentId,
       perPage: 100,
     })
-    entries.value = res.items
+    if (current()) entries.value = res.items
   } catch (e) {
-    error.value = (e as Error).message
-    entries.value = []
+    if (current()) {
+      error.value = (e as Error).message
+      entries.value = []
+    }
   } finally {
-    loading.value = false
+    if (current()) loading.value = false
   }
 }
 
-onMounted(() => {
-  void load()
-  if (!agentStore.tenantMembers.length) {
-    void agentStore.fetchTenantMembers(props.tenantId)
-  }
-})
+// #4257 — a routed section: a change of org in the URL reuses it with a new
+// `tenantId`, so it follows its org from the start. A change empties the
+// previous org's rows until this org's land.
+watch(
+  () => props.tenantId,
+  (tenantId, previous) => {
+    if (previous !== undefined) entries.value = []
+    void load()
+    // This org's people, not any: a list that holds another org's members is
+    // not empty.
+    void agentStore.ensureTenantMembers(tenantId)
+  },
+  { immediate: true },
+)
 
 defineExpose({ load })
 </script>

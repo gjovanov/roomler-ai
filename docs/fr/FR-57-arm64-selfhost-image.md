@@ -2,6 +2,8 @@
 
 > **CLOSED 2026-09-01** — issue #1161 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
+**Anchors:** master `7a71dcd63` (closed 2026-09-01): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1161](https://github.com/gjovanov/roomler-ai/issues/1161) ·
 Status: **P1 proven; P2/P3 in this PR** (2026-09-01) · Follows
 [FR-42](FR-42-selfhost-verified-on-a-clean-box.md) (#967), which shipped the

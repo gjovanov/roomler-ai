@@ -341,6 +341,7 @@ mod tests {
             why: None,
             probes: Vec::new(),
             debug: None,
+            control_down: None,
         }
     }
 

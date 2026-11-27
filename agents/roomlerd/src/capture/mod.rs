@@ -95,22 +95,133 @@ pub mod gpu_frame;
 #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
 pub mod iosurface_frame;
 
-/// FR-118 — the kill switch for GPU-resident frames, on every platform:
-/// `ROOMLERD_ZERO_COPY` (config `zero_copy`), default OFF. A capture backend
-/// reads it once, when it opens, and delivers GPU frames only while it is on.
-pub fn zero_copy_enabled() -> bool {
+/// FR-118 — the switch for GPU-resident frames, on every platform:
+/// `ROOMLERD_ZERO_COPY` (config `zero_copy`). A capture backend reads it once,
+/// when it opens; an encoder at every open; the probe once per process.
+///
+/// FR-132 P2 — it reads three ways, as its config key does (`kind:
+/// "tribool"`): `On` takes the GPU form on every cell the probe proved, `Off`
+/// on none, and `Unset` on the cells of the built-in default list
+/// ([`DEFAULT_CELLS`]) only. Read it through [`zero_copy_admits`] (an
+/// encoder's open, the probe's candidates) or [`zero_copy_capture`] (a
+/// capture's open), never as a yes or no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZeroCopy {
+    On,
+    Off,
+    Unset,
+}
+
+/// The switch as this process reads it now.
+pub fn zero_copy() -> ZeroCopy {
     zero_copy_from(tunnel_core::env::node_env("ZERO_COPY").as_deref())
 }
 
-/// `1`, `true`, `yes` or `on`, in any case, turn it on; anything else leaves
-/// it off.
-fn zero_copy_from(value: Option<&str>) -> bool {
-    value.is_some_and(|v| {
-        let v = v.trim();
-        ["1", "true", "yes", "on"]
-            .iter()
-            .any(|on| v.eq_ignore_ascii_case(on))
-    })
+/// `1`, `true`, `yes` or `on`, in any case, turn it on; absent or blank leave
+/// it unset, as a blank config value does; anything else turns it off, as
+/// every other value did before P2.
+fn zero_copy_from(value: Option<&str>) -> ZeroCopy {
+    let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return ZeroCopy::Unset;
+    };
+    if ["1", "true", "yes", "on"]
+        .iter()
+        .any(|on| v.eq_ignore_ascii_case(on))
+    {
+        ZeroCopy::On
+    } else {
+        ZeroCopy::Off
+    }
+}
+
+/// FR-132 P2 — the built-in default list: the encoders whose GPU-input form
+/// opens with `zero_copy` unset. Whole names, matched by equality. It ships
+/// EMPTY, so P2 alone changes nothing a session does: a cell joins it in a
+/// release of its own after a clean canary week (P3 to P5; `docs/encoders.md`
+/// records each flip), and decision 9 keeps `hevc_qsv` and `h264_qsv` off it.
+/// A listed cell is held to everything a cell turned on by hand is: the
+/// probe's proof, `zero_copy_deny`, the adapter.
+pub const DEFAULT_CELLS: &[&str] = &[];
+
+/// Whether `name` is on the default list in force: [`DEFAULT_CELLS`], or a
+/// test's own list on its thread ([`with_default_cells`]).
+fn default_listed(name: &str) -> bool {
+    #[cfg(test)]
+    if let Some(list) = TEST_DEFAULT_CELLS.with(|l| l.borrow().clone()) {
+        return list.iter().any(|n| n == name);
+    }
+    DEFAULT_CELLS.contains(&name)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own default list, for its thread only, as a release that
+    /// listed those cells would ship it: the built-in one is empty, and a
+    /// process-wide list would decide every other test's open.
+    static TEST_DEFAULT_CELLS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `names` as the default list on this thread.
+#[cfg(test)]
+pub(crate) fn with_default_cells<T>(names: &[&str], f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_DEFAULT_CELLS.with(|l| *l.borrow_mut() = None);
+        }
+    }
+    TEST_DEFAULT_CELLS
+        .with(|l| *l.borrow_mut() = Some(names.iter().map(|n| n.to_string()).collect()));
+    let _reset = Reset;
+    f()
+}
+
+/// FR-132 P2 — the switch's gate: the first gate an encoder's GPU-input open
+/// reads (`gpu_input::plan`, `vt_input::plan`), and the one the probe's GPU
+/// phase picks its candidates by (`caps::child::candidates_gpu`), so both
+/// entry points read it alike. `Ok` lets `name` on to the gates after it;
+/// `Err` is why it takes CPU frames: `switch_off` with the switch off,
+/// `default_off` with it unset and `name` not on the list.
+pub fn zero_copy_admits(name: &str) -> Result<(), &'static str> {
+    match zero_copy() {
+        ZeroCopy::On => Ok(()),
+        ZeroCopy::Off => Err("switch_off"),
+        ZeroCopy::Unset if default_listed(name) => Ok(()),
+        ZeroCopy::Unset => Err("default_off"),
+    }
+}
+
+/// FR-132 P2 — whether a capture opening now delivers GPU frames. It decides
+/// at its open, before the session's encoder is known: on, it does, and off,
+/// it does not, as before P2; unset, it does only when one of `cells`, the
+/// proven GPU-input cells its frames would go to, is on the list. An encoder
+/// on an unlisted cell then reads such a frame back through [`Frame::cpu`].
+pub fn zero_copy_capture(cells: &[String]) -> bool {
+    match zero_copy() {
+        ZeroCopy::On => true,
+        ZeroCopy::Off => false,
+        ZeroCopy::Unset => cells.iter().any(|c| default_listed(c)),
+    }
+}
+
+/// FR-118 P3 — the encoders whose GPU-input form the capability probe proved,
+/// as the capture side sees them: the list the encoders' GPU-input gates read,
+/// installed by `caps::detect` before any session, and again only when a later
+/// try's answer is adopted with no session live (#3280). FR-132 P2 moved it
+/// here from `gpu_frame`, so that macOS's capture reads it too.
+static GPU_INPUT_CELLS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+pub fn install_gpu_input_cells(names: Vec<String>) {
+    *GPU_INPUT_CELLS.write().unwrap_or_else(|e| e.into_inner()) = names;
+}
+
+/// The proven GPU-input cells, as `caps::detect` installed them.
+pub fn gpu_input_cells() -> Vec<String> {
+    GPU_INPUT_CELLS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// A captured frame, in an encoder-agnostic representation.
@@ -765,26 +876,26 @@ impl CaptureUnavailableCode {
                 if cfg!(target_os = "macos") {
                     MAC_PERMISSION_HINT
                 } else {
-                    "The host denied this agent permission to capture the screen. Grant it on \
+                    "The host denied roomlerd permission to capture the screen. Grant it on \
                      the host, then reconnect."
                 }
             }
             Self::NoDisplay => {
                 if cfg!(target_os = "macos") {
-                    "This agent runs as a system daemon, which has no desktop session and \
+                    "This roomlerd runs as a system daemon, which has no desktop session and \
                      therefore no screen to capture. Connect to this machine's user-session \
-                     agent instead. Remote shell works here."
+                     roomlerd instead. Remote shell works here."
                 } else {
                     no_display_hint(crate::files::follows_the_screen())
                 }
             }
             Self::NotBuilt => {
-                "This agent was built without a capture backend — it can signal, but never \
-                 send pixels. Install a full agent build."
+                "This roomlerd was built without a capture backend — it can signal, but never \
+                 send pixels. Install a full roomlerd build."
             }
             Self::BackendError => {
                 "The host's capture backend failed to start. Its own error is in the detail; \
-                 the agent log has the full line."
+                 roomlerd's log has the full line."
             }
             Self::WaylandNotEnabled => wayland_hint(running_as_root()),
             Self::X11NotEnabled => x11_hint(running_as_root()),
@@ -907,7 +1018,7 @@ fn x11_hint_with(
             "Remote shell and file transfer still work."
         )
     } else {
-        "This computer is showing an X11 desktop, and this agent was started without access to \
+        "This computer is showing an X11 desktop, and roomlerd was started without access to \
          it (no DISPLAY). Restart it from inside the desktop session, with roomler restart in a \
          terminal there, or install the system service. Remote shell and file transfer still \
          work."
@@ -3684,17 +3795,21 @@ mod frame_tests {
         assert_eq!(copy.cpu(), f.cpu(), "a clone carries the same bytes");
     }
 
-    /// FR-118 — the switch is off unless it says on: unset, empty, `0` and
-    /// anything unrecognised all leave a host on today's path.
+    /// FR-132 P2 — the switch reads three ways, as its config key does: `on`
+    /// (`1`, `true`, `yes`, `on`, any case), unset (absent, or blank, as a
+    /// blank config value is), and `off`, which is anything else, as it was
+    /// before P2: `0` and a value nobody recognises stay on today's path.
     #[test]
-    fn the_zero_copy_switch_is_off_unless_it_says_on() {
+    fn the_zero_copy_switch_reads_on_off_or_unset() {
         for on in ["1", "true", "TRUE", "yes", "On", " on "] {
-            assert!(zero_copy_from(Some(on)), "{on:?} turns it on");
+            assert_eq!(zero_copy_from(Some(on)), ZeroCopy::On, "{on:?}");
         }
-        for off in ["0", "false", "no", "off", "", "2", "enabled"] {
-            assert!(!zero_copy_from(Some(off)), "{off:?} leaves it off");
+        for off in ["0", "false", "no", "off", "2", "enabled"] {
+            assert_eq!(zero_copy_from(Some(off)), ZeroCopy::Off, "{off:?}");
         }
-        assert!(!zero_copy_from(None));
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(zero_copy_from(unset), ZeroCopy::Unset, "{unset:?}");
+        }
     }
 
     // P8a — damage re-projection through a downscale (moved here with
@@ -5159,5 +5274,115 @@ mod login_session_tests {
         )
         .expect_err("the open's own failure");
         assert_eq!(format!("{e:#}"), "creating scrap::Capturer: other error");
+    }
+}
+
+#[cfg(test)]
+mod zero_copy_tests {
+    //! FR-132 P2 — the default list, and the switch's gate, read at both
+    //! entry points' first step (the probe's GPU candidates, an encoder's open)
+    //! and at a capture's open.
+    use super::*;
+    use tunnel_core::env::test_env::{Saved, clear, set};
+
+    /// The lock every test that sets the zero-copy knobs takes.
+    fn knobs() -> std::sync::MutexGuard<'static, ()> {
+        crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn cells(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The list ships EMPTY, so P2 changes nothing a session does. A cell
+    /// joins it in a release of its own (P3 to P5), after its canary week, and
+    /// decision 9 keeps `hevc_qsv` and `h264_qsv` off it.
+    #[test]
+    fn the_default_list_ships_empty() {
+        assert!(DEFAULT_CELLS.is_empty(), "{DEFAULT_CELLS:?}");
+    }
+
+    /// AC4's gate: `on` admits every cell and `off` none, whatever the list
+    /// says; unset admits exactly the listed cells, and the rest read
+    /// `default_off`. Names compare whole, so `av1_qsv` lists no prefix of
+    /// itself and nothing that merely starts with it.
+    #[test]
+    fn the_list_is_read_only_while_the_switch_is_unset() {
+        let _guard = knobs();
+        let _switch = Saved::cleared("ZERO_COPY");
+        with_default_cells(&["av1_qsv", "hevc_nvenc"], || {
+            for name in ["av1_qsv", "hevc_nvenc"] {
+                assert_eq!(zero_copy_admits(name), Ok(()), "unset, listed: {name}");
+            }
+            for name in [
+                "hevc_qsv",
+                "h264_qsv",
+                "av1_nvenc",
+                "av1_qs",
+                "av1_qsv:gpu",
+                "",
+            ] {
+                assert_eq!(
+                    zero_copy_admits(name),
+                    Err("default_off"),
+                    "unset, unlisted: {name:?}"
+                );
+            }
+            // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+            unsafe { set("ZERO_COPY", "0") };
+            for name in ["av1_qsv", "hevc_nvenc", "hevc_qsv"] {
+                assert_eq!(zero_copy_admits(name), Err("switch_off"), "off: {name}");
+            }
+            // SAFETY: as above.
+            unsafe { set("ZERO_COPY", "1") };
+            for name in ["av1_qsv", "hevc_nvenc", "hevc_qsv", "h264_qsv"] {
+                assert_eq!(zero_copy_admits(name), Ok(()), "on: {name}");
+            }
+        });
+        // SAFETY: as above.
+        unsafe { clear("ZERO_COPY") };
+        for name in ["av1_qsv", "hevc_nvenc", "hevc_videotoolbox"] {
+            assert_eq!(
+                zero_copy_admits(name),
+                Err("default_off"),
+                "the built-in list: {name}"
+            );
+        }
+    }
+
+    /// The capture's half (spec 3c): a capture decides at its open, before the
+    /// session's cell is known. `on` delivers GPU frames and `off` does not,
+    /// as before P2; unset delivers them only when one of the cells its frames
+    /// would go to is listed.
+    #[test]
+    fn unset_the_capture_delivers_gpu_frames_only_for_a_listed_cell() {
+        let _guard = knobs();
+        let _switch = Saved::cleared("ZERO_COPY");
+        assert!(
+            !zero_copy_capture(&cells(&["hevc_qsv", "av1_qsv", "hevc_videotoolbox"])),
+            "the built-in list is empty"
+        );
+        with_default_cells(&["av1_qsv"], || {
+            assert!(zero_copy_capture(&cells(&["hevc_qsv", "av1_qsv"])));
+            assert!(!zero_copy_capture(&cells(&["hevc_qsv", "h264_qsv"])));
+            assert!(
+                !zero_copy_capture(&[]),
+                "nothing proven: nothing to take them"
+            );
+            // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+            unsafe { set("ZERO_COPY", "0") };
+            assert!(
+                !zero_copy_capture(&cells(&["av1_qsv"])),
+                "off wins over the list"
+            );
+            // SAFETY: as above.
+            unsafe { set("ZERO_COPY", "1") };
+            assert!(
+                zero_copy_capture(&[]),
+                "on: as before P2, whatever is proven"
+            );
+        });
     }
 }

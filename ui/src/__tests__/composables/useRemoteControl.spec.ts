@@ -15,6 +15,7 @@ import {
   letterboxedNormalise,
   directVideoNormalise,
   extractStatsSnapshot,
+  selectedRelayProtocol,
   inspectBrowserVideoCodecs,
   base64ToBytes,
   shouldPreventDefault,
@@ -49,8 +50,9 @@ import {
   parseNativeClipPayload,
   bytesToBase64,
   VP9_444_DC_LABEL,
+  VIDEO_DEADLINE_DC_LABEL,
   videoDcOptions,
-  storedUnorderedVideo,
+  videoDeadlineDcOptions,
   readStoredAudioEnabled,
   persistAudioEnabled,
   audioRequestFields,
@@ -727,6 +729,91 @@ describe('extractStatsSnapshot', () => {
     ])
     const snap = extractStatsSnapshot(report, 0, 0)
     expect(snap.next.codec).toBe('VP9')
+  })
+})
+
+describe('selectedRelayProtocol (FR-148 P4b-3b cell 1, the viewer reports its relay)', () => {
+  function makeReport(entries: Array<[string, Record<string, unknown>]>): RTCStatsReport {
+    const map = new Map<string, Record<string, unknown>>()
+    for (const [id, stats] of entries) map.set(id, { id, ...stats })
+    return map as unknown as RTCStatsReport
+  }
+
+  /** Chromium's shape: the transport names the selected pair, the pair its
+   *  local candidate, here given its fields. */
+  function chromium(local: Record<string, unknown>, more: Array<[string, Record<string, unknown>]> = []) {
+    return makeReport([
+      ['T01', { type: 'transport', dtlsState: 'connected', selectedCandidatePairId: 'CPsel' }],
+      ['CPsel', { type: 'candidate-pair', localCandidateId: 'ILsel', remoteCandidateId: 'IRsel', state: 'succeeded', nominated: true }],
+      ['CPother', { type: 'candidate-pair', localCandidateId: 'ILother', remoteCandidateId: 'IRsel', state: 'failed' }],
+      ['ILsel', { type: 'local-candidate', ...local }],
+      ['ILother', { type: 'local-candidate', candidateType: 'relay', relayProtocol: 'udp' }],
+      ['IRsel', { type: 'remote-candidate', candidateType: 'srflx' }],
+      ...more,
+    ])
+  }
+
+  it('reads the relayProtocol of the selected pair’s local candidate when it is a relay', () => {
+    for (const p of ['udp', 'tcp', 'tls'] as const) {
+      expect(selectedRelayProtocol(chromium({ candidateType: 'relay', relayProtocol: p, url: 'turns:x' }))).toBe(p)
+    }
+  })
+
+  it('gives none for a local candidate that is not a relay, whatever else it carries', () => {
+    for (const candidateType of ['host', 'srflx', 'prflx']) {
+      expect(selectedRelayProtocol(chromium({ candidateType })), candidateType).toBeNull()
+      expect(selectedRelayProtocol(chromium({ candidateType, relayProtocol: 'tls' })), candidateType).toBeNull()
+    }
+  })
+
+  it('gives none for a relay with no relayProtocol, or one outside udp, tcp and tls', () => {
+    expect(selectedRelayProtocol(chromium({ candidateType: 'relay' }))).toBeNull()
+    for (const relayProtocol of ['TLS', 'quic', 'Udp', 'tcp ', '', 6, null, true]) {
+      expect(selectedRelayProtocol(chromium({ candidateType: 'relay', relayProtocol })), String(relayProtocol)).toBeNull()
+    }
+  })
+
+  it('reads Firefox’s shape: no transport, the candidate-pair whose selected is true', () => {
+    const report = makeReport([
+      ['p1', { type: 'candidate-pair', localCandidateId: 'l1', selected: false, nominated: true }],
+      ['p2', { type: 'candidate-pair', localCandidateId: 'l2', selected: true, nominated: true }],
+      ['l1', { type: 'local-candidate', candidateType: 'relay', relayProtocol: 'udp' }],
+      ['l2', { type: 'local-candidate', candidateType: 'relay', relayProtocol: 'tls' }],
+    ])
+    expect(selectedRelayProtocol(report)).toBe('tls')
+  })
+
+  it('takes the pair the transport names over one marked selected', () => {
+    const report = chromium({ candidateType: 'relay', relayProtocol: 'udp' }, [
+      ['CPflag', { type: 'candidate-pair', localCandidateId: 'ILflag', selected: true }],
+      ['ILflag', { type: 'local-candidate', candidateType: 'relay', relayProtocol: 'tls' }],
+    ])
+    expect(selectedRelayProtocol(report)).toBe('udp')
+  })
+
+  it('gives none with no selected pair', () => {
+    expect(selectedRelayProtocol(makeReport([]))).toBeNull()
+    // A transport that names none yet, and pairs none of which is selected.
+    const checking = makeReport([
+      ['T01', { type: 'transport', dtlsState: 'new' }],
+      ['p1', { type: 'candidate-pair', localCandidateId: 'l1', state: 'in-progress' }],
+      ['l1', { type: 'local-candidate', candidateType: 'relay', relayProtocol: 'tls' }],
+    ])
+    expect(selectedRelayProtocol(checking)).toBeNull()
+    // A transport that names a pair the report does not hold: none, and the
+    // pair marked selected is not read in its place.
+    const gone = makeReport([
+      ['T01', { type: 'transport', selectedCandidatePairId: 'CPgone' }],
+      ['p1', { type: 'candidate-pair', localCandidateId: 'l1', selected: true }],
+      ['l1', { type: 'local-candidate', candidateType: 'relay', relayProtocol: 'tls' }],
+    ])
+    expect(selectedRelayProtocol(gone)).toBeNull()
+    // A selected pair whose local candidate the report does not hold.
+    const noLocal = makeReport([
+      ['T01', { type: 'transport', selectedCandidatePairId: 'p1' }],
+      ['p1', { type: 'candidate-pair', localCandidateId: 'lgone' }],
+    ])
+    expect(selectedRelayProtocol(noLocal)).toBeNull()
   })
 })
 
@@ -1745,58 +1832,34 @@ describe('buildClipboardImageFrames (clipboard v2)', () => {
   })
 })
 
-describe('VP9_444_DC_LABEL + videoDcOptions', () => {
-  // The agent's `on_data_channel` arm matches on `"video-bytes"`
-  // exactly (see agents/roomlerd/src/peer.rs:494). A typo on
-  // either side silently turns the entire VP9-444 path into a
-  // log-only dead end, so lock the value here.
-  it('uses the exact label the agent matches on', () => {
+describe('the two video channels: labels and options (FR-148 P4b-2, D55)', () => {
+  // The agent's `on_data_channel` arm matches each label by equality
+  // (agents/roomlerd/src/peer.rs:1359) and attaches any other log-only. A
+  // typo on either side silently turns a video path into a log-only dead
+  // end, so lock the values here.
+  it('uses the exact labels the agent matches on', () => {
     expect(VP9_444_DC_LABEL).toBe('video-bytes')
+    expect(VIDEO_DEADLINE_DC_LABEL).toBe('video-deadline')
   })
 
-  // FR-17 stage B. The historical profile stays the default: reliable +
-  // ordered, because without framing SCTP's arrival order IS the
-  // reassembly and nothing else can recover it.
-  it('defaults to the reliable + ordered profile', () => {
-    expect(videoDcOptions(false, false)).toEqual({ ordered: true })
-    expect(videoDcOptions(true, false)).toEqual({ ordered: true })
+  it('names two labels neither of which is a prefix of the other', () => {
+    expect(VIDEO_DEADLINE_DC_LABEL.startsWith(VP9_444_DC_LABEL)).toBe(false)
+    expect(VP9_444_DC_LABEL.startsWith(VIDEO_DEADLINE_DC_LABEL)).toBe(false)
   })
 
-  // ⚠️ The invariant this function exists for. An unframed stream
-  // delivered out of order is not a degraded picture — it is garbage the
-  // decoder reports as corruption, because a bare byte stream has no way
-  // to tell "rest of this frame" from "start of the next". Asking for
-  // unordered without framing must therefore be REFUSED, not honoured.
-  it('refuses to go unordered without framing', () => {
-    expect(videoDcOptions(false, true)).toEqual({ ordered: true })
+  // Without framing SCTP's arrival order IS the reassembly and nothing else
+  // can recover it; with framing, `video-bytes` stays the reliable channel
+  // and the unordered shape lives only in `video-deadline`.
+  it('opens video-bytes reliable and ordered, with or without framing', () => {
+    expect(videoDcOptions()).toEqual({ ordered: true })
   })
 
-  it('goes unordered with no retransmits once framing is negotiated', () => {
-    // maxRetransmits: 0 is coupled to stage A's assembler, which treats a
-    // chunk-index jump as unrecoverable. A retransmitted chunk arriving
-    // an RTT late would be discarded as a gap — so 1-2 retransmits
-    // (stage C) needs a reorder buffer first and is NOT a number that
-    // can be turned up on its own.
-    expect(videoDcOptions(true, true)).toEqual({ ordered: false, maxRetransmits: 0 })
-  })
-})
-
-describe('FR-17 stage B opt-in', () => {
-  beforeEach(() => {
-    globalThis.localStorage?.clear()
-  })
-
-  it('is off unless explicitly enabled', () => {
-    expect(storedUnorderedVideo()).toBe(false)
-    globalThis.localStorage?.setItem('roomler-rc-unordered-video', '0')
-    expect(storedUnorderedVideo()).toBe(false)
-    globalThis.localStorage?.setItem('roomler-rc-unordered-video', 'true')
-    expect(storedUnorderedVideo()).toBe(false)
-  })
-
-  it('turns on for exactly the documented value', () => {
-    globalThis.localStorage?.setItem('roomler-rc-unordered-video', '1')
-    expect(storedUnorderedVideo()).toBe(true)
+  // ⚠️ Unordered is legal only WITH framing: an unframed stream delivered out
+  // of order is garbage the decoder reports as corruption. So without framing
+  // there is no second channel at all.
+  it('opens video-deadline unordered with no retransmits, and only with framing', () => {
+    expect(videoDeadlineDcOptions(true)).toEqual({ ordered: false, maxRetransmits: 0 })
+    expect(videoDeadlineDcOptions(false)).toBeNull()
   })
 })
 
@@ -4211,6 +4274,35 @@ describe('decodeStatWireMessage — FR-135 R0, the worker’s window for the age
   })
 })
 
+describe('decodeStatWireMessage — FR-148 P4b-3b cell 2, the viewer’s relay for the agent’s pick', () => {
+  it('carries relay only when it is udp, tcp or tls', () => {
+    for (const relay of ['udp', 'tcp', 'tls']) {
+      expect(decodeStatWireMessage(30, false, null, null, null, null, null, null, relay)).toEqual({
+        t: 'rc:decodestat',
+        fps: 30,
+        struggling: false,
+        relay,
+        de: 1,
+      })
+    }
+    for (const relay of [undefined, null, '', 'TLS', 'Tcp', 'quic', 'relay', 'tls ']) {
+      const m = decodeStatWireMessage(30, false, null, null, null, null, null, null, relay)
+      expect('relay' in m, String(relay)).toBe(false)
+    }
+  })
+
+  it('leaves every other key exactly as it was', () => {
+    const age = { avgMs: 123.4, minMs: 61.8 }
+    const link = { rxBps: 395_122, queueMs: 240 }
+    const media = { freezes: 1, painted: 1_234, decoderHw: true }
+    const before = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 100 }, media, -7)
+    const after = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 100 }, media, -7, 'tls')
+    for (const [k, v] of Object.entries(before)) expect(after[k], k).toEqual(v)
+    expect(Object.keys(after).filter((k) => !(k in before))).toEqual(['relay'])
+    expect(after.relay).toBe('tls')
+  })
+})
+
 describe('decodeErrorWireMessage (FR-132 P1, decode errors counted)', () => {
   it('names the stage the agent matches by equality, for every worker error type', () => {
     expect(decodeErrorStage('decoder-configure-error')).toBe('configure')
@@ -5837,8 +5929,8 @@ describe('FR-27: friendlyEndReason', () => {
   it('#2810: says who the wait is for', () => {
     expect(awaitingConsentLabel('owner')).toMatch(/device's owner to approve/)
     expect(awaitingConsentLabel('both')).toMatch(/someone at that device, or the device's owner/)
-    expect(awaitingConsentLabel('host')).toBe('Waiting for the agent to allow the connection…')
-    expect(awaitingConsentLabel(null)).toBe('Waiting for the agent to allow the connection…')
+    expect(awaitingConsentLabel('host')).toBe('Waiting for the host to allow the connection…')
+    expect(awaitingConsentLabel(null)).toBe('Waiting for the host to allow the connection…')
   })
 
   it("FR-101 P4b: names the org's maximum length when that is the limit that ended it", () => {

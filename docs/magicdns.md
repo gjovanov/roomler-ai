@@ -41,9 +41,9 @@ name upstream, and under an exit node the host's whole DNS goes there (`dns.rs:6
 
 ⚠️ The bit is decided before the body is read, so a member without it gets one 403
 `forbidden` whatever the body says (a valid domain, one the route would refuse 400,
-or switching MagicDNS off), never `not_a_member`. The page shows such a member the
-current settings read-only, and a save the server refuses turns it read-only rather
-than showing an error ([security-baseline.md](security-baseline.md#the-orgs-magicdns-manage_agents-to-change-it-any-member-to-read-it)).
+switching MagicDNS off, or a body that does not parse, #4218), never `not_a_member`.
+The page shows such a member the current settings read-only, and a save the server
+refuses turns it read-only rather than showing an error ([security-baseline.md](security-baseline.md#the-orgs-magicdns-manage_agents-to-change-it-any-member-to-read-it)).
 
 ## Bring-up
 
@@ -334,9 +334,9 @@ measured 2 s after it (kicks that come together cost one lookup):
 
 | Kick | Where |
 |---|---|
-| the steer is written late, once the resolver binds | `runtime.rs:3103` |
-| the resolver gets its socket back | `runtime.rs:3122` |
-| the network materially moves (a VPN connects, the default route changes). netstate publishes at most one such change per 120 s, so a VPN's route war never drives it | `runtime.rs:3499` |
+| the steer is written late, once the resolver binds | `runtime.rs:3262` |
+| the resolver gets its socket back | `runtime.rs:3281` |
+| the network materially moves (a VPN connects, the default route changes). netstate publishes at most one such change per 120 s, so a VPN's route war never drives it | `runtime.rs:3661` |
 | the host slept: the wall clock ran more than 30 s past the monotonic one, which stops in a suspend on Linux and macOS | `dns_probe.rs:104` |
 
 Each reading says when the next one comes (`next_at_ms`), so a client reads a

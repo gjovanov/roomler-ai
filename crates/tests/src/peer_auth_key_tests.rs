@@ -242,6 +242,10 @@ async fn the_real_agent_says_hello_with_a_key_it_keeps_beside_its_config() {
         machine_id: "device-key-real",
         machine_name: "Device key host",
         install: None,
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .expect("agent enrollment");

@@ -760,6 +760,8 @@ pub(super) fn stage(
         let staging = open_staging(&base, base_path, true)?;
         #[cfg(test)]
         super::stand_in::before_the_id_is_made(base_path);
+        #[cfg(test)]
+        super::drawer_edges::seams::the_id_is_next(base_path);
         match mkdir_at(&staging, id, 0o700) {
             Err(e) if e.kind() == io::ErrorKind::NotFound && tries > 0 => continue,
             made => break made.map(|()| staging),

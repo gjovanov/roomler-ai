@@ -47,10 +47,10 @@ pub struct AgentConfig {
     /// the daemon de-enrolls itself on SIGTERM/SIGINT so a clean stop removes
     /// the device in seconds instead of on the deadline.
     ///
-    /// Recorded FROM THE SERVER'S ENROLL RESPONSE, never from a local flag
-    /// alone — the credential decides what was minted, and the config must
-    /// not disagree with the row. Absent (every pre-FR-51 config) = a normal
-    /// permanent device, byte-for-byte today's behaviour.
+    /// Recorded FROM THE SERVER'S ENROLL RESPONSE on every enrollment, a fold
+    /// into an existing file too (#4331), never from a local flag or the old
+    /// file: the answer is the row's, and the config must not disagree with it.
+    /// Absent (every pre-FR-51 config) = a permanent device, today's behaviour.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
     /// Encoder preference: `auto` (default), `hardware`, or `software`.
@@ -369,9 +369,9 @@ pub struct AgentConfig {
     /// OpenSSH public keys allowed to open an SSH session, one entry per key
     /// in `authorized_keys` form (`ssh-ed25519 AAAA… comment`).
     ///
-    /// **Empty means nobody**, which is why [`Self::ssh_enabled`] alone cannot
-    /// let anyone in. P3 replaced this as the primary path with server-minted,
-    /// short-lived session grants tied to a roomler user — but the list stays
+    /// **Empty, the default, refuses only a key-list session.** P3 made
+    /// server-minted, short-lived session grants tied to a roomler user the
+    /// primary path, and a grant needs no entry here (#4325). The list stays
     /// as the break-glass route for when the control plane is the thing that is
     /// broken, which is exactly when a remote shell is most wanted.
     ///
@@ -1206,11 +1206,11 @@ pub struct AgentConfig {
     /// config surface.
     #[serde(default)]
     pub ice_relay_tcp: Option<bool>,
-    /// FR-148 P4 — the carrier rank: `0` (unset; off, as before), `prio` or
-    /// `1`. With it on, a remote-desktop session whose mesh link to the
-    /// viewer is not direct ranks its mesh candidates below every relay; `1`
-    /// also marks them ` network-cost 999`. Env `ROOMLERD_RC_CARRIER_RANK`,
-    /// read once per session. Local only. Temporary: FR-148 P5 deletes it.
+    /// FR-148 P4 — the carrier rank: `0` (unset; off, as before), `prio`, `1` or `route`.
+    /// On, a remote-desktop session whose mesh link to the viewer is not direct ranks its
+    /// mesh candidates below every relay; `1` also marks them ` network-cost 999`, and
+    /// `route` (D49) is `1`, ranking pairs by their route. Env `ROOMLERD_RC_CARRIER_RANK`, read
+    /// once per session. Local only. Temporary: FR-148 P5 deletes it.
     #[serde(default)]
     pub rc_carrier_rank: Option<String>,
     /// FR-148 P1 — the path model's switch: `off`, `shadow` (unset; the
@@ -1226,6 +1226,14 @@ pub struct AgentConfig {
     /// `ROOMLERD_INFLIGHT_BUDGET`, read once per session. Local only.
     #[serde(default)]
     pub inflight_budget: Option<String>,
+    /// FR-148 P4b-3 (D55) — the deadline-limited video channel's switch:
+    /// `off` (unset; the default), `shadow` or `on`. `on` sends a framed
+    /// session's video on the viewer's `video-deadline` channel when its
+    /// carrier is TCP somewhere, switching at a key frame, and drops a frame
+    /// older than D there; `shadow` only logs and counts what `on` would do.
+    /// Env `ROOMLERD_VIDEO_DEADLINE`, read once per pump. Local only.
+    #[serde(default)]
+    pub video_deadline: Option<String>,
     /// Bitrate ceiling for a CONSTRAINED (relay) remote-control transport,
     /// kbps. Built-in default 3000; clamped 100-100000. See `relay_max_kbps`
     /// in the config surface.
@@ -1498,9 +1506,12 @@ pub struct AgentConfig {
     /// (`ROOMLERD_ZERO_COPY`): the SystemContext DXGI arm's frames go to QSV,
     /// the WGC arm's to NVENC, and on macOS the display stream's IOSurfaces to
     /// VideoToolbox, each without a CPU copy once the capability probe has
-    /// proven that encoder's GPU-input form. Built-in: off. Read when a capture
-    /// or an encoder opens and by the probe, so a change needs a restart. On a
-    /// supervised Mac the root's value binds the GUI worker.
+    /// proven that encoder's GPU-input form. `true` takes it on every proven
+    /// cell, `false` on none; unset (the built-in) only on the cells on the
+    /// agent's built-in default list (FR-132 P2), and that list is empty for
+    /// now, so unset is off. Read when a capture or an encoder
+    /// opens and by the probe, so a change needs a restart. On a supervised Mac
+    /// the root's value binds the GUI worker.
     #[serde(default)]
     pub zero_copy: Option<bool>,
     /// FR-130 — every encoder writes the colour description it converted
@@ -2337,11 +2348,36 @@ pub struct Promotion {
 ///
 /// The exit node a primary USES (`overlay_exit_node`) is org-specific and is
 /// cleared; an exit node it OFFERS travels with its enrollment.
+///
+/// #4370 — refused while the primary enrollment is
+/// [`ephemeral`](AgentConfig::ephemeral): checked FIRST, whatever the labels,
+/// and `cfg` is left as it was. An organization beside the primary is never
+/// ephemeral (#4352), and an `[[orgs]]` entry has no `ephemeral`, so the swap
+/// would move the row where this device no longer knows it is ephemeral (and
+/// the restart that applies it, an OS stop of the run that started as that row,
+/// would remove it on the server while the file still lists it), and mark the
+/// promoted org's permanent row ephemeral. Not seen, so not refused: an
+/// `[[orgs]]` entry whose row the server holds as ephemeral (joined before
+/// #4352), since an entry carries no flag.
 pub fn promote_org_to_primary(
     cfg: &mut AgentConfig,
     label: &str,
     demoted_label: Option<&str>,
 ) -> Result<Promotion> {
+    if cfg.ephemeral {
+        anyhow::bail!(
+            "the primary enrollment (row {}, tenant {} on {}) is ephemeral, and an ephemeral \
+             enrollment never sits beside another organization: `org set-primary` would move it \
+             into [[orgs]], where this device would no longer know it is ephemeral. Remove that \
+             row on the Devices page (an ephemeral row never turns permanent), then enroll this \
+             machine in that organization again with a standard enrollment token: the config \
+             keeps its settings and its other organizations. Then run `org set-primary` again. \
+             Nothing has changed",
+            cfg.agent_id,
+            cfg.tenant_id,
+            cfg.server_url
+        );
+    }
     let Some(idx) = cfg.orgs.iter().position(|o| o.label == label) else {
         anyhow::bail!("no org labelled {label:?} — see `roomlerd org ls`");
     };
@@ -2725,6 +2761,44 @@ pub fn mark_rollback_attempted(cfg: &mut AgentConfig) {
     cfg.rollback_attempted = true;
 }
 
+/// #4097 — the top-level keys of a config that the agent's own run
+/// bookkeeping writes: [`AgentConfig::last_known_good_version`],
+/// [`AgentConfig::crash_count`], [`AgentConfig::last_crash_unix`],
+/// [`AgentConfig::rollback_attempted`], [`AgentConfig::last_run_unhealthy`]
+/// and [`AgentConfig::last_run_boot`]. [`mark_run_starting`],
+/// [`record_clean_run_at`], [`mark_clean_shutdown`], [`record_crash_at`] and
+/// [`mark_rollback_attempted`] move no other key, and a field that joins them
+/// joins this list. `sudo roomlerd one-row` converts a person's config from
+/// what their agent saved as it stopped when that save moved only these
+/// ([`run_state_moved`]).
+pub const RUN_STATE_KEYS: [&str; 6] = [
+    "last_known_good_version",
+    "crash_count",
+    "last_crash_unix",
+    "rollback_attempted",
+    "last_run_unhealthy",
+    "last_run_boot",
+];
+
+/// #4097 — `Some` when the config texts `before` and `after` differ in
+/// nothing but [`RUN_STATE_KEYS`]: those of them whose values differ, in that
+/// list's order, and none when only the way the file is written differs.
+/// Each text is read as a raw TOML table, so a key this build does not know
+/// counts as any other key, and the six are taken off the top level of both
+/// before the rest is compared. `None` when anything else differs, or when
+/// either text does not parse.
+pub fn run_state_moved(before: &str, after: &str) -> Option<Vec<&'static str>> {
+    let mut before: toml::Table = toml::from_str(before).ok()?;
+    let mut after: toml::Table = toml::from_str(after).ok()?;
+    let mut moved = Vec::new();
+    for key in RUN_STATE_KEYS {
+        if before.remove(key) != after.remove(key) {
+            moved.push(key);
+        }
+    }
+    (before == after).then_some(moved)
+}
+
 /// TOML-friendly mirror of `encode::EncoderPreference`. Kept separate so
 /// the `encode` module stays CLI-independent and the config file survives
 /// feature gating without needing the `mf-encoder` feature enabled to
@@ -3018,6 +3092,7 @@ pub fn test_fixture() -> AgentConfig {
         rc_carrier_rank: None,
         path_model: None,
         inflight_budget: None,
+        video_deadline: None,
         relay_max_kbps: None,
         rate_slow_start: None,
         media_thread: None,
@@ -3462,6 +3537,10 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     if let Some(v) = &cfg.inflight_budget {
         fallbacks.insert("INFLIGHT_BUDGET".to_string(), v.clone());
     }
+    // FR-148 P4b-3 — the deadline channel's switch, read once per pump.
+    if let Some(v) = &cfg.video_deadline {
+        fallbacks.insert("VIDEO_DEADLINE".to_string(), v.clone());
+    }
     // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
     // probe child too.
     if let Some(v) = &cfg.vaapi_device {
@@ -3538,8 +3617,8 @@ pub fn machine_global_config_path() -> PathBuf {
 
 /// Sibling copy of the last config that both saved AND parsed, kept so an
 /// unreadable live file can be recovered without re-enrolling the host.
-/// Public for a writer that keeps the outgoing config itself under the name
-/// [`load`] recovers from (`roomlerd one-row-home convert`).
+/// Public for a writer that keeps a copy itself under the name [`load`]
+/// recovers from (`roomlerd one-row-home convert`, which keeps the new one).
 pub fn prev_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("toml.prev")
 }
@@ -3571,8 +3650,12 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     // not parse, is "unreadable", as before. Both lines are ERROR: either way
     // the host now runs on an older config.
     let prev = prev_path(path);
-    match load_prev(path, &prev) {
-        Ok(cfg) => {
+    match load_copy(path, &prev, &err) {
+        Ok((mut cfg, checked)) => {
+            #[cfg(all(windows, test))]
+            if let Some(f) = AFTER_THE_COPY_IS_READ.with(|it| it.borrow_mut().take()) {
+                f();
+            }
             if not_found(&err) {
                 tracing::error!(
                     path = %path.display(),
@@ -3590,10 +3673,25 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
                      the live file was likely truncated by an unclean shutdown"
                 );
             }
+            // #4157 — the copy's run marks are those of a run that went on after it was
+            // kept, so they say nothing of how that run ended: the next start must not
+            // count them as a crash ([`previous_run`]). A run on the restored copy marks itself.
+            clear_run_marks(&mut cfg);
             // Reinstate it as the live file so the next save has a base. The
             // keys this build does not know are the copy's to keep (#2078):
             // the live file, which a save reads them from, parses as nothing.
-            if let Err(e) = save_with_base(path, &prev, &cfg, Kept::Keep) {
+            // #4176 — a restore of the missing machine config keeps them from
+            // the copy's text the checks judged, and puts its file in place
+            // only where none is: a config written since that read is loaded.
+            let base = match &checked {
+                Some(text) => Base::Checked(text),
+                None => Base::File(&prev),
+            };
+            if let Err(e) = save_with_base(path, base, &cfg, Kept::Keep) {
+                #[cfg(windows)]
+                if checked.is_some() && path.exists() {
+                    return load_written_since(path);
+                }
                 tracing::warn!(error = %format!("{e:#}"), "could not reinstate recovered config");
             }
             note_unknown_keys(path);
@@ -3750,18 +3848,18 @@ pub fn read_merge_base(path: &PathBuf) -> MergeBase {
 
 /// #3609 — [`read_merge_base`] at the machine-global location: the repair and
 /// the check before anything is folded (`machine_tree::may_fold`), and the
-/// checked `.prev` ([`load_private_prev`]).
+/// `.prev` only where a start would take it ([`copy_beside_the_config`]).
 #[cfg(windows)]
 fn machine_merge_base(
     path: &PathBuf,
     tree: &crate::machine_tree::MachineTree,
     switches: crate::machine_tree::Switches,
 ) -> MergeBase {
-    merge_base(
-        path,
-        || crate::machine_tree::may_fold(tree, switches),
-        load_private_prev,
-    )
+    // #4453 — a `.prev` beside a config that does not load is taken or
+    // refused as a start takes or refuses it, by what it inherits as found
+    // (`machine_tree::copy_inherits_as_found`).
+    let copy = copy_beside_the_config(tree);
+    merge_base(path, || crate::machine_tree::may_fold(tree, switches), copy)
 }
 
 /// The merge base at `path`. `private` says, once the file is known to be
@@ -4009,6 +4107,16 @@ pub fn parse_text(raw: &str, origin: &str) -> Result<AgentConfig> {
 /// What [`try_load`] does with the text it read, `origin` standing for its
 /// path: every reader parses through here.
 fn parse_raw(raw: &str, origin: &str) -> Result<AgentConfig> {
+    let (cfg, promoted) = parse_quietly(raw, origin)?;
+    say_promoted(origin, &promoted);
+    Ok(cfg)
+}
+
+/// [`parse_raw`] without its lines: the config, and each plaintext server URL
+/// the parse read as TLS (the field, and what it held), for the caller to say
+/// ([`say_promoted`]). #4176 — the copy a waiting host asks about at every tick
+/// is parsed here, and said once, by the restore ([`load_machine_copy`]).
+fn parse_quietly(raw: &str, origin: &str) -> Result<(AgentConfig, Vec<(String, String)>)> {
     // An all-NUL file of the correct length is the signature of a power loss
     // between `rename` and the data reaching disk. `toml` reports it as a
     // parse error at line 1, which reads like a hand-edit typo; name it.
@@ -4024,7 +4132,14 @@ fn parse_raw(raw: &str, origin: &str) -> Result<AgentConfig> {
     // FR-101 P1b — TLS to the server whatever the file says, unless its owner
     // kept plaintext (`allow_plaintext_server`). Here, because every reader
     // parses through this function: the daemon, the probe, the recovery.
-    for (field, was) in cfg.secure_server_urls() {
+    let promoted = cfg.secure_server_urls();
+    Ok((cfg, promoted))
+}
+
+/// FR-101 P1b — say each plaintext server URL a parse read as TLS
+/// ([`parse_quietly`]).
+fn say_promoted(origin: &str, promoted: &[(String, String)]) {
+    for (field, was) in promoted {
         tracing::warn!(
             path = %origin,
             field = %field,
@@ -4033,7 +4148,6 @@ fn parse_raw(raw: &str, origin: &str) -> Result<AgentConfig> {
              allow_plaintext_server = true to keep plaintext (a lab without TLS)"
         );
     }
-    Ok(cfg)
 }
 
 /// One step to a key in the config document, as `serde_ignored` reports where
@@ -4427,7 +4541,7 @@ fn unknown_keys_said(raw: &str) -> Option<String> {
 }
 
 pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
-    save_with_base(path, path, cfg, Kept::Keep)
+    save_with_base(path, Base::File(path), cfg, Kept::Keep)
 }
 
 /// #3666 — [`save`] for an elevated writer that folded nothing into what was
@@ -4440,7 +4554,7 @@ pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
 /// would be sealed by the repair and recovered from after any damage, and a
 /// planted key would ride into the new config. Anywhere else it is [`save`].
 pub fn save_fresh(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
-    save_with_base(path, path, cfg, Kept::Drop)
+    save_with_base(path, Base::File(path), cfg, Kept::Drop)
 }
 
 /// #3666 — what a save keeps of the files it replaces: the outgoing config as
@@ -4538,16 +4652,26 @@ impl StartupWrites {
     }
 }
 
+/// What [`save_with_base`] keeps the keys this build does not know from
+/// (#2078), and how it puts its file in place.
+#[derive(Clone, Copy)]
+enum Base<'a> {
+    /// The file at this path, read by the save: the config being replaced, or
+    /// the `.prev` a recovery loaded. The new file replaces the config.
+    File(&'a std::path::Path),
+    /// #4176 — the text of the copy a restore of the missing machine config
+    /// read through the machine's checks ([`load_machine_copy`]): the keys
+    /// come from these bytes, never from a second read. No outgoing config is
+    /// kept as `.prev`, and the new file takes the config's name only where no
+    /// file has it ([`move_where_none_is`]).
+    Checked(&'a str),
+}
+
 /// [`save`], keeping the keys this build does not know of `base` rather than
 /// of the file at `path` (#2078): [`load`]'s recovery reinstates the `.prev`
 /// copy it loaded over a live file that does not parse, and the keys to keep
 /// are the copy's. `kept`: [`Kept`].
-fn save_with_base(
-    path: &PathBuf,
-    base: &std::path::Path,
-    cfg: &AgentConfig,
-    kept: Kept,
-) -> Result<()> {
+fn save_with_base(path: &PathBuf, base: Base<'_>, cfg: &AgentConfig, kept: Kept) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
@@ -4558,7 +4682,7 @@ fn save_with_base(
     // replaced W4(c)'s four `icacls` steps (#3073, #3291): it runs in-process,
     // and on a chain already as it should be it changes nothing.
     #[cfg(windows)]
-    let machine = machine_tree_of(path);
+    let machine = machine_tree_for_a_save(path).map_err(anyhow::Error::msg)?;
     #[cfg(windows)]
     if let Some(tree) = &machine
         && crate::machine_tree::Switches::from_env().repair
@@ -4588,13 +4712,15 @@ fn save_with_base(
         }
     }
     #[cfg(windows)]
-    let serialised = if fresh {
-        toml::to_string_pretty(cfg).context("serialising config")?
-    } else {
-        serialise_for(path, base, cfg, machine.is_some())?
-    };
+    let at_machine = machine.is_some();
     #[cfg(not(windows))]
-    let serialised = serialise_for(path, base, cfg, false)?;
+    let at_machine = false;
+    let restore = matches!(base, Base::Checked(_));
+    let serialised = match base {
+        _ if fresh => toml::to_string_pretty(cfg).context("serialising config")?,
+        Base::File(base) => serialise_for(path, base, cfg, at_machine)?,
+        Base::Checked(text) => serialise_over(cfg, text, &prev_path(path))?.0,
+    };
 
     // ATOMIC (P6 hardening): write a sibling temp file, then rename over
     // the target. The file holds `agent_token` — a torn `fs::write`
@@ -4661,8 +4787,9 @@ fn save_with_base(
     // new file of its own, as the config's own temp, and at the machine
     // location only from a config that passes the machine tree's check.
     // #3666 — and never on a fresh machine save: the outgoing config was not
-    // the machine's, and the repair has just made it pass that check.
-    if !fresh && try_load(path).is_ok() {
+    // the machine's, and the repair has just made it pass that check. #4176 —
+    // nor on a restore, which replaces nothing.
+    if !fresh && !restore && try_load(path).is_ok() {
         #[cfg(windows)]
         let rotated = rotate_prev(path, machine.is_some());
         #[cfg(not(windows))]
@@ -4675,6 +4802,10 @@ fn save_with_base(
         }
     }
 
+    #[cfg(windows)]
+    if restore {
+        return move_where_none_is(&tmp, path);
+    }
     std::fs::rename(&tmp, path).with_context(|| {
         // Best-effort cleanup so failed saves don't accrete temp files.
         let _ = std::fs::remove_file(&tmp);
@@ -4712,6 +4843,18 @@ thread_local! {
     /// own machine tree, which [`machine_tree_of`] then never answers.
     static STAND_IN: std::cell::RefCell<Option<crate::machine_tree::MachineTree>> =
         const { std::cell::RefCell::new(None) };
+    /// Tests only: what runs once on this thread, after [`load`] has read the
+    /// copy it recovers from and before it writes anything: a stand-in for a
+    /// writer at that moment ([`after_the_copy_is_read`]).
+    static AFTER_THE_COPY_IS_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests only: run `f` once on this thread, between [`load`]'s read of the copy
+/// it recovers from and its first write.
+#[cfg(all(windows, test))]
+fn after_the_copy_is_read(f: impl FnOnce() + 'static) {
+    AFTER_THE_COPY_IS_READ.with(|it| *it.borrow_mut() = Some(Box::new(f)));
 }
 
 /// #3666 — what `roomlerd re-enroll` and `roomlerd org` ask before they
@@ -4762,7 +4905,7 @@ pub fn machine_config_as_found(path: &std::path::Path) -> Result<()> {
 /// there was nothing to take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
 #[cfg(windows)]
 pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, String> {
-    let Some(tree) = machine_tree_of(path) else {
+    let Some(tree) = machine_tree_for_a_save(path)? else {
         return Ok(false);
     };
     if !crate::machine_tree::Switches::from_env().repair {
@@ -4787,7 +4930,7 @@ pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, 
 /// take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
 #[cfg(windows)]
 pub fn take_machine_parent(path: &std::path::Path) -> std::result::Result<bool, String> {
-    let Some(tree) = machine_tree_of(path) else {
+    let Some(tree) = machine_tree_for_a_save(path)? else {
         return Ok(false);
     };
     if !crate::machine_tree::Switches::from_env().repair {
@@ -4854,6 +4997,8 @@ fn outgoing_bytes(path: &std::path::Path, machine: bool) -> Result<Option<Vec<u8
 /// check ([`load_private_prev`]). It is not part of the chain the service
 /// checks before it runs the config, so an old copy another account made never
 /// stops a device: the next save replaces it with a new file ([`rotate_prev`]).
+/// #4176 — the copy of a machine config that is not there is read through the
+/// checks the config would pass instead ([`load_copy`]).
 fn load_prev(path: &std::path::Path, prev: &PathBuf) -> Result<AgentConfig> {
     #[cfg(windows)]
     if machine_tree_of(path).is_some() {
@@ -4867,13 +5012,324 @@ fn load_prev(path: &std::path::Path, prev: &PathBuf) -> Result<AgentConfig> {
 /// #3609 — a machine-global `.prev`, only while it is a plain file owned by
 /// SYSTEM or Administrators that no other account may change, checked through
 /// its handle (`machine_tree::read_checked`): what [`load`] and an elevated
-/// writer's merge base ([`read_merge_base`]) recover from.
+/// writer's merge base ([`read_merge_base`]) recover from a config that is
+/// there and does not load. #4176 — the bytes parsed are the bytes checked,
+/// read through that handle, never read again by name.
 #[cfg(windows)]
-fn load_private_prev(prev: &PathBuf) -> Result<AgentConfig> {
-    if let Err(why) = crate::machine_tree::read_checked(prev, 1 << 20) {
-        anyhow::bail!("{why}");
+fn load_private_prev(prev: &std::path::Path) -> Result<AgentConfig> {
+    match crate::machine_tree::read_checked(prev, 1 << 20) {
+        Ok(Some(bytes)) => parse_bytes(bytes, prev),
+        Ok(None) => Err(not_there(prev)),
+        Err(why) => anyhow::bail!("{why}"),
     }
-    try_load(prev)
+}
+
+/// #4176 — the copy [`load`] runs on in place of the config at `path`, whose
+/// read failed with `err`. The machine config that is not there is restored
+/// only from a copy that passes the checks the config itself would, and holds
+/// an enrollment ([`load_machine_copy`]), with the text those checks judged,
+/// which the restore writes from; every other config recovers from its copy
+/// as before ([`load_prev`]), with no text.
+fn load_copy(
+    path: &std::path::Path,
+    prev: &PathBuf,
+    err: &anyhow::Error,
+) -> Result<(AgentConfig, Option<String>)> {
+    #[cfg(windows)]
+    if not_found(err)
+        && let Some(tree) = machine_config_tree(path)
+    {
+        return load_machine_copy(&tree).map(|(cfg, text)| (cfg, Some(text)));
+    }
+    #[cfg(not(windows))]
+    let _ = err;
+    load_prev(path, prev).map(|cfg| (cfg, None))
+}
+
+/// #4176 — the machine tree `path` is the config of, when it is the machine
+/// config itself ([`machine_tree_of`] answers for any path in its folder).
+#[cfg(windows)]
+fn machine_config_tree(path: &std::path::Path) -> Option<crate::machine_tree::MachineTree> {
+    machine_tree_of(path).filter(|tree| tree.config() == path)
+}
+
+/// #4176 — what [`load`] restores the machine config that is not there from:
+/// its copy, read through the checks the config would pass
+/// (`machine_tree::read_machine_copy`: the chain as found, and its check) and
+/// parsed from the bytes that were checked, only when it holds an enrollment.
+/// A copy with none holds nothing the machine could run as SYSTEM, so it is
+/// not written into the machine's place, where the service would then run it.
+/// The service host and the SYSTEM worker's start ask the same question first
+/// ([`machine_previous_copy`]), and restore only an `Enrolled`. The config
+/// comes with the text it was parsed from, and what its parse read as TLS is
+/// said here, once.
+#[cfg(windows)]
+fn load_machine_copy(tree: &crate::machine_tree::MachineTree) -> Result<(AgentConfig, String)> {
+    let copy = machine_copy_config(tree)?;
+    if !copy.cfg.has_primary_enrollment() {
+        anyhow::bail!(
+            "{} holds no enrollment, so the missing machine config is not restored from it",
+            tree.prev().display()
+        );
+    }
+    say_promoted(&tree.prev().display().to_string(), &copy.promoted);
+    Ok((copy.cfg, copy.text))
+}
+
+/// #4176 — a machine config's copy, as [`machine_copy_config`] read it.
+#[cfg(windows)]
+struct MachineCopy {
+    cfg: AgentConfig,
+    /// The bytes the check judged, as text: what a restore writes from.
+    text: String,
+    /// What the parse read as TLS ([`parse_quietly`]), not yet said.
+    promoted: Vec<(String, String)>,
+}
+
+/// #4176 — the copy of the machine config under `tree`, read through
+/// `machine_tree::read_machine_copy` and parsed from those bytes without a
+/// line ([`parse_quietly`]): a host that waits asks at every tick. No copy is
+/// an error [`not_found`] answers yes for.
+#[cfg(windows)]
+fn machine_copy_config(tree: &crate::machine_tree::MachineTree) -> Result<MachineCopy> {
+    let copy = tree.prev();
+    let bytes = match crate::machine_tree::read_machine_copy(tree) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(not_there(&copy)),
+        Err(why) => anyhow::bail!("{why}"),
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("reading config at {}: {e}", copy.display()))?;
+    let (cfg, promoted) = parse_quietly(&text, &copy.display().to_string())?;
+    Ok(MachineCopy {
+        cfg,
+        text,
+        promoted,
+    })
+}
+
+/// #4176 — a config was written at the machine `path` after its restore read
+/// the copy, so the restore did not put its file in place
+/// ([`move_where_none_is`]): the config that was written is loaded instead,
+/// once it passes what the SYSTEM worker's ladder asks of a machine config
+/// (`machine_tree::private_machine_config`).
+#[cfg(windows)]
+fn load_written_since(path: &PathBuf) -> Result<AgentConfig> {
+    tracing::warn!(
+        path = %path.display(),
+        "config: a machine config was written while its copy was being restored; the restore \
+         is dropped, and the config that was written is loaded"
+    );
+    if let Some(tree) = machine_config_tree(path)
+        && let Err(crate::machine_tree::Refusal::NotPrivate(why)) =
+            crate::machine_tree::private_machine_config(
+                &tree,
+                crate::machine_tree::Switches::from_env(),
+            )
+    {
+        anyhow::bail!(
+            "the machine config at {} is not loaded: {why}",
+            path.display()
+        );
+    }
+    let cfg = try_load(path)?;
+    note_unknown_keys(path);
+    Ok(cfg)
+}
+
+/// #4176 — a restore's last step: `tmp` takes the config's name at `path` only
+/// where no file has it (`MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`).
+/// A config written after the copy was read is never replaced: the move fails,
+/// and the temp file is removed.
+#[cfg(windows)]
+fn move_where_none_is(tmp: &std::path::Path, path: &std::path::Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let wide =
+        |p: &std::path::Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (from, to) = (wide(tmp), wide(path));
+    // SAFETY: two NUL-terminated paths that live across the call.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        let e = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(tmp);
+        return Err(anyhow::Error::new(e).context(format!(
+            "putting the restored config in place at {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// A config's bytes, read through a checked handle, parsed by [`try_load`]'s
+/// rules with `path` naming them.
+#[cfg(windows)]
+fn parse_bytes(bytes: Vec<u8>, path: &std::path::Path) -> Result<AgentConfig> {
+    let raw = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("reading config at {}: {e}", path.display()))?;
+    parse_raw(&raw, &path.display().to_string())
+}
+
+/// The error a read of `path` that found nothing gives: [`not_found`] answers
+/// yes for it, as for [`try_load`]'s own.
+#[cfg(windows)]
+fn not_there(path: &std::path::Path) -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+        .context(format!("reading config at {}", path.display()))
+}
+
+/// #4157 — what [`load`] restores the copy without: the marks a run leaves on
+/// the config ([`mark_run_starting`], `last_run_boot`), which [`previous_run`]
+/// reads. The crash count and the rest of the copy stay as they are.
+fn clear_run_marks(cfg: &mut AgentConfig) {
+    cfg.last_run_unhealthy = false;
+    cfg.last_run_boot = None;
+}
+
+/// #4157 — the last good copy of a config that is not there, as [`load`] would
+/// read it to restore it ([`previous_copy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousCopy {
+    /// It loads, and holds a primary enrollment.
+    Enrolled,
+    /// It loads, and holds no primary enrollment
+    /// ([`AgentConfig::has_primary_enrollment`]).
+    NoEnrollment,
+    /// There is none.
+    Missing,
+    /// It is there, and does not load or may not be read. At the
+    /// machine-global location on Windows, also one that fails the machine
+    /// tree's check: #4176, the checks the config itself would pass
+    /// ([`machine_previous_copy`]).
+    Broken,
+}
+
+/// #4157 — what a start whose config at `path` is missing can run on: its last
+/// good copy ([`prev_path`]), read through the same check as [`load`]'s
+/// restore. It reads the copy and writes nothing. #4176 — for the machine
+/// config on Windows, [`machine_previous_copy`].
+pub fn previous_copy(path: &std::path::Path) -> PreviousCopy {
+    #[cfg(windows)]
+    if let Some(tree) = machine_config_tree(path) {
+        return machine_previous_copy(&tree);
+    }
+    what_copy(load_prev(path, &prev_path(path)))
+}
+
+fn what_copy(copy: Result<AgentConfig>) -> PreviousCopy {
+    match copy {
+        Ok(cfg) if cfg.has_primary_enrollment() => PreviousCopy::Enrolled,
+        Ok(_) => PreviousCopy::NoEnrollment,
+        Err(e) if not_found(&e) => PreviousCopy::Missing,
+        Err(_) => PreviousCopy::Broken,
+    }
+}
+
+/// #4379 — [`load`] without its restore: the config at `path` as it is, or the
+/// error its read or parse ends with (a missing file's holds an I/O "not
+/// found"). Its last good copy ([`prev_path`]) is neither read nor written,
+/// and no file is written. For a start that must not run on that copy:
+/// `roomlerd`'s enrolled worker under FR-43's macOS supervisor, whose copy on a
+/// Mac converted to one row can hold an enrollment that moved to the root
+/// daemon.
+pub fn load_without_restore(path: &PathBuf) -> Result<AgentConfig> {
+    let cfg = try_load(path)?;
+    note_unknown_keys(path);
+    Ok(cfg)
+}
+
+/// #4176 — what the machine config under `tree`, which is not there, can be
+/// restored from: its copy, read through the checks the config itself would
+/// pass (`machine_tree::read_machine_copy`). A copy that fails one is
+/// `Broken`, whatever it holds. The one question the service host
+/// (`roomlerd`'s `win_service::supervisor::config_opens_in`, after the machine
+/// config and the SYSTEM profile's) and the SYSTEM worker's start
+/// ([`previous_copy`]) ask, so they cannot disagree; [`load`] restores only
+/// what it calls `Enrolled`. It reads the copy and writes nothing. Why a copy
+/// is not restored is logged once per reason, and nothing its parse finds is
+/// said: not once per tick of a host that waits.
+#[cfg(windows)]
+pub fn machine_previous_copy(tree: &crate::machine_tree::MachineTree) -> PreviousCopy {
+    let copy = machine_copy_config(tree).map(|copy| copy.cfg);
+    note_machine_copy(tree, &copy);
+    what_copy(copy)
+}
+
+#[cfg(windows)]
+fn note_machine_copy(tree: &crate::machine_tree::MachineTree, copy: &Result<AgentConfig>) {
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let why = match copy {
+        Ok(cfg) if cfg.has_primary_enrollment() => None,
+        Ok(_) => Some("it holds no enrollment".to_string()),
+        Err(e) if not_found(e) => None,
+        // A parse error says where it stopped and nothing of the file
+        // ([`parse_failure`]).
+        Err(e) => Some(format!("{e:#}")),
+    };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if why != *last {
+        if let Some(why) = &why {
+            tracing::warn!(
+                config = %tree.config().display(),
+                copy = %tree.prev().display(),
+                reason = %why,
+                "config: the machine config is missing, and its copy is not restored: it does not \
+                 pass the checks the config would, or holds no enrollment; the device runs as one \
+                 with no machine enrollment"
+            );
+        }
+        *last = why;
+    }
+}
+
+/// #4453 — what an elevated save recovers a machine config that does not load
+/// from ([`machine_merge_base`]): the `.prev` beside it, taken or refused as a
+/// start takes or refuses it. It is taken only when what it inherits was the
+/// machine's as found (`machine_tree::copy_inherits_as_found`, the rule a start
+/// applies to a copy beside its config), and then through
+/// [`load_private_prev`], as before. One that was not is said in one line, and
+/// nothing is recovered from it: the writer writes a fresh config, as for any
+/// `.prev` it does not take.
+#[cfg(windows)]
+fn copy_beside_the_config(
+    tree: &crate::machine_tree::MachineTree,
+) -> impl FnOnce(&PathBuf) -> Result<AgentConfig> {
+    use crate::machine_tree::Refusal;
+    let config = tree.config();
+    let refused = match crate::machine_tree::copy_inherits_as_found(tree) {
+        Ok(()) | Err(Refusal::Absent) => None,
+        Err(Refusal::NotPrivate(why)) => Some(why),
+    };
+    move |prev: &PathBuf| match refused {
+        None => load_private_prev(prev),
+        Some(why) => {
+            tracing::warn!(
+                config = %config.display(),
+                reason = %why,
+                "config: the machine config does not load, and the copy beside it is not taken, \
+                 as a start does not take it: what it inherits was not the machine's as found"
+            );
+            anyhow::bail!("{why}")
+        }
+    }
+}
+
+/// #4453 — [`machine_tree_of`] for an elevated save at `path` ([`save_with_base`],
+/// [`take_machine_folder`], [`take_machine_parent`]), which also sets aside a
+/// `.prev` beside the config that a start would not take
+/// (`machine_tree::set_aside_a_copy_a_start_refuses`). As every change the
+/// machine tree makes, it is off with `ROOMLERD_MACHINE_TREE_REPAIR=0`. `Err`
+/// names the file and what to do when it is neither moved nor kept as found.
+#[cfg(windows)]
+fn machine_tree_for_a_save(
+    path: &std::path::Path,
+) -> std::result::Result<Option<crate::machine_tree::MachineTree>, String> {
+    let tree = machine_tree_of(path);
+    if let Some(tree) = &tree
+        && crate::machine_tree::Switches::from_env().repair
+    {
+        crate::machine_tree::set_aside_a_copy_a_start_refuses(tree)?;
+    }
+    Ok(tree)
 }
 
 fn derive_ws_url(http_url: &str) -> String {
@@ -4911,6 +5367,7 @@ mod tests {
         cfg.rc_carrier_rank = Some("prio".into());
         cfg.path_model = Some("on".into());
         cfg.inflight_budget = Some("shadow".into());
+        cfg.video_deadline = Some("shadow".into());
         // FR-130 — default ON, so the direction worth bridging is the off.
         cfg.color_description = Some(false);
         let m = env_fallbacks(&cfg);
@@ -4924,6 +5381,7 @@ mod tests {
         assert_eq!(get("RC_CARRIER_RANK"), Some("prio"));
         assert_eq!(get("PATH_MODEL"), Some("on"));
         assert_eq!(get("INFLIGHT_BUDGET"), Some("shadow"));
+        assert_eq!(get("VIDEO_DEADLINE"), Some("shadow"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
             get("UINPUT"),
@@ -6677,6 +7135,106 @@ tenant_id = "tid2"
         assert_eq!(cfg.tenant_id, "tid-a");
     }
 
+    /// #4370 — the device of the cells below: an EPHEMERAL primary enrollment
+    /// (row `row-eph-a`) beside two permanent `[[orgs]]` entries, `zeta` and
+    /// `acme`.
+    fn ephemeral_primary_beside_two_orgs() -> AgentConfig {
+        let mut cfg = fixture();
+        cfg.ephemeral = true;
+        cfg.agent_id = "row-eph-a".into();
+        let mut acme = org_fixture("acme", "tid-acme");
+        acme.server_url = "https://acme.invalid".into();
+        cfg.orgs = vec![org_fixture("zeta", "tid-z"), acme];
+        cfg
+    }
+
+    /// #4370 — a promotion refused because the primary is ephemeral, told
+    /// apart from every other refusal of `promote_org_to_primary`: it names
+    /// the ephemeral row.
+    fn is_the_ephemeral_refusal(err: &anyhow::Error) -> bool {
+        let said = err.to_string();
+        said.contains("ephemeral") && said.contains("row-eph-a")
+    }
+
+    /// #4370 T1 — an ephemeral primary is never promoted away: `set-primary`
+    /// would move its row into `[[orgs]]`, where the device no longer knows it
+    /// is ephemeral, and leave the promoted org marked ephemeral. Refused, with
+    /// or without `--demoted-label`, and nothing in the config changes: its
+    /// TOML is the same, the `[[orgs]]` order and labels included.
+    #[test]
+    fn promote_refuses_while_the_primary_is_ephemeral_and_changes_nothing() {
+        for demoted_label in [None, Some("old-home")] {
+            let mut cfg = ephemeral_primary_beside_two_orgs();
+            let before = toml::to_string_pretty(&cfg).unwrap();
+
+            let err = promote_org_to_primary(&mut cfg, "acme", demoted_label)
+                .expect_err("an ephemeral primary is never promoted away");
+
+            assert!(is_the_ephemeral_refusal(&err), "{demoted_label:?}: {err:#}");
+            assert_eq!(
+                toml::to_string_pretty(&cfg).unwrap(),
+                before,
+                "{demoted_label:?}: the config is as it was"
+            );
+            let labels: Vec<&str> = cfg.orgs.iter().map(|o| o.label.as_str()).collect();
+            assert_eq!(labels, ["zeta", "acme"], "{demoted_label:?}");
+            assert!(cfg.ephemeral, "{demoted_label:?}");
+            assert_eq!(cfg.agent_id, "row-eph-a", "{demoted_label:?}");
+            assert_eq!(cfg.tenant_id, "tid", "{demoted_label:?}");
+        }
+    }
+
+    /// #4370 T2 — the ephemeral refusal comes first, whatever label is asked
+    /// for: an unknown org, and a `--demoted-label` that is itself refused
+    /// (another org's, the reserved one, an unusable one), are told the
+    /// primary is ephemeral, and nothing in the config changes.
+    #[test]
+    fn promote_refuses_an_ephemeral_primary_before_it_reads_the_labels() {
+        for (label, demoted_label) in [
+            ("ghost", None),
+            ("acme", Some("zeta")),
+            ("acme", Some("Primary")),
+            ("acme", Some("!!")),
+        ] {
+            let mut cfg = ephemeral_primary_beside_two_orgs();
+            let before = toml::to_string_pretty(&cfg).unwrap();
+
+            let err = promote_org_to_primary(&mut cfg, label, demoted_label)
+                .expect_err("an ephemeral primary is never promoted away");
+
+            assert!(
+                is_the_ephemeral_refusal(&err),
+                "({label}, {demoted_label:?}): {err:#}"
+            );
+            assert_eq!(
+                toml::to_string_pretty(&cfg).unwrap(),
+                before,
+                "({label}, {demoted_label:?}): the config is as it was"
+            );
+        }
+    }
+
+    /// #4370 T4 — the same device with a PERMANENT primary is promoted as
+    /// before, and the swap leaves `ephemeral` false.
+    #[test]
+    fn promote_from_a_permanent_primary_swaps_as_before() {
+        let mut cfg = ephemeral_primary_beside_two_orgs();
+        cfg.ephemeral = false;
+
+        let done = promote_org_to_primary(&mut cfg, "acme", None).unwrap();
+
+        assert_eq!(cfg.tenant_id, "tid-acme");
+        assert_eq!(cfg.agent_id, "aid-acme");
+        assert!(
+            !cfg.ephemeral,
+            "a swap never marks the new primary ephemeral"
+        );
+        assert_eq!(done.demoted_label, "acme");
+        assert_eq!(cfg.orgs[1].label, "acme");
+        assert_eq!(cfg.orgs[1].agent_id, "row-eph-a", "the demoted primary");
+        assert_eq!(cfg.orgs[1].tenant_id, "tid");
+    }
+
     #[test]
     fn sanitize_org_label_rules() {
         assert_eq!(sanitize_org_label(" Acme Corp "), Some("acme-corp".into()));
@@ -6988,6 +7546,150 @@ tenant_id = "tid2"
             .join("\n");
         let back: AgentConfig = toml::from_str(&old).unwrap();
         assert_eq!(back.last_run_boot, None);
+    }
+
+    /// #4097 — a config with a value in each of [`RUN_STATE_KEYS`], so a save
+    /// writes every one of them (a `None` is left out of the file).
+    fn with_run_state() -> AgentConfig {
+        let mut cfg = just_updated();
+        cfg.crash_count = 2;
+        cfg.last_crash_unix = 1_000_000;
+        cfg.rollback_attempted = true;
+        cfg.last_run_unhealthy = true;
+        cfg.last_run_boot = Some("7".into());
+        cfg
+    }
+
+    /// #4097 — a config's text as `save` writes it.
+    fn saved_text(cfg: &AgentConfig) -> String {
+        toml::to_string_pretty(cfg).unwrap()
+    }
+
+    /// #4097 — the top-level keys whose values differ between two configs as
+    /// `save` writes them, sorted.
+    fn top_level_keys_moved(before: &AgentConfig, after: &AgentConfig) -> Vec<String> {
+        let table =
+            |cfg: &AgentConfig| -> toml::Table { toml::from_str(&saved_text(cfg)).unwrap() };
+        let (before, after) = (table(before), table(after));
+        let mut keys: Vec<String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|k| before.get(*k) != after.get(*k))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    #[test]
+    fn each_run_state_key_is_a_top_level_key_of_a_saved_config() {
+        let text = saved_text(&with_run_state());
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        for key in RUN_STATE_KEYS {
+            assert!(
+                table.contains_key(key),
+                "{key} is not a top-level key of:\n{text}"
+            );
+        }
+    }
+
+    /// #4097 — each step of the run bookkeeping moves something, and nothing
+    /// outside [`RUN_STATE_KEYS`]; [`run_state_moved`] names what it moved.
+    #[test]
+    fn the_run_bookkeeping_moves_only_run_state_keys() {
+        type Step = fn(&mut AgentConfig);
+        let steps: [(&str, AgentConfig, Step); 5] = [
+            ("mark_run_starting", fixture(), mark_run_starting),
+            ("record_clean_run_at", with_run_state(), |c| {
+                record_clean_run_at(c, "0.4.197")
+            }),
+            ("mark_clean_shutdown", with_run_state(), mark_clean_shutdown),
+            ("record_crash_at", fixture(), |c| {
+                record_crash_at(c, 1_000_000)
+            }),
+            (
+                "mark_rollback_attempted",
+                fixture(),
+                mark_rollback_attempted,
+            ),
+        ];
+        for (name, before, step) in steps {
+            let mut after = before.clone();
+            step(&mut after);
+            let moved = top_level_keys_moved(&before, &after);
+            assert!(!moved.is_empty(), "{name} moved nothing");
+            for key in &moved {
+                assert!(
+                    RUN_STATE_KEYS.contains(&key.as_str()),
+                    "{name} moved {key}, which is not in RUN_STATE_KEYS"
+                );
+            }
+            let mut said: Vec<String> = run_state_moved(&saved_text(&before), &saved_text(&after))
+                .unwrap_or_else(|| panic!("{name}: run_state_moved said no"))
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            said.sort();
+            assert_eq!(said, moved, "{name}");
+        }
+    }
+
+    /// #4097 — yes for a change of run state alone, however the file is
+    /// written; no for any other key, for a key this build does not know, for
+    /// a run-state name below the top level, and for a text that does not
+    /// parse.
+    #[test]
+    fn run_state_moved_is_some_only_when_nothing_else_moved() {
+        let before = saved_text(&with_run_state());
+        let mut stopped = with_run_state();
+        mark_clean_shutdown(&mut stopped);
+        assert_eq!(
+            run_state_moved(&before, &saved_text(&stopped)),
+            Some(vec!["last_run_unhealthy"])
+        );
+        assert_eq!(
+            run_state_moved(&before, &format!("# kept by hand\n{before}")),
+            Some(vec![]),
+            "the same values, written another way"
+        );
+        let mut renamed = with_run_state();
+        renamed.machine_name = "Renamed".into();
+        assert_eq!(
+            run_state_moved(&before, &saved_text(&renamed)),
+            None,
+            "another key"
+        );
+        let mut moved_org = with_run_state();
+        moved_org.orgs.push(org_fixture("second", "t2"));
+        assert_eq!(
+            run_state_moved(&before, &saved_text(&moved_org)),
+            None,
+            "an [[orgs]] entry"
+        );
+        let unknown = format!("future_key = 1\n{before}");
+        assert_eq!(
+            run_state_moved(&before, &unknown),
+            None,
+            "a key this build does not know"
+        );
+        assert_eq!(run_state_moved(&unknown, &before), None, "that key gone");
+        let nested = format!("{before}\n[extra]\ncrash_count = 1\n");
+        assert_eq!(
+            run_state_moved(&before, &nested),
+            None,
+            "below the top level"
+        );
+        assert_eq!(
+            run_state_moved(&before, "crash_count = ["),
+            None,
+            "after does not parse"
+        );
+        assert_eq!(
+            run_state_moved("crash_count = [", &before),
+            None,
+            "before does not parse"
+        );
     }
 
     // ---- Migration tests (rc.18 P4) ---------------------------------
@@ -7525,6 +8227,520 @@ tenant_id = "tid2"
                 other => panic!("{other:?}"),
             }
         }
+
+        /// #4453 — what an elevated save finds at the machine path, beside the
+        /// copy (`.prev`): the cases a start and the save take or refuse alike
+        /// ([`an_elevated_save_takes_the_copy_only_where_a_start_takes_it`]).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Beside {
+            /// A config that loads, beside a copy that inherits, from the
+            /// parent through the folder, an entry giving Users write.
+            ConfigThatLoads,
+            /// No config, beside a copy a start restores (#4176).
+            NoConfigACopyAStartRestores,
+            /// No config, beside a copy that inherits, with the folder, an
+            /// entry giving Users write: a start does not restore it.
+            NoConfigACopyAStartRefuses,
+            /// From here on, a config that does not load, beside: a copy as an
+            /// elevated save leaves it.
+            SealedCopy,
+            /// A copy that inherits, from an inherit-only entry of the folder's
+            /// own, an entry giving an administrator's own account (this
+            /// elevated process's) write.
+            CopyInheritsAnAdministratorsWrite,
+            /// A copy that inherits, from the parent through the folder, an
+            /// entry giving Users write that applies to neither of them: the
+            /// parent, the folder, the config and the keys were closed as found.
+            CopyInheritsWrite,
+            /// A copy that inherits an entry giving Users write from an
+            /// inherit-only entry of the folder's own.
+            CopyInheritsWriteFromTheFolder,
+            /// A copy another account owns.
+            CopyAnotherAccountOwns,
+        }
+
+        /// What a start runs on.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Runs {
+            TheConfig,
+            TheCopy,
+            /// No machine config: the host waits, or the worker's load fails.
+            Nothing,
+        }
+
+        /// What an elevated save's merge base folds the enrollment into.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Folds {
+            /// No config there: a fresh config, whatever the copy holds.
+            Absent,
+            TheConfig,
+            /// A config that does not load, recovered from its copy.
+            TheCopy,
+            /// A config that does not load, and no copy taken: a fresh config.
+            NothingRecovered,
+            /// A config that is set aside.
+            NotPrivate,
+        }
+
+        impl Beside {
+            const ALL: [Beside; 8] = [
+                Beside::ConfigThatLoads,
+                Beside::NoConfigACopyAStartRestores,
+                Beside::NoConfigACopyAStartRefuses,
+                Beside::SealedCopy,
+                Beside::CopyInheritsAnAdministratorsWrite,
+                Beside::CopyInheritsWrite,
+                Beside::CopyInheritsWriteFromTheFolder,
+                Beside::CopyAnotherAccountOwns,
+            ];
+
+            /// What a start runs on, and what the save folds into. Beside a
+            /// config that does not load, they take or refuse the same copy.
+            fn want(self) -> (Runs, Folds) {
+                match self {
+                    Beside::ConfigThatLoads => (Runs::TheConfig, Folds::TheConfig),
+                    Beside::NoConfigACopyAStartRestores => (Runs::TheCopy, Folds::Absent),
+                    Beside::NoConfigACopyAStartRefuses => (Runs::Nothing, Folds::Absent),
+                    Beside::SealedCopy | Beside::CopyInheritsAnAdministratorsWrite => {
+                        (Runs::TheCopy, Folds::TheCopy)
+                    }
+                    Beside::CopyInheritsWrite
+                    | Beside::CopyInheritsWriteFromTheFolder
+                    | Beside::CopyAnotherAccountOwns => (Runs::Nothing, Folds::NothingRecovered),
+                }
+            }
+
+            /// Whether the save says, in one line, that the copy is not taken
+            /// because it was not the machine's as found.
+            fn said(self) -> bool {
+                matches!(
+                    self,
+                    Beside::CopyInheritsWrite | Beside::CopyInheritsWriteFromTheFolder
+                )
+            }
+        }
+
+        const THE_CONFIG: &str = "the config";
+        const THE_COPY: &str = "the copy";
+        /// The save's line for a copy it does not take by the as-found rule.
+        const NOT_TAKEN: &str = "the copy beside it is not taken";
+
+        /// An enrolled config named `name` (its `machine_name`), as text.
+        fn enrolled(name: &str) -> String {
+            let mut cfg = test_fixture();
+            cfg.machine_name = name.into();
+            toml::to_string(&cfg).unwrap()
+        }
+
+        /// A machine tree under `root` shaped as `case` says, from
+        /// `machine_tree::test_support`'s trees. The texts are written into
+        /// the files those made, so each keeps its owner and DACL.
+        fn tree_beside(root: &std::path::Path, case: Beside) -> MachineTree {
+            let tree = match case {
+                Beside::NoConfigACopyAStartRestores => {
+                    missing_config(root, MissingConfig::Restorable)
+                }
+                Beside::NoConfigACopyAStartRefuses => {
+                    missing_config(root, MissingConfig::WriteOnTheParentWithoutReplace)
+                }
+                Beside::ConfigThatLoads | Beside::CopyInheritsWrite => {
+                    config_present(root, ConfigPresent::CopyInheritsWrite)
+                }
+                _ => config_present(root, ConfigPresent::Sealed),
+            };
+            std::fs::write(tree.prev(), enrolled(THE_COPY)).unwrap();
+            match case {
+                Beside::NoConfigACopyAStartRestores | Beside::NoConfigACopyAStartRefuses => {}
+                Beside::ConfigThatLoads => {
+                    std::fs::write(tree.config(), enrolled(THE_CONFIG)).unwrap()
+                }
+                _ => std::fs::write(tree.config(), "agent_token = \"broken\n").unwrap(),
+            }
+            match case {
+                Beside::CopyInheritsAnAdministratorsWrite => inherits_from_the_folder(&tree, &me()),
+                Beside::CopyInheritsWriteFromTheFolder => inherits_from_the_folder(&tree, USERS),
+                Beside::CopyAnotherAccountOwns => assert!(icacls(
+                    &tree.prev(),
+                    &["/setowner", &format!("*{}", other_account())]
+                )),
+                _ => {}
+            }
+            tree
+        }
+
+        /// The folder given an inherit-only entry of its own that gives `sid`
+        /// write on the files it holds, and the copy set to inherit all it
+        /// holds.
+        fn inherits_from_the_folder(tree: &MachineTree, sid: &str) {
+            assert!(icacls(
+                tree.folder(),
+                &["/grant", &format!("*{sid}:(OI)(IO)(W)")]
+            ));
+            assert!(icacls(&tree.prev(), &["/reset"]), "the copy inherits");
+        }
+
+        /// What a start runs on in `tree`: the service host's question at its
+        /// tick, then the SYSTEM worker's ladder's at its start (each the
+        /// repair, then the check); with no config, the copy a start restores
+        /// (#4176); then the worker's load.
+        fn a_start(tree: &MachineTree) -> Runs {
+            use crate::machine_tree::{Refusal, private_machine_config};
+            stand_in(tree);
+            let _host_tick = private_machine_config(tree, Switches::ON);
+            let starts = match private_machine_config(tree, Switches::ON) {
+                Ok(()) => true,
+                Err(Refusal::Absent) => previous_copy(&tree.config()) == PreviousCopy::Enrolled,
+                Err(Refusal::NotPrivate(_)) => false,
+            };
+            match starts.then(|| load(&tree.config())) {
+                Some(Ok(cfg)) if cfg.machine_name == THE_CONFIG => Runs::TheConfig,
+                Some(Ok(cfg)) if cfg.machine_name == THE_COPY => Runs::TheCopy,
+                Some(Ok(cfg)) => panic!("a start ran {}", cfg.machine_name),
+                Some(Err(_)) | None => Runs::Nothing,
+            }
+        }
+
+        /// What an elevated save in `tree` folds into: its merge base.
+        fn a_save(tree: &MachineTree) -> Folds {
+            match base(tree) {
+                MergeBase::Absent => Folds::Absent,
+                MergeBase::Loaded(cfg) if cfg.machine_name == THE_CONFIG => Folds::TheConfig,
+                MergeBase::Unreadable {
+                    recovered: Some(cfg),
+                    ..
+                } if cfg.machine_name == THE_COPY => Folds::TheCopy,
+                MergeBase::Unreadable {
+                    recovered: None, ..
+                } => Folds::NothingRecovered,
+                MergeBase::NotPrivate { .. } => Folds::NotPrivate,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// #4453 — an elevated save whose machine config does not load takes
+        /// the copy beside it only where a start takes it, and says in one
+        /// line when the copy was not the machine's as found. Each case is
+        /// built twice, alike: one tree for a start, one for the save. Beside
+        /// a config that loads, and with no config (a start restores the copy,
+        /// a save writes a fresh config, #4176), the save is as before.
+        #[test]
+        fn an_elevated_save_takes_the_copy_only_where_a_start_takes_it() {
+            if !elevated_or_skip("an elevated save beside a copy") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in Beside::ALL {
+                let root = tempfile::tempdir().unwrap();
+                let runs = a_start(&tree_beside(root.path(), case));
+                let root = tempfile::tempdir().unwrap();
+                let tree = tree_beside(root.path(), case);
+                let (said, guard) = captured();
+                let folds = a_save(&tree);
+                drop(guard);
+                if (runs, folds) != case.want() {
+                    wrong.push(format!(
+                        "{case:?}: a start runs {runs:?} and the save folds into {folds:?}, \
+                         want {:?}",
+                        case.want()
+                    ));
+                }
+                let lines = said.text().matches(NOT_TAKEN).count();
+                if lines != usize::from(case.said()) {
+                    wrong.push(format!("{case:?}: {lines} lines say the copy is not taken"));
+                }
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// #4453 — the name beside it that a `.prev` a start would not take is
+        /// set aside under. No reader loads it.
+        const SET_ASIDE: &str = "config.toml.prev.set-aside";
+
+        /// Where the copy a start refuses is in `tree` once a save has run: set
+        /// aside with what it held, and no longer at its name.
+        fn set_aside_in(tree: &MachineTree, case: Beside, wrong: &mut Vec<String>) {
+            let aside = tree.folder().join(SET_ASIDE);
+            if tree.prev().exists() {
+                wrong.push(format!(
+                    "{case:?}: the copy a start refuses is still at its name"
+                ));
+            } else if std::fs::read_to_string(&aside).ok() != Some(enrolled(THE_COPY)) {
+                wrong.push(format!(
+                    "{case:?}: the copy a start refuses is not at {SET_ASIDE}"
+                ));
+            }
+        }
+
+        /// #4453 — an elevated save's read of its merge base sets aside a
+        /// `.prev` that a start would not take, beside a config that loads and
+        /// beside one that does not.
+        #[test]
+        fn an_elevated_saves_read_sets_aside_a_copy_a_start_refuses() {
+            if !elevated_or_skip("an elevated save's read beside a copy a start refuses") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in [
+                Beside::ConfigThatLoads,
+                Beside::CopyInheritsWrite,
+                Beside::CopyInheritsWriteFromTheFolder,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let tree = tree_beside(root.path(), case);
+                let _ = base(&tree);
+                set_aside_in(&tree, case, &mut wrong);
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// #4453 — an elevated save that stops with its config not written has
+        /// set aside a `.prev` that a start would not take: beside a config
+        /// that loads, beside one that does not load, and, writing a fresh
+        /// config, with no config. The save's own temp file cannot be made: a
+        /// folder that holds a file has its name.
+        #[test]
+        fn an_elevated_save_that_stops_sets_aside_a_copy_a_start_refuses() {
+            if !elevated_or_skip("an elevated save that stops, beside a copy a start refuses") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in [
+                Beside::ConfigThatLoads,
+                Beside::CopyInheritsWrite,
+                Beside::NoConfigACopyAStartRefuses,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let tree = tree_beside(root.path(), case);
+                stand_in(&tree);
+                let temp = tree
+                    .config()
+                    .with_extension(format!("toml.tmp.{}", std::process::id()));
+                std::fs::create_dir(&temp).unwrap();
+                std::fs::write(temp.join("held"), "").unwrap();
+                let mut cfg = test_fixture();
+                cfg.machine_name = "the save".into();
+                let saved = match case {
+                    Beside::NoConfigACopyAStartRefuses => save_fresh(&tree.config(), &cfg),
+                    _ => save(&tree.config(), &cfg),
+                };
+                if saved.is_ok() {
+                    wrong.push(format!("{case:?}: the save did not stop"));
+                }
+                set_aside_in(&tree, case, &mut wrong);
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+    }
+
+    /// #4176 — a machine config that is missing is restored at a start only
+    /// from a copy that SYSTEM would trust as much as the config itself: the
+    /// machine tree's as-found rule and its check, with the copy in the
+    /// config's place. On trees made by `machine_tree::test_support`, never
+    /// the computer's own. They run on CI's elevated runner.
+    #[cfg(windows)]
+    mod machine_copy {
+        use super::*;
+        use crate::machine_tree::MachineTree;
+        use crate::machine_tree::test_support::*;
+
+        /// `tree` stands in for the computer's own machine tree on this
+        /// test's thread, as in `machine_merge_base`.
+        fn stand_in(tree: &MachineTree) {
+            super::super::STAND_IN.with(|it| *it.borrow_mut() = Some(tree.clone()));
+        }
+
+        /// What a start finds in each case: an enrolled copy only in the trees
+        /// that pass, and in every tree that fails a check, a copy it cannot
+        /// run on.
+        fn want(case: MissingConfig) -> PreviousCopy {
+            match case {
+                MissingConfig::NoCopy => PreviousCopy::Missing,
+                MissingConfig::Restorable | MissingConfig::CopyAnAdministratorMayChange => {
+                    PreviousCopy::Enrolled
+                }
+                MissingConfig::CopyWithNoEnrollment => PreviousCopy::NoEnrollment,
+                MissingConfig::CopyInAnOpenFolder
+                | MissingConfig::CopyUnderAnotherAccountsParent
+                | MissingConfig::ReplaceRightOnTheParent
+                | MissingConfig::CopyAnotherAccountOwns
+                | MissingConfig::KeysAnotherAccountMayChange
+                | MissingConfig::CopyThatDoesNotLoad
+                | MissingConfig::InheritOnlyFullControlOnTheParent
+                | MissingConfig::WriteOnTheParentWithoutReplace
+                | MissingConfig::KeyFileInheritsWrite => PreviousCopy::Broken,
+            }
+        }
+
+        /// One tick of a host that waits, as the service host and the SYSTEM
+        /// worker's ladder run it on the machine config: the repair, then the
+        /// check, which finds no config.
+        fn tick(tree: &MachineTree) {
+            use crate::machine_tree::{Refusal, Switches, private_machine_config};
+            assert_eq!(
+                private_machine_config(tree, Switches::ON),
+                Err(Refusal::Absent)
+            );
+        }
+
+        /// #4176 — the copy a start reads for a missing machine config
+        /// ([`previous_copy`], which `config_at_start` asks) passes the same
+        /// checks as the config would, at the first tick of a host that waits
+        /// and at the next, and asking writes nothing.
+        #[test]
+        fn a_missing_machine_configs_copy_is_read_through_the_machines_checks() {
+            if !elevated_or_skip("a missing machine config's copy") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in MissingConfig::ALL {
+                let root = tempfile::tempdir().unwrap();
+                let tree = missing_config(root.path(), case);
+                stand_in(&tree);
+                for at in 0..2 {
+                    tick(&tree);
+                    let got = previous_copy(&tree.config());
+                    if got != want(case) {
+                        wrong.push(format!(
+                            "{case:?}, tick {at}: {got:?}, want {:?}",
+                            want(case)
+                        ));
+                    }
+                }
+                assert!(!tree.config().exists(), "{case:?}: nothing written");
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// #4176 — [`load`] restores a missing machine config only from a
+        /// copy that passes: the file is written, sealed, and the chain
+        /// passes. From any other copy nothing is written, and the load fails
+        /// on the live file's own read error. Each load follows a tick, as a
+        /// worker's start follows its ladder.
+        #[test]
+        fn a_missing_machine_config_is_restored_only_from_a_copy_that_passes() {
+            if !elevated_or_skip("a missing machine config's restore") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in MissingConfig::ALL {
+                let root = tempfile::tempdir().unwrap();
+                let tree = missing_config(root.path(), case);
+                stand_in(&tree);
+                tick(&tree);
+                let loaded = load(&tree.config());
+                if case.restorable() {
+                    let cfg = loaded.expect("restored");
+                    assert!(cfg.has_primary_enrollment());
+                    assert!(tree.config().exists(), "reinstated");
+                    assert_eq!(crate::machine_tree::check(&tree), Ok(()));
+                    continue;
+                }
+                match loaded {
+                    Ok(_) => wrong.push(format!("{case:?}: restored")),
+                    Err(err) if !not_found(&err) => wrong.push(format!("{case:?}: {err:#}")),
+                    Err(_) => {}
+                }
+                if tree.config().exists() {
+                    wrong.push(format!("{case:?}: a config was written"));
+                }
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// The plaintext-URL line [`parse_raw`] says for a config it reads as
+        /// TLS.
+        const PLAINTEXT_LINE: &str = "a plaintext server URL in the config is read as TLS";
+
+        /// #4176 — a host that waits asks the copy at every tick, and that
+        /// ask says nothing of what the copy holds: a copy whose server URL
+        /// is plaintext is said once, by the restore, never once per tick.
+        #[test]
+        fn a_copy_with_a_plaintext_url_is_said_once_not_once_per_tick() {
+            if !elevated_or_skip("a copy with a plaintext URL") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            let mut cfg = test_fixture();
+            cfg.server_url = "http://example.invalid".into();
+            std::fs::write(tree.prev(), toml::to_string(&cfg).unwrap()).unwrap();
+            stand_in(&tree);
+            let (ticks, guard) = captured();
+            for at in 0..4 {
+                tick(&tree);
+                assert_eq!(
+                    previous_copy(&tree.config()),
+                    PreviousCopy::Enrolled,
+                    "tick {at}"
+                );
+            }
+            let said = ticks.text();
+            drop(guard);
+            assert_eq!(said.matches(PLAINTEXT_LINE).count(), 0, "{said}");
+            let (restore, _guard) = captured();
+            load(&tree.config()).expect("restored");
+            let said = restore.text();
+            assert_eq!(said.matches(PLAINTEXT_LINE).count(), 1, "{said}");
+        }
+
+        /// #4176 — a config written after the restore read the copy, and
+        /// before the restore puts its file in place, is never replaced: the
+        /// restore is dropped, and the config that was written is loaded.
+        #[test]
+        fn a_config_written_while_its_copy_is_restored_is_kept() {
+            if !elevated_or_skip("a config written during a restore") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            stand_in(&tree);
+            let mut newer = test_fixture();
+            newer.machine_name = "written meanwhile".into();
+            let text = toml::to_string_pretty(&newer).unwrap();
+            let (path, written) = (tree.config(), text.clone());
+            super::super::after_the_copy_is_read(move || {
+                // As an elevated save leaves it: sealed.
+                std::fs::write(&path, &written).unwrap();
+                set_dacl(&path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+            });
+            let cfg = load(&tree.config()).expect("loaded");
+            assert_eq!(cfg.machine_name, "written meanwhile");
+            assert_eq!(
+                std::fs::read_to_string(tree.config()).unwrap(),
+                text,
+                "never replaced"
+            );
+            let left: Vec<_> = std::fs::read_dir(tree.folder())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".tmp."))
+                .collect();
+            assert!(left.is_empty(), "no temp file left: {left:?}");
+        }
+
+        /// #4176 — the keys this build does not know, which the restore
+        /// writes, come from the bytes the check judged: a change to the copy
+        /// after that read never reaches the restored config.
+        #[test]
+        fn the_restore_writes_the_unknown_keys_of_the_bytes_it_checked() {
+            if !elevated_or_skip("the restore's unknown keys") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            let enrolled = toml::to_string(&test_fixture()).unwrap();
+            std::fs::write(tree.prev(), format!("future_key = \"checked\"\n{enrolled}")).unwrap();
+            stand_in(&tree);
+            let prev = tree.prev();
+            super::super::after_the_copy_is_read(move || {
+                std::fs::write(&prev, format!("future_key = \"later\"\n{enrolled}")).unwrap();
+            });
+            load(&tree.config()).expect("restored");
+            let text = std::fs::read_to_string(tree.config()).unwrap();
+            assert!(text.contains("future_key = \"checked\""), "{text}");
+            assert!(!text.contains("later"), "{text}");
+        }
     }
 
     /// #3116 — a read this process is refused is `Denied`, never `Unreadable`:
@@ -7734,6 +8950,169 @@ tenant_id = "tid2"
         let line = the_error_line(&log);
         assert!(line.contains(UNREADABLE_NO_COPY_LINE), "{log}");
         assert!(!line.contains("config missing"), "{log}");
+    }
+
+    /// A device on 0.4.2 that has crashed twice: its last good copy (`.prev`) is
+    /// the config its last start saved, marked as that start marks it (boot
+    /// `7`), and the live file is a save made later in that run. `now` is a
+    /// minute after the second crash.
+    fn with_a_copy_a_run_marked() -> (tempfile::TempDir, PathBuf, u64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut cfg = test_fixture();
+        cfg.last_known_good_version = Some("0.4.1".into());
+        cfg.crash_count = 2;
+        cfg.last_crash_unix = 1_000_000;
+        start_a_run(&mut cfg, Some("7"), false, 1_000_000);
+        save(&path, &cfg).expect("the start's save");
+        cfg.machine_name = "renamed".into();
+        save(&path, &cfg).expect("a later save: rotates the marked config to .prev");
+        (dir, path, 1_000_060)
+    }
+
+    /// #4157 — a restore clears the run marks the copy carries, missing and
+    /// unreadable live file alike, so the next start on the same boot counts no
+    /// crash and, at two crashes already, does not roll the device back. The
+    /// crash count is the copy's, and a crash of the run started on the
+    /// restored config counts, as any crash does.
+    #[test]
+    fn a_restored_config_brings_no_crash_to_the_next_start() {
+        for unreadable in [false, true] {
+            let (_dir, path, now) = with_a_copy_a_run_marked();
+            let copy = try_load(&prev_path(&path)).expect("the copy");
+            assert!(copy.last_run_unhealthy, "the premise: the copy is marked");
+            assert_eq!(previous_run(&copy, Some("7"), false), PreviousRun::Crashed);
+            if unreadable {
+                std::fs::write(&path, vec![0u8; 64]).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+
+            let mut restored = load(&path).expect("restored from .prev");
+            for cfg in [&restored, &try_load(&path).expect("reinstated")] {
+                assert!(!cfg.last_run_unhealthy, "unreadable={unreadable}");
+                assert_eq!(cfg.last_run_boot, None, "unreadable={unreadable}");
+                assert_eq!(cfg.crash_count, 2, "the copy's count stays");
+                assert_eq!(cfg.machine_name, "host", "the copy, not the live file");
+            }
+            assert_eq!(
+                previous_run(&restored, Some("7"), false),
+                PreviousRun::Clean
+            );
+            start_a_run(&mut restored, Some("7"), false, now);
+            assert_eq!(restored.crash_count, 2, "unreadable={unreadable}");
+            assert!(!should_rollback(&restored, "0.4.2", now));
+
+            // The run on the restored config crashes: the start after it counts it.
+            save(&path, &restored).expect("the restored start's save");
+            let mut next = load(&path).expect("the live file");
+            start_a_run(&mut next, Some("7"), false, now + 60);
+            assert_eq!(next.crash_count, 3, "unreadable={unreadable}");
+            assert!(should_rollback(&next, "0.4.2", now + 60));
+        }
+    }
+
+    /// #4157 — a missing config beside a copy that does not load is not
+    /// restored, and nothing is written: neither the live file nor the copy.
+    #[test]
+    fn a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let prev = prev_path(&path);
+        std::fs::write(&prev, "agent_token = \"broken\n").unwrap();
+
+        let (_cap, _guard) = captured();
+        assert!(not_found(&load(&path).expect_err("the copy does not load")));
+        assert!(!path.exists(), "no live file was written");
+        assert_eq!(
+            std::fs::read_to_string(&prev).unwrap(),
+            "agent_token = \"broken\n"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.toml.prev")]);
+    }
+
+    /// #4157 — what a start finds in the last good copy of a missing config,
+    /// read as [`load`] would restore it. Asking writes nothing.
+    #[test]
+    fn previous_copy_reads_the_copy_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let prev = prev_path(&path);
+        let ask = |want: PreviousCopy| {
+            assert_eq!(previous_copy(&path), want);
+            assert!(!path.exists(), "{want:?}: no live file was written");
+        };
+        ask(PreviousCopy::Missing);
+        std::fs::write(&prev, "agent_token = \"broken\n").unwrap();
+        ask(PreviousCopy::Broken);
+        std::fs::write(&prev, vec![0u8; 64]).unwrap();
+        ask(PreviousCopy::Broken);
+        let blank = AgentConfig::for_person_with_no_enrollment("host").unwrap();
+        std::fs::write(&prev, toml::to_string(&blank).unwrap()).unwrap();
+        ask(PreviousCopy::NoEnrollment);
+        std::fs::write(&prev, toml::to_string(&test_fixture()).unwrap()).unwrap();
+        ask(PreviousCopy::Enrolled);
+        let copy = std::fs::read(&prev).unwrap();
+        let _ = previous_copy(&path);
+        assert_eq!(
+            std::fs::read(&prev).unwrap(),
+            copy,
+            "the copy is not changed"
+        );
+    }
+
+    /// #4379 — [`load_without_restore`] loads the config as it is, and only
+    /// it. A config that does not parse, is all NUL or is missing is an error
+    /// beside a last good copy [`load`] restores (each case ends with that
+    /// restore, to show the copy is one): the copy is not read or written, no
+    /// live file is written, and the folder holds what it held. A config that
+    /// loads is what [`load`] gives.
+    #[test]
+    fn load_without_restore_never_reads_or_writes_the_prev() {
+        let copy = toml::to_string(&test_fixture()).unwrap();
+        let cases: [(&str, Option<Vec<u8>>); 3] = [
+            ("not TOML", Some(b"agent_token = \"broken\n".to_vec())),
+            ("all NUL", Some(vec![0u8; 64])),
+            ("missing", None),
+        ];
+        for (case, live) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            let prev = prev_path(&path);
+            std::fs::write(&prev, &copy).unwrap();
+            if let Some(bytes) = &live {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let names = || {
+                let mut names: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            };
+            let before = names();
+            let (_cap, _guard) = captured();
+            let err = load_without_restore(&path).expect_err(case);
+            assert_eq!(not_found(&err), live.is_none(), "{case}: {err:#}");
+            assert_eq!(std::fs::read(&path).ok(), live, "{case}: the live file");
+            assert_eq!(std::fs::read_to_string(&prev).unwrap(), copy, "{case}");
+            assert_eq!(names(), before, "{case}");
+            let restored = load(&path).expect("load restores the copy");
+            assert_eq!(restored.agent_token, test_fixture().agent_token, "{case}");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &copy).unwrap();
+        let loaded = load_without_restore(&path).expect("a config that loads");
+        assert_eq!(
+            toml::to_string(&loaded).unwrap(),
+            toml::to_string(&load(&path).unwrap()).unwrap()
+        );
     }
 
     /// #3116 — the same on a real file system: a config in a directory this

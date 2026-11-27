@@ -2,6 +2,8 @@
 
 > **CLOSED 2026-09-01** — issue #1123 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
+**Anchors:** master `b46d6cab3` (closed 2026-09-01): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1123](https://github.com/gjovanov/roomler-ai/issues/1123) ·
 Status: **P1 implemented; P2 needs a release** (2026-09-01) · Found while shooting FR-41's demo: the
 device on camera was displaying this.
@@ -72,7 +74,7 @@ longer installed.
 The sentinel cannot tell those apart, because it does not record which version
 failed. `AttentionInfo` (`notify.rs:45`) is `{ path, message, reason }`, and the
 version exists only inside the free-text `message` written by
-`rollback_attention_msg` (`agents/roomlerd/src/app.rs:2601`).
+`rollback_attention_msg` (`agents/roomlerd/src/app.rs:2505`). (2026-11-05)
 
 ## Key design
 

@@ -28,11 +28,11 @@
   a start shortly after (see
   agents/roomlerd/src/service.rs::render_task_xml). Symmetric
   UnregisterAutostart hook runs `service uninstall` before the EXE is
-  removed during uninstall. Both actions Return="ignore" so an
-  individual machine where the existing task has a tightened ACL (rare
-  Win11 quirk that bit us 2026-04-29) doesn't sink the whole MSI —
-  operator can still recover via the manual schtasks delete + service
-  install path documented in packaging/windows/README.txt.
+  removed during uninstall. Both actions Return="ignore" so a refused
+  registration doesn't sink the whole MSI. The refusal that bit us
+  (#3507) was a task registered elevated, which its account could not
+  replace; since FR-150 each task names its account's own descriptor,
+  and each custom action logs its start and end (docs/installation.md).
 
   roomlerdw.exe (#3292): the windowless launcher. The task, the custom
   actions and the Start menu entry all run through it, because Windows opens
@@ -46,8 +46,8 @@
   Why this works without UAC: perUser MSIs run in the user's token
   context. Custom actions with Execute="deferred" Impersonate="yes"
   (which is the default in perUser mode) inherit that token. schtasks
-  /Create /XML /F against a non-elevated task succeeds for the user
-  who owns it.
+  /Create /XML /F succeeds for the account its task's descriptor lets
+  write: since FR-150 each task names one of its account's own.
 
   Effort 2 note (Windows Service deployment mode, 0.1.58):
   This MSI does NOT auto-register the alternative SCM service.
@@ -340,11 +340,11 @@
                     <Component Id='ApplicationShortcut' Guid='6D3F4A02-8B5E-4D4C-B03F-9C4D5E6F7081'>
                         <!-- FR-133 P1: the Start-menu entry's NAME follows the
                              product's; its Id and the component's Guid are identity
-                             and stay. MajorUpgrade runs afterInstallInitialize, so
-                             the old product (and its old .lnk) is removed before
-                             this one installs. #3292: it starts the task, through
-                             the launcher, so a click opens no terminal and never
-                             leaves a daemon nothing supervises. -->
+                             and stay. MajorUpgrade here is afterInstallExecute (see
+                             it above): this product, this entry included, is in
+                             place before the old one is removed. #3292: it starts
+                             the task, through the launcher, so a click opens no
+                             terminal and never leaves a daemon nothing supervises. -->
                         <Shortcut
                             Id='AgentShortcut'
                             Name='Roomler'

@@ -60,6 +60,10 @@ mod recording_tests;
 /// attachments and typing.
 #[cfg(test)]
 mod room_access_tests;
+/// #4409 — a room's stored member count is the number of its member rows,
+/// from its creation on, and the repair of the counts stored wrong.
+#[cfg(test)]
+mod room_member_count_tests;
 /// A reply's thread and quote are live messages of its own room, a thread
 /// lists its own room's replies, and a mention reaches the room's members.
 #[cfg(test)]
@@ -104,6 +108,10 @@ mod agent_self_tests;
 mod agent_socket_end_tests;
 #[cfg(test)]
 mod agent_tests;
+/// #4189 — four answers that sent a stored id or time raw, read through the
+/// routes: every id the 24-hex string, every time RFC 3339.
+#[cfg(test)]
+mod answer_wire_tests;
 /// FR-88 P1a — sign-up attribution: stored once at creation, absent from
 /// every user-facing response, parked across OAuth, counted for the admin.
 #[cfg(test)]
@@ -123,6 +131,11 @@ mod device_diagnostics_tests;
 mod device_list_tests;
 #[cfg(test)]
 mod device_naming_tests;
+/// #3565 — a device row's version is its daemon's own: an enrollment stores
+/// the program that enrolled, in a field of its own, and a pin to a row with
+/// no reported version is refused unless it is forced.
+#[cfg(test)]
+mod device_version_tests;
 #[cfg(test)]
 mod enroll_key_tests;
 /// An enrollment credential works only while the person who minted it may
@@ -245,6 +258,10 @@ mod oauth_tests;
 /// start with the holder named, per seat on Pro, carried across pods.
 #[cfg(test)]
 mod org_session_cap_tests;
+/// #4402 — a fan-out pass writes one line for the peers it could not reach,
+/// not one line a peer.
+#[cfg(test)]
+mod overlay_fan_log_tests;
 #[cfg(test)]
 mod overlay_growth_tests;
 #[cfg(test)]
@@ -283,6 +300,12 @@ mod privacy_activity_tests;
 mod privacy_gate_tests;
 #[cfg(test)]
 mod rate_limit_tests;
+/// #4042 — a viewer's hang-up of a session that runs through the cross-pod
+/// relay reaches the pod that holds it, at the window's default of 0 and with
+/// it on, within a bound measured from a same-pod hang-up; the next Connect
+/// gets a new session; and another member's hang-up is refused as on one pod.
+#[cfg(test)]
+mod rc_cross_pod_hangup_tests;
 #[cfg(test)]
 mod rc_idle_limit_tests;
 #[cfg(test)]
@@ -340,6 +363,11 @@ mod rc_session_policy_tests;
 /// response timeout, instead of hanging.
 #[cfg(test)]
 mod redis_bound_tests;
+/// #3952 — a Redis subscriber whose own connection goes deaf finds it within
+/// a stated bound and subscribes again; a subscribe that gets no answer gives
+/// up within #3840's bounds; a healthy subscriber never subscribes again.
+#[cfg(test)]
+mod redis_subscriber_tests;
 #[cfg(test)]
 mod relay_allowance_tests;
 #[cfg(test)]
@@ -348,6 +376,10 @@ mod relay_region_tests;
 mod remote_control_tests;
 #[cfg(test)]
 mod remote_recording_tests;
+/// #4402 — a request writes a line at production's level only when its
+/// answer is worth reading: a refusal, an error, or a slow answer.
+#[cfg(test)]
+mod request_log_tests;
 /// FR-40 P2 — a key a device rotated away from cannot be used to rejoin:
 /// refused `key_retired` at join and DERP under the org's `enforce`, the
 /// device with the verb ordered to rotate (once), `warn` and `off` admit.
@@ -359,6 +391,11 @@ mod role_reconcile_tests;
 mod role_tests;
 #[cfg(test)]
 mod room_visibility_tests;
+/// #3950 — the seat check's follow-ups: a document that does not decode costs
+/// only the seats it bears on their verdict, the room guard decides each end,
+/// a pass ends only the seats it read, and an ended seat settles its call once.
+#[cfg(test)]
+mod seat_check_tests;
 /// FR-102 P9c — the carrier a session rides: the agent records it on
 /// `rc:session.stats` once Active, and the server stores it on
 /// `remote_sessions.carrier` — a code only, absent read as unknown, never
@@ -405,6 +442,12 @@ mod tenant_archive_tests;
 /// earlier token (agents and tunnel clients alike).
 #[cfg(test)]
 mod token_renewal_tests;
+/// FR-155 P1a — a device trades its agent token for one of the next
+/// generation: one rotation per generation, an answer that was lost asked for
+/// again with its rotation key, at most one first rotation an hour, the
+/// switches, and the audit.
+#[cfg(test)]
+mod token_rotation_tests;
 /// #1821, #1829 — what a removal leaves behind answers nothing: External
 /// access on a removed device, and an overlay join on the socket it still holds.
 #[cfg(test)]

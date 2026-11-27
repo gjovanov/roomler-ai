@@ -15,29 +15,35 @@
 
   It also removes the whole exit-to-update failure class on two-half Macs:
   no agent process is ever the installer's parent and none exits for an
-  update — the pkg's postinstall re-bootstraps both halves, and the helper
-  is not long-running, so there is nothing to race.
+  update — the pkg's postinstall re-bootstraps both halves, and no agent
+  waits on the helper, so there is nothing to race.
 
   Wake sources, all three deliberate:
     RunAtLoad      — catch up right after boot / first install.
     StartInterval  — the periodic cadence (owned HERE, not by the agents;
                      one owner of "check+download+verify+install").
-    WatchPaths     — the trigger file the agents touch on rc:agent.update.
-                     /var/tmp is sticky/world-writable ON PURPOSE: the
-                     per-user agent is not root, and the trigger is
-                     ADVISORY-ONLY — whoever writes it can cause an update
-                     CHECK, never choose what gets installed (the helper
-                     independently resolves and verifies the release, and
-                     the install-storm cooldown bounds spam).
+    WatchPaths     — the wake file a daemon touches for rc:agent.update or
+                     its outage recheck, and `roomlerd self-update` for the
+                     person's own ask. World-writable /var/tmp ON PURPOSE:
+                     a per-user half is not root, and a wake is ADVISORY-ONLY:
+                     a CHECK, never a choice of what gets installed (the
+                     helper verifies the release; the install-storm cooldown
+                     bounds spam). Since FR-151 it never counts or forces.
 
-  Not KeepAlive: the helper runs, decides, exits. launchd relaunches it on
-  the next wake source. ThrottleInterval guards a crash-looping helper.
+  Not KeepAlive: ThrottleInterval guards a crash-looping helper. FR-151: it
+  reads both halves' live work before it installs, and after a defer stays
+  up to read again at the recheck (an hour, R5b's two minutes) or a wake, at
+  most once a minute, while launchd starts no second copy. It exits on the
+  opt-out, a manual install, SIGTERM or 8 h awake, keeping its count; so
+  does a run whose feed probe fails, and the next run is then StartInterval's
+  unless a push, the person's ask, a boot or the outage recheck comes first.
+  /etc/roomler/install-over-live-work makes it install with no reading.
 
-  ⚠️ postinstall must NEVER bootout a LOADED com.roomler.update — during an
-  update the postinstall is a grandchild of this very job, and booting the
-  job kills the whole process group, `installer` included, mid-payload. It
-  bootstraps only when not yet loaded; a CHANGED plist therefore takes
-  effect at next boot, which is acceptable for a file that rarely changes.
+  ⚠️ postinstall must NEVER bootout a RUNNING com.roomler.update: during an
+  update postinstall is a grandchild of this very job, and a bootout kills
+  the whole process group, `installer` included. It re-cycles an idle
+  helper. A running one keeps its job and old plist, and one that waits for
+  live work exits by itself within 5 s of a manual install (FR-151 D1).
 -->
 <plist version="1.0">
 <dict>

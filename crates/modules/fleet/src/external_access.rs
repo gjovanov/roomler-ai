@@ -53,7 +53,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -388,7 +388,8 @@ pub struct ExternalPrincipalBody {
 pub struct ConnectCodeResponse {
     /// Display form, `XXXX-XXXX-XXXX`.
     pub connect_code: String,
-    pub rotated_at: DateTime,
+    /// RFC 3339, as the device's `connect_code_rotated_at` reads (#4189).
+    pub rotated_at: String,
 }
 
 /// One device's connect code, as its External access dialog reads it.
@@ -439,12 +440,15 @@ pub async fn get_settings(
 /// `PUT /api/tenant/{tenant_id}/external-access` — gate 1.
 ///
 /// `MANAGE_TENANT`, not `MANAGE_AGENTS`: this decides whether the org can be
-/// reached from outside at all.
+/// reached from outside at all. It is decided before the body is read
+/// (#4254): a caller without it gets the gate's answer whatever the body is,
+/// and a holder is answered one that does not parse as the `Json` extractor
+/// answered it.
 pub async fn set_enabled(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<ExternalAccessEnabledBody>,
+    body: Result<Json<ExternalAccessEnabledBody>, JsonRejection>,
 ) -> Result<Json<ExternalAccessEnabledBody>, ApiError> {
     let tid = tenant_of(&tenant_id)?;
     require_permission(
@@ -455,6 +459,7 @@ pub async fn set_enabled(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     state
         .tenants
         .base
@@ -709,7 +714,7 @@ pub async fn rotate_connect_code(
                 // membership.
                 return Ok(Json(ConnectCodeResponse {
                     connect_code: connect_code::format_grouped(&code),
-                    rotated_at: DateTime::now(),
+                    rotated_at: fmt_dt(DateTime::now()),
                 }));
             }
             Err(e) => last_err = Some(e),

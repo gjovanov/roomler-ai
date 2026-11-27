@@ -249,12 +249,88 @@ can be pinned out of band.
 - **`sftp` and `scp`** (P7a) — see below.
 - **`ssh -L`, `-J` and `-W`** (P7b) — `direct-tcpip` channels, **default-deny**.
   See below.
-- Still **refused with a stated reason on stderr**: any other subsystem. A bare
-  channel failure reads as "administratively prohibited", which is
-  indistinguishable from a policy denial; a tool silently hanging is a much
-  worse diagnostic than "not implemented yet".
+- Still **refused, with the reason on stderr and exit status 1**: any other
+  subsystem. A tool silently hanging is a much worse diagnostic than "not
+  implemented yet", and how the reason reaches the caller is its own section,
+  [A refusal ends like a program that could not start](#a-refusal-ends-like-a-program-that-could-not-start-4168).
 - **`ssh -R` is not implemented** and is refused by russh's own default,
   promptly and cleanly. That is a decision, not a gap — see P7b below.
+
+### A refusal ends like a program that could not start (#4168)
+
+A shell or subsystem request the device will not serve, on a channel that is
+already open, is answered the way a program that could not start ends. That is
+every `Handler::refuse` (a shell without a terminal; `sftp` with no usable
+account, with no `sftp-server`, or on Windows as a named account or under
+`ROOMLERD_SFTP_AS_USER=0`; any other subsystem; the guards for a session with no
+policy, which authentication never leaves), and the shell of a session whose
+account mode is unusable: unset for a key-list session, above
+`ssh_max_privilege`, or above the SYSTEM service's ceiling.
+
+| # | The device sends | What OpenSSH's client (V_10_6_P2) does with it |
+|---|---|---|
+| 1 | `CHANNEL_SUCCESS` | goes on. A failure would end it: it asks for a shell, a command or a subsystem with `CONFIRM_CLOSE` (`clientloop.c:2801-2816`), and a failure on the session channel is `fatal` (`clientloop.c:844-846`) |
+| 2 | the reason on stderr, `roomler-ssh: …` | writes it to its own stderr |
+| 3 | `exit-status` 1 | keeps it as the exit code it returns (`clientloop.c:2014-2023`) |
+| 4 | `CHANNEL_EOF` | takes it as the end of the output (`nchan.c:258-264`). Stderr after it would be a protocol error that disconnects (`channels.c:3627-3633`), which is why the reason comes first |
+| 5 | `CHANNEL_CLOSE` | ends, but only once the stderr it holds is written: the output side waits for it (`channels.c:1389-1395`) |
+
+`ssh` prints the reason and exits 1. `sftp` and `scp` print it, then their own
+`Connection closed`, and exit 255. Before #4168 the device sent the reason and
+then `CHANNEL_FAILURE`: OpenSSH printed only `shell request failed on channel 0`
+(`subsystem …` under `sftp` and `scp`) and exited 255 without writing the reason
+it had already received. Exit status 1 is what sshd ends a session with when it
+cannot serve it (`session.c:1607-1612`, a shell that will not start at
+`session.c:1664-1666`), and what a command here that never ran ends with.
+
+Nothing starts: the success answers the request and grants nothing. The close
+goes out right behind the reason, and russh drops what a client sends on a
+channel it has closed. When the client's window has no room for the reason, or
+a key exchange is running, russh holds the EOF and the close back behind it.
+Until they go, the handler's `refused` set answers a request on that channel
+with a failure and drops its data, EOF and window changes
+(`Handler::answer_refusal`, [`ssh.rs:2390`](../agents/roomlerd/src/ssh.rs#L2390)).
+The log lines are as before: `ssh: refused an unsupported request` with `peer`
+and `request`, and the account-mode shell's
+`ssh: refusing a shell — unusable account mode`.
+
+Left as they were: a command whose bytes are not UTF-8 is answered with a bare
+failure and no reason, so `ssh` exits 255 with `exec request failed on channel
+0`. A refusal made after the request was accepted (consent refused, an account
+that cannot be reached) already sends its reason after the success.
+
+Tested in `ssh::tests`: `unsupported_requests_are_refused_with_a_reason`,
+`sftp_is_refused_when_the_session_resolved_to_no_account`,
+`a_shell_without_a_pty_is_refused_with_a_reason` and
+`an_interactive_session_without_an_account_mode_gets_no_shell` read the five
+messages in order, and the last three find no process started in the server's
+log. `a_refused_channel_takes_nothing_more_while_its_close_waits` holds the close
+back with a client window of 0: a command, a terminal and a second shell asked
+for on that channel are refused, and the data and EOF sent there reach no
+process. `a_shell_refused_for_its_account_mode_takes_nothing_more` does the same
+for the account-mode shell: a second shell, a command and `sftp` are refused.
+
+### Several channels on one connection
+
+One connection carries several channels at once (`ControlMaster` sessions, `scp`
+beside a shell, an `-L` forward beside a command), and each channel keeps its own
+state ([`ssh.rs:1005`](../agents/roomlerd/src/ssh.rs#L1005)), found by the id
+russh passes to every callback. `data` feeds the process that channel started and
+no other (`:2084`); a forward's bytes go to its own stream. `channel_eof` ends that
+process's input alone (`:2138`). `window_change_request` resizes that channel's
+terminal, and a channel without one resizes nothing (`:2105`). `pty_request` is
+recorded for that channel (`:2042`): only its own shell starts on it, a shell on a
+channel that asked for no terminal is refused, and a second terminal on one
+connection is a terminal of its own. A channel opened as a forward takes no
+session request: RFC 4254 §6 gives pty-req, shell, exec, subsystem and env to
+session channels, so each of them on a forward is answered with a failure and
+starts nothing (`:1021`, `env_request` at `:2204`). On a refused channel whose
+close waits (above) the `refused` checks run first, so nothing more is recorded
+for it. The state goes when the client closes the channel (`:2160`), or, for a
+channel the server closed itself, at the next channel open (`:1173`; a forward
+stays while its splice runs): russh forgets a channel it closed, so the client's
+answering close never reaches the handler. Tested in
+`ssh::tests::channel_scope_tests`.
 
 ### One-shot commands stream (FR-89)
 
@@ -386,8 +462,8 @@ Mechanics worth knowing:
   `crates/tunnel-core/src/child.rs:465`; registered at
   `agents/roomlerd/src/pty/unix.rs:276`). It marks and never closes, so it
   cannot undo the drop. A one-shot command and a Fleet RPC command
-  (`agents/roomlerd/src/exec.rs:2439`) and `sftp-server`
-  (`agents/roomlerd/src/ssh.rs:1255`) sweep the same way. The overlay's TUN
+  (`agents/roomlerd/src/exec.rs:2442`) and `sftp-server`
+  (`agents/roomlerd/src/ssh.rs:1311`) sweep the same way. The overlay's TUN
   device is close-on-exec too ([overlay-communication.md](overlay-communication.md)).
 - **The parent must close the slave** after spawning, or reads on the master
   never see EOF and a session whose shell exited would hang forever.
@@ -659,7 +735,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:4996`](../agents/roomlerd/src/companion.rs#L4996)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:2196`](../agents/roomlerd/src/companion.rs#L2196)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:5201`](../agents/roomlerd/src/companion.rs#L5201)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:2200`](../agents/roomlerd/src/companion.rs#L2200)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -680,7 +756,7 @@ flowchart TD
   inside the person's session.
 - ⚠️ **The server stores `console_user` off Windows only for an agent that
   advertises `console-user`** (`console_user_unsupported`,
-  [`agent_ssh.rs:1105`](../crates/modules/network/src/routes/agent_ssh.rs#L1105)).
+  [`agent_ssh.rs:1115`](../crates/modules/network/src/routes/agent_ssh.rs#L1115)).
   An agent rolled back since refuses the session itself, as every agent before
   P5a did, so this half fails closed either way.
 
@@ -881,9 +957,11 @@ the policy's `account_mode`. A key-list session has no policy behind it, so it
 uses the device-owned `ssh_account_mode` — and while that was unset it fell
 back to the daemon's own identity, meaning listing a key quietly handed out
 SYSTEM/root and a policy of `console_user` was simply untrue for that path.
-Unset now means the session authenticates and runs nothing, with the reason on
-stderr. (Authenticate-then-refuse rather than refuse-the-auth, because it can
-explain itself; a bare auth failure cannot.)
+Unset now means the session authenticates and runs nothing: a command, a shell
+or `sftp` ends with the reason on stderr and exit status 1 (since #4168 the
+shell's and `sftp`'s reach the screen as well, § A refusal ends like a program
+that could not start). (Authenticate-then-refuse rather than refuse-the-auth,
+because it can explain itself; a bare auth failure cannot.)
 
 The rule the whole type exists to enforce: **never silently run as something
 more privileged than was asked for.** A policy that says `console_user` on a
@@ -938,7 +1016,8 @@ Set to `console_user`, a grant asking for the daemon identity is **refused, not
 downgraded** — a caller who asked for root and silently got a user shell has
 been told something untrue about their own session, and would read every later
 permission error as the command's problem rather than the device's answer. The
-refusal names the setting, on stderr, at run time.
+refusal names the setting on stderr at run time, and OpenSSH shows it for a
+command, a shell and `sftp` alike (#4168).
 
 **Unset is permissive** and changes nothing, deliberately: a device-side
 ceiling that arrived switched on would revoke a working configuration in the
@@ -1018,6 +1097,10 @@ sequenceDiagram
 - **Either half can refuse.** The worker refuses a via-service grant when its
   person's `ssh_enabled` is off, when `ssh_max_privilege = console_user` meets a
   `daemon` grant (M5 above), or when `ROOMLERD_SSH_VIA_SERVICE=0` is set.
+- **A copy rings nothing.** The worker rings the service once per grant id. A
+  copy of an id it has already handed on, or refused, is dropped with a warning
+  and answers nothing, because a refusal there could undo the first copy's
+  claim (#3558, [below](#a-grant-id-is-honoured-at-most-once-3558)).
 
 What the signed-in user controls, and why none of it widens port 2223:
 
@@ -1067,7 +1150,7 @@ the claim landing on the other prod pod:
 | 1 — org kill-switch (`remote_ssh_enabled`) | server | **live.** Default off, and a *separate* switch from `remote_exec_enabled`: allowing bounded diagnostic commands is not the same decision as allowing interactive sessions |
 | 2 — caller permission (`SSH_DEVICE`, `1 << 29`) | server | **live.** A *separate* bit from `EXEC_DEVICE` and, like it, deliberately **not** in `DEFAULT_ADMIN` |
 | 3 — `SshPolicy` | server | **live.** `SshMode::Off` default, `can_originate` on the *originating* device, user/role allowlists, `account_mode`, consent |
-| 4 — `ssh_enabled` + `ssh_authorized_keys` | the device | **live.** The refusal that survives a compromised control plane |
+| 4 — `ssh_enabled` | the device | **live.** The refusal that survives a compromised control plane. A grant needs no entry in `ssh_authorized_keys`: that list is the separate break-glass route, empty by default (#4325) |
 
 All four are default-deny, and each is owned by a different party, so no single
 compromise is sufficient.
@@ -1145,7 +1228,7 @@ life to dial in), and logs `confirmed_after_ms` on every confirmed grant.
 | recorded | where to dial |
 | `ssh_disabled` — gate 4 | `agent_disabled` |
 | `expired` — only from an agent released before #3511: its clock read the grant's timestamp as already past, because it ran ahead of the server's | `grant_expired_on_arrival` |
-| `invalid`, or a reason newer than the server | `grant_refused` |
+| `invalid` (a key that does not parse here, or since #3558 a copy of a grant id the device has already seen), or a reason newer than the server | `grant_refused` |
 | nothing within 10 s | `grant_unconfirmed` — **never an address**: the one thing known is that the device has not confirmed |
 
 ⚠️ `ssh-grant-ack` is **equality-matched** — `ssh` is its prefix exactly as it is
@@ -1177,6 +1260,11 @@ reason to accept an unbounded table or an eternal key:
 
 - **Single use.** A redeemed grant is removed, so a captured public key cannot
   be replayed into a second session even inside its lifetime.
+- **Each grant id at most once** (#3558). A copy of a grant whose id is still
+  pending, or left the table in the last ten minutes (redeemed, expired or
+  dropped), is refused and not recorded, so it can neither open a second
+  session nor give the key a fresh window. 256 ids are remembered, the oldest
+  forgotten first ([below](#a-grant-id-is-honoured-at-most-once-3558)).
 - **A local deadline**: 60 s from the grant's *arrival*, on the device's
   monotonic clock (`Instant`), whatever the server's timestamp says (#3511,
   next section). A skewed clock or a compromised control plane can neither
@@ -1215,8 +1303,8 @@ Now the window is the TTL from **arrival**, on the device's monotonic clock:
 
 | side | where | what it does |
 |---|---|---|
-| the device | `record_grant` ([`ssh.rs:3084`](../agents/roomlerd/src/ssh.rs#L3084)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3116-3125`), so a skewed clock stays visible |
-| the server | `decide` ([`agent_ssh.rs:445`](../crates/modules/network/src/routes/agent_ssh.rs#L445)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2575`](../crates/remote_control/src/models.rs#L2575)), on `rc:ssh.grant` (`agent_ssh.rs:465`) and in the FR-105 `ssh_pending` row the service claims (`:491`). The caller's copy stays mint + 60 s |
+| the device | `record_grant` ([`ssh.rs:3291`](../agents/roomlerd/src/ssh.rs#L3291)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3323-3332`), so a skewed clock stays visible |
+| the server | `decide` ([`agent_ssh.rs:445`](../crates/modules/network/src/routes/agent_ssh.rs#L445)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2717`](../crates/remote_control/src/models.rs#L2717)), on `rc:ssh.grant` (`agent_ssh.rs:465`) and in the FR-105 `ssh_pending` row the service claims (`:491`). The caller's copy stays mint + 60 s |
 
 The slack is for agents released before #3511, which still take
 `min(expires_at_ms − now, 60 s)`. From the server release that carries it they
@@ -1234,7 +1322,7 @@ server's. These bounds hold whatever the device's clock says:
 
 1. **FR-83.** The caller is told where to dial only once the target's
    `rc:ssh.grant_ack` is back, within `GRANT_ACK_TIMEOUT_SECS` (10 s,
-   `models.rs:2587`). Later than that the answer is `grant_unconfirmed`
+   `models.rs:2729`). Later than that the answer is `grant_unconfirmed`
    (`agent_ssh.rs:599`), never an address.
 2. **FR-105.** The SYSTEM service can claim a via-service grant only before
    `claim_by`, mint + 10 s on the server's clock (`agent_ssh.rs:496`; the claim
@@ -1245,24 +1333,130 @@ server's. These bounds hold whatever the device's clock says:
 4. **A queued grant dies with its connection.** It waits on the connection's
    own queue (`crates/modules/fleet/src/hub.rs:3291`), so a reconnect drops it,
    and a connection that hears nothing for 80 s (`WS_RX_DEADLINE`,
-   `agents/roomlerd/src/signaling.rs:66`, checked at `:2393`) reconnects. On a
+   `agents/roomlerd/src/signaling.rs:66`, checked at `:2421`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
-   (`agents/roomlerd/src/ssh.rs:3031`), and no window longer than 60 s from
-   arrival.
+   (`agents/roomlerd/src/ssh.rs:3225`), and no window longer than 60 s from
+   arrival. A copy of a grant gets no window at all: it is refused while its
+   id is pending and for ten minutes after the id left the table (#3558, next
+   section).
 
 One case is left: a caller of the HTTP route who keeps a reusable key after a
 `grant_unconfirmed` and dials anyway (the route takes any OpenSSH public key,
-`agent_ssh.rs:1203`). On a stalled control connection, a grant that lands late
+`agent_ssh.rs:1213`). On a stalled control connection, a grant that lands late
 could then be redeemed up to about 165 s after mint, instead of 60 s. That
 matters only if the caller's authorization was revoked in between, and a
 redeemed session already outlives a revocation for its `session_secs` (12 h at
-most, `MAX_SESSION_SECS`, `models.rs:2591`). #3511 records that decision.
+most, `MAX_SESSION_SECS`, `models.rs:2733`). #3511 records that decision.
 
 | | server before #3511 | server with #3511 |
 |---|---|---|
 | **agent before #3511** | refuses every grant from about 60 s ahead | takes grants up to about 10 min ahead; the window stays ≤ 60 s from arrival |
 | **agent with #3511** | takes grants at any skew, 60 s from arrival | takes grants at any skew, 60 s from arrival |
+
+### A grant id is honoured at most once (#3558)
+
+`record_grant` used to append whatever arrived. A grant delivered twice became
+two redeemable entries, and `take_grant_for` matches by key and removes one, so
+two connections with that key could each redeem one. A copy that arrived after
+its grant was redeemed was recorded as new, and since #3511 with a fresh 60 s
+window from its own arrival. Today's server sends each grant once, on one path,
+so this takes a duplicated or replayed frame. The rule it broke is the one the
+table exists for: a captured key must not open a second session.
+
+Now a process honours a grant id at most once. `record_grant` checks the id
+after its prune and before the table changes
+([`ssh.rs:3350-3360`](../agents/roomlerd/src/ssh.rs#L3350)), and a copy is
+never recorded, so the first copy keeps its entry, its window and its
+acknowledgement:
+
+| What became of the first copy | A copy is refused | Where the id is remembered |
+|---|---|---|
+| pending: in the table, waiting for its connection | while it stays pending, then as below | the table itself refuses it |
+| redeemed by a connection | for ten minutes after the redemption | `take_grant_for` ([`ssh.rs:3412`](../agents/roomlerd/src/ssh.rs#L3412)) |
+| expired unredeemed: its 60 s ran out | for ten minutes after the prune that found it expired: a grant that timed out is burned too | `prune` ([`ssh.rs:3391`](../agents/roomlerd/src/ssh.rs#L3391)) |
+| dropped from a full table (16 pending) | for ten minutes after the drop | `record_grant` ([`ssh.rs:3371`](../agents/roomlerd/src/ssh.rs#L3371)) |
+
+`record_grant`, in order:
+
+```mermaid
+flowchart TD
+    A["rc:ssh.grant arrives"] --> B{"the key parses?"}
+    B -- no --> X1["refused: invalid"]
+    B -- yes --> C["the window: 60 s from arrival"]
+    C --> D["prune: an expired grant leaves the table,<br/>and its id is remembered"]
+    D --> E{"the id is pending,<br/>or remembered?"}
+    E -- yes --> X2["refused: invalid<br/>nothing recorded, the first copy untouched"]
+    E -- no --> F{"16 pending?"}
+    F -- yes --> G["drop the oldest,<br/>and remember its id"]
+    F -- no --> H["recorded: the key is in the table auth reads"]
+    G --> H
+```
+
+- **The horizon**, `GRANT_ID_HORIZON`
+  ([`ssh.rs:3439`](../agents/roomlerd/src/ssh.rs#L3439)): ten minutes, ten
+  windows of `GRANT_TTL_SECS`, counted from the moment the id left the table.
+  While the grant is pending the table itself refuses a copy, so an id is
+  refused for its whole window and ten minutes after: at least the window, by
+  construction.
+- **The bound**, `MAX_REMEMBERED_GRANTS`
+  ([`ssh.rs:3448`](../agents/roomlerd/src/ssh.rs#L3448)): 256 ids, the oldest
+  forgotten first, a few KiB. The server mints one grant per session asked for,
+  so 256 inside ten minutes is a scripted loop, not a person. The pending table
+  keeps its own bound of 16.
+- **The memory**, `SPENT` ([`ssh.rs:3529`](../agents/roomlerd/src/ssh.rs#L3529)),
+  is locked only while the pending table is held, and always after it: one lock
+  order, and no moment at which a grant has left the table and its id is not
+  yet remembered.
+- **Forgotten:** an id past the horizon or pushed out by the bound, and every id
+  at a restart. The memory belongs to the process, as the table does.
+
+**The refusal** is `invalid` (`SshGrantRefusal::Invalid`,
+[`ssh.rs:3262`](../agents/roomlerd/src/ssh.rs#L3262)), which the caller hears
+as `grant_refused`. The wire gets no new value, so every server release reads
+it. It is not `other`, a reason this build would not know, and not `expired`,
+which #3511 retired. The worker logs it as it logs any refusal of
+`record_grant`, `rc:ssh.grant rejected` with the grant id
+([`signaling.rs:6227`](../agents/roomlerd/src/signaling.rs#L6227)), and the
+error names the case: "a grant id is honoured at most once, and its first copy
+was redeemed" (or is still pending, expired unredeemed, or was dropped from a
+full table).
+
+**The first copy's acknowledgement stands**, and the two paths answer a copy
+differently so that it does:
+
+| Path | A copy is | Why the first copy's answer stands |
+|---|---|---|
+| the worker's own table | refused, `invalid` | One loop records and acknowledges each grant in order (`handle_server_msg`, [`signaling.rs:3354`](../agents/roomlerd/src/signaling.rs#L3354)), and its answers leave on one queue ([`signaling.rs:2788`](../agents/roomlerd/src/signaling.rs#L2788)). The server reads one socket's frames in order ([`socket.rs:560-583`](../crates/modules/fleet/src/socket.rs#L560)), and the first answer removes the caller's wait ([`ssh_grant_acks.rs:108-120`](../crates/modules/network/src/ssh_grant_acks.rs#L108)). The copy's refusal finds no wait, and the server logs `ssh: grant ack with no waiter` at debug ([`agent_socket.rs:141-155`](../crates/modules/network/src/agent_socket.rs#L141)) |
+| the SYSTEM service (FR-105) | dropped by the worker: no second ring and no acknowledgement, only a warning, `rc:ssh.grant already handed to the SYSTEM service (or refused); this copy is dropped, no ack` ([`signaling.rs:6125-6134`](../agents/roomlerd/src/signaling.rs#L6125)) | Here a refusal could undo the first copy. The service's claim is single use ([`ssh_pending.rs:44-68`](../crates/services/src/dao/ssh_pending.rs#L44)), so a copy's ring ends in a 404 ([`agent_ssh.rs:1263-1290`](../crates/modules/network/src/routes/agent_ssh.rs#L1263)), which the worker would answer as a refusal. The first copy's claim can land on a server instance other than the one holding the caller's wait. That wait reads the claim from the shared row every 400 ms, and until then it still takes a worker's refusal ([`ssh_grant_acks.rs:115`](../crates/modules/network/src/ssh_grant_acks.rs#L115)): its refusal arm would deny the caller ([`agent_ssh.rs:545-566`](../crates/modules/network/src/routes/agent_ssh.rs#L545)) while the service holds the grant. So the worker remembers each via-service id at first sight, before any outcome (`first_sight_via_service`, [`ssh.rs:3557`](../agents/roomlerd/src/ssh.rs#L3557)), in a memory of its own with the same horizon and bound, never the table's. A grant the worker refused is as dead as one the service took, and its first refusal already answered |
+
+Left as they are:
+
+- A copy delivered to both the worker and the SYSTEM service of one Windows
+  device: two processes, two memories. The server sends each grant down one
+  path.
+- A grant the worker refused at gate 4 (`ssh_enabled` off) never enters the
+  table, so its id is not remembered, and a copy that arrived after SSH was
+  turned on would be recorded. The first copy was never honoured, so the id is
+  still honoured once at most.
+- `record_grant`'s warning that the server's expiry is already past by this
+  device's clock still prints for a copy before the copy is refused. The order
+  of the checks is unchanged, and the warning is a log line only.
+
+Tested in `ssh::tests`: `the_same_grant_twice_is_held_once_and_admits_one_session`,
+`a_copy_of_a_redeemed_grant_is_refused`,
+`a_second_copy_does_not_extend_the_first_ones_window` and
+`a_copy_of_a_grant_that_expired_unredeemed_is_refused` connect with the key,
+and find the second session refused and the copy answered `invalid`. Before the
+fix each second session got in. `both_tables_stay_within_their_bounds` records
+320 ids, each followed by a copy, and holds the table to 16 and the memory to
+256 throughout. `a_via_service_grant_is_handed_on_at_first_sight_only`,
+`the_via_service_memory_stays_within_its_bound` and
+`a_via_service_id_is_forgotten_after_the_horizon` hold the worker's via-service
+memory to the same rule. On the server,
+`a_refusal_after_a_recorded_ack_lands_nowhere`
+([`ssh_grant_acks.rs:350`](../crates/modules/network/src/ssh_grant_acks.rs#L350))
+pins the worker path's argument.
 
 ### Operator consent (P5d — shipped)
 
@@ -1312,7 +1506,7 @@ global, `consent::set_shared`, whose absence the server had to treat as a
 denial; "no broker ⇒ deny" is now unrepresentable rather than documented.)
 
 ⚠️ **Armed before it is shown (#3442).** The device registers the question with
-the broker first (`ask_here`, [`ssh.rs:2454`](../agents/roomlerd/src/ssh.rs#L2454)), then puts it up: the native panel, the
+the broker first (`ask_here`, [`ssh.rs:2634`](../agents/roomlerd/src/ssh.rs#L2634)), then puts it up: the native panel, the
 `.pending` marker the companion and `roomlerd consent --list` read, a companion
 it may have to start (up to 3 s), a notification. An answer counts from the
 moment anything shows the question. Until #3442 the question was armed last,
@@ -1320,11 +1514,11 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4298`](../agents/roomlerd/src/signaling.rs#L4298), [`:5849`](../agents/roomlerd/src/signaling.rs#L5849)), as the recording question does
+first the same way ([`signaling.rs:4357`](../agents/roomlerd/src/signaling.rs#L4357), [`:5919`](../agents/roomlerd/src/signaling.rs#L5919)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
-[`ssh.rs:2320`](../agents/roomlerd/src/ssh.rs#L2320)).** Channels of one session can ask at once: a command waits in a
+[`ssh.rs:2500`](../agents/roomlerd/src/ssh.rs#L2500)).** Channels of one session can ask at once: a command waits in a
 task of its own, so a second channel can ask while the first waits. A channel
 that asks what a question already standing for its grant asks (the same
 activity: "run a command", "open an interactive shell", "transfer files over
@@ -1333,7 +1527,7 @@ it. A different activity is a different question: the question names the
 activity (FR-27), so an Allow given for a command never opens a shell. Each
 question is filed under a fresh object id, never the grant's, and the daemon
 logs the two side by side. A channel that joins a standing question logs that
-question's id ([`ssh.rs:2338`](../agents/roomlerd/src/ssh.rs#L2338)), and the answer's line carries the grant ([`:2537`](../agents/roomlerd/src/ssh.rs#L2537)), so a
+question's id ([`ssh.rs:2518`](../agents/roomlerd/src/ssh.rs#L2518)), and the answer's line carries the grant ([`:2731`](../agents/roomlerd/src/ssh.rs#L2731)), so a
 joiner is matched to the answer it took by id, not by timing.
 
 **One Allow settles every channel of the grant that asks about the same
@@ -1365,7 +1559,7 @@ what was asked (#3465).
 
 The SYSTEM service (FR-105) coalesces before it relays, and the relayed
 question carries its own id, which the worker checks is an object id
-([`ssh_service.rs:928`](../agents/roomlerd/src/ssh_service.rs#L928)). ⚠️ **The fix needs the service, not only the worker.** A
+([`ssh_service.rs:931`](../agents/roomlerd/src/ssh_service.rs#L931)). ⚠️ **The fix needs the service, not only the worker.** A
 service from before #3442 relays the grant's id for every question and does not
 coalesce, so a worker behind it still has the second question withdraw the
 first, until the service is updated too.
@@ -1535,9 +1729,12 @@ included, and through a repair. An uninstall removes it with the service. Up to
 0.4.199 an update dropped it with every other entry but the SystemContext switch,
 silently (#3375, `docs/installation.md`,
 [What the service's `Environment` keeps](installation.md#what-the-services-environment-keeps-3375)).
-To check that the switch holds, try a transfer. OpenSSH's `sftp` shows the
-refusal only as `subsystem request failed on channel 0`, without the reason the
-device sends on stderr. The device's log has
+To check that the switch holds, try a transfer. OpenSSH's `sftp` prints the
+device's reason, `roomler-ssh: SFTP as the signed-in user is switched off on
+this device (ROOMLERD_SFTP_AS_USER=0).`, then `Connection closed`, and the
+`ssh` under it exits 1 (#4168). An agent before #4168 shows the refusal only as
+`subsystem request failed on channel 0`, without the reason it sends on stderr,
+and `ssh` exits 255. The device's log has
 `ssh: refused an unsupported request … request="sftp"`. An agent before #3815
 writes it unquoted, `request=sftp`, as measured on a Win11 SystemContext guest
 after an update (#3375).
@@ -1559,7 +1756,7 @@ channel — SFTP is binary and injected text corrupts a transfer. It is one
 `ssh: sftp-server stderr` line a session, written when the child closes its
 stderr, with the text as ONE escaped field, `msg="…"`: its first 4 KiB, and
 `cut_bytes` counting the rest (#3890, `SftpStderr`,
-`agents/roomlerd/src/ssh.rs:2174`). A line break or a control character in
+`agents/roomlerd/src/ssh.rs:2318`). A line break or a control character in
 it, or in a path it quotes from the client, stays inside that line. Up to 0.4.222
 the text was logged as it came, and on Windows one line per chunk.
 
@@ -1822,17 +2019,17 @@ stay, each for a reason that outlives it:
 |---|---|---|---|
 | `ssh_ticket` on `ClientMsg::SshRequest`, parse-only, sent by no build | a 0.4.199 agent still sends it, and `ClientMsg` ignores a field it does not know: dropped from the wire, a ticketed request would parse as the device owner's own | `crates/remote_control/src/signaling.rs:858` | no agent at 0.4.199 or older is left (FR-137 D8) |
 | a request that carries one is refused `TicketRefused` and audited, never served as the owner's | the same | bound to a refused caller at `crates/modules/network/src/agent_arms.rs:193`, refused at `crates/modules/network/src/routes/agent_ssh.rs:348`, and recorded by `dispatch` like any refusal | with the field |
-| `SshDenyReason::{TicketRefused, SessionNotAllowed, TargetTooOld}` (`ticket_refused`, `session_not_allowed`, `target_too_old`) | `ssh_audit` keeps its rows for 90 days and the enum is strict, with no `#[serde(other)]`: one unknown word fails a whole listing. No build writes the last two now | `crates/remote_control/src/models.rs:5163-5173` | 90 days after P1's roll of 2026-11-04, so 2027-02-02 at the earliest (FR-137 D7); `ticket_refused` goes with the field |
+| `SshDenyReason::{TicketRefused, SessionNotAllowed, TargetTooOld}` (`ticket_refused`, `session_not_allowed`, `target_too_old`) | `ssh_audit` keeps its rows for 90 days and the enum is strict, with no `#[serde(other)]`: one unknown word fails a whole listing. No build writes the last two now | `crates/remote_control/src/models.rs:5305-5315` | 90 days after P1's roll of 2026-11-04, so 2027-02-02 at the earliest (FR-137 D7); `ticket_refused` goes with the field |
 
 A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `claim_service_grant` reads no query, so the word is ignored
-(`crates/modules/network/src/routes/agent_ssh.rs:1223`). The verb
+(`crates/modules/network/src/routes/agent_ssh.rs:1233`). The verb
 `ssh-one-command` is reserved with the rest of FR-90's verbs.
 
 `a_ticketed_ssh_request_is_refused_and_audited`
 (`crates/tests/src/parked_wire_tests.rs:43`), `ssh_audit_rows_written_before_p2_list`
 (`:118`) and `ssh_audit_rows_written_before_p2_still_load`
-(`crates/remote_control/src/models.rs:8990`) lock it. The other surfaces FR-90
+(`crates/remote_control/src/models.rs:9267`) lock it. The other surfaces FR-90
 left reserved are listed in
 [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 

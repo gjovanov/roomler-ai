@@ -36,7 +36,9 @@
 //! ## Platform backends
 //! * `linux` — `wmctrl` (list/focus) + `tmux` (bash sessions) + `xterm`.
 //!   The flagship: a bash "session" is a tmux session, surfaced as an
-//!   xterm attached to it — survives agent restart/disconnect and is
+//!   xterm attached to it — outlives its xterm, a disconnect and the virtual
+//!   desktop's X server (a daemon restart only where no service manager owns
+//!   the daemon), and is
 //!   ssh-attachable. Windows are matched back to their session/app via a
 //!   `roomler:tmux:<s>` / `roomler:app:<key>` xterm-title convention.
 //! * `windows` — `EnumWindows` / `SetForegroundWindow` / a plain spawn on
@@ -260,7 +262,7 @@ impl Unavailable {
                  ({detail}). They are never run as root on a user's session instead."
             ),
             Self::ToolMissing { tool, install } => format!(
-                "`{tool}` is not installed on the agent host ({install}); this backend \
+                "`{tool}` is not installed on this device ({install}); this backend \
                  needs it to find and manage the desktop."
             ),
             Self::Platform => "Remote apps have no backend on this platform — they exist for \
@@ -268,7 +270,7 @@ impl Unavailable {
                                macOS."
                 .to_string(),
             Self::SwitchedOff => format!(
-                "Remote apps are switched off on this device by `{APPS_ENV}=0` in the agent's \
+                "Remote apps are switched off on this device by `{APPS_ENV}=0` in the daemon's \
                  environment — on a Mac, the form in which the root half's \
                  `[virtual_desktop_apps] enabled = false` reaches the GUI worker that serves \
                  the session. Remove the variable, or enable them in that config, and restart \
@@ -475,6 +477,22 @@ pub fn backend() -> Result<Box<dyn WindowManager>, Unavailable> {
     {
         Err(Unavailable::Platform)
     }
+}
+
+/// #4100 — the Linux backend on the virtual desktop `display`, with stand-ins
+/// for its helper programs (tmux, xterm, wmctrl and xprop, in that order) and
+/// asking `start` first, for the virtual desktop's tests (`mod linux` is
+/// private).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn linux_backend_for_tests(
+    display: &str,
+    tools: [String; 4],
+    start: crate::virtual_desktop::XStarter,
+) -> Box<dyn WindowManager> {
+    let target = linux::Target::Daemon {
+        display: display.into(),
+    };
+    Box::new(linux::LinuxWm::with(target, tools, start))
 }
 
 // ---------------------------------------------------------------------------

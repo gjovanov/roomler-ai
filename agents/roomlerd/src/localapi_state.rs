@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::watch;
 use tunnel_core::localapi::{
-    ConnectionType, ConsentRequest, DaemonMode, ExternalPasswordState, FlowInfo, LocalApiState,
-    NodeStatus, OverlayView, PeerInfo, Response, Secret,
+    ConnectionType, ConsentRequest, ControlDown, DaemonMode, ExternalPasswordState, FlowInfo,
+    LocalApiState, NodeStatus, OverlayView, PeerInfo, Response, Secret,
 };
 
 /// How often the RTT prober ICMP-pings each carrier-reachable peer (P3b-3).
@@ -150,15 +150,22 @@ pub struct DaemonState {
     /// node, not the account.
     privileged: bool,
     tenant_id: Option<String>,
-    /// Set while a signaling WS connection is live (updated by the signaling
-    /// loop's per-connection guard). `peers()` reports none when this is false,
-    /// since the overlay carriers are torn down on WS drop and the last view is
-    /// stale.
+    /// Set while the PRIMARY's signaling WS connection is live (updated by the
+    /// signaling loop's per-connection guard). While it is false, `peers()`
+    /// still lists what the primary's mesh holds, marked as last known (#4367):
+    /// the overlay runtime outlives the socket and its carriers keep running,
+    /// so only a runtime that ended (the `runtime_alive` probe) lists none.
     connected: Arc<AtomicBool>,
     /// The overlay runtime's latest view. An empty `Default` when overlay is
     /// disabled or this build lacks `overlay-l3` (nothing publishes) — so
     /// `peers()` is simply empty there.
     overlay: watch::Receiver<OverlayView>,
+    /// #4367 — does a tenant's overlay runtime still run? `peers()` asks it for
+    /// an org whose control socket is down, because a runtime's view keeps its
+    /// last list after the runtime ends. The daemon's composition passes
+    /// `overlay::runtime_alive` ([`Self::for_daemon`]); test states built with
+    /// the test-only `DaemonState::new` answer yes.
+    runtime_alive: RuntimeAlive,
     /// The SAME consent broker the signaling loop prompts on (injected from
     /// `run_cmd`) — so `consent_decide` gates on the LIVE pending set and reads
     /// the broker's own sentinel dir, rather than a throwaway broker over a
@@ -194,6 +201,11 @@ pub struct DaemonState {
     /// loop through its `ViewerIndicator`. `None` in tests and in any daemon
     /// shape that never runs signalling.
     rc_sessions: Option<crate::rc_sessions::RcSessionRegistry>,
+    /// FR-151 — the newest ask for an update this daemon recorded (an
+    /// operator's push, or its person's own ask), which `live_work` answers
+    /// as an age. The process's book ([`crate::updater::ask_book`]), which the
+    /// trigger forwarder writes.
+    asks: Arc<crate::updater::AskBook>,
     /// The netstack ICMP backend for the `ping` verb. `None` on a node not
     /// running the userspace stack (OS-TUN or non-overlay build).
     pinger: Option<Arc<dyn NetstackPinger>>,
@@ -537,10 +549,20 @@ pub struct OrgRuntime {
     /// FR-103 — the enrollment's LIVE token slot (shared with its loop), so
     /// `OrgStatus.token_expires_at` moves the moment a renewal lands.
     pub token: crate::token_slot::TokenSlot,
+    /// #4367 — Unix ms when this org's control socket was last lost (0 =
+    /// never): the SAME clock its loop's connected guard stamps
+    /// (`signaling::OrgCtx::control_lost_at_ms`). `peers()` puts it on the
+    /// mark of each peer it lists for this org while `connected` is false.
+    pub control_lost_at_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Shared registry of [`OrgRuntime`] rows (primary first).
 pub type OrgStatusRegistry = Arc<Mutex<Vec<OrgRuntime>>>;
+
+/// #4367 — the daemon's answer to "does this tenant's overlay runtime still
+/// run?" (`overlay::runtime_alive` in an overlay build). See
+/// [`DaemonState::for_daemon`].
+pub type RuntimeAlive = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Multi-org — one SECONDARY org's live overlay view, labelled.
 ///
@@ -557,8 +579,16 @@ impl DaemonState {
     /// [`DaemonMode::Service`]; the reach-only user-mode daemon arrives with the
     /// binary unification at P3). The account it runs as is read here, not
     /// passed in: see [`process_is_privileged`].
+    ///
+    /// #4367 — `runtime_alive` answers, for a tenant, whether its overlay
+    /// runtime still runs: `overlay::runtime_alive` in an overlay build, and
+    /// `|_| false` in one without the overlay, where nothing is held. `peers()`
+    /// asks it before it lists what an org's mesh holds while that org's
+    /// control socket is down. `DaemonState::new` is test-only, so a
+    /// production build that composes a state without this answer does not
+    /// compile.
     #[allow(clippy::too_many_arguments)] // a daemon-state constructor; grouping would obscure
-    pub fn new(
+    pub fn for_daemon(
         node_id: String,
         name: String,
         mode: DaemonMode,
@@ -569,6 +599,7 @@ impl DaemonState {
         pinger: Option<Arc<dyn NetstackPinger>>,
         tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
         rtt_cache: RttCache,
+        runtime_alive: RuntimeAlive,
     ) -> Self {
         let privileged = process_is_privileged();
         // #3967 — which half of a Mac this process is, from the process
@@ -584,8 +615,10 @@ impl DaemonState {
             tenant_id,
             connected,
             overlay,
+            runtime_alive,
             consent,
             rc_sessions: None,
+            asks: crate::updater::ask_book(),
             pinger,
             tunnel_hub,
             rtt_cache,
@@ -607,6 +640,39 @@ impl DaemonState {
             started_at_ms: unix_now_ms(),
             keep_busy_worker: None,
         }
+    }
+
+    /// The test states' constructor: [`Self::for_daemon`] with a probe that
+    /// says every tenant's overlay runtime runs. Test-only on purpose (#4367):
+    /// the daemon's composition has to say how to tell a live data plane from
+    /// a dead one.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)] // mirrors `for_daemon`
+    pub fn new(
+        node_id: String,
+        name: String,
+        mode: DaemonMode,
+        tenant_id: Option<String>,
+        connected: Arc<AtomicBool>,
+        overlay: watch::Receiver<OverlayView>,
+        consent: crate::consent::ConsentBroker,
+        pinger: Option<Arc<dyn NetstackPinger>>,
+        tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
+        rtt_cache: RttCache,
+    ) -> Self {
+        Self::for_daemon(
+            node_id,
+            name,
+            mode,
+            tenant_id,
+            connected,
+            overlay,
+            consent,
+            pinger,
+            tunnel_hub,
+            rtt_cache,
+            Arc::new(|_: &str| true),
+        )
     }
 
     /// FR-92 — answer the keep-busy verbs from the attached GUI worker of a
@@ -731,6 +797,20 @@ impl DaemonState {
     /// list and a `false` disconnect, which is the honest answer there.
     pub fn with_rc_sessions(mut self, sessions: crate::rc_sessions::RcSessionRegistry) -> Self {
         self.rc_sessions = Some(sessions);
+        self
+    }
+
+    /// FR-151 — a book of asks of the test's own, in place of the process's.
+    #[cfg(test)]
+    pub(crate) fn with_ask_book(mut self, asks: Arc<crate::updater::AskBook>) -> Self {
+        self.asks = asks;
+        self
+    }
+
+    /// FR-151 — as if this daemon ran as root (or not), for a test.
+    #[cfg(test)]
+    pub(crate) fn with_privileged(mut self, privileged: bool) -> Self {
+        self.privileged = privileged;
         self
     }
 
@@ -1078,38 +1158,110 @@ impl LocalApiState for DaemonState {
         Some(crate::encode::caps::summarize_cached())
     }
 
-    fn peers(&self) -> Vec<PeerInfo> {
-        // A peer list from a dropped connection is misleading — the carriers are
-        // gone. Report none until reconnected + re-synced.
-        if !self.connected.load(Ordering::Relaxed) {
-            return Vec::new();
+    fn live_work(&self) -> Option<tunnel_core::localapi::LiveWorkInfo> {
+        // FR-151 — what an install that restarts this daemon would cut, as
+        // its own update gate reads it (`busy::now`), and the newest ask it
+        // recorded. A shape without signalling has no session registry, and
+        // so no sessions: its other work is still counted.
+        let busy = match &self.rc_sessions {
+            Some(sessions) => crate::busy::now(sessions),
+            None => crate::busy::now(&crate::rc_sessions::RcSessionRegistry::new()),
+        };
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Some(tunnel_core::localapi::LiveWorkInfo {
+            rc_sessions: count(busy.rc_sessions),
+            ssh_connections: count(busy.ssh_connections),
+            exec_runs: count(busy.exec_runs),
+            work: count(busy.work),
+            net_transition: busy.net_transition,
+            ask_age_secs: self.asks.age_secs(std::time::SystemTime::now()),
+        })
+    }
+
+    fn ask_for_update(&self) -> Result<(), String> {
+        // FR-151 — only the person's own daemon records the person's ask: a
+        // root daemon's record lets an update install over everything, so a
+        // root daemon's record is only ever an operator's push.
+        if self.privileged {
+            return Err(
+                "this daemon runs as root and records no person's ask for an \
+                        update; ask the daemon of your own account"
+                    .into(),
+            );
         }
-        let mut peers = self.overlay.borrow().peers.clone();
+        self.asks.record(crate::updater::AskedBy::Person);
+        Ok(())
+    }
+
+    fn peers(&self) -> Vec<PeerInfo> {
+        // #4367 — each org's list is decided by ITS OWN control socket
+        // ([`Listing`]). The overlay runtime outlives the socket (rc.307): while
+        // a socket is down, its org's mesh keeps carrying sessions, so the list
+        // is what that mesh still holds, each peer marked as last known. Only
+        // an org that ended, or whose runtime is gone, lists none. This used to
+        // return nothing whenever the PRIMARY's socket was down, which hid
+        // every org's peers through the primary's outage and listed a
+        // secondary's as live through its own.
+        //
+        // The rows are copied out before any view is read, and the views are
+        // borrowed one at a time (#2551: never two `borrow()`s at once).
+        let gates: Option<Vec<OrgGate>> = self.orgs.as_ref().map(|o| {
+            o.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(OrgGate::of)
+                .collect()
+        });
+        let primary_gate = gates
+            .as_ref()
+            .and_then(|rows| rows.iter().find(|g| g.primary));
+        // The primary row shares this flag; a test state may have no rows.
+        let primary_connected = self.connected.load(Ordering::Acquire);
+        let primary = Listing::of(
+            primary_connected,
+            primary_gate.map_or(0, |g| g.lost_at_ms.load(Ordering::Relaxed)),
+            primary_gate.is_some_and(|g| g.ended),
+            || (self.runtime_alive)(self.tenant_id.as_deref().unwrap_or("")),
+        );
+        let primary_view = self.overlay.borrow().peers.clone();
+        let mut peers = primary.apply(primary_view);
         // Multi-org — append every SECONDARY org's mesh, labelled. Each org
         // runs its own overlay engine with a DISJOINT peer set and address
         // space, so without the label a merged list is ambiguous (the same
         // host can appear once per shared org under different overlay IPs).
         // Only stamp when there IS more than one org, so a single-org daemon's
         // output stays byte-identical.
-        if let Some(views) = &self.org_views
-            && let Ok(views) = views.lock()
-            && !views.is_empty()
-        {
-            let primary_label = self
-                .orgs
-                .as_ref()
-                .and_then(|o| o.lock().ok())
-                .and_then(|rows| rows.iter().find(|r| r.primary).map(|r| r.label.clone()))
-                .unwrap_or_else(|| "primary".to_string());
-            for p in &mut peers {
-                p.org = primary_label.clone();
-            }
-            for (label, rx) in views.iter() {
-                let mut org_peers = rx.borrow().peers.clone();
-                for p in &mut org_peers {
-                    p.org = label.clone();
+        if let Some(views) = &self.org_views {
+            let views = views.lock().unwrap_or_else(|e| e.into_inner());
+            if !views.is_empty() {
+                let primary_label =
+                    primary_gate.map_or_else(|| "primary".to_string(), |g| g.label.clone());
+                for p in &mut peers {
+                    p.org = primary_label.clone();
                 }
-                peers.extend(org_peers);
+                for (label, rx) in views.iter() {
+                    let listing = match &gates {
+                        // The org's own row decides. A view whose org has no
+                        // row any more belongs to an org that is gone.
+                        Some(gates) => gates
+                            .iter()
+                            .rev()
+                            .find(|g| !g.primary && g.label == *label)
+                            .map_or(Listing::Nothing, |g| g.listing(&self.runtime_alive)),
+                        // A test state with no rows: the primary's socket
+                        // decides for every org, as it did before #4367.
+                        None => primary,
+                    };
+                    if listing == Listing::Nothing {
+                        continue;
+                    }
+                    let org_view = rx.borrow().peers.clone();
+                    let mut org_peers = listing.apply(org_view);
+                    for p in &mut org_peers {
+                        p.org = label.clone();
+                    }
+                    peers.extend(org_peers);
+                }
             }
         }
         // P3b-3: overlay a peer as `Tunnel` when its WG carrier is down and the
@@ -2300,7 +2452,7 @@ impl LocalApiState for DaemonState {
     ///   * both copies must parse and carry the SAME `agent_id` (a different
     ///     id = a second enrollment — refused, an operator must decide),
     ///   * the stale copy is renamed aside (`config.toml.stale-<ts>`), never
-    ///     deleted.
+    ///     deleted, its `.prev` with it ([`set_aside`], #4176).
     async fn config_cleanup_stale(&self) -> Response {
         let Some((live_path, lock)) = self.config_persist.as_ref() else {
             return Response::Error {
@@ -2364,9 +2516,8 @@ impl LocalApiState for DaemonState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let archived = stale_path.with_extension(format!("toml.stale-{ts}"));
-        match std::fs::rename(&stale_path, &archived) {
-            Ok(()) => {
+        match set_aside(&stale_path, ts) {
+            Ok(archived) => {
                 tracing::info!(
                     stale = %stale_path.display(),
                     archived = %archived.display(),
@@ -2385,6 +2536,114 @@ impl LocalApiState for DaemonState {
                 message: format!("archiving {} failed: {e}", stale_path.display()),
             },
         }
+    }
+}
+
+/// S1b — set the stale config at `stale` aside as `config.toml.stale-<ts>`.
+/// #4176 — its last good copy (`.prev`) first, as `config.toml.prev.stale-<ts>`:
+/// a start restores a missing config from that copy, so a copy left beside it
+/// would bring back the config this sets aside. A copy that cannot be moved
+/// moves nothing; with no copy, the config alone.
+fn set_aside(stale: &std::path::Path, ts: u64) -> std::io::Result<std::path::PathBuf> {
+    let copy = crate::config::prev_path(stale);
+    match std::fs::rename(&copy, copy.with_extension(format!("prev.stale-{ts}"))) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let archived = stale.with_extension(format!("toml.stale-{ts}"));
+    std::fs::rename(stale, &archived)?;
+    Ok(archived)
+}
+
+/// #4367 — how one org's peers are listed, decided from that org's own control
+/// socket: live while it is up; kept and marked while it is down and the org's
+/// overlay runtime still runs (the runtime outlives the socket, and its
+/// carriers keep running through the outage); none when the org ended
+/// (disabled, or its loop stopped for good) or its runtime is gone, since a
+/// runtime's view keeps its last list after the runtime ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Listing {
+    Live,
+    Kept(ControlDown),
+    Nothing,
+}
+
+impl Listing {
+    /// `lost_at_ms` is read AFTER `connected` (see `ConnectedGuard`'s drop);
+    /// `runtime_alive` is asked only for a socket that is down.
+    fn of(
+        connected: bool,
+        lost_at_ms: u64,
+        ended: bool,
+        runtime_alive: impl FnOnce() -> bool,
+    ) -> Self {
+        if connected {
+            Self::Live
+        } else if ended || !runtime_alive() {
+            Self::Nothing
+        } else {
+            Self::Kept(ControlDown {
+                since_ms: (lost_at_ms != 0).then_some(lost_at_ms),
+            })
+        }
+    }
+
+    /// One org's view, listed as this says.
+    fn apply(self, mut peers: Vec<PeerInfo>) -> Vec<PeerInfo> {
+        match self {
+            Self::Live => {}
+            Self::Kept(mark) => {
+                for p in &mut peers {
+                    p.control_down = Some(mark);
+                }
+            }
+            Self::Nothing => peers.clear(),
+        }
+        peers
+    }
+}
+
+/// #4367 — what `peers()` needs from one [`OrgRuntime`] row, copied out so
+/// that no lock is held while the views are read.
+struct OrgGate {
+    label: String,
+    primary: bool,
+    tenant_id: String,
+    connected: Arc<AtomicBool>,
+    lost_at_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Disabled, or its loop stopped for good (`terminal_error`): the org's
+    /// server said a final goodbye (the device was removed there, or a policy
+    /// refused it), a duplicate-instance stop, or a config that failed to load.
+    ended: bool,
+}
+
+impl OrgGate {
+    fn of(row: &OrgRuntime) -> Self {
+        let ended = !row.enabled
+            || row
+                .terminal_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+        Self {
+            label: row.label.clone(),
+            primary: row.primary,
+            tenant_id: row.tenant_id.clone(),
+            connected: row.connected.clone(),
+            lost_at_ms: row.control_lost_at_ms.clone(),
+            ended,
+        }
+    }
+
+    fn listing(&self, runtime_alive: &RuntimeAlive) -> Listing {
+        let connected = self.connected.load(Ordering::Acquire);
+        Listing::of(
+            connected,
+            self.lost_at_ms.load(Ordering::Relaxed),
+            self.ended,
+            || runtime_alive(&self.tenant_id),
+        )
     }
 }
 
@@ -2500,15 +2759,54 @@ fn external_password_state(cfg: &crate::config::AgentConfig) -> ExternalPassword
     }
 }
 
-fn is_hex_object_id(s: &str) -> bool {
+/// A 24-hex ObjectId: the only shape a consent question's id takes. FR-149 —
+/// the session panel's ask and the worker's gate check it too.
+pub(crate) fn is_hex_object_id(s: &str) -> bool {
     s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tunnel_core::localapi::ConnectionType;
+
+    /// #4176 — the cleanup sets the stale config's last good copy (`.prev`)
+    /// aside with it, the copy first: a start restores a missing config from
+    /// its copy, and a copy left behind would bring back the config the
+    /// cleanup set aside. A copy that cannot be set aside moves nothing.
+    #[test]
+    fn the_cleanup_sets_the_last_good_copy_aside_with_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = dir.path().join("config.toml");
+        let copy = dir.path().join("config.toml.prev");
+        std::fs::write(&stale, "config").expect("the config");
+        std::fs::write(&copy, "copy").expect("its copy");
+        let archived = set_aside(&stale, 7).expect("set aside");
+        assert_eq!(archived, dir.path().join("config.toml.stale-7"));
+        assert!(!stale.exists() && !copy.exists(), "both set aside");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.prev.stale-7")).ok(),
+            Some("copy".to_string())
+        );
+
+        // No copy: the config alone.
+        std::fs::write(&stale, "config").expect("the config");
+        assert_eq!(
+            set_aside(&stale, 8).expect("set aside"),
+            dir.path().join("config.toml.stale-8")
+        );
+        assert!(!stale.exists());
+
+        // A copy that cannot take its new name: nothing moves.
+        std::fs::write(&stale, "config").expect("the config");
+        std::fs::write(&copy, "copy").expect("its copy");
+        let taken = dir.path().join("config.toml.prev.stale-9");
+        std::fs::create_dir(&taken).expect("a folder in the way");
+        std::fs::write(taken.join("x"), "x").expect("not empty");
+        assert!(set_aside(&stale, 9).is_err());
+        assert!(stale.exists() && copy.exists(), "nothing moved");
+    }
 
     /// P8-cosmetics — the locale-tolerant ping-output parse: English, German,
     /// sub-millisecond, and Linux fractional forms all yield the right integer;
@@ -2560,6 +2858,7 @@ mod tests {
                 why: None,
                 probes: Vec::new(),
                 debug: None,
+                control_down: None,
             }],
             exit_node: None,
             route_offer_withheld: None,
@@ -2999,8 +3298,65 @@ mod tests {
         )
     }
 
+    /// FR-151 D1 — `live_work` counts this daemon's own sessions and answers
+    /// the age of the newest ask it recorded: none recorded, no age; one that
+    /// reads as made later than now (the clock went back), no age either.
+    #[test]
+    fn live_work_counts_the_registry_and_the_ask() {
+        let sessions = crate::rc_sessions::RcSessionRegistry::new();
+        let (kill, _orders) = tokio::sync::mpsc::channel(1);
+        sessions.insert(
+            bson::oid::ObjectId::new(),
+            "viewer".into(),
+            "VIEW".into(),
+            String::new(),
+            kill,
+        );
+        let book = Arc::new(crate::updater::AskBook::default());
+        let st = half(consent_broker("fr151-d1"))
+            .with_rc_sessions(sessions)
+            .with_ask_book(book.clone());
+        let before = st.live_work().expect("the daemon reports live work");
+        assert_eq!(before.rc_sessions, 1);
+        assert_eq!(before.ask_age_secs, None);
+        let now = std::time::SystemTime::now();
+        book.record_at(
+            crate::updater::AskedBy::Operator { pin: None },
+            now - std::time::Duration::from_secs(30),
+        );
+        let after = st.live_work().expect("live work");
+        assert!(matches!(after.ask_age_secs, Some(30..=32)), "{after:?}");
+        book.record_at(
+            crate::updater::AskedBy::Person,
+            now + std::time::Duration::from_secs(600),
+        );
+        assert_eq!(st.live_work().expect("live work").ask_age_secs, None);
+    }
+
+    /// FR-151 D2 — a daemon that runs as root records no person's ask, so a
+    /// root daemon's record is only ever an operator's push; a person's own
+    /// daemon records it, and answers its age.
+    #[test]
+    fn a_root_daemon_records_no_persons_ask() {
+        let book = Arc::new(crate::updater::AskBook::default());
+        let root = half(consent_broker("fr151-d2r"))
+            .with_ask_book(book.clone())
+            .with_privileged(true);
+        assert!(root.ask_for_update().is_err());
+        assert_eq!(book.newest(), None, "nothing recorded");
+        let person = half(consent_broker("fr151-d2p"))
+            .with_ask_book(book.clone())
+            .with_privileged(false);
+        assert_eq!(person.ask_for_update(), Ok(()));
+        assert_eq!(
+            book.newest().map(|ask| ask.by),
+            Some(crate::updater::AskedBy::Person)
+        );
+        let age = person.live_work().expect("live work").ask_age_secs;
+        assert!(matches!(age, Some(0..=2)), "{age:?}");
+    }
     /// A question the companion is to show, on `broker`.
-    fn ask_on(
+    pub(crate) fn ask_on(
         broker: &crate::consent::ConsentBroker,
         id: &str,
         window: Duration,
@@ -3025,7 +3381,7 @@ mod tests {
     /// own, as the root daemon's is in root's home and the worker's in the
     /// person's: the root half behind its person socket for `person`, and the
     /// worker, with no enrollment unless `enrolled`, asking that socket.
-    fn one_row_mac(
+    pub(crate) fn one_row_mac(
         dirs: &tempfile::TempDir,
         window: Duration,
         enrolled: bool,
@@ -3099,6 +3455,90 @@ mod tests {
                 "{id}: a decided question is still listed"
             );
         }
+    }
+
+    /// FR-149 AC2 (D3) — a click on the screen worker's panel takes the
+    /// app's road: on a root daemon's question it goes to the root half,
+    /// whose person socket asks the seat again before its broker takes it
+    /// (`consent_decide_view`'s rule); on the worker's own question it stays
+    /// with the worker's broker; and after a question's window it is
+    /// refused. The click goes as the worker's signalling loop sends it: by
+    /// the road `consent_relay::panel_road` chooses (the registered road, or
+    /// the worker's own broker when it asks the question), through
+    /// `panel_answered`.
+    ///
+    /// Review F1 — a click the root half did not take tells the root daemon,
+    /// unasked, that the panel no longer shows the question (`not_up`,
+    /// `CLICK_NOT_TAKEN`); a click that was taken, or that the worker's own
+    /// broker decided, tells it nothing.
+    ///
+    /// Red before FR-149: the panel's click went to the worker's own broker
+    /// alone, which refused the root daemon's question as one it was not
+    /// asking. Red before the review's F1: a refused click told nobody.
+    #[tokio::test]
+    async fn a_session_panel_click_on_the_roots_question_takes_the_apps_road() {
+        use crate::indicator::session_panel::{CLICK_NOT_TAKEN, PanelState};
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let (root_broker, worker_broker, worker) = one_row_mac(&dirs, window, false);
+        async fn decided(
+            asking: impl std::future::Future<Output = crate::consent::Decision>,
+        ) -> crate::consent::Decision {
+            tokio::time::timeout(Duration::from_secs(3), asking)
+                .await
+                .expect("a question ends promptly")
+        }
+        /// A click on the worker's panel, and what the root daemon was told.
+        async fn click(
+            own: &crate::consent::ConsentBroker,
+            id: &str,
+            allow: bool,
+        ) -> (bool, Vec<PanelState>) {
+            let road = crate::consent_relay::panel_road(own, id);
+            let mut said = Vec::new();
+            let taken =
+                crate::consent_relay::panel_answered(own, road.as_deref(), id, allow, |state| {
+                    said.push(state);
+                    true
+                })
+                .await;
+            (taken, said)
+        }
+
+        crate::consent_relay::road_for_tests::with_the_road(worker.clone(), async {
+            // The root daemon's question, shown on the worker's panel.
+            let roots = "414900000000000000000b01";
+            let asking = ask_on(&root_broker, roots, window);
+            let (taken, said) = click(&worker_broker, roots, true).await;
+            assert!(taken, "the click on the root daemon's question was refused");
+            assert_eq!(said, Vec::new(), "a click that was taken");
+            assert_eq!(decided(asking).await, crate::consent::Decision::Granted);
+
+            // The worker's own question stays with the worker's broker.
+            let own = "414900000000000000000b02";
+            let asking = ask_on(&worker_broker, own, window);
+            assert!(crate::consent_relay::panel_road(&worker_broker, own).is_none());
+            let (taken, said) = click(&worker_broker, own, false).await;
+            assert!(taken);
+            assert_eq!(said, Vec::new(), "the worker's own question");
+            assert_eq!(decided(asking).await, crate::consent::Decision::Denied);
+
+            // After the window, a click counts for nothing, and the root
+            // daemon hears that the panel no longer shows the question.
+            let late = "414900000000000000000b03";
+            let asking = ask_on(&root_broker, late, Duration::from_millis(300));
+            assert_eq!(decided(asking).await, crate::consent::Decision::Timeout);
+            let (taken, said) = click(&worker_broker, late, true).await;
+            assert!(!taken, "a click after the window was taken");
+            assert_eq!(
+                said,
+                vec![PanelState::NotUp {
+                    why: CLICK_NOT_TAKEN.into()
+                }],
+                "the root daemon was not told that the panel no longer shows its question"
+            );
+        })
+        .await;
     }
 
     /// #3967 — a question `broker` asks of the companion, of `kind`: the root
@@ -4153,15 +4593,19 @@ mod tests {
         assert_eq!(s.overlay_ip.as_deref(), Some("100.64.0.2"));
         assert!(!s.connected);
 
-        // Peers hidden while disconnected…
-        assert!(st.peers().is_empty(), "no peers reported while WS is down");
+        // #4367 — the peer the mesh still holds is listed while the WS is
+        // down, marked as last known (no org rows here, so no loss time)…
+        let kept = st.peers();
+        assert_eq!(kept.len(), 1, "the mesh outlives the WS: {kept:?}");
+        assert_eq!(kept[0].control_down, Some(ControlDown { since_ms: None }));
 
-        // …shown once connected.
+        // …and live, unmarked, once connected.
         connected.store(true, Ordering::Relaxed);
         assert!(st.status().connected);
         let peers = st.peers();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].connection, ConnectionType::Relay);
+        assert_eq!(peers[0].control_down, None);
 
         // Flows are empty on the agent side in P1.
         assert!(st.flows().is_empty());
@@ -4207,6 +4651,308 @@ mod tests {
         assert_eq!(st.peers()[0].rtt_ms, None);
     }
 
+    /// #4367 — the control socket is down, and the mesh still holds this
+    /// device's peers: `peers` lists them. In the field read behind the issue,
+    /// two devices lost only their control socket for an hour, an SSH session
+    /// to each ran over the direct WireGuard path the whole time, and
+    /// `roomler peers` on each said `(no peers)`.
+    #[test]
+    fn peers_the_data_plane_holds_are_listed_while_the_control_socket_is_down() {
+        let mut held = view();
+        let mut direct = held.peers[0].clone();
+        direct.node_id = "n3".into();
+        direct.name = "peer-b".into();
+        direct.overlay_ip = Some("100.64.0.3".into());
+        direct.overlay_ip6 = Some("fd72:6f6f:6d6c::6440:3".into());
+        direct.connection = ConnectionType::Direct;
+        held.peers.push(direct);
+        let (_tx, rx) = watch::channel(held);
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            Some("tid".into()),
+            // The control socket is down.
+            Arc::new(AtomicBool::new(false)),
+            rx,
+            consent_broker("kept"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        );
+
+        let peers = st.peers();
+        assert_eq!(peers.len(), 2, "the mesh still holds both peers: {peers:?}");
+        assert_eq!(peers[0].connection, ConnectionType::Relay);
+        assert_eq!(peers[1].connection, ConnectionType::Direct);
+    }
+
+    /// #4367 — one org row, as `run_cmd` seeds it: its own connected flag and
+    /// the clock its loop's connected guard stamps.
+    fn org_row(
+        label: &str,
+        tenant: &str,
+        primary: bool,
+        connected: &Arc<AtomicBool>,
+        lost_at_ms: u64,
+    ) -> OrgRuntime {
+        OrgRuntime {
+            label: label.into(),
+            server_url: "https://example.invalid".into(),
+            tenant_id: tenant.into(),
+            agent_id: format!("agent-{label}"),
+            primary,
+            enabled: true,
+            connected: connected.clone(),
+            terminal_error: Arc::new(Mutex::new(None)),
+            updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overlay_mode: "tun",
+            token: crate::token_slot::TokenSlot::new("token"),
+            control_lost_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(lost_at_ms)),
+        }
+    }
+
+    /// A view holding one peer, told apart by `node`.
+    fn view_of(node: &str, ip: &str) -> OverlayView {
+        let mut v = view();
+        v.peers[0].node_id = node.into();
+        v.peers[0].name = format!("peer-{node}");
+        v.peers[0].overlay_ip = Some(ip.into());
+        v.peers[0].overlay_ip6 = None;
+        v
+    }
+
+    /// A daemon state for tenant `t0`, with the runtime probe the test gives.
+    fn probed_state(
+        tag: &str,
+        connected: &Arc<AtomicBool>,
+        primary_view: OverlayView,
+        runtime_alive: RuntimeAlive,
+    ) -> DaemonState {
+        let (_tx, rx) = watch::channel(primary_view);
+        DaemonState::for_daemon(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            Some("t0".into()),
+            connected.clone(),
+            rx,
+            consent_broker(tag),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+            runtime_alive,
+        )
+    }
+
+    /// Each listed peer's org and mark, in list order.
+    fn marks_of(st: &DaemonState) -> Vec<(String, Option<ControlDown>)> {
+        st.peers()
+            .into_iter()
+            .map(|p| (p.org, p.control_down))
+            .collect()
+    }
+
+    fn lost_at(ms: u64) -> Option<ControlDown> {
+        Some(ControlDown { since_ms: Some(ms) })
+    }
+
+    /// #4367 — a kept peer carries the time this device lost its control
+    /// socket (the primary row's clock), and is live and unmarked again once
+    /// the socket is back.
+    #[test]
+    fn a_kept_peer_carries_when_the_socket_was_lost_and_is_live_once_it_is_back() {
+        const LOST_AT: u64 = 1_764_000_000_000;
+        let connected = Arc::new(AtomicBool::new(false));
+        let st = probed_state("since", &connected, view(), Arc::new(|_: &str| true)).with_orgs(
+            Arc::new(Mutex::new(vec![org_row(
+                "primary", "t0", true, &connected, LOST_AT,
+            )])),
+        );
+
+        assert_eq!(
+            marks_of(&st),
+            vec![(String::new(), lost_at(LOST_AT))],
+            "kept, marked with the loss time; a single-org device's rows stay unlabelled"
+        );
+
+        connected.store(true, Ordering::Release);
+        assert_eq!(
+            marks_of(&st),
+            vec![(String::new(), None)],
+            "live again, no mark"
+        );
+    }
+
+    /// #4367 — what still lists none while the socket is down: an org whose
+    /// runtime is gone (it ended, or the overlay was turned off; its view
+    /// keeps the last list either way), and a daemon that has not joined since
+    /// its start (the view is empty). The probe is asked for this tenant.
+    #[test]
+    fn a_data_plane_that_is_gone_lists_none_while_the_socket_is_down() {
+        let connected = Arc::new(AtomicBool::new(false));
+
+        let gone = probed_state("gone", &connected, view(), Arc::new(|_: &str| false));
+        assert!(
+            gone.peers().is_empty(),
+            "the runtime is gone: its last list is not what the mesh holds"
+        );
+
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        let ours = probed_state(
+            "ours",
+            &connected,
+            view(),
+            Arc::new(move |t: &str| {
+                seen.lock().unwrap().push(t.to_string());
+                t == "t0"
+            }),
+        );
+        assert_eq!(ours.peers().len(), 1);
+        assert_eq!(*asked.lock().unwrap(), vec!["t0".to_string()]);
+
+        let unjoined = probed_state(
+            "unjoined",
+            &connected,
+            OverlayView::default(),
+            Arc::new(|_: &str| true),
+        );
+        assert!(
+            unjoined.peers().is_empty(),
+            "nothing joined since the start"
+        );
+
+        // Up: the live list, unmarked.
+        connected.store(true, Ordering::Release);
+        assert_eq!(marks_of(&ours), vec![(String::new(), None)]);
+    }
+
+    /// #4367 — an org that ended lists none while its socket is down: one
+    /// whose loop stopped for good (a final goodbye from that org's server)
+    /// and one that is disabled. A secondary whose socket is down and whose
+    /// runtime runs is kept and marked; the primary, up, is live.
+    #[test]
+    fn an_org_that_ended_lists_none_while_its_socket_is_down() {
+        let up = Arc::new(AtomicBool::new(true));
+        let down = Arc::new(AtomicBool::new(false));
+        let removed = org_row("removed", "t1", false, &down, 1);
+        *removed.terminal_error.lock().unwrap() = Some("removed from the org".into());
+        let mut disabled = org_row("disabled", "t2", false, &down, 2);
+        disabled.enabled = false;
+        let kept = org_row("kept", "t3", false, &down, 3);
+        let rows = vec![
+            org_row("primary", "t0", true, &up, 0),
+            removed,
+            disabled,
+            kept,
+        ];
+        let views: Vec<(String, watch::Receiver<OverlayView>)> = ["removed", "disabled", "kept"]
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let (_tx, rx) = watch::channel(view_of(label, &format!("100.64.1.{i}")));
+                (label.to_string(), rx)
+            })
+            .collect();
+        let st = probed_state("ended", &up, view(), Arc::new(|_: &str| true))
+            .with_orgs(Arc::new(Mutex::new(rows)))
+            .with_org_views(Arc::new(Mutex::new(views)));
+
+        assert_eq!(
+            marks_of(&st),
+            vec![
+                ("primary".to_string(), None),
+                ("kept".to_string(), lost_at(3))
+            ]
+        );
+    }
+
+    /// #4367 — a view whose org has no row any more (the org is gone) lists
+    /// none, whatever the primary's socket says.
+    #[test]
+    fn a_view_whose_org_has_no_row_lists_none() {
+        let up = Arc::new(AtomicBool::new(true));
+        let (_tx, rx) = watch::channel(view_of("ghost", "100.64.1.9"));
+        let st = probed_state("ghost", &up, view(), Arc::new(|_: &str| true))
+            .with_orgs(Arc::new(Mutex::new(vec![org_row(
+                "primary", "t0", true, &up, 0,
+            )])))
+            .with_org_views(Arc::new(Mutex::new(vec![("ghost".to_string(), rx)])));
+
+        assert_eq!(marks_of(&st), vec![("primary".to_string(), None)]);
+    }
+
+    /// #4367 — each org is listed by its OWN control socket. Three orgs, each
+    /// socket down in turn: only that org's peers are marked, with that org's
+    /// own loss time. An org whose runtime is gone lists none. Before, the
+    /// primary's socket alone decided: down, it hid every org; up, it listed
+    /// a secondary whose own socket was down as live.
+    #[test]
+    fn each_org_is_listed_and_marked_by_its_own_control_socket() {
+        let labels = ["primary", "acme", "beta"];
+        let flags: Vec<Arc<AtomicBool>> = labels
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(true)))
+            .collect();
+        let rows: Vec<OrgRuntime> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| org_row(label, &format!("t{i}"), i == 0, &flags[i], 1_000 + i as u64))
+            .collect();
+        let views: Vec<(String, watch::Receiver<OverlayView>)> = labels[1..]
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let (_tx, rx) = watch::channel(view_of(label, &format!("100.64.{}.1", i + 1)));
+                (label.to_string(), rx)
+            })
+            .collect();
+        let dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let probe_dead = dead.clone();
+        let st = probed_state(
+            "three",
+            &flags[0],
+            view_of("primary", "100.64.0.1"),
+            Arc::new(move |t: &str| probe_dead.lock().unwrap().as_deref() != Some(t)),
+        )
+        .with_orgs(Arc::new(Mutex::new(rows)))
+        .with_org_views(Arc::new(Mutex::new(views)));
+        let live = |label: &str| -> (String, Option<ControlDown>) { (label.to_string(), None) };
+
+        assert_eq!(
+            marks_of(&st),
+            vec![live("primary"), live("acme"), live("beta")],
+            "every socket up"
+        );
+
+        for (i, label) in labels.iter().enumerate() {
+            flags[i].store(false, Ordering::Release);
+            let want: Vec<_> = labels
+                .iter()
+                .enumerate()
+                .map(|(j, l)| {
+                    if j == i {
+                        (l.to_string(), lost_at(1_000 + j as u64))
+                    } else {
+                        live(l)
+                    }
+                })
+                .collect();
+            assert_eq!(marks_of(&st), want, "{label}'s socket down");
+            flags[i].store(true, Ordering::Release);
+        }
+
+        // A socket down and its runtime gone: that org lists none.
+        flags[1].store(false, Ordering::Release);
+        *dead.lock().unwrap() = Some("t1".into());
+        assert_eq!(marks_of(&st), vec![live("primary"), live("beta")]);
+        flags[1].store(true, Ordering::Release);
+        flags[0].store(false, Ordering::Release);
+        *dead.lock().unwrap() = Some("t0".into());
+        assert_eq!(marks_of(&st), vec![live("acme"), live("beta")]);
+    }
+
     #[test]
     fn tunnel_override_only_fills_carrier_gaps_and_respects_precedence() {
         fn peer(agent: Option<&str>, conn: ConnectionType) -> PeerInfo {
@@ -4231,6 +4977,7 @@ mod tests {
                 why: None,
                 probes: Vec::new(),
                 debug: None,
+                control_down: None,
             }
         }
         let tunneled: HashSet<String> = ["aid-1".to_string()].into_iter().collect();

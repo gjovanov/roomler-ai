@@ -21,6 +21,8 @@ describe('FR-67 P7 — updateRefusal', () => {
     expect(refusalShort('primary_org')).toContain('another organization')
     expect(refusalShort('auto_update_off')).toContain('auto-update is off')
     expect(refusalShort('pin_downgrade')).toContain('downgrade')
+    // #3565: a pin to a row with no reported version is refused unless it is forced.
+    expect(refusalShort('version_unreported')).toBe('it has not reported its version yet')
     expect(refusalShort(undefined)).toBe('refused')
   })
 })

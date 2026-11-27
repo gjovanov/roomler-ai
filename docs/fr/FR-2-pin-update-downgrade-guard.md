@@ -2,6 +2,8 @@
 
 > **CLOSED 2026-08-27** — issue #770 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
+**Anchors:** master `367820a58` (closed 2026-08-27): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** gjovanov/roomler-ai — `FR-2: pin-update downgrade guard` (filed with this doc)
 **Status:** implemented, pending field verification
 
@@ -40,7 +42,7 @@ server, where it cannot be skipped by a stale script.
     (`#[serde(default)]` — additive; existing callers unchanged).
   - New `release_ord(&str) -> Option<(u64,u64,u64,u64)>`: the same ordering
     tuple as the agent updater's `parse_version`
-    (`agents/roomlerd/src/updater.rs:258-296`) — `rc.N` ranks `N`, finals
+    (`agents/roomlerd/src/updater.rs:258-296`) — `rc.N` ranks `N`, finals (2026-08-28)
     rank `u64::MAX`, so `0.3.0-rc.482 < 0.4.0 < 0.4.1`. Tags and bare semvers
     both parse; unparseable → `None`.
   - New `pin_downgrade(pin, agent_version) -> Option<String>`: `Some(reason)`
@@ -77,8 +79,8 @@ forced push, so there is nothing operational to disable.
 - [x] Field: a stale pin against a live 0.4.x agent answers 409 in prod; a
       current pin still delivers. **Met 2026-08-27** (the log below): a stale pin against
       CORPLAP-2, online on 0.4.4, answered 409 with no device side effect. The box was
-      left open when the issue closed. Read again 2026-11-03: the guard is on master at
-      both entry points (`crates/modules/fleet/src/agent.rs:1770`, `:1896`).
+      left open when the issue closed. Read again (2026-11-03): the guard is on master at
+      both entry points (`crates/modules/fleet/src/agent.rs:1488`, `:1614`).
 
 ## Open decisions
 

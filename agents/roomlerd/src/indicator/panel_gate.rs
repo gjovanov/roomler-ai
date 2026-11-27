@@ -57,11 +57,13 @@
 //! which a fast user switch away and back leaves alive, so the connection
 //! alone decides for it.
 //!
-//! ⚠️ This `false` is not a refusal. It is the answer a panel already showing
-//! another question gives, and it takes the same road: the caller marks the
-//! question for the person's app (`PromptSurface::Companion`) and, on a
-//! one-row Mac, the app gets it over the root daemon's relay (#3864, #3967).
-//! Never turn it into a deny or an accept.
+//! ⚠️ This `false` is not a refusal. It takes the road of a panel already
+//! showing another question: the caller marks the question for the person's
+//! app (`PromptSurface::Companion`) and, on a one-row Mac, the app gets it
+//! over the root daemon's relay (#3864, #3967). Never turn it into a deny or
+//! an accept. #4164 — it is no panel here, though, never a busy one
+//! ([`reaches_the_screen`]): if nothing else shows the question, the caller's
+//! words say the panel was busy only for a panel that showed another.
 //!
 //! The operator's ruling on #4053 keeps it there: after a reboot or a log-out
 //! every question goes to the app until the root daemon's next start, and
@@ -455,11 +457,98 @@ fn say_the_seat(was: u32, now: Seat) {
     );
 }
 
+/// FR-149 P1 (C2) — where the AppKit main loop stands, for the panel
+/// ([`super::mac`]): `main` promised it (`mac::promise_main_loop`, before it
+/// starts the daemon's thread and hands its own to AppKit), and it pumps
+/// (`run_main_loop`, once its first reads are made).
+///
+/// P0 read the gap on 0.4.228: a panel was built only once the loop pumped,
+/// and the daemon's signalling loop, on its own thread, could build it first.
+/// That refusal was kept for the process's life, so a screen worker whose
+/// loop started late showed no question at all. Now the promise builds the
+/// panel, and the loop's first pass opens it: a question before that goes to
+/// the person's app, and none after it does for this reason. Nothing waits
+/// for the loop, and nothing polls it: each question reads the flags once.
+#[derive(Debug, Default)]
+pub(crate) struct MainLoop {
+    promised: AtomicBool,
+    pumping: AtomicBool,
+}
+
+impl MainLoop {
+    pub(crate) const fn new() -> Self {
+        Self {
+            promised: AtomicBool::new(false),
+            pumping: AtomicBool::new(false),
+        }
+    }
+
+    /// `main` will hand the main thread to AppKit.
+    pub(crate) fn promise(&self) {
+        self.promised.store(true, Ordering::SeqCst);
+    }
+
+    /// The loop pumps: its first reads are made.
+    pub(crate) fn pumps(&self) {
+        self.pumping.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a panel can be built now: the loop pumps, or `main` promised
+    /// it. Neither in a process that never hands its main thread over (a CLI
+    /// call, a test), which keeps the refusal it always had.
+    pub(crate) fn builds_a_panel(&self) -> bool {
+        self.promised.load(Ordering::SeqCst) || self.pumping.load(Ordering::SeqCst)
+    }
+
+    /// Whether the panel takes a question now: only while the loop pumps,
+    /// since a question parked before then would wait for a pass that has
+    /// not come. Read at each question, never kept.
+    pub(crate) fn takes_a_question(&self) -> bool {
+        self.pumping.load(Ordering::SeqCst)
+    }
+}
+
+/// #4164 — whether the macOS panel reaches the screen for a question now:
+/// the main loop takes one ([`MainLoop::takes_a_question`]), and then the
+/// gate lets it through (`shows`, [`PanelGate::verdict`], read only then: its
+/// connection read waits for a main thread that a loop not pumping never
+/// runs). What `mac`'s panel asks first, with its slot unlocked
+/// (`indicator::panel_takes`): `false` is no panel here, never a busy one.
+pub(crate) fn reaches_the_screen(main_loop: &MainLoop, shows: impl FnOnce() -> bool) -> bool {
+    main_loop.takes_a_question() && shows()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::peer::files_log_tests::Logged;
     use std::cell::Cell;
+
+    /// FR-149 P1 (C2) — a panel built after `main`'s promise and before the
+    /// loop pumps takes no question until the loop's first pass, and every
+    /// question from then on: the refusal does not outlive the loop's start.
+    /// Without the promise (a CLI call, a test) no panel is built, as before.
+    #[test]
+    fn a_panel_built_before_the_main_loop_pumps_takes_questions_once_it_does() {
+        let early = MainLoop::new();
+        assert!(!early.builds_a_panel(), "no promise, no loop: no panel");
+        early.promise();
+        assert!(early.builds_a_panel(), "the promise builds the panel");
+        assert!(
+            !early.takes_a_question(),
+            "before the loop pumps, a question goes to the app"
+        );
+        early.pumps();
+        for question in 0..3 {
+            assert!(
+                early.takes_a_question(),
+                "question {question} after the loop's start"
+            );
+        }
+        let unpromised = MainLoop::new();
+        unpromised.pumps();
+        assert!(unpromised.builds_a_panel() && unpromised.takes_a_question());
+    }
 
     /// The two reads, stood in: what each answers now, and how often each
     /// was made.
@@ -906,14 +995,14 @@ mod tests {
     /// cannot reach the screen takes the road of one it does not take
     /// because another question is up. Each caller marks it for the person's
     /// app (`surface: if native { Native } else { Companion }`: remote
-    /// control at `signaling.rs:4373`, exec at `:5898`, SSH at `ssh.rs:2484`,
-    /// a recording at `recording/remote.rs:1559`), and on a one-row Mac the
+    /// control at `signaling.rs:4408`, exec at `:5943`, SSH at `ssh.rs:2668`,
+    /// a recording at `recording/remote.rs:1562`), and on a one-row Mac the
     /// app reads the root daemon's questions over the root daemon's relay
     /// (#3864). Here the root daemon's own LocalAPI answers the relay, so a
     /// `false` from each of the gate's verdicts is followed, beside a taken
     /// panel's, from the marker to the person's list and back: it is listed
     /// with a surface the app shows (every one but `native`,
-    /// `agents/roomler-desktop/src/main.rs:410`), and the person's answer
+    /// `agents/roomler-desktop/src/main.rs:414`), and the person's answer
     /// there decides it, an approval and a denial alike. Nothing denies it
     /// and nothing grants it on its own. The control: a question the panel
     /// takes is listed `native`, which the app leaves to the panel.
@@ -971,8 +1060,8 @@ mod tests {
         left.seat_looked(Seat::Person(501));
         left.seat_looked(Seat::Nobody);
         let no_answer = StoodIn::new(Connection::NotKnown, SESSION);
-        // `Inner::prompt`'s own answer for a panel already showing a
-        // question (`mac.rs`): the road every one below must take.
+        // `native` for `Inner::prompt`'s answer to a panel already showing a
+        // question (`mac.rs`, #4164's busy): the road every one below takes.
         let taken = false;
         let cases = [
             (
@@ -1086,5 +1175,96 @@ mod tests {
             .find(|q| q.session_id == session)
             .expect("listed");
         assert_eq!(question.surface, "native");
+    }
+
+    /// #4164 — what the macOS panel's refusal says, read as `mac.rs` reads it
+    /// ([`reaches_the_screen`] through `indicator::panel_takes`, with the
+    /// panel's slot stood in): a second question while one is up is busy,
+    /// and the first stays; no loop pumping, a connection refused at the
+    /// start and one lost later are no panel, whatever the slot holds; and
+    /// the screen is read with the slot unlocked, and not at all while no
+    /// loop pumps.
+    ///
+    /// Red before #4164: every refusal was `false`, and the caller read a
+    /// busy panel as no panel at all ("no one at its screen").
+    #[test]
+    fn the_macos_panel_says_busy_only_for_a_question_it_shows() {
+        use crate::indicator::{NotShown, PromptView, panel_takes};
+        use std::time::{Duration, Instant};
+        let question = |id: &str| PromptView {
+            session_hex: id.into(),
+            title: "Command execution request".into(),
+            lead: "Alice wants to run a command on this device.".into(),
+            detail: "uptime".into(),
+            permissions: String::new(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        };
+        let slot: Mutex<Option<PromptView>> = Mutex::new(None);
+        let take = |main_loop: &MainLoop, gate: &PanelGate, screen: &StoodIn, id: &str| {
+            panel_takes(
+                || {
+                    assert!(
+                        slot.try_lock().is_ok(),
+                        "the screen read under the slot's lock"
+                    );
+                    reaches_the_screen(main_loop, || gate.verdict(screen).shows())
+                },
+                &slot,
+                question(id),
+            )
+        };
+        let held = || slot.lock().unwrap().as_ref().map(|v| v.session_hex.clone());
+
+        let main_loop = MainLoop::new();
+        main_loop.promise();
+        let screen = StoodIn::new(WORKS, SESSION);
+        let gate = PanelGate::new(WORKS, SESSION);
+        assert_eq!(
+            take(&main_loop, &gate, &screen, "a"),
+            Err(NotShown::NoPanel),
+            "no loop pumps yet"
+        );
+        assert_eq!(
+            screen.reads(),
+            0,
+            "the screen read with no loop to answer it"
+        );
+        assert_eq!(held(), None);
+
+        main_loop.pumps();
+        assert_eq!(take(&main_loop, &gate, &screen, "a"), Ok(()));
+        assert_eq!(
+            take(&main_loop, &gate, &screen, "b"),
+            Err(NotShown::Busy),
+            "a second question while one is up"
+        );
+        assert_eq!(held().as_deref(), Some("a"), "the first question stays");
+
+        screen.connection.set(REFUSED);
+        assert_eq!(
+            take(&main_loop, &gate, &screen, "c"),
+            Err(NotShown::NoPanel),
+            "lost at a log-out, holding a question"
+        );
+        let refused = PanelGate::new(REFUSED, SESSION);
+        let works = StoodIn::new(WORKS, SESSION);
+        assert_eq!(
+            take(&main_loop, &refused, &works, "d"),
+            Err(NotShown::NoPanel),
+            "refused at the start, holding a question"
+        );
+        *slot.lock().unwrap() = None;
+        assert_eq!(
+            take(&main_loop, &refused, &works, "e"),
+            Err(NotShown::NoPanel),
+            "refused at the start, nothing held"
+        );
+        assert_eq!(held(), None, "no panel takes nothing");
+        assert_eq!(
+            take(&main_loop, &PanelGate::new(WORKS, SESSION), &works, "f"),
+            Ok(()),
+            "a free panel that reaches the screen"
+        );
     }
 }

@@ -268,7 +268,7 @@ pub async fn dispatch_controller_rc(
     };
     // …and so does the cross-pod relay, for the same reason.
     let relay_tenant_name = tenant_name;
-    let dispatched = hub.dispatch(&ctx, parsed);
+    let dispatched = crate::relay::dispatch(state, &ctx, parsed, text, connection_id).await;
     // FR-115 P3b — a slot the hub did not take (it refused, or coalesced the
     // request into a session that already exists) goes back now.
     if let Some(lease) = &slot {
@@ -407,16 +407,16 @@ pub async fn dispatch_controller_rc(
             let _ = controller_tx.try_send(ServerMsg::Error {
                 session_id: None,
                 code: "agent_on_other_pod".to_string(),
-                message: "agent is homed on another pod; re-dial and retry".to_string(),
+                message: "device is homed on another pod; re-dial and retry".to_string(),
                 open_nonce: None,
             });
             return true;
         }
-        // PR-2: a session-scoped frame (answer / ice / terminate) whose
-        // session lives on another pod - this conn relayed its create
-        // there. Forward it: the owner holding the session dispatches;
-        // an owner that lost it answers session_not_found, which is the
-        // honest surface either way.
+        // PR-2: a session-scoped frame (answer / ice) whose session lives
+        // on another pod - this conn relayed its create there. Forward it:
+        // the owner holding the session dispatches; an owner that lost it
+        // answers session_not_found, the honest surface either way. A
+        // hang-up never errs here: `crate::relay::dispatch` relays it.
         if matches!(
             &e,
             roomler_ai_remote_control::error::Error::SessionNotFound(_)

@@ -9,6 +9,8 @@ consent surfaces (FR-27) · **Split from:** [FR-93](FR-93-wayland-out-of-the-box
 day) · **Builds on:** [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-27](FR-27-consent-surfaces-and-desktop-companion.md)
 (the companion and the prompt-surface chain), FR-93 P2b (the hello's desktop brief, to measure who this serves)
 
+**Anchors:** master `698bc3c83` (closed 2026-10-18): this spec is the record of the work, and its line anchors read at that commit.
+
 ## 1. Goal
 
 A **system** (root) install on a GNOME or KDE Wayland desktop shows the real desktop to an authorised controller
@@ -33,13 +35,13 @@ Where an indicator exists today, by install:
 
 | host | "being viewed" banner + Disconnect | source |
 |---|---|---|
-| Debian family, x86_64, system | ✅ the companion (FR-27 P11) | the companion ships as **one x86_64 `.deb`** (`release-agent.yml:917`) |
-| any non-Debian (Fedora, Arch, openSUSE), system | ❌ none | `install.sh` skips it: "no dpkg here, the desktop companion ships as a .deb only" (`scripts/install.sh:657`, at master `88897bff6`) |
-| aarch64, any distro | ❌ none | no `.deb` for the arch (`scripts/install.sh:664`, at master `88897bff6`) |
+| Debian family, x86_64, system | ✅ the companion (FR-27 P11) | the companion ships as **one x86_64 `.deb`** (`release-agent.yml:871`) |
+| any non-Debian (Fedora, Arch, openSUSE), system | ❌ none | `install.sh` skips it: "no dpkg here, the desktop companion ships as a .deb only" (`scripts/install.sh:621`, at master `88897bff6`) |
+| aarch64, any distro | ❌ none | no `.deb` for the arch (`scripts/install.sh:628`, at master `88897bff6`) |
 | the greeter and the lock screen, anywhere | ❌ none | FR-93 D1b (`FR-93-wayland-out-of-the-box.md:559`), deferred |
 
 A root daemon whose prompt has nowhere to show already says so: `no_prompt_surface`
-(`agents/roomlerd/src/signaling.rs:234`, `companion.rs:224`). That is the hook this FR uses.
+(`agents/roomlerd/src/signaling.rs:234`, `companion.rs:174`). That is the hook this FR uses.
 
 ## 3. Key design
 
@@ -57,7 +59,7 @@ flowchart TD
 ```
 
 1. **Default-on where the person can see it, not per distro.** The root branch of `capture::wayland_plan`
-   (`agents/roomlerd/src/capture/mod.rs:1039`, `root` ⇒ `AsConfigured`) gains a third answer. If FR-27's chain
+   (`agents/roomlerd/src/capture/mod.rs:740`, `root` ⇒ `AsConfigured`) gains a third answer. If FR-27's chain
    finds a surface for the session a controller would see, DRM + uinput switch themselves on, the way the keys
    would. If not, nothing changes. A Debian x86_64 host then goes default-on the day this ships, and every other
    host the day it gets a surface.

@@ -36,6 +36,15 @@
 # daemon's answer, and under every shell those calls must equal the mode's
 # record in install-sh-output-check.calls, beside this script: a command the
 # script adds or drops shows there.
+# #3931 — the script is one function, main, which its last line alone calls,
+# and whose first statement gives the shell /dev/null as stdin: a check reads
+# that shape from the text. In every mode one case makes every call of every
+# stand-in read its stdin first, and under dash a second one does so with the
+# script padded so that one of dash's 8 KiB reads of the pipe ends inside the
+# main block: the script runs to its last line, with the mode's calls. And a
+# script cut off after each line of the main block, after sampled lines above
+# it and after each byte of its last line runs nothing: no stand-in records a
+# call. Each cut's exit code is printed.
 #
 # What it cannot show: a real package install, systemd, launchd, a real feed,
 # Apple's /bin/sh, and BSD grep, sed and tr (the Mac cases run Debian's GNU
@@ -205,6 +214,8 @@ case "$me" in
     uname | hostname | mktemp | stat | sleep) ;; # answers, not actions
     *) printf '%s\n' "$line" >>"$C/calls.log" ;;
 esac
+# #3931 — a case can make every call of every stand-in read its stdin first.
+if [ -f "$C/stdin.all" ]; then cat >/dev/null; fi
 # #3925 — a case can make one call read its stdin first, as a binary could: the
 # call of this name whose line holds the words in stdin.<name>.
 if [ -f "$C/stdin.$me" ]; then
@@ -297,6 +308,9 @@ for t in curl sudo systemctl installer launchctl uname hostname stat mktemp slee
     ln -sf "$S/standin" "$BIN/$t"
 done
 for t in dpkg apt-get; do ln -sf "$S/standin" "$DPKG/$t"; done
+# FR-141 P2 — `install`, which places a one-row Mac's root config: recorded and
+# never run, so the record holds the mode and the owner it places it with.
+ln -sf "$S/standin" "$BIN/install"
 # The daemon where the script runs it: the .deb's path, and the macOS bundle's.
 ln -sf "$S/standin" /usr/bin/roomlerd
 mkdir -p /Library/Roomler/roomlerd.app/Contents/MacOS
@@ -308,6 +322,9 @@ PID=..$S/running
 # What a privileged half takes with --config-from: the config its caller
 # enrolled in its own process (the stand-in daemon never reads it).
 printf 'agent_id = "check-agent"\n' >"$S/enrolled.toml"
+# FR-141 P2 — the same enrollment as HAS_CONFIG's earlier install: a Retry of
+# the wizard's one-row half finds its own config in place.
+printf 'agent_id = "check-earlier"\n' >"$S/earlier.toml"
 
 # The feed: compact JSON as the server writes it, newest release first. Every
 # asset is the same small file, so the digest checks out, and an asset's URL
@@ -379,9 +396,13 @@ SH=""
 # its stdin first. READS='<stand-in> <words>' makes that stand-in read its
 # stdin first in the call whose line holds the words; FAILS, in the same
 # form, makes it exit 1 in that call. HAS_CONFIG=1 puts an
-# earlier install's config at /etc/roomler/config.toml, HAS_PLIST=1 the root
+# earlier install's config at /etc/roomler/config.toml, ONE_ROW_CONFIG=1 a
+# one-row Mac's there instead (the same agent_id, both one-row switches on),
+# HAS_PLIST=1 the root
 # half's LaunchDaemon where the package puts it, and AS_ROOT=1 runs the script
-# as root, as a privileged half runs. The records land in $RUNS/$SH/CASE.
+# as root, as a privileged half runs. READS_ALL=1 makes every call of every
+# stand-in read its stdin first, and SCRIPT=<file> pipes that file in place of
+# the script (#3931). The records land in $RUNS/$SH/CASE.
 run() {
     CASE=$1 os=$2 arch=$3 debian=$4 feedname=$5 answer=$6 answer_rc=$7
     shift 7
@@ -390,6 +411,11 @@ run() {
     if [ "${HAS_CONFIG:-0}" = 1 ]; then
         mkdir -p /etc/roomler
         printf 'agent_id = "check-earlier"\n' >/etc/roomler/config.toml
+    fi
+    if [ "${ONE_ROW_CONFIG:-0}" = 1 ]; then
+        mkdir -p /etc/roomler
+        printf 'agent_id = "check-earlier"\nmacos_supervise_gui_worker = true\nmacos_one_row = true\n' \
+            >/etc/roomler/config.toml
     fi
     if [ "${HAS_PLIST:-0}" = 1 ]; then
         mkdir -p /Library/LaunchDaemons
@@ -411,6 +437,7 @@ run() {
     [ -z "${CLI_READS_STDIN:-}" ] || printf '%s\n' "$CLI_READS_STDIN" >"$C/cli.reads-stdin"
     [ -z "${READS:-}" ] || printf '%s' "${READS#* }" >"$C/stdin.${READS%% *}"
     [ -z "${FAILS:-}" ] || printf '%s' "${FAILS#* }" >"$C/fails.${FAILS%% *}"
+    [ "${READS_ALL:-0}" = 0 ] || : >"$C/stdin.all"
     : >"$C/calls.log"
     : >"$C/curl.log"
     : >"$C/roomlerd.log"
@@ -426,7 +453,7 @@ run() {
     who=tester uid=1000 home=/home/tester
     [ "${AS_ROOT:-0}" = 0 ] || who=root uid=0 home=/root
     set +e
-    cat /src/install.sh 2>/dev/null | setpriv --reuid=$uid --regid=$uid --clear-groups \
+    cat "${SCRIPT:-/src/install.sh}" 2>/dev/null | setpriv --reuid=$uid --regid=$uid --clear-groups \
         env -i HOME=$home USER=$who LOGNAME=$who LANG=C.UTF-8 PATH="$path" \
         "${shell[@]}" -s -- --server https://roomler.example "$@" >"$C/out.txt" 2>&1
     echo "${PIPESTATUS[1]}" >"$C/rc"
@@ -438,9 +465,10 @@ lines() {
     got=$(grep -cF -- "$1" "$C/out.txt" || true)
     [ "$got" = "$2" ] || WHY="$WHY"$'\n'"    $got line(s) carry '$1', want $2"
 }
+# WANT_RC=<n> before done_case is the exit code the case wants (0 otherwise).
 done_case() {
     rc=$(cat "$C/rc")
-    [ "$rc" = 0 ] || WHY="$WHY"$'\n'"    exit code $rc, want 0"
+    [ "$rc" = "${WANT_RC:-0}" ] || WHY="$WHY"$'\n'"    exit code $rc, want ${WANT_RC:-0}"
     # Text, newline and tab only, on stdout and stderr alike: an ESC or any
     # other control byte there is what the alphabet is for. Bytes from 0x80
     # up stay allowed, as the script's own UTF-8 text.
@@ -464,6 +492,125 @@ same() { want "==> the running daemon (pid $PID) already runs $1: nothing to res
 self() { want "==> the running daemon (pid $PID) restarts onto $1 by itself, once nothing it serves would be cut"; }
 restart() {
     want "==> restarting the running daemon (pid $PID): it runs $1, which cannot restart onto a new binary by itself (a remote or SSH session to this device drops for a few seconds)"
+}
+
+# #3931 — the script's shape, read from its text: one function, main, opened
+# below nothing but comments and blank lines, whose first statement gives the
+# shell /dev/null as stdin and whose last statement is exit; the line before
+# the last closes it, and the last line, the only call, is `main "$@"` with
+# nothing after its newline. So the shell has read all of the script before
+# the first command runs, and no line after the call is ever run.
+WHY=""
+open=$(grep -n -m1 '^main() {' /src/install.sh | cut -d: -f1 || true)
+if [ -z "$open" ]; then
+    WHY="$WHY"$'\n'"    no line opens the function: main() {"
+else
+    [ "$(grep -c '^main() {' /src/install.sh)" = 1 ] || WHY="$WHY"$'\n'"    main() { opens more than once"
+    above=$(head -n $((open - 1)) /src/install.sh | grep -cv '^#\|^[[:space:]]*$' || true)
+    [ "$above" = 0 ] || WHY="$WHY"$'\n'"    $above line(s) above main() { are neither comment nor blank: they run before the script is read"
+    # The first statement, on the opening line after the brace or on the first
+    # line after it that is neither comment nor blank.
+    first=$(sed -n "${open}p" /src/install.sh | sed 's/^main() {[[:space:]]*//; s/^#.*//')
+    [ -n "$first" ] || first=$(tail -n +$((open + 1)) /src/install.sh | grep -v '^#\|^[[:space:]]*$' | head -n 1 || true)
+    case "$first" in
+        'exec </dev/null'*) ;;
+        *) WHY="$WHY"$'\n'"    main's first statement is not exec </dev/null: $first" ;;
+    esac
+fi
+[ "$(tail -c 1 /src/install.sh | od -An -tx1 | tr -d ' ')" = 0a ] ||
+    WHY="$WHY"$'\n'"    the script does not end with the newline of its last line"
+[ "$(tail -n 1 /src/install.sh)" = 'main "$@"' ] ||
+    WHY="$WHY"$'\n'"    the last line is not main \"\$@\": $(tail -n 1 /src/install.sh)"
+[ "$(tail -n 2 /src/install.sh | head -n 1)" = '}' ] ||
+    WHY="$WHY"$'\n'"    the line before the last does not close main: $(tail -n 2 /src/install.sh | head -n 1)"
+calls=$(grep -cE '^[[:space:]]*main([[:space:]]|;|$)' /src/install.sh || true)
+[ "$calls" = 1 ] || WHY="$WHY"$'\n'"    $calls line(s) call main, want 1, the last"
+last_statement=$(head -n -2 /src/install.sh | grep -v '^[[:space:]]*#\|^[[:space:]]*$' | tail -n 1 || true)
+[ "$last_statement" = exit ] ||
+    WHY="$WHY"$'\n'"    main's last statement is not exit: $last_statement"
+TOTAL=$((TOTAL + 1))
+if [ -z "$WHY" ]; then
+    echo "PASS the script is one function, opened at line $open below comments alone, stdin /dev/null first, exit last, and its last line alone calls it"
+else
+    FAILED=$((FAILED + 1))
+    echo "FAIL the script is not one function that its last line alone calls:$WHY"
+fi
+
+# #3931 — the script padded so that one of dash's reads of the pipe ends inside
+# its main block. Dash reads a pipe 8192 bytes at a time, so a command there
+# that reads its stdin would eat what lies past that read. The padding is
+# comment lines after the first line, and it puts a multiple of 8192 bytes
+# halfway between the main block's heading and the end.
+pad_lines() { # N >= 2: comment lines of N bytes in all, none over 80
+    local n=$1 l
+    while [ "$n" -gt 0 ]; do
+        l=$n
+        [ "$l" -le 80 ] || l=80
+        [ $((n - l)) != 1 ] || l=$((l - 1))
+        printf '#%*s\n' $((l - 2)) '' | tr ' ' p
+        n=$((n - l))
+    done
+}
+main_at=$(LC_ALL=C grep -b -m1 '^# ─── main ─' /src/install.sh | cut -d: -f1)
+size=$(wc -c </src/install.sh)
+mid=$(((main_at + size) / 2))
+pad=$(((8192 - mid % 8192) % 8192))
+[ "$pad" -ge 2 ] || pad=$((pad + 8192))
+PADDED=$S/install-padded.sh
+{ head -n 1 /src/install.sh; pad_lines "$pad"; tail -n +2 /src/install.sh; } >"$PADDED"
+echo "padded for dash: $pad bytes, the main block at bytes $((main_at + pad))-$((size + pad)), a read ending at $((mid + pad))"
+
+# #3931 — the script cut off: after every 97th line above its main block, after
+# each line of the main block, and after each byte of its last line but the
+# newline. `cut_off` (in the loop below) pipes each one in.
+CUTS=$S/cuts
+mkdir -p "$CUTS"
+nlines=$(wc -l </src/install.sh)
+main_line=$(grep -n -m1 '^# ─── main ─' /src/install.sh | cut -d: -f1)
+for k in $(seq 1 97 $((main_line - 1))) $(seq "$main_line" $((nlines - 1))); do
+    head -n "$k" /src/install.sh >"$CUTS/$(printf 'line-%05d' "$k")"
+done
+last_line=$(tail -n 1 /src/install.sh)
+for b in $(seq 1 $((${#last_line} - 1))); do
+    { head -n $((nlines - 1)) /src/install.sh; printf '%s' "${last_line:0:b}"; } >"$CUTS/$(printf 'last-%03d' "$b")"
+done
+# cut_off MODE ARGS...: as run, each cut script in turn; none may record a call.
+cut_off() {
+    local m=$1 f k what n0 n1 n2 n127 nother
+    shift
+    n0=0 n1=0 n2=0 n127=0 nother=0
+    for f in "$CUTS"/*; do
+        SCRIPT=$f run "cut/$m" "$@"
+        rc=$(cat "$C/rc")
+        case "${f##*/}" in
+            line-*) k=$((10#${f##*/line-})); what="after line $k of $nlines ($(sed -n "${k}p" /src/install.sh | cut -c1-40))" ;;
+            last-*) what="inside the last line, after '$(cat "$f" | tail -n 1)'" ;;
+        esac
+        case "$rc" in 0) n0=$((n0 + 1)) ;; 1) n1=$((n1 + 1)) ;; 2) n2=$((n2 + 1)) ;; 127) n127=$((n127 + 1)) ;; *) nother=$((nother + 1)) ;; esac
+        TOTAL=$((TOTAL + 1))
+        ran=$(cat "$C/calls.log" "$C/curl.log" "$C/roomlerd.log" "$C/roomler.log")
+        if [ -z "$ran" ]; then
+            echo "PASS $SH cut $m $what: exit $rc, nothing ran"
+        else
+            FAILED=$((FAILED + 1))
+            echo "FAIL $SH cut $m $what: exit $rc, and it ran:"
+            printf '%s\n' "$ran" | sed 's/^/    | /'
+        fi
+    done
+    echo "cut $m under $SH: $(ls "$CUTS" | wc -l) cuts; exit 0 x$n0, 1 x$n1, 2 x$n2, 127 x$n127, other x$nother"
+}
+# every MODE ARGS...: as run, the case MODE/stdin-all, every call of every
+# stand-in reading its stdin first; under dash MODE/stdin-all-padded as well.
+every() {
+    local m=$1
+    shift
+    READS_ALL=1 run "$m/stdin-all" "$@"
+    want "==> done."
+    done_case
+    [ "$SH" = dash ] || return 0
+    READS_ALL=1 SCRIPT=$PADDED run "$m/stdin-all-padded" "$@"
+    want "==> done."
+    done_case
 }
 
 for SH in $SHELLS; do
@@ -617,6 +764,57 @@ for SH in $SHELLS; do
     AS_ROOT=1 HAS_CONFIG=1 READS='dpkg [-i]' \
         run deb-privileged/reads-stdin-dpkg Linux x86_64 1 normal "$new" 0 "${priv[@]}"
     says agent-v0.4.221 0.4.221 0; want "$fold"; want "==> done."; done_case
+    # FR-141 P2 — the setup wizard's one-row half, run as root: the root config
+    # the wizard enrolled placed before the one package run, no user half, and
+    # the package's install reading its stdin. A Retry finds its own config in
+    # place and keeps it. A root config that is another row's stops the half
+    # before any change, and names the person's command.
+    wiz=(--role daemon --privileged-steps --one-row --config-from "$S/enrolled.toml")
+    placed="==> placing the root config the wizard enrolled at /etc/roomler/config.toml (root-owned, 0600): this Mac's one row"
+    nouser="==> privileged steps done — a one-row Mac has no user half: its root service starts the screen worker"
+    AS_ROOT=1 run pkg-wizard-one-row/normal Darwin arm64 0 normal "$new" 0 "${wiz[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$placed"; want "$nouser"; want "==> done."; done_case
+    AS_ROOT=1 READS='installer [-pkg]' run pkg-wizard-one-row/reads-stdin Darwin arm64 0 normal "$new" 0 "${wiz[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$placed"; want "$nouser"; want "==> done."; done_case
+    AS_ROOT=1 HAS_CONFIG=1 run pkg-wizard-one-row-retry/normal Darwin arm64 0 normal "$new" 0 \
+        --role daemon --privileged-steps --one-row --config-from "$S/earlier.toml"
+    says agent-v0.4.221 0.4.221 0; lines "$placed" 0
+    want "==> the root config an earlier attempt placed is this one (/etc/roomler/config.toml): it stays"
+    want "$nouser"; want "==> done."; done_case
+    AS_ROOT=1 HAS_CONFIG=1 run pkg-wizard-one-row-own-row/normal Darwin arm64 0 normal "$new" 0 "${wiz[@]}"
+    lines "sudo roomlerd one-row" 1; lines "$placed" 0; lines "==> done." 0; WANT_RC=1 done_case
+    # FR-141 P2's follow-up — a root config that is one row already, under
+    # another enrollment (another org, or the terminal's one row), stops the
+    # half before any change too. The wizard words the line by its start.
+    AS_ROOT=1 ONE_ROW_CONFIG=1 run pkg-wizard-one-row-over-another/normal Darwin arm64 0 normal "$new" 0 "${wiz[@]}"
+    lines "error: this Mac is one row already (" 1; lines "$placed" 0; lines "==> done." 0; WANT_RC=1 done_case
+    # FR-141 P2 — the three flags the one-row half refuses, before anything is
+    # downloaded: no user half, no half without the config its caller enrolled,
+    # and nothing folded into that config.
+    run pkg-one-row-refused/user-half Darwin arm64 0 normal "$new" 0 --role daemon --user-steps --one-row
+    lines "error: a one-row Mac has no user half" 1; WANT_RC=1 done_case
+    run pkg-one-row-refused/no-config Darwin arm64 0 normal "$new" 0 --role daemon --privileged-steps --one-row
+    lines "error: --privileged-steps --one-row places the root config its caller enrolled" 1; WANT_RC=1 done_case
+    run pkg-one-row-refused/config-take Darwin arm64 0 normal "$new" 0 "${wiz[@]}" --config-take overlay_enabled
+    lines "error: --one-row places the root config whole and folds nothing into it" 1; WANT_RC=1 done_case
+    # FR-141 P2's follow-up (F1) — the wizard's two-row half (FR-129 B2) on a
+    # Mac whose root config is one row already: an attempt the wizard left
+    # half-placed, a one-row Mac whose daemon did not answer the wizard's guard
+    # in time, or one removed with --keep-config. Before it, the fold kept both
+    # switches and the package removed the per-user LaunchAgent the second row
+    # needs. It stops before the marker and the package run, changes nothing,
+    # and names the roads that finish or remove such a Mac. Beside it, the same
+    # half over a two-row root config folds the new enrollment in, as before.
+    b2=(--role daemon --privileged-steps --config-from "$S/enrolled.toml")
+    req="==> requesting the privileged half (root LaunchDaemon — the overlay needs root)"
+    AS_ROOT=1 HAS_CONFIG=1 HAS_PLIST=1 run pkg-wizard-two-rows/normal Darwin arm64 0 normal "$new" 0 "${b2[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$req"; want "$fold"; want "==> done."; done_case
+    AS_ROOT=1 ONE_ROW_CONFIG=1 HAS_PLIST=1 run pkg-wizard-two-rows-over-one-row/normal Darwin arm64 0 normal "$new" 0 "${b2[@]}"
+    lines "error: this Mac is one row already (" 1; lines "sh -s -- --role daemon --one-row" 1
+    lines "sh -s -- --uninstall" 1; lines "$req" 0; lines "$fold" 0; lines "==> done." 0
+    [ ! -e /etc/roomler/enable-daemon ] || WHY="$WHY"$'\n'"    the marker was placed"
+    grep -qx 'macos_one_row = true' /etc/roomler/config.toml || WHY="$WHY"$'\n'"    root's config changed"
+    WANT_RC=1 done_case
     # #3925 — a Mac given its root half as a second row (--daemon-token): that
     # half's enrollment, through sudo, reads its stdin.
     two=(--role daemon --token check-token --daemon-token check-token-2)
@@ -669,6 +867,28 @@ for SH in $SHELLS; do
     READS='roomler [enroll]' run tunnel-enroll/reads-stdin Linux x86_64 1 normal '' 0 --role tunnel --token check-token
     lines "$R" 0; lines "$V" 0; want "$tun"; want "==> done."; done_case
 
+    # #3931 — in every mode, every call of every stand-in reads its stdin first
+    # (under dash a second time, padded): the script runs to its last line, and
+    # the check below holds the calls to the mode's.
+    every deb-dl Linux x86_64 1 normal '' 0 "${dl[@]}"
+    every deb-fallback Linux x86_64 1 nodeb '' 0 "${dl[@]}"
+    every tgz-dl Linux x86_64 0 normal '' 0 "${dl[@]}"
+    every pkg-dl Darwin arm64 0 normal '' 0 "${dl[@]}"
+    every deb-system Linux x86_64 1 normal "$new" 0 "${sys[@]}"
+    FAILS='sudo [dpkg]' every deb-system-apt Linux x86_64 1 normal "$new" 0 "${sys[@]}"
+    every deb-user Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    every pkg Darwin arm64 0 normal "$new" 0 "${usr[@]}"
+    RUNNING=$new every deb-user-same Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    RUNNING=$old RUNNING_CAPS=$cap every deb-user-self Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    RUNNING=$old every deb-user-restart Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    AS_ROOT=1 HAS_CONFIG=1 every deb-privileged Linux x86_64 1 normal "$new" 0 "${priv[@]}"
+    HAS_PLIST=1 every pkg-two-row Darwin arm64 0 normal "$new" 0 "${two[@]}"
+    every pkg-one-row Darwin arm64 0 normal "$new" 0 "${one[@]}"
+    every tunnel-dl Linux x86_64 1 normal '' 0 --role tunnel --download-only
+    every tunnel Linux x86_64 1 normal '' 0 --role tunnel
+    FAILS='sudo [dpkg]' every tunnel-apt Linux x86_64 1 normal '' 0 --role tunnel
+    every tunnel-enroll Linux x86_64 1 normal '' 0 --role tunnel --token check-token
+
     # The same calls, byte for byte, in every case of a mode: neither the
     # feed's tag nor the daemon's answer changes what the script runs or how
     # it exits.
@@ -694,6 +914,11 @@ for SH in $SHELLS; do
             echo "FAIL $SH ${mode##*/}: the calls differ between cases:$WHY"
         fi
     done
+
+    # #3931 — a script cut off in transit runs nothing, in a Linux system
+    # install and in a Mac's per-user install: no stand-in records a call.
+    cut_off deb-system Linux x86_64 1 normal "$new" 0 "${sys[@]}"
+    cut_off pkg Darwin arm64 0 normal "$new" 0 "${usr[@]}"
 done
 
 # Every mode's calls as one record: its first case's (the check above holds

@@ -364,3 +364,71 @@ async fn exclusions_list_the_implicit_set_and_replace_the_explicit_one() {
     let set = ExclusionSet::load(&app.state.core).await.unwrap();
     assert!(set.explicit.is_empty());
 }
+
+/// #4254 — the exclusions PUT decides its gate before it reads its body at
+/// all: anyone but a platform operator, an org's owner included, gets the one
+/// 404 for a body that does not even parse, the answer a body the route reads
+/// gets, so the route stays unseen. While it took `Json<T>` as an extractor,
+/// axum answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone.
+#[tokio::test]
+async fn the_exclusions_gate_is_decided_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let operator = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+    })
+    .await;
+    let org = app.seed_tenant("excl-unparsed").await;
+    let write = GatedWrite {
+        method: "PUT",
+        path: "/api/admin/growth/exclusions".to_owned(),
+        reads: json!({ "exclusions": [] }),
+        refused_field: r#"{"exclusions": 7}"#,
+    };
+
+    let mut wrong = Vec::new();
+    for (who, token) in [
+        ("an org's owner", &org.admin.access_token),
+        ("a member", &org.member.access_token),
+    ] {
+        wrong.extend(gate_problems(&app, who, token, Gate::Unseen, &write).await);
+    }
+    assert_no_problems("answered before the gate", &wrong);
+}
+
+/// #4254's control. A platform operator is answered an exclusions body that
+/// does not parse exactly as axum's `Json` extractor answers it, the status
+/// and the plain-text words, and the explicit list stays empty.
+#[tokio::test]
+async fn an_operator_is_answered_an_exclusions_body_that_does_not_parse_as_the_json_extractor_answers_it()
+ {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_api::growth::exclusions::PutBody;
+
+    let operator = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+    })
+    .await;
+    let op = app
+        .state
+        .auth
+        .generate_tokens(operator, "padmin@test.io", "padmin")
+        .unwrap();
+
+    let wrong = holder_problems::<PutBody>(
+        &app,
+        &op.access_token,
+        "PUT",
+        "/api/admin/growth/exclusions",
+        r#"{"exclusions": 7}"#,
+    )
+    .await;
+    assert_no_problems("a platform operator", &wrong);
+    let set = ExclusionSet::load(&app.state.core).await.unwrap();
+    assert!(set.explicit.is_empty());
+}

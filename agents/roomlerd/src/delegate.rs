@@ -217,6 +217,38 @@ pub enum DelegateFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<String>,
     },
+    /// FR-149 P1 — daemon → worker: show this consent question of the root
+    /// daemon's on the person's panel. `id` is the question's 24-hex ObjectId;
+    /// the question carries the panel's text and the time left in
+    /// milliseconds. Sent only to a worker that said
+    /// [`crate::indicator::session_panel::CONSENT_PANEL`]. The answer is
+    /// [`DelegateFrame::PanelTold`] with the same `id`, from a show the worker
+    /// runs off its frame loop (`session_panel::Desk`): a panel whose main
+    /// thread stalls never stops the channel's other frames. Additive both ways: an
+    /// older worker never says the word, so it is never asked, and an older
+    /// daemon drops the word and never asks; a reader on either side skips a
+    /// frame it does not know (a debug line), as it always has.
+    PanelAsk {
+        id: String,
+        question: crate::indicator::session_panel::PanelQuestion,
+    },
+    /// FR-149 P1 — worker → daemon: what the panel did with question `id`:
+    /// `shown`, `busy`, or `not_up` with its reason. Read only on this
+    /// channel, whose attach proved the secret, and only while `id` is asked
+    /// ([`DelegateHost::ask_panel`]); a late `shown` gets a
+    /// [`DelegateFrame::PanelHide`]. Unasked, `not_up` says the panel no
+    /// longer shows a question it showed (a click the root half refused):
+    /// the daemon moves it to the person's app while its broker asks it and
+    /// it is on the panel's books, and drops the word otherwise. It routes a
+    /// question and never decides one: the panel's answer takes the app's
+    /// road (`consent_relay`).
+    PanelTold {
+        id: String,
+        state: crate::indicator::session_panel::PanelState,
+    },
+    /// FR-149 P1 — daemon → worker: take question `id` down (it was answered,
+    /// it ended, or its `shown` came after the wait).
+    PanelHide { id: String },
 }
 
 /// FR-138 P2b — the word a worker says in [`DelegateFrame::WorkerCaps`] when it
@@ -230,17 +262,28 @@ pub const KEEP_DELEGATED: &str = "keep-delegated";
 ///
 /// #3864 — `relays_consent`: a worker with no enrollment (a one-row Mac's)
 /// lists and decides the root half's consent questions for its person's app.
-pub fn worker_features(relays_consent: bool) -> Vec<String> {
+///
+/// FR-149 P1 — `hosts_panel`: such a worker, in a build with the macOS panel
+/// and with `ROOMLERD_SESSION_PANEL` on, shows the root daemon's questions on
+/// its panel ([`crate::indicator::session_panel::hosts_the_panel`]).
+pub fn worker_features(relays_consent: bool, hosts_panel: bool) -> Vec<String> {
     let mut words = vec![KEEP_DELEGATED.to_string()];
     if relays_consent {
         words.push(crate::consent_relay::RELAY_CONSENT.to_string());
+    }
+    if hosts_panel {
+        words.push(crate::indicator::session_panel::CONSENT_PANEL.to_string());
     }
     words
 }
 
 /// FR-138 P2b — the feature words the daemon knows. A word a worker gains is
 /// added here too, or the daemon never hears it.
-const WORKER_FEATURE_WORDS: [&str; 2] = [KEEP_DELEGATED, crate::consent_relay::RELAY_CONSENT];
+const WORKER_FEATURE_WORDS: [&str; 3] = [
+    KEEP_DELEGATED,
+    crate::consent_relay::RELAY_CONSENT,
+    crate::indicator::session_panel::CONSENT_PANEL,
+];
 
 /// FR-138 P2b — what the daemon keeps of its worker's feature words, as
 /// [`worker_words`] keeps its capability words (#3706): the words this build
@@ -1115,6 +1158,25 @@ struct Inner {
     /// FR-138 P2b (A9) — bumped each time a channel ends: a record made under
     /// an older one belongs to a worker that is gone, with its peers.
     generation: std::sync::atomic::AtomicU64,
+    /// FR-149 P1 — the panel questions put to the worker and not yet told
+    /// ([`DelegateHost::ask_panel`]), by id. Emptied when the channel ends,
+    /// which ends each wait at once.
+    panel_asks: Mutex<
+        std::collections::HashMap<
+            String,
+            tokio::sync::oneshot::Sender<crate::indicator::session_panel::PanelState>,
+        >,
+    >,
+    /// FR-149 P1 — the questions the worker said `shown` for within their
+    /// wait: what [`DelegateHost::hide_panel`] takes down, and what the
+    /// channel's end sends to the app (D4).
+    on_panel: Mutex<std::collections::HashSet<String>>,
+    /// FR-149 P1 — the broker whose markers the channel's end rewrites for the
+    /// app (D4). Set on a one-row Mac's root daemon.
+    consent: Mutex<Option<crate::consent::ConsentBroker>>,
+    /// FR-149 P1 — how many times a question moved to the person's app
+    /// started the app ([`DelegateHost::start_the_app`]).
+    app_starts: std::sync::atomic::AtomicUsize,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -1322,6 +1384,276 @@ impl DelegateHost {
 
     fn one_row(&self) -> bool {
         self.inner.one_row.load(Ordering::Acquire)
+    }
+
+    /// FR-149 P1 — whether this is a one-row Mac's root daemon, the one
+    /// daemon whose questions the session panel can show.
+    pub fn is_one_row(&self) -> bool {
+        self.one_row()
+    }
+
+    /// FR-149 P1 — the broker whose questions this host's worker shows: a
+    /// question on its panel when the channel ends is marked for the app, by
+    /// that broker's rewrite (D4).
+    pub fn set_consent_broker(&self, broker: crate::consent::ConsentBroker) {
+        *self.inner.consent.lock().expect("consent mutex") = Some(broker);
+    }
+
+    /// FR-149 P1 — whether the attached worker shows this daemon's questions
+    /// on its panel: it said [`crate::indicator::session_panel::CONSENT_PANEL`],
+    /// matched by equality, on the channel it holds now.
+    pub fn says_consent_panel(&self) -> bool {
+        self.inner
+            .worker_features
+            .lock()
+            .expect("worker features mutex")
+            .iter()
+            .any(|w| w == crate::indicator::session_panel::CONSENT_PANEL)
+    }
+
+    /// FR-149 P1 — ask the attached worker to show question `id` on its
+    /// panel, as [`Self::ask_worker_keep_busy`] asks: `NoAnswer` with no
+    /// worker, a full queue, a channel that ends under the question, or no
+    /// word within `wait`. A `shown` that comes after the wait is taken down
+    /// ([`Self::panel_told`]), so a panel this daemon did not count never
+    /// stays up.
+    pub async fn ask_panel(
+        &self,
+        id: &str,
+        question: crate::indicator::session_panel::PanelQuestion,
+        wait: std::time::Duration,
+    ) -> crate::indicator::session_panel::Asked {
+        use crate::indicator::session_panel::{Asked, PanelState};
+        let Some(tx) = self
+            .inner
+            .to_worker
+            .lock()
+            .expect("to_worker mutex")
+            .clone()
+        else {
+            return Asked::NoAnswer;
+        };
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+        self.inner
+            .panel_asks
+            .lock()
+            .expect("panel_asks mutex")
+            .insert(id.to_string(), answer_tx);
+        let frame = DelegateFrame::PanelAsk {
+            id: id.to_string(),
+            question,
+        };
+        let asked = if tx.try_send(frame).is_ok() {
+            match tokio::time::timeout(wait, answer_rx).await {
+                Ok(Ok(state)) => Asked::Told(state),
+                _ => Asked::NoAnswer,
+            }
+        } else {
+            Asked::NoAnswer
+        };
+        self.inner
+            .panel_asks
+            .lock()
+            .expect("panel_asks mutex")
+            .remove(id);
+        // A `shown` told just as the wait ran out was counted on the panel
+        // (`panel_told`) and never by this question: it comes down.
+        if !matches!(asked, Asked::Told(PanelState::Shown)) && self.off_the_panel(id) {
+            let _ = tx.try_send(DelegateFrame::PanelHide { id: id.to_string() });
+        }
+        asked
+    }
+
+    /// FR-149 P1 — the worker's word on question `id`. Counted only while the
+    /// question is asked; a late or unasked `shown` gets a `PanelHide`. An
+    /// unasked `not_up` is the worker saying that its panel no longer shows
+    /// the question ([`Self::panel_let_go`]).
+    fn panel_told(&self, id: String, state: crate::indicator::session_panel::PanelState) {
+        use crate::indicator::session_panel::PanelState;
+        let waiting = self
+            .inner
+            .panel_asks
+            .lock()
+            .expect("panel_asks mutex")
+            .remove(&id);
+        let shown = state == PanelState::Shown;
+        let not_up = match &state {
+            PanelState::NotUp { why } => Some(why.clone()),
+            _ => None,
+        };
+        if shown {
+            self.inner
+                .on_panel
+                .lock()
+                .expect("on_panel mutex")
+                .insert(id.clone());
+        }
+        let counted = waiting.is_some_and(|tx| tx.send(state).is_ok());
+        if !counted {
+            if shown && self.off_the_panel(&id) {
+                tracing::info!(
+                    %id,
+                    "consent panel: the screen worker showed a question after its wait; taking it \
+                     down (FR-149)"
+                );
+                self.send_panel_hide(&id);
+            } else if let Some(why) = not_up {
+                self.panel_let_go(&id, &why);
+            } else {
+                tracing::debug!(%id, "delegation: a panel answer nobody is waiting for");
+            }
+        }
+    }
+
+    /// FR-149 P1 — the worker says, unasked, that its panel no longer shows
+    /// question `id` (a click the root half refused: the panel took it down
+    /// before the answer was relayed). While this daemon's broker asks `id`
+    /// and `id` is on the panel's books, the question moves to the person's
+    /// app as D4 moves one whose channel ended ([`Self::to_the_app`]), and
+    /// leaves the books. Anything else is dropped. The word routes the
+    /// question and never decides, ends or extends it, and it is never put
+    /// back on the panel: the refusal may mean the question ended, was
+    /// answered elsewhere or the seat moved, which the broker knows.
+    fn panel_let_go(&self, id: &str, why: &str) {
+        let broker = self.inner.consent.lock().expect("consent mutex").clone();
+        if !broker.is_some_and(|b| b.is_asking(id)) {
+            tracing::debug!(%id, %why, "delegation: the panel let go of a question nobody asks");
+            return;
+        }
+        if !self.off_the_panel(id) {
+            tracing::debug!(%id, %why, "delegation: the panel let go of a question it did not show");
+            return;
+        }
+        let moved = self.to_the_app(id);
+        tracing::info!(
+            %id,
+            %why,
+            moved,
+            "consent panel: the screen worker's panel no longer shows the question; it goes to \
+             the person's app for the rest of its window (FR-149)"
+        );
+    }
+
+    /// FR-149 P1 — question `id` moves to the person's app for the rest of
+    /// its window: its marker says `companion`, its deadline kept, by the
+    /// broker's rewrite while it is asked (#4000's rewrite for a
+    /// notification), and the app is started ([`Self::start_the_app`]).
+    /// Whether the marker moved: `false` for a question that ended, or that
+    /// has no marker yet (its caller writes it, and reads the panel's books
+    /// after: `session_panel::write_marker`).
+    pub fn to_the_app(&self, id: &str) -> bool {
+        let broker = self.inner.consent.lock().expect("consent mutex").clone();
+        let moved = match broker.map(|b| b.to_the_companion_while_asking(id)) {
+            Some(Ok(moved)) => moved,
+            Some(Err(e)) => {
+                tracing::warn!(%id, %e, "consent panel: could not mark the question for the app");
+                false
+            }
+            None => false,
+        };
+        if moved {
+            self.start_the_app();
+        }
+        moved
+    }
+
+    /// FR-149 P1 — the person's app, started for a question moved to it, by
+    /// the start a question whose surface is the app makes from the outset
+    /// (`companion::start_for_prompt`, the remote-control prompt's): on a
+    /// task of its own, best-effort, with no lock held. A test counts it and
+    /// starts nothing: a test never starts the real app.
+    fn start_the_app(&self) {
+        self.inner.app_starts.fetch_add(1, Ordering::AcqRel);
+        // The start is detached: nobody reads its verdict, as the question's
+        // own window ends it either way.
+        #[cfg(not(test))]
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async {
+                drop(crate::companion::start_for_prompt().await);
+            });
+        }
+    }
+
+    /// FR-149 P1 — how many times a moved question started the app.
+    #[cfg(test)]
+    pub(crate) fn app_starts(&self) -> usize {
+        self.inner.app_starts.load(Ordering::Acquire)
+    }
+
+    /// Whether `id` was on the session panel, which it leaves now.
+    fn off_the_panel(&self, id: &str) -> bool {
+        self.inner
+            .on_panel
+            .lock()
+            .expect("on_panel mutex")
+            .remove(id)
+    }
+
+    fn send_panel_hide(&self, id: &str) {
+        let tx = self
+            .inner
+            .to_worker
+            .lock()
+            .expect("to_worker mutex")
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(DelegateFrame::PanelHide { id: id.to_string() });
+        }
+    }
+
+    /// FR-149 P1 — question `id` ended (answered, out of time, withdrawn): the
+    /// worker takes it down when it is on the session panel.
+    pub fn hide_panel(&self, id: &str) {
+        if self.off_the_panel(id) {
+            self.send_panel_hide(id);
+        }
+    }
+
+    /// FR-149 P1 — whether question `id` is on the session panel now.
+    pub fn on_the_panel(&self, id: &str) -> bool {
+        self.inner
+            .on_panel
+            .lock()
+            .expect("on_panel mutex")
+            .contains(id)
+    }
+
+    /// FR-149 P1 — whether any of this daemon's questions is on the session
+    /// panel now: the root daemon's own panel then takes none (at most one
+    /// panel on the screen).
+    pub fn panel_shows_one(&self) -> bool {
+        !self
+            .inner
+            .on_panel
+            .lock()
+            .expect("on_panel mutex")
+            .is_empty()
+    }
+
+    /// FR-149 P1, D4 — the channel ended: each question that was on the
+    /// session panel moves to the person's app for the rest of its window
+    /// ([`Self::to_the_app`]: the broker's rewrite of its marker while it is
+    /// asked, #4000's rewrite for a notification, and the app started). An
+    /// answer stays bound to its id, and once the prompt's look has decided a
+    /// question, a later one is refused.
+    fn panel_channel_ended(&self) {
+        let shown: Vec<String> = self
+            .inner
+            .on_panel
+            .lock()
+            .expect("on_panel mutex")
+            .drain()
+            .collect();
+        for id in shown {
+            let moved = self.to_the_app(&id);
+            tracing::info!(
+                %id,
+                moved,
+                "consent panel: the channel to the screen worker ended while its panel showed a \
+                 question; the question goes to the person's app for the rest of its window \
+                 (FR-149 D4)"
+            );
+        }
     }
 
     /// FR-43 P3b — the person's floor, for a session's `Request` arm to fold
@@ -1890,6 +2222,8 @@ impl DelegateHost {
                 Ok(DelegateFrame::WorkerLogs { lines }) => self.worker_logs(lines),
                 // FR-43 P3b — and its person's consent floor.
                 Ok(DelegateFrame::PersonFloor(floor)) => self.note_person_floor(floor),
+                // FR-149 P1 — what its panel did with a question of ours.
+                Ok(DelegateFrame::PanelTold { id, state }) => self.panel_told(id, state),
                 Ok(DelegateFrame::WorkerCaps { caps, features }) => {
                     // #3695 — only the words that are the worker's to say.
                     let caps = worker_words(*caps);
@@ -1919,7 +2253,9 @@ impl DelegateHost {
                     | DelegateFrame::Detached { .. }
                     | DelegateFrame::Resumed { .. }
                     | DelegateFrame::Close { .. }
-                    | DelegateFrame::Ended { .. },
+                    | DelegateFrame::Ended { .. }
+                    | DelegateFrame::PanelAsk { .. }
+                    | DelegateFrame::PanelHide { .. },
                 ) => {
                     // Daemon → worker only. A worker sending one is confused
                     // about which end it is.
@@ -1962,6 +2298,14 @@ impl DelegateHost {
             .lock()
             .expect("keep_busy_asks mutex")
             .clear();
+        // FR-149 P1 — its panel's questions too, and (D4) each one its panel
+        // showed goes to the person's app for the rest of its window.
+        self.inner
+            .panel_asks
+            .lock()
+            .expect("panel_asks mutex")
+            .clear();
+        self.panel_channel_ended();
     }
 
     /// FR-138 P2b — the channel to the worker ended, `cause` its why: what P2b
@@ -2046,6 +2390,26 @@ impl DelegateHost {
         *self.inner.worker_uid.lock().expect("worker uid mutex")
     }
 
+    /// FR-149 P1 — the attached worker as the session panel reads it
+    /// (`indicator::session_panel::TheRoad`): the account it was started for
+    /// ([`Self::worker_uid`]), and whether it said
+    /// [`crate::indicator::session_panel::CONSENT_PANEL`] on the channel it
+    /// holds now ([`Self::says_consent_panel`]).
+    ///
+    /// #4421 — `None` while no worker is attached. From a channel's end to the
+    /// next attach the account stays until a revoke (the app's road reads it),
+    /// and a question asked then is not asked for `no_worker`, not for an
+    /// attached worker's `no_word`. `attached` is read first: the word is said
+    /// only on an attached channel and cleared before `attached` is
+    /// ([`Self::serve`]), so with a worker attached this reads what it read
+    /// before.
+    pub fn panel_worker(&self) -> Option<(u32, bool)> {
+        if !self.inner.attached.load(Ordering::Acquire) {
+            return None;
+        }
+        Some((self.worker_uid()?, self.says_consent_panel()))
+    }
+
     /// FR-138 P2b — whether `session`'s params crossed `keepable`.
     pub(crate) fn is_keepable(&self, session: &str) -> bool {
         self.inner
@@ -2112,6 +2476,14 @@ impl DelegateHost {
     pub(crate) fn end_channel_for_test(&self) {
         self.channel_ended();
         self.records_channel_ended("closed");
+    }
+
+    /// #4421 — the account a worker is started for, noted as
+    /// [`Self::open_for`] notes it at each spawn, for a test (that one is
+    /// Unix's, and binds the worker's socket).
+    #[cfg(test)]
+    pub(crate) fn started_for_test(&self, uid: u32) {
+        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
     }
 
     /// #3992 — a worker's capabilities held as `serve` holds the ones its frame
@@ -2266,7 +2638,7 @@ pub(crate) fn secret_eq(expected: &str, offered: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::io::AsyncBufReadExt;
 
@@ -2879,7 +3251,7 @@ mod tests {
 
     /// Attach a fake worker and wait until the daemon's frame loop is up (its
     /// queue toward the worker exists only once it is): a ping answered.
-    async fn attached_worker(
+    pub(crate) async fn attached_worker(
         host: &DelegateHost,
     ) -> (
         tokio::task::JoinHandle<()>,
@@ -2902,7 +3274,7 @@ mod tests {
         (task, lines, cwr)
     }
 
-    async fn next_frame<R: tokio::io::AsyncBufRead + Unpin>(
+    pub(crate) async fn next_frame<R: tokio::io::AsyncBufRead + Unpin>(
         lines: &mut tokio::io::Lines<R>,
     ) -> DelegateFrame {
         let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
@@ -3173,7 +3545,7 @@ mod tests {
     #[tokio::test]
     async fn p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions() {
         assert!(
-            worker_features(false).contains(&KEEP_DELEGATED.to_string()),
+            worker_features(false, false).contains(&KEEP_DELEGATED.to_string()),
             "this build's worker says it"
         );
         assert!(
@@ -3235,11 +3607,11 @@ mod tests {
     async fn a_one_row_worker_says_relay_consent_and_the_daemon_keeps_it() {
         use crate::consent_relay::RELAY_CONSENT;
         assert!(
-            worker_features(true).contains(&RELAY_CONSENT.to_string()),
+            worker_features(true, false).contains(&RELAY_CONSENT.to_string()),
             "a worker with no enrollment says it"
         );
         assert!(
-            !worker_features(false).contains(&RELAY_CONSENT.to_string()),
+            !worker_features(false, false).contains(&RELAY_CONSENT.to_string()),
             "a worker with an enrollment does not"
         );
 
@@ -3247,15 +3619,15 @@ mod tests {
         assert!(!host.relays_consent(), "no worker");
         let (task, mut lines, mut cwr) = attached_worker(&host).await;
         for (features, relays, what) in [
-            (worker_features(true), true, "a one-row worker"),
-            (worker_features(false), false, "a two-row worker"),
+            (worker_features(true, false), true, "a one-row worker"),
+            (worker_features(false, false), false, "a two-row worker"),
             (Vec::new(), false, "an older worker"),
             (
                 vec!["relay-consent-v2".into(), "RELAY-CONSENT".into()],
                 false,
                 "a near miss",
             ),
-            (worker_features(true), true, "a one-row worker again"),
+            (worker_features(true, false), true, "a one-row worker again"),
         ] {
             let frame = DelegateFrame::WorkerCaps {
                 caps: Box::new(AgentCaps::default()),
@@ -3277,6 +3649,170 @@ mod tests {
         assert_eq!(host.worker_uid(), Some(501));
         host.revoke();
         assert_eq!(host.worker_uid(), None, "gone with the worker");
+    }
+
+    /// FR-149 P1 — `consent-panel` is kept by equality, and a near miss is
+    /// dropped; a worker that never said it holds no road to the panel, so
+    /// the root daemon never asks it (`session_panel::ask`: `no_word`).
+    #[tokio::test]
+    async fn the_panel_word_is_kept_by_equality() {
+        use crate::indicator::session_panel::CONSENT_PANEL;
+        assert!(worker_features(true, true).contains(&CONSENT_PANEL.to_string()));
+        assert!(!worker_features(true, false).contains(&CONSENT_PANEL.to_string()));
+        let host = DelegateHost::new();
+        assert!(!host.says_consent_panel(), "no worker");
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        for (features, says, what) in [
+            (
+                worker_features(true, true),
+                true,
+                "a worker that hosts the panel",
+            ),
+            (
+                worker_features(true, false),
+                false,
+                "a worker that does not",
+            ),
+            (Vec::new(), false, "an older worker"),
+            (
+                vec![
+                    "consent-panel-v2".into(),
+                    "CONSENT-PANEL".into(),
+                    "consent-pane".into(),
+                ],
+                false,
+                "a near miss",
+            ),
+        ] {
+            let frame = DelegateFrame::WorkerCaps {
+                caps: Box::new(AgentCaps::default()),
+                features,
+            };
+            write_frame(&mut cwr, &frame).await.unwrap();
+            cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+            assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+            assert_eq!(host.says_consent_panel(), says, "{what}");
+        }
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(!host.says_consent_panel(), "gone with its channel");
+    }
+
+    /// FR-149 P1 — a panel question's answer is read on the attached channel
+    /// only, for its own id, within its wait: a `PanelTold` with another id
+    /// is dropped, a `shown` after the wait is taken down (`PanelHide`), and
+    /// the channel's end ends a wait at once.
+    #[tokio::test]
+    async fn a_panel_question_is_read_on_the_attached_channel_only() {
+        use crate::indicator::session_panel::{Asked, PanelQuestion, PanelState};
+        use std::time::Duration;
+        let question = || PanelQuestion {
+            title: "Remote control request".into(),
+            lead: "Alice is requesting to control this device.".into(),
+            detail: String::new(),
+            permissions: "VIEW".into(),
+            org: String::new(),
+            left_ms: 30_000,
+        };
+        let (a, b, c, d) = (
+            "414900000000000000000a01",
+            "414900000000000000000a02",
+            "414900000000000000000a03",
+            "414900000000000000000a04",
+        );
+        let host = DelegateHost::new();
+        // No channel: nobody to ask, at once.
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            host.ask_panel(a, question(), Duration::from_secs(5)).await,
+            Asked::NoAnswer
+        );
+        assert!(t0.elapsed() < Duration::from_secs(1));
+
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        let h = host.clone();
+        let asked =
+            tokio::spawn(async move { h.ask_panel(a, question(), Duration::from_secs(5)).await });
+        match next_frame(&mut lines).await {
+            DelegateFrame::PanelAsk { id, question: q } => {
+                assert_eq!((id.as_str(), q.left_ms), (a, 30_000));
+            }
+            other => panic!("expected the question, got {other:?}"),
+        }
+        // Another id is dropped: no wait ends on it, and its `shown` comes down.
+        write_frame(
+            &mut cwr,
+            &DelegateFrame::PanelTold {
+                id: b.into(),
+                state: PanelState::Shown,
+            },
+        )
+        .await
+        .unwrap();
+        match next_frame(&mut lines).await {
+            DelegateFrame::PanelHide { id } => assert_eq!(id, b),
+            other => panic!("expected a take-down, got {other:?}"),
+        }
+        write_frame(
+            &mut cwr,
+            &DelegateFrame::PanelTold {
+                id: a.into(),
+                state: PanelState::Shown,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(asked.await.unwrap(), Asked::Told(PanelState::Shown));
+        assert!(host.on_the_panel(a), "counted on the panel");
+        host.hide_panel(a);
+        match next_frame(&mut lines).await {
+            DelegateFrame::PanelHide { id } => assert_eq!(id, a),
+            other => panic!("expected a take-down, got {other:?}"),
+        }
+        assert!(!host.on_the_panel(a));
+
+        // After its wait: no answer, and a late `shown` is taken down.
+        assert_eq!(
+            host.ask_panel(c, question(), Duration::from_millis(100))
+                .await,
+            Asked::NoAnswer
+        );
+        assert!(matches!(
+            next_frame(&mut lines).await,
+            DelegateFrame::PanelAsk { .. }
+        ));
+        write_frame(
+            &mut cwr,
+            &DelegateFrame::PanelTold {
+                id: c.into(),
+                state: PanelState::Shown,
+            },
+        )
+        .await
+        .unwrap();
+        match next_frame(&mut lines).await {
+            DelegateFrame::PanelHide { id } => assert_eq!(id, c),
+            other => panic!("expected a take-down, got {other:?}"),
+        }
+        assert!(!host.on_the_panel(c));
+
+        // The channel's end ends a wait at once.
+        let h = host.clone();
+        let t0 = std::time::Instant::now();
+        let asked =
+            tokio::spawn(async move { h.ask_panel(d, question(), Duration::from_secs(30)).await });
+        assert!(matches!(
+            next_frame(&mut lines).await,
+            DelegateFrame::PanelAsk { .. }
+        ));
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert_eq!(asked.await.unwrap(), Asked::NoAnswer);
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        // And with the channel gone, a `shown` can no longer arrive at all.
+        assert!(host.inner.panel_asks.lock().unwrap().is_empty());
     }
 
     /// FR-138 P2b (review HIGH-2) — the channel ends on an I/O error, its

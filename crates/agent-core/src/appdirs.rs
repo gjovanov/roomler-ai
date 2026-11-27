@@ -77,8 +77,9 @@ fn segment_of(
 /// #3802 — the agent's folders in one account's tree, as `ProjectDirs` names
 /// them: the config folder, the data folder and the local data folder.
 /// [`project_dirs`] returns this rather than a `ProjectDirs` because on macOS
-/// the tree hangs off the home the account database names ([`dirs_for`]), and
-/// a `ProjectDirs` takes its home from `$HOME` with no way to be given another.
+/// the tree hangs off the home the account database names, and for root on
+/// Linux off `/root` (#3866) ([`dirs_for`]), and a `ProjectDirs` takes its
+/// home from `$HOME` with no way to be given another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppDirs {
     config: PathBuf,
@@ -133,6 +134,195 @@ fn macos_dirs(app: &str, account_home: impl FnOnce() -> Option<PathBuf>) -> Opti
     })
 }
 
+/// #3866 — an account's own folders on Linux, as the XDG Base Directory
+/// specification names them: its home, its config, data, cache and state
+/// folders, and its runtime folder where it has one.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnFolders {
+    pub home: PathBuf,
+    pub config: PathBuf,
+    pub data: PathBuf,
+    pub cache: PathBuf,
+    pub state: PathBuf,
+    pub runtime: Option<PathBuf>,
+}
+
+/// Root's home on Linux: `/root`, the home systemd gives a service that runs
+/// with `User=root`.
+#[cfg(any(target_os = "linux", test))]
+const ROOT_HOME: &str = "/root";
+
+/// #3866 — the Linux rule, pure: the folders of the account `euid`, with
+/// `var` as the process's environment and `account_home` as the home the
+/// account database names for that account.
+///
+/// - Root (`euid` 0) reads no variable and asks the account database
+///   nothing. Its home is `/root`, as systemd gives it to a service with
+///   `User=root`, and each folder is the XDG default beneath it, with no
+///   runtime folder. So a root process uses root's own folders beneath
+///   `/root`, whatever `HOME` or `XDG_*` it was started with, and a daemon
+///   that systemd started as root keeps the folders it has always had.
+/// - Any other account resolves as `directories` resolves it: its home is
+///   `HOME` where that is not empty, else the account database's; each
+///   `XDG_*_HOME` and `XDG_RUNTIME_DIR` counts where it names an absolute
+///   folder, else the default beneath the home. `None` with neither home.
+///
+/// A folder counts as absolute by `Path::has_root`, which is
+/// `Path::is_absolute` on Linux; written so, the rule tests on every
+/// platform.
+#[cfg(any(target_os = "linux", test))]
+fn linux_folders(
+    euid: u32,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    account_home: impl FnOnce() -> Option<PathBuf>,
+) -> Option<OwnFolders> {
+    let root = euid == 0;
+    let home = if root {
+        PathBuf::from(ROOT_HOME)
+    } else {
+        var("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .or_else(account_home)?
+    };
+    let given = |name: &str| {
+        if root {
+            return None;
+        }
+        var(name)
+            .map(PathBuf::from)
+            .filter(|folder| folder.has_root())
+    };
+    Some(OwnFolders {
+        config: given("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config")),
+        data: given("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")),
+        cache: given("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache")),
+        state: given("XDG_STATE_HOME").unwrap_or_else(|| home.join(".local/state")),
+        runtime: given("XDG_RUNTIME_DIR"),
+        home,
+    })
+}
+
+/// #3866 — this process's own folders on Linux ([`linux_folders`]): its
+/// effective uid, its environment as it is at the call, and, for a process
+/// that is not root and has no `HOME`, the home the account database names
+/// for its account, read once per process.
+#[cfg(target_os = "linux")]
+pub fn own_folders() -> Option<OwnFolders> {
+    static ACCOUNT_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+    // SAFETY: `geteuid` is a thread-safe read of the caller's own credentials.
+    let euid = unsafe { libc::geteuid() };
+    linux_folders(
+        euid,
+        |name| std::env::var_os(name),
+        || ACCOUNT_HOME.get_or_init(own_home).clone(),
+    )
+}
+
+/// #3866 — the daemon's folders for segment `app` in an account's own
+/// folders on Linux (`own`), laid out as `ProjectDirs` lays them out there:
+/// the config folder, and the data folder, which is the local data folder
+/// too.
+#[cfg(any(target_os = "linux", test))]
+fn linux_dirs(app: &str, own: Option<OwnFolders>) -> Option<AppDirs> {
+    let own = own?;
+    Some(AppDirs {
+        config: own.config.join(app),
+        data: own.data.join(app),
+        data_local: own.data.join(app),
+    })
+}
+
+/// #3866 — an account's Videos folder on Linux: the one `user-dirs.dirs` in
+/// its own config folder names (`XDG_VIDEOS_DIR`), read as `directories`'
+/// `UserDirs` reads it ([`user_dir_in`]). `None` where the file names none,
+/// or there is no file. `read` stands in for the file system.
+#[cfg(any(target_os = "linux", test))]
+pub fn videos_dir(
+    own: &OwnFolders,
+    read: impl FnOnce(&Path) -> Option<Vec<u8>>,
+) -> Option<PathBuf> {
+    let text = read(&own.config.join("user-dirs.dirs"))?;
+    user_dir_in(&own.home, &text, "VIDEOS")
+}
+
+/// The folder a `user-dirs.dirs` text names for `name` (its
+/// `XDG_<name>_DIR` line), as `dirs-sys` parses the file: blanks around the
+/// key and the value are trimmed, and the value is a double-quoted
+/// `"$HOME/…"`, a folder beneath `home`, or a double-quoted absolute folder,
+/// with each backslash taking the byte after it as it is. `"$HOME/"` alone
+/// and any other value name no folder, and of the lines that name one, the
+/// last counts.
+#[cfg(any(target_os = "linux", test))]
+fn user_dir_in(home: &Path, text: &[u8], name: &str) -> Option<PathBuf> {
+    fn trimmed(bytes: &[u8]) -> &[u8] {
+        let blank = |b: &&u8| **b == b' ' || **b == b'\t';
+        let start = bytes.iter().take_while(blank).count();
+        let bytes = &bytes[start..];
+        &bytes[..bytes.len() - bytes.iter().rev().take_while(blank).count()]
+    }
+    let mut found = None;
+    for line in text.split(|b| *b == b'\n') {
+        let Some(at) = line.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        let key = trimmed(&line[..at]);
+        if key
+            .strip_prefix(b"XDG_")
+            .and_then(|key| key.strip_suffix(b"_DIR"))
+            != Some(name.as_bytes())
+        {
+            continue;
+        }
+        let Some(value) = trimmed(&line[at + 1..])
+            .strip_prefix(b"\"")
+            .and_then(|value| value.strip_suffix(b"\""))
+        else {
+            continue;
+        };
+        let (beneath_home, value) = if value == b"$HOME/" {
+            continue;
+        } else if let Some(rest) = value.strip_prefix(b"$HOME/") {
+            (true, rest)
+        } else if value.starts_with(b"/") {
+            (false, value)
+        } else {
+            continue;
+        };
+        let mut unescaped = Vec::with_capacity(value.len());
+        let mut bytes = value.iter();
+        while let Some(&byte) = bytes.next() {
+            if byte == b'\\' {
+                unescaped.extend(bytes.next());
+            } else {
+                unescaped.push(byte);
+            }
+        }
+        let folder = path_of_bytes(unescaped);
+        found = Some(if beneath_home {
+            home.join(folder)
+        } else {
+            folder
+        });
+    }
+    found
+}
+
+/// A path from the bytes a file names it by.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn path_of_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+}
+
+/// A path from the bytes a file names it by; outside Unix only the tests
+/// read one, and their paths are UTF-8.
+#[cfg(all(test, not(unix)))]
+fn path_of_bytes(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// #3802 — the agent's folders for segment `app` in the tree of the account
 /// this process runs as.
 ///
@@ -147,15 +337,23 @@ fn macos_dirs(app: &str, account_home: impl FnOnce() -> Option<PathBuf>) -> Opti
 /// (the LaunchAgent, the worker `sudo -u` starts, the tray), resolves the same
 /// folders as before.
 ///
-/// Everywhere else `ProjectDirs` decides, as it always has: `$HOME` and the
-/// XDG variables on Linux, the known folders on Windows.
+/// #3866 — on Linux the tree is in the account's own folders
+/// ([`own_folders`]): a root process uses root's own folders beneath
+/// `/root`, whatever `HOME` or `XDG_*` it was started with, and any other
+/// process honours `HOME` and the XDG variables as `ProjectDirs` does.
+///
+/// On Windows `ProjectDirs` decides, as it always has: the known folders.
 fn dirs_for(app: &str) -> Option<AppDirs> {
     #[cfg(target_os = "macos")]
     {
         static ACCOUNT_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
         macos_dirs(app, || ACCOUNT_HOME.get_or_init(own_home).clone())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_dirs(app, own_folders())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         ProjectDirs::from(QUALIFIER, ORG, app).map(|dirs| AppDirs::from(&dirs))
     }
@@ -187,7 +385,9 @@ fn app_segment() -> &'static str {
 /// The agent's folders ([`dirs_for`]), resolved to the NEW segment unless a
 /// pre-rename install is detected (then the OLD segment, so its enrolled
 /// config is never orphaned). `None` only if the platform exposes no config
-/// dir at all, or on macOS the account database names no home.
+/// dir at all, or on macOS the account database names no home, or on Linux a
+/// process that is not root has no `HOME` and no home in the account
+/// database.
 pub fn project_dirs() -> Option<AppDirs> {
     dirs_for(app_segment())
 }
@@ -734,14 +934,14 @@ pub fn migration_notes() -> &'static [String] {
 /// Rules, per directory (per-user config/data roots + the Windows
 /// machine-global root, each independent):
 ///   * legacy exists, new doesn't → atomic same-volume `fs::rename`
-///   * both exist (split-brain from the self-heal era) → left in place
-///     (the resolution keeps the tree that holds the config folder, the new
-///     one when both do, and with no config folder the new data folder's;
-///     config cleanup is the `ConfigCleanupStale` verb's job)
+///   * both exist → a data pair merges ([`migrate_children`], #3746); the
+///     config and machine pairs stay (the resolution keeps the tree that
+///     holds the config folder, the new one when both do, and with no config
+///     folder the new data folder's; `ConfigCleanupStale` cleans config up)
 ///   * legacy absent → nothing to do
 ///
-/// Never deletes; a failed rename (locked file, ACL) is noted and the
-/// read-both resolution keeps everything working until the next start.
+/// Never deletes or overwrites; what cannot move (locked file, ACL) is noted,
+/// stays, and moves at a later start. [`DataMerge`]: who runs the merge.
 ///
 /// `companion_running` (the roomler-desktop tray): skip entirely — the tray
 /// may hold open handles inside the tree, and a pre-S1a tray would keep
@@ -753,13 +953,13 @@ pub fn migration_notes() -> &'static [String] {
 /// system names for the account this process runs as. The pairs move by
 /// [`migrate_dirs_within`], which decides for all of them before any pair
 /// moves (none moves through a link below its root), moves the config pair
-/// first and by one rename, and stops at a pair whose move fails: the pairs
-/// before it stay moved, the pairs after it stay in the OLD tree. The
-/// machine pair's root is [`machine_program_data`].
+/// first and by one rename, and leaves the rest in the OLD tree when that
+/// fails. The machine pair's root is [`machine_program_data`].
 pub fn migrate_legacy_trees(
     companion_running: bool,
     installer_step: bool,
     own_profile: Option<&Path>,
+    merge: DataMerge,
 ) {
     let mut notes = Vec::new();
     if companion_running {
@@ -790,7 +990,7 @@ pub fn migrate_legacy_trees(
                 Some(profile) => {
                     // The config pair is first in `pairs`: the order
                     // `migrate_dirs_within` keeps.
-                    notes.extend(migrate_dirs_within(profile, &pairs, rename_on_disk));
+                    notes.extend(migrate_dirs_within(profile, &pairs, merge, rename_on_disk));
                     // Best-effort: drop the now-empty legacy shells (e.g.
                     // Windows `%APPDATA%\roomler\roomler-agent` after its
                     // `config`/`data` children moved out). `remove_dir`
@@ -833,13 +1033,13 @@ pub fn migrate_legacy_trees(
         {
             let root = machine_program_data();
             let base = root.join(ORG);
-            let (old, new) = (base.join(OLD_APP), base.join(NEW_APP));
+            let pair = (base.join(OLD_APP), base.join(NEW_APP));
             if installer_step {
-                if old.exists() {
-                    notes.push(in_an_installer_step(&old));
+                if pair.0.exists() {
+                    notes.push(in_an_installer_step(&pair.0));
                 }
             } else {
-                notes.extend(migrate_dirs_within(&root, &[(old, new)], rename_on_disk));
+                notes.extend(migrate_dirs_within(&root, &[pair], merge, rename_on_disk));
             }
         }
     }
@@ -988,20 +1188,21 @@ fn kept_in_place(root: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<String> {
 }
 
 /// #3702 — [`migrate_dir`] for the pairs in `root`, with `rename` as the
-/// rename of a pair's folder ([`rename_on_disk`] outside tests). Whether
-/// they move is decided for every pair before any pair moves: none moves
-/// when one lies outside `root` or is reached through a link below it
-/// ([`kept_in_place`]). They then move in the order given, the config pair
-/// first and by one rename, and a pair whose move fails ends the move: the
-/// pairs before it stay moved, the pairs after it stay in the OLD tree.
-/// The segment choice ([`segment_of`]) takes the tree that holds a config
-/// folder. The move makes the NEW config folder only whole, by one rename,
-/// and the NEW local data folder only when the config pair's move did not
-/// fail: the daemon reads the config it had, from the NEW tree or from the
-/// OLD one.
+/// rename of a pair's folder or of an entry a merge moves ([`rename_on_disk`]
+/// outside tests). Whether they move is decided for every pair before any
+/// pair moves: none moves when one lies outside `root` or is reached through
+/// a link below it ([`kept_in_place`]). They then move in the order given,
+/// the config pair first and by one rename; its failure ends the move, and
+/// the pairs after it stay in the OLD tree. A data pair converges on its own
+/// (#3746, [`DataMerge`]). The segment choice ([`segment_of`]) takes the tree
+/// that holds a config folder. The move makes the NEW config folder only
+/// whole, by one rename, and the NEW local data folder only when the config
+/// pair's move did not fail: the daemon reads the config it had, from the NEW
+/// tree or from the OLD one.
 fn migrate_dirs_within(
     root: &Path,
     pairs: &[(PathBuf, PathBuf)],
+    data_merge: DataMerge,
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Vec<String> {
     if let Some(note) = kept_in_place(root, pairs) {
@@ -1010,10 +1211,11 @@ fn migrate_dirs_within(
     let mut notes = Vec::new();
     for (at, (old, new)) in pairs.iter().enumerate() {
         // The first pair holds `config.toml`: one rename moves its folder
-        // whole, or the folder stays. The pairs after it may move child by
-        // child.
-        match migrate_dir(old, new, at > 0, &mut rename) {
+        // whole, or the folder stays. A data pair after it merges, and one
+        // that leaves an entry behind holds back no pair after it.
+        match migrate_dir(old, new, (at > 0).then_some(data_merge), &mut rename) {
             Ok(note) => notes.extend(note),
+            Err(note) if at > 0 => notes.push(note),
             Err(note) => {
                 notes.push(note);
                 notes.extend(pairs[at + 1..].iter().filter(|(old, _)| old.exists()).map(
@@ -1032,32 +1234,40 @@ fn migrate_dirs_within(
 }
 
 /// The system's own rename: the one [`migrate_dirs_within`] takes outside
-/// tests.
+/// tests. A real folder renames as the system renames one; anything else (a
+/// file, or a link, which is never followed) only to a free name
+/// ([`rename_no_replace`]), so a merge never takes a name that is taken.
 fn rename_on_disk(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)
+    if std::fs::symlink_metadata(from)?.is_dir() {
+        return std::fs::rename(from, to);
+    }
+    rename_no_replace(from, to)
 }
 
 /// Apply the migration rules to one directory pair, with `rename` as the
 /// rename of its folder: `Ok` with a note for anything noteworthy (moved, or
 /// left beside a NEW folder that is already there), `Ok(None)` for the quiet
 /// no-legacy case, `Err` with a note when the move failed and the legacy
-/// folder is still where it was. A rename the system refuses
-/// (`PermissionDenied`) moves the folder's children one by one when
-/// `per_child` ([`migrate_children`]), and is an `Err` otherwise.
+/// folder is still where it was. A data pair (`merge` is `Some`) merges into
+/// a NEW folder that is there, or when its folder's rename fails, entry by
+/// entry ([`migrate_children`]); the config and machine pairs never do.
 fn migrate_dir(
     old: &Path,
     new: &Path,
-    per_child: bool,
-    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    merge: Option<DataMerge>,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<Option<String>, String> {
     if !old.exists() {
         return Ok(None);
     }
     if new.exists() {
-        return Ok(Some(format!(
-            "legacy tree left in place (new tree also present): {}",
-            old.display()
-        )));
+        return match merge {
+            Some(merge) => migrate_children(old, new, merge, None, &mut rename).map(Some),
+            None => Ok(Some(format!(
+                "legacy tree left in place (new tree also present): {}",
+                old.display()
+            ))),
+        };
     }
     if let Some(parent) = new.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -1073,20 +1283,20 @@ fn migrate_dir(
             old.display(),
             new.display()
         ))),
-        Err(e) if per_child && e.kind() == std::io::ErrorKind::PermissionDenied => {
-            // Field finding (DEVBOX, 2026-07-27): renaming the TOP dir was
-            // denied by an external ROOT-handle (an AV / indexer
-            // directory-watch — no roomler process held anything, ACLs
-            // were Full, and every CHILD renamed fine). Fall back to
-            // moving the children individually; that dodges the
-            // root-handle without needing the watcher gone.
-            migrate_children(old, new, &e).map(Some)
-        }
-        Err(e) => Err(format!(
-            "migration failed ({} -> {}): {e} — read-both fallback stays in charge",
-            old.display(),
-            new.display()
-        )),
+        // Field finding (DEVBOX, 2026-07-27): renaming the TOP dir was
+        // denied by an external ROOT-handle (an AV / indexer
+        // directory-watch — no roomler process held anything, ACLs
+        // were Full, and every CHILD renamed fine). A data pair merges
+        // its children instead; that dodges the root-handle without
+        // needing the watcher gone, and a held child waits for a later start.
+        Err(e) => match merge {
+            Some(merge) => migrate_children(old, new, merge, Some(&e), &mut rename).map(Some),
+            None => Err(format!(
+                "migration failed ({} -> {}): {e} — read-both fallback stays in charge",
+                old.display(),
+                new.display()
+            )),
+        },
     }
 }
 
@@ -1252,69 +1462,570 @@ pub fn system_config_notes() -> &'static [String] {
         .unwrap_or(&[])
 }
 
-/// Per-child move of a data pair whose folder rename the system refused
-/// (never the first pair, which holds `config.toml`). A failure midway
-/// renames the moved entries back and removes the NEW folder this move
-/// made; either can fail in turn, and the note's `rolled back` says only
-/// whether every rename back succeeded.
-fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> Result<String, String> {
-    let Ok(entries) = std::fs::read_dir(old) else {
+/// #3746 — the merge of a data pair's OLD folder into its NEW folder, entry
+/// by entry ([`merge_folder`]): when the NEW folder is already there (`why`
+/// is `None`, as once that start's `logging::init` made `logs` in it), or
+/// when the folder's own rename failed (`why`). A folder both hold merges
+/// the same way inside it; any other name both hold keeps the copy modified
+/// last, a tie the NEW folder's, and the other copy goes beside it
+/// ([`KEPT_BESIDE`]). Nothing is overwritten or deleted, and an entry gone
+/// meanwhile (another runner moved it) is done. `Ok` once the OLD folder is
+/// gone, `Err` while an entry is left in it for the next start; the note
+/// names what was kept beside and what was left.
+fn migrate_children(
+    old: &Path,
+    new: &Path,
+    merge: DataMerge,
+    why: Option<&std::io::Error>,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<String, String> {
+    let how = match why {
+        None => "the new folder was already there".to_string(),
+        Some(e) => format!("its folder rename failed: {e}"),
+    };
+    if gone(old) {
+        return Ok(format!(
+            "legacy tree {} already moved by another start",
+            old.display()
+        ));
+    }
+    if let Some(because) = merge.left_because() {
         return Err(format!(
-            "migration failed ({} -> {}): {root_err} (and the legacy dir is unreadable)",
-            old.display(),
+            "legacy tree left in place ({how}): {} — {because}",
+            old.display()
+        ));
+    }
+    if !is_real_folder(old) {
+        return Err(format!(
+            "legacy tree left in place: {} is not a folder",
+            old.display()
+        ));
+    }
+    let made_new = match std::fs::create_dir(new) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(format!("migration failed (create {}): {e}", new.display())),
+    };
+    if !is_real_folder(new) {
+        return Err(format!(
+            "legacy tree left in place: {} is not a folder",
             new.display()
         ));
-    };
-    let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    // config.toml last: the enrollment must be the final thing to leave
-    // the old tree.
-    children.sort_by_key(|p| p.file_name().is_some_and(|f| f == "config.toml"));
-    let made_new = !new.exists();
-    if let Err(e) = std::fs::create_dir_all(new) {
-        return Err(format!("migration failed (create {}): {e}", new.display()));
     }
-    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for src in &children {
-        let Some(name) = src.file_name() else {
-            continue;
+    let mut merged = Merged::default();
+    merge_folder(old, new, "", rename, &mut merged);
+    let old_gone = match std::fs::remove_dir(old) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            if merged.left.is_empty() {
+                merged.leave("", &e);
+            }
+            false
+        }
+    };
+    // A NEW folder this merge made goes again while it is empty: the segment
+    // choice keys on a new data folder where neither tree holds a config
+    // folder. `remove_dir` leaves it while anything is in it.
+    if made_new && !old_gone {
+        let _ = std::fs::remove_dir(new);
+    }
+    let note = merged.note(old, new, &how, old_gone);
+    if old_gone { Ok(note) } else { Err(note) }
+}
+
+/// #3746 — whether this process runs the data pairs' merge
+/// ([`migrate_children`]). A process running elevated from a split token
+/// does not: the account's own unelevated daemon runs it at its next start,
+/// so the merge never runs above the integrity level of the folder owner's
+/// own processes. A pair's one folder rename is the same in every process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataMerge {
+    /// The merge runs.
+    Runs,
+    /// Left to the account's own daemon: this process runs elevated from a
+    /// split token.
+    Elevated,
+    /// Left to the account's own daemon: this process could not read its
+    /// own token.
+    TokenUnread,
+}
+
+impl DataMerge {
+    /// From whether this process runs elevated from a split token:
+    /// `Some(true)` it does, `Some(false)` it does not, `None` it could not
+    /// tell.
+    pub fn from_split_elevation(elevated: Option<bool>) -> Self {
+        match elevated {
+            Some(false) => Self::Runs,
+            Some(true) => Self::Elevated,
+            None => Self::TokenUnread,
+        }
+    }
+
+    /// Why the merge is left, for the note; `None` when it runs.
+    fn left_because(self) -> Option<&'static str> {
+        match self {
+            Self::Runs => None,
+            Self::Elevated => Some(
+                "this process runs elevated; the account's own daemon merges it at its next start",
+            ),
+            Self::TokenUnread => Some(
+                "this process could not read its own token; the account's own daemon merges it \
+                 at its next start",
+            ),
+        }
+    }
+}
+
+/// #3746 — the suffix of a copy the merge keeps beside a name both folders
+/// hold: `<name>.older`, then `<name>.older-2`, `<name>.older-3`, … when the
+/// name before it is taken.
+pub const KEPT_BESIDE: &str = ".older";
+
+/// How many names beside one name [`put_beside`] tries.
+const BESIDE_TRIES: u32 = 100;
+
+/// #3746 — whether `name` is a copy the merge kept beside another
+/// (`<name>.older` or `<name>.older-<n>`), which no reader takes for the
+/// file of that name.
+pub fn is_kept_beside(name: &str) -> bool {
+    let Some(at) = name.rfind(KEPT_BESIDE) else {
+        return false;
+    };
+    let rest = &name[at + KEPT_BESIDE.len()..];
+    at > 0
+        && (rest.is_empty()
+            || rest
+                .strip_prefix('-')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+}
+
+/// The `n`th name beside `name`: `<name>.older`, `<name>.older-2`, …
+fn beside_name(name: &Path, n: u32) -> PathBuf {
+    let mut at = name.as_os_str().to_os_string();
+    at.push(beside_suffix(n));
+    PathBuf::from(at)
+}
+
+fn beside_suffix(n: u32) -> String {
+    match n {
+        1 => KEPT_BESIDE.to_string(),
+        n => format!("{KEPT_BESIDE}-{n}"),
+    }
+}
+
+/// Nothing is at `path`, read without following a link.
+fn gone(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// A real folder is at `path`, not a link to one.
+fn is_real_folder(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// What a merge did, for its note.
+#[derive(Default)]
+struct Merged {
+    moved: usize,
+    /// Each copy kept beside a name, by its path from the pair's folder.
+    beside: Vec<String>,
+    /// Each entry left in the OLD folder, with why.
+    left: Vec<String>,
+}
+
+impl Merged {
+    fn kept_beside(&mut self, rel: &str, n: u32, whose: &str) {
+        let suffix = beside_suffix(n);
+        self.beside
+            .push(format!("{rel}{suffix} (the {whose} folder's copy)"));
+    }
+
+    fn leave(&mut self, rel: &str, e: &std::io::Error) {
+        let rel = if rel.is_empty() {
+            "the folder itself"
+        } else {
+            rel
         };
-        let dst = new.join(name);
-        match std::fs::rename(src, &dst) {
-            Ok(()) => moved.push((src.clone(), dst)),
+        self.left.push(format!("{rel} ({e})"));
+    }
+
+    fn note(&self, old: &Path, new: &Path, how: &str, old_gone: bool) -> String {
+        let mut note = format!(
+            "{} {} -> {} entry by entry ({how}): {} moved",
+            if old_gone {
+                "migrated legacy tree"
+            } else {
+                "legacy tree partly migrated"
+            },
+            old.display(),
+            new.display(),
+            self.moved
+        );
+        if !self.beside.is_empty() {
+            note.push_str("; kept beside: ");
+            note.push_str(&listed(&self.beside));
+        }
+        if !old_gone {
+            note.push_str("; left in the old folder for the next start: ");
+            note.push_str(&listed(&self.left));
+        }
+        note
+    }
+}
+
+/// `items` joined for a note, the first 32 of them.
+fn listed(items: &[String]) -> String {
+    const SHOWN: usize = 32;
+    let mut text = items
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > SHOWN {
+        text.push_str(&format!(" and {} more", items.len() - SHOWN));
+    }
+    text
+}
+
+/// A name's path from the pair's folder, for the note: `rel/name`.
+fn joined(rel: &str, name: &std::ffi::OsStr) -> String {
+    let name = name.to_string_lossy();
+    if rel.is_empty() {
+        name.into_owned()
+    } else {
+        format!("{rel}/{name}")
+    }
+}
+
+/// Every entry of `src_dir`, an OLD folder, into `dst_dir`, the same place
+/// in the NEW folder, by [`merge_entry`]. `rel` is `src_dir`'s path from the
+/// pair's folder. `config.toml` goes last.
+fn merge_folder(
+    src_dir: &Path,
+    dst_dir: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+) {
+    let entries = match std::fs::read_dir(src_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => return merged.leave(rel, &e),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => names.push(entry.file_name()),
             Err(e) => {
-                // Roll back so the OLD tree stays complete (best-effort;
-                // a rollback failure is noted and read-both still covers
-                // the pieces that DID move — they're identical content).
-                let mut rolled_back = true;
-                for (orig, dstp) in moved.iter().rev() {
-                    if std::fs::rename(dstp, orig).is_err() {
-                        rolled_back = false;
-                    }
-                }
-                // The NEW folder this move made goes too: the segment choice
-                // keys on a new config folder, and on a new data folder where
-                // neither tree holds a config folder. `remove_dir` leaves it
-                // while anything is in it.
-                if made_new {
-                    let _ = std::fs::remove_dir(new);
-                }
-                return Err(format!(
-                    "per-child migration of {} aborted at {} ({e}); rolled back: {rolled_back} \
-                     (root rename was denied: {root_err})",
-                    old.display(),
-                    src.display()
-                ));
+                merged.leave(rel, &e);
+                break;
             }
         }
     }
-    let _ = std::fs::remove_dir(old);
-    Ok(format!(
-        "migrated legacy tree {} -> {} per-child ({} entries; the root dir itself was \
-         locked by another process: {root_err})",
-        old.display(),
-        new.display(),
-        moved.len()
-    ))
+    // config.toml last: the enrollment must be the final thing to leave
+    // the old tree.
+    names.sort_by(|a, b| (a == "config.toml", a).cmp(&(b == "config.toml", b)));
+    for name in names {
+        let (src, dst) = (src_dir.join(&name), dst_dir.join(&name));
+        merge_entry(&src, &dst, &joined(rel, &name), rename, merged);
+    }
+}
+
+/// One entry of an OLD folder (`src`) to the same place in the NEW folder
+/// (`dst`), each read as it is now and never followed. An entry gone
+/// meanwhile was moved by another runner, and is done. To a free name it
+/// moves by one rename; a real folder whose rename fails merges entry by
+/// entry; a name the NEW folder holds too is settled by [`settle`].
+fn merge_entry(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+) {
+    if gone(src) {
+        return;
+    }
+    if gone(dst) {
+        let e = match rename(src, dst) {
+            Ok(()) => {
+                merged.moved += 1;
+                return;
+            }
+            Err(e) => e,
+        };
+        if gone(src) {
+            return;
+        }
+        if gone(dst) {
+            if !is_real_folder(src) {
+                return merged.leave(rel, &e);
+            }
+            // A folder whose own rename failed (a handle held on it, or on
+            // something in it): its entries, one by one.
+            match std::fs::create_dir(dst) {
+                Ok(()) => return merge_subfolder(src, dst, rel, rename, merged, true),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return merged.leave(rel, &e),
+            }
+        }
+    }
+    settle(src, dst, rel, rename, merged);
+}
+
+/// A folder both folders hold (`made`: one this merge just made in the NEW
+/// folder): its entries merge, and the OLD folder goes once it is empty. A
+/// folder this merge made goes again while the OLD one stays and it is
+/// empty.
+fn merge_subfolder(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+    made: bool,
+) {
+    let noted = merged.left.len();
+    merge_folder(src, dst, rel, rename, merged);
+    match std::fs::remove_dir(src) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            if merged.left.len() == noted {
+                merged.leave(rel, &e);
+            }
+            if made {
+                let _ = std::fs::remove_dir(dst);
+            }
+        }
+    }
+}
+
+/// A name both folders hold. Two real folders merge ([`merge_subfolder`]);
+/// anything else is settled by the rule: the copy modified last keeps the
+/// name, a tie the NEW folder's, and the other copy goes beside it
+/// ([`put_beside`]). Nothing is overwritten or deleted.
+fn settle(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+) {
+    let old = match std::fs::symlink_metadata(src) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => return merged.leave(rel, &e),
+    };
+    let new = match std::fs::symlink_metadata(dst) {
+        Ok(meta) => meta,
+        // The NEW folder's copy went meanwhile: the name is free again.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return take_name(src, dst, rel, rename, merged);
+        }
+        Err(e) => return merged.leave(rel, &e),
+    };
+    if old.is_dir() && new.is_dir() {
+        return merge_subfolder(src, dst, rel, rename, merged, false);
+    }
+    let modified =
+        |meta: &std::fs::Metadata| meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    if modified(&old) <= modified(&new) {
+        // The NEW folder's copy keeps the name; the OLD one goes beside it.
+        match put_beside(src, dst, rename) {
+            Beside::Put(n) => merged.kept_beside(rel, n, "old"),
+            Beside::Gone => {}
+            Beside::Failed(e) => merged.leave(rel, &e),
+        }
+        return;
+    }
+    // The OLD folder's copy is newer: the NEW one goes beside, and the OLD
+    // one takes the name.
+    match put_beside(dst, dst, rename) {
+        Beside::Put(n) => match rename(src, dst) {
+            Ok(()) => {
+                merged.moved += 1;
+                merged.kept_beside(rel, n, "new");
+            }
+            Err(e) => {
+                // The NEW folder's copy goes back under its name while that
+                // is free, and stays beside it otherwise.
+                if rename(&beside_name(dst, n), dst).is_err() {
+                    merged.kept_beside(rel, n, "new");
+                }
+                if !gone(src) {
+                    merged.leave(rel, &e);
+                }
+            }
+        },
+        Beside::Gone => take_name(src, dst, rel, rename, merged),
+        Beside::Failed(e) => merged.leave(rel, &e),
+    }
+}
+
+/// `src` to `dst`, a name that was free when last read: another runner may
+/// take it first, and the next start settles it then.
+fn take_name(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+) {
+    match rename(src, dst) {
+        Ok(()) => merged.moved += 1,
+        Err(e) if !gone(src) => merged.leave(rel, &e),
+        Err(_) => {}
+    }
+}
+
+/// What [`put_beside`] did.
+enum Beside {
+    /// Renamed to the `n`th name beside ([`beside_name`]).
+    Put(u32),
+    /// The entry went meanwhile: another runner moved it.
+    Gone,
+    Failed(std::io::Error),
+}
+
+/// `from` renamed to the first free name beside `name`: `<name>.older`, then
+/// `<name>.older-2`, … A name taken meanwhile is skipped.
+fn put_beside(
+    from: &Path,
+    name: &Path,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Beside {
+    let mut last = None;
+    for n in 1..=BESIDE_TRIES {
+        let at = beside_name(name, n);
+        if !gone(&at) {
+            continue;
+        }
+        match rename(from, &at) {
+            Ok(()) => return Beside::Put(n),
+            Err(_) if gone(from) => return Beside::Gone,
+            Err(e) if !gone(&at) => last = Some(e),
+            Err(e) => return Beside::Failed(e),
+        }
+    }
+    Beside::Failed(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "every name beside it is taken",
+        )
+    }))
+}
+
+/// #3746 — `from` renamed to `to` only while `to` is free: `AlreadyExists`
+/// when anything is there. `from` itself is renamed, never what a link at it
+/// leads to.
+#[cfg(windows)]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let (from, to) = (wide_path(from)?, wide_path(to)?);
+    // SAFETY: both are NUL-terminated wide strings that outlive the call.
+    // Flags 0: no replace, and no copy to another volume.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `path` as a NUL-terminated wide string; a NUL inside it is refused.
+#[cfg(windows)]
+fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a NUL in the path",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+/// #3746 — as on Windows, by `renameat2` with `RENAME_NOREPLACE`, made as a
+/// raw system call: libc's own wrapper needs glibc 2.28 at load time. A
+/// kernel or filesystem without the flag takes [`link_then_unlink`].
+#[cfg(target_os = "linux")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both are NUL-terminated strings that outlive the call, and
+    // `renameat2` takes (dirfd, path, dirfd, path, flags).
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD as libc::c_long,
+            from_c.as_ptr(),
+            libc::AT_FDCWD as libc::c_long,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_long,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOSYS) | Some(libc::EINVAL) => link_then_unlink(from, to),
+        _ => Err(e),
+    }
+}
+
+/// #3746 — as on Windows, by `renamex_np` with `RENAME_EXCL`. A filesystem
+/// without the flag takes [`link_then_unlink`].
+#[cfg(target_vendor = "apple")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both are NUL-terminated strings that outlive the call.
+    if unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOTSUP) | Some(libc::EINVAL) => link_then_unlink(from, to),
+        _ => Err(e),
+    }
+}
+
+/// #3746 — elsewhere, [`link_then_unlink`].
+#[cfg(all(unix, not(target_os = "linux"), not(target_vendor = "apple")))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    link_then_unlink(from, to)
+}
+
+/// `path` as a C string; a NUL inside it is refused.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn c_path(path: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a NUL in the path"))
+}
+
+/// A rename that never takes a taken name, where the system has none: a
+/// second link to `from` at `to` (refused when `to` is taken), then `from`'s
+/// own link removed. When that removal fails, the link at `to` goes again,
+/// and only while it is still `from`'s.
+#[cfg(unix)]
+fn link_then_unlink(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::hard_link(from, to)?;
+    if let Err(e) = std::fs::remove_file(from) {
+        if let (Ok(a), Ok(b)) = (
+            std::fs::symlink_metadata(from),
+            std::fs::symlink_metadata(to),
+        ) && (a.dev(), a.ino()) == (b.dev(), b.ino())
+        {
+            let _ = std::fs::remove_file(to);
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1689,6 +2400,7 @@ mod tests {
         let notes = migrate_dirs_within(
             &profile,
             &[(link.join(OLD_APP), link.join(NEW_APP))],
+            DataMerge::Runs,
             rename_on_disk,
         );
         assert!(
@@ -1703,6 +2415,7 @@ mod tests {
         let notes = migrate_dirs_within(
             &real,
             &[(real.join(OLD_APP), real.join(NEW_APP))],
+            DataMerge::Runs,
             rename_on_disk,
         );
         assert!(real.join(NEW_APP).is_dir(), "{notes:?}");
@@ -1740,7 +2453,12 @@ mod tests {
         std::fs::write(data_home.join(OLD_APP).join("logs.txt"), "x").unwrap();
         let (config, data) = (pair_in(&config_home), pair_in(&data_home));
 
-        let notes = migrate_dirs_within(&profile, &[config.clone(), data.clone()], rename_on_disk);
+        let notes = migrate_dirs_within(
+            &profile,
+            &[config.clone(), data.clone()],
+            DataMerge::Runs,
+            rename_on_disk,
+        );
 
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
@@ -1758,7 +2476,7 @@ mod tests {
         for (old, _) in &pairs {
             std::fs::create_dir_all(old).unwrap();
         }
-        let notes = migrate_dirs_within(&plain, &pairs, rename_on_disk);
+        let notes = migrate_dirs_within(&plain, &pairs, DataMerge::Runs, rename_on_disk);
         assert!(
             pairs.iter().all(|(old, new)| !old.exists() && new.is_dir()),
             "{notes:?}"
@@ -1781,13 +2499,18 @@ mod tests {
         }
         std::fs::write(config.0.join("config.toml"), "x").unwrap();
         let mut tried = Vec::new();
-        let notes = migrate_dirs_within(profile, &[config.clone(), data.clone()], |from, to| {
-            tried.push(from.to_path_buf());
-            if from == config.0 {
-                return Err(std::io::Error::other("another volume"));
-            }
-            std::fs::rename(from, to)
-        });
+        let notes = migrate_dirs_within(
+            profile,
+            &[config.clone(), data.clone()],
+            DataMerge::Runs,
+            |from, to| {
+                tried.push(from.to_path_buf());
+                if from == config.0 {
+                    return Err(std::io::Error::other("another volume"));
+                }
+                std::fs::rename(from, to)
+            },
+        );
         assert_eq!(tried, std::slice::from_ref(&config.0), "{notes:?}");
         assert!(!tree_present(&config.1, &data.1), "{notes:?}");
         assert!(config.0.join("config.toml").is_file(), "{notes:?}");
@@ -1818,12 +2541,17 @@ mod tests {
         }
         std::fs::write(config.0.join("config.toml"), "x").unwrap();
 
-        let notes = migrate_dirs_within(profile, &[config.clone(), data.clone()], |from, to| {
-            if from == config.0 {
-                return Err(std::io::ErrorKind::PermissionDenied.into());
-            }
-            std::fs::rename(from, to)
-        });
+        let notes = migrate_dirs_within(
+            profile,
+            &[config.clone(), data.clone()],
+            DataMerge::Runs,
+            |from, to| {
+                if from == config.0 {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                std::fs::rename(from, to)
+            },
+        );
 
         assert!(!tree_present(&config.1, &data.1), "{notes:?}");
         assert!(tree_present(&config.0, &data.0), "{notes:?}");
@@ -1960,7 +2688,7 @@ mod tests {
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("config.toml"), b"agent_token = \"x\"").unwrap();
 
-        let note = migrate_dir(&old, &new, true, rename_on_disk)
+        let note = migrate_dir(&old, &new, Some(DataMerge::Runs), rename_on_disk)
             .unwrap()
             .expect("a move produces a note");
         assert!(note.starts_with("migrated"), "{note}");
@@ -1972,20 +2700,30 @@ mod tests {
         );
     }
 
+    /// #3746 — both folders present: the config pair stays as it is, and a
+    /// data pair merges into the NEW folder. Before #3746 this test pinned
+    /// "left in place" for every pair; it now pins both rules.
     #[test]
-    fn migrate_dir_leaves_split_brain_alone() {
+    fn a_split_brain_config_pair_stays_and_a_data_pair_merges() {
         let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("roomler-agent");
-        let new = tmp.path().join("roomler");
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::create_dir_all(&new).unwrap();
-        std::fs::write(old.join("stale.txt"), b"old").unwrap();
-
-        let note = migrate_dir(&old, &new, true, rename_on_disk)
-            .unwrap()
-            .expect("both-present produces a note");
-        assert!(note.contains("left in place"), "{note}");
-        assert!(old.join("stale.txt").exists(), "nothing may be deleted");
+        for per_child in [false, true] {
+            let old = tmp.path().join(per_child.to_string()).join("roomler-agent");
+            let new = tmp.path().join(per_child.to_string()).join("roomler");
+            std::fs::create_dir_all(&old).unwrap();
+            std::fs::create_dir_all(&new).unwrap();
+            std::fs::write(old.join("stale.txt"), b"old").unwrap();
+            let merge = per_child.then_some(DataMerge::Runs);
+            let note = migrate_dir(&old, &new, merge, rename_on_disk)
+                .unwrap()
+                .expect("both-present produces a note");
+            if per_child {
+                assert!(!old.exists(), "{note}");
+                assert_eq!(std::fs::read(new.join("stale.txt")).unwrap(), b"old");
+            } else {
+                assert!(note.contains("left in place"), "{note}");
+                assert!(old.join("stale.txt").exists(), "nothing may be deleted");
+            }
+        }
     }
 
     #[test]
@@ -1998,8 +2736,9 @@ mod tests {
         std::fs::write(old.join("service-logs").join("a.log"), b"l").unwrap();
 
         let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
-        let note = migrate_children(&old, &new, &err).unwrap();
-        assert!(note.contains("per-child"), "{note}");
+        let note =
+            migrate_children(&old, &new, DataMerge::Runs, Some(&err), &mut rename_on_disk).unwrap();
+        assert!(note.contains("entry by entry"), "{note}");
         assert!(!old.exists(), "emptied legacy root must be removed");
         assert_eq!(
             std::fs::read_to_string(new.join("config.toml")).unwrap(),
@@ -2008,35 +2747,49 @@ mod tests {
         assert!(new.join("service-logs").join("a.log").exists());
     }
 
+    /// #3746 — a data folder whose rename is refused while another runner
+    /// fills the NEW folder merges into it entry by entry, with no roll
+    /// back: a folder both hold merges, and what the other runner put there
+    /// stays. Before #3746 this test pinned the per-child move's roll back.
     #[test]
-    fn migrate_children_rolls_back_on_midway_failure() {
+    fn a_refused_data_folder_merges_into_what_another_runner_made() {
         let tmp = tempfile::tempdir().unwrap();
         let old = tmp.path().join("roomler-agent");
         let new = tmp.path().join("roomler");
         std::fs::create_dir_all(old.join("crashes")).unwrap();
+        std::fs::write(old.join("crashes").join("c1.dmp"), b"dump").unwrap();
         std::fs::write(old.join("config.toml"), b"tok").unwrap();
-        // Pre-create a CONFLICTING non-empty destination for `crashes` so
-        // its rename fails mid-way (rename onto a non-empty dir errors).
-        std::fs::create_dir_all(new.join("crashes").join("blocker")).unwrap();
 
-        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
-        let note = migrate_children(&old, &new, &err).unwrap_err();
-        assert!(note.contains("aborted"), "{note}");
-        // config.toml sorted LAST → it never left the old tree before the
-        // failure, and anything that did move was rolled back.
-        assert!(
-            old.join("config.toml").exists(),
-            "the enrollment must still be in the OLD tree: {note}"
-        );
-        assert!(old.join("crashes").exists());
+        let note = migrate_dir(
+            &old,
+            &new,
+            Some(DataMerge::Runs),
+            |from: &Path, to: &Path| {
+                if from == old {
+                    // The other runner, first: a `crashes` folder with something in it.
+                    std::fs::create_dir_all(new.join("crashes").join("blocker")).unwrap();
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                rename_on_disk(from, to)
+            },
+        )
+        .unwrap()
+        .expect("a merge produces a note");
+
+        assert!(!old.exists(), "{note}");
+        assert_eq!(std::fs::read(new.join("config.toml")).unwrap(), b"tok");
+        let dump = new.join("crashes").join("c1.dmp");
+        assert_eq!(std::fs::read(dump).unwrap(), b"dump", "{note}");
+        assert!(new.join("crashes").join("blocker").is_dir(), "{note}");
     }
 
-    /// #3702 — a per-child move that stops midway leaves no NEW folder it
-    /// made: the segment choice keys on that folder being there. A file held
-    /// open with no sharing cannot be renamed on Windows.
+    /// #3746 — a file held open with no sharing, which cannot be renamed on
+    /// Windows, stays in the OLD folder while every other entry moves, and
+    /// the next start moves it. Before #3746 this test pinned the per-child
+    /// move's roll back, which left the whole folder in the OLD tree.
     #[cfg(windows)]
     #[test]
-    fn a_per_child_move_that_stops_leaves_no_new_folder() {
+    fn a_held_file_stays_in_the_old_folder_and_moves_at_the_next_start() {
         use std::os::windows::fs::OpenOptionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let old = tmp.path().join(OLD_APP);
@@ -2050,15 +2803,28 @@ mod tests {
             .share_mode(0)
             .open(old.join("b.log"))
             .unwrap();
+        // An indexer's handle on the folder refuses the folder's own rename.
+        let refused = |from: &Path, to: &Path| {
+            if from == old {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            rename_on_disk(from, to)
+        };
 
-        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
-        let note = migrate_children(&old, &new, &err).unwrap_err();
+        let note = migrate_dir(&old, &new, Some(DataMerge::Runs), refused).unwrap_err();
+        assert!(note.contains("b.log"), "{note}");
+        for name in ["a.log", "config.toml"] {
+            assert!(new.join(name).is_file(), "{name}: {note}");
+        }
+        assert!(old.join("b.log").is_file(), "{note}");
+
         drop(held);
-
-        assert!(note.contains("aborted"), "{note}");
-        assert!(!new.exists(), "{note}");
+        let note = migrate_dir(&old, &new, Some(DataMerge::Runs), rename_on_disk)
+            .unwrap()
+            .expect("a merge produces a note");
+        assert!(!old.exists(), "{note}");
         for name in ["a.log", "b.log", "config.toml"] {
-            assert!(old.join(name).is_file(), "{name}: {note}");
+            assert_eq!(std::fs::read_to_string(new.join(name)).unwrap(), name);
         }
     }
 
@@ -2069,7 +2835,7 @@ mod tests {
             migrate_dir(
                 &tmp.path().join("roomler-agent"),
                 &tmp.path().join("roomler"),
-                true,
+                Some(DataMerge::Runs),
                 rename_on_disk
             ),
             Ok(None)
@@ -2153,6 +2919,312 @@ mod tests {
         assert_eq!(macos_dirs(NEW_APP, || None), None);
     }
 
+    // ── #3866: a Linux process's own folders ──────────────────────────────
+
+    /// `pairs` as a process's environment, the stand-in [`linux_folders`]
+    /// reads.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.into())
+        }
+    }
+
+    /// The XDG defaults beneath `home`, with no runtime folder.
+    fn defaults_beneath(home: impl Into<PathBuf>) -> OwnFolders {
+        let home = home.into();
+        OwnFolders {
+            config: home.join(".config"),
+            data: home.join(".local/share"),
+            cache: home.join(".cache"),
+            state: home.join(".local/state"),
+            runtime: None,
+            home,
+        }
+    }
+
+    /// The account database's home, as a stand-in that names `home`.
+    fn database(home: &str) -> impl FnOnce() -> Option<PathBuf> {
+        let home = PathBuf::from(home);
+        move || Some(home)
+    }
+
+    /// An account database that must not be asked.
+    fn not_asked() -> Option<PathBuf> {
+        panic!("the account database was asked")
+    }
+
+    /// The folder the single-instance lock is taken in: the runtime folder,
+    /// else the cache folder.
+    fn lock_folder(own: &OwnFolders) -> &Path {
+        own.runtime.as_deref().unwrap_or(own.cache.as_path())
+    }
+
+    /// A `HOME` and XDG folders of another account.
+    const ANOTHER_ACCOUNTS: &[(&str, &str)] = &[
+        ("HOME", "/home/p"),
+        ("XDG_CONFIG_HOME", "/home/p/.config"),
+        ("XDG_DATA_HOME", "/home/p/.local/share"),
+        ("XDG_CACHE_HOME", "/home/p/.cache"),
+        ("XDG_STATE_HOME", "/home/p/.local/state"),
+        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+    ];
+
+    /// #3866 AC1 — a root command uses root's own folders, whatever `HOME`
+    /// and `XDG_*` it was given: each folder is the XDG default beneath
+    /// `/root`, it has no runtime folder, so its lock is in root's own cache
+    /// folder, and its Videos folder is the one root's own `user-dirs.dirs`
+    /// names. It asks the account database nothing.
+    #[test]
+    fn a_root_command_uses_roots_own_folders_whatever_home_it_was_given() {
+        let own = linux_folders(0, env_of(ANOTHER_ACCOUNTS), not_asked).unwrap();
+        assert_eq!(own, defaults_beneath("/root"));
+        assert_eq!(lock_folder(&own), Path::new("/root/.cache"));
+        for app in [NEW_APP, OLD_APP] {
+            let dirs = linux_dirs(app, Some(own.clone())).unwrap();
+            assert_eq!(dirs.config_dir(), Path::new("/root/.config").join(app));
+            assert_eq!(dirs.data_dir(), Path::new("/root/.local/share").join(app));
+            assert_eq!(dirs.data_local_dir(), dirs.data_dir());
+        }
+        let videos = videos_dir(&own, |file| {
+            assert_eq!(file, Path::new("/root/.config/user-dirs.dirs"));
+            Some(b"XDG_VIDEOS_DIR=\"$HOME/Videos\"\n".to_vec())
+        });
+        assert_eq!(videos.as_deref(), Some(Path::new("/root/Videos")));
+        // Values that are empty or relative change nothing either.
+        let other: &[(&str, &str)] = &[
+            ("HOME", ""),
+            ("XDG_CONFIG_HOME", ""),
+            ("XDG_DATA_HOME", "share"),
+            ("XDG_RUNTIME_DIR", "run"),
+        ];
+        assert_eq!(
+            linux_folders(0, env_of(other), not_asked),
+            Some(defaults_beneath("/root"))
+        );
+    }
+
+    /// #3866 — root's folders are beneath `/root` whatever the account
+    /// database names for root: `/home/root`, another home, or no entry at
+    /// all (as in some container images).
+    #[test]
+    fn root_uses_slash_root_whatever_the_account_database_names() {
+        let none: &[(&str, &str)] = &[];
+        for given in [ANOTHER_ACCOUNTS, none] {
+            for names in [Some("/home/root"), Some("/srv/admin"), None] {
+                assert_eq!(
+                    linux_folders(0, env_of(given), move || names.map(PathBuf::from)),
+                    Some(defaults_beneath("/root")),
+                    "{given:?} {names:?}"
+                );
+            }
+        }
+    }
+
+    /// #3866 AC2 — a daemon that systemd started keeps every folder. The
+    /// environment systemd gives the shipped units: `roomlerd.service` runs
+    /// with `User=root`, so `HOME=/root`, `USER`, `LOGNAME` and `SHELL`, and
+    /// sets no `XDG_*`; `roomler-update.service` has no `User=`, so no
+    /// `HOME`. Root's folders are the ones `directories` gave that
+    /// environment (for the update helper, on a host whose account database
+    /// names `/root`): the XDG defaults beneath `/root`, with no runtime
+    /// folder, so the lock stays `/root/.cache/roomler-agent-<id>.lock`. A
+    /// runtime folder in the environment, `/run/user/0`, does not move it
+    /// either, and nothing here looks at whether a folder exists.
+    #[test]
+    fn a_daemon_systemd_started_keeps_every_folder() {
+        const PATH: (&str, &str) = (
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        let daemon: &[(&str, &str)] = &[
+            PATH,
+            ("HOME", "/root"),
+            ("USER", "root"),
+            ("LOGNAME", "root"),
+            ("SHELL", "/bin/sh"),
+            ("ROOMLERD_CONFIG", "/etc/roomler/config.toml"),
+            ("RUST_LOG", "roomlerd=info,warn"),
+        ];
+        let update_helper: &[(&str, &str)] = &[PATH, ("RUST_LOG", "info")];
+        let with_runtime: Vec<(&str, &str)> = daemon
+            .iter()
+            .copied()
+            .chain([("XDG_RUNTIME_DIR", "/run/user/0")])
+            .collect();
+        for unit in [daemon, with_runtime.as_slice(), update_helper] {
+            let own = linux_folders(0, env_of(unit), not_asked).unwrap();
+            assert_eq!(own.home, Path::new("/root"), "{unit:?}");
+            assert_eq!(own.config, Path::new("/root/.config"), "{unit:?}");
+            assert_eq!(own.data, Path::new("/root/.local/share"), "{unit:?}");
+            assert_eq!(own.cache, Path::new("/root/.cache"), "{unit:?}");
+            assert_eq!(own.state, Path::new("/root/.local/state"), "{unit:?}");
+            assert_eq!(own.runtime, None, "{unit:?}");
+            assert_eq!(lock_folder(&own), Path::new("/root/.cache"), "{unit:?}");
+            let dirs = linux_dirs(NEW_APP, Some(own)).unwrap();
+            assert_eq!(dirs.config_dir(), Path::new("/root/.config/roomler"));
+            assert_eq!(dirs.data_dir(), Path::new("/root/.local/share/roomler"));
+        }
+    }
+
+    /// #3866 AC3 — a person's command honours `HOME` and the XDG variables
+    /// as `directories` does: each `XDG_*` folder that is absolute as given,
+    /// an empty or relative one the default beneath `HOME`, an empty or
+    /// missing `HOME` the account database's home, and no folders with
+    /// neither. The account database is not read while `HOME` names a home.
+    #[test]
+    fn a_persons_command_honours_xdg() {
+        let person: &[(&str, &str)] = &[
+            ("HOME", "/home/p"),
+            ("XDG_CONFIG_HOME", "/data/p/config"),
+            ("XDG_DATA_HOME", "/data/p/share"),
+            ("XDG_CACHE_HOME", "/data/p/cache"),
+            ("XDG_STATE_HOME", "/data/p/state"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ];
+        let own = linux_folders(1000, env_of(person), not_asked).unwrap();
+        assert_eq!(
+            own,
+            OwnFolders {
+                home: PathBuf::from("/home/p"),
+                config: PathBuf::from("/data/p/config"),
+                data: PathBuf::from("/data/p/share"),
+                cache: PathBuf::from("/data/p/cache"),
+                state: PathBuf::from("/data/p/state"),
+                runtime: Some(PathBuf::from("/run/user/1000")),
+            }
+        );
+        assert_eq!(lock_folder(&own), Path::new("/run/user/1000"));
+        let videos = videos_dir(&own, |file| {
+            assert_eq!(file, Path::new("/data/p/config/user-dirs.dirs"));
+            Some(b"XDG_VIDEOS_DIR=\"$HOME/Videos\"\n".to_vec())
+        });
+        assert_eq!(videos.as_deref(), Some(Path::new("/home/p/Videos")));
+        let relative: &[(&str, &str)] = &[
+            ("HOME", "/home/p"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", ""),
+            ("XDG_RUNTIME_DIR", "run"),
+        ];
+        assert_eq!(
+            linux_folders(1000, env_of(relative), || None),
+            Some(defaults_beneath("/home/p"))
+        );
+        let empty: &[(&str, &str)] = &[("HOME", "")];
+        let none: &[(&str, &str)] = &[];
+        for no_home in [empty, none] {
+            assert_eq!(
+                linux_folders(1000, env_of(no_home), database("/home/q")),
+                Some(defaults_beneath("/home/q")),
+                "{no_home:?}"
+            );
+            assert_eq!(linux_folders(1000, env_of(no_home), || None), None);
+        }
+    }
+
+    /// #3866 — the Videos folder is read from `user-dirs.dirs` as
+    /// `directories`' `UserDirs` reads it.
+    #[test]
+    fn the_videos_folder_is_read_as_user_dirs_reads_it() {
+        let own = defaults_beneath("/home/p");
+        let named = |text: &str| {
+            videos_dir(&own, |file| {
+                assert_eq!(file, Path::new("/home/p/.config/user-dirs.dirs"));
+                Some(text.as_bytes().to_vec())
+            })
+        };
+        for (text, want) in [
+            ("XDG_VIDEOS_DIR=\"$HOME/Videos\"\n", "/home/p/Videos"),
+            ("XDG_VIDEOS_DIR=\"/srv/videos\"", "/srv/videos"),
+            (
+                " \tXDG_VIDEOS_DIR = \"$HOME/My\\ Videos\"\t ",
+                "/home/p/My Videos",
+            ),
+            (
+                "XDG_VIDEOS_DIR=\"$HOME/a\"\nXDG_VIDEOS_DIR=\"$HOME/b\"\nXDG_VIDEOS_DIR=\"$HOME/\"\n",
+                "/home/p/b",
+            ),
+            (
+                "# Written by xdg-user-dirs-update\nXDG_MUSIC_DIR=\"$HOME/Music\"\nXDG_VIDEOS_DIR=\"$HOME/Clips\"\n",
+                "/home/p/Clips",
+            ),
+        ] {
+            assert_eq!(named(text).as_deref(), Some(Path::new(want)), "{text:?}");
+        }
+        for text in [
+            "",
+            "# XDG_VIDEOS_DIR=\"$HOME/Videos\"",
+            "XDG_VIDEOS_DIR=$HOME/Videos",
+            "XDG_VIDEOS_DIR=\"Videos\"",
+            "XDG_VIDEOS_DIR=\"$HOME/\"",
+            "XDG_VIDEOS_DIR=\"$HOME\"",
+            "XDG_VIDEOS_DIR=\"\"",
+            "XDG_VIDEOS_DIR=\"",
+            "XDG_DIR=\"/srv\"",
+            "XDG_MUSIC_DIR=\"$HOME/Music\"",
+            "XDG_VIDEOS_DIR=\"$HOME/Videos\"\r",
+        ] {
+            assert_eq!(named(text), None, "{text:?}");
+        }
+        assert_eq!(videos_dir(&own, |_| None), None);
+    }
+
+    /// #3866 — this process's own folders, from its real environment, which
+    /// is read and never changed: where it is not root, exactly what
+    /// `directories` resolves (its `BaseDirs` and its `UserDirs`' Videos
+    /// folder); where it is root, the XDG defaults beneath `/root`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_processs_folders_are_what_directories_gives_unless_it_is_root() {
+        let own = own_folders();
+        // SAFETY: a read of this process's own credentials.
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(own, Some(defaults_beneath(ROOT_HOME)));
+            return;
+        }
+        let base = directories::BaseDirs::new();
+        assert_eq!(own.is_some(), base.is_some());
+        let (Some(own), Some(base)) = (own, base) else {
+            return;
+        };
+        assert_eq!(own.home, base.home_dir());
+        assert_eq!(own.config, base.config_dir());
+        assert_eq!(own.data, base.data_dir());
+        assert_eq!(own.data, base.data_local_dir());
+        assert_eq!(own.cache, base.cache_dir());
+        assert_eq!(Some(own.state.as_path()), base.state_dir());
+        assert_eq!(own.runtime.as_deref(), base.runtime_dir());
+        let theirs =
+            directories::UserDirs::new().and_then(|u| u.video_dir().map(Path::to_path_buf));
+        assert_eq!(videos_dir(&own, |file| std::fs::read(file).ok()), theirs);
+    }
+
+    /// The home this process's folders hang off where its account decides
+    /// them, not `HOME`: on macOS the one the account database names, and on
+    /// Linux `/root` for root (#3866); `None` where `ProjectDirs` decides.
+    fn account_home_decides() -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            Some(own_home().expect("the account database names this account's home"))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: a read of this process's own credentials.
+            let root = unsafe { libc::geteuid() } == 0;
+            root.then(|| PathBuf::from(ROOT_HOME))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
     /// Set in the child [`a_child_given_another_home_keeps_its_accounts_folders`]
     /// starts: the child prints what it resolves and writes nothing.
     const CHILD_3802: &str = "ROOMLER_TEST_3802_CHILD";
@@ -2175,6 +3247,17 @@ mod tests {
             Some(home) => child.env("HOME", home),
             None => child.env_remove("HOME"),
         };
+        // The child's folders hang off the home it is given, not off XDG
+        // folders of whoever runs this.
+        for name in [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+        ] {
+            child.env_remove(name);
+        }
         let out = child.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
@@ -2204,9 +3287,11 @@ mod tests {
     /// `ProjectDirs` in that same child follows the `HOME` it was given, which
     /// shows the child really had another one. With its own `HOME`, or none,
     /// a child resolves exactly what `ProjectDirs` resolves, so nothing an
-    /// installed Mac reads moves. Everywhere else every answer is
-    /// `ProjectDirs`'. The child only resolves paths: the `HOME` it is given
-    /// stays empty, and nothing is made in the home of whoever runs this.
+    /// installed Mac reads moves. #3866: a root child on Linux takes its
+    /// folders from its own account the same way. Everywhere else every
+    /// answer is `ProjectDirs`'. The child only resolves paths: the `HOME` it
+    /// is given stays empty, and nothing is made in the home of whoever runs
+    /// this.
     #[test]
     fn a_child_given_another_home_keeps_its_accounts_folders() {
         if std::env::var_os(CHILD_3802).is_some() {
@@ -2228,20 +3313,19 @@ mod tests {
             "the child wrote into the HOME it was given"
         );
         for (name, ours, theirs) in &another {
-            #[cfg(target_os = "macos")]
-            {
-                let account = own_home().expect("the account database names this account's home");
-                assert!(
-                    theirs.starts_with(given.path()),
-                    "{name}: ProjectDirs did not follow the given HOME: {theirs:?}"
-                );
-                assert!(
-                    ours.starts_with(&account) && !ours.starts_with(given.path()),
-                    "{name}: {ours:?} is not in {account:?}, the home of the account the child runs as"
-                );
+            match account_home_decides() {
+                Some(account) => {
+                    assert!(
+                        theirs.starts_with(given.path()),
+                        "{name}: ProjectDirs did not follow the given HOME: {theirs:?}"
+                    );
+                    assert!(
+                        ours.starts_with(&account) && !ours.starts_with(given.path()),
+                        "{name}: {ours:?} is not in {account:?}, the home of the account the child runs as"
+                    );
+                }
+                None => assert_eq!(ours, theirs, "{name}: the folders moved off ProjectDirs"),
             }
-            #[cfg(not(target_os = "macos"))]
-            assert_eq!(ours, theirs, "{name}: the folders moved off ProjectDirs");
         }
         #[cfg(unix)]
         let own = own_home();
@@ -2275,6 +3359,487 @@ mod tests {
             assert!(!entry.name.is_empty());
         }
         assert_eq!(account_entry(4_000_000_123), None);
+    }
+
+    // ── #3746: a data folder's move converges ─────────────────────────────
+
+    const DAY: std::time::Duration = std::time::Duration::from_secs(86_400);
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+    /// The file at `path` (its folders made), holding `body`, last modified
+    /// at `when`.
+    fn write_at(path: &Path, body: &str, when: std::time::SystemTime) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(when).unwrap();
+    }
+
+    /// The file at `path`, holding `body`, last modified `age` ago.
+    fn write_aged(path: &Path, body: &str, age: std::time::Duration) {
+        write_at(path, body, std::time::SystemTime::now() - age);
+    }
+
+    /// Every entry below `dir` that is not a folder, by its path from `dir`
+    /// (parts joined by `/`), with a file's content, or `<link>` for a link,
+    /// which is never followed. In name order.
+    fn files_below(dir: &Path) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut folders = vec![(dir.to_path_buf(), String::new())];
+        while let Some((at, rel)) = folders.pop() {
+            let Ok(entries) = std::fs::read_dir(&at) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let rel = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                let kind = std::fs::symlink_metadata(entry.path()).unwrap().file_type();
+                if kind.is_symlink() {
+                    found.push((rel, "<link>".to_string()));
+                } else if kind.is_dir() {
+                    folders.push((entry.path(), rel));
+                } else {
+                    found.push((rel, std::fs::read_to_string(entry.path()).unwrap()));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// `(path, content)` pairs, owned and in name order, as [`files_below`]
+    /// lists them.
+    fn listing(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut listed: Vec<(String, String)> = entries
+            .iter()
+            .map(|(rel, body)| (rel.to_string(), body.to_string()))
+            .collect();
+        listed.sort();
+        listed
+    }
+
+    /// The pairs of one profile: its config pair first, then its data pair.
+    fn config_and_data(profile: &Path) -> [(PathBuf, PathBuf); 2] {
+        [
+            pair_in(&profile.join("config")),
+            pair_in(&profile.join("data")),
+        ]
+    }
+
+    /// #3746 AC1 — a data folder whose move failed moves at a later start,
+    /// although that start's `logging::init` has made a `logs` folder in the
+    /// NEW data folder meanwhile: no OLD data folder is left, and every file
+    /// it held is in the NEW one.
+    #[test]
+    fn a_data_folder_whose_move_failed_moves_at_a_later_start() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = config_and_data(profile);
+        let (data_old, data_new) = pairs[1].clone();
+        write_aged(&pairs[0].0.join("config.toml"), "token", DAY);
+        let held = [
+            ("host-mute.json", "muted"),
+            ("privacy-curtains.json", "curtains"),
+            ("keep-busy.json", "busy"),
+            ("logs/update-attempt", "attempt"),
+            ("logs/last-install.json", "install"),
+            ("logs/roomlerd.log.2026-11-01", "an earlier day"),
+        ];
+        for (rel, body) in held {
+            write_aged(&data_old.join(rel), body, DAY);
+        }
+
+        // The first start: the config folder moves, and a handle held on the
+        // data folder refuses every rename below it.
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, |from, to| {
+            if from.starts_with(&data_old) {
+                return Err(std::io::Error::other("held"));
+            }
+            rename_on_disk(from, to)
+        });
+        assert!(pairs[0].1.join("config.toml").is_file(), "{notes:?}");
+        assert!(data_old.join("host-mute.json").is_file(), "{notes:?}");
+        // That start runs on the NEW tree: `logging::init` makes its folder.
+        let today = data_new.join("logs").join("roomlerd.log.2026-11-22");
+        write_aged(&today, "today", std::time::Duration::ZERO);
+
+        // A later start, with nothing held.
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
+
+        assert!(!data_old.exists(), "{notes:?}");
+        let mut want = held.to_vec();
+        want.push(("logs/roomlerd.log.2026-11-22", "today"));
+        assert_eq!(files_below(&data_new), listing(&want), "{notes:?}");
+    }
+
+    /// #3746 AC2 — a name both folders hold. Folders merge, entry by entry;
+    /// any other entry is kept under the name by the copy modified last (a
+    /// tie by the NEW folder's), and the other copy is kept beside it as
+    /// `<name>.older`, or `.older-2`, … when that is taken. Nothing is
+    /// overwritten or deleted, and the run's note names what it kept beside.
+    #[test]
+    fn a_name_both_folders_hold_is_kept_by_the_copy_modified_last() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = config_and_data(profile);
+        let (old, new) = pairs[1].clone();
+        // NEW's copy is the newer one; OLD's goes beside it, past a name
+        // an earlier merge took.
+        write_aged(&old.join("host-mute.json"), "old mute", DAY);
+        write_aged(&new.join("host-mute.json"), "new mute", HOUR);
+        write_aged(&new.join("host-mute.json.older"), "an earlier merge", DAY);
+        // OLD's copy is the newer one: it takes the name.
+        write_aged(&old.join("keep-busy.json"), "old busy", HOUR);
+        write_aged(&new.join("keep-busy.json"), "new busy", DAY);
+        // The same time: the NEW folder's copy keeps the name.
+        let then = std::time::SystemTime::now() - DAY;
+        write_at(&old.join("privacy-curtains.json"), "old curtains", then);
+        write_at(&new.join("privacy-curtains.json"), "new curtains", then);
+        // A folder both hold merges, by the same rule inside it.
+        let day_log = "logs/roomlerd.log.2026-11-01";
+        write_aged(&old.join(day_log), "old day", DAY);
+        write_aged(&new.join(day_log), "new day", HOUR);
+        write_aged(&old.join("logs/update-attempt"), "attempt", DAY);
+
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
+
+        assert!(!old.exists(), "{notes:?}");
+        let want = listing(&[
+            ("host-mute.json", "new mute"),
+            ("host-mute.json.older", "an earlier merge"),
+            ("host-mute.json.older-2", "old mute"),
+            ("keep-busy.json", "old busy"),
+            ("keep-busy.json.older", "new busy"),
+            ("logs/roomlerd.log.2026-11-01", "new day"),
+            ("logs/roomlerd.log.2026-11-01.older", "old day"),
+            ("logs/update-attempt", "attempt"),
+            ("privacy-curtains.json", "new curtains"),
+            ("privacy-curtains.json.older", "old curtains"),
+        ]);
+        assert_eq!(files_below(&new), want, "{notes:?}");
+        let note = notes.join("\n");
+        for beside in [
+            "host-mute.json.older-2",
+            "keep-busy.json.older",
+            "privacy-curtains.json.older",
+            "roomlerd.log.2026-11-01.older",
+        ] {
+            assert!(note.contains(beside), "{beside}: {note}");
+        }
+    }
+
+    /// #3746 — two processes can run the move at the same moment (a service
+    /// and a process it starts, or the person's daemon and a command typed
+    /// by hand). Each takes an entry the other moved as moved and a folder
+    /// the other made as one to merge into, and no rename takes a name that
+    /// is taken: no file is lost or doubled, and the next start finishes
+    /// whatever either one left.
+    #[test]
+    fn two_runners_at_once_lose_nothing_and_converge() {
+        for round in 0..12 {
+            let root = tempfile::tempdir().unwrap();
+            let profile = root.path();
+            let pairs = config_and_data(profile);
+            let (old, new) = pairs[1].clone();
+            let mut want = Vec::new();
+            for i in 0..40 {
+                let rel = match i % 4 {
+                    0 => format!("state-{i}.json"),
+                    1 => format!("logs/roomlerd.log.{i}"),
+                    2 => format!("logs/crashes/c{i}.dmp"),
+                    _ => format!("recordings/r{i}.webm"),
+                };
+                write_aged(&old.join(&rel), &format!("old {i}"), DAY);
+                want.push(format!("old {i}"));
+                if i % 5 == 0 {
+                    write_aged(&new.join(&rel), &format!("new {i}"), HOUR);
+                    want.push(format!("new {i}"));
+                }
+            }
+            std::fs::create_dir_all(new.join("logs")).unwrap();
+            want.sort();
+            let contents = || {
+                let mut all: Vec<String> = [&old, &new]
+                    .iter()
+                    .flat_map(|dir| files_below(dir).into_iter().map(|(_, body)| body))
+                    .collect();
+                all.sort();
+                all
+            };
+
+            let start = std::sync::Barrier::new(2);
+            let notes: Vec<Vec<String>> = std::thread::scope(|s| {
+                let runners: Vec<_> = (0..2)
+                    .map(|_| {
+                        s.spawn(|| {
+                            start.wait();
+                            migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk)
+                        })
+                    })
+                    .collect();
+                runners.into_iter().map(|r| r.join().unwrap()).collect()
+            });
+            assert_eq!(contents(), want, "round {round}: {notes:?}");
+
+            let next = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
+            assert!(!old.exists(), "round {round}: {notes:?} then {next:?}");
+            assert_eq!(contents(), want, "round {round}: {notes:?} then {next:?}");
+        }
+    }
+
+    /// #3746 — another runner made the NEW data folder, with a file under a
+    /// name the OLD folder holds too, just before this run's rename of the
+    /// folder was refused: no collision, the folders merge by the rule, and
+    /// both copies stay.
+    #[test]
+    fn a_folder_another_runner_just_made_is_merged_into() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = config_and_data(profile);
+        let (old, new) = pairs[1].clone();
+        write_aged(&old.join("host-mute.json"), "ours", DAY);
+        write_aged(&old.join("a.log"), "a", DAY);
+
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, |from, to| {
+            if from == old {
+                // The other runner, first: the NEW folder, a file in it.
+                write_aged(&new.join("host-mute.json"), "theirs", HOUR);
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            rename_on_disk(from, to)
+        });
+
+        assert!(!old.exists(), "{notes:?}");
+        let want = listing(&[
+            ("a.log", "a"),
+            ("host-mute.json", "theirs"),
+            ("host-mute.json.older", "ours"),
+        ]);
+        assert_eq!(files_below(&new), want, "{notes:?}");
+    }
+
+    /// #3746 — an entry another runner moved between this run's look at the
+    /// OLD folder and its rename is moved, not left behind.
+    #[test]
+    fn an_entry_another_runner_moved_is_done() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = config_and_data(profile);
+        let (old, new) = pairs[1].clone();
+        write_aged(&old.join("a.log"), "a", DAY);
+        write_aged(&old.join("b.log"), "b", DAY);
+        std::fs::create_dir_all(new.join("logs")).unwrap();
+
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, |from, to| {
+            if from == old.join("a.log") {
+                // The other runner, first.
+                std::fs::rename(from, to).unwrap();
+            }
+            rename_on_disk(from, to)
+        });
+
+        assert!(!old.exists(), "{notes:?}");
+        assert_eq!(
+            files_below(&new),
+            listing(&[("a.log", "a"), ("b.log", "b")]),
+            "{notes:?}"
+        );
+        assert!(!notes.join("\n").contains("a.log"), "{notes:?}");
+    }
+
+    /// #3746 — a data pair that leaves an entry in the OLD folder holds back
+    /// no pair after it: each data pair converges on its own, and the next
+    /// start moves the entry that was left.
+    #[test]
+    fn a_data_pair_that_leaves_an_entry_behind_holds_back_no_pair_after_it() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = [
+            pair_in(&profile.join("config")),
+            pair_in(&profile.join("roaming")),
+            pair_in(&profile.join("local")),
+        ];
+        write_aged(&pairs[0].0.join("config.toml"), "token", DAY);
+        write_aged(&pairs[1].0.join("held.log"), "held", DAY);
+        write_aged(&pairs[1].0.join("free.log"), "free", DAY);
+        write_aged(&pairs[2].0.join("logs/x.log"), "x", DAY);
+        let held = pairs[1].0.join("held.log");
+
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, |from, to| {
+            if from == pairs[1].0 || from == held {
+                return Err(std::io::Error::other("held"));
+            }
+            rename_on_disk(from, to)
+        });
+
+        assert!(pairs[0].1.join("config.toml").is_file(), "{notes:?}");
+        assert!(pairs[1].1.join("free.log").is_file(), "{notes:?}");
+        assert!(held.is_file(), "{notes:?}");
+        assert!(notes.join("\n").contains("held.log"), "{notes:?}");
+        assert!(!pairs[2].0.exists(), "{notes:?}");
+        assert!(pairs[2].1.join("logs").join("x.log").is_file(), "{notes:?}");
+
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
+        assert!(!pairs[1].0.exists(), "{notes:?}");
+        assert!(pairs[1].1.join("held.log").is_file(), "{notes:?}");
+    }
+
+    /// #3746 — the rename the move makes on disk never takes a name that is
+    /// taken: not a file's, not a folder's that holds something, and not by
+    /// a link. A free name it takes.
+    #[test]
+    fn the_rename_on_disk_never_takes_a_name_that_is_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = |name: &str| tmp.path().join(name);
+        std::fs::write(at("a"), "a").unwrap();
+        std::fs::write(at("b"), "b").unwrap();
+        let err = rename_on_disk(&at("a"), &at("b")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read_to_string(at("a")).unwrap(), "a");
+        assert_eq!(std::fs::read_to_string(at("b")).unwrap(), "b");
+
+        std::fs::create_dir_all(at("d").join("x")).unwrap();
+        std::fs::create_dir_all(at("e").join("y")).unwrap();
+        assert!(rename_on_disk(&at("d"), &at("e")).is_err());
+        assert!(at("d").join("x").is_dir() && at("e").join("y").is_dir());
+
+        folder_link(&at("l"), &at("d"));
+        assert!(rename_on_disk(&at("l"), &at("b")).is_err());
+        assert_eq!(std::fs::read_to_string(at("b")).unwrap(), "b");
+        assert!(at("d").join("x").is_dir());
+
+        rename_on_disk(&at("a"), &at("c")).unwrap();
+        assert!(!at("a").exists());
+        assert_eq!(std::fs::read_to_string(at("c")).unwrap(), "a");
+    }
+
+    /// #3746 — a link in the OLD data folder (a junction on Windows, a
+    /// symbolic link elsewhere) is settled by the rule as a link and never
+    /// followed: what it leads to stays where it is, and the NEW folder of
+    /// the same name keeps everything it holds.
+    #[test]
+    fn a_link_in_the_old_folder_moves_as_a_link_and_is_never_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        let elsewhere = root.path().join("elsewhere");
+        write_aged(&elsewhere.join("secret.txt"), "secret", DAY);
+        let pairs = config_and_data(&profile);
+        let (old, new) = pairs[1].clone();
+        write_aged(&old.join("other.json"), "other", DAY);
+        folder_link(&old.join("logs"), &elsewhere);
+        write_aged(&new.join("logs").join("today.log"), "today", HOUR);
+
+        let notes = migrate_dirs_within(&profile, &pairs, DataMerge::Runs, rename_on_disk);
+
+        assert!(!old.exists(), "{notes:?}");
+        let secret = listing(&[("secret.txt", "secret")]);
+        assert_eq!(files_below(&elsewhere), secret, "{notes:?}");
+        let link_beside = listing(&[
+            ("logs.older", "<link>"),
+            ("logs/today.log", "today"),
+            ("other.json", "other"),
+        ]);
+        let link_named = listing(&[
+            ("logs", "<link>"),
+            ("logs.older/today.log", "today"),
+            ("other.json", "other"),
+        ]);
+        let found = files_below(&new);
+        assert!(
+            found == link_beside || found == link_named,
+            "{found:?}: {notes:?}"
+        );
+    }
+
+    /// #3746 — a process running elevated from a split token, or one that
+    /// could not read its own token, leaves a data pair's merge to the
+    /// account's own daemon, with a note that says why. A pair it can move
+    /// by one rename still moves, and the account's daemon merges the rest
+    /// at its next start.
+    #[test]
+    fn an_elevated_process_leaves_the_data_merge_to_the_accounts_own_daemon() {
+        for merge in [DataMerge::Elevated, DataMerge::TokenUnread] {
+            let root = tempfile::tempdir().unwrap();
+            let profile = root.path();
+            let pairs = [
+                pair_in(&profile.join("config")),
+                pair_in(&profile.join("roaming")),
+                pair_in(&profile.join("local")),
+            ];
+            write_aged(&pairs[1].0.join("host-mute.json"), "muted", DAY);
+            write_aged(&pairs[1].1.join("logs/today.log"), "today", HOUR);
+            write_aged(&pairs[2].0.join("logs/x.log"), "x", DAY);
+
+            let notes = migrate_dirs_within(profile, &pairs, merge, rename_on_disk);
+
+            let because = merge.left_because().unwrap();
+            let old = pairs[1].0.display().to_string();
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.contains(because) && n.contains(&old)),
+                "{merge:?}: {notes:?}"
+            );
+            let muted = listing(&[("host-mute.json", "muted")]);
+            assert_eq!(files_below(&pairs[1].0), muted, "{notes:?}");
+            let today = listing(&[("logs/today.log", "today")]);
+            assert_eq!(files_below(&pairs[1].1), today, "{notes:?}");
+            assert!(!pairs[2].0.exists(), "{notes:?}");
+            assert!(pairs[2].1.join("logs").join("x.log").is_file(), "{notes:?}");
+
+            // The account's own daemon, at its next start.
+            let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
+            assert!(!pairs[1].0.exists(), "{notes:?}");
+            let both = listing(&[("host-mute.json", "muted"), ("logs/today.log", "today")]);
+            assert_eq!(files_below(&pairs[1].1), both, "{notes:?}");
+        }
+    }
+
+    /// #3746 — only a process running elevated from a split token, or one
+    /// that could not tell, leaves the merge.
+    #[test]
+    fn the_merge_runs_unless_the_process_runs_elevated_from_a_split_token() {
+        assert_eq!(
+            DataMerge::from_split_elevation(Some(false)),
+            DataMerge::Runs
+        );
+        assert_eq!(
+            DataMerge::from_split_elevation(Some(true)),
+            DataMerge::Elevated
+        );
+        assert_eq!(
+            DataMerge::from_split_elevation(None),
+            DataMerge::TokenUnread
+        );
+        assert_eq!(DataMerge::Runs.left_because(), None);
+    }
+
+    /// #3746 — a copy kept beside a name is known by its suffix alone.
+    #[test]
+    fn a_copy_kept_beside_is_known_by_its_suffix() {
+        for name in [
+            "a.older",
+            "a.older-2",
+            "a.older.older",
+            "roomlerd.log.2026-11-22.older-17",
+        ] {
+            assert!(is_kept_beside(name), "{name}");
+        }
+        for name in [
+            "a.older-",
+            "a.olderx",
+            ".older",
+            "a.older-2x",
+            "a.log",
+            "older",
+            "roomlerd.log.2026-11-22",
+        ] {
+            assert!(!is_kept_beside(name), "{name}");
+        }
     }
 }
 

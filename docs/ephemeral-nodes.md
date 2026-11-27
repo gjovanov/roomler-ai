@@ -23,8 +23,8 @@ roomlerd run          … the device works like any other …
         │     • Unix: SIGTERM / SIGINT (e.g. `docker stop`, `systemctl stop`)
         │     • Windows SCM service: SCM Stop / Preshutdown — the service host
         │       signals the worker's stop event and waits (#1683)
-        │       (an update's OWN service stop is not a leave — the device
-        │        stays enrolled; see below)
+        │       (an auto-update's OWN service stop is not a leave — the
+        │        device stays enrolled; see below)
         │     • Windows per-user install (the Scheduled Task): `roomlerd service
         │       stop`, sign-out, shutdown (FR-97 P4d; see below)
         │       → the daemon calls POST /api/agent/self/unenroll
@@ -142,7 +142,7 @@ exec roomlerd run
 - **A per-user Windows install** (the perUser MSI's Scheduled Task) has no
   service host to ask it, so it holds a stop channel of its own and listens for
   the session's end: [below](#a-per-user-windows-install-fr-97-p4d).
-- **An update's own service stop never unenrolls.** The MSI stops the service
+- **An auto-update's own service stop never unenrolls.** The MSI stops the service
   while it replaces the binary — by then the worker that spawned the installer
   has already exited 0 and the SCM host has respawned a fresh one, which receives
   that stop as an OS-initiated stop, indistinguishable from `sc stop`. So the
@@ -152,6 +152,25 @@ exec roomlerd run
   `spawn_installer_with_watch` touches, rollbacks included) keeps the device
   enrolled and logs why. An operator stop inside that window leaves the row to
   the reaper — which is what every Windows-service stop did before #1683.
+- **A perMachine MSI the updater did not launch still unenrolls**
+  ([#4322](https://github.com/gjovanov/roomler-ai/issues/4322)). Run by hand
+  (`msiexec`), by `install.ps1`, by the setup wizard or by an RMM push, it writes
+  no marker: the updater writes one right before it spawns the installer
+  ([`updater.rs:2000`](../agents/roomlerd/src/updater.rs#L2000)). Every run that
+  is not a full removal restarts the service through the SCM
+  (`EnableSystemContext`, `DisableSystemContext` or `KeepSystemContext`,
+  [`wix-perMachine/main.wxs:689-697`](../agents/roomlerd/wix-perMachine/main.wxs#L689-L697)),
+  which stops it when it is running and then starts it
+  ([`win_service/environment.rs:401-408`](../agents/roomlerd/src/win_service/environment.rs#L401-L408)).
+  A major upgrade stops it earlier, when the old product's removal runs
+  `service uninstall --as-service`
+  ([`wix-perMachine/main.wxs:698-700`](../agents/roomlerd/wix-perMachine/main.wxs#L698-L700),
+  [`win_service/lifecycle.rs:293`](../agents/roomlerd/src/win_service/lifecycle.rs#L293)).
+  The worker takes either stop as an OS-initiated stop
+  ([`app.rs:5928-5935`](../agents/roomlerd/src/app.rs#L5928-L5935)), finds no
+  update in flight, and an ephemeral device deletes its own row, the one its
+  run started as
+  ([`app.rs:6027-6036`](../agents/roomlerd/src/app.rs#L6027-L6036)).
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
@@ -186,7 +205,7 @@ flowchart LR
 
 - **Which daemon.** The event is keyed by the config's instance id, the
   fingerprint the single-instance lock already uses
-  ([`instance_lock.rs:92`](../agents/roomlerd/src/instance_lock.rs#L92)). So
+  ([`instance_lock.rs:100`](../agents/roomlerd/src/instance_lock.rs#L100)). So
   `service stop` reaches the daemon of the config it resolved, and no other.
   `Local\` keeps the event in the person's own session, and its default DACL
   lets that person and SYSTEM signal it, which Task Manager already allows them.
@@ -201,9 +220,16 @@ flowchart LR
   stops the daemon.
 - **Why Restart Manager is ignored.** An installer that finds the daemon's files
   in use asks it to close with `ENDSESSION_CLOSEAPP`. Read as a leave, a manual
-  MSI upgrade would delete an ephemeral device, the trap #1683 closed for the
-  service. The auto-updater's own stop is the internal arm, which never
-  unenrolls.
+  MSI upgrade would delete an ephemeral device. The service has the same trap,
+  and #1683 closed it for the auto-updater's installer. A perMachine MSI run by
+  hand, by `install.ps1`, by the setup wizard or by an RMM push still deletes the
+  row ([above](#the-ci--container-recipe),
+  [#4322](https://github.com/gjovanov/roomler-ai/issues/4322)). The
+  auto-updater's own exit is the internal arm, which never unenrolls
+  ([`updater.rs:3471`](../agents/roomlerd/src/updater.rs#L3471)). A stop its
+  installer issues after that takes the OS-initiated arm, and the
+  `update-attempt` marker written before the spawn is what keeps the row
+  ([`updater.rs:2000`](../agents/roomlerd/src/updater.rs#L2000)).
 - **`service uninstall` does not stop the daemon, on purpose.** On a major
   upgrade, Windows Installer runs the old product's uninstall, which runs
   `service uninstall` from the outgoing binary (`UnregisterAutostart` in
@@ -221,6 +247,104 @@ flowchart LR
   takes the name as soon as the old daemon is gone.
 - Kill switch: `ROOMLERD_SESSION_END=0` makes no window, and a sign-out ends the
   daemon unannounced again. `service stop` needs none: it acts only when asked.
+
+## Enrolling again over an existing config (#4331)
+
+A device's `ephemeral` (`crates/agent-core/src/config.rs:45-55`) is what the
+server answered the enrollment that wrote the file, on every enrollment. One
+that folds into a file already there keeps that file's settings and takes the
+rest from the fresh enrollment: the identity fields, and `ephemeral`
+(`preserve_operator_config`, `crates/agent-core/src/enrollment.rs:1049-1062`).
+That covers the three folds of `apply_enrollment` into the primary: onto a file
+with no enrollment in it (a one-row Mac person's), a `--replace`, and a
+re-enrollment into the same server and org. Before #4331 a fold kept the old
+file's flag, so a device enrolled again with the other kind of key disagreed
+with its row. A fold into a second organization never takes an ephemeral
+answer ([below](#a-second-organization-is-never-ephemeral-4352)).
+
+The answer is the row's nature (`EnrollResponse::ephemeral`,
+`crates/modules/fleet/src/agent.rs:337-341`, answered at `:497`), and a row's
+nature is fixed when the row is made:
+
+| The enrollment | The row it gets | The answer, and so the file |
+|---|---|---|
+| An ephemeral key | a new row, always: the key path is create-only, and a known machine id is a 409 | ephemeral |
+| A standard token, and the machine id has no live row | a new device: a new row, or a removed permanent row brought back as one (`revive`). A removed ephemeral row left nothing | permanent |
+| A standard token, and the machine id's row is live and permanent | that row, refreshed (`rehydrate`, `crates/services/src/dao/agent.rs:273-313`) | permanent |
+| A standard token, and the machine id's row is live and **ephemeral** | none: **409**, decided before the single-use token is spent, as the plan cap is (#4352: `refuse_live_ephemeral`, `crates/modules/fleet/src/agent.rs:642-656`, at `:408-410`, and again in every later round of `enroll_row`, `:568`) | nothing; the file is not written |
+
+A re-enrollment keeps the config's machine id
+(`agents/roomlerd/src/app.rs:2925-2932`), so the live row is the one it finds.
+An ephemeral device that enrolls again with a standard token while its row
+lives is therefore refused, and the token stays unused. Refreshed, the row
+would stay ephemeral, and the device, which records the row's kind, would
+remove it at its next stop: a person who meant to make it permanent would lose
+it at the next reboot. To make it permanent, remove it first (the Devices page,
+or a clean stop, on which it deletes itself), then enroll it again: the same
+token still works within its 10 minutes, the same config keeps its settings,
+and the new row is permanent. Before #4352 the token refreshed the live row,
+which stayed ephemeral; before #4331 the server also answered permanent for it,
+the token's kind rather than the row's.
+
+`--ephemeral` beside an existing config is still refused
+(`agents/roomlerd/src/app.rs:2916-2924`): the flag mints a random machine id,
+and a fold would put it on a real device's row.
+
+### A second organization is never ephemeral (#4352)
+
+A secondary org (`[[orgs]]`) has no `ephemeral` (`OrgEntry`,
+`crates/agent-core/src/config.rs:1970-2028`), and a stop removes only the row
+its run started as ([below](#a-stop-removes-only-the-row-its-run-started-as-4352)),
+so nothing would ever remove an ephemeral secondary's row. An enrollment whose
+answer is ephemeral, and which would add an `[[orgs]]` entry or refresh one, is
+refused (`refuse_ephemeral_org`, `crates/agent-core/src/enrollment.rs:796-817`,
+decided in `apply_enrollment` at `:939-945`):
+
+| The answer | The config file | The row |
+|---|---|---|
+| a NEW row (another `agent_id` than the file holds for that server and org, or an org the file does not hold) | unchanged, byte for byte | removed again with the answer's own server and token (`remove_refused_row`, `:798-829`; the server lets it, since the row is ephemeral). The reaper is off by default, so a row left behind would stay |
+| the row the file already holds for that org | unchanged | kept: it is the device's own. Only a server without the 409 above answers this |
+| permanent | folded, as before | the answer's |
+
+The message names the org, says why, says what became of the row, and gives
+the way on: join the org again with a standard token, or enroll it on a config
+of its own. The enrollment has already used its token (or one use of the
+ephemeral key). Every caller of the fold passes its error through the one
+helper, so each refuses and removes alike: `enroll`, `re-enroll`,
+`adopt-enrollment` (the root half of the Linux system and macOS installs),
+`org join`, the setup wizard (in its own process, and in the Windows
+administrator step) and the companion's re-enroll. The primary is unchanged: a
+first enrollment, `--replace`, and the same server and org again take
+`ephemeral` from the answer. A secondary made ephemeral before #4352 stays as it
+is: the device does not know it as ephemeral, and the reaper, where it runs,
+collects its row. `org set-primary` promotes such a secondary as any other,
+since the device cannot tell it, but refuses while the primary is ephemeral
+(#4370, [multi-org.md](multi-org.md#3-p1--the-foundation-orgs-shipped-313)):
+that swap would put an ephemeral row beside another org.
+
+### A stop removes only the row its run started as (#4352)
+
+The daemon keeps the row it started as: its primary's server, org, `agent_id`
+and `ephemeral` (`updater::RunRow`, taken at
+`agents/roomlerd/src/app.rs:4766`). On an OS stop the gate
+(`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
+unchanged) reads the run's own `ephemeral`, and the removal targets the run's
+own row (`updater::stop_removal`, `:5150-5179`, at
+`agents/roomlerd/src/app.rs:6027-6055`):
+
+| The file at the stop | The stop removes |
+|---|---|
+| still names the run's row, as the primary (a renewed token, a re-enrollment of the same row) or as an `[[orgs]]` entry (an `org set-primary` that moved it: since #4370 that command refuses while the primary is ephemeral, so only a file an older agent wrote holds the run's row there) | the run's row, with the file's token, the newest |
+| names another row: a re-enrollment written while the daemon ran, in this org or another | the run's row, with the run's own token; never the file's row |
+| does not load | the run's row, with the run's own token |
+| anything, on a run that started permanent | nothing |
+
+Before #4352 the stop removed the row the FILE named, with the file's token.
+So a re-enrollment written while a daemon ran, followed by any OS stop, removed
+the new row before it ever ran: `enroll` on a Linux system install prints
+`sudo systemctl restart roomlerd`, and that restart was such a stop. The
+internal arm, an update in flight, and a worker with no enrollment remove
+nothing, as before.
 
 ## Quota
 
@@ -255,6 +379,13 @@ device left").
 - A reaped-but-still-running device (unclean-stop survivor, network partition)
   hears **401** on its next control-plane call — its credential died with the
   row — and its self-unenroll treats 401/404 as "already gone".
+- **`sudo roomlerd one-row` refuses an ephemeral row on a Mac** before it
+  changes anything (#4312, [FR-147](fr/FR-147-root-out-of-homes-macos.md)'s
+  "Refusals at Plan"): its restart and its bootout are stops, on which the row
+  deletes itself, and a row it retires sits offline for the reaper, so
+  `--revert` could bring neither back. The way on is the same file: remove the
+  row, then enroll that half again with a standard token
+  ([above](#enrolling-again-over-an-existing-config-4331)).
 - Every reap logs
   `ephemeral device reaped` with tenant, device, silence and TTL; every
   self-removal logs `ephemeral device unenrolled itself`. The lifecycle also

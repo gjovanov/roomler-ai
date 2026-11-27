@@ -12,6 +12,8 @@ is content-bound before the first burst and the refined law's floor guard erodes
 **Parent:** the RC quality program (FR-17/16/14); rides on FR-59's measured pipe and FR-70's
 pump instrumentation.
 
+**Anchors:** master `1c584fb7e` (closed 2026-11-16): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 Scrolling text over a direct, low-latency path is readable while it moves and crisp

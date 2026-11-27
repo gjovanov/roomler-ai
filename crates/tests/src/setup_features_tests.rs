@@ -54,6 +54,7 @@ async fn the_default_shape_is_pairing_on_and_the_wizard_claims_off() {
             "wizard_unix_daemon": false,
             "wizard_pairing": false,
             "wizard_reinstall_guard": true,
+            "wizard_macos_one_row": false,
         })
     );
 }
@@ -79,6 +80,7 @@ async fn each_flag_follows_its_setting() {
             "wizard_unix_daemon": true,
             "wizard_pairing": true,
             "wizard_reinstall_guard": true,
+            "wizard_macos_one_row": false,
         })
     );
 
@@ -113,6 +115,7 @@ async fn each_flag_follows_its_setting() {
             "wizard_unix_daemon": false,
             "wizard_pairing": true,
             "wizard_reinstall_guard": true,
+            "wizard_macos_one_row": false,
         })
     );
 }
@@ -135,6 +138,7 @@ async fn linux_alone_hides_the_cards_from_wizards_released_before_the_split() {
             "wizard_unix_daemon": false,
             "wizard_pairing": false,
             "wizard_reinstall_guard": true,
+            "wizard_macos_one_row": false,
         })
     );
 
@@ -150,6 +154,7 @@ async fn linux_alone_hides_the_cards_from_wizards_released_before_the_split() {
             "wizard_unix_daemon": false,
             "wizard_pairing": false,
             "wizard_reinstall_guard": true,
+            "wizard_macos_one_row": false,
         })
     );
 }
@@ -173,6 +178,7 @@ async fn both_oses_on_turn_every_daemon_key_on() {
             "wizard_unix_daemon": true,
             "wizard_pairing": false,
             "wizard_reinstall_guard": true,
+            "wizard_macos_one_row": false,
         })
     );
 }
@@ -194,6 +200,7 @@ async fn the_legacy_key_turns_both_oses_on() {
             "wizard_unix_daemon": true,
             "wizard_pairing": false,
             "wizard_reinstall_guard": true,
+            "wizard_macos_one_row": false,
         })
     );
 }
@@ -215,6 +222,28 @@ async fn the_reinstall_guard_follows_its_setting() {
             "wizard_unix_daemon": false,
             "wizard_pairing": false,
             "wizard_reinstall_guard": false,
+            "wizard_macos_one_row": false,
+        })
+    );
+}
+
+/// FR-141 P2 — the one-row form's switch follows its setting, off by default
+/// (every object above), and turning it on turns nothing else on: not the
+/// macOS daemon card, and not the guard off.
+#[tokio::test]
+async fn the_macos_one_row_form_follows_its_setting() {
+    let app = TestApp::spawn_with_settings(|s| s.setup.wizard_macos_one_row = true).await;
+    let body: Value = get_anon(&app).await.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "pairing": true,
+            "wizard_linux_daemon": false,
+            "wizard_macos_daemon": false,
+            "wizard_unix_daemon": false,
+            "wizard_pairing": false,
+            "wizard_reinstall_guard": true,
+            "wizard_macos_one_row": true,
         })
     );
 }

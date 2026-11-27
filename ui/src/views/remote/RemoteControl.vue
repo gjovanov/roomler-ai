@@ -29,7 +29,7 @@
         variant="text"
         class="rc-tb-back"
         :to="isExternal ? { name: 'connect' } : { name: 'devices', params: { tenantId } }"
-        :aria-label="isExternal ? 'Back to Connect' : 'Back to Agents'"
+        :aria-label="isExternal ? 'Back to Connect' : 'Back to Devices'"
       />
       <v-toolbar-title class="d-flex align-center text-truncate">
         <v-icon :color="statusColor" size="small" class="mr-2 flex-shrink-0 rc-tb-dot">
@@ -43,7 +43,7 @@
         <!-- FR-52 P4e — an outsider knows the device by its connect code
              only; its name and OS are its organization's to show. -->
         <span v-if="isExternal" class="text-truncate">{{ externalCode || 'Device' }}</span>
-        <span v-else class="text-truncate">{{ agent?.display_name || agent?.name || 'Agent' }}</span>
+        <span v-else class="text-truncate">{{ agent?.display_name || agent?.name || 'Device' }}</span>
         <!-- OS + version subtitle hidden on phone-sized viewports;
              they're useful context on a desktop but on mobile they
              push Connect/Disconnect off the right edge. -->
@@ -51,7 +51,7 @@
           <template v-if="secondaryDeviceName(agent, hideDeviceName)">
             {{ agent.name }} ·
           </template>
-          {{ agent.os }} · {{ agent.agent_version || '—' }}
+          {{ agent.os }} · {{ reportedVersion(agent.agent_version) ?? VERSION_NOT_REPORTED }}
         </span>
       </v-toolbar-title>
       <v-spacer />
@@ -133,7 +133,7 @@
         variant="flat"
         prepend-icon="mdi-shield-account"
         class="mr-2"
-        :title="`Agent thread is bound to ${rc.currentDesktop.value} — type the host's password to unlock`"
+        :title="`roomlerd's thread is bound to ${rc.currentDesktop.value} — type the host's password to unlock`"
       >
         On {{ rc.currentDesktop.value }}
       </v-chip>
@@ -1115,7 +1115,7 @@
           @dismiss="dismissRating"
         />
         <p v-if="agent && !agent.is_online" class="text-caption text-medium-emphasis">
-          This agent is currently offline. The session will fail until the agent
+          This device is currently offline. The session will fail until the device
           reconnects.
         </p>
         <!-- Not offered right after the person at the device ended the session
@@ -1446,9 +1446,9 @@
         </div>
         <div v-else-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
-          <p class="text-body-1 mt-3">Connected — waiting for agent to publish a video track.</p>
+          <p class="text-body-1 mt-3">Connected — waiting for roomlerd to publish a video track.</p>
           <p class="text-caption text-medium-emphasis mt-1">
-            The agent needs to be built with the media feature
+            roomlerd needs to be built with the media feature
             (<code>--features media</code>) to send video.
             Input events flow as soon as the input channel is open.
           </p>
@@ -1561,14 +1561,14 @@
                explanation instead. -->
           <div class="text-caption text-medium-emphasis mb-3">
             <template v-if="nativeSourceLabel">
-              Agent native source: <strong>{{ nativeSourceLabel }}</strong>.
+              Host native source: <strong>{{ nativeSourceLabel }}</strong>.
               Values above this are capped to native — the capture
               backend cannot upscale.
             </template>
             <template v-else>
-              Agent's native dimensions haven't been observed yet — they
+              The host's native dimensions haven't been observed yet — they
               show up after the first decoded frame. Values larger than
-              the agent's panel resolution will be silently capped.
+              the host's panel resolution will be silently capped.
             </template>
           </div>
           <div class="d-flex align-center mb-3">
@@ -1625,7 +1625,7 @@
           >
             <v-icon size="small" class="mr-1">mdi-alert-circle-outline</v-icon>
             {{ customResolutionW }} × {{ customResolutionH }} exceeds native
-            {{ nativeSourceLabel }}. The agent will cap at native — applying
+            {{ nativeSourceLabel }}. roomlerd will cap at native — applying
             this value is equivalent to picking "Original resolution".
           </div>
         </v-card-text>
@@ -1939,7 +1939,7 @@
             density="compact"
             hide-details="auto"
             label="Frame age (end to end)"
-            :messages="statsAgeLabel || 'e.g. ~4 ms — needs agent 0.4.9+'"
+            :messages="statsAgeLabel || 'e.g. ~4 ms — needs roomlerd 0.4.9+'"
           />
           <v-checkbox
             v-model="metrics.paint"
@@ -2116,7 +2116,7 @@
                 (agentSupportsBrowse
                   ? 'Browse remote files (download)'
                   : isLegacyFileDc
-                    ? 'Browse needs agent 0.3.0+ — upgrade host agent'
+                    ? 'Browse needs roomlerd 0.3.0+ — update it on the host'
                     : 'Browse disabled by host config')
               "
               class="mb-2"
@@ -2146,7 +2146,7 @@
               :title="
                 agentAppsCaps.includes('list')
                   ? 'List, focus or launch apps on the controlled host'
-                  : 'Remote apps were not available when this agent announced itself — open to see why'
+                  : 'Remote apps were not available when roomlerd on this device announced itself — open to see why'
               "
               class="mb-2"
               @click="openAppsDialog(); settingsOpen = false"
@@ -2160,7 +2160,7 @@
               class="mb-2"
               @click="openAgentLogDialog(); settingsOpen = false"
             >
-              Agent logs
+              Daemon logs
             </v-btn>
           </template>
           </v-tabs-window-item>
@@ -2274,7 +2274,7 @@
                 v-for="t in rc.appsCoverage.value.missing_tools"
                 :key="t.tool"
               >
-                <strong>{{ t.tool }}</strong> is not installed on the agent
+                <strong>{{ t.tool }}</strong> is not installed on the
                 host — {{ t.blocks }} ({{ t.install }})
               </div>
             </v-alert>
@@ -2305,7 +2305,7 @@
         <v-toolbar density="compact" color="primary" :extended="dialogFullscreen">
           <v-icon class="ml-4">mdi-file-document-outline</v-icon>
           <v-toolbar-title>
-            Agent log
+            Daemon log
             <span
               v-if="!dialogFullscreen && rc.agentLogs.value?.path"
               class="ml-2 text-caption text-truncate"
@@ -2501,6 +2501,9 @@
       <div v-if="dirError" class="pa-3 text-error text-caption">
         {{ dirError }}
       </div>
+      <div v-else-if="dirCapped" class="pa-3 text-caption text-medium-emphasis" data-testid="files-capped">
+        {{ dirEntries.length.toLocaleString() }} of this folder's entries are shown; it holds more.
+      </div>
       <v-progress-linear v-if="dirLoading" indeterminate />
       <v-list density="compact" class="pa-0">
         <v-list-item
@@ -2580,6 +2583,7 @@ import { takeExternalSession } from '@/composables/useExternalLogin'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
 import { peerAuthBadge } from '@/utils/peerAuth'
+import { VERSION_NOT_REPORTED, reportedVersion } from '@/utils/deviceVersion'
 import { claimRcResume, notifyRcReloadSurface, registerRcReloadSurface } from '@/utils/staleBuildWatch'
 import type { RcReloadSurface } from '@/utils/staleBuildPolicy'
 import {
@@ -2609,6 +2613,7 @@ import {
   thisDevicesFromPick,
 } from '@/composables/useRemoteControl'
 import { offersBreakGlass } from '@/composables/breakGlass'
+import { createLatest } from '@/composables/remoteDirListing'
 import {
   PICKER_CHROMAS,
   PICKER_CODECS,
@@ -3286,7 +3291,7 @@ async function refreshAgentLog() {
     await nextTick()
     scrollAgentLogToBottom()
   } catch (e) {
-    showError(`Failed to fetch agent log: ${e instanceof Error ? e.message : String(e)}`)
+    showError(`Failed to fetch the daemon log: ${e instanceof Error ? e.message : String(e)}`)
   }
 }
 
@@ -3300,7 +3305,7 @@ async function copyAgentLog() {
   if (!lines || lines.length === 0) return
   try {
     await navigator.clipboard.writeText(lines.join('\n'))
-    showSuccess('Agent log copied to clipboard')
+    showSuccess('Daemon log copied to clipboard')
   } catch (e) {
     showError(`Copy failed: ${e instanceof Error ? e.message : String(e)}`)
   }
@@ -3310,6 +3315,8 @@ async function copyAgentLog() {
 const filesDrawer = ref(false)
 const dirLoading = ref(false)
 const dirError = ref<string | null>(null)
+// The folder held more entries than the agent lists (#4121).
+const dirCapped = ref(false)
 const dirEntries = ref<{ name: string; is_dir: boolean; size: number | null; mtime_unix: number | null }[]>([])
 const currentDirPath = ref('')
 const currentParent = ref<string | null>(null)
@@ -3326,8 +3333,11 @@ const isRootsView = ref(false)
 const dirPathInput = ref('')
 const selectedDirEntries = ref<Set<string>>(new Set())
 let lastSelectedDirIndex: number | null = null
+// Which navigation's answer may still change the drawer (#4121).
+const dirNavigations = createLatest()
 
 async function navigateTo(path: string) {
+  const isCurrent = dirNavigations.begin()
   dirLoading.value = true
   dirError.value = null
   selectedDirEntries.value = new Set()
@@ -3338,16 +3348,20 @@ async function navigateTo(path: string) {
   const requestingRoots = isRootsRequest(path)
   try {
     const listing = await rc.listDir(path)
+    if (!isCurrent()) return
     currentDirPath.value = listing.path
     currentParent.value = listing.parent
     isRootsView.value = requestingRoots
     dirPathInput.value = listing.path
     dirEntries.value = listing.entries
+    dirCapped.value = listing.capped === true
   } catch (e) {
+    if (!isCurrent()) return
     dirError.value = (e as Error).message
     dirEntries.value = []
+    dirCapped.value = false
   } finally {
-    dirLoading.value = false
+    if (isCurrent()) dirLoading.value = false
   }
 }
 
@@ -3415,9 +3429,9 @@ function downloadLabel(entry: { name: string; is_dir: boolean }): string {
   if (entry.is_dir) {
     return agentSupportsFolderDownload.value
       ? `Download ${entry.name} as zip (Chrome/Edge only)`
-      : 'Folder download needs agent 0.3.0+'
+      : 'Folder download needs roomlerd 0.3.0+'
   }
-  return agentSupportsDownload.value ? `Download ${entry.name}` : 'Download needs agent 0.3.0+'
+  return agentSupportsDownload.value ? `Download ${entry.name}` : 'Download needs roomlerd 0.3.0+'
 }
 
 async function downloadEntry(entry: { name: string; is_dir: boolean }) {
@@ -3754,7 +3768,7 @@ const audioTooltip = computed<string>(() => {
     // its OS); an older agent leaves only the build to blame.
     return (
       hostReason(agent.value?.capabilities, 'audio') ??
-      'This agent does not advertise audio support (needs an agent built with the audio feature) — receive-audio unavailable'
+      'roomlerd on this device does not advertise audio support (it needs a build with the audio feature) — receive-audio unavailable'
     )
   }
   if (sessionLive.value) {
@@ -3781,8 +3795,8 @@ const localRelayTooltip = computed<string>(() => {
     return 'Corp relay assist — disconnect to change (takes effect on next Connect)'
   }
   return localRelayOn.value
-    ? 'Corp relay assist ON — when a direct path can\'t form (UDP-blocked corporate network), relay through this device\'s local agent over the overlay instead of the capped far relay. Takes effect on next Connect.'
-    : 'Corp relay assist OFF — click to relay through this device\'s local agent when direct fails (needs an enrolled agent with an overlay on this machine). Takes effect on next Connect.'
+    ? 'Corp relay assist ON — when a direct path can\'t form (UDP-blocked corporate network), relay through this device\'s own roomlerd over the overlay instead of the capped far relay. Takes effect on next Connect.'
+    : 'Corp relay assist OFF — click to relay through this device\'s own roomlerd when direct fails (needs roomlerd enrolled with an overlay on this machine). Takes effect on next Connect.'
 })
 function toggleLocalRelay() {
   rc.setLocalRelayEnabled(!localRelayOn.value)
@@ -3824,7 +3838,7 @@ const localRelayRefusedText = computed<string | null>(() => {
     device_offline: 'that device is offline, or reports no relay',
     // FR-128 — also `auto` on an agent too old to decide it, which reads as off.
     rc_overlay_off:
-      'this device does not let remote desktop use the mesh (rc_overlay off, or auto on an agent that predates it)',
+      'this device does not let remote desktop use the mesh (rc_overlay off, or auto on a roomlerd that predates it)',
     same_device: 'you are viewing the device this browser runs on',
   }
   return `The local relay was not used: ${reasons[why] ?? why}.`
@@ -3847,7 +3861,7 @@ const clipboardAutoSyncTooltip = computed<string>(() => {
   return rc.supportsClipboardEvents.value
     ? base
     : base +
-        ' This agent is older — remote→local auto-sync needs an agent upgrade; local→remote still syncs.'
+        ' roomlerd on this device is older — remote→local auto-sync needs a roomlerd update; local→remote still syncs.'
 })
 function toggleClipboardAutoSync() {
   rc.setClipboardAutoSyncEnabled(!clipboardAutoSyncOn.value)
@@ -4271,10 +4285,10 @@ const resolutionSettingHint = computed<string>(() => {
   // lifts it, ahead of the native-dims note.
   const { w, h } = decodedDims.value
   const override = resolutionOverrideHint(rc.videoInfo.value, w, h)
-  if (override) return `${override} Agent native ${native}.`
+  if (override) return `${override} Host native ${native}.`
   return customTargetExceedsNative.value
-    ? `Agent native ${native} — custom target exceeds this; capped at native`
-    : `Agent native ${native}`
+    ? `Host native ${native} — custom target exceeds this; capped at native`
+    : `Host native ${native}`
 })
 
 /** Bind callback for the webcodecs canvas ref. Vue calls this with
@@ -4470,10 +4484,10 @@ const resolutionPresetValue = computed<string>({
 const resolutionButtonTitle = computed(() => {
   const s = rc.resolution.value
   const native = nativeSourceLabel.value
-  const nativeHint = native ? ` — agent native ${native}` : ''
-  if (s.mode === 'original') return `Agent streams at native monitor resolution${nativeHint}`
+  const nativeHint = native ? ` — host native ${native}` : ''
+  if (s.mode === 'original') return `The host streams at native monitor resolution${nativeHint}`
   if (s.mode === 'fit') {
-    return `Agent downscales to fit local viewport (currently ${s.width ?? '?'} × ${s.height ?? '?'})${nativeHint}`
+    return `The host downscales to fit local viewport (currently ${s.width ?? '?'} × ${s.height ?? '?'})${nativeHint}`
   }
   const capped = customTargetExceedsNative.value
     ? ` — exceeds native ${native}, will be capped at native (no upscale)`
@@ -4616,7 +4630,7 @@ const displayMatchTooltip = computed<string>(() => {
   if (!agentSupportsDisplayMatch.value) {
     return displayMatchUnavailable.value
       ? `Match remote display — ${displayMatchUnavailable.value}`
-      : 'Match remote display — this agent is too old to say whether its display can be switched'
+      : 'Match remote display — roomlerd on this device is too old to say whether its display can be switched'
   }
   // FR-108 — the device decides (its owner's setting, and whether someone is
   // using the screen); say what it answered when it has.
@@ -5321,7 +5335,7 @@ const isLegacyFileDc = computed(() => agentFilesCaps.value.length === 0)
 const filesWhy = computed<string | null>(() => {
   if (filesRefusal.value) return filesRefusal.value
   if (agentSupportsBrowse.value) return null
-  return isLegacyFileDc.value ? 'Browse needs agent 0.3.0+ — upgrade host agent' : 'Browse disabled by host config'
+  return isLegacyFileDc.value ? 'Browse needs roomlerd 0.3.0+ — update it on the host' : 'Browse disabled by host config'
 })
 
 // #1631 — the device this view is for, wherever it lives: the cached page
@@ -5346,9 +5360,9 @@ function saysNoSuchDevice(e: unknown): boolean {
 async function loadAgent() {
   // FR-52 P4e — an outsider has no tenant to list devices from.
   if (isExternal) return
-  if (!agentStore.agents.length) {
-    await agentStore.fetchAgents(tenantId.value)
-  }
+  // #4257 — this org's devices, waited for while their fetch is in flight, so
+  // the view holds the store's own row (a list of another org's is not empty).
+  await agentStore.ensureAgents(tenantId.value)
   try {
     agent.value = await resolveAgent()
   } catch (e) {

@@ -153,7 +153,9 @@ async fn enroll_revives_soft_deleted_agent() {
     let revived: Value = resp.json().await.unwrap();
     assert_eq!(revived["agent_id"].as_str().unwrap(), first_agent_id);
 
-    // Admin list now shows the revived row with the new name + version.
+    // Admin list now shows the revived row with the new name, and the
+    // program that enrolled it. #3565: the row's version is its daemon's own,
+    // and this device's daemon has not connected, so it has none yet.
     let list: Value = app
         .auth_get(
             &format!("/api/tenant/{}/agent", seeded.tenant_id),
@@ -169,7 +171,12 @@ async fn enroll_revives_soft_deleted_agent() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"].as_str().unwrap(), first_agent_id);
     assert_eq!(items[0]["name"].as_str().unwrap(), "corp3_laptop");
-    assert_eq!(items[0]["agent_version"].as_str().unwrap(), "0.2.7");
+    assert_eq!(items[0]["agent_version"].as_str().unwrap(), "");
+    assert_eq!(
+        items[0]["enrolling_program"],
+        json!({ "name": "unknown", "version": "0.2.7" }),
+        "a request without the field names only its own version"
+    );
 }
 
 #[tokio::test]
@@ -1181,6 +1188,121 @@ async fn an_unconfigured_device_reports_no_policy_rather_than_a_root_default() {
         "an unconfigured device must not report an ssh policy — the model \
          default is `daemon`, and the dialog would pre-select it: {row}"
     );
+}
+
+/// #4218 — the two SSH writes decide their bit before they read their body
+/// at all: a device's SSH policy (`MANAGE_AGENTS`, before the device is looked
+/// up) and the org's SSH switch (`MANAGE_TENANT`, which an org admin does not
+/// hold). A member without the bit gets the one 403 `forbidden` for a body
+/// that does not even parse, the answer a body the route reads gets, and
+/// someone outside the org the one `not_a_member`. While both took `Json<T>`
+/// as an extractor, axum answered such a body before the handler ran, with a
+/// 400, 415 or 422 decided by the body alone.
+#[tokio::test]
+async fn the_ssh_writes_decide_the_bit_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems, person_with_role,
+    };
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("sshgate-unparsed").await;
+    let other = app.seed_tenant("sshgate-unparsed-b").await;
+    let org_admin = person_with_role(&app, &seeded, "orgadmin", "admin").await;
+    let device = bson::oid::ObjectId::new().to_hex();
+    let policy = GatedWrite {
+        method: "PUT",
+        path: format!("/api/tenant/{}/agent/{device}/ssh-policy", seeded.tenant_id),
+        reads: json!({}),
+        refused_field: r#"{"can_originate": 7}"#,
+    };
+    let switch = GatedWrite {
+        method: "PUT",
+        path: format!("/api/tenant/{}/ssh-settings", seeded.tenant_id),
+        reads: json!({ "remote_ssh_enabled": false }),
+        refused_field: r#"{"remote_ssh_enabled": 7}"#,
+    };
+    let member = &seeded.member.access_token;
+    let outsider = &other.admin.access_token;
+
+    let mut wrong = Vec::new();
+    for (who, token, gate, write) in [
+        (
+            "a member without the bit",
+            member,
+            Gate::Bit("MANAGE_AGENTS"),
+            &policy,
+        ),
+        ("another org's owner", outsider, Gate::NotAMember, &policy),
+        (
+            "a member without the bit",
+            member,
+            Gate::Bit("MANAGE_TENANT"),
+            &switch,
+        ),
+        (
+            "an org admin",
+            &org_admin.access_token,
+            Gate::Bit("MANAGE_TENANT"),
+            &switch,
+        ),
+        ("another org's owner", outsider, Gate::NotAMember, &switch),
+    ] {
+        wrong.extend(gate_problems(&app, who, token, gate, write).await);
+    }
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4218's control. The owner is answered a body that does not parse exactly
+/// as axum's `Json` extractor answers it on both SSH writes, the status and
+/// the plain-text words, whether or not the device exists, and the org's SSH
+/// switch stays off.
+#[tokio::test]
+async fn the_ssh_writes_answer_a_holder_a_body_that_does_not_parse_as_the_json_extractor_answers_it()
+ {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_network::routes::agent_ssh::{OrgSshSettings, SshPolicyBody};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("sshgate-unparsed-holder").await;
+    let owner = &seeded.admin.access_token;
+    let (enrolled, _token) = enroll_helper(&app, &seeded, "mach-sshgate-holder", "Gate Box").await;
+    let switch = format!("/api/tenant/{}/ssh-settings", seeded.tenant_id);
+
+    let mut wrong = Vec::new();
+    for device in [enrolled, bson::oid::ObjectId::new().to_hex()] {
+        let policy = format!("/api/tenant/{}/agent/{device}/ssh-policy", seeded.tenant_id);
+        wrong.extend(
+            holder_problems::<SshPolicyBody>(
+                &app,
+                owner,
+                "PUT",
+                &policy,
+                r#"{"can_originate": 7}"#,
+            )
+            .await,
+        );
+    }
+    wrong.extend(
+        holder_problems::<OrgSshSettings>(
+            &app,
+            owner,
+            "PUT",
+            &switch,
+            r#"{"remote_ssh_enabled": 7}"#,
+        )
+        .await,
+    );
+    assert_no_problems("a holder of the bit", &wrong);
+
+    let settings: Value = app
+        .auth_get(&switch, owner)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings["remote_ssh_enabled"], false, "{settings}");
 }
 
 // ────────────────────────────────────────────────────────────────────────────

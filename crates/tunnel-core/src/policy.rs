@@ -209,7 +209,7 @@ pub fn check_forward_request(
         return GateResult::Reject {
             kind: RejectKind::CrossTenant,
             reason: format!(
-                "client tenant {} ≠ agent tenant {}",
+                "client tenant {} ≠ device tenant {}",
                 client_tenant_id, agent.tenant_id
             ),
         };
@@ -218,13 +218,13 @@ pub fn check_forward_request(
     if agent.deleted_at.is_some() {
         return GateResult::Reject {
             kind: RejectKind::AgentError,
-            reason: "agent has been deleted".into(),
+            reason: "device has been deleted".into(),
         };
     }
     if matches!(agent.status, AgentStatus::Quarantined) {
         return GateResult::Reject {
             kind: RejectKind::AgentError,
-            reason: "agent is quarantined".into(),
+            reason: "device is quarantined".into(),
         };
     }
     // 3. ACL eval
@@ -233,7 +233,7 @@ pub fn check_forward_request(
         None => {
             return GateResult::Reject {
                 kind: RejectKind::AgentError,
-                reason: "agent missing _id".into(),
+                reason: "device missing _id".into(),
             };
         }
     };
@@ -954,7 +954,7 @@ mod tests {
             os: OsKind::Linux,
             arch: None,
             arch_emulated: false,
-            agent_version: "0".into(),
+            agent_version: Some("0".into()),
             companion_version: None,
             keep_busy: None,
             power: None,
@@ -964,6 +964,7 @@ mod tests {
             agent_token_hash: String::new(),
             token_gen: 0,
             token_exp: None,
+            token_rotation: None,
             status,
             last_seen_at: DateTime::now(),
             last_presence: None,
@@ -976,6 +977,7 @@ mod tests {
             ssh_service: None,
             enrolled_with_jti: None,
             install: None,
+            enrolling_program: None,
             ssh_policy: Default::default(),
             peer_relay_policy: Default::default(),
             external_access_policy: Default::default(),
@@ -1098,6 +1100,82 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// FR-133 P2d: the gate's four refusal reasons reach a person. The server
+    /// sends each to the tunnel client, which prints it (`driver.rs`'s
+    /// `rc:tunnel.tcp.reject` warning, `udp.rs`'s "udp forward rejected"
+    /// error), and the tunnel audit stores it. So each names the device, never
+    /// an "agent". The kinds are wire names and stay. None may read as the
+    /// client's session-death signal either: `driver.rs`'s
+    /// `is_session_gone_reject` ends the whole session on an `AgentError` whose
+    /// reason holds one of the three phrases below, and a gate refusal refuses
+    /// one flow.
+    #[test]
+    fn gate_refusal_reasons_say_device_not_agent() {
+        use roomler_ai_remote_control::signaling::{
+            REJECT_REASON_NO_SESSION, REJECT_REASON_SESSION_GONE, REJECT_REASON_SESSION_MISMATCH,
+        };
+        let tenant = ObjectId::new();
+        let client_tenant = ObjectId::new();
+        let mut no_id = agent_for(tenant, AgentStatus::Online, false);
+        no_id.id = None;
+        let cases = [
+            (
+                client_tenant,
+                agent_for(tenant, AgentStatus::Online, false),
+                RejectKind::CrossTenant,
+                format!("client tenant {client_tenant} ≠ device tenant {tenant}"),
+            ),
+            (
+                tenant,
+                agent_for(tenant, AgentStatus::Online, true),
+                RejectKind::AgentError,
+                "device has been deleted".to_string(),
+            ),
+            (
+                tenant,
+                agent_for(tenant, AgentStatus::Quarantined, false),
+                RejectKind::AgentError,
+                "device is quarantined".to_string(),
+            ),
+            (
+                tenant,
+                no_id,
+                RejectKind::AgentError,
+                "device missing _id".to_string(),
+            ),
+        ];
+        for (client, agent, want_kind, want_reason) in cases {
+            let (kind, reason) = match check_tcp(
+                client,
+                &agent,
+                &[allow_all_policy_for(tenant)],
+                &subject(ObjectId::new()),
+                "db",
+                5432,
+            ) {
+                GateResult::Reject { kind, reason } => (kind, reason),
+                r => panic!("expected the refusal {want_reason:?}, got {r:?}"),
+            };
+            assert_eq!(kind, want_kind, "{reason:?}");
+            assert_eq!(reason, want_reason);
+            assert!(reason.contains("device"), "{reason:?} names no device");
+            assert!(
+                !reason.to_ascii_lowercase().contains("agent"),
+                "{reason:?} says agent"
+            );
+            for phrase in [
+                REJECT_REASON_SESSION_GONE,
+                REJECT_REASON_NO_SESSION,
+                REJECT_REASON_SESSION_MISMATCH,
+            ] {
+                assert!(
+                    !reason.contains(phrase),
+                    "{reason:?} reads as session death ({phrase:?})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -11,13 +11,14 @@ criterion is ticked with its evidence (§11). The operator keeps every decision 
 
 This page is the engineering reference. The decisions and their evidence are in the spec,
 [FR-131](fr/FR-131-hub-coordinator.md) (#3127), and for process hygiene, the host budget, the
-mailbox and the idle handoff (§12) in [FR-136](fr/FR-136-hub-process-hygiene.md) (#3457). The FR
+mailbox and the idle handoff (§12) in [FR-136](fr/FR-136-hub-process-hygiene.md) (#3457), and for
+the cold rotation (§12.5) in [FR-152](fr/FR-152-cold-hub-continues-from-handoff.md) (#4290). The FR
 rules that every FR worker follows are in
 [`fr/README.md`](fr/README.md) and [`.claude/agents/fr-worker.md`](../.claude/agents/fr-worker.md).
 The tooling is **not in this repo**: on 2026-10-30 the operator decided it stays local for now, in
 the user's Claude skills folder, with a source history of its own. Its files are cited below by
 section name (`SKILL.md §Signals`), never by line.
-*As of Claude Code 2.1.314, the hub skill of 2026-11-05, `hub-view` 0.4.1 and `hub-guard` 0.4.3.*
+*As of Claude Code 2.1.322, the hub skill of 2026-11-23, `hub-view` 0.4.1 and `hub-guard` 0.6.0.*
 
 ## 1. What it is, and why sessions
 
@@ -69,8 +70,8 @@ only when a local branch matches `^fr-?<N>`.
 | **Build slots** `cargo-slot.sh` | same | One host-wide FIFO pool of build slots that every hub shares (§12.2). |
 | **Navigator** `hubs.mjs` | same, run as `hubs` | A terminal program with no dependencies: every hub, then one hub's workers grouped by what they need, then one worker, in one window, with a filter across every hub. It answers, cleans up, opens and attaches in the same window (§8.1). |
 | **Hub view** `hub-view` | `~/.claude/skills/hub-view/` | A function-hooks plugin. `/hub` with no arguments opens a pane with the host strip and one question list across hubs. A question enters its worker, which the operator can answer through its mailbox, activate, deactivate, attach to, or clean up after (§8.2). |
-| **Guard** `hub-guard` | `~/.claude/skills/hub-guard/` | A function-hooks plugin in every session. It ends what a stopped, interrupted or timed-out call started, refuses a bare build in a worker, delivers a worker's mail, and gates the idle handoff (§12). |
-| **Idle handoff** `hub-handoff` | `~/.claude/skills/hub-handoff/` | The skill the auto-handoff plugin runs in a session that sat idle; what it writes depends on whether the session is a worker, a hub or neither (§12.4). |
+| **Guard** `hub-guard` | `~/.claude/skills/hub-guard/` | A function-hooks plugin in every session. It ends what a stopped, interrupted or timed-out call started, refuses a bare build in a worker, delivers a worker's mail, runs and gates the idle handoff (§12.4), and rotates a hub coordinator whose cache went cold: it drops a tick, a worker's message or a task notification, keeping a message or a notification in the hub's cold inbox, then runs `/clear` and `/hub resume <id> cold` (§12.5). |
+| **Idle handoff** `hub-handoff` | `~/.claude/skills/hub-handoff/` | The skill hub-guard runs 45 minutes after a session's last model request, while its prompt cache is still warm; what it writes depends on whether the session is a worker, a hub or neither (§12.4). |
 
 Each tool folder is a git work tree whose repository sits outside it, so git's own writes never
 land in a folder Claude Code watches.
@@ -83,9 +84,10 @@ its folder:
 | `state.json` | `hub.mjs` only, run by the hub or by the view | The registry: the hub's session name and permission mode, the config (tiers, effort, thresholds, slots), the flags, the queue, and each worker with its tier, worktree, branch, PR, state and every generation's session. |
 | `status.json` | `hub.mjs status` | The last measurement: totals, account windows, free disk, every recommendation and every worker's view. |
 | `board.md` · `board.txt` | `hub.mjs status` | The board, as the hub issue's body and as text for the terminal. |
-| `events.log` | `hub.mjs` | One tab-separated line per action: init, add, spawn, stop, respawn, set. |
+| `events.log` | `hub.mjs`, and hub-guard's `cold` part | One tab-separated line per action: init, add, spawn, stop, respawn, set, and each cold rotation or let-through (§12.5). |
 | `issue-body.md` | the hub, each tick | The hub issue's body as last read, the input to `sync`. |
-| `hub-handoff.md` | the hub | Only what the hub was in the middle of, when its own context is rotated. |
+| `hub-handoff.md` | the hub | Only what the hub was in the middle of, when its own context is rotated: dated blocks, of which a cold resume reads the newest alone, and `hub.mjs cold` moves all but the newest three to `hub-handoff.archive.md`. Each turn the operator started adds a person-turn line to the newest block (§12.5). |
+| `cold-inbox/` | hub-guard; a resume or a tick moves each file it read to `read/` | Each worker's message or task notification that hub-guard kept while it rotated a cold coordinator, verbatim, and `tasks.md` (§12.5). |
 | `workers/<W>/brief.md` | the hub | The worker's whole world (§3). |
 | `workers/<W>/status.json` | the worker only | Its plan, heartbeat, state, phase, `next`, what it is blocked on, its open question, its claims, and what the operator owes. |
 | `workers/<W>/handoff-g<N>.md` | the worker, or `spawn --from-status` | Generation N's handoff to N+1. |
@@ -363,6 +365,12 @@ The machine has a budget of its own, shared by every hub: live sessions, free me
 CPU, and the build slots (§12.2). A worker that sits idle long enough is handed off by the idle
 handoff, unless the hub would not hand it off either (§12.4).
 
+The coordinator rotates too: at `HUB_CTX` it writes its handoff and asks the operator for `/clear`
+and `/hub resume <id>`. Once its cache has gone cold, hub-guard does that by itself for a tick, a
+worker's message or a task notification that would re-read the whole context: it drops the prompt,
+keeping a message or a notification in the hub's cold inbox, clears the session and runs
+`/hub resume <id> cold`, which continues from the newest handoff block (§12.5).
+
 ## 8. The hub view
 
 The operator sees the hubs in two places. **`hubs`**, the navigator, runs in a terminal and lists
@@ -583,7 +591,7 @@ four are in the generic skill, and two are specific to this repo and are kept he
 | 3 | **Anchor churn.** PRs that move a heavily anchored file conflict with each other, and with master, in many docs at once. | 24 docs anchor into `agents/roomlerd/src/app.rs`. After one merge to master, FR-16 L1's PR ([#3155](https://github.com/gjovanov/roomler-ai/pull/3155)) conflicted in 16 docs. FR-55 P4's conflicted in 4 to 11 docs a round. Every hunk differed only in anchor numbers. | One of the two methods in §11.2, each with its cross-check. Merging soon after green (lesson 2) keeps the rounds few. | here (repo-specific) |
 | 4 | **Disk.** Container target volumes grow fast. | One worker held about 72 GB: a 39 GB target volume, a 30 GB native target and a 3 GB image. The hub read C: falling 21 GB in 11 minutes. | Every brief tells the worker to run `df` before each build, build one feature set at a time, send `BLOCKED: disk` under 45 GB free, and tear down its containers, volumes and images at park. Under pressure, the hub may delete a parked or done worker's regenerable target cache, never a running one's. One such cache gave back 16 GB. The budget hold starts nothing under 40 GB free (§7). | `SKILL.md §Rails` |
 | 5 | **Missed cron fires can arrive back to back.** | While the hub was busy, the heartbeat's missed fires came in one after another, which reads like a doubled cron. | It is not a second cron: `CronList` shows one. Never add another. | `SKILL.md §Start` (Heartbeat) |
-| 6 | **Known flakes are not the worker's failure.** | The macOS lane's `thread_dump` test failed on three of the run's PRs ([#3148](https://github.com/gjovanov/roomler-ai/pull/3148), [#3151](https://github.com/gjovanov/roomler-ai/pull/3151), #3155). On the loaded dev box, `exec::tests::concurrency_cap_refuses_rather_than_queues` ([`agents/roomlerd/src/exec.rs:3226`](../agents/roomlerd/src/exec.rs#L3226)) failed a native Windows `cargo test -p roomlerd --lib` for two workers. | Re-run the macOS job (`gh run rerun <run> --failed`) until it is green, and never merge red. The exec test passes alone. It also still fails with the PR's own tests skipped, which rules the PR out, and CI's Windows lane is the gate of record. | here (repo-specific) |
+| 6 | **Known flakes are not the worker's failure.** | The macOS lane's `thread_dump` test failed on three of the run's PRs ([#3148](https://github.com/gjovanov/roomler-ai/pull/3148), [#3151](https://github.com/gjovanov/roomler-ai/pull/3151), #3155). On the loaded dev box, `exec::tests::concurrency_cap_refuses_rather_than_queues` ([`agents/roomlerd/src/exec.rs:3267`](../agents/roomlerd/src/exec.rs#L3267)) failed a native Windows `cargo test -p roomlerd --lib` for two workers. | Re-run the macOS job (`gh run rerun <run> --failed`) until it is green, and never merge red. The exec test passes alone. It also still fails with the PR's own tests skipped, which rules the PR out, and CI's Windows lane is the gate of record. | here (repo-specific) |
 
 ### 11.1 Merge and deploy, once a PR is ready
 
@@ -785,15 +793,15 @@ every backtick and `$(…)` inside it, the failure that started FR-136.
 
 ### 12.4 The idle handoff
 
-The third-party auto-handoff plugin runs a command once a session has sat idle for its configured
-minutes. It is set to run the `hub-handoff` skill with `idle-triggered` after 45 minutes, while the
-prompt cache, which lives an hour, is still warm. The skill asks `hub.mjs role` what the session is:
+hub-guard runs the `hub-handoff` skill with `idle-triggered` 45 minutes after the session's last
+**model request**, while the prompt cache, which lives an hour, still has 15 minutes left. The skill
+asks `hub.mjs role` what the session is:
 
 | Role | It writes |
 |---|---|
 | hub worker | `handoff-g<N>.md` by `worker.md §Handoff`, `state: handing_off`, then `HANDOFF READY` |
 | hub | `hub-handoff.md`, with no `/clear` |
-| any other session | the plugin's own sections, under `~/.claude/handoffs/<project>/`, never inside a repository |
+| any other session | a handoff under the skill's eight headings (Goal, Status, Decisions, Dead ends, Files, Verification, Next steps, Open questions), in `~/.claude/handoffs/<project>/`, never inside a repository |
 
 hub-guard's gate on `command.run` answers in the skill's place, with no model turn, when the
 handoff would be wasted:
@@ -804,8 +812,200 @@ handoff would be wasted:
 4. the worker has a next step with nothing blocking it, a context under 150k tokens, or a wait shorter
    than the cache's life: the cases where `CACHE_HANDOFF` would not hand off either.
 
-The plugin marks its idle period done before its command runs, so a skipped run spends that
-period's one try until a person types again. That is why the gate skips instead of waiting.
+**The timer (hub-guard 0.5.0, 2026-11-22).** Every 30 seconds hub-guard reads the last request's
+time from Cache Keeper's live snapshot (`cache.lastAt`), the same file the gate reads:
+
+| It runs | It does not run |
+|---|---|
+| 45 minutes after the last request, with more than 5 minutes of the 1h cache left | during a turn · on the 5m tier · on a cold cache or within 5 minutes of it · when no request has been seen · when the snapshot was not rewritten after the last turn's end (nothing is keeping it) |
+
+```mermaid
+flowchart LR
+  R["last model request<br/>(cache.lastAt)"] -->|45 min| D{"more than 5 min<br/>of cache left?"}
+  D -->|yes| C["runs hub-handoff<br/>idle-triggered"]
+  D -->|no| N["nothing: a handoff now<br/>pays the full re-read"]
+  C --> G{"gate (above)"}
+  G -->|passes| H["handoff written<br/>on a warm cache"]
+  G -->|skips| S["answered in place,<br/>no model turn"]
+```
+
+It runs once per idle period. The handoff's own turn keeps the period quiet. Any other turn starts a
+new one: a prompt, a cron tick, mail or a background task. A skipped run spends that period's one
+try, which is why the gate skips instead of waiting. The settings are `HUB_GUARD_IDLE_MIN` (`0` turns
+it off), `HUB_GUARD_IDLE_CMD` and `HUB_GUARD_CACHE_LIVE`; the kill-switch part is `idle`.
+
+Until 0.5.0 the third-party auto-handoff plugin ran it, and timed the 45 minutes from a turn's
+**end**. A turn that made no request restarted that clock while the cache kept ageing. In hub `bl1`
+on 2026-11-22 the last request was at 09:11:59Z, a turn at 09:31:43Z made none, and the plugin came
+due at 10:16:43Z, five minutes after the cache had gone cold. The gate skipped it with no model turn,
+as designed, but no handoff was written while it was still cheap. The plugin is now disabled.
+
+### 12.5 The cold rotation
+
+A hub coordinator's prompt cache lives an hour from its last model request. A prompt that comes
+later re-reads the whole context at the cache-write price, 40 times what a read from the cache
+costs, and most of a coordinator's prompts are typed by nobody: the cron tick, a worker's message, a
+task notification. bl1's coordinator transcript of 2026-11-04 → 11-19 holds 90 cold re-reads of
+150k tokens or more, 43.5M tokens written to the cache in all (about $348), and nobody typed the
+prompt that started any of them: 79 were ticks and 11 were workers' messages. From 11-08 that hub
+mostly ticked every three hours, slower than the cache's hour, so each tick found the cache cold and
+re-read a median 454k tokens, about eight times a day.
+[FR-152](fr/FR-152-cold-hub-continues-from-handoff.md) (#4290) is the answer.
+
+hub-guard 0.6.0's sixth part, `cold`, does what the operator does by hand after a hub's handoff,
+`/clear` and then `/hub resume <id>`, and keeps the worker's message or task notification that
+arrived. It acts at one moment: a prompt nobody typed is about to start a turn in a hub coordinator
+whose cache is cold and whose re-read would be large. FR-152's D1, the operator's ruling, allows
+hub-guard this one `/clear`, under every condition below, with a toast, an `events.log` line and the
+kill switches.
+
+```mermaid
+flowchart TB
+    P["a prompt is about to start a turn<br/>in hub X's coordinator"] --> K{"nobody typed it,<br/>and no turn is running?<br/>condition 1"}
+    K -- "no" --> T["it goes in as today<br/>a person's cold prompt is Cache Keeper's to hold"]
+    K -- "yes: a cron tick, a worker's message<br/>or a task notification" --> C{"conditions 2 to 8 all hold?<br/>X's coordinator · a current snapshot of a cold cache<br/>a re-read of 150k or more · the handoff current<br/>the box empty · no rotation for 30 min"}
+    C -- "no" --> L["it goes in as today<br/>events.log names the condition that failed,<br/>unless the table below calls it quiet"]
+    C -- "yes" --> KEEP["a message or a notification is kept<br/>in X's cold-inbox/ · a tick is not"]
+    KEEP --> D["the prompt is dropped<br/>with no model request in the old context"]
+    D --> CL["/clear, awaited<br/>until the new session has started"]
+    CL --> R["/hub resume X cold"]
+    R --> RR["the fresh context reads the newest handoff block,<br/>the events.log lines since it and the cold inbox,<br/>then ticks"]
+```
+
+**When it acts.** All eight conditions must hold. One that fails, or that cannot be read, lets the
+prompt in as it would go without hub-guard: a wrong "no" costs what a re-read costs today, and a
+wrong "yes" clears someone's session. A let-through that is logged reads
+`cold: let through (condition N: …)`, with the reason the last column quotes. A condition that could
+not be read is logged the same way, for instance `condition 6: no hub-handoff.md to continue from`.
+
+| # | Condition | What it guards against | When it fails, `events.log` reads |
+|---|---|---|---|
+| 1 | Nobody typed the prompt: its origin is `scheduled-trigger` (a cron tick), `peer` (a worker's message) or `task-notification`. No turn is running or about to start. | touching a person's prompt; cutting into a running turn, a resume included | nothing (quiet) |
+| 2 | The session is the hub's coordinator and not a worker: this context ran the hub's tick or resume, `state.json` names it (`hub.sessionId`, or `hub.name`), and `HUB_WORKER` is unset | clearing a session that is not this hub's coordinator | nothing (quiet): a session that is not the coordinator never writes into the hub's log, or a stale one with a cron would add a line a minute |
+| 3 | Cache Keeper's live snapshot is current: written after the context's last turn ended, or less than a minute before | judging the cache by a reading that nothing keeps | `condition 3: the cache snapshot predates the last turn`, or `condition 3: no cache snapshot for this session` |
+| 4 | The cache is cold: now is at or past `cache.lastAt` plus its TTL | rotating a context whose next request reads from the cache | nothing (quiet): a prompt on a warm cache is not a cold prompt |
+| 5 | The re-read would write at least 150k tokens (`cache.recacheTokens`, else the context's size) | rotating a small context, where a fresh resume costs about as much (FR-152's D2) | `condition 5: the re-read is 92k, under 150k` |
+| 6 | `hub-handoff.md` was written after the last turn a person started had ended | losing what a person said, which may be on no other disk (FR-152's D3) | `condition 6: the handoff is older than the last person turn` |
+| 7 | The prompt box is empty | a person deciding: a draft, or a prompt Cache Keeper held and put back. FR-152's P0 found that a `/clear` leaves the box as it was. | `condition 7: a draft is in the prompt box` |
+| 8 | No rotation of this hub in the last 30 minutes, by any session, and the part on for this hub | a loop | `condition 8: this hub rotated 10 min ago`; nothing (quiet) when the hub's flag or `HUB_GUARD_COLD_MIN_K=0` turned the part off |
+
+**A person's prompt is never touched.** Claude Code stamps each prompt with its origin: `composer`
+and `bridge` are a person typing, and an origin hub-guard does not know, another plugin's included,
+counts as a person's. Such a prompt is never dropped, held or changed, and costs hub-guard not even a
+file read. A person who meets a cold cache already has Cache Keeper's hold, which offers a handoff, a
+pack and clear, or sending the prompt anyway; a rotation would decide for them what Cache Keeper asks
+them. For the same reason a draft in the box (condition 7), or a person who comes in before the
+`/clear`, stops a rotation.
+
+**What is kept.** A tick is not kept, because the resume ends with a tick. A worker's message or a
+task notification is written, before the drop, to `~/.claude/hub/<id>/cold-inbox/` as
+`<UTC time>-peer.md` or `<UTC time>-notification.md`: the header lines `origin:`, `received:`,
+`session:` (the old session's id) and `hub:`, a `---`, then the prompt's text verbatim. The time has
+no colons (`2026-11-23T15-28-01-980Z`), so the names sort by time and are legal on Windows. These
+files are the only copy, since the transcript keeps no text of a dropped prompt (P0). Each is written
+under a temporary name in the same folder and then linked into place, so a reader never sees half a
+file. `tasks.md` names the background tasks the old context still had running, each with its id,
+command and start time, because their notifications will reach a context that did not start them. The
+resume, and any later tick, reads every file oldest first and moves it to `cold-inbox/read/`, which
+hub-guard never reads.
+
+**The steps and the window.** The steps run from a timer, because `$.command.run` rejects inside a
+hook that a turn waits on, and each awaits the one before: `tasks.md`, the rotation's record,
+`/clear` (which resolves once the new session has started), the new session id (polled, since
+`session.start` does not always fire after a `/clear`), then `/hub resume <id> cold`. The `/clear`
+keeps the session's name, its process and its cron (P0), so workers still reach the hub and the
+heartbeat keeps firing into the fresh context. From the drop until the resume is submitted, every
+further prompt nobody typed is dropped the same way, a message or a notification kept first, so a
+queued worker's message cannot reach the fresh context before the resume does; hub-guard's own mail
+and the idle handoff wait too.
+A person who comes in, a draft or a turn that starts before the `/clear` stops the rotation: the
+kept files are taken back, and the kept prompts go in as they came. A window still open after 3
+minutes, a `/clear` that never resolved, closes, and prompts pass again.
+
+**What the operator sees.** A toast at the drop, `hub-guard: hub <id> is cold (…): /clear, then
+/hub resume <id> cold`, and another once the resume is submitted, `hub-guard: hub <id> continues in
+a fresh context: /hub resume <id> cold`. The hub's `events.log` gets a line for each event, in
+`hub.mjs`'s format, with the writer `hub-guard`:
+
+| Line | When |
+|---|---|
+| `cold: rotated (tick; re-read 212k; inbox 0 files)` | the resume was submitted. `peer` or `notification` in place of `tick` names a kept prompt, and `; 2 tasks in tasks.md` is added when tasks were running. |
+| `cold: let through (condition N: …)` | a cold prompt that a condition let in (the table above) |
+| `cold: kept peer during the rotation` · `cold: dropped tick during the rotation` | a prompt that arrived in the window |
+| `cold: rotation stopped (a person came in); 1 kept prompt sent in as it came` | the rotation stopped before its `/clear` |
+| `cold: the rotation did not finish in 3 min, so prompts pass again` | the window's ceiling |
+| `cold: the resume could not be submitted (…); the inbox waits for the next tick` | the `/clear` went through and the resume did not; the next tick resumes first |
+
+**The fresh context.** `/hub resume <id> cold` runs the skill's Resume (`SKILL.md §Pause and
+resume`) and adds three reads before its closing Tick. It reads nothing else of the old context:
+
+1. the newest block of `hub-handoff.md`. The file is a log of blocks, each under a `##` heading that
+   starts with its UTC date and time, and a new block stands on its own. `hub.mjs cold` first moves
+   every block older than the newest three to `hub-handoff.archive.md`;
+2. the `events.log` lines written since that block, at most the last 200;
+3. the cold inbox, each file handled as if it had just arrived.
+
+Every Resume and Tick passes `--sid "$CLAUDE_CODE_SESSION_ID"`, which keeps `state.json`'s
+`hub.sessionId` on the coordinator's current session: a `/clear` changes the id, and condition 2
+recognises the coordinator by it. A tick in a context that has not run a resume yet runs one first,
+so a resume refused at a usage limit is made up by the first tick that goes through.
+
+**The person-turn line.** Condition 6 rests on the hub's protocol (`SKILL.md §The handoff file`).
+Every turn the operator started by typing ends with one dated line added to the newest handoff
+block, `hub.mjs turn <dir>` with its text in a quoted heredoc: what was asked, and any hold or
+promise that follows. hub-guard counts a person's turn as ending at its last call of a tool that can
+write, and the line is that call, so the handoff is newer than the turn. A tick, a worker's message,
+a task notification, hub-guard's mail and the cold resume are not a person's turns.
+
+**A slow tick schedule** (FR-152's D4). A tick less often than the cache's hour always finds the
+cache cold. Such a schedule stays allowed, and the part decides what it costs:
+
+| Tick schedule | Without the part | With the part |
+|---|---|---|
+| under an hour, as the skill's 20 minutes | each tick reads the context from a warm cache | the same: a warm cache is never rotated |
+| over an hour, as bl1's three hours | each tick re-reads the whole context cold: a median 454k tokens in bl1, about $3.60 at $8 per million, about eight times a day | each tick that meets a re-read of 150k or more rotates instead. The fresh context's first request is about 74k tokens and grows to about 150k over its first twenty requests, a third of the median re-read, and each later tick reads a context about a third the size. |
+
+The skill's heartbeat step says the same (`SKILL.md §Start`): keep the cadence under an hour, because
+without the part a slower one is the most expensive schedule a hub can choose.
+
+**Kill switches.**
+
+| Switch | Turns off |
+|---|---|
+| the word `cold` in `~/.claude/hub-guard/off`, which is re-read every minute | the part, in every session |
+| `HUB_GUARD=off:cold`, or `HUB_GUARD_COLD_MIN_K=0`, in a session's environment at its start | the part, in that session |
+| `hub.mjs set <dir> hub cold_rotate=off`, which writes `flags.cold_rotate` in the hub's `state.json` | the part, for that hub alone; `cold_rotate=on` turns it back on |
+| an empty `off` file, one that reads `all`, or `HUB_GUARD=off` | **the whole guard**: the cleanup, the cargo guard, the mail, the gate, the idle handoff and `cold` |
+
+> **An empty `off` file turns off the whole guard, not one part.** To turn `cold` off, write the word
+> `cold` into `~/.claude/hub-guard/off`. To turn it back on when `cold` is the file's only word,
+> delete the file: emptying it would turn everything else off as well.
+
+A lab gives one session its own off file and records with `HUB_GUARD_STATE=<folder>`, which is how
+the part ran in the lab while it was off everywhere else. `HUB_GUARD_HUBS`, `HUB_GUARD_CACHE_LIVE`,
+`HUB_GUARD_COLD_CMD` and `HUB_GUARD_COLD_GAP_MIN` point that session at a lab hub, fake cache
+snapshots, a stand-in skill and a shorter gap between rotations.
+
+**The lab, and the flip.** P3 ran the installed hub-guard 0.6.0 and hub skill on a lab hub in
+throwaway Haiku sessions, with the part on for those sessions alone and fake cache snapshots so that
+no cell waited an hour. Every cell of AC1 to AC7 passed, with no defect and no change to either tool.
+In four rotations (a tick; a worker's message, kept word for word and answered from the fresh
+context; a tick with two running background tasks named in `tasks.md`; a task notification) the old
+context made no model request, and each fresh context's first request was about 73k tokens against a
+212k re-read. Each condition and kill switch, failing alone, let its prompt in with no `/clear`. The
+part went live on every hub on 2026-11-23 at 18:17:35Z, and AC8 reads the live hubs' `events.log`
+for seven days from there. The cells are in the spec's
+[field log](fr/FR-152-cold-hub-continues-from-handoff.md#field-log).
+
+**Known limits.** The lab found five, none of them a defect in hub-guard or the skill:
+
+| Limit | What happens |
+|---|---|
+| A restart loses the heartbeat | The rotation's `/clear` keeps the session-only cron while the process lives. But a cron stays with the session that made it, so a process restarted with `--resume` of a context that a `/clear` made comes back without it, and the coordinator has no heartbeat until `/hub resume <id>` runs, whose `CronList` step makes it again. A `/clear` by hand has the same property today. |
+| Every cold resume fetches master | The skill's Orient step fetches the repository's master, even for a hub with no repository. It is a read. |
+| A cut `/exit` leaves a handoff pending | handoff-guard holds the first `/exit` to write a before-exit handoff, and a second `/exit` cuts that off. A later `--resume` finishes the handoff at its next prompt and can append a second dated block to `hub-handoff.md`. Ctrl+C twice exits without that turn. |
+| Condition 6 rests on the person-turn line | If the model skips the line, the turn's last other write, a Bash call for instance, becomes its end, and the handoff is older than it. A restart likewise counts the last person turn as ending at the load. Either way rotations stay off for that hub until the handoff is written again: the safe direction, a re-read as before. |
+| A tick can land in a resume | A resume took 7 to 8.5 minutes in the lab. A tick that arrives while it runs meets a busy context, is let through, and runs after the resume's own closing tick: one extra turn. |
 
 ## 13. Field log
 
@@ -864,6 +1064,24 @@ period's one try until a person types again. That is why the gate skips instead 
   The third hub, whose process predated the install, came onto the guard at a `/reload-plugins` on
   2026-11-05 01:14, and onto a fresh process at 01:23. A day after the resume, at 11:30,
   `hub.mjs procs` found nothing left in any of the three hubs, and FR-136 closed.
+- **2026-11-23 — FR-152, the cold rotation: the lab, then live.** P3 ran the installed hub-guard
+  0.6.0 and hub skill in throwaway Haiku sessions in the pty harness. A lab coordinator ran a lab hub
+  with no repository, a second throwaway was its worker, the part was on for those sessions alone,
+  and fake cache snapshots stood in for an hour's wait. From 15:45Z the lab ran with 12 minutes
+  between rotations instead of 30 (`HUB_GUARD_COLD_GAP_MIN`), so that a cell could keep condition 8
+  without a half-hour wait. Every cell of AC1 to AC7 passed, with no defect and no change to either
+  tool. Four rotations, on a tick, a worker's message, a tick with two running background tasks named
+  in `tasks.md` and a task notification, left no model request in the old context. Each fresh
+  context's first request was 73,176 to 73,180 tokens against a 212k re-read, and each resume took
+  7 to 8.5 minutes on the lab's machine. The worker's message reached the fresh context word for
+  word and was answered through the hub's mail. Each of the twelve conditions and kill switches,
+  failing alone, let its prompt in with no `/clear`, and each of the 13 let-throughs that were logged
+  named its condition. A typed prompt went straight in on a cold cache and on a warm one, and a
+  resume cut short by Esc led to one resume at the next tick, not a second rotation. The lab took 37
+  throwaway turns, and its five findings are the known limits in §12.5. At 18:17:35Z the off file
+  under `~/.claude/hub-guard/`, which held only the word `cold`, was deleted, and the part went live
+  on every hub. AC8's seven days run from there
+  ([spec, field log](fr/FR-152-cold-hub-continues-from-handoff.md#field-log)).
 
 P1 (the skill, the protocol and the helper) and P1b (the move to 2.1.314) are logged in the
 [spec](fr/FR-131-hub-coordinator.md#field-log).

@@ -1,5 +1,7 @@
 # FR-75: Self-host **profile** install & verify matrix — every profile does the job it advertises
 
+**Anchors:** master `27549b6e0` (closed 2026-09-09): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#1447](https://github.com/gjovanov/roomler-ai/issues/1447) ·
 **Status:** proposed 2026-09-06 ·
 **Handover this came from:** `docs/handover/modular-monolith.md`

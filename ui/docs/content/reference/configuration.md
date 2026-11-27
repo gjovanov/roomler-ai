@@ -1,11 +1,11 @@
 ---
 title: Configuration reference
-description: The agent's config.toml — where it lives per platform, the settings worth knowing, and which ones the server can and cannot change.
-tags: [reference, configuration, agent, security, admin]
+description: The config.toml of roomlerd, the Roomler daemon — where it lives per platform, the settings worth knowing, and which ones the server can and cannot change.
+tags: [reference, configuration, daemon, security, admin]
 order: 2
 ---
 
-The agent reads one `config.toml` per machine.
+The daemon reads one `config.toml` per machine.
 
 ## Where it lives
 
@@ -18,7 +18,7 @@ The agent reads one `config.toml` per machine.
 | macOS, root half | `/etc/roomler/config.toml` |
 
 :::danger This file is a credential store
-It holds the agent token and, if SSH is enabled, the SSH host private key. It is
+It holds the device credential and, if SSH is enabled, the SSH host private key. It is
 written with restrictive permissions, and the machine-global directory on
 Windows is explicitly hardened at install time because its default permissions
 are readable by all local users.
@@ -61,7 +61,7 @@ property these gates exist for.
 | `overlay_exit_node` | The exit node to route all traffic through, by name |
 | `overlay_exit_node_enabled` | Offer this machine as an exit node (an admin must still approve) |
 | `relay_server_enabled` | Let this machine relay other machines' encrypted traffic |
-| `[[tunnel_routes]]` | Declared forwards the agent re-establishes on every start |
+| `[[tunnel_routes]]` | Declared forwards the daemon re-establishes on every start |
 
 ## Remote access — all default-deny
 
@@ -70,15 +70,15 @@ property these gates exist for.
 | `exec_enabled` | off | Allow remote command execution at all |
 | `ssh_enabled` | off | Run the SSH server |
 | `ssh_port` | `2222` | Not 22, so an existing `sshd` keeps serving during a migration |
-| `ssh_authorized_keys` | empty | **Empty means nobody.** Enabling SSH without listing a key grants nothing |
+| `ssh_authorized_keys` | empty | The break-glass keys, for when the server cannot be reached. Empty means no key-list session: a session the server grants (`roomler ssh`) needs no key here |
 | `ssh_account_mode` | unset | Which account a key-list session runs as. Unset means authenticate, then run nothing |
 | `ssh_host_key` | minted | Generated on first SSH-enabled start |
 | `forward_acl` | empty | SSH port-forward destinations. **Empty means nowhere** |
 | `ssh_activity_log` | off | Whether this machine reports what its SSH sessions did |
 | `ssh_exec_streaming` | on | Stream a one-shot command's output as it is produced, with no 1 MiB ceiling and no time limit; the command ends when the SSH channel does. Off restores the buffered path. Restart required |
 
-Keys from a parked feature, such as the `hive_*`, `vault_*` and `knowhow_*` settings of agent
-sessions, stay in the file through every save: this agent no longer reads them or warns about
+Keys from a parked feature, such as the `hive_*`, `vault_*` and `knowhow_*` settings of
+agent sessions, stay in the file through every save: this daemon no longer reads them or warns about
 them, and leaves them where they were.
 
 :::danger These are the gates the server cannot write
@@ -89,7 +89,7 @@ a machine-held one does not.
 
 :::warning `ssh_port` defaults to 2222 on purpose
 Binding 22 fails on a machine that already runs `sshd`, because that server
-covers every local address. The agent warns when its port shadows an existing
+covers every local address. The daemon warns when its port shadows an existing
 one.
 :::
 
@@ -119,7 +119,7 @@ default**.
 | Key | Default | Meaning |
 |---|---|---|
 | `remote_config_enabled` | off | Allow the dashboard to change this machine's settings |
-| `auto_update` | on | Let the agent update itself |
+| `auto_update` | on | Let the daemon update itself |
 
 :::danger `remote_config_enabled` is structurally absent from anything the server can push
 A machine that sets it has knowingly delegated its last gate to its control
@@ -128,7 +128,7 @@ changes that. The value can only be set on the machine.
 :::
 
 :::warning An isolated `--config` does not isolate the updater
-Running a second agent against a separate config file does **not** give it a
+Running a second `roomlerd` against a separate config file does **not** give it a
 separate updater. It will still update the machine's installed binaries
 system-wide. If you are running a probe or a test instance, set
 `auto_update = false` on it.
@@ -144,9 +144,9 @@ system-wide. If you are running a probe or a test instance, set
 A machine reporting `needs_restart` after a configuration push is telling the
 truth rather than failing.
 
-:::warning The agent will not restart itself
+:::warning The daemon will not restart itself
 Deliberately: nothing can reliably tell whether it is supervised, and exiting an
-unsupervised agent would take that machine permanently offline. Restart it
+unsupervised daemon would take that machine permanently offline. Restart it
 yourself, or on the next reboot.
 :::
 

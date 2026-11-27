@@ -95,7 +95,7 @@ already held the stale row, so a VPN reconnect does not cure it.
 
 That case is repaired, not reported
 (`crates/tunnel-core/src/overlay/lan_repair.rs:165`, run from the network-state
-sample before the capture probe at `netstate.rs:650`):
+sample before the capture probe at `netstate.rs:686`):
 
 ```mermaid
 flowchart TD
@@ -476,7 +476,7 @@ cascade's guarantees while replacing its reactive counters:
   inbound payload between the WG and tunnel routes with `payload_is_wg_or_disco`
   ([`derp_frame.rs:39`](../crates/remote_control/src/derp_frame.rs#L39)), and the server's
   relay reads the same function to decide what its tunnel shaper applies to
-  ([`modules/network/src/derp.rs:709`](../crates/modules/network/src/derp.rs#L709)). It
+  ([`modules/network/src/derp.rs:711`](../crates/modules/network/src/derp.rs#L711)). It
   read the first byte only, 1..=4, and quinn **greases QUIC's fixed bit** by default
   (RFC 9287): an end whose peer advertised the parameter clears the bit on about half of
   what it sends, so a tunnel short header can open on any byte below 0x40. Measured over a
@@ -495,14 +495,14 @@ cascade's guarantees while replacing its reactive counters:
   direction is clean at once, the fixed-to-old one once the old end upgrades.
 - **A retired Hive frame is dropped and counted, never `Unrouted` (FR-137 S-B1).** FR-90's
   Hive replica streams put `RMHIVE01` · a 12-byte tag · a QUIC packet on a DERP payload
-  ([`derp.rs:166`](../crates/tunnel-core/src/transport/derp.rs#L166)). Hive is parked and no build sends one, but a 0.4.199
+  ([`derp.rs:171`](../crates/tunnel-core/src/transport/derp.rs#L171)). Hive is parked and no build sends one, but a 0.4.199
   peer still does, so `deliver` drops such a frame FIRST and counts it in `hive_drops()`
-  ([`derp.rs:532`](../crates/tunnel-core/src/transport/derp.rs#L532), [`derp.rs:469`](../crates/tunnel-core/src/transport/derp.rs#L469)).
+  ([`derp.rs:580`](../crates/tunnel-core/src/transport/derp.rs#L580), [`derp.rs:516`](../crates/tunnel-core/src/transport/derp.rs#L516)).
   Left to the tunnel/WG split below it, the frame would reach a tunnel's QUIC endpoint,
   boringtun or `Unrouted`, and `Unrouted` sends the overlay after a healthy DIRECT pair onto
   the relay, with a hold-down that grows to 15 minutes. The test is
   `a_parked_hive_frame_is_dropped_and_never_unrouted`
-  ([`derp.rs:873`](../crates/tunnel-core/src/transport/derp.rs#L873)). ⚠️ Nothing outside `derp.rs` reads `hive_drops()`, so
+  ([`derp.rs:921`](../crates/tunnel-core/src/transport/derp.rs#L921)). ⚠️ Nothing outside `derp.rs` reads `hive_drops()`, so
   `roomler status` does not print it. ⚠️ The stub goes only once no deployed agent can send
   the magic: past the rollback reach of the last release that compiled Hive
   ([retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137)).
@@ -512,6 +512,9 @@ cascade's guarantees while replacing its reactive counters:
   carries `(unrouted, backpressure)` and `roomler status` prints a `derp drops`
   line when either is non-zero — silent at zero, because a permanent zero line
   is noise, but after a transition `unrouted` is the first thing to read.
+  Since FR-148 D52 each `/derp` socket's drop line carries the same two counts,
+  its mux's own, beside the two outbound ones and with each count's move since
+  the line before ([every drop on the relay path](overlay-communication.md#every-drop-on-the-relay-path-and-where-it-reports-fr-148-d52)).
   ⚠️ Cumulative since daemon start: **diff two readings**, never judge the
   absolute. ⚠️ And measure on a host whose network actually moves — the
   reference box saw zero.

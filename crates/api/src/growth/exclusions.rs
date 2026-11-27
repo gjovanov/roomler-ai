@@ -13,7 +13,10 @@
 //! writing admin's id, never an address. A reason is required and bounded:
 //! it ends up in an operator-facing table.
 
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{State, rejection::JsonRejection},
+};
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_services::dao::growth::{ExclusionKind, GrowthDao, GrowthExclusion};
 use roomler_core::growth::{ExclusionSet, IMPLICIT_OWNED_BY_EXCLUDED, IMPLICIT_PLATFORM_ADMIN};
@@ -119,13 +122,18 @@ pub struct PutBody {
 }
 
 /// `PUT /api/admin/growth/exclusions` — replace the explicit list. Answers
-/// the same shape as the GET, so a client renders what it saved.
+/// the same shape as the GET, so a client renders what it saved. The gate is
+/// decided before the body is read (#4254): anyone but a platform operator
+/// gets its 404 whatever the body is, so the route stays unseen, and an
+/// operator is answered a body that does not parse as the `Json` extractor
+/// answered it (`ApiError::JsonBody`).
 pub async fn put_exclusions(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(body): Json<PutBody>,
+    body: Result<Json<PutBody>, JsonRejection>,
 ) -> Result<Json<ExclusionsResponse>, ApiError> {
     super::require_growth_admin(&state, &auth)?;
+    let Json(body) = body?;
     let rows = validate_rows(body.exclusions, auth.user_id, DateTime::now())?;
     GrowthDao::new(&state.db).replace_exclusions(&rows).await?;
     let set = ExclusionSet::load(&state.core).await?;

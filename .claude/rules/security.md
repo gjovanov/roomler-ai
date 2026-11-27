@@ -42,6 +42,22 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   stays any member's: every node receives it anyway. ⚠️ The forward reads no bit, and
   must not: the policy IS the grant, made for people who hold none
   (security-baseline.md §3).
+- **A gated write decides its gate before it reads its body** (#4187, #4218, #4254).
+  `Json<T>` as an extractor answers a body that does not parse (400/413/415/422)
+  before the handler runs: a caller the gate refuses is told about the body instead,
+  and a platform-operator route's 404 stops keeping it unseen. A write gated on a
+  permission bit or the platform allowlist takes `Result<Json<T>, JsonRejection>` and
+  unwraps it straight after the gate (`let Json(body) = body?;`), before it parses any
+  id its gate does not need; `ApiError::JsonBody` answers a caller it lets through as
+  the extractor did. Every gated write of the api crate and of every module does. A
+  gate that needs the body comes after it: the billing writes' gate asks about the org
+  the body's `tenant_id` names, and their routes carry no org in their path; `join-org`
+  asks the path's org before the body and the org the body names after it. The api
+  crate's unit test `gate_before_body` (`crates/api/src/gate_before_body.rs`) fails on
+  a new one that does not; its `BY_DESIGN` list holds the checks that need the body,
+  and only shrinks. ⚠️ It cannot see an ownership check (a message edit's author check
+  is one: only its integration test shows the order) or another extractor
+  (`Query<T>`, a typed `Path<T>`, `Form<T>`): those stay the reviewer's.
 - **A member's roles are the org's own, read where a rule is evaluated.** Only the
   ids of a membership row that are `roles` rows of THAT org count: read them through
   `TenantDao::get_member_permissions` (the bits), `member_live_role_ids` (one member)
@@ -61,7 +77,7 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   live row with no field. ⚠️ A removed device must still be told it was removed:
   the revocation checks keep the tombstone reader, or the device retries a bare
   401 forever.
-- **Call media is authorized by the caller's call seat (`call/join`), never by org membership.** Every `media:*` frame checks the seat, and losing the membership revokes it. The pod serving a call also ends a seat whose admission reads gone twice in a row (`conference/src/seat_check.rs`), so a seat no membership admits by design (a recorder, a bot) must be skipped there.
+- **Call media is authorized by the caller's call seat (`call/join`), never by org membership.** Every `media:*` frame checks the seat, and losing the membership revokes it. The pod serving a call also ends a seat whose admission reads gone twice in a row and the room guard then refuses (`conference/src/seat_check.rs`), so a seat no membership admits by design (a recorder, a bot) must be skipped there.
 - **A 403 is an answer, not an expired credential.** It never ends a session, on any
   method. The only 403 with a navigation is `not_a_member`, matched on a
   **server-sent code**, never a message-string sniff — chat's

@@ -22,27 +22,40 @@
 //! | Step | Root | The person's process | If it fails |
 //! |---|---|---|---|
 //! | Read | root, macOS, the root half enrolled and connected, a person at the console; lists `/Users`, `stat`s each entry, reads each owner's account and UUID | `read`, one per uid, in uid order, 30 s each: owners, modes and kinds, the config's and the plist's bytes, any old copy's name | stops; nothing has changed. R1 to R5 refuse here |
-//! | Plan | retired or moved, for each enrollment; `--dry-run` stops here | | |
+//! | Plan | retired or moved, for each enrollment; `--dry-run` stops here | | stops; nothing has changed. An ephemeral enrollment refuses here (#4312): a person's, and the root half's where one-row would restart; `--revert` refuses an ephemeral root file before its restart |
 //! | Keep | root's kept copy, `root.json`, then one folder per uid under [`RECORDS`], its `record.json` last | | puts back what it did, and stops |
 //! | LaunchAgent | booted out by label | | the same |
+//! | Read again | where an agent's save as it stopped moved only its own run state, that person's files kept again, `record.json` last ([`since_read`], #4097) | `read` again, for each person whose agent was booted out | the same; anything else that moved stops it here |
 //! | Root's file | both switches on, moved enrollments appended to `[[orgs]]` | | the same |
-//! | People's files | | `convert`, over the bytes root kept: identity blanked, `[[orgs]]` emptied, every other key kept; the plist removed | `put-back` for every person started, answered or not |
+//! | People's files | | `convert`, over the bytes root kept last: identity blanked, `[[orgs]]` emptied, every other key kept, the new file kept as its `.prev` too (#4184); the plist removed. A `.prev` it cannot replace stops it before the config (exit 1) | `put-back` for every person started, answered or not, but one whose process refused before any change ([`before_any_change`]) |
 //! | Restart | `launchctl kickstart -k`, which ends live sessions | | puts everything back, and restarts |
 //! | Verify | within 60 s: connected, the worker attached, `screen-capture` | | the same, and says what it saw |
 //! | Report | each retired row, and where a person deletes it | | |
 //!
 //! Root's records go only after a restart answered, so a stop part-way leaves
-//! what the next `--revert` reads. `--revert` puts root's file back first, then
-//! each person in uid order, through `put-back` from the records, or
-//! `put-back-legacy` on a Mac an older release converted. One who fails is
-//! named and keeps their record, the others go on, and it exits 1; when nobody's
-//! `read` answers and nothing else is left, it exits 1 before it asks and
-//! restarts nothing.
+//! what the next `--revert` reads; an undo that could not put root's file back
+//! starts no agent, keeps them all, and past the Restart step leaves the Mac
+//! converted. `--revert` puts root's file back first, then each person in uid
+//! order, through `put-back` from the records, or `put-back-legacy` on a Mac an
+//! older release converted. One who fails is named and keeps their record, the
+//! others go on, and it exits 1; when nobody's `read` answers and nothing else
+//! is left, it exits 1 before it asks and restarts nothing.
 //!
 //! The command cannot delete a row: a device holds no user credential, and
 //! `POST /api/agent/self/unenroll` refuses a permanent row on purpose. A row it
 //! retires reads offline until a person deletes it, and until then `--revert`
 //! puts the two rows back.
+//!
+//! #4379 — the root daemon's sweep, after a conversion ([`sweep`]): once the
+//! daemon has run [`crate::config::CLEAN_RUN_THRESHOLD_SECS`], and only while
+//! root's tree holds a conversion's records (its kept copy, `root.json` or a uid
+//! folder under [`RECORDS`]), one `blank-prev` child per person, in uid order,
+//! console or not. Each is handed the server and tenant of every enrollment
+//! root's file holds ([`held_orgs`]) and replaces the config's `.prev` where it
+//! holds one: a conversion before #4184 kept the outgoing, enrolled config
+//! there, and a load restores that copy when the config does not load. One line
+//! per person in [`LOG`]; a child that fails is its line, and the next person
+//! goes on. No record of it is kept: the next start of the daemon asks again.
 //!
 //! The planner, the refusals' lines and the spawn and bootstrap plans are pure,
 //! and every effect goes through [`Host`], whose effects name no path in a home:
@@ -587,22 +600,20 @@ pub fn plan(root: &AgentConfig, people: &[Person]) -> Result<Plan> {
         let mut found = 0;
         if cfg.has_primary_enrollment() {
             found += 1;
-            let fate = match held_by(&root_after, &cfg.server_url, &cfg.tenant_id) {
+            let held = held_by(&root_after, &cfg.server_url, &cfg.tenant_id);
+            // #4312 — an ephemeral row is refused, held or not: the bootout
+            // stops this half, and on that stop an ephemeral row deletes
+            // itself (FR-51). An `[[orgs]]` entry carries no such flag. The
+            // root half's is refused in `migrate`, where a restart follows.
+            if cfg.ephemeral {
+                return Err(ephemeral_person(&person.account.name, cfg, held.is_some()));
+            }
+            let fate = match held {
                 Some(held) => {
                     retirement_notes(&mut notes, &person.account.name, cfg.overlay_enabled, &held);
                     Fate::Retired
                 }
                 None => {
-                    if cfg.ephemeral {
-                        bail!(
-                            "{}'s enrollment ({} tenant {}) is ephemeral, and the root half does \
-                             not hold that org: an ephemeral row lives only with the half that \
-                             enrolled it. Unenroll it first, or enroll the root half there",
-                            person.account.name,
-                            cfg.server_url,
-                            cfg.tenant_id
-                        );
-                    }
                     let label = free_label(&root_after, host_of(&cfg.server_url));
                     if cfg.overlay_enabled {
                         notes.push(format!(
@@ -706,11 +717,50 @@ fn retirement_notes(notes: &mut Vec<String>, user: &str, overlay_on: bool, held:
     }
 }
 
+/// #4312, #4331 — why the way on past an ephemeral row removes it first: the
+/// same file takes the next enrollment's `ephemeral` from the server's answer
+/// (`enrollment::preserve_operator_config`), and a live ephemeral row stays one.
+const OVER_EPHEMERAL: &str = "an ephemeral row never turns permanent";
+
+/// #4312 — the root half's enrollment is ephemeral. One-row's restart is a
+/// stop, and on it the daemon deletes its own row.
+fn ephemeral_root(root: &AgentConfig) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the root half's enrollment ({}, tenant {}) is ephemeral: one-row restarts the daemon, \
+         and on that stop an ephemeral row deletes itself. Remove it on the Devices page \
+         ({OVER_EPHEMERAL}) and enroll the root half again with a key that is not ephemeral: \
+         {ROOT_CONFIG} keeps its settings. Then run this again. Nothing has changed",
+        root.server_url,
+        root.tenant_id
+    )
+}
+
+/// #4312 — a person's enrollment is ephemeral. `held`: the root half holds
+/// its org once the plan's moves are in, so the plan would retire it; else it
+/// would move it.
+fn ephemeral_person(name: &str, cfg: &AgentConfig, held: bool) -> anyhow::Error {
+    let why = if held {
+        "and the root half holds that org: one-row would retire that row. Its half deletes it \
+         when the bootout stops it, and the server's reaper, where it runs, deletes it while it \
+         sits offline, so `--revert` could not bring it back"
+    } else {
+        "and the root half does not hold that org: an ephemeral row lives only with the half \
+         that enrolled it, so it cannot move to the root half"
+    };
+    anyhow::anyhow!(
+        "{name}'s enrollment ({}, tenant {}) is ephemeral, {why}. Remove it on the Devices page \
+         ({OVER_EPHEMERAL}) and enroll {name}'s half again with a key that is not ephemeral: \
+         that half's config keeps its settings. Then run this again. Nothing has changed",
+        cfg.server_url,
+        cfg.tenant_id
+    )
+}
+
 /// The plan, in the words the command says before it asks.
 pub fn describe(read: &Read, plan: &Plan) -> Vec<String> {
     let mut out = vec!["one row: the plan. Nothing has changed yet.".to_string()];
     out.push(format!(
-        "the root half: \"{}\", agent {}, tenant {}, {}{}",
+        "the root half: \"{}\", device {}, tenant {}, {}{}",
         read.root.machine_name,
         read.root.agent_id,
         read.root.tenant_id,
@@ -745,7 +795,7 @@ pub fn describe(read: &Read, plan: &Plan) -> Vec<String> {
             .as_deref()
             .map_or_else(|| "primary".to_string(), |l| format!("org `{l}`"));
         out.push(format!(
-            "{}, {which}: \"{}\", agent {}, tenant {}, {}",
+            "{}, {which}: \"{}\", device {}, tenant {}, {}",
             item.user, item.name, item.agent_id, item.tenant_id, item.server_url
         ));
         out.push(match &item.fate {
@@ -1359,6 +1409,98 @@ async fn ask<H: Host>(
     reply
 }
 
+/// #4379 — the server and tenant of each enrollment `root`'s file holds: its
+/// primary when it holds one, and every `[[orgs]]` entry. What `blank-prev`
+/// is handed, and all of it: a `.prev` holds a moved enrollment when it holds
+/// one of these, as [`held_by`] tells a person's enrollment root holds.
+pub fn held_orgs(root: &AgentConfig) -> Vec<crate::one_row_home::HeldOrg> {
+    use crate::one_row_home::HeldOrg;
+    let primary = root.has_primary_enrollment().then(|| HeldOrg {
+        server_url: root.server_url.clone(),
+        tenant_id: root.tenant_id.clone(),
+    });
+    primary
+        .into_iter()
+        .chain(root.orgs.iter().map(|o| HeldOrg {
+            server_url: o.server_url.clone(),
+            tenant_id: o.tenant_id.clone(),
+        }))
+        .collect()
+}
+
+/// #4379 — whom the sweep asks, in uid order, and what each child is fed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sweep {
+    pub accounts: Vec<Account>,
+    pub stdin: Vec<u8>,
+}
+
+/// #4379 — the sweep's reads, every one of them root's own: `None`, with
+/// nothing read past them, unless root's tree holds a conversion's records
+/// ([`RootFile::Kept`], `root.json`, a uid folder), and nothing to do when
+/// root's file holds no enrollment. Root's file is read and parsed as it is,
+/// never through [`Host::load_root`], whose load writes it when it does not
+/// load: the sweep writes nothing of root's. Then the accounts Read would ask
+/// ([`accounts_to_ask`]), in uid order, console or not. A read of root's that
+/// fails is one line, and the sweep stops: the next start asks again.
+pub fn sweep_plan<H: Host>(host: &mut H) -> Option<Sweep> {
+    let root = match converted_root(host) {
+        Ok(Some(root)) => root,
+        Ok(None) => return None,
+        Err(e) => {
+            host.say(&format!(
+                "the sweep of people's config.toml.prev did not run: {e:#}"
+            ));
+            return None;
+        }
+    };
+    let orgs = held_orgs(&root);
+    if orgs.is_empty() {
+        return None;
+    }
+    let stdin = serde_json::to_vec(&crate::one_row_home::HeldOrgs {
+        v: crate::one_row_home::FORMAT,
+        orgs,
+    })
+    .ok()?;
+    let entries = host.users();
+    let accounts = accounts_to_ask(&entries, |uid| host.account(uid)).accounts;
+    Some(Sweep { accounts, stdin })
+}
+
+/// #4379 — root's file, parsed as it is, when root's tree holds a
+/// conversion's records; `None` when it holds none.
+fn converted_root<H: Host>(host: &H) -> Result<Option<AgentConfig>> {
+    let records = host.read_root(RootFile::Kept)?.is_some()
+        || host.read_root(RootFile::RootRecord)?.is_some()
+        || !host.record_uids()?.is_empty();
+    if !records {
+        return Ok(None);
+    }
+    let bytes = host
+        .read_root(RootFile::Config)?
+        .with_context(|| format!("{ROOT_CONFIG} is not there"))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{ROOT_CONFIG} is not UTF-8"))?;
+    crate::config::parse_text(&text, ROOT_CONFIG).map(Some)
+}
+
+/// #4379 — one `blank-prev` child per account of `sweep`, in its order, each
+/// with its one line ([`ask`]); a child that fails is that line, and the next
+/// person goes on.
+pub async fn sweep_run<H: Host>(host: &mut H, sweep: &Sweep) {
+    for account in &sweep.accounts {
+        let _ = ask(host, account, Verb::BlankPrev, &sweep.stdin).await;
+    }
+}
+
+/// #4379 — the sweep: [`sweep_plan`], then [`sweep_run`].
+pub async fn sweep<H: Host>(host: &mut H) {
+    if let Some(planned) = sweep_plan(host) {
+        sweep_run(host, &planned).await;
+    }
+}
+
 /// FR-147 — who is a person ("Which homes are people"): one `read` child per
 /// account [`accounts_to_ask`] names, in uid order, and a person is an
 /// account with a config, a plist or an old copy. Converting, a child that
@@ -1622,14 +1764,34 @@ struct Done {
     records: Vec<u32>,
     /// Indexes into [`Read::people`] of the agents booted out.
     booted_out: Vec<usize>,
+    /// #4097 — each person whose agent's save as the bootout stopped it moved
+    /// only its own run state ([`since_read`]), with that second `read`: root
+    /// keeps it instead of Read's, `convert` acts on it, and the undo puts it
+    /// back.
+    reread: Vec<(usize, crate::one_row_home::ReadAnswer)>,
     /// Root's file was written.
     wrote_root: bool,
     /// Indexes into [`Read::people`], each pushed before its `convert` is
     /// started: one the deadline stopped after its rename changed the file
     /// all the same.
     started: Vec<usize>,
+    /// #4097 — each person whose `convert` their own process refused with an
+    /// exit it raises only before its first change ([`before_any_change`]),
+    /// and that exit. The undo writes nothing back to them.
+    refused: Vec<(usize, crate::one_row_home::Exit)>,
     /// The daemon was asked to restart onto the new files.
     restarted: bool,
+}
+
+impl Done {
+    /// What root kept last of person `index`: the second `read`'s, else
+    /// Read's.
+    fn kept<'a>(&'a self, read: &'a Read, index: usize) -> &'a crate::one_row_home::ReadAnswer {
+        self.reread
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map_or(&read.people[index].seen, |(_, seen)| seen)
+    }
 }
 
 /// A record's bytes.
@@ -1643,6 +1805,26 @@ fn written_by() -> (String, String) {
         crate::one_row_home::VERSION.to_string(),
         chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     )
+}
+
+/// `record.json` for a person whose files root keeps as `seen` reports them.
+fn person_record(
+    account: &Account,
+    seen: &crate::one_row_home::ReadAnswer,
+    release: &str,
+    at: &str,
+) -> PersonRecord {
+    PersonRecord {
+        v: RECORD_FORMAT,
+        uid: account.uid,
+        uuid: account.uuid.clone(),
+        name: account.name.clone(),
+        segment: seen.segment,
+        config: FileRecord::of(present(&seen.config)),
+        plist: FileRecord::of(present(&seen.plist)),
+        release: release.to_string(),
+        at: at.to_string(),
+    }
 }
 
 /// Everything after Read: the plan, said, and its refusals; then, unless only
@@ -1684,6 +1866,12 @@ pub async fn migrate<H: Host>(
     {
         host.say("this Mac is one row already: nothing to do");
         return Ok(());
+    }
+    // #4312 — a Mac with something to do is restarted, by the apply and by
+    // its undo, and on that stop an ephemeral row deletes itself (FR-51). A
+    // Mac with nothing to do is stopped by nothing: it is left alone above.
+    if read.root.ephemeral {
+        return Err(ephemeral_root(&read.root));
     }
     let refused = refusals(host, read, &plan).await;
     if !refused.is_empty() {
@@ -1744,6 +1932,11 @@ pub fn revert_digest(r: &Revert) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     r.root_kept.as_deref().map(sha256_hex).hash(&mut h);
     (r.supervised, &r.unfinished, &r.strays).hash(&mut h);
+    // #4122 — whose LaunchAgent it bootstraps for a keep that never finished.
+    r.unfinished_agent.as_ref().map(|a| a.uid).hash(&mut h);
+    // #4227 — whether the job of the person given back is loaded: the plan's
+    // words for them turn on it.
+    r.agent_loaded.hash(&mut h);
     for p in &r.people {
         p.uid.hash(&mut h);
         match &p.back {
@@ -1825,17 +2018,7 @@ async fn steps<H: Host>(
                     .with_context(|| format!("keeping {}'s files", p.account.name))?;
             }
         }
-        let record = PersonRecord {
-            v: RECORD_FORMAT,
-            uid,
-            uuid: p.account.uuid.clone(),
-            name: p.account.name.clone(),
-            segment: p.seen.segment,
-            config: FileRecord::of(config),
-            plist: FileRecord::of(plist),
-            release: release.clone(),
-            at: at.clone(),
-        };
+        let record = person_record(&p.account, &p.seen, &release, &at);
         host.write_root(
             RootFile::Person {
                 uid,
@@ -1860,22 +2043,71 @@ async fn steps<H: Host>(
             done.booted_out.push(index);
         }
     }
+    // #4097 — read again. A booted-out agent's graceful stop saves its config
+    // (`mark_clean_shutdown`), and in its first five minutes that save moves
+    // `last_run_unhealthy`. A save that moved only the agent's own run state
+    // is kept again and converted from; anything else that moved stops the
+    // conversion here, before root's file.
+    for c in &plan.converts {
+        if !done.booted_out.contains(&c.person) {
+            continue;
+        }
+        let p = &read.people[c.person];
+        let changed = |what: &str| {
+            anyhow::anyhow!(
+                "{}'s files: this Mac changed after the plan was said: {what}",
+                p.account.name
+            )
+        };
+        let now = match ask(host, &p.account, Verb::Read, &[]).await {
+            Ok(reply) => reply
+                .read
+                .ok_or_else(|| changed("their own process read nothing"))?,
+            Err(f) => {
+                return Err(changed(&format!(
+                    "their own process could not read them again ({})",
+                    f.why
+                )));
+            }
+        };
+        match since_read(&p.seen, &now) {
+            Since::Same => {}
+            Since::RunState(moved) => {
+                rekeep(host, &p.account, &now, &release, &at)
+                    .with_context(|| format!("keeping {}'s files again", p.account.name))?;
+                host.say(&rekept_line(&p.account.name, &moved));
+                done.reread.push((c.person, now));
+            }
+            Since::Changed(what) => return Err(changed(what)),
+        }
+    }
     // Root's file.
     done.wrote_root = true;
     host.save_root(&plan.root_after)
         .with_context(|| format!("writing {ROOT_CONFIG}"))?;
     host.say(&format!("written: {ROOT_CONFIG}"));
-    // Each person's files, by their own process, on the bytes Read kept.
+    // Each person's files, by their own process, on the bytes root kept last.
     for c in &plan.converts {
         let p = &read.people[c.person];
         done.started.push(c.person);
+        // #4097 — the second `read`'s config, where root keeps that instead.
+        let config = match done.reread.iter().find(|(i, _)| *i == c.person) {
+            Some((_, now)) => crate::one_row_home::Expect::of(present(&now.config).map(|(b, _)| b)),
+            None => c.config,
+        };
         let verb = Verb::Convert {
-            config: c.config,
+            config,
             plist: c.plist,
         };
-        let reply = ask(host, &p.account, verb, &[])
-            .await
-            .map_err(|f| anyhow::anyhow!("{}'s files: {}", p.account.name, f.why))?;
+        let reply = match ask(host, &p.account, verb, &[]).await {
+            Ok(reply) => reply,
+            Err(f) => {
+                if let Some(exit) = f.exit.filter(|e| before_any_change(*e)) {
+                    done.refused.push((c.person, exit));
+                }
+                bail!("{}'s files: {}", p.account.name, f.why);
+            }
+        };
         let config_sha256 = reply.convert.and_then(|a| a.config_sha256);
         let after = AfterRecord {
             v: RECORD_FORMAT,
@@ -1923,13 +2155,156 @@ fn kept_of(seen: &crate::one_row_home::ReadAnswer) -> crate::one_row_home::Kept 
     }
 }
 
+/// The mode [`crate::config::save`] gives every config it writes: a
+/// temporary file made 0600, then renamed over the config. So a config the
+/// agent saves is 0600, whatever wrote it before.
+pub const SAVED_CONFIG_MODE: u32 = 0o600;
+
+/// #4097 — what a person's second `read`, once their agent was booted out,
+/// found moved since Read's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Since {
+    /// Nothing: every entry and both files as Read found them.
+    Same,
+    /// Only the config, and only as the agent's own save leaves it: the same
+    /// owner, Read's mode or [`SAVED_CONFIG_MODE`], and a text whose other keys
+    /// are Read's ([`crate::config::run_state_moved`]). The run-state keys
+    /// that moved.
+    RunState(Vec<&'static str>),
+    /// Anything else: what moved, for the line that stops the conversion.
+    Changed(&'static str),
+}
+
+/// #4097 — Read's answer for a person against the one their own process gave
+/// again after the bootout. Every entry but the config must be as it was, and
+/// the config may be a save of the agent's own run state alone.
+pub fn since_read(
+    then: &crate::one_row_home::ReadAnswer,
+    now: &crate::one_row_home::ReadAnswer,
+) -> Since {
+    use crate::one_row_home::Held;
+    let rest = [
+        (then.home == now.home, "their home changed"),
+        (then.library == now.library, "their Library folder changed"),
+        (
+            then.support == now.support,
+            "their Application Support folder changed",
+        ),
+        (
+            then.agents_dir == now.agents_dir,
+            "their LaunchAgents folder changed",
+        ),
+        (
+            then.folder == now.folder && then.segment == now.segment,
+            "their roomler folder changed",
+        ),
+        (then.plist == now.plist, "their LaunchAgent plist changed"),
+        (
+            then.legacy == now.legacy,
+            "an old copy's name in their roomler folder changed",
+        ),
+    ];
+    if let Some((_, what)) = rest.into_iter().find(|(same, _)| !same) {
+        return Since::Changed(what);
+    }
+    if then.config == now.config {
+        return Since::Same;
+    }
+    let (
+        Held::Present {
+            bytes: was,
+            uid: was_uid,
+            mode: was_mode,
+        },
+        Held::Present {
+            bytes: is,
+            uid: is_uid,
+            mode: is_mode,
+        },
+    ) = (&then.config, &now.config)
+    else {
+        return Since::Changed("their config changed");
+    };
+    if was_uid != is_uid {
+        return Since::Changed("their config's owner changed");
+    }
+    if is_mode != was_mode && *is_mode != SAVED_CONFIG_MODE {
+        return Since::Changed("their config's mode changed");
+    }
+    match (std::str::from_utf8(was), std::str::from_utf8(is)) {
+        (Ok(was), Ok(is)) => match crate::config::run_state_moved(was, is) {
+            Some(moved) => Since::RunState(moved),
+            None => Since::Changed("their config changed beyond its daemon's own run state"),
+        },
+        _ => Since::Changed("their config changed"),
+    }
+}
+
+/// #4097 — a person's config kept again, from their second `read`, in K2's
+/// order, so that `--revert` reads a stop at any point right: `record.json`
+/// goes first, which leaves an unfinished Keep (no live file of theirs has
+/// been changed by this run yet), then the config's copy is replaced, and
+/// `record.json` is written again, last. The plist's copy stays: the second
+/// `read` found the plist as Read did.
+fn rekeep<H: Host>(
+    host: &mut H,
+    account: &Account,
+    now: &crate::one_row_home::ReadAnswer,
+    release: &str,
+    at: &str,
+) -> Result<()> {
+    let uid = account.uid;
+    let file = |part| RootFile::Person { uid, part };
+    host.remove_root(file(Part::Record))?;
+    host.remove_root(file(Part::Config))?;
+    if let Some((bytes, _)) = present(&now.config) {
+        host.write_root(file(Part::Config), bytes)?;
+    }
+    host.write_root(
+        file(Part::Record),
+        &json(&person_record(account, now, release, at))?,
+    )
+}
+
+/// #4097 — the line a person kept again is said with.
+fn rekept_line(name: &str, moved: &[&str]) -> String {
+    let moved = if moved.is_empty() {
+        "none of its values, only how the file is written".to_string()
+    } else {
+        moved.join(", ")
+    };
+    format!(
+        "{name}'s daemon saved their config as it stopped, moving only its own run state \
+         ({moved}): root keeps that save instead, and their files are converted from it"
+    )
+}
+
+/// #4097 — the exits a person's `convert` raises only before its first
+/// change: 2, its checks of itself (`one_row_home::run`); 3, both live files
+/// checked against the bytes root kept before either changes; 4, both
+/// folders checked writable, the same. Exit 1 can follow the plist's removal,
+/// and a deadline or a signal can follow anything.
+pub fn before_any_change(exit: crate::one_row_home::Exit) -> bool {
+    use crate::one_row_home::Exit;
+    matches!(exit, Exit::Refused | Exit::Changed | Exit::NotWritable)
+}
+
 /// Puts back what [`steps`] did: root's file first, then every person whose
-/// `convert` was started, answered or not, then a restart onto them where the
-/// conversion had restarted, then the LaunchAgents (#4092: only once that
-/// restart answered, through [`start_agent`]; at once where none was needed).
-/// Each failure is said and the rest still run. Root's records go only once
-/// that restart answered (or none was needed): until then they are how
-/// `--revert` finishes the job.
+/// `convert` was started, answered or not, but one whose process refused
+/// before any change ([`before_any_change`]), each from the bytes root kept
+/// last of them; then a restart onto them where the conversion had restarted,
+/// then the LaunchAgents (#4092: only once that restart answered, through
+/// [`start_agent`]; at once where none was needed). Each failure is said and
+/// the rest still run. Root's records go only once that restart answered (or
+/// none was needed): until then they are how `--revert` finishes the job.
+///
+/// #4097 — when root's file did not go back, no LaunchAgent starts and every
+/// record stays. Where the conversion had restarted, which it does only once
+/// every `convert` answered, nothing else is undone either: nobody's files go
+/// back and nothing restarts again, so the Mac stays converted, one row,
+/// rather than holding each moved enrollment twice, in root's file and in a
+/// person's put back. Where it had not, a person may be half converted: their
+/// files still go back, and nothing restarts.
 async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
     let mut problems = Vec::new();
     let mut root_back = true;
@@ -1949,10 +2324,34 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
             }
         }
     }
+    // #4097 — root's file is still the converted one, and the conversion had
+    // restarted, which it does only once every `convert` answered: every
+    // person is converted, and root's `[[orgs]]` hold their enrollments, one
+    // row. A person's files put back would hold those enrollments as well, and
+    // their next login would load the plist put back beside root's daemon. So
+    // nothing more is undone, and every record stays for `--revert`.
+    if !root_back && done.restarted {
+        host.say(&format!(
+            "{ROOT_CONFIG} did not go back after the restart, so the Mac stays converted (one \
+             row): nobody's files are put back, no LaunchAgent starts, and every record stays in \
+             {RECORDS}; `sudo roomlerd one-row --revert` finishes the job"
+        ));
+        return problems;
+    }
     let mut not_back = Vec::new();
     for &index in &done.started {
         let p = &read.people[index];
-        let stdin = match serde_json::to_vec(&kept_of(&p.seen)) {
+        // #4097 — their process changed nothing: what is there is theirs, their
+        // agent's own save included.
+        if let Some((_, exit)) = done.refused.iter().find(|(i, _)| *i == index) {
+            host.say(&format!(
+                "not put back: {}'s files, which their own process left as they were (exit {})",
+                p.account.name,
+                exit.code()
+            ));
+            continue;
+        }
+        let stdin = match serde_json::to_vec(&kept_of(done.kept(read, index))) {
             Ok(stdin) => stdin,
             Err(e) => {
                 problems.push(format!("{}'s files: {e}", p.account.name));
@@ -1973,6 +2372,29 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
                 not_back.push(p.account.uid);
             }
         }
+    }
+    // #4097 — root's file may still be the converted one, and the conversion
+    // stopped before its restart: at root's file, at a person's `convert` or
+    // at their `after.json`, so a person may be half converted, and their files
+    // went back above. Root's `[[orgs]]` would hold the enrollments moved out
+    // of them: an agent started on one of those would run it beside root's
+    // daemon once that daemon starts on root's file. So none starts, nothing
+    // restarts, and every record stays for `--revert`, the console person's
+    // bootstrap included.
+    if !root_back {
+        for &index in &done.booted_out {
+            problems.push(format!(
+                "gui/{}/com.roomler.agent: not bootstrapped, as {ROOT_CONFIG} did not go back",
+                read.people[index].account.uid
+            ));
+        }
+        host.say(&format!(
+            "{ROOT_CONFIG} did not go back, so no LaunchAgent starts and every record stays in \
+             {RECORDS}. At the daemon's next start (a reboot or an update) it reads {ROOT_CONFIG} \
+             as it is now, which may still be the converted one, so run `--revert` before then: \
+             `sudo roomlerd one-row --revert` finishes the job"
+        ));
+        return problems;
     }
     let mut answered = true;
     // #4092 — the LaunchAgents go last. After the conversion's restart the
@@ -2006,7 +2428,7 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
                      system/com.roomler.daemon` retries it"
                 ));
                 for &index in &done.booted_out {
-                    problems.push(not_bootstrapped(read.people[index].account.uid));
+                    problems.push(not_bootstrapped(host, read.people[index].account.uid));
                 }
                 None
             }
@@ -2105,11 +2527,11 @@ async fn worker_gone<H: Host>(host: &mut H, uid: u32) -> Option<String> {
             return Some(match no_answer {
                 None => format!(
                     "the one-row daemon's screen worker still runs as uid {uid} after {secs} s, \
-                     holding the lock this agent takes"
+                     holding the lock this daemon takes"
                 ),
                 Some(e) => format!(
                     "`ps` gave no answer for {secs} s ({e:#}), so whether the one-row daemon's \
-                     screen worker, which holds the lock this agent takes, has stopped is not known"
+                     screen worker, which holds the lock this daemon takes, has stopped is not known"
                 ),
             });
         }
@@ -2127,16 +2549,29 @@ async fn worker_gone<H: Host>(host: &mut H, uid: u32) -> Option<String> {
 /// starts a job that lost the race anyway and does nothing to one that runs:
 /// the supervisor's own hand-back (`kickstart_launch_agent` in
 /// `macos_supervisor.rs`). `Err`: the bootstrap's, which the caller says.
+///
+/// #4227 — the job is read right before the bootstrap, here, for every
+/// caller: one still loaded (a run that stopped after the person's Keep and
+/// before its bootout) or loaded again (a login since) is never bootstrapped a
+/// second time, which launchd refuses, and one line says so. The kickstart
+/// still follows: an agent that started while the one-row daemon's screen
+/// worker held its lock exited 0, so its job is loaded and nothing runs.
 async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) -> Result<()> {
     let job = format!("gui/{uid}/com.roomler.agent");
     if wait && let Some(why) = worker_gone(host, uid).await {
         host.say(&format!(
-            "{job}: {why}. Nothing here stops a process: if the agent is not running once that \
+            "{job}: {why}. Nothing here stops a process: if roomlerd is not running once that \
              worker has stopped, `sudo launchctl kickstart {job}` starts it"
         ));
     }
-    host.bootstrap(&bootstrap_argv(uid, home))?;
-    host.say(&format!("bootstrapped: {job}"));
+    if host.agent_loaded(uid) {
+        host.say(&format!(
+            "{job}: already loaded, so it is not bootstrapped again"
+        ));
+    } else {
+        host.bootstrap(&bootstrap_argv(uid, home))?;
+        host.say(&format!("bootstrapped: {job}"));
+    }
     match host.kickstart_agent(uid) {
         Ok(()) => host.say(&format!("kickstarted: {job}")),
         Err(e) => host.say(&format!(
@@ -2148,11 +2583,26 @@ async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) ->
 
 /// #4092 — what `--revert` and the undo say of an agent they load only once
 /// the restart has answered, when it did not.
-fn not_bootstrapped(uid: u32) -> String {
-    format!(
-        "gui/{uid}/com.roomler.agent: not bootstrapped, as the daemon did not restart onto the \
-         files put back; launchd loads it at the next login"
-    )
+///
+/// #4287 — the job is read as the line is made. One still loaded (a run that
+/// stopped after the person's Keep and before its bootout) or loaded again (a
+/// login since) does not load at the next login: its agent may run, or may
+/// have exited 0 while the one-row daemon's screen worker held its lock, and
+/// then only `kickstart` starts it.
+fn not_bootstrapped<H: Host>(host: &mut H, uid: u32) -> String {
+    let job = format!("gui/{uid}/com.roomler.agent");
+    if host.agent_loaded(uid) {
+        format!(
+            "{job}: already loaded, and not started here, as the daemon did not restart onto \
+             the files put back; if roomlerd is not running, `sudo launchctl kickstart {job}` \
+             starts it"
+        )
+    } else {
+        format!(
+            "{job}: not bootstrapped, as the daemon did not restart onto the files put back; \
+             launchd loads it at the next login"
+        )
+    }
 }
 
 /// The Verify step: the restarted daemon has every part of one row within
@@ -2207,7 +2657,7 @@ fn report<H: Host>(host: &mut H, read: &Read, plan: &Plan, after: &NodeStatus) {
         host.say("the rows this Mac no longer uses read offline until a person deletes them:");
         for item in &retired {
             host.say(&format!(
-                "  \"{}\", agent {}, tenant {}, {}: DELETE {}/api/tenant/{}/agent/{}",
+                "  \"{}\", device {}, tenant {}, {}: DELETE {}/api/tenant/{}/agent/{}",
                 item.name,
                 item.agent_id,
                 item.tenant_id,
@@ -2265,6 +2715,19 @@ pub struct Revert {
     /// Uid folders with no `record.json` that parses: a Keep that never
     /// finished, removed first.
     pub unfinished: Vec<u32>,
+    /// #4122 — the person of one of those folders whose LaunchAgent the
+    /// revert bootstraps after the restart, as it does a person given back
+    /// with their plist: the console user, where root's file put back leaves
+    /// that half to its LaunchAgent ([`bootstrap_after_revert`]), their plist
+    /// in their home as their own process read it, and their job not loaded.
+    /// A keep again that stopped after the bootout (#4097) leaves just that.
+    pub unfinished_agent: Option<Account>,
+    /// #4227 — the LaunchAgent of the person given back whom
+    /// [`bootstrap_after_revert`] names was loaded as the plan read it, as a
+    /// run that stopped after their Keep and before its bootout leaves it.
+    /// The plan then says it is started, not bootstrapped; [`start_agent`]
+    /// reads it again right before either.
+    pub agent_loaded: bool,
     /// [`Host::record_strays`]: temporary files a power loss left, removed
     /// first.
     pub strays: Vec<String>,
@@ -2394,6 +2857,24 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
             "root's file, which an earlier revert already put back",
         ),
     };
+    // #4122 — a keep again that stopped after the bootout leaves its person's
+    // folder unfinished and their agent booted out, with no record of them.
+    // Decided here, so that the plan says it and its digest holds it.
+    let console_uid = host.console_uid();
+    let mut unfinished_agent = None;
+    if let Some(uid) = bootstrap_after_revert(supervised, console_uid)
+        && unfinished.contains(&uid)
+        && let Some(p) = found.people.iter().find(|p| p.account.uid == uid)
+        && p.has_plist
+        && !host.agent_loaded(uid)
+    {
+        unfinished_agent = Some(p.account.clone());
+    }
+    // #4227 — the job of the person given back whom the bootstrap names, read
+    // so that the plan says what the revert does with it.
+    let agent_loaded = bootstrap_after_revert(supervised, console_uid)
+        .filter(|uid| people.iter().any(|p| p.uid == *uid))
+        .is_some_and(|uid| host.agent_loaded(uid));
     Ok(Some(Revert {
         root_kept,
         root_record,
@@ -2401,9 +2882,11 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
         supervised_from,
         people,
         unfinished,
+        unfinished_agent,
+        agent_loaded,
         strays,
         unread,
-        console_uid: host.console_uid(),
+        console_uid,
     }))
 }
 
@@ -2415,13 +2898,33 @@ pub fn bootstrap_after_revert(supervised: bool, console_uid: Option<u32>) -> Opt
     console_uid.filter(|_| !supervised)
 }
 
+/// What the plan adds to the line of the person whose LaunchAgent `--revert`
+/// bootstraps: one given back (#4092), or one whose keep never finished
+/// ([`Revert::unfinished_agent`], #4122).
+const AGENT_AFTER_RESTART: &str = ", and their LaunchAgent is bootstrapped after the restart, \
+                                   once the one-row screen worker that runs as them has stopped";
+
+/// #4227 — what the plan adds instead for a person given back whose job is
+/// loaded as it reads it ([`Revert::agent_loaded`]): never bootstrapped
+/// again, only kickstarted without `-k`, which starts it if it is not running
+/// ([`start_agent`]).
+const LOADED_AGENT_AFTER_RESTART: &str = ", and their LaunchAgent, already loaded, is started \
+                                          after the restart if it is not running, once the \
+                                          one-row screen worker that runs as them has stopped";
+
 /// The revert's plan, in the words it says before it asks.
 pub fn describe_revert(r: &Revert) -> Vec<String> {
     let mut out = vec!["one row --revert: the plan. Nothing has changed yet.".to_string()];
     for uid in &r.unfinished {
-        out.push(format!(
-            "{RECORDS}/{uid} is removed: a keep that never finished"
-        ));
+        let line = match r.unfinished_agent.as_ref().filter(|a| a.uid == *uid) {
+            Some(a) => format!(
+                "{RECORDS}/{uid} is removed: a keep of {}'s files that never finished\
+                 {AGENT_AFTER_RESTART}",
+                a.name
+            ),
+            None => format!("{RECORDS}/{uid} is removed: a keep that never finished"),
+        };
+        out.push(line);
     }
     for name in &r.strays {
         out.push(format!(
@@ -2443,16 +2946,16 @@ pub fn describe_revert(r: &Revert) -> Vec<String> {
             Back::Record { .. } => format!("from what root keeps in {RECORDS}/{}", p.uid),
             Back::Legacy => "from the copies an earlier release kept in their folder".to_string(),
         };
+        let agent = if bootstrap_for != Some(p.uid) {
+            ""
+        } else if r.agent_loaded {
+            LOADED_AGENT_AFTER_RESTART
+        } else {
+            AGENT_AFTER_RESTART
+        };
         out.push(format!(
-            "{} (uid {}): their files go back {how}, by their own process{}",
-            p.name,
-            p.uid,
-            if bootstrap_for == Some(p.uid) {
-                ", and their LaunchAgent is bootstrapped after the restart, once the one-row \
-                 screen worker that runs as them has stopped"
-            } else {
-                ""
-            }
+            "{} (uid {}): their files go back {how}, by their own process{agent}",
+            p.name, p.uid
         ));
     }
     for (uid, name, why) in &r.unread {
@@ -2589,9 +3092,9 @@ async fn give_back<H: Host>(host: &mut H, p: &RevertPerson) -> std::result::Resu
 /// file back first, as a copy of its kept bytes checked against `root.json`;
 /// each person in uid order, one who fails named and the others going on;
 /// the restart; then, only once it answered, the console person's LaunchAgent
-/// where root's file leaves it to launchd (#4092, [`start_agent`]), the
-/// records of those given back, and `root.json` and the kept copy if nobody
-/// failed.
+/// where root's file leaves it to launchd (#4092, [`start_agent`]), given back
+/// with their plist or their keep unfinished (#4122), the records of those
+/// given back, and `root.json` and the kept copy if nobody failed.
 pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     for &uid in &r.unfinished {
         host.remove_records_of(uid)
@@ -2658,6 +3161,11 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     failed.sort_unstable();
     failed.dedup();
     let failed: Vec<String> = failed.into_iter().map(|(_, name)| name).collect();
+    // #4122 — the person of an unfinished folder the plan named, at the same
+    // point and in the same way as one given back, and once, whichever path
+    // names them. `start_agent` reads their job again first, as it does
+    // anyone's (#4227): a login since loads it.
+    let agent = agent.or_else(|| r.unfinished_agent.as_ref().map(|a| (a.uid, a.home.clone())));
     host.say("restarting the daemon onto the files put back: live sessions end now");
     let leaving = host.status().await.ok().map(|s| DaemonInstance::of(&s));
     let back = match host.kickstart() {
@@ -2668,7 +3176,8 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
         Ok(status) => status,
         Err(e) => {
             if let Some((uid, _)) = &agent {
-                host.say(&not_bootstrapped(*uid));
+                let line = not_bootstrapped(host, *uid);
+                host.say(&line);
             }
             host.say(&format!(
                 "root's records stay in {RECORDS}: `sudo roomlerd one-row --revert` finishes the \
@@ -2685,7 +3194,8 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
         && let Err(e) = start_agent(host, *uid, home, true).await
     {
         host.say(&format!(
-            "gui/{uid}/com.roomler.agent did not start ({e:#}); launchd loads it at the next login"
+            "gui/{uid}/com.roomler.agent did not start ({e:#}); launchd loads it at the next \
+             login"
         ));
     }
     for uid in given_back {
@@ -2720,6 +3230,45 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     Ok(())
 }
 
+/// #4312 — `--revert` restarts the daemon onto root's file put back, and on
+/// that stop an ephemeral row deletes itself, so the root half would come
+/// back on a dead token. The file read is the one that restart stops on:
+/// root's kept copy where there is one, since it goes back first, else root's
+/// own file, read as bytes ([`Host::load_root`] may repair a file). One that
+/// is not there or does not parse holds no ephemeral row. `Some`: the line
+/// that refuses.
+fn ephemeral_revert<H: Host>(host: &H, r: &Revert) -> Result<Option<String>> {
+    let (bytes, kept) = match &r.root_kept {
+        Some(kept) => (kept.clone(), true),
+        None => match host.read_root(RootFile::Config)? {
+            Some(bytes) => (bytes, false),
+            None => return Ok(None),
+        },
+    };
+    let Ok(cfg) = crate::config::parse_text(&String::from_utf8_lossy(&bytes), ROOT_CONFIG) else {
+        return Ok(None);
+    };
+    if !cfg.ephemeral {
+        return Ok(None);
+    }
+    let (file, remove) = if kept {
+        (
+            format!("{ROOT_CONFIG}.{KEPT_EXT}, which --revert puts back first,"),
+            format!(", remove {ROOT_CONFIG}.{KEPT_EXT}, whose enrollment cannot come back,"),
+        )
+    } else {
+        (ROOT_CONFIG.to_string(), String::new())
+    };
+    Ok(Some(format!(
+        "--revert is refused: the root half's enrollment ({}, tenant {}) in {file} is \
+         ephemeral: --revert restarts the daemon onto that file, and on that stop an ephemeral \
+         row deletes itself, so the root half would come back on a dead token. Remove it on the \
+         Devices page ({OVER_EPHEMERAL}){remove} and enroll the root half again with a key that is \
+         not ephemeral: {ROOT_CONFIG} keeps its settings. Then run this again. Nothing has changed",
+        cfg.server_url, cfg.tenant_id
+    )))
+}
+
 /// `--revert` as the command runs it: the plan, said, then `confirm` and the
 /// revert, unless only the plan was asked for.
 pub async fn revert_main<H: Host>(
@@ -2745,6 +3294,9 @@ pub async fn revert_main<H: Host>(
              tries again",
             names.join(", ")
         );
+    }
+    if let Some(line) = ephemeral_revert(host, &r)? {
+        bail!("{line}");
     }
     if dry_run {
         host.say("--dry-run: nothing has changed");
@@ -3006,7 +3558,11 @@ mod mac {
     /// each call checked. Never `Command::uid` or `gid`, whose group handling
     /// is not this hook's. Fed and read within [`CHILD_DEADLINE`] and
     /// [`CHILD_CAP`] on a blocking thread, never on a runtime worker.
-    async fn spawn_person(account: &Account, verb: Verb, stdin: &[u8]) -> Result<ChildOutput> {
+    pub(crate) async fn spawn_person(
+        account: &Account,
+        verb: Verb,
+        stdin: &[u8],
+    ) -> Result<ChildOutput> {
         use std::os::unix::process::CommandExt as _;
         let plan = spawn_plan(account, verb);
         let lstat = std::fs::symlink_metadata(plan.program).map(|m| (m.uid(), m.mode()));
@@ -3090,27 +3646,87 @@ mod mac {
         }
     }
 
+    /// The account `uid` as root starts a child for it: the one-row host's
+    /// lookup, and FR-151's update helper's for the console person.
+    pub(crate) fn person_account(uid: u32) -> Option<Account> {
+        let entry = crate::appdirs::account_entry(uid)?;
+        Some(Account {
+            uid: entry.uid,
+            gid: entry.gid,
+            name: entry.name.into_string().ok()?,
+            home: entry.home.into_os_string().into_string().ok()?,
+            uuid: account_uuid(entry.uid)?,
+        })
+    }
+
     struct MacHost {
-        log: Option<std::fs::File>,
+        /// The log, once opened: at the start of the command, at the first
+        /// line of the daemon's sweep. `Some(None)`: it could not be opened.
+        log: Option<Option<std::fs::File>>,
+        /// #4379 — each line is printed too: the command's are; the daemon's
+        /// sweep's go to the log alone.
+        print: bool,
         started: std::time::Instant,
+    }
+
+    /// [`LOG`], opened to append, made 600 where it is missing.
+    fn open_log() -> Option<std::fs::File> {
+        let log_path = root_path(RootFile::Log);
+        if let Some(dir) = log_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)
+            .ok()
     }
 
     impl MacHost {
         fn new() -> Self {
-            let log_path = root_path(RootFile::Log);
-            if let Some(dir) = log_path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let log = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(&log_path)
-                .ok();
             Self {
-                log,
+                log: Some(open_log()),
+                print: true,
                 started: std::time::Instant::now(),
             }
+        }
+
+        /// #4379 — the daemon's sweep: a Mac with nothing to say gets no log.
+        fn for_daemon() -> Self {
+            Self {
+                log: None,
+                print: false,
+                started: std::time::Instant::now(),
+            }
+        }
+    }
+
+    /// #4379 — the root daemon's sweep ([`sweep`]), started beside FR-43's
+    /// supervisor by a root daemon that is not a worker: once it has run
+    /// [`crate::config::CLEAN_RUN_THRESHOLD_SECS`], its reads on the blocking
+    /// pool (an account lookup can be held up, #3853), then one child per
+    /// person. A stop of the daemon ends it at once, at any point; a child it
+    /// was waiting for ends by its own deadline ([`CHILD_DEADLINE`]).
+    pub(crate) async fn sweep_at_start(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let after = Duration::from_secs(crate::config::CLEAN_RUN_THRESHOLD_SECS);
+        let work = async {
+            tokio::time::sleep(after).await;
+            let read = tokio::task::spawn_blocking(|| {
+                let mut host = MacHost::for_daemon();
+                let planned = sweep_plan(&mut host);
+                (host, planned)
+            })
+            .await;
+            match read {
+                Ok((mut host, Some(planned))) => sweep_run(&mut host, &planned).await,
+                Ok((_, None)) => {}
+                Err(e) => tracing::warn!(error = %e, "the sweep of people's config.toml.prev"),
+            }
+        };
+        tokio::select! {
+            () = work => {}
+            _ = shutdown.wait_for(|stop| *stop) => {}
         }
     }
 
@@ -3120,8 +3736,10 @@ mod mac {
             // Never `println!`: under `roomler exec` the pipe behind stdout
             // belongs to the daemon being restarted, and `println!` panics on a
             // closed pipe, which would stop the verify and its undo midway.
-            let _ = writeln!(std::io::stdout(), "{line}");
-            if let Some(log) = self.log.as_mut() {
+            if self.print {
+                let _ = writeln!(std::io::stdout(), "{line}");
+            }
+            if let Some(log) = self.log.get_or_insert_with(open_log).as_mut() {
                 let _ = writeln!(log, "{} {line}", chrono::Utc::now().to_rfc3339());
             }
         }
@@ -3240,14 +3858,7 @@ mod mac {
         }
 
         fn account(&self, uid: u32) -> Option<Account> {
-            let entry = crate::appdirs::account_entry(uid)?;
-            Some(Account {
-                uid: entry.uid,
-                gid: entry.gid,
-                name: entry.name.into_string().ok()?,
-                home: entry.home.into_os_string().into_string().ok()?,
-                uuid: account_uuid(entry.uid)?,
-            })
+            person_account(uid)
         }
 
         fn console_uid(&self) -> Option<u32> {
@@ -3377,6 +3988,12 @@ mod mac {
         }
     }
 }
+
+/// FR-151 — the update helper starts the console person's `live-work` child
+/// with FR-147's own spawn and account lookup. #4379 — the root daemon starts
+/// its sweep.
+#[cfg(target_os = "macos")]
+pub(crate) use mac::{person_account, spawn_person, sweep_at_start};
 
 #[cfg(test)]
 mod tests {
@@ -3586,11 +4203,73 @@ mod tests {
         )];
         let e = plan(&root(), &people).unwrap_err().to_string();
         assert!(e.contains("ephemeral"), "{e}");
-        // One the root holds is retired, ephemeral or not.
+        // #4312 — one the root holds stops it too: retired, its row would go
+        // at the bootout or to the reaper, and `--revert` could not bring it
+        // back.
         let mut held = cfg("t1", "user-1", "token");
         held.ephemeral = true;
         let people = vec![person("casey", 501, Path::new("/Users/casey"), Some(held))];
-        assert_eq!(plan(&root(), &people).unwrap().items[0].fate, Fate::Retired);
+        assert!(plan(&root(), &people).is_err());
+    }
+
+    /// #4312 — a person's ephemeral enrollment in an org the root holds would
+    /// be retired, and its row would go at the bootout, or to the reaper while
+    /// it stays retired, so `--revert` could not bring it back. The line names
+    /// the person and the org, says why, and how to go on.
+    #[test]
+    fn a_held_ephemeral_person_stops_the_plan_for_the_row_it_would_lose() {
+        let mut held = casey();
+        held.ephemeral = true;
+        let people = vec![person("casey", 501, Path::new("/Users/casey"), Some(held))];
+        let e = plan(&root(), &people).unwrap_err().to_string();
+        for want in [
+            "casey's enrollment",
+            SERVER,
+            "tenant t1",
+            "is ephemeral, and the root half holds that org",
+            "`--revert` could not bring it back",
+            "Remove it on the Devices page (an ephemeral row never turns permanent)",
+            "enroll casey's half again with a key that is not ephemeral: that half's config",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
+    }
+
+    /// #4312 — the unheld refusal keeps its meaning, and its way on no longer
+    /// sends a person to enroll the root half there, where the held refusal
+    /// would stop them next.
+    #[test]
+    fn an_unheld_ephemeral_person_is_refused_in_words_true_for_it() {
+        let mut theirs = cfg("t2", "user-2", "token");
+        theirs.ephemeral = true;
+        let people = vec![person(
+            "casey",
+            501,
+            Path::new("/Users/casey"),
+            Some(theirs),
+        )];
+        let e = plan(&root(), &people).unwrap_err().to_string();
+        for want in [
+            "casey's enrollment",
+            "tenant t2",
+            "the root half does not hold that org",
+            "lives only with the half that enrolled it",
+            "Remove it on the Devices page (an ephemeral row never turns permanent)",
+            "enroll casey's half again with a key that is not ephemeral: that half's config",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+        assert!(!e.contains("enroll the root half there"), "{e}");
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
     }
 
     #[test]
@@ -3771,6 +4450,11 @@ mod tests {
         Exit(i32),
         /// It acts, then the deadline stops it before it answers.
         StoppedAfterActing,
+        /// #4097 — it acts, then exits 1, as a `convert` whose config write
+        /// failed after the plist went.
+        FailedAfterActing,
+        /// #4097 — it cannot be started.
+        NotRun,
         Garbage,
         OtherUid,
     }
@@ -3808,6 +4492,22 @@ mod tests {
         workers: HashMap<u32, Option<u32>>,
         /// `ps` gives no answer.
         ps_fails: bool,
+        /// #4097 — what each person's agent saves as a bootout stops it: the
+        /// config's bytes and mode, written over their config then.
+        stop_saves: HashMap<u32, (Vec<u8>, u32)>,
+        /// #4227 — `(effect, n, uid)`: `uid` logs in just before the n-th
+        /// call of that effect, and launchd loads their LaunchAgent from the
+        /// plist in their home, where one is there.
+        login_at: Option<(&'static str, usize, u32)>,
+        /// #4184 — the people whose `convert` and `put-back` are done as
+        /// `one_row_home` does them, on a home that also holds what this fake
+        /// does not: the config's `.prev`. #4379: and `blank-prev`.
+        real: BTreeMap<u32, crate::one_row_home::ChildHome>,
+        /// #4379 — how often `/Users` was read.
+        users_read: std::cell::Cell<usize>,
+        /// #4379 — what each child was fed: its uid, its verb's word, its
+        /// stdin.
+        fed: Vec<(u32, &'static str, Vec<u8>)>,
     }
 
     fn one_row_daemon(kicks: u32) -> NodeStatus {
@@ -3866,7 +4566,22 @@ mod tests {
                 clock: Duration::ZERO,
                 workers: HashMap::new(),
                 ps_fails: false,
+                stop_saves: HashMap::new(),
+                login_at: None,
+                real: BTreeMap::new(),
+                users_read: std::cell::Cell::new(0),
+                fed: Vec::new(),
             }
+        }
+
+        /// #4184 — `uid`'s `convert` and `put-back` done by `one_row_home`
+        /// itself, each on their files as they are then. #4379: and
+        /// `blank-prev`.
+        fn with_real_child(mut self, uid: u32) -> Self {
+            let h = &self.homes[&uid];
+            let home = crate::one_row_home::ChildHome::with(h.config.as_ref(), h.plist.as_ref());
+            self.real.insert(uid, home);
+            self
         }
 
         /// A second person, ana (uid 502), whose enrollment the root holds.
@@ -3886,7 +4601,14 @@ mod tests {
         fn hit(&mut self, effect: &'static str) -> Result<()> {
             let n = self.counts.entry(effect).or_default();
             *n += 1;
-            if self.fail == Some((effect, *n)) {
+            let n = *n;
+            if let Some((at, call, uid)) = self.login_at
+                && (at, call) == (effect, n)
+                && self.homes.get(&uid).is_some_and(|h| h.plist.is_some())
+            {
+                self.loaded.insert(uid);
+            }
+            if self.fail == Some((effect, n)) {
                 bail!("{effect} #{n} failed (the test said so)");
             }
             Ok(())
@@ -4026,6 +4748,16 @@ mod tests {
                     }
                     reply.put_back_legacy = Some(Legacy { config, plist });
                 }
+                // FR-151: the one-row move never asks it.
+                Verb::LiveWork => return Err(2),
+                // #4379 — this fake keeps no `.prev`: a home that holds one is
+                // a real child's (`with_real_child`).
+                Verb::BlankPrev => {
+                    reply.blank_prev = Some(crate::one_row_home::BlankPrevAnswer {
+                        found: false,
+                        sha256: None,
+                    });
+                }
             }
             Ok(())
         }
@@ -4090,10 +4822,16 @@ mod tests {
             Ok(())
         }
         fn users(&self) -> Vec<UsersEntry> {
+            self.users_read.set(self.users_read.get() + 1);
             self.homes
                 .keys()
                 .map(|uid| UsersEntry {
-                    name: self.accounts[uid].name.clone(),
+                    // #4379 — a home whose account is gone keeps its folder's
+                    // name.
+                    name: self
+                        .accounts
+                        .get(uid)
+                        .map_or_else(|| format!("gone-{uid}"), |a| a.name.clone()),
                     uid: *uid,
                     dev: 1,
                     ino: u64::from(*uid),
@@ -4116,6 +4854,10 @@ mod tests {
         fn bootout_agent(&mut self, uid: u32) -> Result<()> {
             self.hit("bootout")?;
             self.loaded.remove(&uid);
+            // The agent's graceful stop saves before launchd lets it go.
+            if let Some(save) = self.stop_saves.get(&uid).cloned() {
+                self.homes.get_mut(&uid).unwrap().config = Some(save);
+            }
             self.calls.push(format!("bootout {uid}"));
             Ok(())
         }
@@ -4127,6 +4869,12 @@ mod tests {
                 self.homes[&uid].plist.is_some(),
                 "a LaunchAgent is bootstrapped from its plist"
             );
+            // #4227 — launchd refuses a job it has loaded already.
+            if self.loaded.contains(&uid) {
+                self.calls
+                    .push(format!("bootstrap {uid}: refused, already loaded"));
+                bail!("Bootstrap failed: 37: Operation already in progress");
+            }
             self.loaded.insert(uid);
             self.calls.push(format!("bootstrap {uid}"));
             Ok(())
@@ -4164,6 +4912,7 @@ mod tests {
             stdin: &[u8],
         ) -> Result<ChildOutput> {
             self.calls.push(format!("{} {}", verb.word(), account.uid));
+            self.fed.push((account.uid, verb.word(), stdin.to_vec()));
             let script = self.scripts.get(&(account.uid, verb.word())).copied();
             let out = |code: Option<i32>, stdout: Vec<u8>| ChildOutput {
                 pid: 4242,
@@ -4175,7 +4924,29 @@ mod tests {
             match script {
                 Some(Script::Exit(code)) => return Ok(out(Some(code), Vec::new())),
                 Some(Script::Garbage) => return Ok(out(Some(0), b"not json".to_vec())),
+                Some(Script::NotRun) => bail!("spawning it failed (the test said so)"),
                 _ => {}
+            }
+            // #4184 — the verb as `one_row_home` does it, on the files as they
+            // are now; what it leaves is the person's files from then on.
+            if matches!(verb, Verb::Convert { .. } | Verb::PutBack | Verb::BlankPrev)
+                && let Some(home) = self.real.get_mut(&account.uid)
+            {
+                let h = self.homes.get_mut(&account.uid).unwrap();
+                home.hold(h.config.as_ref(), h.plist.as_ref());
+                let done = home.answer(verb, account.uid, account.gid, stdin);
+                h.config = home.config();
+                h.plist = home.plist();
+                return Ok(match script {
+                    Some(Script::StoppedAfterActing) => out(None, Vec::new()),
+                    Some(Script::FailedAfterActing) => out(Some(1), Vec::new()),
+                    _ => ChildOutput {
+                        code: Some(done.exit.code()),
+                        stdout: done.stdout,
+                        stderr: done.stderr.into_bytes(),
+                        ..out(None, Vec::new())
+                    },
+                });
             }
             let mut reply = Reply {
                 v: crate::one_row_home::FORMAT,
@@ -4187,12 +4958,15 @@ mod tests {
                 convert: None,
                 put_back: None,
                 put_back_legacy: None,
+                live_work: None,
+                blank_prev: None,
             };
             if let Err(code) = self.act(account.uid, verb, stdin, &mut reply) {
                 return Ok(out(Some(code), Vec::new()));
             }
             match script {
                 Some(Script::StoppedAfterActing) => Ok(out(None, Vec::new())),
+                Some(Script::FailedAfterActing) => Ok(out(Some(1), Vec::new())),
                 Some(Script::OtherUid) => {
                     reply.uid += 1;
                     Ok(out(Some(0), serde_json::to_vec(&reply).unwrap()))
@@ -4505,6 +5279,168 @@ mod tests {
             .unwrap();
         assert_eq!(mac.files(), before);
         assert!(mac.said().contains("one row already"));
+    }
+
+    /// #4312 — an ephemeral root half stops the plan: one-row restarts the
+    /// daemon, and on that stop an ephemeral row deletes itself. Nothing is
+    /// written and launchd is asked nothing.
+    #[tokio::test]
+    async fn an_ephemeral_root_half_stops_the_plan_and_changes_nothing() {
+        let mut mac = Fake::new(one_row_daemon);
+        let mut ephemeral = root();
+        ephemeral.ephemeral = true;
+        mac.root.insert(RootFile::Config, toml_of(&ephemeral));
+        let before = mac.files();
+        let e = convert_now(&mut mac).await.unwrap_err().to_string();
+        for want in [
+            "the root half's enrollment",
+            SERVER,
+            "tenant t1",
+            "is ephemeral",
+            "one-row restarts the daemon, and on that stop an ephemeral row deletes itself",
+            "Remove it on the Devices page (an ephemeral row never turns permanent) and enroll",
+            "the root half again with a key that is not ephemeral: /etc/roomler/config.toml keeps",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
+        assert_eq!(mac.files(), before);
+        assert!(!mac.wrote(), "{:?}", mac.calls);
+        assert!(mac.loaded.contains(&501), "casey's agent is not booted out");
+        // With nobody's enrollment to take, the restart alone is that stop,
+        // and a dry run says so too.
+        let mut mac = Fake::new(one_row_daemon);
+        mac.root.insert(RootFile::Config, toml_of(&ephemeral));
+        let mut read = read_now(&mut mac).await;
+        read.people[0].config = Some(AgentConfig::for_person_with_no_enrollment("Mac").unwrap());
+        let before = mac.files();
+        let e = migrate(&mut mac, &read, true, |_| panic!("nothing to ask"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the root half's enrollment"), "{e}");
+        assert_eq!(mac.files(), before);
+        assert!(!mac.wrote(), "{:?}", mac.calls);
+    }
+
+    /// #4312 — a Mac that is one row already, its root half ephemeral, is left
+    /// alone as before: one-row stops nothing there, so nothing is refused.
+    #[tokio::test]
+    async fn an_ephemeral_mac_that_is_one_row_already_is_left_alone() {
+        let mut mac = Fake::new(one_row_daemon);
+        let mut read = read_now(&mut mac).await;
+        read.root.ephemeral = true;
+        read.root.macos_supervise_gui_worker = true;
+        read.root.macos_one_row = true;
+        read.people[0].config = Some(AgentConfig::for_person_with_no_enrollment("Mac").unwrap());
+        read.people[0].has_plist = false;
+        mac.loaded.clear();
+        let before = mac.files();
+        migrate(&mut mac, &read, false, |_| panic!("nothing to ask"))
+            .await
+            .unwrap();
+        assert_eq!(mac.files(), before);
+        assert!(mac.said().contains("one row already"));
+    }
+
+    /// #4312 — a permanent root, a permanent person and an ephemeral one: the
+    /// plan stops on the ephemeral one before anything is kept, booted out or
+    /// written, for either person.
+    #[tokio::test]
+    async fn a_mixed_mac_stops_on_its_ephemeral_person_and_writes_nothing() {
+        let mut mac = Fake::new(one_row_daemon).with_ana();
+        let mut ana = cfg("t1", "user-9", "ana-token");
+        ana.ephemeral = true;
+        mac.homes.get_mut(&502).unwrap().config = Some((toml_of(&ana), 0o600));
+        mac.loaded.insert(502);
+        let before = mac.files();
+        let e = convert_now(&mut mac).await.unwrap_err().to_string();
+        assert!(
+            e.contains("ana's enrollment") && e.contains("is ephemeral"),
+            "{e}"
+        );
+        assert!(
+            !e.contains("casey"),
+            "the permanent person is no reason: {e}"
+        );
+        assert_eq!(mac.files(), before);
+        assert!(!mac.wrote(), "{:?}", mac.calls);
+        assert!(mac.loaded.contains(&501) && mac.loaded.contains(&502));
+    }
+
+    /// #4312 — `--revert` restarts the daemon onto root's file put back, and
+    /// on that stop an ephemeral row deletes itself. So an ephemeral root file
+    /// stops it before anything changes: no file written, no launchctl call.
+    /// The file read is the one the restart stops on: root's kept copy where
+    /// there is one, which goes back first; else root's own file.
+    #[tokio::test]
+    async fn revert_refuses_an_ephemeral_root_half_before_any_change() {
+        let mut ephemeral = root();
+        ephemeral.ephemeral = true;
+        // Converted with root's kept copy, which `--revert` writes back.
+        let mut mac = Fake::new(one_row_daemon);
+        convert_now(&mut mac).await.unwrap();
+        let mut now = mac.root_cfg();
+        now.ephemeral = true;
+        mac.root.insert(RootFile::Config, toml_of(&now));
+        let kept = toml_of(&ephemeral);
+        let mut record: RootRecord =
+            serde_json::from_slice(&mac.root[&RootFile::RootRecord]).unwrap();
+        record.kept_sha256 = sha256_hex(&kept);
+        record.kept_len = kept.len() as u64;
+        mac.root
+            .insert(RootFile::RootRecord, serde_json::to_vec(&record).unwrap());
+        mac.root.insert(RootFile::Kept, kept);
+        mac.calls.clear();
+        let before = mac.files();
+        let e = format!("{:#}", revert_now(&mut mac).await.unwrap_err());
+        for want in [
+            "--revert is refused",
+            "/etc/roomler/config.toml.pre-one-row",
+            SERVER,
+            "tenant t1",
+            "is ephemeral",
+            "an ephemeral row deletes itself",
+            "Remove it on the Devices page (an ephemeral row never turns permanent)",
+            "remove /etc/roomler/config.toml.pre-one-row, whose enrollment cannot come back, and",
+            "a key that is not ephemeral: /etc/roomler/config.toml keeps its settings",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
+        assert_eq!(mac.files(), before);
+        assert!(!mac.wrote(), "{:?}", mac.calls);
+        // Converted by an older release: its revert reads root's own file.
+        let mut old = Fake::new(one_row_daemon);
+        old.root.insert(RootFile::Config, toml_of(&ephemeral));
+        old.converted_by_an_older_release();
+        let before = old.files();
+        let e = format!("{:#}", revert_now(&mut old).await.unwrap_err());
+        for want in [
+            "--revert is refused",
+            "tenant t1",
+            "is ephemeral",
+            "Remove it on the Devices page (an ephemeral row never turns permanent) and enroll",
+            "a key that is not ephemeral: /etc/roomler/config.toml keeps its settings",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+        assert!(
+            !e.contains("into a new"),
+            "#4331: the same file works now: {e}"
+        );
+        assert!(!e.contains(".pre-one-row"), "{e}");
+        assert_eq!(old.files(), before);
+        assert!(!old.wrote(), "{:?}", old.calls);
     }
 
     #[tokio::test]
@@ -5009,7 +5945,8 @@ mod tests {
     }
 
     /// T19: a `convert` that fails, answers nothing a parent can read, answers
-    /// as another account, or never answers: the undo runs.
+    /// as another account, or never answers: the undo runs. #4097: one that
+    /// refused before any change (exit 3) is not put back.
     #[tokio::test]
     async fn a_child_that_fails_during_the_conversion_undoes_it() {
         for script in [
@@ -5030,10 +5967,1071 @@ mod tests {
                 );
             }
             assert_eq!(mac.files(), before, "{script:?}");
+            let put_back: &[&str] = match script {
+                Script::Exit(3) => &[],
+                _ => &["put-back 501"],
+            };
+            assert_eq!(calls_of(&mac, &["put-back"]), put_back, "{script:?}");
+        }
+    }
+
+    /// #4097 — casey's agent in its first five minutes: their file has
+    /// `last_run_unhealthy` true, and the bootout's graceful stop saves it as
+    /// `stopped` makes it from that (`mark_clean_shutdown`, then `edit`).
+    /// Returns the bytes the save leaves.
+    fn casey_saves_as_it_stops(mac: &mut Fake, edit: fn(&mut AgentConfig)) -> Vec<u8> {
+        let mut running = casey();
+        crate::config::mark_run_starting(&mut running);
+        let mut stopped = running.clone();
+        crate::config::mark_clean_shutdown(&mut stopped);
+        edit(&mut stopped);
+        let stopped = toml_of(&stopped);
+        mac.homes.get_mut(&501).unwrap().config = Some((toml_of(&running), 0o600));
+        mac.stop_saves.insert(501, (stopped.clone(), 0o600));
+        stopped
+    }
+
+    /// #4097 T1: the agent's save as the bootout stops it moves only its own
+    /// run state. The conversion goes on from that save through the restart
+    /// and the verify, and what root keeps of the person is that save.
+    #[tokio::test]
+    async fn a_save_of_the_agents_own_run_state_as_it_stops_is_converted_from() {
+        let mut mac = Fake::new(one_row_daemon);
+        let stopped = casey_saves_as_it_stops(&mut mac, |_| {});
+        convert_now(&mut mac).await.unwrap();
+        let stored = |part| mac.root[&RootFile::Person { uid: 501, part }].clone();
+        assert_eq!(stored(Part::Config), stopped, "root keeps the agent's save");
+        let record: PersonRecord = serde_json::from_slice(&stored(Part::Record)).unwrap();
+        assert!(record.config.matches(Some(&stopped[..])), "{record:?}");
+        assert_eq!(record.config.mode, Some(0o600));
+        let home = &mac.homes[&501];
+        let person_now = crate::config::parse_text(
+            std::str::from_utf8(&home.config.as_ref().unwrap().0).unwrap(),
+            "p",
+        )
+        .unwrap();
+        assert!(!person_now.has_primary_enrollment() && person_now.orgs.is_empty());
+        assert!(!person_now.last_run_unhealthy, "converted from the save");
+        assert!(home.plist.is_none());
+        let said = mac.said();
+        assert!(
+            said.contains("casey's daemon saved") && said.contains("last_run_unhealthy"),
+            "{said}"
+        );
+    }
+
+    /// #4097 T3: the save as the agent stops moves another key too. It stops
+    /// before root's file is written, writes nothing back to the person, whose
+    /// file stays as their agent saved it, and starts their agent again.
+    #[tokio::test]
+    async fn a_save_that_moves_another_key_stops_it_before_roots_file() {
+        type Edit = fn(&mut AgentConfig);
+        let edits: [(&str, Edit); 2] = [
+            ("name", |c| c.machine_name = "Renamed".to_string()),
+            ("orgs", |c| {
+                c.orgs[0].agent_token = "user-token-9".to_string()
+            }),
+        ];
+        for (what, edit) in edits {
+            let mut mac = Fake::new(one_row_daemon);
+            let root_before = mac.root_bytes();
+            let stopped = casey_saves_as_it_stops(&mut mac, edit);
+            let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+            assert!(
+                e.contains("this Mac changed after the plan was said"),
+                "{what}: {e}"
+            );
+            assert_eq!(
+                mac.counts.get("save_root"),
+                None,
+                "{what}: root's file is never written"
+            );
+            assert_eq!(mac.root_bytes(), root_before, "{what}");
+            assert!(
+                calls_of(&mac, &["put-back", "convert"]).is_empty(),
+                "{what}: {:?}",
+                mac.calls
+            );
+            assert_eq!(
+                mac.homes[&501].config,
+                Some((stopped, 0o600)),
+                "{what}: as the agent saved it"
+            );
+            assert!(
+                mac.loaded.contains(&501),
+                "{what}: its agent is started again"
+            );
+            assert!(
+                !mac.root
+                    .keys()
+                    .any(|f| matches!(f, RootFile::Person { .. })),
+                "{what}"
+            );
+        }
+    }
+
+    /// #4097 T2: T1, and the verify fails. The undo puts back the agent's own
+    /// save byte for byte, `last_run_unhealthy` false included.
+    #[tokio::test]
+    async fn an_undo_puts_back_the_agents_own_save() {
+        let mut mac = Fake::new(no_grant_daemon);
+        let root_before = mac.root_bytes();
+        let stopped = casey_saves_as_it_stops(&mut mac, |_| {});
+        let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+        assert!(e.contains("no Screen Recording grant"), "{e}");
+        assert!(e.contains("the Mac is as it was"), "{e}");
+        let home = &mac.homes[&501];
+        assert_eq!(
+            home.config,
+            Some((stopped, 0o600)),
+            "the save, byte for byte"
+        );
+        assert_eq!(home.plist, Some((b"<plist/>".to_vec(), 0o644)));
+        assert_eq!(mac.root_bytes(), root_before);
+        assert!(mac.loaded.contains(&501));
+        assert!(
+            !mac.root
+                .keys()
+                .any(|f| matches!(f, RootFile::Person { .. }))
+        );
+    }
+
+    /// #4097 T4: a `convert` its own process refuses with exit 3 (ana wrote
+    /// her file after Read) or exit 4, which it raises only before its first
+    /// change. Nothing goes back to her, and her files stay as they are; casey,
+    /// converted before her, is put back.
+    #[tokio::test]
+    async fn a_person_whose_process_refused_before_any_change_gets_no_put_back() {
+        for (code, script) in [(3, None), (4, Some(Script::Exit(4)))] {
+            let mut mac = Fake::new(one_row_daemon).with_ana();
+            let (root_before, homes_before) = mac.files();
+            let read = read_now(&mut mac).await;
+            let hers = (b"machine_name = \"ana's own\"\n".to_vec(), 0o600);
+            mac.homes.get_mut(&502).unwrap().config = Some(hers.clone());
+            if let Some(script) = script {
+                mac.scripts.insert((502, "convert"), script);
+            }
+            let e = format!(
+                "{:#}",
+                migrate(&mut mac, &read, false, |_| Ok(()))
+                    .await
+                    .unwrap_err()
+            );
+            assert!(e.contains("ana's files"), "{code}: {e}");
+            assert!(e.contains("the Mac is as it was"), "{code}: {e}");
+            assert_eq!(calls_of(&mac, &["put-back"]), ["put-back 501"], "{code}");
+            assert_eq!(mac.homes[&502].config, Some(hers), "{code}: as she left it");
+            assert_eq!(mac.homes[&502].plist, homes_before[&502].plist, "{code}");
+            assert_eq!(
+                mac.homes[&501], homes_before[&501],
+                "{code}: casey is put back"
+            );
+            assert_eq!(mac.root_bytes(), root_before[&RootFile::Config], "{code}");
+            assert!(
+                mac.said().contains(&format!(
+                    "not put back: ana's files, which their own process left as they were \
+                     (exit {code})"
+                )),
+                "{code}: {}",
+                mac.said()
+            );
+        }
+    }
+
+    /// #4097 T5: a `convert` that may have changed something before it ended
+    /// is put back, as before: one the deadline stopped, one that exited 1
+    /// after it acted, and one that could not be started.
+    #[tokio::test]
+    async fn a_convert_that_may_have_changed_something_is_put_back() {
+        for script in [
+            Script::StoppedAfterActing,
+            Script::FailedAfterActing,
+            Script::NotRun,
+        ] {
+            let mut mac = Fake::new(one_row_daemon);
+            let before = mac.files();
+            mac.scripts.insert((501, "convert"), script);
+            let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+            assert!(e.contains("the Mac is as it was"), "{script:?}: {e}");
             assert_eq!(
                 calls_of(&mac, &["put-back"]),
                 ["put-back 501"],
                 "{script:?}"
+            );
+            assert_eq!(mac.files(), before, "{script:?}");
+            assert!(mac.loaded.contains(&501), "{script:?}");
+        }
+    }
+
+    /// #4097 T6: root's file does not go back in the undo after the
+    /// conversion's restart, which comes only once every `convert` answered:
+    /// the Mac stays converted, one row. Nobody's files are put back, nothing
+    /// restarts again, no agent is bootstrapped or kickstarted, every record
+    /// stays, and the command names `--revert`, which then finishes: root's
+    /// file back, the person back, the restart, then the console person's
+    /// agent.
+    #[tokio::test]
+    async fn an_undo_whose_root_file_did_not_go_back_starts_no_agent() {
+        let mut mac = Fake::new(no_grant_daemon);
+        let before = mac.files();
+        // Root's copy, `root.json`, casey's config, plist and `record.json`,
+        // then `after.json`: the undo's write of root's file is the seventh.
+        mac.fail = Some(("write_root", 7));
+        let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+        assert!(e.contains("could not be put back"), "{e}");
+        assert!(
+            calls_of(&mac, &["put-back"]).is_empty(),
+            "nobody's files are put back: {:?}",
+            mac.calls
+        );
+        assert_eq!(
+            calls_of(&mac, &["kickstart"]),
+            ["kickstart"],
+            "the conversion's restart alone"
+        );
+        assert!(
+            calls_of(&mac, &["bootstrap", "agent kickstart"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+        assert!(!mac.loaded.contains(&501));
+        assert!(
+            mac.root_cfg().macos_one_row,
+            "root's file is the converted one"
+        );
+        let after: AfterRecord = serde_json::from_slice(
+            &mac.root[&RootFile::Person {
+                uid: 501,
+                part: Part::After,
+            }],
+        )
+        .unwrap();
+        let home = &mac.homes[&501];
+        assert_eq!(
+            after.config_sha256,
+            Some(sha256_hex(&home.config.as_ref().unwrap().0)),
+            "casey's config is as `convert` left it"
+        );
+        assert!(home.plist.is_none(), "and their plist stays removed");
+        for file in [RootFile::Kept, RootFile::RootRecord]
+            .into_iter()
+            .chain(Part::ALL.map(|part| RootFile::Person { uid: 501, part }))
+        {
+            assert!(mac.root.contains_key(&file), "{file:?} stays");
+        }
+        let said = mac.said();
+        assert!(
+            said.contains(
+                "/etc/roomler/config.toml did not go back after the restart, so the Mac stays \
+                 converted (one row): nobody's files are put back, no LaunchAgent starts, and \
+                 every record stays in /etc/roomler/one-row; `sudo roomlerd one-row --revert` \
+                 finishes the job"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("not bootstrapped"), "{said}");
+        mac.calls.clear();
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(mac.files(), before);
+        assert!(mac.loaded.contains(&501));
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "write Config",
+                    "put-back",
+                    "kickstart",
+                    "bootstrap",
+                    "agent kickstart"
+                ]
+            ),
+            [
+                "write Config",
+                "put-back 501",
+                "kickstart",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+    }
+
+    /// #4097 T8: root's file does not go back in the undo, and the conversion
+    /// had not restarted: a `convert` failed, perhaps after it changed
+    /// something, so a person may be half converted. Their files are put back,
+    /// nothing restarts, no agent is bootstrapped or kickstarted, every record
+    /// stays, and the command says what the daemon's next start reads. Then
+    /// `--revert` finishes: root's file back, the person back, the restart,
+    /// then the console person's agent.
+    #[tokio::test]
+    async fn an_undo_before_the_restart_whose_root_file_did_not_go_back_puts_the_people_back() {
+        let mut mac = Fake::new(one_row_daemon);
+        let before = mac.files();
+        mac.scripts
+            .insert((501, "convert"), Script::FailedAfterActing);
+        // Root's copy, `root.json`, casey's config, plist and `record.json`;
+        // their `convert` fails, so no `after.json`: the undo's write of
+        // root's file is the sixth.
+        mac.fail = Some(("write_root", 6));
+        let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+        assert!(e.contains("could not be put back"), "{e}");
+        assert_eq!(calls_of(&mac, &["put-back"]), ["put-back 501"]);
+        assert!(
+            calls_of(&mac, &["kickstart", "bootstrap", "agent kickstart"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+        assert!(!mac.loaded.contains(&501));
+        assert!(
+            mac.root_cfg().macos_one_row,
+            "root's file is the converted one"
+        );
+        assert_eq!(mac.homes[&501], before.1[&501], "casey's files are back");
+        for file in [RootFile::Kept, RootFile::RootRecord].into_iter().chain(
+            [Part::Config, Part::Plist, Part::Record]
+                .map(|part| RootFile::Person { uid: 501, part }),
+        ) {
+            assert!(mac.root.contains_key(&file), "{file:?} stays");
+        }
+        let said = mac.said();
+        for want in [
+            "gui/501/com.roomler.agent: not bootstrapped, as /etc/roomler/config.toml did not go \
+             back",
+            "/etc/roomler/config.toml did not go back, so no LaunchAgent starts and every record \
+             stays in /etc/roomler/one-row. At the daemon's next start (a reboot or an update) it \
+             reads /etc/roomler/config.toml as it is now, which may still be the converted one, so \
+             run `--revert` before then: `sudo roomlerd one-row --revert` finishes the job",
+        ] {
+            assert!(said.contains(want), "{want:?} in {said}");
+        }
+        mac.calls.clear();
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(mac.files(), before);
+        assert!(mac.loaded.contains(&501));
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "write Config",
+                    "put-back",
+                    "kickstart",
+                    "bootstrap",
+                    "agent kickstart"
+                ]
+            ),
+            [
+                "write Config",
+                "put-back 501",
+                "kickstart",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+    }
+
+    /// #4097 T7: a stop inside a keep-again, before its config copy is
+    /// written: the uid's folder has no `record.json`, so `--revert` reads it
+    /// as an unfinished Keep and removes it, and the person's files are as
+    /// their agent's save left them. Through `apply`, the undo writes nothing
+    /// back to them and starts their agent again.
+    #[tokio::test]
+    async fn a_keep_again_that_stops_part_way_is_an_unfinished_keep() {
+        // Root's copy, `root.json`, casey's config, plist and `record.json`:
+        // the copy of the agent's save is the sixth write.
+        let mut mac = Fake::new(one_row_daemon);
+        let root_before = mac.root_bytes();
+        let stopped = casey_saves_as_it_stops(&mut mac, |_| {});
+        mac.fail = Some(("write_root", 6));
+        let read = read_now(&mut mac).await;
+        let plan = plan(&read.root, &read.people).unwrap();
+        // A stop there, as a power loss leaves it: `steps` alone, no undo.
+        let mut done = Done::default();
+        let e = format!(
+            "{:#}",
+            steps(&mut mac, &read, &plan, &mut done).await.unwrap_err()
+        );
+        assert!(e.contains("keeping casey's files again"), "{e}");
+        let kept: Vec<Part> = mac
+            .root
+            .keys()
+            .filter_map(|f| match f {
+                RootFile::Person { uid: 501, part } => Some(*part),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept, [Part::Plist], "no record.json, and no config copy");
+        let home = mac.homes[&501].clone();
+        assert_eq!(
+            home.config,
+            Some((stopped.clone(), 0o600)),
+            "the agent's save"
+        );
+        assert!(home.plist.is_some());
+        let r = revert_plan(&mut mac).await.unwrap().unwrap();
+        assert_eq!(r.unfinished, [501]);
+        revert(&mut mac, &r).await.unwrap();
+        assert!(
+            mac.said()
+                .contains("removed: /etc/roomler/one-row/501, a keep that never finished"),
+            "{}",
+            mac.said()
+        );
+        assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
+        assert_eq!(mac.root_bytes(), root_before);
+        assert_eq!(mac.homes[&501], home, "nothing of theirs was written");
+
+        let mut mac = Fake::new(one_row_daemon);
+        let stopped = casey_saves_as_it_stops(&mut mac, |_| {});
+        mac.fail = Some(("write_root", 6));
+        let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+        assert!(e.contains("the Mac is as it was"), "{e}");
+        assert!(calls_of(&mac, &["put-back"]).is_empty(), "{:?}", mac.calls);
+        assert_eq!(mac.homes[&501].config, Some((stopped, 0o600)));
+        assert!(mac.loaded.contains(&501), "its agent is started again");
+        assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
+    }
+
+    /// #4122 — T7's stop: a power loss inside casey's keep again, after their
+    /// agent was booted out (`steps` alone, no undo). Returns their files as
+    /// their agent's save left them; the calls and lines so far are forgotten.
+    async fn stopped_inside_the_keep_again(mac: &mut Fake) -> FakeHome {
+        let stopped = casey_saves_as_it_stops(mac, |_| {});
+        mac.fail = Some(("write_root", 6));
+        let read = read_now(mac).await;
+        let plan = plan(&read.root, &read.people).unwrap();
+        let mut done = Done::default();
+        let e = format!(
+            "{:#}",
+            steps(mac, &read, &plan, &mut done).await.unwrap_err()
+        );
+        assert!(e.contains("keeping casey's files again"), "{e}");
+        assert!(!mac.loaded.contains(&501), "their agent was booted out");
+        let home = mac.homes[&501].clone();
+        assert_eq!(home.config, Some((stopped, 0o600)), "the agent's save");
+        assert!(home.plist.is_some());
+        mac.fail = None;
+        mac.calls.clear();
+        mac.said.clear();
+        home
+    }
+
+    /// #4122 — a stop inside casey's first keep, at its `record.json`, before
+    /// any bootout: their folder is unfinished and their agent still loaded.
+    async fn stopped_before_the_bootout(mac: &mut Fake) -> FakeHome {
+        // Root's copy, `root.json`, casey's config and plist: `record.json`
+        // is the fifth write.
+        mac.fail = Some(("write_root", 5));
+        let read = read_now(mac).await;
+        let plan = plan(&read.root, &read.people).unwrap();
+        let mut done = Done::default();
+        let e = format!(
+            "{:#}",
+            steps(mac, &read, &plan, &mut done).await.unwrap_err()
+        );
+        assert!(
+            e.contains("keeping casey's files") && !e.contains("again"),
+            "{e}"
+        );
+        assert!(calls_of(mac, &["bootout"]).is_empty(), "{:?}", mac.calls);
+        assert!(mac.loaded.contains(&501), "never booted out");
+        mac.fail = None;
+        mac.calls.clear();
+        mac.said.clear();
+        mac.homes[&501].clone()
+    }
+
+    /// #4122 T1: a stop inside the keep again, after the bootout, then
+    /// `--revert`. The folder goes, casey's files stay as their agent's save
+    /// left them, and their LaunchAgent is bootstrapped and kickstarted once
+    /// the restart has answered, as a person's given back is.
+    #[tokio::test]
+    async fn a_revert_after_a_stop_inside_the_keep_again_starts_the_booted_out_agent() {
+        let mut mac = Fake::new(one_row_daemon);
+        let root_before = mac.root_bytes();
+        let home = stopped_inside_the_keep_again(&mut mac).await;
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
+        assert_eq!(mac.root_bytes(), root_before);
+        assert_eq!(mac.homes[&501], home, "nothing of theirs was written");
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "remove records",
+                    "write Config",
+                    "kickstart",
+                    "status: daemon 1",
+                    "worker",
+                    "bootstrap",
+                    "agent"
+                ]
+            ),
+            [
+                "remove records 501",
+                "write Config",
+                "kickstart",
+                "status: daemon 1",
+                "worker 501: gone",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4122 T2: a keep that stopped before the bootout, then `--revert`. The
+    /// folder goes, and the job, still loaded, is not bootstrapped again.
+    #[tokio::test]
+    async fn a_revert_after_a_stop_before_the_bootout_leaves_the_loaded_agent_alone() {
+        let mut mac = Fake::new(one_row_daemon);
+        let root_before = mac.root_bytes();
+        let home = stopped_before_the_bootout(&mut mac).await;
+        revert_now(&mut mac).await.unwrap();
+        assert!(
+            mac.said()
+                .contains("removed: /etc/roomler/one-row/501, a keep that never finished"),
+            "{}",
+            mac.said()
+        );
+        assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
+        assert_eq!(mac.root_bytes(), root_before);
+        assert_eq!(mac.homes[&501], home);
+        assert!(
+            calls_of(&mac, &["worker", "bootstrap", "agent"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4122 T3: the plan names that bootstrap for T1's stop and not for
+    /// T2's, in the words a person given back gets, and the two plans'
+    /// digests differ, so a yes to one is no yes to the other.
+    #[tokio::test]
+    async fn the_revert_plan_names_the_agent_a_keep_again_booted_out() {
+        let mut t1 = Fake::new(one_row_daemon);
+        stopped_inside_the_keep_again(&mut t1).await;
+        let r1 = revert_plan(&mut t1).await.unwrap().unwrap();
+        let mut t2 = Fake::new(one_row_daemon);
+        stopped_before_the_bootout(&mut t2).await;
+        let r2 = revert_plan(&mut t2).await.unwrap().unwrap();
+        assert_eq!(r1.unfinished, [501]);
+        assert_eq!(r2.unfinished, [501]);
+        let words = |r: &Revert| describe_revert(r).join("\n");
+        let named = "/etc/roomler/one-row/501 is removed: a keep of casey's files that never \
+                     finished, and their LaunchAgent is bootstrapped after the restart, once the \
+                     one-row screen worker that runs as them has stopped";
+        assert!(words(&r1).lines().any(|l| l == named), "{}", words(&r1));
+        let plain = "/etc/roomler/one-row/501 is removed: a keep that never finished";
+        assert!(words(&r2).lines().any(|l| l == plain), "{}", words(&r2));
+        assert!(!words(&r2).contains("LaunchAgent"), "{}", words(&r2));
+        let again = revert_plan(&mut t1).await.unwrap().unwrap();
+        assert_eq!(revert_digest(&r1), revert_digest(&again));
+        assert_ne!(revert_digest(&r1), revert_digest(&r2));
+    }
+
+    /// #4122 — after T1's stop, the cells where the rule names nobody and
+    /// the revert loads no agent: supervision on in root's file before the
+    /// conversion, another person or nobody at the console, and no plist in
+    /// casey's home.
+    #[tokio::test]
+    async fn a_revert_after_a_keep_again_loads_no_agent_the_rule_does_not_name() {
+        type Edit = fn(&mut Fake);
+        let cells: [(&str, Edit, Edit); 4] = [
+            (
+                "supervision on",
+                |mac| {
+                    let mut on = mac.root_cfg();
+                    on.macos_supervise_gui_worker = true;
+                    mac.root.insert(RootFile::Config, toml_of(&on));
+                },
+                |_| {},
+            ),
+            (
+                "another person at the console",
+                |_| {},
+                |mac| {
+                    mac.accounts.insert(502, account(502, "ana"));
+                    mac.console = Some(502);
+                },
+            ),
+            ("nobody at the console", |_| {}, |mac| mac.console = None),
+            (
+                "no plist in their home",
+                |_| {},
+                |mac| {
+                    mac.homes.get_mut(&501).unwrap().plist = None;
+                },
+            ),
+        ];
+        for (cell, before, after) in cells {
+            let mut mac = Fake::new(one_row_daemon);
+            before(&mut mac);
+            stopped_inside_the_keep_again(&mut mac).await;
+            after(&mut mac);
+            let r = revert_plan(&mut mac).await.unwrap().unwrap();
+            assert_eq!(r.unfinished, [501], "{cell}");
+            let words = describe_revert(&r).join("\n");
+            assert!(!words.contains("LaunchAgent"), "{cell}: {words}");
+            revert(&mut mac, &r).await.unwrap();
+            assert!(
+                calls_of(&mac, &["worker", "bootstrap", "agent"]).is_empty(),
+                "{cell}: {:?}",
+                mac.calls
+            );
+            assert!(!mac.loaded.contains(&501), "{cell}");
+        }
+    }
+
+    /// #4122 — a restart that does not answer: the agent T1's stop booted out
+    /// is not bootstrapped, as a person's given back is not, and the revert
+    /// says so in the same line.
+    #[tokio::test]
+    async fn a_revert_whose_restart_never_answers_names_the_agent_a_keep_again_booted_out() {
+        let mut mac = Fake::new(one_row_daemon);
+        stopped_inside_the_keep_again(&mut mac).await;
+        mac.stuck = true;
+        assert!(revert_now(&mut mac).await.is_err());
+        assert!(
+            calls_of(&mac, &["worker", "bootstrap", "agent"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+        let line = "gui/501/com.roomler.agent: not bootstrapped, as the daemon did not restart \
+                    onto the files put back; launchd loads it at the next login";
+        assert!(mac.said().contains(line), "{}", mac.said());
+    }
+
+    /// #4122 — a bootstrap that fails is said in the line a person given back
+    /// gets, and the revert goes on.
+    #[tokio::test]
+    async fn a_failed_bootstrap_of_the_agent_a_keep_again_booted_out_is_said() {
+        let mut mac = Fake::new(one_row_daemon);
+        stopped_inside_the_keep_again(&mut mac).await;
+        mac.fail = Some(("bootstrap", 1));
+        revert_now(&mut mac).await.unwrap();
+        let line = "gui/501/com.roomler.agent did not start (bootstrap #1 failed (the test said \
+                    so)); launchd loads it at the next login";
+        assert!(mac.said().contains(line), "{}", mac.said());
+        assert!(calls_of(&mac, &["agent"]).is_empty(), "{:?}", mac.calls);
+        assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
+    }
+
+    /// #4227 — the line `start_agent` says of casey's job when it finds it
+    /// loaded.
+    const ALREADY_LOADED_501: &str =
+        "gui/501/com.roomler.agent: already loaded, so it is not bootstrapped again";
+
+    /// #4122, #4227 R4 — the job is loaded between the plan and the bootstrap
+    /// (casey logged in again meanwhile): read again right before, it is not
+    /// bootstrapped again, one line says so, and it is kickstarted without
+    /// `-k` once the worker is gone.
+    #[tokio::test]
+    async fn an_agent_loaded_after_the_revert_plan_is_kickstarted_not_bootstrapped() {
+        let mut mac = Fake::new(one_row_daemon);
+        stopped_inside_the_keep_again(&mut mac).await;
+        let r = revert_plan(&mut mac).await.unwrap().unwrap();
+        mac.loaded.insert(501);
+        revert(&mut mac, &r).await.unwrap();
+        assert_eq!(
+            calls_of(&mac, &["worker", "bootstrap", "agent"]),
+            ["worker 501: gone", "agent kickstart 501"]
+        );
+        let said = mac.said();
+        assert!(said.contains(ALREADY_LOADED_501), "{said}");
+        assert!(
+            said.contains("kickstarted: gui/501/com.roomler.agent"),
+            "{said}"
+        );
+        assert!(!said.contains("did not start"), "{said}");
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4227 — a stop after casey's Keep has finished (their `record.json`
+    /// written) and before the bootout: their record whole, their job still
+    /// loaded. The bootout's first call fails before it changes anything,
+    /// which leaves the Mac as a stop there does (`steps` alone, no undo).
+    async fn stopped_after_the_keep(mac: &mut Fake) {
+        mac.fail = Some(("bootout", 1));
+        let read = read_now(mac).await;
+        let plan = plan(&read.root, &read.people).unwrap();
+        let mut done = Done::default();
+        let e = format!(
+            "{:#}",
+            steps(mac, &read, &plan, &mut done).await.unwrap_err()
+        );
+        assert!(e.contains("booting out casey's LaunchAgent"), "{e}");
+        let record = RootFile::Person {
+            uid: 501,
+            part: Part::Record,
+        };
+        assert!(mac.root.contains_key(&record), "their Keep finished");
+        assert!(mac.loaded.contains(&501), "never booted out");
+        mac.fail = None;
+        mac.calls.clear();
+        mac.said.clear();
+    }
+
+    /// #4227 R1 — after that stop, `--revert` gives casey back and does not
+    /// bootstrap their job again, which launchd refuses: one line says so,
+    /// and the kickstart without `-k` follows once the restart has answered
+    /// and the worker is gone. Before, the bootstrap failed and the revert's
+    /// last word was that the agent did not start, while it ran.
+    #[tokio::test]
+    async fn a_person_given_back_whose_agent_is_still_loaded_is_not_bootstrapped_again() {
+        let mut mac = Fake::new(one_row_daemon);
+        let before = mac.files();
+        stopped_after_the_keep(&mut mac).await;
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(
+            mac.files(),
+            before,
+            "the files as they were, root's records gone"
+        );
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "write Config",
+                    "put-back",
+                    "kickstart",
+                    "status: daemon 1",
+                    "worker",
+                    "bootstrap",
+                    "agent"
+                ]
+            ),
+            [
+                "write Config",
+                "put-back 501",
+                "kickstart",
+                "status: daemon 1",
+                "worker 501: gone",
+                "agent kickstart 501"
+            ]
+        );
+        let said = mac.said();
+        assert!(said.contains(ALREADY_LOADED_501), "{said}");
+        assert!(
+            said.contains("kickstarted: gui/501/com.roomler.agent"),
+            "{said}"
+        );
+        assert!(!said.contains("did not start"), "{said}");
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4227 R2 — the plan says it: R1's plan does not say "bootstrapped"
+    /// for casey, but that their LaunchAgent, already loaded, is started if
+    /// it is not running. The same Mac with the job not loaded is another
+    /// plan, with another digest.
+    #[tokio::test]
+    async fn the_revert_plan_says_a_loaded_agent_is_started_not_bootstrapped() {
+        let mut mac = Fake::new(one_row_daemon);
+        stopped_after_the_keep(&mut mac).await;
+        let loaded = revert_plan(&mut mac).await.unwrap().unwrap();
+        let words = describe_revert(&loaded).join("\n");
+        let line = "casey (uid 501): their files go back from what root keeps in \
+                    /etc/roomler/one-row/501, by their own process, and their LaunchAgent, \
+                    already loaded, is started after the restart if it is not running, once \
+                    the one-row screen worker that runs as them has stopped";
+        assert!(words.lines().any(|l| l == line), "{words}");
+        assert!(!words.contains("bootstrapped"), "{words}");
+        mac.loaded.remove(&501);
+        let not_loaded = revert_plan(&mut mac).await.unwrap().unwrap();
+        let words = describe_revert(&not_loaded).join("\n");
+        assert!(
+            words.contains("and their LaunchAgent is bootstrapped after the restart"),
+            "{words}"
+        );
+        assert_ne!(revert_digest(&loaded), revert_digest(&not_loaded));
+    }
+
+    /// #4227 R3 — the undo: casey logs in again after the run booted their
+    /// agent out, and launchd loads it from the plist in their home before
+    /// the undo starts it. It is not bootstrapped again: the line, then the
+    /// kickstart without `-k`. Before the conversion's restart (root's file
+    /// fails, and the login comes as the undo writes root's file back) at
+    /// once; after it (the verify fails, and the login comes with the undo's
+    /// restart, once casey's plist is back) once the worker is gone.
+    #[tokio::test]
+    async fn an_undo_never_bootstraps_an_agent_loaded_again() {
+        type Cell = (
+            &'static str,
+            fn(u32) -> NodeStatus,
+            Option<(&'static str, usize)>,
+            (&'static str, usize, u32),
+            &'static [&'static str],
+        );
+        let cells: [Cell; 2] = [
+            (
+                "before the restart",
+                one_row_daemon,
+                Some(("save_root", 1)),
+                ("write_root", 6, 501),
+                &["bootout 501", "agent kickstart 501"],
+            ),
+            (
+                "after the restart",
+                no_grant_daemon,
+                None,
+                ("kickstart", 2, 501),
+                &[
+                    "bootout 501",
+                    "kickstart",
+                    "put-back 501",
+                    "kickstart",
+                    "status: daemon 2",
+                    "worker 501: gone",
+                    "agent kickstart 501",
+                ],
+            ),
+        ];
+        for (cell, daemon, fail, login, want) in cells {
+            let mut mac = Fake::new(daemon);
+            let before = mac.files();
+            mac.fail = fail;
+            mac.login_at = Some(login);
+            let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+            assert!(e.contains("the Mac is as it was"), "{cell}: {e}");
+            assert_eq!(mac.files(), before, "{cell}");
+            assert_eq!(
+                calls_of(
+                    &mac,
+                    &[
+                        "bootout",
+                        "put-back",
+                        "kickstart",
+                        "status: daemon 2",
+                        "worker",
+                        "bootstrap",
+                        "agent"
+                    ]
+                ),
+                want,
+                "{cell}"
+            );
+            let said = mac.said();
+            assert!(said.contains(ALREADY_LOADED_501), "{cell}: {said}");
+            assert!(
+                said.contains("kickstarted: gui/501/com.roomler.agent"),
+                "{cell}: {said}"
+            );
+            assert!(mac.loaded.contains(&501), "{cell}");
+        }
+    }
+
+    /// #4287 — the two lines `--revert` and the undo say of casey's job when
+    /// the restart onto the files put back does not answer: not loaded, it
+    /// loads at the next login, as before; loaded, it was not started here,
+    /// and `kickstart` starts it if its agent is not running.
+    const NOT_BOOTSTRAPPED_501: &str = "gui/501/com.roomler.agent: not bootstrapped, as the \
+                                        daemon did not restart onto the files put back; launchd \
+                                        loads it at the next login";
+    const LOADED_NOT_STARTED_501: &str = "gui/501/com.roomler.agent: already loaded, and not \
+                                          started here, as the daemon did not restart onto the \
+                                          files put back; if roomlerd is not running, `sudo \
+                                          launchctl kickstart gui/501/com.roomler.agent` starts it";
+
+    /// #4287 — a `--revert` whose restart does not answer starts no agent, and
+    /// reads casey's job as it says the line. Not loaded (a conversion, then
+    /// the revert): the line as before. Loaded again by a login as the revert
+    /// restarts, after its plan read it not loaded, or still loaded after a
+    /// stop after the Keep: no "next login", but that it is loaded and how it
+    /// starts.
+    #[tokio::test]
+    async fn a_revert_whose_restart_does_not_answer_says_whether_the_agent_is_loaded() {
+        type Cell = (
+            &'static str,
+            bool,
+            Option<(&'static str, usize, u32)>,
+            &'static str,
+            &'static str,
+        );
+        let cells: [Cell; 3] = [
+            (
+                "not loaded",
+                false,
+                None,
+                "their LaunchAgent is bootstrapped after the restart",
+                NOT_BOOTSTRAPPED_501,
+            ),
+            (
+                "loaded again by a login as the revert restarts",
+                false,
+                Some(("kickstart", 2, 501)),
+                "their LaunchAgent is bootstrapped after the restart",
+                LOADED_NOT_STARTED_501,
+            ),
+            (
+                "still loaded after a stop after the Keep",
+                true,
+                None,
+                "their LaunchAgent, already loaded, is started after the restart",
+                LOADED_NOT_STARTED_501,
+            ),
+        ];
+        for (cell, stopped, login, plan, line) in cells {
+            let mut mac = Fake::new(one_row_daemon);
+            if stopped {
+                stopped_after_the_keep(&mut mac).await;
+            } else {
+                convert_now(&mut mac).await.unwrap();
+                mac.calls.clear();
+                mac.said.clear();
+            }
+            mac.stuck = true;
+            mac.login_at = login;
+            let e = format!("{:#}", revert_now(&mut mac).await.unwrap_err());
+            assert!(
+                e.contains("the restart onto the files put back"),
+                "{cell}: {e}"
+            );
+            assert!(
+                calls_of(&mac, &["bootstrap", "agent"]).is_empty(),
+                "{cell}: {:?}",
+                mac.calls
+            );
+            let said = mac.said();
+            assert!(said.contains(plan), "{cell}: {said}");
+            assert!(said.lines().any(|l| l == line), "{cell}: {said}");
+            let loaded = line == LOADED_NOT_STARTED_501;
+            assert_eq!(mac.loaded.contains(&501), loaded, "{cell}");
+            assert_eq!(said.contains("next login"), !loaded, "{cell}: {said}");
+        }
+    }
+
+    /// #4287 — the undo whose restart does not answer starts no agent, and
+    /// reads each job it booted out as it says the line. casey's job not
+    /// loaded: the line as before. Loaded again by a login as the undo
+    /// restarts, their plist back: that it is loaded and how it starts.
+    #[tokio::test]
+    async fn an_undo_whose_restart_does_not_answer_says_whether_the_agent_is_loaded() {
+        type Cell = (
+            &'static str,
+            Option<(&'static str, usize, u32)>,
+            &'static str,
+        );
+        let cells: [Cell; 2] = [
+            ("not loaded", None, NOT_BOOTSTRAPPED_501),
+            (
+                "loaded again by a login as the undo restarts",
+                Some(("kickstart", 2, 501)),
+                LOADED_NOT_STARTED_501,
+            ),
+        ];
+        for (cell, login, line) in cells {
+            let mut mac = Fake::new(one_row_daemon);
+            mac.stuck = true;
+            mac.login_at = login;
+            let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+            assert!(
+                e.contains("2 thing(s) could not be put back"),
+                "{cell}: {e}"
+            );
+            assert_eq!(
+                calls_of(
+                    &mac,
+                    &["bootout", "put-back", "kickstart", "bootstrap", "agent"]
+                ),
+                ["bootout 501", "kickstart", "put-back 501", "kickstart"],
+                "{cell}"
+            );
+            let said = mac.said();
+            let want = format!("could not put back: {line}");
+            assert!(said.lines().any(|l| l == want), "{cell}: {said}");
+            let loaded = line == LOADED_NOT_STARTED_501;
+            assert_eq!(mac.loaded.contains(&501), loaded, "{cell}");
+            assert_eq!(said.contains("next login"), !loaded, "{cell}: {said}");
+        }
+    }
+
+    /// #4097 — the second `read` lets through only a save of the agent's own
+    /// run state: the same owner, Read's mode or the 0600 a save writes, and
+    /// no other key; every other entry as Read found it.
+    #[test]
+    fn since_read_lets_through_only_the_agents_own_save() {
+        let config = |cfg: &AgentConfig, uid: u32, mode: u32| Held::Present {
+            bytes: toml::to_string(cfg).unwrap().into_bytes(),
+            uid,
+            mode,
+        };
+        let mut running = casey();
+        crate::config::mark_run_starting(&mut running);
+        let mut stopped = running.clone();
+        crate::config::mark_clean_shutdown(&mut stopped);
+        let mut renamed = stopped.clone();
+        renamed.machine_name = "Renamed".to_string();
+        let then = ReadAnswer {
+            config: config(&running, 501, 0o600),
+            ..seen(501)
+        };
+        let saved = ReadAnswer {
+            config: config(&stopped, 501, 0o600),
+            ..then.clone()
+        };
+        assert_eq!(since_read(&then, &then.clone()), Since::Same);
+        assert_eq!(
+            since_read(&then, &saved),
+            Since::RunState(vec!["last_run_unhealthy"])
+        );
+        // 0644 at Read, then the 0600 every save writes: the agent's own save.
+        let then_0644 = ReadAnswer {
+            config: config(&running, 501, 0o644),
+            ..then.clone()
+        };
+        assert_eq!(
+            since_read(&then_0644, &saved),
+            Since::RunState(vec!["last_run_unhealthy"])
+        );
+        assert_eq!(since_read(&then_0644, &then), Since::RunState(vec![]));
+        type Change<'a> = Box<dyn Fn(&mut ReadAnswer) + 'a>;
+        let changed: [(&str, Change<'_>); 13] = [
+            (
+                "a mode no save writes",
+                Box::new(|n| n.config = config(&stopped, 501, 0o640)),
+            ),
+            (
+                "another owner",
+                Box::new(|n| n.config = config(&stopped, 0, 0o600)),
+            ),
+            (
+                "another key",
+                Box::new(|n| n.config = config(&renamed, 501, 0o600)),
+            ),
+            ("the config gone", Box::new(|n| n.config = Held::Absent)),
+            (
+                "not UTF-8",
+                Box::new(|n| {
+                    n.config = Held::Present {
+                        bytes: vec![0xff, 0xfe],
+                        uid: 501,
+                        mode: 0o600,
+                    }
+                }),
+            ),
+            ("the plist", Box::new(|n| n.plist = Held::Absent)),
+            ("the home", Box::new(|n| n.home.ino = Some(9))),
+            ("the Library", Box::new(|n| n.library.mode = Some(0o755))),
+            ("Application Support", Box::new(|n| n.support.uid = Some(0))),
+            ("LaunchAgents", Box::new(|n| n.agents_dir.writable = false)),
+            ("the folder", Box::new(|n| n.folder.mode = Some(0o700))),
+            ("the segment", Box::new(|n| n.segment = Segment::Legacy)),
+            (
+                "an old copy",
+                Box::new(|n| {
+                    n.legacy.config = Entry {
+                        kind: Kind::File,
+                        ..ABSENT
+                    }
+                }),
+            ),
+        ];
+        for (what, edit) in changed {
+            let mut now = saved.clone();
+            edit(&mut now);
+            assert!(
+                matches!(since_read(&then, &now), Since::Changed(_)),
+                "{what}: {:?}",
+                since_read(&then, &now)
             );
         }
     }
@@ -5152,6 +7150,8 @@ mod tests {
             supervised_from: "root.json",
             people: Vec::new(),
             unfinished: Vec::new(),
+            unfinished_agent: None,
+            agent_loaded: false,
             strays: Vec::new(),
             unread: Vec::new(),
             console_uid: Some(501),
@@ -5675,6 +7675,547 @@ mod tests {
         ] {
             let why = program_refusal(stat);
             assert!(why.is_some(), "{case} is refused");
+        }
+    }
+
+    /// #4184 — a conversion as the command drives it, casey's own process
+    /// doing `convert` and `put-back` as `one_row_home` does them: root's
+    /// records hold the outgoing config, and nothing in casey's folder does.
+    /// The new config is kept as its `.prev` too, so no load of casey's
+    /// config, with the file as it is, removed or unreadable, makes an
+    /// enrollment live again, and root's records stay as the conversion left
+    /// them. `--revert` gives the outgoing bytes back from those records.
+    #[tokio::test]
+    async fn after_a_conversion_roots_records_are_the_only_copy_of_the_enrollment() {
+        let mut mac = Fake::new(one_row_daemon).with_real_child(501);
+        let (_, homes_before) = mac.files();
+        let outgoing = homes_before[&501].config.clone().unwrap();
+        convert_now(&mut mac).await.unwrap();
+        let records = mac.root.clone();
+        let person_file = |part| records[&RootFile::Person { uid: 501, part }].clone();
+        assert_eq!(person_file(Part::Config), outgoing.0);
+        let record: PersonRecord = serde_json::from_slice(&person_file(Part::Record)).unwrap();
+        assert_eq!(record.config.sha256, Some(sha256_hex(&outgoing.0)));
+        let home = &mac.real[&501];
+        let now = home.config().expect("casey's new config");
+        assert_eq!(mac.homes[&501].config, Some(now.clone()));
+        assert_eq!(
+            home.prev(),
+            Some(now),
+            "the new config is kept as its `.prev` too"
+        );
+        assert_eq!(home.plist(), None);
+        let dir = tempfile::tempdir().unwrap();
+        crate::one_row_home::assert_no_load_brings_an_enrollment_back(&home.on_disk(dir.path()));
+        assert_eq!(mac.root, records, "root's records are unchanged");
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(mac.real[&501].config(), Some(outgoing));
+        assert_eq!(mac.homes[&501], homes_before[&501]);
+    }
+
+    /// #4184 — a conversion stopped at each of its steps, and at each step of
+    /// its undo that can fail, casey's own process doing `convert` and
+    /// `put-back` as `one_row_home` does them: casey is left a config that
+    /// loads. Where the undo puts their files back, the config and the plist
+    /// are as they were; where it leaves them converted, no load of the
+    /// config brings an enrollment back. A `.prev` their process cannot
+    /// replace stops their `convert` (exit 1) with the plist already gone,
+    /// and the undo puts both back.
+    #[tokio::test]
+    async fn a_conversion_stopped_at_any_step_leaves_the_person_a_config_that_loads() {
+        // The step, the daemon's answers, how the step fails, and whether
+        // casey stays converted after the undo.
+        type Case = (&'static str, fn(u32) -> NodeStatus, fn(&mut Fake), bool);
+        let cases: [Case; 17] = [
+            (
+                "root's kept copy",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 1)),
+                false,
+            ),
+            (
+                "root.json",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 2)),
+                false,
+            ),
+            (
+                "casey's kept config",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 3)),
+                false,
+            ),
+            (
+                "casey's kept plist",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 4)),
+                false,
+            ),
+            (
+                "casey's record.json",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 5)),
+                false,
+            ),
+            (
+                "the bootout",
+                one_row_daemon,
+                |m| m.fail = Some(("bootout", 1)),
+                false,
+            ),
+            (
+                "root's file",
+                one_row_daemon,
+                |m| m.fail = Some(("save_root", 1)),
+                false,
+            ),
+            (
+                "a convert that exits 1 before it acts",
+                one_row_daemon,
+                |m| {
+                    m.scripts.insert((501, "convert"), Script::Exit(1));
+                },
+                false,
+            ),
+            (
+                "a convert stopped after it acted",
+                one_row_daemon,
+                |m| {
+                    m.scripts
+                        .insert((501, "convert"), Script::StoppedAfterActing);
+                },
+                false,
+            ),
+            (
+                "a convert that exits 1 after it acted",
+                one_row_daemon,
+                |m| {
+                    m.scripts
+                        .insert((501, "convert"), Script::FailedAfterActing);
+                },
+                false,
+            ),
+            (
+                "a `.prev` casey's process cannot replace",
+                one_row_daemon,
+                |m| m.real.get_mut(&501).unwrap().prev_cannot_be_replaced(),
+                false,
+            ),
+            (
+                "casey's after.json",
+                one_row_daemon,
+                |m| m.fail = Some(("write_root", 6)),
+                false,
+            ),
+            (
+                "the restart",
+                one_row_daemon,
+                |m| m.fail = Some(("kickstart", 1)),
+                false,
+            ),
+            ("the verify", no_grant_daemon, |_| {}, false),
+            // The undo's own steps.
+            (
+                "the undo's root file, before the restart",
+                one_row_daemon,
+                |m| {
+                    m.scripts
+                        .insert((501, "convert"), Script::FailedAfterActing);
+                    m.fail = Some(("write_root", 6));
+                },
+                false,
+            ),
+            (
+                "the undo's root file, after the restart",
+                no_grant_daemon,
+                |m| m.fail = Some(("write_root", 7)),
+                true,
+            ),
+            (
+                // Casey's agent is not loaded, so the undo starts none.
+                "the undo's put-back",
+                no_grant_daemon,
+                |m| {
+                    m.loaded.clear();
+                    m.scripts.insert((501, "put-back"), Script::Exit(1));
+                },
+                true,
+            ),
+        ];
+        for (step, daemon, stop, stays_converted) in cases {
+            let mut mac = Fake::new(daemon).with_real_child(501);
+            let before = mac.homes[&501].clone();
+            stop(&mut mac);
+            assert!(
+                convert_now(&mut mac).await.is_err(),
+                "{step}: {}",
+                mac.said()
+            );
+            let home = &mac.real[&501];
+            assert_eq!(home.config(), mac.homes[&501].config, "{step}");
+            let dir = tempfile::tempdir().unwrap();
+            let path = home.on_disk(dir.path());
+            let cfg = crate::config::load(&path).unwrap_or_else(|e| panic!("{step}: {e:#}"));
+            if stays_converted {
+                assert!(mac.homes[&501].plist.is_none(), "{step}");
+                assert!(
+                    !cfg.has_primary_enrollment() && cfg.orgs.is_empty(),
+                    "{step}"
+                );
+                crate::one_row_home::assert_no_load_brings_an_enrollment_back(&path);
+            } else {
+                assert_eq!(
+                    mac.homes[&501], before,
+                    "{step}: casey's files are as they were"
+                );
+                assert!(cfg.has_primary_enrollment(), "{step}");
+            }
+        }
+    }
+
+    /// #4184 — a `.prev` casey's process cannot replace: their `convert`
+    /// stops before the config (exit 1), its line in the output says what to
+    /// do, and the undo puts the config and the plist back and starts their
+    /// agent again.
+    #[tokio::test]
+    async fn a_prev_the_person_cannot_replace_stops_the_conversion_and_says_what_to_do() {
+        let mut mac = Fake::new(one_row_daemon).with_real_child(501);
+        let before = mac.files();
+        mac.real.get_mut(&501).unwrap().prev_cannot_be_replaced();
+        let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+        assert!(e.contains("the Mac is as it was"), "{e}");
+        let said = mac.said();
+        for want in [
+            "casey's one-row-home convert: pid 4242, uid 501, exit 1",
+            "config.toml.prev could not be replaced",
+            "then run `sudo roomlerd one-row` again",
+        ] {
+            assert!(said.contains(want), "{want:?} in {said}");
+        }
+        assert_eq!(calls_of(&mac, &["put-back"]), ["put-back 501"]);
+        assert_eq!(mac.files(), before);
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4379 — casey (uid 501, at the console) and ana (502, not logged in)
+    /// converted, each person's own process doing the verbs as
+    /// `one_row_home` does them; then each `.prev` made what a conversion
+    /// before #4184 left there: their outgoing, enrolled config. The
+    /// outgoing bytes, by uid.
+    async fn converted_with_held_prevs() -> (Fake, BTreeMap<u32, (Vec<u8>, u32)>) {
+        let mut mac = Fake::new(one_row_daemon)
+            .with_ana()
+            .with_real_child(501)
+            .with_real_child(502);
+        let outgoing: BTreeMap<u32, (Vec<u8>, u32)> = mac
+            .homes
+            .iter()
+            .map(|(uid, h)| (*uid, h.config.clone().unwrap()))
+            .collect();
+        convert_now(&mut mac).await.unwrap();
+        for (uid, file) in &outgoing {
+            mac.real.get_mut(uid).unwrap().hold_prev(Some(file));
+        }
+        mac.calls.clear();
+        mac.said.clear();
+        mac.fed.clear();
+        mac.users_read.set(0);
+        (mac, outgoing)
+    }
+
+    /// `name`'s lines from their `blank-prev` child.
+    fn blank_prev_lines(mac: &Fake, name: &str) -> Vec<String> {
+        let start = format!("{name}'s one-row-home blank-prev: ");
+        mac.said
+            .iter()
+            .filter(|l| l.starts_with(&start))
+            .cloned()
+            .collect()
+    }
+
+    /// `uid`'s `.prev` is its config's bytes, and no load of the config, as
+    /// it is, removed, all NUL or not TOML, brings an enrollment back.
+    fn prev_is_the_config(mac: &Fake, uid: u32) {
+        let home = &mac.real[&uid];
+        let config = home.config().expect("the converted config");
+        assert_eq!(home.prev(), Some((config.0, 0o600)), "{uid}");
+        let dir = tempfile::tempdir().unwrap();
+        crate::one_row_home::assert_no_load_brings_an_enrollment_back(&home.on_disk(dir.path()));
+    }
+
+    /// #4379, cell 14 — a Mac with no conversion's records: the sweep reads
+    /// no `/Users`, starts no child and says nothing, even beside a `.prev`
+    /// that holds an enrollment root's file holds.
+    #[tokio::test]
+    async fn the_sweep_does_nothing_on_a_mac_with_no_records() {
+        let mut mac = Fake::new(one_row_daemon).with_ana().with_real_child(501);
+        let held = mac.homes[&501].config.clone();
+        mac.real.get_mut(&501).unwrap().hold_prev(held.as_ref());
+        let before = mac.files();
+        sweep(&mut mac).await;
+        assert_eq!(mac.users_read.get(), 0);
+        assert!(mac.calls.is_empty(), "{:?}", mac.calls);
+        assert!(mac.said.is_empty(), "{}", mac.said());
+        assert_eq!(mac.files(), before);
+        assert_eq!(mac.real[&501].prev(), held);
+    }
+
+    /// #4379, cell 15 — the sweep asks each person's own process, console
+    /// or not, in uid order: each `.prev` that holds the enrollments that
+    /// moved to root (a primary root's own retired, an org it moved) becomes
+    /// their converted config's bytes, with one line each that says whom it
+    /// ran as. The same where root kept a conversion's every record (this
+    /// release's) or its own kept copy alone (an older release's). Root's
+    /// files are not written, and `--revert` still gives each person's
+    /// config back from the records.
+    #[tokio::test]
+    async fn the_sweep_blanks_each_persons_held_prev_console_or_not() {
+        for records in ["every record", "root's kept copy only"] {
+            let (mut mac, outgoing) = converted_with_held_prevs().await;
+            if records == "root's kept copy only" {
+                mac.root
+                    .retain(|f, _| matches!(f, RootFile::Config | RootFile::Kept));
+            }
+            let root_before = mac.root.clone();
+            sweep(&mut mac).await;
+            assert_eq!(
+                calls_of(&mac, &["blank-prev"]),
+                ["blank-prev 501", "blank-prev 502"],
+                "{records}"
+            );
+            for uid in [501, 502] {
+                prev_is_the_config(&mac, uid);
+            }
+            for name in ["casey", "ana"] {
+                let lines = blank_prev_lines(&mac, name);
+                assert_eq!(lines.len(), 1, "{records}: {}", mac.said());
+                assert!(lines[0].contains(", exit 0, "), "{records}: {}", lines[0]);
+                assert!(
+                    lines[0].contains("it ran as uid="),
+                    "{records}: {}",
+                    lines[0]
+                );
+            }
+            assert_eq!(mac.root, root_before, "{records}: root's files");
+            if records == "every record" {
+                revert_now(&mut mac).await.unwrap();
+                for uid in [501, 502] {
+                    assert_eq!(mac.real[&uid].config(), Some(outgoing[&uid].clone()));
+                }
+            }
+        }
+    }
+
+    /// #4379, cell 16 — each child is fed the server and tenant of every
+    /// enrollment root's file holds after the conversion (its primary, its
+    /// own org, the org it moved), and nothing else: no token, agent id or
+    /// key of root's or of the person's. Its command line is the one every
+    /// child of a person's has.
+    #[tokio::test]
+    async fn the_sweep_hands_the_child_root_orgs_and_no_secret() {
+        let (mut mac, outgoing) = converted_with_held_prevs().await;
+        sweep(&mut mac).await;
+        let root = mac.root_cfg();
+        let mut secrets: Vec<String> = vec![
+            root.agent_token.clone(),
+            root.agent_id.clone(),
+            "user-token".to_string(),
+            "user-1".to_string(),
+            "wg-user".to_string(),
+            "ana-token".to_string(),
+            "user-9".to_string(),
+        ];
+        secrets.extend(root.overlay_wg_secret_key.clone());
+        for o in &root.orgs {
+            secrets.extend([o.agent_token.clone(), o.agent_id.clone()]);
+            secrets.extend(o.overlay_wg_secret_key.clone());
+        }
+        let fed: Vec<&(u32, &str, Vec<u8>)> = mac
+            .fed
+            .iter()
+            .filter(|(_, verb, _)| *verb == "blank-prev")
+            .collect();
+        assert_eq!(fed.len(), 2, "{:?}", mac.calls);
+        for (uid, _, stdin) in fed {
+            let held: crate::one_row_home::HeldOrgs = serde_json::from_slice(stdin).unwrap();
+            assert_eq!(held.v, crate::one_row_home::FORMAT);
+            let pairs: Vec<(&str, &str)> = held
+                .orgs
+                .iter()
+                .map(|o| (o.server_url.as_str(), o.tenant_id.as_str()))
+                .collect();
+            assert_eq!(pairs, [(SERVER, "t1"), (SERVER, "t3"), (SERVER, "t2")]);
+            let text = String::from_utf8(stdin.clone()).unwrap();
+            for secret in secrets.iter().filter(|s| !s.is_empty()) {
+                assert!(!text.contains(secret.as_str()), "{secret} in {text}");
+            }
+            let account = mac.accounts[uid].clone();
+            assert_eq!(
+                spawn_plan(&account, Verb::BlankPrev).args,
+                crate::one_row_home::child_args(*uid, account.gid, Verb::BlankPrev)
+            );
+            assert!(outgoing.contains_key(uid));
+        }
+    }
+
+    /// #4379, cell 17 — a revert that put casey's enrolled config back and
+    /// stopped before its records went: the sweep runs, and casey's own
+    /// process leaves the config and its `.prev` byte for byte, and names
+    /// both. The person's live config is theirs to change.
+    #[tokio::test]
+    async fn the_sweep_leaves_a_person_a_revert_put_back() {
+        let (mut mac, outgoing) = converted_with_held_prevs().await;
+        let kept = mac.root[&RootFile::Kept].clone();
+        mac.root.insert(RootFile::Config, kept);
+        let plist = mac.homes[&501].plist.clone();
+        mac.homes.get_mut(&501).unwrap().config = Some(outgoing[&501].clone());
+        mac.real
+            .get_mut(&501)
+            .unwrap()
+            .hold(Some(&outgoing[&501]), plist.as_ref());
+        sweep(&mut mac).await;
+        let home = &mac.real[&501];
+        assert_eq!(home.config(), Some(outgoing[&501].clone()));
+        assert_eq!(home.prev(), Some(outgoing[&501].clone()));
+        let lines = blank_prev_lines(&mac, "casey");
+        assert_eq!(lines.len(), 1, "{}", mac.said());
+        assert!(
+            lines[0].contains("are left as they are") && lines[0].contains("config.toml.prev"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    /// #4379, cell 18 — a child of casey's that fails (exit 1, not started, a
+    /// reply that does not parse, stopped at its deadline, a folder it may
+    /// not write) is its one line, asked once, and ana's own process goes on.
+    #[tokio::test]
+    async fn a_failed_child_is_one_line_and_the_next_person_goes_on() {
+        let cases: [(&str, Option<Script>); 5] = [
+            ("exit 1", Some(Script::Exit(1))),
+            ("not started", Some(Script::NotRun)),
+            ("garbage", Some(Script::Garbage)),
+            ("its deadline", Some(Script::StoppedAfterActing)),
+            ("a folder it may not write", None),
+        ];
+        for (case, script) in cases {
+            let (mut mac, _) = converted_with_held_prevs().await;
+            match script {
+                Some(script) => {
+                    mac.scripts.insert((501, "blank-prev"), script);
+                }
+                None => mac.real.get_mut(&501).unwrap().folder_not_writable(),
+            }
+            sweep(&mut mac).await;
+            assert_eq!(
+                calls_of(&mac, &["blank-prev"]),
+                ["blank-prev 501", "blank-prev 502"],
+                "{case}"
+            );
+            assert_eq!(
+                blank_prev_lines(&mac, "casey").len(),
+                1,
+                "{case}: {}",
+                mac.said()
+            );
+            prev_is_the_config(&mac, 502);
+            assert_eq!(
+                blank_prev_lines(&mac, "ana").len(),
+                1,
+                "{case}: {}",
+                mac.said()
+            );
+        }
+    }
+
+    /// #4379, cell 19 — a home whose account is gone: no child of that uid,
+    /// and its `.prev` is left as it is.
+    #[tokio::test]
+    async fn the_sweep_asks_no_uid_without_an_account() {
+        let (mut mac, outgoing) = converted_with_held_prevs().await;
+        mac.accounts.remove(&502);
+        sweep(&mut mac).await;
+        assert_eq!(calls_of(&mac, &["blank-prev"]), ["blank-prev 501"]);
+        prev_is_the_config(&mac, 501);
+        assert_eq!(mac.real[&502].prev(), Some(outgoing[&502].clone()));
+    }
+
+    /// #4379, cell 20 — one row turned off by hand in root's file: the
+    /// conversion's records stay, and so does the sweep.
+    #[tokio::test]
+    async fn the_sweep_runs_with_one_row_turned_off_by_hand() {
+        let (mut mac, _) = converted_with_held_prevs().await;
+        let mut root = mac.root_cfg();
+        root.macos_one_row = false;
+        mac.root.insert(RootFile::Config, toml_of(&root));
+        sweep(&mut mac).await;
+        assert_eq!(
+            calls_of(&mac, &["blank-prev"]),
+            ["blank-prev 501", "blank-prev 502"]
+        );
+        for uid in [501, 502] {
+            prev_is_the_config(&mac, uid);
+        }
+    }
+
+    /// #4379, cell 21 — after a revert that finished, root's tree holds no
+    /// record: the sweep reads no `/Users`, starts no child, says nothing and
+    /// changes nothing.
+    #[tokio::test]
+    async fn the_sweep_after_a_finished_revert_does_nothing() {
+        let (mut mac, _) = converted_with_held_prevs().await;
+        revert_now(&mut mac).await.unwrap();
+        mac.calls.clear();
+        mac.said.clear();
+        mac.users_read.set(0);
+        let before = mac.files();
+        let prevs: Vec<_> = [501, 502].map(|uid| mac.real[&uid].prev()).into();
+        sweep(&mut mac).await;
+        assert_eq!(mac.users_read.get(), 0);
+        assert!(mac.calls.is_empty(), "{:?}", mac.calls);
+        assert!(mac.said.is_empty(), "{}", mac.said());
+        assert_eq!(mac.files(), before);
+        let after: Vec<_> = [501, 502].map(|uid| mac.real[&uid].prev()).into();
+        assert_eq!(after, prevs);
+    }
+
+    /// #4417 — a sweep planned before a revert, whose children run after the
+    /// revert put each person's config back: every config is left as the
+    /// revert wrote it, and so is each `.prev` beside it (the moved
+    /// enrollment's, or one an earlier sweep replaced), and root's files are
+    /// as the revert left them. The sweep writes no person's config, so it
+    /// needs no order against a revert.
+    #[tokio::test]
+    async fn a_sweep_planned_before_a_revert_leaves_the_configs_the_revert_put_back() {
+        for prevs in ["the moved enrollment's", "one an earlier sweep replaced"] {
+            let (mut mac, outgoing) = converted_with_held_prevs().await;
+            if prevs == "one an earlier sweep replaced" {
+                sweep(&mut mac).await;
+            }
+            let planned = sweep_plan(&mut mac).expect("the conversion's records");
+            revert_now(&mut mac).await.unwrap();
+            let put_back = |mac: &Fake| [501, 502].map(|uid| mac.real[&uid].config());
+            let given_back = [501, 502].map(|uid| Some(outgoing[&uid].clone()));
+            assert_eq!(put_back(&mac), given_back, "{prevs}: the revert");
+            let before = mac.files();
+            let prevs_before = [501, 502].map(|uid| mac.real[&uid].prev());
+            if prevs == "the moved enrollment's" {
+                assert_eq!(
+                    prevs_before, given_back,
+                    "each .prev holds the outgoing config"
+                );
+            }
+            mac.calls.clear();
+            sweep_run(&mut mac, &planned).await;
+            assert_eq!(
+                calls_of(&mac, &["blank-prev"]),
+                ["blank-prev 501", "blank-prev 502"],
+                "{prevs}"
+            );
+            assert_eq!(put_back(&mac), given_back, "{prevs}: the configs");
+            assert_eq!(mac.files(), before, "{prevs}: root's files and the homes");
+            let prevs_after = [501, 502].map(|uid| mac.real[&uid].prev());
+            assert_eq!(prevs_after, prevs_before, "{prevs}: each .prev");
         }
     }
 }

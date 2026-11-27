@@ -46,6 +46,22 @@
  * never arrived is undecodable anyway and the gap is what asks for the IDR
  * that repairs the chain.
  *
+ * ⚠️ Unless the newer frame is a KEY frame (FR-148 P4b-2, D55). The viewer
+ * reads two video channels into this one assembler, `video-bytes` and
+ * `video-deadline`, and the agent is to switch between them only at a key
+ * frame, with one frame_seq space across both (P4b-3). So when the switch's
+ * key frame completes, the old channel may still hold a partial frame from
+ * before it. A key frame needs no frame before it, so a partial it overtakes
+ * is a straggler: counted in `stragglers`, with no gap, since a gap would ask
+ * for a key frame the decoder already has. The flag is read from the record's
+ * own header, as the agent's `video_bytes_is_keyframe` reads it. An eviction
+ * stays a gap: when it runs, the frame that forced it is not whole yet, so
+ * whether it is a key frame is not known. A frame the old channel delivers
+ * after the switch is a straggler only within `STRAGGLER_WINDOW` of the last
+ * frame completed; one further behind reads as a new stream (the counter
+ * restart rule below), so a switch must not leave the old channel that far
+ * behind.
+ *
  * ⚠️ `gap` IS the counter, made visible: it is true on exactly the
  * messages that make `gaps` grow, on every path, and the test "raises the
  * flag exactly when the counter moves" holds every path to that. The
@@ -65,7 +81,8 @@
  * loses a chunk would be retained forever, on the exact link where frames
  * lose chunks.
  *
- * ⚠️ This module is deliberately SHARED by both workers rather than copied
+ * ⚠️ This module is deliberately ONE module, written to be shared by the two
+ * decode workers that FR-135 R3 has since merged into one, rather than copied
  * into each. The rule "what counts as a gap" has to be one function: FR-10
  * shipped a spacing rule that lived in one of its two call sites and the
  * other one silently didn't have it, which is the defect this file's
@@ -110,7 +127,9 @@ export interface ChunkFramingState {
   discarded: number
   /** Cumulative count of late chunks belonging to a frame already moved
    *  past. Under an unordered channel these are expected; a rising count
-   *  with steady fps is the transport working, not failing. */
+   *  with steady fps is the transport working, not failing. It also counts
+   *  the chunks a partial frame held when a key frame overtook it (FR-148
+   *  P4b-2): moved past too, and no loss. */
   stragglers: number
   /** True between an unclassifiable message and the next one we can
    *  place. It exists so a run of garbage is reported as ONE break: each
@@ -142,6 +161,12 @@ export interface ChunkFramingResult {
    *  independent failures — each `gap` costs a keyframe request, and an
    *  IDR is the largest frame on the thinnest pipe. */
   gap: boolean
+  /** FR-148 P4b-5a — on a message that completed a frame, whether that frame
+   *  is a key frame, read from its record's header as the supersede rule
+   *  reads it; absent on every message that completed none. The worker counts
+   *  the key frames it completes whole by it, per channel, for the agent's
+   *  `path delivery` line. */
+  key?: boolean
 }
 
 /** How far back a `frame_seq` may be and still count as a late chunk of a
@@ -295,7 +320,12 @@ function placeChunk(
  *  will never arrive, and only the caller can ask for the IDR that repairs
  *  that. This is the ONE place the completion path's flag comes from —
  *  a `false` written at the call site is how it went unreported for eight
- *  weeks (header, "`gap` IS the counter"). */
+ *  weeks (header, "`gap` IS the counter").
+ *
+ *  When `seq` is a KEY frame, nothing it overtook is lost: it needs no frame
+ *  before it, so the older partials are stragglers and `gap` stays false
+ *  (FR-148 P4b-2, the switch between the two video channels). The frame is
+ *  named a key frame or not in `key` (FR-148 P4b-5a). */
 function finish(
   st: ChunkFramingState,
   seq: number,
@@ -304,16 +334,29 @@ function finish(
   if (partial.filled < partial.slots.length) return { payload: null, gap: false }
   const out = assemble(partial)
   st.partials.delete(seq)
+  const key = isKeyRecord(out)
   let abandoned = false
-  for (const older of [...st.partials.keys()]) {
+  for (const [older, held] of [...st.partials]) {
     if (!isNewer(older, seq)) {
       st.partials.delete(older)
-      st.gaps++
-      abandoned = true
+      if (key) {
+        st.stragglers += held.filled
+      } else {
+        st.gaps++
+        abandoned = true
+      }
     }
   }
   st.lastSeq = seq
-  return { payload: out, gap: abandoned }
+  return { payload: out, gap: abandoned, key }
+}
+
+/** Whether a whole record is a key frame: bit 0 of byte 4, the flags byte of
+ *  the 13-byte header the agent's `frame_video_bytes` writes, read as its
+ *  `video_bytes_is_keyframe` reads it. A record too short for a header is
+ *  no key frame. */
+function isKeyRecord(record: Uint8Array): boolean {
+  return record.length > 4 && (record[4] & 0x01) !== 0
 }
 
 /** An unclassifiable message: nothing in flight can be trusted.

@@ -65,9 +65,9 @@
           density="compact"
           class="mt-2"
         >
-          This device had been set to <strong>the signed-in user</strong>, which its agent
+          This device had been set to <strong>the signed-in user</strong>, which its daemon
           cannot do — it refuses it, so every session was failing at connect time. Update
-          the agent, or pick an account and save to fix it.
+          roomlerd, or pick an account and save to fix it.
         </v-alert>
         <div
           v-if="isWindows && servedBySystem"
@@ -85,7 +85,7 @@
           class="text-caption text-medium-emphasis mb-4"
           data-test="ssh-identity-agent"
         >
-          <strong>The daemon account</strong> is the agent's own: <strong>SYSTEM</strong>
+          <strong>The daemon account</strong> is roomlerd's own: <strong>SYSTEM</strong>
           on a service install, but <strong>the signed-in user</strong> on an attended
           one. <strong>The signed-in user</strong> works on a service install; an
           attended install serves it only through the device's SYSTEM service, which
@@ -100,7 +100,7 @@
           <strong>The daemon account</strong> means <strong>root</strong> — choosing it
           grants root on this device.
           <template v-if="!offersConsoleUser">
-            "The person at the device's screen" needs a newer agent on this device.
+            "The person at the device's screen" needs a newer roomlerd on this device.
           </template>
         </div>
 
@@ -296,7 +296,7 @@ const accountOptions = computed(() => [
       ? 'The daemon account (root)'
       : servedBySystem.value
         ? 'The daemon account (SYSTEM)'
-        : "The daemon account (the agent's own)",
+        : "The daemon account (roomlerd's own)",
     value: 'daemon',
   },
   { title: 'A named Unix account…', value: 'named' },
@@ -335,12 +335,12 @@ watch(
       draft.value.account_mode = 'named'
       coercedFromConsoleUser.value = true
     }
-    if (!agentStore.tenantMembers.length) {
-      void agentStore.fetchTenantMembers(props.tenantId)
-    }
-    if (agentStore.orgSshEnabled === null) {
-      void agentStore.fetchOrgSshEnabled(props.tenantId)
-    }
+    // #4257 — this org's people, not any: a list that holds another org's
+    // members is not empty.
+    void agentStore.ensureTenantMembers(props.tenantId)
+    // #4332 — this org's switch, not any: a switch that holds another org's
+    // value is not unset.
+    void agentStore.ensureOrgSshEnabled(props.tenantId)
   },
   { immediate: true },
 )

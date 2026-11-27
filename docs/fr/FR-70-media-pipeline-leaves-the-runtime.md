@@ -916,7 +916,7 @@ every rate move is a background open and a swap):
 **It is not a plan bug.** The loop built that replacement at exactly the plan's
 rate at the moment it decided it: `rebuild_spec(bps)` coarsens the controller's
 applied rate onto the ladder, and `after_tick` folds the same
-`governor.applied_bps()` into the plan (`peer.rs:9549`). What the counter
+`governor.applied_bps()` into the plan (`peer.rs:9669`). What the counter
 measured is the plan MOVING during a build that takes seconds — which is what
 make-before-break is, with one swap in flight and an encoder that cannot re-rate
 in place. M3b's loop, reading the plan, would do the same thing. The check
@@ -941,7 +941,7 @@ viewer's Fit mode and the stage shrunk below the DPR-1.5 native box:
 | 11:03:04 | Priority Balanced → Smoother | `rc:priority updated`; no geometry move on a direct path with the dial's dims caps at their default (off); no divergence |
 
 **The plan held** through that 4 ms open — this is not a stale adoption. The dims
-replacement was opened at `min(last_ceiling, applied)` (`peer.rs:8688`): the
+replacement was opened at `min(last_ceiling, applied)` (`peer.rs:8685`): the
 **old** 1600×900 frame's ceiling and the applied 22.95 M, the 25 M rung. The plan
 already aimed at 1050×590. The controller's first tick after adoption clamped the
 target to the smaller frame's ceiling — 9.87 M, which is 0.43 × 23 M, the pixel
@@ -977,19 +977,19 @@ been lost.
 
 - `Shadow::swap_spawn` (`plan.rs:552`) captures the plan's rate and dims when a
   replacement spawns, and the pump carries it beside the handle: `pending_swap`
-  is now `(handle, spawn)` (`peer.rs:7692`), and `PendingDimsOpen` gains a fifth
-  field (`peer.rs:6808`).
+  is now `(handle, spawn)` (`peer.rs:7736`), and `PendingDimsOpen` gains a fifth
+  field (`peer.rs:6853`).
 - At adoption, `judge_swap` (`plan.rs:601`, through `note_rate_swap_adopted`
-  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7643` and
-  `:7026`) asks one question: **did the plan move while it opened?**
+  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7687` and
+  `:7591`) asks one question: **did the plan move while it opened?**
   - **It held** — the common case; opens are milliseconds on most backends: the
     replacement is judged exactly as an inline open is, against the
     controller's first target after adoption (`after_tick`, `plan.rs:527`).
     Re-rated there although the plan did not move is a divergence — the `zeus`
     finding above.
   - **It moved**: a **stale adoption**, counted apart — `plan_stale_swaps` on
-    the heartbeat (`peer.rs:10138`), and the session's first logs once at INFO
-    with its three rates (`log_plan_stale_swap`, `peer.rs:10205`): *`FR-70 M3a: a
+    the heartbeat (`peer.rs:10294`), and the session's first logs once at INFO
+    with its three rates (`log_plan_stale_swap`, `peer.rs:10431`): *`FR-70 M3a: a
     replacement was adopted after the plan moved while it opened (built at the
     plan of its spawn; first time this session)`*. Not judged at the tick. That
     is the lag M4 will trade against an IDR per adoption.
@@ -1439,7 +1439,7 @@ flowchart TD
   after the open, a rung crossed on that tick re-rated the new encoder at once,
   a second open on a rebuild-bound backend. It also opens at the controller's
   target rather than `ceiling.min(target)`: where the controller's floor lifts
-  it over the frame's ceiling (`aimd.rs:188-193`), the next tick would apply that
+  it over the frame's ceiling (`aimd.rs:370-381`), the next tick would apply that
   target anyway.
 - **What it costs, or still does.** (1) After an M2 swap to a larger geometry
   is adopted on a still screen, on a backend that scaled the last frame and

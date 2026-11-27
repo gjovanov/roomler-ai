@@ -104,7 +104,7 @@ fn new_room(r: NewRoom) -> Room {
         creator_id: r.creator_id,
         last_message_id: None,
         last_activity_at: None,
-        member_count: 1,
+        member_count: 0, // `create`'s join of the creator counts them, as every join does (#4409)
         message_count: 0,
         participant_count: 0,
         peak_participant_count: 0,
@@ -170,7 +170,7 @@ impl RoomDao {
 
         let room_id = self.base.insert_one(&room).await?;
 
-        // Auto-join creator
+        // Auto-join creator: their row and the room's first count (the room is stored at 0)
         self.join(tenant_id, room_id, creator_id).await?;
 
         self.base.find_by_id(room_id).await
@@ -549,7 +549,7 @@ impl RoomDao {
         self.members
             .find_paginated(
                 doc! { "room_id": room_id },
-                Some(doc! { "joined_at": 1 }),
+                Some(doc! { "joined_at": 1, "_id": 1 }),
                 params,
             )
             .await
@@ -1247,7 +1247,7 @@ impl RoomDao {
         self.base
             .find_paginated(
                 doc! { "tenant_id": tenant_id, "deleted_at": null },
-                Some(doc! { "created_at": -1 }),
+                Some(doc! { "created_at": -1, "_id": -1 }),
                 params,
             )
             .await

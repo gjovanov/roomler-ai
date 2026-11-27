@@ -3,6 +3,8 @@
 **Issue:** [#3262](https://github.com/gjovanov/roomler-ai/issues/3262) · **Status:** closed 2026-11-08, every criterion met. P1 and P2 shipped in 0.4.194, 2026-11-01; AC3 read seven days of the fleet with no false alarm on 2026-11-08
 **Related:** #3252 (the leak that prompted this), FR-65 ([#1255](https://github.com/gjovanov/roomler-ai/issues/1255), the stall watch), FR-92 (keep-busy, the leak's constant caller)
 
+**Anchors:** master `a10715b5d` (closed 2026-11-08): this spec is the record of the work, and its line anchors read at that commit.
+
 ## Goal
 
 **A leak in the daemon's own handles shows up in the fleet's logs within the hour, not when the

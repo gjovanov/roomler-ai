@@ -1,5 +1,7 @@
 # FR-25 — Call UX: layout controls that honour their labels, mentions, PiP, spotlight
 
+**Anchors:** master `8c154c2d9` (closed 2026-11-08): this spec is the record of the work, and its line anchors read at that commit.
+
 **Issue:** [#839](https://github.com/gjovanov/roomler-ai/issues/839)
 **Status:** shipped in #842 + #859 + #873; field-verified 2026-08-29. One criterion (hide-non-video) is **not achievable without a protocol change** and is written up for its own FR
 

@@ -143,7 +143,7 @@ pub(crate) async fn hello_with(
 }
 
 /// The device's `rc:agent.hello`, advertising `rpc` and claiming back `kept`.
-fn hello_frame(rpc: &[&str], kept: &[ObjectId], max_sessions: u8) -> Value {
+pub(crate) fn hello_frame(rpc: &[&str], kept: &[ObjectId], max_sessions: u8) -> Value {
     let mut hello = json!({
         "t": "rc:agent.hello",
         "machine_name": "fr138 test box",
@@ -204,15 +204,40 @@ pub(crate) async fn answer_for(ws: &mut Ws, sid: ObjectId, within: Duration) -> 
     None
 }
 
-/// Open a session as `token` and drive it LIVE the way the two ends do: the
-/// agent consents and answers the controller's offer. The controller's
-/// socket and the session id.
+/// Once `app`'s hub holds `agent_id`. The pod registers a device only after
+/// it has read the hello and finished its database calls, so a viewer's
+/// request sent right after the hello can reach the hub first and is then
+/// answered `agent_offline` (#4383). The hub is the pod's own: ask the pod
+/// the device's socket is on. A viewer on another pod reaches the device
+/// through its presence record instead, and waits for that
+/// (`rc_cross_pod_hangup_tests::seen_from`). This waits on the hub, not on a
+/// frame: `rc:agent.resume_window` stays unread for the tests that read it,
+/// and at window 0 none is sent. It sees whether the hub holds the device, not
+/// which connection: an older connection the hub still holds passes it too,
+/// so it does not serve a test that asks right after a redial.
+pub(crate) async fn registered(app: &TestApp, agent_id: ObjectId) {
+    let deadline = Instant::now() + WITHIN;
+    while !app.state.fleet().rc_hub.is_agent_online(agent_id) {
+        assert!(
+            Instant::now() < deadline,
+            "device {agent_id} never registered on the pod at {} within {WITHIN:?}",
+            app.addr
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Open a session as `token`, once `app`'s hub holds the device
+/// ([`registered`]), and drive it LIVE the way the two ends do: the agent
+/// consents and answers the controller's offer. The controller's socket and
+/// the session id.
 pub(crate) async fn go_live(
     app: &TestApp,
     token: &str,
     agent_id: ObjectId,
     agent: &mut Ws,
 ) -> (Ws, ObjectId) {
+    registered(app, agent_id).await;
     let url = format!("ws://{}/ws?token={}", app.addr, urlencode(token));
     let (mut ctl, _) = connect_async(&url).await.expect("controller ws");
     let _ = tokio::time::timeout(Duration::from_millis(200), ctl.next()).await;

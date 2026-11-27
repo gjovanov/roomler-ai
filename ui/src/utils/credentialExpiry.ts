@@ -40,8 +40,8 @@ export function credentialChip(
       text: days === 0 ? 'credential expires today' : `credential expires in ${days} d`,
       color: 'warning',
       tooltip:
-        `Its agent token expires on ${on}. A device on agent 0.4.135 or later renews it ` +
-        `itself 180 days early, so one this close is not renewing: update its agent, ` +
+        `Its device credential expires on ${on}. A device on roomlerd 0.4.135 or later renews it ` +
+        `itself 180 days early, so one this close is not renewing: update its daemon, ` +
         `or check whether it was removed and re-enrolled elsewhere.`,
     }
   }
@@ -51,10 +51,10 @@ export function credentialChip(
     text: 'credential expired',
     color: 'error',
     tooltip: renewable
-      ? `Its agent token expired on ${on}. The server still renews it for ` +
-        `${GRACE_DAYS - late} more day(s) once the device runs agent 0.4.135 or later; ` +
+      ? `Its device credential expired on ${on}. The server still renews it for ` +
+        `${GRACE_DAYS - late} more day(s) once the device runs roomlerd 0.4.135 or later; ` +
         `after that, re-enroll it.`
-      : `Its agent token expired on ${on}, more than ${GRACE_DAYS} days ago: ` +
+      : `Its device credential expired on ${on}, more than ${GRACE_DAYS} days ago: ` +
         `re-enroll the device.`,
   }
 }

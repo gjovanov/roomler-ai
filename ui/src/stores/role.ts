@@ -23,23 +23,52 @@ export const useRoleStore = defineStore('roles', () => {
   // List-level error surface (sibling-store convention); dialog-level save
   // errors stay local to the section so the dialog can stay open.
   const error = ref<string | null>(null)
+  /** #4248 — which org `roles` describes: the org of the latest fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's roles never show (or fill a picker) under another org's page. */
+  const rolesTenantId = ref<string | null>(null)
+  // Only the latest fetch writes: the answer for an org asked before it (the
+  // page moved on to another org) is dropped.
+  let seq = 0
+  // The latest fetch failed: `ensureRoles` asks again.
+  let failed = false
 
   async function fetchRoles(tenantId: string) {
+    const mySeq = ++seq
+    if (rolesTenantId.value !== null && rolesTenantId.value !== tenantId) roles.value = []
+    rolesTenantId.value = tenantId
+    failed = false
     loading.value = true
     error.value = null
     try {
-      roles.value = await api.get<Role[]>(`/tenant/${tenantId}/role`)
+      const list = await api.get<Role[]>(`/tenant/${tenantId}/role`)
+      if (mySeq !== seq) return
+      roles.value = list
     } catch (e) {
+      if (mySeq !== seq) return
+      failed = true
       error.value = (e as Error).message
       roles.value = []
     } finally {
-      loading.value = false
+      if (mySeq === seq) loading.value = false
     }
+  }
+
+  /** #4257 — the org's roles for a dialog or a list that only names or picks
+   *  them, fetched only when the store does not hold them already. A store
+   *  that holds another org's roles, or whose last fetch failed, fetches; one
+   *  that holds this org's (or is loading them) does not. It replaces a check
+   *  of an empty list, which never reloaded a list holding another org's. */
+  function ensureRoles(tenantId: string): Promise<void> {
+    if (rolesTenantId.value === tenantId && !failed) return Promise.resolve()
+    return fetchRoles(tenantId)
   }
 
   async function createRole(tenantId: string, payload: Partial<Role>) {
     const role = await api.post<Role>(`/tenant/${tenantId}/role`, payload)
-    roles.value.push(role)
+    // #4257 — a role created for an org the page has left stays out of a
+    // list that now holds another org's roles.
+    if (rolesTenantId.value === null || rolesTenantId.value === tenantId) roles.value.push(role)
     return role
   }
 
@@ -79,7 +108,9 @@ export const useRoleStore = defineStore('roles', () => {
     roles,
     loading,
     error,
+    rolesTenantId,
     fetchRoles,
+    ensureRoles,
     createRole,
     updateRole,
     deleteRole,

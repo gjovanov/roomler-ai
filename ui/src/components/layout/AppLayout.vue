@@ -647,6 +647,11 @@
       <keyed-router-view />
     </v-main>
 
+    <!-- #3563 — the call's sound: every remote participant, whatever the
+         call page's layout renders, and while the mini view stands in for
+         it. Here, not on the call page: this layout is the parent of both. -->
+    <call-audio />
+
     <!-- FR-12 P2 — one mount point for spotlight tours. It lives here rather
          than in each page because a tour is STARTED from somewhere else (the
          Tutorial, via `?tour=`), and a component cannot mount itself into a
@@ -729,6 +734,7 @@ import { useMessageStore } from '@/stores/messages'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 import KeyedRouterView from '@/components/layout/KeyedRouterView.vue'
 import MiniConference from '@/components/conference/MiniConference.vue'
+import CallAudio from '@/components/conference/CallAudio.vue'
 import SearchDialog from '@/components/layout/SearchDialog.vue'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useValidation } from '@/composables/useValidation'
@@ -1008,7 +1014,12 @@ watch(
     // initial fetch): reload the sidebar's rooms + unread badges for the
     // new org; the old switcher left them showing the previous org.
     if (tid && prevTid !== undefined && prevTid !== tid && caps.has('chat')) {
-      void roomStore.fetchRooms(tid).then(() => roomStore.fetchAllUnreadCounts(tid))
+      // #4257 — the count runs over this org's rooms only (the store checks),
+      // and a failed fetch leaves nothing to count.
+      void roomStore
+        .fetchRooms(tid)
+        .then(() => roomStore.fetchAllUnreadCounts(tid))
+        .catch(() => {})
     }
   },
   { immediate: true },
@@ -1080,7 +1091,9 @@ async function maybeAutoOpenTour() {
   try {
     await Promise.all([
       agentStore.fetchAgents(tid),
-      roomStore.rooms.length || !caps.has('chat') ? Promise.resolve() : roomStore.fetchRooms(tid),
+      // #4257 — this org's rooms, once they have landed: a list that holds
+      // another org's rooms is not empty, and a fetch in flight is waited for.
+      !caps.has('chat') ? Promise.resolve() : roomStore.ensureRooms(tid),
     ])
   } catch {
     return
@@ -1201,7 +1214,12 @@ async function onWsReconnected() {
   // FR-69 P9 — rooms, unread counts and messages are the chat module's; a
   // server without it has nothing to refetch (and would answer 404).
   if (!caps.has('chat')) return
-  await roomStore.fetchRooms(tenantId.value)
+  // #4257 — a failed fetch ends here, as it did, without an unhandled rejection.
+  try {
+    await roomStore.fetchRooms(tenantId.value)
+  } catch {
+    return
+  }
   roomStore.fetchAllUnreadCounts(tenantId.value)
   const messageStore = useMessageStore()
   if (messageStore.currentRoomId) {
@@ -1219,8 +1237,13 @@ onMounted(async () => {
   // Fetch rooms and unread counts for current tenant — the chat module's;
   // skipped where the server does not mount it (FR-69 P9).
   if (tenantId.value && caps.has('chat')) {
-    await roomStore.fetchRooms(tenantId.value)
-    roomStore.fetchAllUnreadCounts(tenantId.value)
+    // #4257 — a failed fetch leaves nothing to count, and no unhandled rejection.
+    try {
+      await roomStore.fetchRooms(tenantId.value)
+      roomStore.fetchAllUnreadCounts(tenantId.value)
+    } catch {
+      /* the next change of org or reconnect asks again */
+    }
   }
 })
 

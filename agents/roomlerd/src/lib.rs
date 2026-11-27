@@ -124,6 +124,9 @@ pub mod lock_on_end;
 pub mod lock_overlay;
 pub mod lock_state;
 pub mod logs_fetch;
+/// #4280 — one daemon per machine: the guard `run` takes before anything
+/// host-global, which only a privileged daemon can hold.
+pub mod machine_guard;
 /// #3164 — a Quit AppleEvent restarts the agent; LaunchServices' own launch of
 /// the bundle never becomes a second daemon. Pure halves on every platform.
 pub mod macos_quit;
@@ -237,6 +240,9 @@ pub mod resource_watch;
 /// FR-98 C6 — `playout-delay` 0/0 on the RTP fallback track, so the
 /// browser's jitter buffer renders as soon as it decodes (default off).
 pub mod rtp_playout;
+/// #4292 — an end of the daemon's own choosing (its removal, a lost duel, a
+/// log-out's quit on macOS) marks its run clean, so it never counts as a crash.
+pub mod run_end;
 /// FR-65 P2 / FR-70 AC1 — a 10 ms timer that records how late it woke, so a
 /// starved runtime shows up in the logs.
 pub mod runtime_canary;
@@ -523,8 +529,40 @@ pub fn purge_exit_routes_unless_owned(daemon_running: bool) -> bool {
     true
 }
 
+/// #4382 — the daemon is stopping. The first thing each arm of the run loop's
+/// `select!` does (`app.rs`), before `shutdown_tx`, the 200 ms flush and any
+/// teardown, and every one of those arms ends the process. The route monitor's
+/// child takes the stop's own signal (systemd's stop reaches the unit's whole
+/// cgroup, a terminal's Ctrl-C the whole process group), and netstate's
+/// supervisor reads that exit as the stop's instead of a death to WARN about
+/// and respawn (`tunnel_core::overlay::netstate::note_stopping`). At the crate
+/// root, like its siblings, so the run loop calls it with no feature gate.
+pub fn note_stopping() {
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    tunnel_core::overlay::netstate::note_stopping();
+}
+
 // Here, not in the list above, so that no line the docs anchor in this file moves.
+/// #3429 — what a restart would cut or wedge, now: the one model the periodic
+/// update check and the replaced-binary restart both read.
+pub mod busy;
+/// FR-148 — each `enum:` config key read by a parser in this crate,
+/// pinned both ways against the values its registry entry declares.
+#[cfg(test)]
+mod config_enum_pins;
 pub mod daemon_error;
+/// FR-133 P2c — the viewer's sentences, the CLI and LocalAPI output, `--help`.
+#[cfg(test)]
+mod daemon_text_tests;
+/// FR-151 — the Mac's root update helper waits for live work: the pure
+/// decision its macOS arm (`updater::run_update_helper`) runs.
+pub mod helper_gate;
+/// FR-148 P4b-3 — the agent's half of the deadline-limited video channel:
+/// the pick per carrier class, the switch at a key frame, the drain rule, D.
+pub mod media_deadline;
+/// FR-133 — every needs-attention notice, rendered and read back whole.
+#[cfg(test)]
+mod notice_text_tests;
 
 #[cfg(test)]
 mod tests {

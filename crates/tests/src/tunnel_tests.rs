@@ -1236,6 +1236,10 @@ async fn enrol_agent_lib(
         machine_id,
         machine_name,
         install: None,
+        program: enrollment::EnrollingProgram::new(
+            enrollment::EnrollingProgramName::Roomlerd,
+            env!("CARGO_PKG_VERSION"),
+        ),
     })
     .await
     .expect("agent enrollment")
@@ -1655,4 +1659,603 @@ async fn tunnel_grace_reregister_cancels_terminate() {
         !matches!(saw_terminate, Ok(true)),
         "a re-register within grace must CANCEL the pending terminate (A received one)"
     );
+}
+
+/// #3636 — the ids a tunnel-policy answer carries, and what saving one back
+/// stores.
+///
+/// Every answer (create, list, get, update) names a subject's or a target's id
+/// as the 24-hex string `docs/api.md` promises. The web app reads it as a
+/// string, names the subject by it, and its editor sends it back on save; the
+/// answers carried bson's extended JSON `{"$oid": …}` before, which the
+/// Tunnel ACL tab printed as `[object Object]`. What a save stores, what the
+/// forward gate compiles and what `forget_agent` (#3627) finds are pinned
+/// here too: the fix is a projection at the route, and none of them may move.
+mod policy_ids_on_the_wire {
+    use super::*;
+    use crate::fixtures::seed::SeededTenant;
+    use crate::tunnel_policy_permission_tests::call;
+    use bson::{Bson, RawDocumentBuf, doc, oid::ObjectId, spec::ElementType};
+    use std::collections::BTreeMap;
+
+    /// `(kind, id)` of one subject or target as a request names it and an
+    /// answer must carry it back; `None` for a catch-all.
+    type Entry = (&'static str, Option<String>);
+
+    /// One org with one of every kind a tunnel policy names by id: its owner,
+    /// a role of the org, an enrolled tunnel client and an enrolled device.
+    struct EveryKind {
+        seeded: SeededTenant,
+        user: String,
+        role: String,
+        client: String,
+        device: String,
+    }
+
+    impl EveryKind {
+        fn tenant(&self, tail: &str) -> String {
+            format!("/api/tenant/{}{tail}", self.seeded.tenant_id)
+        }
+
+        fn token(&self) -> &str {
+            &self.seeded.admin.access_token
+        }
+
+        fn tid(&self) -> ObjectId {
+            ObjectId::parse_str(&self.seeded.tenant_id).unwrap()
+        }
+
+        /// The subjects a policy names by id, in the order an admin listed them.
+        fn id_subjects(&self) -> Vec<Entry> {
+            vec![
+                ("user_id", Some(self.user.clone())),
+                ("role_id", Some(self.role.clone())),
+                ("tunnel_client_id", Some(self.client.clone())),
+                ("agent_id", Some(self.device.clone())),
+            ]
+        }
+
+        fn id_targets(&self) -> Vec<Entry> {
+            vec![("agent_id", Some(self.device.clone()))]
+        }
+    }
+
+    async fn every_kind(app: &TestApp, tag: &str) -> EveryKind {
+        let seeded = app.seed_tenant(tag).await;
+        let (status, role) = call(
+            app,
+            "POST",
+            &format!("/api/tenant/{}/role", seeded.tenant_id),
+            &seeded.admin.access_token,
+            Some(json!({ "name": "tunnel operators", "permissions": 0 })),
+        )
+        .await;
+        assert_eq!(status, 200, "the owner makes a role: {role}");
+        let role = role["id"].as_str().expect("role id").to_string();
+        let client =
+            enroll_tunnel_client(app, &seeded, &format!("mach-{tag}-client"), "acl-client").await;
+        let (device, _token) =
+            enroll_agent(app, &seeded, &format!("mach-{tag}-device"), "acl-device").await;
+        let user = seeded.admin.id.clone();
+        EveryKind {
+            seeded,
+            user,
+            role,
+            client,
+            device,
+        }
+    }
+
+    fn hex_id(id: &str) -> Value {
+        json!(id)
+    }
+
+    /// The form every answer carried before #3636, which a request still takes.
+    fn extended_json_id(id: &str) -> Value {
+        json!({ "$oid": id })
+    }
+
+    /// `want` as a request body names it: `{kind, id}`, the id written by
+    /// `id_form`; a catch-all as a bare `{kind}`.
+    fn entries(want: &[Entry], id_form: fn(&str) -> Value) -> Value {
+        Value::Array(
+            want.iter()
+                .map(|(kind, id)| match id {
+                    Some(id) => json!({ "kind": kind, "id": id_form(id) }),
+                    None => json!({ "kind": kind }),
+                })
+                .collect(),
+        )
+    }
+
+    /// A policy that reaches nothing: TEST-NET-1, port 9.
+    fn policy_body(name: &str, subjects: Value, targets: Value) -> Value {
+        json!({
+            "name": name,
+            "subjects": subjects,
+            "targets": targets,
+            "allowlist": [{
+                "host_pattern": { "kind": "cidr", "value": "192.0.2.1/32" },
+                "port_range": { "low": 9, "high": 9 },
+                "proto": "tcp"
+            }],
+        })
+    }
+
+    /// The two policies the cells start from: one that names a user, a role,
+    /// a tunnel client and a device (and the device as its target), and one
+    /// with the two catch-alls. Their ids, in that order.
+    async fn create_both(app: &TestApp, k: &EveryKind) -> (String, String) {
+        let mut ids = Vec::new();
+        for body in [
+            policy_body(
+                "names every kind",
+                entries(&k.id_subjects(), hex_id),
+                entries(&k.id_targets(), hex_id),
+            ),
+            policy_body(
+                "catch-alls",
+                json!([{ "kind": "all_users" }]),
+                json!([{ "kind": "all_agents" }]),
+            ),
+        ] {
+            let (status, created) = call(
+                app,
+                "POST",
+                &k.tenant("/tunnel-policy"),
+                k.token(),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, 201, "create: {created}");
+            ids.push(created["id"].as_str().expect("policy id").to_string());
+        }
+        (ids[0].clone(), ids[1].clone())
+    }
+
+    fn is_hex24(s: &str) -> bool {
+        s.len() == 24 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// What is wrong with an answer's `subjects` or `targets` as the browser
+    /// reads them, against `want`: an id must be the 24-hex string sent, a
+    /// catch-all is the single key `kind`, and nothing is lost, added or
+    /// reordered.
+    fn wire_problems(what: &str, entries: &Value, want: &[Entry]) -> Vec<String> {
+        let Some(got) = entries.as_array() else {
+            return vec![format!("{what}: not an array: {entries}")];
+        };
+        let mut wrong = Vec::new();
+        if got.len() != want.len() {
+            wrong.push(format!(
+                "{what}: {} entries, want {}: {entries}",
+                got.len(),
+                want.len()
+            ));
+        }
+        for (i, (entry, (kind, id))) in got.iter().zip(want).enumerate() {
+            let at = format!("{what}[{i}] ({kind})");
+            if entry["kind"] != *kind {
+                wrong.push(format!("{at}: the kind is {}", entry["kind"]));
+            }
+            let keys = entry.as_object().map_or(0, |o| o.len());
+            match id {
+                None if keys != 1 => wrong.push(format!(
+                    "{at}: a catch-all is the single key `kind`: {entry}"
+                )),
+                None => {}
+                Some(id) => match entry["id"].as_str() {
+                    None => wrong.push(format!("{at}: the id is not a string: {entry}")),
+                    Some(s) if !is_hex24(s) => {
+                        wrong.push(format!("{at}: the id is not 24 lowercase hex: {s}"))
+                    }
+                    Some(s) if s != id => {
+                        wrong.push(format!("{at}: the id {s} is not the one sent, {id}"))
+                    }
+                    Some(_) if keys != 2 => {
+                        wrong.push(format!("{at}: `kind` and `id` only: {entry}"))
+                    }
+                    Some(_) => {}
+                },
+            }
+        }
+        wrong
+    }
+
+    /// Every problem with one policy answer: its subjects, its targets, and
+    /// any `$oid` text anywhere in it.
+    fn answer_problems(
+        what: &str,
+        answer: &Value,
+        subjects: &[Entry],
+        targets: &[Entry],
+    ) -> Vec<String> {
+        let mut wrong = wire_problems(&format!("{what}: subjects"), &answer["subjects"], subjects);
+        wrong.extend(wire_problems(
+            &format!("{what}: targets"),
+            &answer["targets"],
+            targets,
+        ));
+        if answer.to_string().contains("$oid") {
+            wrong.push(format!("{what}: the answer carries `$oid`: {answer}"));
+        }
+        wrong
+    }
+
+    /// GET policy `pid` and PUT its `subjects` and `targets` back exactly as
+    /// the answer carried them, as the web app's editor does when it saves.
+    async fn echo_policy(app: &TestApp, k: &EveryKind, pid: &str) {
+        let one = k.tenant(&format!("/tunnel-policy/{pid}"));
+        let (status, got) = call(app, "GET", &one, k.token(), None).await;
+        assert_eq!(status, 200, "GET {pid}: {got}");
+        let echo =
+            json!({ "subjects": got["subjects"].clone(), "targets": got["targets"].clone() });
+        let (status, saved) = call(app, "PUT", &one, k.token(), Some(echo)).await;
+        assert_eq!(status, 200, "the echo of {pid} is accepted: {saved}");
+    }
+
+    /// Policy `pid` as Mongo holds it, raw.
+    async fn stored_policy(app: &TestApp, pid: &str) -> RawDocumentBuf {
+        app.db
+            .collection::<RawDocumentBuf>("tunnel_policies")
+            .find_one(doc! { "_id": ObjectId::parse_str(pid).unwrap() })
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("policy {pid} is stored"))
+    }
+
+    async fn policy_count(app: &TestApp, tid: ObjectId) -> u64 {
+        app.db
+            .collection::<bson::Document>("tunnel_policies")
+            .count_documents(doc! { "tenant_id": tid })
+            .await
+            .unwrap()
+    }
+
+    /// What differs between two stored rows' `subjects` and `targets`, byte
+    /// for byte and `Bson` for `Bson`, and every id element of `after` that
+    /// is not an ObjectId. `ids` is how many id elements `after` must hold,
+    /// so the check cannot pass over an empty list.
+    fn stored_problems(
+        what: &str,
+        before: &RawDocumentBuf,
+        after: &RawDocumentBuf,
+        ids: usize,
+    ) -> Vec<String> {
+        let mut wrong = Vec::new();
+        let (b, a) = (before.to_document().unwrap(), after.to_document().unwrap());
+        let mut seen = 0;
+        for field in ["subjects", "targets"] {
+            let (raw_b, raw_a) = (
+                before.get_array(field).unwrap(),
+                after.get_array(field).unwrap(),
+            );
+            if raw_b.as_bytes() != raw_a.as_bytes() {
+                wrong.push(format!("{what}: {field}: the stored bytes changed"));
+            }
+            if b.get(field) != a.get(field) {
+                wrong.push(format!(
+                    "{what}: {field}: was {:?}, is {:?}",
+                    b.get(field),
+                    a.get(field)
+                ));
+            }
+            for entry in a.get_array(field).unwrap() {
+                let Some(id) = entry.as_document().and_then(|e| e.get("id")) else {
+                    continue;
+                };
+                seen += 1;
+                if id.element_type() != ElementType::ObjectId {
+                    wrong.push(format!(
+                        "{what}: {field}: an id is stored as {:?}: {entry}",
+                        id.element_type()
+                    ));
+                }
+            }
+        }
+        if seen != ids {
+            wrong.push(format!("{what}: {seen} id elements stored, want {ids}"));
+        }
+        wrong
+    }
+
+    /// The typed policies the forward gate compiles for the org, keyed by
+    /// id, each as a document without `updated_at`: the gate's only input
+    /// (`list_active_for_tenant`, `crates/modules/network/src/tunnel.rs`).
+    async fn gate_input(app: &TestApp, tid: ObjectId) -> BTreeMap<String, bson::Document> {
+        let policies = app
+            .state
+            .network()
+            .tunnel_policies
+            .list_active_for_tenant(tid)
+            .await
+            .unwrap();
+        policies
+            .iter()
+            .map(|p| {
+                let mut d = bson::to_document(p).unwrap();
+                d.remove("updated_at");
+                (p.id.expect("a stored policy has an id").to_hex(), d)
+            })
+            .collect()
+    }
+
+    /// Create, list, get and update each answer a policy's ids as the 24-hex
+    /// strings sent, and a catch-all as a bare `{"kind"}`.
+    #[tokio::test]
+    async fn every_tunnel_policy_answer_names_its_ids_as_hex_strings() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "tpol-wire").await;
+        let named = (k.id_subjects(), k.id_targets());
+        let catch_alls: (Vec<Entry>, Vec<Entry>) =
+            (vec![("all_users", None)], vec![("all_agents", None)]);
+        let mut wrong = Vec::new();
+
+        let mut ids = Vec::new();
+        for (what, body, want) in [
+            (
+                "create",
+                policy_body(
+                    "names every kind",
+                    entries(&named.0, hex_id),
+                    entries(&named.1, hex_id),
+                ),
+                &named,
+            ),
+            (
+                "create (catch-alls)",
+                policy_body(
+                    "catch-alls",
+                    entries(&catch_alls.0, hex_id),
+                    entries(&catch_alls.1, hex_id),
+                ),
+                &catch_alls,
+            ),
+        ] {
+            let (status, created) = call(
+                &app,
+                "POST",
+                &k.tenant("/tunnel-policy"),
+                k.token(),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, 201, "{what}: {created}");
+            wrong.extend(answer_problems(what, &created, &want.0, &want.1));
+            ids.push(created["id"].as_str().expect("policy id").to_string());
+        }
+
+        let (status, list) = call(&app, "GET", &k.tenant("/tunnel-policy"), k.token(), None).await;
+        assert_eq!(status, 200, "list: {list}");
+        let items = list["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2, "both policies, on one page: {list}");
+        for (id, what, want) in [
+            (&ids[0], "list", &named),
+            (&ids[1], "list (catch-alls)", &catch_alls),
+        ] {
+            let item = items
+                .iter()
+                .find(|p| p["id"] == id.as_str())
+                .unwrap_or_else(|| panic!("{what}: {id} is listed: {list}"));
+            wrong.extend(answer_problems(what, item, &want.0, &want.1));
+        }
+
+        for (id, what, want) in [
+            (&ids[0], "", &named),
+            (&ids[1], " (catch-alls)", &catch_alls),
+        ] {
+            let one = k.tenant(&format!("/tunnel-policy/{id}"));
+            let (status, got) = call(&app, "GET", &one, k.token(), None).await;
+            assert_eq!(status, 200, "get{what}: {got}");
+            wrong.extend(answer_problems(
+                &format!("get{what}"),
+                &got,
+                &want.0,
+                &want.1,
+            ));
+            let rename = json!({ "name": format!("renamed{what}") });
+            let (status, renamed) = call(&app, "PUT", &one, k.token(), Some(rename)).await;
+            assert_eq!(status, 200, "update{what}: {renamed}");
+            wrong.extend(answer_problems(
+                &format!("update{what}"),
+                &renamed,
+                &want.0,
+                &want.1,
+            ));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// What the editor saves is what the server answered. An echo of a
+    /// policy's `subjects` and `targets` (objects before the fix, strings
+    /// after it) stores the bytes that were stored, every id still an
+    /// ObjectId element. A subject lost, reordered or re-typed on the way out
+    /// would be revoked or broken by the next save.
+    #[tokio::test]
+    async fn an_echoed_tunnel_policy_stores_the_bytes_it_stored() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "tpol-echo").await;
+        let (named, catch_alls) = create_both(&app, &k).await;
+        let mut wrong = Vec::new();
+        for (pid, ids) in [(&named, 5), (&catch_alls, 0)] {
+            let before = stored_policy(&app, pid).await;
+            echo_policy(&app, &k, pid).await;
+            let after = stored_policy(&app, pid).await;
+            wrong.extend(stored_problems(pid, &before, &after, ids));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A request names an id as the bare hex or as the `{"$oid": …}` map the
+    /// answers carried before #3636, on create and on update, and both store
+    /// the same ObjectId elements: a page loaded before the fix still saves
+    /// what it shows.
+    #[tokio::test]
+    async fn a_tunnel_policy_request_takes_a_hex_id_and_an_extended_json_id_alike() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "tpol-forms").await;
+        let mut rows = Vec::new();
+        for (form, id_form) in [
+            ("hex", hex_id as fn(&str) -> Value),
+            ("$oid", extended_json_id),
+        ] {
+            let body = policy_body(
+                form,
+                entries(&k.id_subjects(), id_form),
+                entries(&k.id_targets(), id_form),
+            );
+            let (status, created) = call(
+                &app,
+                "POST",
+                &k.tenant("/tunnel-policy"),
+                k.token(),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, 201, "create, ids as {form}: {created}");
+            let pid = created["id"].as_str().expect("policy id").to_string();
+            rows.push((pid.clone(), stored_policy(&app, &pid).await));
+        }
+        let mut wrong = stored_problems("create, hex vs $oid", &rows[0].1, &rows[1].1, 5);
+
+        let (pid, before) = &rows[0];
+        let update = json!({
+            "subjects": entries(&k.id_subjects(), extended_json_id),
+            "targets": entries(&k.id_targets(), extended_json_id),
+        });
+        let one = k.tenant(&format!("/tunnel-policy/{pid}"));
+        let (status, saved) = call(&app, "PUT", &one, k.token(), Some(update)).await;
+        assert_eq!(status, 200, "update, ids as $oid: {saved}");
+        let after = stored_policy(&app, pid).await;
+        wrong.extend(stored_problems("update, ids as $oid", before, &after, 5));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A functional control on the request side: an id that is not one, the
+    /// text `"x"` or the number `42`, is refused on create and on update, and
+    /// nothing is stored. The status is printed for the record.
+    #[tokio::test]
+    async fn a_tunnel_policy_request_with_a_malformed_id_is_refused_and_stores_nothing() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "tpol-malformed").await;
+        let (named, _) = create_both(&app, &k).await;
+        let one = k.tenant(&format!("/tunnel-policy/{named}"));
+        for bad in [json!("x"), json!(42)] {
+            let count = policy_count(&app, k.tid()).await;
+            let body = policy_body(
+                "malformed",
+                json!([{ "kind": "user_id", "id": bad }]),
+                json!([{ "kind": "all_agents" }]),
+            );
+            let (status, answer) = call(
+                &app,
+                "POST",
+                &k.tenant("/tunnel-policy"),
+                k.token(),
+                Some(body),
+            )
+            .await;
+            eprintln!("#3636 a malformed id {bad}: create answered {status}");
+            assert!(
+                status == 400 || status == 422,
+                "create with the id {bad} is refused: {status} {answer}"
+            );
+            assert_eq!(
+                policy_count(&app, k.tid()).await,
+                count,
+                "create with the id {bad} stores nothing"
+            );
+
+            let before = stored_policy(&app, &named).await;
+            let body = json!({ "targets": [{ "kind": "agent_id", "id": bad }] });
+            let (status, answer) = call(&app, "PUT", &one, k.token(), Some(body)).await;
+            eprintln!("#3636 a malformed id {bad}: update answered {status}");
+            assert!(
+                status == 400 || status == 422,
+                "update with the id {bad} is refused: {status} {answer}"
+            );
+            assert_eq!(
+                stored_policy(&app, &named).await.as_bytes(),
+                before.as_bytes(),
+                "update with the id {bad} changes nothing"
+            );
+        }
+    }
+
+    /// #3627's guard on an echoed row: after the editor's save, taking the
+    /// device out of the org's policies still finds it by the ObjectId the
+    /// row holds. A save that wrote the id back as a string would hide the
+    /// device from `forget_agent`, and a revived device would keep the
+    /// removed one's grants.
+    #[tokio::test]
+    async fn forget_agent_still_finds_the_device_in_an_echoed_tunnel_policy() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "tpol-forget").await;
+        let (named, catch_alls) = create_both(&app, &k).await;
+        echo_policy(&app, &k, &named).await;
+        echo_policy(&app, &k, &catch_alls).await;
+        let device = Bson::ObjectId(ObjectId::parse_str(&k.device).unwrap());
+        let changed = app
+            .state
+            .network()
+            .tunnel_policies
+            .forget_agent(k.tid(), ObjectId::parse_str(&k.device).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(changed, 1, "the one policy that names the device");
+        let row = stored_policy(&app, &named).await.to_document().unwrap();
+        for field in ["subjects", "targets"] {
+            let naming = row
+                .get_array(field)
+                .unwrap()
+                .iter()
+                .filter(|e| e.as_document().and_then(|d| d.get("id")) == Some(&device))
+                .count();
+            assert_eq!(naming, 0, "{field} no longer name the device: {row}");
+        }
+        let kinds: Vec<&str> = row
+            .get_array("subjects")
+            .unwrap()
+            .iter()
+            .map(|e| e.as_document().unwrap().get_str("kind").unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["user_id", "role_id", "tunnel_client_id"],
+            "every other subject stays: {row}"
+        );
+        assert!(
+            row.get_array("targets").unwrap().is_empty(),
+            "the device was the policy's only target: {row}"
+        );
+        assert_eq!(
+            stored_policy(&app, &catch_alls)
+                .await
+                .to_document()
+                .unwrap()
+                .get_array("subjects")
+                .unwrap(),
+            &[Bson::Document(doc! { "kind": "all_users" })],
+            "a policy that never named the device is untouched"
+        );
+    }
+
+    /// The forward gate's only input is the typed rows
+    /// `list_active_for_tenant` reads. An echo leaves every field of them as
+    /// it was, `updated_at` aside, so the gate decides as it did.
+    #[tokio::test]
+    async fn an_echoed_tunnel_policy_compiles_as_it_did() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "tpol-gate").await;
+        let (named, catch_alls) = create_both(&app, &k).await;
+        let before = gate_input(&app, k.tid()).await;
+        assert_eq!(before.len(), 2, "both policies compile: {before:?}");
+        echo_policy(&app, &k, &named).await;
+        echo_policy(&app, &k, &catch_alls).await;
+        assert_eq!(
+            gate_input(&app, k.tid()).await,
+            before,
+            "what the gate compiles"
+        );
+    }
 }

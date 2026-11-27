@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **4 of 8 criteria ticked** — AC1, AC2, AC5 (forced rekeys bounded on the release that carries P3's gate, read 2026-11-10) and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. AC4's read (2026-11-10) shows the runtime starved at times, so AC4 waits for attribution and a fix. The census is a fleet-wide server read since 2026-11-03 (#3372). Next: AC7's after-read on or after 2026-11-15, AC4's attribution, then AC3. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code and field-read (AC7, 2026-11-20)** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **5 of 8 criteria ticked** — AC1, AC2, AC5 (forced rekeys bounded on the release that carries P3's gate, read 2026-11-10), AC6 (the caps-probe respawn, measured gone on four hosts) and AC7 (#3138's after-read, 2026-11-20: `reset` and `untimed` at 0 on CORPLAP-1/-2/-3 over 7 days) — AC8 (docs) `[~]`. AC4's read (2026-11-10) shows the runtime starved at times, so AC4 waits for attribution and a fix. The census is a fleet-wide server read since 2026-11-03 (#3372). Next: AC4's attribution, then AC3, which [the plan](https://github.com/gjovanov/roomler-ai/issues/1255#issuecomment-7027613602) proposes to FR-148's P2. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -145,8 +145,8 @@ speculatively.
 > section designed was built under FR-70 (M2, "make-before-break, as designed
 > and built", 2026-09-05) and field-verified as M2a on 0.4.75 the next day: a
 > dims change opens the replacement off the frame path while the pump serves
-> at the old dims (`peer.rs:8746`, "FR-70 M2: dims change"), adopts it in one
-> pass (`peer.rs:7547`, "dims swap adopted — the picture never froze"), and
+> at the old dims (`peer.rs:8743`, "FR-70 M2: dims change"), adopts it in one
+> pass (`peer.rs:7553`, "dims swap adopted — the picture never froze"), and
 > counts it in the heartbeat's `dims_swaps`. On CORPLAP-3 (`av1_qsv`, direct)
 > both moves adopted in 252–285 ms off-path with an in-path adoption of
 > `apply=15 ms`; on CORPLAP-2 (`av1_nvenc`, relay) four moves, `apply=41–44 ms`,
@@ -474,7 +474,7 @@ of each is to produce a number.
       the same way; and a restart on an unchanged version shows none (a cache
       hit, NEO16 2026-10-29 10:14:34). No FR-65 change was involved; what
       stopped the respawn is not established here (see P4's status).
-- [ ] **AC7** — every fix carries a before/after from the **same** instrument on
+- [x] **AC7** — every fix carries a before/after from the **same** instrument on
       this issue. A fix with no measurement does not count as shipped.
       *2026-10-30:* P0's two fixes (#3138: the window-reset rebase and the
       governor's monotonic stall count) have their **before** — the host census
@@ -492,6 +492,13 @@ of each is to produce a number.
       (`open`, `encode`, …), and `untimed` must shrink by what the six newly
       named phases take. The first two days have both at 0 over 23/2 816/1 925
       heartbeats, which is a reading and not this criterion.
+      *2026-11-20, the after: met.* The same read over 2026-11-13 17:00Z ..
+      11-20 17:00Z, every line from 0.4.219 to 0.4.229: `reset` 0 and `untimed`
+      0 on CORPLAP-1/-2/-3 over 9 088/6 794/25 625 heartbeats, with `dropped` and
+      `reset_no_hb` at 0. The long passes now carry their phase: CORPLAP-2's 29
+      `open` lines mean 1.1 s and reach 5.0 s, where its long opens read as
+      `reset` before
+      ([the read](https://github.com/gjovanov/roomler-ai/issues/1255#issuecomment-7045603938)).
 - [~] **AC8** — Docs: [`docs/stall-watch.md`](../stall-watch.md) in the house
       style (mermaid, tables, `file:line` anchors) for the instrument and for each
       later phase as it ships, and a `docs/README.md` index row.
@@ -546,6 +553,32 @@ path), FR-63 #1243, FR-64 #1244, #1237 (the sibling route war).
 ## Field-verification log
 
 _(every entry must carry a before/after from the stall watch.)_
+
+- **2026-11-20 — #3138's after-read: AC7 met.** The census in its STALL mode over
+  2026-11-13 17:00Z .. 11-20 17:00Z, every device, the 7 days `agent_logs` holds.
+  Every line it counted came from 0.4.219 to 0.4.229, so the whole window is the
+  after. Per-device tables:
+  [#1255](https://github.com/gjovanov/roomler-ai/issues/1255#issuecomment-7045603938).
+  - **The database.** Three reads (`--swaps` and `--canary` beside STALL), each
+    with its client outside the pod: `mongodb-0` restarts 1 → 1 on all three, and
+    `memory.current` 78.7 → 80.8 % of its limit on the first, then flat.
+  - **AC7.** Per 1 000 heartbeats, before → after, on CORPLAP-1/-2/-3: `reset`
+    1.10/4.20/0.86 → 0/0/0 and `untimed` 1.76/0.81/0 → 0/0/0, over 9 088/6 794/
+    25 625 heartbeats. Every device: 147 269 heartbeats, 1 227 STALLs, 0 `reset`,
+    0 `untimed`; `dropped` 0 and `reset_no_hb` 0 on every row.
+  - **`dc_lock` is now most of what is left.** 872 of the 1 227 STALLs, 686 of
+    them on CORPLAP-3, whose 0.4.227 sessions logged 659 (worst pass 12.2 s). The
+    mutex is §6.3's in the manual, named and not fixed (ledger row `peer:S34`).
+  - **AC3 is not readable early.** No constrained QSV session changed size in the
+    window: `av1_qsv` and `hevc_qsv` with `constrained=true` show 0 dims swaps and
+    0 size changes.
+  - **AC4's before for its attribution PR.** 17 020 ten-minute summaries, 1 271 of
+    them (7.5 %) with a wake over 100 ms late; 1 227 STALLs, 1 214 covered, 254
+    `runtime_late`.
+  - **The script.** `scripts/fr65-stall-census.sh --mars --yes` with no other
+    option sent one empty argument to the run on mars, which refused it before
+    any read; this read passed the window as `--since`/`--until`. Fixed in the
+    same PR as this entry.
 
 - **2026-11-10 — the 7-day reads on the release: AC5 met, AC4 read.** The census's
   `--rekeys` and `--canary` over 2026-11-03 17:50Z .. 11-10 17:50Z, every device, the

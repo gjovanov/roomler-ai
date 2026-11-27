@@ -414,26 +414,29 @@ pub fn host_arch() -> String {
 }
 
 /// The loopback HTTP server this crate's pairing tests speak to — shared
-/// with `pairing_terminal`'s (FR-129 A4).
-#[cfg(test)]
-pub(crate) mod test_http {
+/// with `pairing_terminal`'s (FR-129 A4), and with the enrollment's (#4352),
+/// here and, through `test-fixtures`, in `roomlerd`'s.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_http {
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
     };
 
-    /// One request the loopback server saw: its path and its body.
+    /// One request the loopback server saw: its path, its head (the request
+    /// line and the headers, as sent) and its body.
     #[derive(Clone, Debug)]
-    pub(crate) struct Seen {
-        pub(crate) path: String,
-        pub(crate) body: String,
+    pub struct Seen {
+        pub path: String,
+        pub head: String,
+        pub body: String,
     }
 
     /// A loopback HTTP server that reads each whole request, records its
     /// path and body, and answers the next scripted `(status line, body)` —
     /// the last one again once the script is used up. Returns its base URL
     /// and the record.
-    pub(crate) async fn scripted_server(
+    pub async fn scripted_server(
         script: Vec<(&'static str, &'static str)>,
     ) -> (String, Arc<Mutex<Vec<Seen>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -485,11 +488,11 @@ pub(crate) mod test_http {
                         .and_then(|l| l.split_whitespace().nth(1))
                         .unwrap_or_default()
                         .to_string();
-                    let body = text
+                    let (head, body) = text
                         .split_once("\r\n\r\n")
-                        .map(|(_, b)| b.to_string())
+                        .map(|(h, b)| (h.to_string(), b.to_string()))
                         .unwrap_or_default();
-                    record.lock().unwrap().push(Seen { path, body });
+                    record.lock().unwrap().push(Seen { path, head, body });
                     let (status, reply_body) = {
                         let mut a = answers.lock().unwrap();
                         if a.len() > 1 {

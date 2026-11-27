@@ -1547,7 +1547,10 @@ impl Handler {
             org: self.ctx.org.clone(),
             expires_at: Instant::now() + window,
         };
-        let native = self.ctx.indicator.show_prompt(view.clone());
+        // FR-149 P1 — the screen worker's panel first on a one-row Mac's root
+        // daemon, `PANEL_WITHIN` at most.
+        let on_screen = self.ctx.indicator.show_prompt(view.clone()).await;
+        let native = on_screen.native;
         let mut prompt = crate::consent::PendingPrompt {
             kind: crate::consent::PromptKind::Record,
             asked_by: name,
@@ -1565,7 +1568,13 @@ impl Handler {
         // The marker is written either way (`roomlerd consent --list` shows a
         // natively-prompted question too); without it the companion has
         // nothing to render, so it is part of "could anyone be asked".
-        let marker = match self.ctx.consent.write_prompt(&prompt_id, &prompt) {
+        // FR-149 P1 — and read on the session panel's books after it.
+        let marker = match crate::indicator::session_panel::write_marker(
+            &self.ctx.consent,
+            &prompt_id,
+            &prompt,
+            &on_screen,
+        ) {
             Ok(_) => true,
             Err(e) => {
                 warn!(%e, native, "record: could not write the .pending consent marker");
@@ -1591,7 +1600,12 @@ impl Handler {
                 }
             }
         }
-        info!(session = %self.ctx.session_id, native, notified, have_surface, "consent prompt surface (record)");
+        info!(
+            session = %self.ctx.session_id, native, panel = on_screen.panel(),
+            session_panel = on_screen.session_panel(), why = on_screen.why(), notified,
+            have_surface,
+            "consent prompt surface (record)"
+        );
         let decision = asking.await;
         self.ctx.indicator.hide_prompt(&prompt_id);
         if let Ok(mut p) = self.prompt.lock() {
@@ -2779,6 +2793,11 @@ mod console_lookup_tests {
     /// What "at once" may take on a busy CI runner: the bar #3830 sets for
     /// `roomler status` while logind is paused.
     const AT_ONCE: Duration = Duration::from_millis(500);
+    /// How long a test waits for the lookups it started to begin (#4134):
+    /// far longer than a busy runner takes to schedule a thread. A count
+    /// already there returns at once, so only a lookup that never begins
+    /// waits this out.
+    const BEGINS: Duration = Duration::from_secs(10);
 
     /// Lookups, counted as they begin. The first `quick` answer at once; every
     /// later one holds until the gate opens, as a stopped logind holds
@@ -2823,6 +2842,28 @@ mod console_lookup_tests {
 
         fn began(&self) -> usize {
             self.0.began.load(Ordering::SeqCst)
+        }
+
+        /// The lookups begun, once `want` of them have, waited for `within`
+        /// at most. A lookup counts when its own thread runs it, and an ask
+        /// can answer before that thread has run: `now` at once, and an ask
+        /// that waits once its wait is out. So a count read straight after
+        /// the asks can miss a lookup they started (#4134). The caller
+        /// asserts the exact count, so one lookup more than `want` still
+        /// fails.
+        fn began_within(&self, want: usize, within: Duration) -> usize {
+            let deadline = Instant::now() + within;
+            loop {
+                let began = self.began();
+                if began >= want {
+                    return began;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{began} of {want} lookups began within {within:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -2938,7 +2979,7 @@ mod console_lookup_tests {
             }
             worst
         });
-        let began = held.began();
+        let began = held.began_within(1, BEGINS);
         let (worst, _) = late.expect("a 10 ms timer kept waking while the console lookup hung");
         assert!(
             worst < AT_ONCE,
@@ -2987,7 +3028,11 @@ mod console_lookup_tests {
             assert!(took < AT_ONCE, "the caps took {took:?}");
             assert!(caps.contains(&available), "{caps:?}");
         }
-        assert_eq!(held.began(), 1, "one lookup in flight, however many asked");
+        assert_eq!(
+            held.began_within(1, BEGINS),
+            1,
+            "one lookup in flight, however many asked"
+        );
     }
 
     /// #3830 — FR-85 P1f's guards ask who is signed in afresh, and a fresh
@@ -3041,7 +3086,7 @@ mod console_lookup_tests {
             "{started:?}"
         );
         assert_eq!(
-            held.began(),
+            held.began_within(2, BEGINS),
             2,
             "the held lookup, and only it, since the first"
         );

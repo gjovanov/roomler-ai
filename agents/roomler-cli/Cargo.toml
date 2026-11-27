@@ -105,6 +105,12 @@ flate2 = "1"
 tar = "0.4"
 tempfile = { workspace = true }
 
+# #3866 — on Linux a command's own folders come from the daemon's shared crate
+# (`appdirs::own_folders`): root's are its own beneath `/root`, whatever `HOME`
+# it was given. Default features only; never `overlay-l3`/`overlay-netstack`.
+[target.'cfg(target_os = "linux")'.dependencies]
+roomler-node-core = { path = "../../crates/agent-core" }
+
 # build.rs embeds a Windows VERSIONINFO resource into roomler.exe. See
 # agents/roomlerd/Cargo.toml for why this is embed-resource rather than
 # winres/winresource (per-binary scoping vs. a link-lib that leaks into

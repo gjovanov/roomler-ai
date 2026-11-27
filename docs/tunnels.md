@@ -352,8 +352,8 @@ Three links had to break, one in each place that owned it:
 | Where | Change | Anchor |
 |---|---|---|
 | `webrtc` | `send`/`send_text` take the channel out of its slot instead of holding the slot's lock across the write. They take turns on a `send_lock` of their own, which `close()` and `buffered_amount()` never take: the slot lock was the only thing ordering a channel's writes, and two at once shared a stream sequence number or split a message | `crates/vendored/webrtc/src/data_channel/mod.rs:378`, `:89` |
-| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:568`, `:308`, `queue/pending_queue.rs:237` |
-| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:270`, `queue/pending_queue.rs:230` |
+| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:584`, `:324`, `queue/pending_queue.rs:261` |
+| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:284`, `queue/pending_queue.rs:254` |
 
 #1856's comment expected a transport that is really gone to fail the association's `recv`.
 Nothing below SCTP ever fails it on a dead path, because the ICE agent's conn ends only when
@@ -375,7 +375,7 @@ Now no candidate is closed under the lock. Each local candidate closes on a task
 and one still closing after 5 s is named in a `closing candidate … is taking over 5s` warning.
 That line names the ICE role and the candidate, not the session, which the ICE agent never
 learns. A remote-desktop session logs each of its local candidates with the session
-(`ICE: gathered local candidate`, `agents/roomlerd/src/carrier_rank.rs:67`), and the candidate's
+(`ICE: gathered local candidate`, `agents/roomlerd/src/carrier_rank.rs:76`), and the candidate's
 address and port join the two lines.
 
 **The net under the rest:** `AgentPeer::close` and `TunnelPeer::close` run `pc.close()` through
@@ -409,7 +409,7 @@ kept a task past its baseline in those 90 runs.
 **A close while a channel is still being taken up (#4103).** The SCTP transport takes up each
 channel the browser opens on a task of its own (`accept_data_channels`,
 `crates/vendored/webrtc/src/sctp_transport/mod.rs:246`), and the loop's body awaits the agent's
-`on_data_channel` handler (`:335`), which awaits in turn (`agents/roomlerd/src/peer.rs:1260`).
+`on_data_channel` handler (`:335`), which awaits in turn (`agents/roomlerd/src/peer.rs:1269`).
 Upstream's stop woke that task with one `notify_waiters()`, which wakes only the waiters of that
 instant and stores nothing, and the loop made its next wait after the body. So a stop that came
 while the task was in its body was lost: the task waited for good, holding the association, the
@@ -428,17 +428,17 @@ CPUs, left a task.
 | `a_close_while_a_channel_is_being_accepted_leaves_nothing` (`peer_close_tests.rs:777`) | the viewer opens a second channel, and the agent's handler for it waits at a gate (`AcceptGate`, `:733`) while the agent's close (`peer_close::close`) runs to its end; then the gate opens, and nothing is left | `3 tasks alive after both closes, 1 before the peers`, in 12 runs of 12 |
 
 **The same loss one layer down (#4116).** Every data-channel read ends in the SCTP stream's
-`read_sctp` (`crates/vendored/webrtc-sctp/src/stream/mod.rs:186`). A stream is shut down two
-ways: by its own `shutdown`, which a channel's close runs (`:428`), and by the association's
+`read_sctp` (`crates/vendored/webrtc-sctp/src/stream/mod.rs:202`). A stream is shut down two
+ways: by its own `shutdown`, which a channel's close runs (`:444`), and by the association's
 `unregister_stream`, which its close runs for every stream
-(`src/association/association_internal.rs:364`). Each sets `read_shutdown` and then wakes
+(`src/association/association_internal.rs:390`). Each sets `read_shutdown` and then wakes
 the reads of that instant with one `notify_waiters()`, and only the first one wakes anything.
 Upstream's read checked the flag and the queue, and made its wait only once it had found
 nothing to read. So a shutdown that landed between the check and the wait was lost. The read
 waited for good, and the channel's read loop with it, holding the channel, its stream and the
 handlers the agent set on it (`crates/vendored/webrtc/src/data_channel/mod.rs:310-317`).
 This is the second site of the class, after the accept loop above. The read now makes its
-wait and registers it (`Notified::enable`, `stream/mod.rs:202-203`) before it checks
+wait and registers it (`Notified::enable`, `stream/mod.rs:218-219`) before it checks
 anything: a shutdown after that wakes it, and the check sees one from before. A chunk still wakes a read with
 `notify_one()`, which stores a permit when no read waits. One that reaches a read that then
 finds data anyway is not lost either: as the read's unused wait drops, tokio hands the wake-up
@@ -449,7 +449,7 @@ The channel's read loop has the accept loop's shape too: `close()` wakes it with
 the agent's message handler has run (`:366-373`), so a close during the handler is lost to
 it. It is left as it is, because that wake is no longer its only stop. The same `close()`
 then shuts the channel's stream (`:455`), which sets `read_shutdown` before its first await
-(`stream/mod.rs:438`). The loop ends through its end-of-stream arm
+(`stream/mod.rs:454`). The loop ends through its end-of-stream arm
 (`data_channel/mod.rs:326`), since the flag stays set and the read now sees it whenever it
 was set. That arm also runs the channel's `on_close` handler, as it did whenever the read
 ended the loop. A close that comes before the channel is stored shuts nothing: the accept
@@ -472,8 +472,8 @@ RTP sender's `stop()` sets its flag and wakes with one `notify_waiters()`
 (`crates/vendored/webrtc/src/rtp_transceiver/rtp_sender/mod.rs:565-566`). Its RTCP `read`
 never reads the flag, and it makes its second wait after an await (`:593-611`), so a stop
 before the call, or between its two waits, is lost to that read. The agent's RTCP reader
-calls `read_rtcp`, which wraps it, in a loop (`agents/roomlerd/src/peer.rs:792`), but the
-agent's close aborts that task before it closes the peer (`stop_serving`, `:1952-1954`). Once
+calls `read_rtcp`, which wraps it, in a loop (`agents/roomlerd/src/peer.rs:795`), but the
+agent's close aborts that task before it closes the peer (`stop_serving`, `:1980-1982`). Once
 the sender has sent, the read also ends when `stop()` closes the sender's SRTCP stream
 (`crates/vendored/webrtc/src/rtp_transceiver/srtp_writer_future.rs:164-179`). That close ends in webrtc-util's `Buffer::close`, which has
 the same shape: its read checks the flag, lets its lock go, and only then makes its wait
@@ -537,7 +537,7 @@ by reading the code. A lab guest then showed it on 0.4.221 and not on 0.4.222
 the crate.
 
 Every data-channel send ends in `Stream::write_sctp`
-(`crates/vendored/webrtc-sctp/src/stream/mod.rs:308`), which can wait twice before its
+(`crates/vendored/webrtc-sctp/src/stream/mod.rs:324`), which can wait twice before its
 chunks are queued: for the pending queue's lock, and for room in the queue (128 KiB, shared
 by every stream of the association). Upstream spent the write's stream sequence number (SSN)
 and added its bytes to `buffered_amount` in `packetize`, **before** those waits. A caller that
@@ -573,7 +573,7 @@ sequenceDiagram
 ```
 
 The agent drops send futures on purpose. On the control channel, `send_control_notice`
-(`agents/roomlerd/src/peer.rs:6187`) bounds each attempt with a timeout and retries, and the
+(`agents/roomlerd/src/peer.rs:6231`) bounds each attempt with a timeout and retries, and the
 idle warning (`agents/roomlerd/src/session_idle.rs:465`) and the session's `rc:ended`
 (`agents/roomlerd/src/session_table.rs:362`) each have a 2 s budget. Other sends race the
 session's end in a `select!` or die with an aborted pump. A tunnel flow's cancel cuts its
@@ -588,12 +588,12 @@ the fix is there and no caller changed:
 
 | Where | Change | Anchor |
 |---|---|---|
-| `stream/mod.rs` | `packetize` only reads the SSN. `commit_write` spends it and adds the write's bytes to `buffered_amount`; the queue calls it once the first chunk has room. A write refused because the association is not established commits nothing either | `crates/vendored/webrtc-sctp/src/stream/mod.rs:379`, `:401`, `:540` |
-| `queue/pending_queue.rs` | `append` takes the queue's lock and the room, then commits and pushes, with no await between the two. The commit runs before the push, so an acknowledgement can never release bytes not yet counted | `crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:304`, `:327` |
-| `queue/pending_queue.rs` | a message of two thirds of the queue (87,381 bytes) or more is queued chunk by chunk. Once its first chunk is queued, it is begun: dropped before its last chunk, `BegunMessage` queues the rest at once, in place, under the lock it still holds, so the peer reads it whole and once. The rest's bytes are owed first (`overdraft`), then the free room pays what it can, and `pop` pays the remainder before it gives room again | `queue/pending_queue.rs:595`, `:603`, `:536` |
-| `queue/pending_queue.rs` | an append that must wait for room wakes the write loop first (`take_room`). The loop woke only after a whole append, so a message larger than the free room, on an association with nothing in flight, waited forever with its first chunks queued and never sent. That was a separate bug, which the same tests found | `queue/pending_queue.rs:339` |
+| `stream/mod.rs` | `packetize` only reads the SSN. `commit_write` spends it and adds the write's bytes to `buffered_amount`; the queue calls it once the first chunk has room. A write refused because the association is not established commits nothing either | `crates/vendored/webrtc-sctp/src/stream/mod.rs:395`, `:417`, `:556` |
+| `queue/pending_queue.rs` | `append` takes the queue's lock and the room, then commits and pushes, with no await between the two. The commit runs before the push, so an acknowledgement can never release bytes not yet counted | `crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:333`, `:356` |
+| `queue/pending_queue.rs` | a message of two thirds of the queue (87,381 bytes) or more is queued chunk by chunk. Once its first chunk is queued, it is begun: dropped before its last chunk, `BegunMessage` queues the rest at once, in place, under the lock it still holds, so the peer reads it whole and once. The rest's bytes are owed first (`overdraft`), then the free room pays what it can, and `pop` pays the remainder before it gives room again | `queue/pending_queue.rs:648`, `:656`, `:589` |
+| `queue/pending_queue.rs` | an append that must wait for room wakes the write loop first (`take_room`). The loop woke only after a whole append, so a message larger than the free room, on an association with nothing in flight, waited forever with its first chunks queued and never sent. That was a separate bug, which the same tests found | `queue/pending_queue.rs:368` |
 
-**What a cut write means now** (`write_sctp`'s doc comment, `stream/mod.rs:293`):
+**What a cut write means now** (`write_sctp`'s doc comment, `stream/mod.rs:309`):
 
 - dropped at any await before its first chunk is queued, a write leaves no trace: the SSN and
   `buffered_amount` are as if it had never been called, nothing of it is sent, and the next
@@ -605,9 +605,9 @@ the fix is there and no caller changed:
 ⚠️ **The product reaches only the first two.** The agent's associations keep the default
 maximum message size of 65,536 bytes: the vendored `webrtc` passes 0
 (`crates/vendored/webrtc/src/sctp_transport/mod.rs:177`), which means the default
-(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:105`,
-`association/mod.rs:65`), and `prepare_write` refuses a larger write before it waits
-(`stream/mod.rs:334`). So every agent and tunnel send is below the large threshold and is all
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:116`,
+`association/mod.rs:67`), and `prepare_write` refuses a larger write before it waits
+(`stream/mod.rs:350`). So every agent and tunnel send is below the large threshold and is all
 or nothing: a cut send was never sent. `send_control_notice`'s retry therefore sends its notice
 once, and a tunnel write (at most 65,535 bytes, `crates/tunnel-core/src/forward.rs:68`) is the
 same. The begun-message path and its overdraft are reached only by the tests. The drop records
@@ -642,7 +642,7 @@ crate's in-memory bridge, with a queue of a few KiB, and close the pair at the e
 | `test_pending_queue_pops_during_a_drop_pay_its_debt_first` (`:750`) | a stand-in for the write loop on another thread pops 0 to 3 whole chunks at each step of a begun message's drop, every one after the debt was recorded: those pops pay the debt before they give room, so none of their room is left free while anything is owed, the accounting holds, and the rest goes out whole, in order | uses the fix's accessors |
 | `test_pending_queue_a_pop_split_around_a_drop_frees_at_most_its_chunk` (`:820`) | the race that is left: a `pop` on another thread, held between what it pays and the room it gives back while a drop records its debt and reads the room, leaves at most its own chunk free while the rest is owed; a large message that begins on it and is cut adds one rest, within (1 + races) times the largest message; every later `pop` pays first; the queue drains whole, in order, to rest | uses the fix's accessors |
 
-**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:3147`), which is not
+**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:3164`), which is not
 yet one of the checks the `rust` aggregator needs. The fork is not a workspace member, so no
 other `cargo test` builds it. The job seeds the fork's standalone build with the workspace's
 `Cargo.lock`, so the tests run against the tokio the agent ships, and skips the two
@@ -657,6 +657,10 @@ rm crates/vendored/webrtc-sctp/Cargo.lock   # before a revendor --regen or --che
 
 The fork's deltas, #3755's among them, are listed in its `Cargo.toml` header, and
 `crates/vendored/webrtc-sctp.patch` is the ledger `scripts/revendor-webrtc-sctp.sh` checks.
+The newest is FR-148's pacer (`association/pacer.rs`), which holds new data to a rate only
+while a writer has it on. Nothing in the product turns it on yet: only the open-time train's
+cells do (`docs/rate-control.md` § The open-time train). Off, it keeps no state and arms no
+timer, so a tunnel's association sends as it did.
 
 #### What the lab showed (#3755)
 
@@ -673,21 +677,21 @@ writer busy. The rule was written before the counted runs, and it and every run 
 | 0.4.222, three runs | 6.4 s | 661,403 to 666,457 B | 4.6 to 4.9 s after the lock, 0.5 to 0.9 s after the cut's end | every later lock and unlock shows within 2 s, on one stream from start to end |
 
 **What a person saw on 0.4.221 was a reconnect, not a chip that stays wrong.** The lock
-notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10701`) was lost, and nothing the agent
+notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10712`) was lost, and nothing the agent
 sent on the control channel after it was read. On this guest a locked session sends no video.
 The viewer's media watchdog spares only an agent that said it cannot capture or that it waits
-(`ui/src/composables/useRemoteControl.ts:5819`), and no such word could arrive. So it asked
-for a keyframe 6 s after the last picture and built a new connection at 10 s (`:320-322`,
-`:681-683`): 15.5 s after the lock. The new connection showed "Host locked".
+(`ui/src/composables/useRemoteControl.ts:5844`), and no such word could arrive. So it asked
+for a keyframe 6 s after the last picture and built a new connection at 10 s (`:321-323`,
+`:682-684`): 15.5 s after the lock. The new connection showed "Host locked".
 
 **The defect needs three things at once**, which is why it was rare, and why a one-way test
 never shows it:
 
 | Condition | Why | Anchor |
 |---|---|---|
-| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4246`, `:5199`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2466` |
-| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7251`, `:2206`, `agents/roomlerd/src/peer.rs:11330`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
-| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1507`, `:6187`, `agents/roomlerd/src/lock_state.rs:333` |
+| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4277`, `:5241`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2621` |
+| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7279`, `:2207`, `agents/roomlerd/src/peer.rs:11343`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
+| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1534`, `:6231`, `agents/roomlerd/src/lock_state.rs:333` |
 
 A real path failure cuts both directions. The second row is read from the source: two runs on
 0.4.221 with only the agent's outgoing packets cut, and a waiting writer, delivered every
@@ -979,19 +983,19 @@ sequenceDiagram
     S->>C: relayed
 ```
 
-The channel (`signaling.rs:800`) has the #1754 reap channel's shape: created in
+The channel (`signaling.rs:810`) has the #1754 reap channel's shape: created in
 `signaling::run` **per org loop** — a process-global sender would land a secondary
 org's peer in the primary's maps — borrowed into every `connect_once`, a sender
 retained for the loop's life so the receiver never closes. The in-flight
 bookkeeping is `PendingQuicSetups` (`agents/roomlerd/src/tunnel/quic_setup.rs`),
-fresh per connection (`signaling.rs:1707`) like the session maps, and free of I/O
+fresh per connection (`agents/roomlerd/src/signaling.rs:2231`) like the session maps, and free of I/O
 so tests drive it directly:
 
 | While a setup is in flight… | Rule | Where |
 |---|---|---|
-| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `signaling.rs:4250`, `quic_setup.rs:243` |
-| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `signaling.rs:5540`, `quic_setup.rs:258` |
-| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `signaling.rs:3064` |
+| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5571-5579`, `quic_setup.rs:243` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5610`, `quic_setup.rs:258` |
+| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `agents/roomlerd/src/signaling.rs:3123` |
 | a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
 | more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
 | the control WS ends | the entry map dies with the connection (one log line names how many were in flight); the results reach the next connection and are closed there. The #1754 teardown and R3 parking of the **maps** are unchanged | `quic_setup.rs:335` |
@@ -1249,7 +1253,7 @@ Locked by lib tests, each shown red with a one-line negative control:
    ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
    The forward itself reads no permission bit: the policy is the grant, made to let
    people who hold no management bit reach what a holder named them for
-   (`crates/modules/network/src/tunnel.rs:1114`). Every decision lands in
+   (`crates/modules/network/src/tunnel.rs:1115`). Every decision lands in
    `tunnel_audit` (90 d). A device the org
    removed is refused as a target while it is removed; if its machine enrolls
    again, the device is taken out of every live policy's subjects and targets
@@ -1261,7 +1265,7 @@ Locked by lib tests, each shown red with a one-line negative control:
 ### Who a forward is matched as (#3635)
 
 A forward is matched in the org whose policies decide it, the target device's
-(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1108`); a forward from
+(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1109`); a forward from
 another org is refused `cross_tenant` whatever those policies say. In that org the
 originator is matched as the person it acts for, its `owner_user_id`:
 
@@ -1270,7 +1274,7 @@ originator is matched as the person it acts for, its `owner_user_id`:
 | A tunnel client: `roomler` on its own socket, with its tunnel-client credential | the person who enrolled it; for a paired client, whoever approved the pairing | a role that person holds in the org | `TunnelClientId` = this client; an `AgentId` never matches it | yes |
 | A device opening forwards over its own device socket: `forward --daemon`, a declared route, a supervised SOCKS5 listener ([tunnel-install.md](tunnel-install.md#declared-routes-daemon-supervised--p6)) | the device's owner, as read when the device's socket connected | a role the device's owner holds in the org | `AgentId` = this device; a `TunnelClientId` never matches it | yes |
 
-The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1000`),
+The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1001`),
 through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:757`),
 the same read every gate that matches a role makes
 ([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)):
@@ -1315,7 +1319,7 @@ flowchart TD
 | `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:398`) | a device forwards on its owner's role, and is refused once the owner left the org |
 | `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:455`) | a role of another org, and a role the org deleted, grant nothing here; the rule naming the other org's role is a stored one, because a policy write takes only the org's roles |
 | `…::the_other_subject_kinds_forward_as_before` (`:539`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
-| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2188`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
+| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2190`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
 
 ### A retired agent-session grant is refused (FR-137)
 
@@ -1329,7 +1333,7 @@ reach whatever the device may reach. So:
   (`crates/remote_control/src/signaling.rs:1363`), and no build sends it;
 - the server refuses any open that carries one, at step 3c
   (`crates/modules/network/src/tunnel.rs:698`), before a tunnel session exists
-  (step 4, `:780`), with `rc:error {code: net_grant_refused}`
+  (step 4, `:781`), with `rc:error {code: net_grant_refused}`
   (`NET_GRANT_REFUSED`, `signaling.rs:102`). An old device reads that code as the
   end of its grant, never as a reason to retry.
 
@@ -1419,6 +1423,7 @@ to a running `roomlerd` without any token:
 | `ConfigGet` · `ConfigSet` | The config surface, grouped (FR-84 D2) |
 | `RestartDaemon` | "Apply now" — restart only under a proven supervisor (FR-84 D3) |
 | `EncoderCaps` · `Devices` · `Mesh` | What the companion's Overview and Devices pages show (FR-84 D4, D5) |
+| `LiveWork` · `AskForUpdate` | A Mac's update gate (FR-151). `{"t":"live_work"}` answers `{"t":"live_work","d":{…}}`: what an install that restarts this daemon would cut (`rc_sessions`, `ssh_connections`, `exec_runs`, `work` for transfers and recordings, `net_transition`) and `ask_age_secs`, the age of the newest update ask it recorded. The root update helper reads it from both halves before it installs. `{"t":"ask_for_update"}` records the person's own ask ("Apply update", a `roomlerd self-update` run as the person) and answers `{"t":"update_ask_recorded"}`; a daemon that runs as root refuses it. Neither is served on the person socket (`crates/localapi/src/lib.rs:1870`, `:1878`; `person_may`, `:3811`; [installation.md](installation.md#macos-the-root-update-helpers-gate-fr-151)) |
 
 ⚠️ **On Windows the pipe keeps a pool of listening instances** (`localapi_pipe_pool`,
 default 4; `1` is the pre-FR-84 single instance). With one instance, a client that

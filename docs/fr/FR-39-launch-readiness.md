@@ -2,6 +2,8 @@
 
 > **CLOSED 2026-09-01** — issue #951 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
+**Anchors:** master `b46d6cab3` (closed 2026-09-01): this spec is the record of the work, and its line anchors read at that commit.
+
 Status: **P1–P6 implemented; field-verification pending** (2026-08-29). Tracking issue: `FR-39` (#951).
 Spec on master up front; the work is known and mostly mechanical.
 
@@ -69,7 +71,7 @@ account** — so that interest which does not convert immediately is not lost pe
 
 5. **Email capture** — new `subscribers` collection + three public routes, mirroring the
    shape of the existing token-capability routes (`public_consent_routes`,
-   `crates/api/src/lib.rs:480`), which take no auth extractor because an unguessable token
+   `crates/api/src/lib.rs:463` (2026-08-29, at `fc10ca200`)), which take no auth extractor because an unguessable token
    *is* the capability:
    - `POST /api/subscribe` — `{ email, source }`. **Always answers 202**, whether the
      address is new, already subscribed or malformed-but-plausible: a response that

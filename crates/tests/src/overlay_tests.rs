@@ -109,6 +109,7 @@ impl Ipam {
                 supports_org_relay: false,
                 advertised_routes: vec![],
                 route_offer_withheld: None,
+                exit_serves_v6: None,
             })
             .await
     }
@@ -830,6 +831,7 @@ async fn agent_delete_releases_the_overlay_node() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
@@ -918,6 +920,7 @@ async fn a_re_enrolled_removed_machine_gets_a_fresh_overlay_node() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
@@ -1039,6 +1042,7 @@ async fn tunnel_client_delete_releases_the_overlay_node() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
@@ -1380,6 +1384,7 @@ async fn agent_delete_does_not_release_a_tunnel_clients_node() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
@@ -1705,6 +1710,7 @@ async fn renumber_refuses_a_fleet_below_the_version_floor() {
             supports_org_relay: false,
             advertised_routes: vec![],
             route_offer_withheld: None,
+            exit_serves_v6: None,
         })
         .await
         .unwrap();
@@ -2619,4 +2625,907 @@ async fn flipping_multi_block_on_installs_the_position_guard() {
         still_twin.is_err(),
         "the guard still holds after the second boot"
     );
+}
+
+/// #3636 — the ids an overlay-ACL answer carries, and what saving one back
+/// stores: the overlay twin of `tunnel_tests::policy_ids_on_the_wire`.
+///
+/// Every answer that returns a rule (create, list, get, update) names a
+/// source's or a via node's id as the 24-hex string `docs/api.md` promises.
+/// The Overlay ACL tab names the node, user or role by it, and its editor sends
+/// it back on save; the answers carried bson's extended JSON `{"$oid": …}`
+/// before, so the tab fell back to a bare "Node", "User" or "Role". What a save
+/// stores and what the netmap compile reads are pinned here too: the fix is a
+/// projection at the route, and neither may move. The compile fails OPEN on a
+/// row it cannot read, so a stored shape that moved would switch an enforcing
+/// org's ACL off.
+mod overlay_policy_ids_on_the_wire {
+    use super::*;
+    use crate::fixtures::seed::SeededTenant;
+    use crate::tunnel_policy_permission_tests::call;
+    use bson::{RawDocumentBuf, spec::ElementType};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    /// `(kind, id)` of one source or via entry as a request names it and an
+    /// answer must carry it back; `None` for a catch-all.
+    type Entry = (&'static str, Option<String>);
+
+    /// One org with one of every kind an overlay rule names by id: a node of
+    /// the org's overlay network, the org's owner and a role of the org.
+    struct EveryKind {
+        seeded: SeededTenant,
+        node: String,
+        user: String,
+        role: String,
+    }
+
+    impl EveryKind {
+        fn tenant(&self, tail: &str) -> String {
+            format!("/api/tenant/{}{tail}", self.seeded.tenant_id)
+        }
+
+        fn token(&self) -> &str {
+            &self.seeded.admin.access_token
+        }
+
+        fn tid(&self) -> ObjectId {
+            tid(&self.seeded.tenant_id)
+        }
+
+        /// The sources a rule names by id, in the order an admin listed them.
+        fn id_sources(&self) -> Vec<Entry> {
+            vec![
+                ("node_id", Some(self.node.clone())),
+                ("user_id", Some(self.user.clone())),
+                ("role_id", Some(self.role.clone())),
+            ]
+        }
+
+        fn id_via(&self) -> Vec<Entry> {
+            vec![("node_id", Some(self.node.clone()))]
+        }
+    }
+
+    async fn every_kind(app: &TestApp, tag: &str) -> EveryKind {
+        let seeded = app.seed_tenant(tag).await;
+        let (status, role) = call(
+            app,
+            "POST",
+            &format!("/api/tenant/{}/role", seeded.tenant_id),
+            &seeded.admin.access_token,
+            Some(json!({ "name": "mesh operators", "permissions": 0 })),
+        )
+        .await;
+        assert_eq!(status, 200, "the owner makes a role: {role}");
+        let role = role["id"].as_str().expect("role id").to_string();
+        let ipam = Ipam::new(app, tid(&seeded.tenant_id)).await;
+        let node = ipam
+            .create_node(&format!("mach-{tag}"), "acl-node", "100.64.0.1")
+            .await
+            .expect("a node of the org's network");
+        let node = node.id.expect("node _id").to_hex();
+        let user = seeded.admin.id.clone();
+        EveryKind {
+            seeded,
+            node,
+            user,
+            role,
+        }
+    }
+
+    fn hex_id(id: &str) -> Value {
+        json!(id)
+    }
+
+    /// The form every answer carried before #3636, which a request still takes.
+    fn extended_json_id(id: &str) -> Value {
+        json!({ "$oid": id })
+    }
+
+    /// `want` as a request body names it: `{kind, id}`, the id written by
+    /// `id_form`; a catch-all as a bare `{kind}`.
+    fn entries(want: &[Entry], id_form: fn(&str) -> Value) -> Value {
+        Value::Array(
+            want.iter()
+                .map(|(kind, id)| match id {
+                    Some(id) => json!({ "kind": kind, "id": id_form(id) }),
+                    None => json!({ "kind": kind }),
+                })
+                .collect(),
+        )
+    }
+
+    /// A rule that reaches nothing: TEST-NET-1, port 9. The overlay's PUT
+    /// replaces the whole rule, so every body carries every field.
+    fn rule_body(name: &str, sources: Value, via: Value) -> Value {
+        json!({
+            "name": name,
+            "enabled": true,
+            "sources": sources,
+            "via": via,
+            "destinations": [{
+                "cidr": "192.0.2.1/32",
+                "port_range": { "low": 9, "high": 9 },
+                "proto": "tcp"
+            }],
+        })
+    }
+
+    /// The two rules the cells start from: one that names a node, a user and
+    /// a role (and the node as its via), and one with the two catch-alls.
+    /// Their ids, in that order.
+    async fn create_both(app: &TestApp, k: &EveryKind) -> (String, String) {
+        let mut ids = Vec::new();
+        for body in [
+            rule_body(
+                "names every kind",
+                entries(&k.id_sources(), hex_id),
+                entries(&k.id_via(), hex_id),
+            ),
+            rule_body(
+                "catch-alls",
+                json!([{ "kind": "all_nodes" }]),
+                json!([{ "kind": "all_nodes" }]),
+            ),
+        ] {
+            let (status, created) = call(
+                app,
+                "POST",
+                &k.tenant("/overlay-acl"),
+                k.token(),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, 200, "create: {created}");
+            ids.push(created["id"].as_str().expect("rule id").to_string());
+        }
+        (ids[0].clone(), ids[1].clone())
+    }
+
+    fn is_hex24(s: &str) -> bool {
+        s.len() == 24 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// What is wrong with an answer's `sources` or `via` as the browser reads
+    /// them, against `want`: an id must be the 24-hex string sent, a
+    /// catch-all is the single key `kind`, and nothing is lost, added or
+    /// reordered.
+    fn wire_problems(what: &str, entries: &Value, want: &[Entry]) -> Vec<String> {
+        let Some(got) = entries.as_array() else {
+            return vec![format!("{what}: not an array: {entries}")];
+        };
+        let mut wrong = Vec::new();
+        if got.len() != want.len() {
+            wrong.push(format!(
+                "{what}: {} entries, want {}: {entries}",
+                got.len(),
+                want.len()
+            ));
+        }
+        for (i, (entry, (kind, id))) in got.iter().zip(want).enumerate() {
+            let at = format!("{what}[{i}] ({kind})");
+            if entry["kind"] != *kind {
+                wrong.push(format!("{at}: the kind is {}", entry["kind"]));
+            }
+            let keys = entry.as_object().map_or(0, |o| o.len());
+            match id {
+                None if keys != 1 => wrong.push(format!(
+                    "{at}: a catch-all is the single key `kind`: {entry}"
+                )),
+                None => {}
+                Some(id) => match entry["id"].as_str() {
+                    None => wrong.push(format!("{at}: the id is not a string: {entry}")),
+                    Some(s) if !is_hex24(s) => {
+                        wrong.push(format!("{at}: the id is not 24 lowercase hex: {s}"))
+                    }
+                    Some(s) if s != id => {
+                        wrong.push(format!("{at}: the id {s} is not the one sent, {id}"))
+                    }
+                    Some(_) if keys != 2 => {
+                        wrong.push(format!("{at}: `kind` and `id` only: {entry}"))
+                    }
+                    Some(_) => {}
+                },
+            }
+        }
+        wrong
+    }
+
+    /// Every problem with one rule answer: its sources, its via nodes, and
+    /// any `$oid` text anywhere in it.
+    fn answer_problems(
+        what: &str,
+        answer: &Value,
+        sources: &[Entry],
+        via: &[Entry],
+    ) -> Vec<String> {
+        let mut wrong = wire_problems(&format!("{what}: sources"), &answer["sources"], sources);
+        wrong.extend(wire_problems(&format!("{what}: via"), &answer["via"], via));
+        if answer.to_string().contains("$oid") {
+            wrong.push(format!("{what}: the answer carries `$oid`: {answer}"));
+        }
+        wrong
+    }
+
+    /// GET rule `pid` and PUT it back exactly as the answer carried it, as
+    /// the web app's editor does when it saves: name, enabled, sources, via
+    /// and destinations, since the overlay's PUT takes the whole rule.
+    async fn echo_rule(app: &TestApp, k: &EveryKind, pid: &str) {
+        let one = k.tenant(&format!("/overlay-acl/{pid}"));
+        let (status, got) = call(app, "GET", &one, k.token(), None).await;
+        assert_eq!(status, 200, "GET {pid}: {got}");
+        let echo = json!({
+            "name": got["name"].clone(),
+            "enabled": got["enabled"].clone(),
+            "sources": got["sources"].clone(),
+            "via": got["via"].clone(),
+            "destinations": got["destinations"].clone(),
+        });
+        let (status, saved) = call(app, "PUT", &one, k.token(), Some(echo)).await;
+        assert_eq!(status, 200, "the echo of {pid} is accepted: {saved}");
+    }
+
+    /// Rule `pid` as Mongo holds it, raw.
+    async fn stored_rule(app: &TestApp, pid: &str) -> RawDocumentBuf {
+        app.db
+            .collection::<RawDocumentBuf>("overlay_policies")
+            .find_one(doc! { "_id": tid(pid) })
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("rule {pid} is stored"))
+    }
+
+    async fn rule_count(app: &TestApp, tenant: ObjectId) -> u64 {
+        app.db
+            .collection::<bson::Document>("overlay_policies")
+            .count_documents(doc! { "tenant_id": tenant })
+            .await
+            .unwrap()
+    }
+
+    /// What differs between two stored rows' `sources`, `via` and
+    /// `destinations`, byte for byte and `Bson` for `Bson`, and every id
+    /// element of `after` that is not an ObjectId. `ids` is how many id
+    /// elements `after` must hold, so the check cannot pass over an empty list.
+    fn stored_problems(
+        what: &str,
+        before: &RawDocumentBuf,
+        after: &RawDocumentBuf,
+        ids: usize,
+    ) -> Vec<String> {
+        let mut wrong = Vec::new();
+        let (b, a) = (before.to_document().unwrap(), after.to_document().unwrap());
+        let mut seen = 0;
+        for field in ["sources", "via", "destinations"] {
+            let (raw_b, raw_a) = (
+                before.get_array(field).unwrap(),
+                after.get_array(field).unwrap(),
+            );
+            if raw_b.as_bytes() != raw_a.as_bytes() {
+                wrong.push(format!("{what}: {field}: the stored bytes changed"));
+            }
+            if b.get(field) != a.get(field) {
+                wrong.push(format!(
+                    "{what}: {field}: was {:?}, is {:?}",
+                    b.get(field),
+                    a.get(field)
+                ));
+            }
+            for entry in a.get_array(field).unwrap() {
+                let Some(id) = entry.as_document().and_then(|e| e.get("id")) else {
+                    continue;
+                };
+                seen += 1;
+                if id.element_type() != ElementType::ObjectId {
+                    wrong.push(format!(
+                        "{what}: {field}: an id is stored as {:?}: {entry}",
+                        id.element_type()
+                    ));
+                }
+            }
+        }
+        if seen != ids {
+            wrong.push(format!("{what}: {seen} id elements stored, want {ids}"));
+        }
+        wrong
+    }
+
+    /// The typed rules the netmap compile reads for the org, keyed by id,
+    /// each as a document without `updated_at`: the compile's only input
+    /// (`try_load_acl` reads `list_active_for_tenant`,
+    /// `crates/modules/network/src/overlay.rs`).
+    async fn compile_input(app: &TestApp, tenant: ObjectId) -> BTreeMap<String, bson::Document> {
+        let rules = app
+            .state
+            .network()
+            .overlay_policies
+            .list_active_for_tenant(tenant)
+            .await
+            .unwrap();
+        rules
+            .iter()
+            .map(|p| {
+                let mut d = bson::to_document(p).unwrap();
+                d.remove("updated_at");
+                (p.id.expect("a stored rule has an id").to_hex(), d)
+            })
+            .collect()
+    }
+
+    /// Create, list, get and update each answer a rule's ids as the 24-hex
+    /// strings sent, and a catch-all as a bare `{"kind"}`.
+    #[tokio::test]
+    async fn every_overlay_acl_answer_names_its_ids_as_hex_strings() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "ovpol-wire").await;
+        let named = (k.id_sources(), k.id_via());
+        let catch_alls: (Vec<Entry>, Vec<Entry>) =
+            (vec![("all_nodes", None)], vec![("all_nodes", None)]);
+        let mut wrong = Vec::new();
+
+        let mut ids = Vec::new();
+        for (what, want) in [("create", &named), ("create (catch-alls)", &catch_alls)] {
+            let body = rule_body(what, entries(&want.0, hex_id), entries(&want.1, hex_id));
+            let (status, created) = call(
+                &app,
+                "POST",
+                &k.tenant("/overlay-acl"),
+                k.token(),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, 200, "{what}: {created}");
+            wrong.extend(answer_problems(what, &created, &want.0, &want.1));
+            ids.push(created["id"].as_str().expect("rule id").to_string());
+        }
+
+        let (status, list) = call(&app, "GET", &k.tenant("/overlay-acl"), k.token(), None).await;
+        assert_eq!(status, 200, "list: {list}");
+        let items = list["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2, "both rules, on one page: {list}");
+        for (id, what, want) in [
+            (&ids[0], "list", &named),
+            (&ids[1], "list (catch-alls)", &catch_alls),
+        ] {
+            let item = items
+                .iter()
+                .find(|p| p["id"] == id.as_str())
+                .unwrap_or_else(|| panic!("{what}: {id} is listed: {list}"));
+            wrong.extend(answer_problems(what, item, &want.0, &want.1));
+        }
+
+        for (id, what, want) in [
+            (&ids[0], "", &named),
+            (&ids[1], " (catch-alls)", &catch_alls),
+        ] {
+            let one = k.tenant(&format!("/overlay-acl/{id}"));
+            let (status, got) = call(&app, "GET", &one, k.token(), None).await;
+            assert_eq!(status, 200, "get{what}: {got}");
+            wrong.extend(answer_problems(
+                &format!("get{what}"),
+                &got,
+                &want.0,
+                &want.1,
+            ));
+            let rename = rule_body(
+                &format!("renamed{what}"),
+                entries(&want.0, hex_id),
+                entries(&want.1, hex_id),
+            );
+            let (status, renamed) = call(&app, "PUT", &one, k.token(), Some(rename)).await;
+            assert_eq!(status, 200, "update{what}: {renamed}");
+            wrong.extend(answer_problems(
+                &format!("update{what}"),
+                &renamed,
+                &want.0,
+                &want.1,
+            ));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// What the editor saves is what the server answered. An echo of a rule
+    /// (its ids objects before the fix, strings after it) stores the bytes
+    /// that were stored, every id still an ObjectId element. A source lost,
+    /// reordered or re-typed on the way out would be revoked or broken by the
+    /// next save.
+    #[tokio::test]
+    async fn an_echoed_overlay_acl_rule_stores_the_bytes_it_stored() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "ovpol-echo").await;
+        let (named, catch_alls) = create_both(&app, &k).await;
+        let mut wrong = Vec::new();
+        for (pid, ids) in [(&named, 4), (&catch_alls, 0)] {
+            let before = stored_rule(&app, pid).await;
+            echo_rule(&app, &k, pid).await;
+            let after = stored_rule(&app, pid).await;
+            wrong.extend(stored_problems(pid, &before, &after, ids));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A request names an id as the bare hex or as the `{"$oid": …}` map the
+    /// answers carried before #3636, on create and on update, and both store
+    /// the same ObjectId elements: a page loaded before the fix still saves
+    /// what it shows.
+    #[tokio::test]
+    async fn an_overlay_acl_request_takes_a_hex_id_and_an_extended_json_id_alike() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "ovpol-forms").await;
+        let mut rows = Vec::new();
+        for (form, id_form) in [
+            ("hex", hex_id as fn(&str) -> Value),
+            ("$oid", extended_json_id),
+        ] {
+            let body = rule_body(
+                form,
+                entries(&k.id_sources(), id_form),
+                entries(&k.id_via(), id_form),
+            );
+            let (status, created) = call(
+                &app,
+                "POST",
+                &k.tenant("/overlay-acl"),
+                k.token(),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, 200, "create, ids as {form}: {created}");
+            let pid = created["id"].as_str().expect("rule id").to_string();
+            rows.push((pid.clone(), stored_rule(&app, &pid).await));
+        }
+        let mut wrong = stored_problems("create, hex vs $oid", &rows[0].1, &rows[1].1, 4);
+
+        let (pid, before) = &rows[0];
+        let update = rule_body(
+            "hex",
+            entries(&k.id_sources(), extended_json_id),
+            entries(&k.id_via(), extended_json_id),
+        );
+        let one = k.tenant(&format!("/overlay-acl/{pid}"));
+        let (status, saved) = call(&app, "PUT", &one, k.token(), Some(update)).await;
+        assert_eq!(status, 200, "update, ids as $oid: {saved}");
+        let after = stored_rule(&app, pid).await;
+        wrong.extend(stored_problems("update, ids as $oid", before, &after, 4));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A functional control on the request side: an id that is not one, the
+    /// text `"x"` or the number `42`, is refused on create and on update, and
+    /// nothing is stored. The status is printed for the record.
+    #[tokio::test]
+    async fn an_overlay_acl_request_with_a_malformed_id_is_refused_and_stores_nothing() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "ovpol-malformed").await;
+        let (named, _) = create_both(&app, &k).await;
+        let one = k.tenant(&format!("/overlay-acl/{named}"));
+        for bad in [json!("x"), json!(42)] {
+            let count = rule_count(&app, k.tid()).await;
+            let body = rule_body(
+                "malformed",
+                json!([{ "kind": "user_id", "id": bad }]),
+                json!([{ "kind": "all_nodes" }]),
+            );
+            let (status, answer) = call(
+                &app,
+                "POST",
+                &k.tenant("/overlay-acl"),
+                k.token(),
+                Some(body),
+            )
+            .await;
+            eprintln!("#3636 overlay, a malformed id {bad}: create answered {status}");
+            assert!(
+                status == 400 || status == 422,
+                "create with the id {bad} is refused: {status} {answer}"
+            );
+            assert_eq!(
+                rule_count(&app, k.tid()).await,
+                count,
+                "create with the id {bad} stores nothing"
+            );
+
+            let before = stored_rule(&app, &named).await;
+            let body = rule_body(
+                "malformed",
+                entries(&k.id_sources(), hex_id),
+                json!([{ "kind": "node_id", "id": bad }]),
+            );
+            let (status, answer) = call(&app, "PUT", &one, k.token(), Some(body)).await;
+            eprintln!("#3636 overlay, a malformed id {bad}: update answered {status}");
+            assert!(
+                status == 400 || status == 422,
+                "update with the id {bad} is refused: {status} {answer}"
+            );
+            assert_eq!(
+                stored_rule(&app, &named).await.as_bytes(),
+                before.as_bytes(),
+                "update with the id {bad} changes nothing"
+            );
+        }
+    }
+
+    /// The netmap compile's only input is the typed rows
+    /// `list_active_for_tenant` reads. An echo leaves every field of them as
+    /// it was, `updated_at` aside, so every node's netmap is shaped as it was.
+    #[tokio::test]
+    async fn an_echoed_overlay_acl_rule_compiles_as_it_did() {
+        let app = TestApp::spawn().await;
+        let k = every_kind(&app, "ovpol-gate").await;
+        let (named, catch_alls) = create_both(&app, &k).await;
+        let before = compile_input(&app, k.tid()).await;
+        assert_eq!(before.len(), 2, "both rules compile: {before:?}");
+        echo_rule(&app, &k, &named).await;
+        echo_rule(&app, &k, &catch_alls).await;
+        assert_eq!(
+            compile_input(&app, k.tid()).await,
+            before,
+            "what the netmap compile reads"
+        );
+    }
+}
+
+/// #4187 — the overlay ACL's writes decide `MANAGE_AGENTS` before they read
+/// their body, as the tunnel-policy routes beside them do
+/// (`tunnel_policy_permission_tests`): create, update and the posture switch
+/// (`PUT …/overlay-acl/mode`). A member without the bit gets the one 403
+/// `forbidden` for a body that does not even parse, someone outside the org
+/// the one `not_a_member`, and a holder is still answered such a body exactly
+/// as axum's `Json` extractor answers it.
+mod overlay_acl_decides_the_bit_before_the_body {
+    use super::*;
+    use crate::fixtures::seed::SeededTenant;
+    use crate::tunnel_policy_permission_tests::{
+        call, call_raw, extractor_answer, holder_answer_problem, refusal_problem, unparsed_bodies,
+    };
+    use roomler_ai_mod_network::routes::overlay_policy::{
+        SetAclModeRequest, UpsertOverlayPolicyRequest,
+    };
+
+    fn acl(seeded: &SeededTenant, tail: &str) -> String {
+        format!("/api/tenant/{}/overlay-acl{tail}", seeded.tenant_id)
+    }
+
+    /// The owner writes a rule; returns its id.
+    async fn owner_creates(app: &TestApp, seeded: &SeededTenant) -> String {
+        let (s, created) = call(
+            app,
+            "POST",
+            &acl(seeded, ""),
+            &seeded.admin.access_token,
+            Some(acl_body("the owner's own rule", true)),
+        )
+        .await;
+        assert_eq!(s, 200, "the owner writes a rule: {created}");
+        created["id"].as_str().expect("rule id").to_string()
+    }
+
+    /// The three writes, each with a field its own body's type refuses. The
+    /// mode is an enum, so it takes an unknown variant: `{"mode": 7}` is a
+    /// syntax error to serde_json (400), not the 422 kind.
+    fn writes(seeded: &SeededTenant, rule: &str) -> [(&'static str, String, &'static str); 3] {
+        [
+            ("POST", acl(seeded, ""), r#"{"name": 7}"#),
+            ("PUT", acl(seeded, &format!("/{rule}")), r#"{"name": 7}"#),
+            ("PUT", acl(seeded, "/mode"), r#"{"mode": "loud"}"#),
+        ]
+    }
+
+    /// While the three took `Json<T>` as an extractor, axum answered a body
+    /// that does not parse before the handler ran, with a 400, 415 or 422
+    /// decided by the body alone, and the permission was never asked.
+    #[tokio::test]
+    async fn the_bit_is_decided_before_a_body_that_does_not_parse() {
+        let app = TestApp::spawn().await;
+        let seeded = app.seed_tenant("ovacl-unparsed").await;
+        let other = app.seed_tenant("ovacl-unparsed-b").await;
+        let rule = owner_creates(&app, &seeded).await;
+        let callers = [
+            (
+                "a member without the bit",
+                &seeded.member.access_token,
+                "forbidden",
+            ),
+            (
+                "another org's owner",
+                &other.admin.access_token,
+                "not_a_member",
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (who, token, want) in callers {
+            for (method, path, refused_field) in writes(&seeded, &rule) {
+                for b in unparsed_bodies(refused_field) {
+                    let (s, _, text) =
+                        call_raw(&app, method, &path, token, b.content_type, b.body).await;
+                    if let Some(why) = refusal_problem(want, s, &text) {
+                        wrong.push(format!(
+                            "{who}: {method} {path} {} ({:?} as {}): {why}",
+                            b.what, b.body, b.content_type
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} answers came before the gate:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// The control: a holder's answer to such a body is the extractor's own,
+    /// the status and the plain-text words both, and nothing is written.
+    #[tokio::test]
+    async fn a_holder_is_answered_a_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+        let app = TestApp::spawn().await;
+        let seeded = app.seed_tenant("ovacl-unparsed-holder").await;
+        let rule = owner_creates(&app, &seeded).await;
+        let owner = &seeded.admin.access_token;
+
+        let mut wrong = Vec::new();
+        for (method, path, refused_field) in writes(&seeded, &rule) {
+            for b in unparsed_bodies(refused_field) {
+                let want = if path.ends_with("/mode") {
+                    extractor_answer::<SetAclModeRequest>(b.content_type, b.body).await
+                } else {
+                    extractor_answer::<UpsertOverlayPolicyRequest>(b.content_type, b.body).await
+                };
+                let (s, answered_as, text) =
+                    call_raw(&app, method, &path, owner, b.content_type, b.body).await;
+                let answer = (s, answered_as.as_str(), text.as_str());
+                if let Some(why) = holder_answer_problem(&b, &want, answer) {
+                    wrong.push(format!("{method} {path} {}: {why}", b.what));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+        // Nothing was written: the one rule, as the owner wrote it, and the
+        // posture as it was.
+        let (s, list) = call(&app, "GET", &acl(&seeded, ""), owner, None).await;
+        assert_eq!(s, 200, "{list}");
+        assert_eq!(list["total"], 1, "{list}");
+        assert_eq!(list["items"][0]["id"], rule.as_str(), "{list}");
+        assert_eq!(list["items"][0]["name"], "the owner's own rule", "{list}");
+        assert_eq!(list["mode"], "off", "{list}");
+    }
+}
+
+/// #4218 — the overlay's other gated writes decide their gate before they
+/// read their body, as the ACL's do (`overlay_acl_decides_the_bit_before_the_body`):
+/// a route approval, an exit-node approval and a renumber decide
+/// `MANAGE_AGENTS` (a renumber lets a platform operator through as well), and
+/// the block reclaim, the host reconcile and the orphan sweep are a platform
+/// operator's, answered 404 to anyone else so the route stays unseen. A caller
+/// a gate refuses gets that refusal for a body that does not even parse, the
+/// answer a body the route reads gets; a caller it lets through is still
+/// answered such a body as axum's `Json` extractor answers it.
+mod overlay_writes_decide_the_gate_before_the_body {
+    use super::*;
+    use crate::fixtures::seed::SeededTenant;
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems, holder_problems,
+    };
+    use roomler_ai_mod_network::routes::overlay_block::{
+        OrphanRequest, ReclaimRequest, ReconcileHostsRequest, RenumberRequest,
+    };
+    use roomler_ai_mod_network::routes::overlay_route::{
+        SetApprovedRoutesRequest, SetExitNodeRequest,
+    };
+    use serde_json::json;
+
+    const RECLAIM: &str = "/api/admin/overlay-block/reclaim";
+    const ORPHANS: &str = "/api/admin/overlay-network/orphans";
+
+    /// A server whose per-address rate limit is out of the way, with
+    /// `operator` on the platform-operator allowlist: each test sends more
+    /// requests than the default burst, and a 429 would read as an answer.
+    async fn spawn(operator: Option<ObjectId>) -> TestApp {
+        TestApp::spawn_with_settings(move |s| {
+            s.app.rate_limit_per_sec = 1_000;
+            s.app.rate_limit_burst = 10_000;
+            s.stats.platform_admins = operator.map(|o| o.to_hex());
+        })
+        .await
+    }
+
+    fn tenant(seeded: &SeededTenant, tail: &str) -> String {
+        format!("/api/tenant/{}{tail}", seeded.tenant_id)
+    }
+
+    /// A node id that names nothing, and one that is not an id at all: the
+    /// bit is decided before the id is parsed or looked up, and a holder is
+    /// answered a body that does not parse whatever the id is.
+    fn node_ids() -> [String; 2] {
+        [ObjectId::new().to_hex(), "not-an-id".to_string()]
+    }
+
+    /// The writes `MANAGE_AGENTS` decides.
+    fn bit_writes(seeded: &SeededTenant) -> Vec<GatedWrite> {
+        let mut writes = Vec::new();
+        for node in node_ids() {
+            writes.push(GatedWrite {
+                method: "PUT",
+                path: tenant(seeded, &format!("/overlay-node/{node}/approved-routes")),
+                reads: json!({ "approved_routes": [] }),
+                refused_field: r#"{"approved_routes": 7}"#,
+            });
+            writes.push(GatedWrite {
+                method: "PUT",
+                path: tenant(seeded, &format!("/overlay-node/{node}/exit-node")),
+                reads: json!({ "enabled": false }),
+                refused_field: r#"{"enabled": 7}"#,
+            });
+        }
+        writes.push(GatedWrite {
+            method: "POST",
+            path: tenant(seeded, "/overlay-block/renumber"),
+            reads: json!({}),
+            refused_field: r#"{"dry_run": 7}"#,
+        });
+        writes
+    }
+
+    /// A platform operator's writes, each a dry run unless asked otherwise.
+    fn operator_writes(seeded: &SeededTenant) -> [GatedWrite; 3] {
+        [
+            GatedWrite {
+                method: "POST",
+                path: RECLAIM.to_string(),
+                reads: json!({}),
+                refused_field: r#"{"dry_run": 7}"#,
+            },
+            GatedWrite {
+                method: "POST",
+                path: tenant(seeded, "/overlay-block/reconcile-hosts"),
+                reads: json!({}),
+                refused_field: r#"{"dry_run": 7}"#,
+            },
+            GatedWrite {
+                method: "POST",
+                path: ORPHANS.to_string(),
+                reads: json!({}),
+                refused_field: r#"{"dry_run": 7}"#,
+            },
+        ]
+    }
+
+    /// While these took `Json<T>` as an extractor, axum answered a body that
+    /// does not parse before the handler ran, with a 400, 415 or 422 decided
+    /// by the body alone: a member without the bit, or someone outside the
+    /// org, was told about their body instead of being refused, and on an
+    /// operator's route anyone was.
+    #[tokio::test]
+    async fn the_gate_is_decided_before_a_body_that_does_not_parse() {
+        let app = spawn(None).await;
+        let seeded = app.seed_tenant("ovgate-unparsed").await;
+        let other = app.seed_tenant("ovgate-unparsed-b").await;
+
+        let mut wrong = Vec::new();
+        for write in bit_writes(&seeded) {
+            let member = &seeded.member.access_token;
+            let bit = Gate::Bit("MANAGE_AGENTS");
+            wrong
+                .extend(gate_problems(&app, "a member without the bit", member, bit, &write).await);
+            let outsider = &other.admin.access_token;
+            wrong.extend(
+                gate_problems(
+                    &app,
+                    "another org's owner",
+                    outsider,
+                    Gate::NotAMember,
+                    &write,
+                )
+                .await,
+            );
+        }
+        // Not even the org's owner, who holds every bit of the org, is told
+        // anything on an operator's route.
+        for write in operator_writes(&seeded) {
+            for (who, token) in [
+                ("the org's owner", &seeded.admin.access_token),
+                ("a member", &seeded.member.access_token),
+            ] {
+                wrong.extend(gate_problems(&app, who, token, Gate::Unseen, &write).await);
+            }
+        }
+        assert_no_problems("answered before the gate", &wrong);
+    }
+
+    /// The control: a holder of the bit (the org's owner), and a platform
+    /// operator on the routes that let one through, are answered such a body
+    /// exactly as the extractor answers it, the status and the plain-text
+    /// words, whatever the node id is.
+    #[tokio::test]
+    async fn a_holder_is_answered_a_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+        let operator = ObjectId::new();
+        let app = spawn(Some(operator)).await;
+        let seeded = app.seed_tenant("ovgate-unparsed-holder").await;
+        let owner = &seeded.admin.access_token;
+        let op = app
+            .state
+            .auth
+            .generate_tokens(operator, "operator@ovgate.test", "ovgate_operator")
+            .unwrap()
+            .access_token;
+        let networks = OverlayNetworkDao::new(&app.db);
+        let before = networks
+            .get_or_create(tid(&seeded.tenant_id))
+            .await
+            .unwrap()
+            .cidr;
+
+        let mut wrong = Vec::new();
+        for node in node_ids() {
+            let routes = tenant(&seeded, &format!("/overlay-node/{node}/approved-routes"));
+            wrong.extend(
+                holder_problems::<SetApprovedRoutesRequest>(
+                    &app,
+                    owner,
+                    "PUT",
+                    &routes,
+                    r#"{"approved_routes": 7}"#,
+                )
+                .await,
+            );
+            let exit = tenant(&seeded, &format!("/overlay-node/{node}/exit-node"));
+            wrong.extend(
+                holder_problems::<SetExitNodeRequest>(
+                    &app,
+                    owner,
+                    "PUT",
+                    &exit,
+                    r#"{"enabled": 7}"#,
+                )
+                .await,
+            );
+        }
+        let renumber = tenant(&seeded, "/overlay-block/renumber");
+        for token in [owner, &op] {
+            wrong.extend(
+                holder_problems::<RenumberRequest>(
+                    &app,
+                    token,
+                    "POST",
+                    &renumber,
+                    r#"{"dry_run": 7}"#,
+                )
+                .await,
+            );
+        }
+        let reconcile = tenant(&seeded, "/overlay-block/reconcile-hosts");
+        wrong.extend(
+            holder_problems::<ReclaimRequest>(&app, &op, "POST", RECLAIM, r#"{"dry_run": 7}"#)
+                .await,
+        );
+        wrong.extend(
+            holder_problems::<ReconcileHostsRequest>(
+                &app,
+                &op,
+                "POST",
+                &reconcile,
+                r#"{"dry_run": 7}"#,
+            )
+            .await,
+        );
+        wrong.extend(
+            holder_problems::<OrphanRequest>(&app, &op, "POST", ORPHANS, r#"{"dry_run": 7}"#).await,
+        );
+        assert_no_problems("a caller the gate lets through", &wrong);
+
+        // Nothing was renumbered: the org's network is where it was.
+        let after = networks
+            .get_or_create(tid(&seeded.tenant_id))
+            .await
+            .unwrap()
+            .cidr;
+        assert_eq!(
+            after, before,
+            "a body that does not parse renumbers nothing"
+        );
+    }
 }

@@ -224,7 +224,7 @@
               </span>
               <span class="mx-1">·</span>
               <span :title="`machine_id: ${item.machine_id}`">{{ shortId(item.machine_id) }}</span>
-              <span v-if="item.version"> · v{{ item.version }}</span>
+              <span :title="versionTitle(item)"> · {{ versionLabel(item.version) }}</span>
               <!-- FR-27 — the companion's own version, and only when it
                    DISAGREES with the daemon's. Shown at all because the two
                    update by different mechanisms on every platform, so
@@ -589,7 +589,7 @@
                     <div v-if="!xs || isCardOpen(item)" class="text-caption text-medium-emphasis text-break">
                       <span v-if="secondaryDeviceName(item, hideNameWhenDisplay)">{{ item.name }} · </span>
                       <v-icon size="x-small" :icon="osIcon(item.os)" class="mr-1" />{{ item.os }}
-                      <span v-if="item.version"> · v{{ item.version }}</span>
+                      <span :title="versionTitle(item)"> · {{ versionLabel(item.version) }}</span>
                       <span :title="fmtDate(item.last_seen_at)"> · {{ fmtRelative(item.last_seen_at) }}</span>
                     </div>
                   </div>
@@ -1020,7 +1020,7 @@
             <strong>{{ nodeLabel(evictTarget) }}</strong> is still enrolled, so it
             rejoins automatically on its next connect — with a
             <strong>different</strong> overlay address. This does not revoke
-            access; to remove the device for good, delete the agent or tunnel
+            access; to remove the device for good, delete the device or tunnel
             client.
           </li>
           <li v-else>
@@ -1158,17 +1158,17 @@
   <v-dialog v-model="updateAllDialogOpen" max-width="480" scrollable :fullscreen="fullscreen">
     <v-card>
       <v-card-title class="d-flex align-center ga-2">
-        <span class="text-wrap" style="min-width: 0">Update all agents?</span>
+        <span class="text-wrap" style="min-width: 0">Update all devices?</span>
         <v-spacer />
         <v-btn icon="mdi-close" size="small" variant="text" aria-label="Close" @click="updateAllDialogOpen = false" />
       </v-card-title>
       <v-card-text>
-        Pushes an immediate self-update to every agent in this tenant
+        Pushes an immediate self-update to every device in this tenant
         ({{ agentStore.agents.length }} total,
         {{ agentStore.agents.filter((a) => a.is_online).length }} online).
-        Each agent downloads the latest release, installs it, and restarts —
-        active remote-control sessions on updating agents will drop for a few
-        seconds. Offline agents update on their next periodic check.
+        Each roomlerd downloads the latest release, installs it, and restarts —
+        active remote-control sessions on updating devices will drop for a few
+        seconds. Offline devices update on their next periodic check.
         <div v-if="wontUpdateHere.length > 0" class="mt-3">
           {{ wontUpdateHere.length }} will not take it from here:
           <ul class="ml-4">
@@ -1208,14 +1208,14 @@
             later be assigned to a <strong>different</strong> machine.
           </li>
           <li>
-            The agent stays installed on the host. It can be enrolled again with
+            roomlerd stays installed on the host. It can be enrolled again with
             a new enrollment token, but it comes back with a
             <strong>new overlay address and a new name</strong>.
           </li>
         </ul>
         <v-alert type="warning" variant="tonal" density="compact" class="mb-0">
           Anything pinned to the old identity stops working — scripts using this
-          agent id, tunnel forwards targeting it, firewall rules on its old
+          device id, tunnel forwards targeting it, firewall rules on its old
           overlay address, and any client configured with
           <code>overlay_exit_node = "{{ deleteTarget?.name }}"</code>.
         </v-alert>
@@ -1253,7 +1253,7 @@
           variant="tonal"
           density="compact"
           class="mb-3"
-          text="This device runs an agent version that predates remote org-join. Update it
+          text="This device runs a roomlerd version that predates remote org-join. Update it
                 first, or enroll it at the keyboard."
         />
         <v-alert
@@ -1302,9 +1302,9 @@
           variant="tonal"
           density="compact"
           class="mt-3"
-          text="This device's agent started with a single organization, so it holds its
+          text="This device's roomlerd started with a single organization, so it holds its
                 network adapter exclusively. The join is applied right away, but mesh
-                access begins after the agent restarts — the next auto-update does that."
+                access begins after roomlerd restarts — the next auto-update does that."
         />
         <v-alert
           v-if="joinOrgError"
@@ -1376,7 +1376,7 @@
         <p class="text-body-2 mb-3">
           CIDRs that <strong>{{ deviceLabel(routesTarget) }}</strong> advertises for the
           mesh (<code>roomler socks5</code>). A LAN target IP matching one of
-          these routes is dialed by this agent, so the mesh can reach non-agent
+          these routes is dialed by this device, so the mesh can reach other
           devices behind it (a NAS, a printer, a database host). Access is still
           gated by your <strong>Tunnel ACL</strong> — a route steers the dial, it
           doesn't authorize it.
@@ -1397,12 +1397,12 @@
           </v-chip>
         </div>
         <p v-else class="text-body-2 text-medium-emphasis mb-3">
-          No routes yet — this agent only reaches its own host.
+          No routes yet — this device reaches only itself.
         </p>
 
         <div v-if="advertisedSuggestions.length" class="mb-3">
           <p class="text-caption text-medium-emphasis mb-1">
-            Advertised by the agent — click to approve into the routes above:
+            Advertised by the device — click to approve into the routes above:
           </p>
           <div class="d-flex flex-wrap ga-2">
             <v-chip
@@ -1462,6 +1462,7 @@ import { codecChips, permissionWarnings } from './agentCodecChips'
 import { keepBusyBriefTitle } from '@/composables/keepBusy'
 import { credentialChip } from '@/utils/credentialExpiry'
 import { updateStallChip } from '@/utils/updateStall'
+import { reportedVersion, versionLabel } from '@/utils/deviceVersion'
 import { refusalShort, updateRefusal } from '@/utils/updateRefusal'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
@@ -1664,7 +1665,19 @@ function stallChip(a: Agent) {
  *  in a table cell would be worse than saying nothing. */
 function companionSkew(row: DeviceRow): string {
   const cv = agentFor(row)?.companion_version
-  return cv && cv !== row.version ? cv : ''
+  // #3565: with no version from the daemon there is nothing to disagree with.
+  const daemon = reportedVersion(row.version)
+  return cv && daemon && cv !== daemon ? cv : ''
+}
+
+/** #3565 — the version's tooltip: for a device whose daemon has not reported
+ *  a version yet, which program enrolled it. A row's version is its daemon's
+ *  own, never the enrolling program's. */
+function versionTitle(row: DeviceRow): string | undefined {
+  if (reportedVersion(row.version)) return undefined
+  const p = agentFor(row)?.enrolling_program
+  const by = p ? ` Enrolled by ${p.name}${p.version ? ` ${p.version}` : ''}.` : ''
+  return `Its daemon has not reported its version yet: it does once it connects.${by}`
 }
 const clientById = computed(() => {
   const m = new Map<string, TunnelClient>()
@@ -2155,9 +2168,9 @@ function keyRotationChip(
       return {
         color: 'grey',
         icon: 'mdi-update',
-        text: 'agent too old for key rotation',
+        text: 'roomlerd too old for key rotation',
         tooltip:
-          "This device's agent predates key rotation (0.4.25+). Update it — the order stays queued.",
+          "This device's roomlerd predates key rotation (0.4.25+). Update it — the order stays queued.",
       }
     default:
       return null
@@ -2200,8 +2213,8 @@ async function doUpdateAll() {
     const names = new Map(agentStore.agents.map((a) => [a.id, deviceLabel(a)]))
     const skipped = res.results.filter((r) => r.refused_code)
     let notice =
-      `Update pushed to ${res.delivered} of ${res.requested} agents — ` +
-      `offline agents update on their next periodic check.`
+      `Update pushed to ${res.delivered} of ${res.requested} devices — ` +
+      `offline devices update on their next periodic check.`
     if (skipped.length > 0) {
       notice +=
         ` ${skipped.length} not updated from here: ` +
@@ -2343,11 +2356,11 @@ function remoteConfigChip(
       return {
         color: 'grey',
         icon: 'mdi-update',
-        text: 'agent too old',
+        text: 'roomlerd too old',
         tooltip:
           state === 'push_unsupported'
-            ? 'This agent predates remote configuration; nothing is sent to it.'
-            : 'This agent applies pushed config but cannot report what it did.',
+            ? 'roomlerd on this device predates remote configuration; nothing is sent to it.'
+            : 'roomlerd on this device applies pushed config but cannot report what it did.',
       }
     default:
       return null
@@ -2566,7 +2579,7 @@ async function confirmJoinOrg() {
       : `${deviceLabel(joinOrgTarget.value)} is joining as "${res.label}". It appears in that organization's device list shortly.`
     // Say the quiet part: the enrollment landed, the MESH did not.
     updateNotice.value = res.restart_required
-      ? `${base} Mesh access is configured but starts after the device's agent restarts — the next auto-update delivers that.`
+      ? `${base} Mesh access is configured but starts after the device's roomlerd restarts — the next auto-update delivers that.`
       : base
   } catch (e) {
     joinOrgError.value = (e as Error).message
@@ -2736,6 +2749,7 @@ onMounted(() => {
 watch(() => props.tenantId, (tid) => {
   if (tid) {
     agentStore.fetchAgents(tid)
+    agentStore.fetchTenantMembers(tid)
     loadNetworkStores(tid)
     // Reset the grid to a clean first page for the new org.
     gridSearch.value = ''

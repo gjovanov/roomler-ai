@@ -304,6 +304,83 @@ pub fn down() -> Option<String> {
     }
 }
 
+/// #4100 — who starts an X client that Remote Apps (FR-56) asked for on a
+/// display of this daemon's ([`start_x_client`]), and how that went.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) enum XStart {
+    /// Remote Apps starts it itself, as before #4100: no keeper of this
+    /// daemon's runs on that display.
+    Direct,
+    /// The desktop's keeper started it, as its child.
+    Started,
+    /// The desktop's keeper could not start it: the error its start
+    /// returned, as Remote Apps' own start would have got it.
+    Failed(std::io::Error),
+    /// Not started, and why: the desktop is stopping or down, or its keeper
+    /// refused the start or did not answer in time.
+    Refused(String),
+}
+
+/// #4100 — now on `CLOCK_MONOTONIC`, in milliseconds: one clock for the daemon
+/// and its keeper, who reads the deadline the daemon gave a start.
+#[cfg(target_os = "linux")]
+fn monotonic_ms() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime(2)` with a live out-pointer; Linux always has
+    // `CLOCK_MONOTONIC`.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+    }
+    (now.tv_sec as u64)
+        .saturating_mul(1000)
+        .saturating_add(now.tv_nsec as u64 / 1_000_000)
+}
+
+/// #4100 — the starts that wait for their keeper's answer, by id: the daemon
+/// puts each one here before it writes it, and the thread that follows the
+/// keeper's output ([`follow_keeper`]) hands each answer to its start. That
+/// thread's end closes it: every start still waiting hears so at once, and a
+/// later one is refused before it is written.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct Waiting {
+    starts: std::collections::HashMap<u64, std::sync::mpsc::SyncSender<keeper::Answer>>,
+    closed: bool,
+}
+
+/// [`Waiting`], shared by the daemon and the thread that follows the keeper.
+/// Taken AFTER [`Desktop`]'s state, never before; that thread takes nothing
+/// else.
+#[cfg(target_os = "linux")]
+type Answers = std::sync::Arc<std::sync::Mutex<Waiting>>;
+
+/// #4100 — the slack past a start's deadline that the daemon waits for its
+/// answer: the keeper starts nothing read after the deadline, so a start the
+/// daemon gave up on never starts later, and one it answered just in time
+/// still has its answer heard.
+#[cfg(target_os = "linux")]
+const X_CLIENT_SLACK: Duration = Duration::from_secs(1);
+
+/// #4100 — what Remote Apps asks before it starts an X client on the daemon's
+/// own display: [`start_x_client`] in the daemon, a test's desktop in a test.
+/// The display, the program and its arguments.
+#[cfg(target_os = "linux")]
+pub(crate) type XStarter = std::sync::Arc<dyn Fn(&str, &str, &[&str]) -> XStart + Send + Sync>;
+
+/// #4100 — Remote Apps' door to this daemon's own virtual desktop: who starts
+/// `program` with `args` on `display`. [`XStart::Direct`] in a process that
+/// started no desktop.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_x_client(display: &str, program: &str, args: &[&str]) -> XStart {
+    desktop().map_or(XStart::Direct, |desk| {
+        desk.start_x_client(display, program, args)
+    })
+}
+
 /// #3671 — how many times this daemon's own virtual desktop came back on a new
 /// X server since it started: the X connection a part of the daemon made
 /// under one generation is dead in the next, although `DISPLAY` names the
@@ -360,7 +437,7 @@ pub fn down_detail() -> Option<String> {
 
 fn down_detail_of(why: &str) -> String {
     format!(
-        "this device's virtual desktop is down: {why}. The agent starts it again by itself; \
+        "this device's virtual desktop is down: {why}. The daemon starts it again by itself; \
          reconnect in a moment"
     )
 }
@@ -1034,6 +1111,14 @@ struct Plan {
     delay_floor: Duration,
     delay_ceil: Duration,
     stable_after: Duration,
+    /// #4099 — the window manager's restart delays, which the desktop's
+    /// keeper gets in its job: the X server's numbers in the daemon. Its own,
+    /// because the tests' window manager (`true`) exits at once, and the
+    /// tests' 20 ms server delays would start it again every few
+    /// milliseconds in every keeper test.
+    wm_delay_floor: Duration,
+    wm_delay_ceil: Duration,
+    wm_stable_after: Duration,
     /// Who starts the window manager and the startup apps (#3665).
     clients: Clients,
     /// How long a start waits for the keeper to say it is ready.
@@ -1041,6 +1126,8 @@ struct Plan {
     /// Where a test reads the lines the keeper says after `ready`, as the
     /// daemon logs them; `None` in the daemon.
     keeper_lines: Option<KeeperLines>,
+    /// #4100 — how long a Remote Apps start waits for the keeper's answer.
+    x_client_wait: Duration,
 }
 
 /// The lines a keeper said, kept for a test.
@@ -1059,6 +1146,9 @@ impl Plan {
             delay_floor: RESTART_DELAY_FLOOR,
             delay_ceil: RESTART_DELAY_CEIL,
             stable_after: STABLE_AFTER,
+            wm_delay_floor: RESTART_DELAY_FLOOR,
+            wm_delay_ceil: RESTART_DELAY_CEIL,
+            wm_stable_after: STABLE_AFTER,
             clients: if tunnel_core::env::flag("VIRTUAL_DESKTOP_KEEPER", true) {
                 Clients::Keeper(KeeperCmd::daemon())
             } else {
@@ -1066,9 +1156,16 @@ impl Plan {
             },
             keeper_ready_timeout: KEEPER_READY_TIMEOUT,
             keeper_lines: None,
+            x_client_wait: X_CLIENT_WAIT,
         }
     }
 }
+
+/// #4100 — how long a Remote Apps start waits for the keeper's answer. A
+/// launch already waits 250 ms for its window, and runs on a blocking thread
+/// of its own, so a few seconds cost nothing a person would notice.
+#[cfg(target_os = "linux")]
+const X_CLIENT_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a start waits for the keeper's `ready`. It starts nothing before
 /// it, so this is a few milliseconds on a working host; a keeper that says
@@ -1206,8 +1303,13 @@ struct State {
     /// The write end of the keeper's input (#3665). Its end is the keeper's
     /// signal to take the whole desktop down: dropped by every kill of the
     /// tree, and closed by the kernel when the daemon dies however it dies.
-    /// Created close-on-exec, so no other program holds it.
+    /// Created close-on-exec, so no other program holds it. Non-blocking
+    /// once the job is out (#4100): each later write is one start of at most
+    /// [`KEEPER_JOB_MAX`] bytes, whole or not at all, never a wait.
     lifeline: Option<std::process::ChildStdin>,
+    /// #4100 — the starts written on `lifeline` that wait for the keeper's
+    /// answer; kept and dropped with it.
+    answers: Option<Answers>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1258,6 +1360,9 @@ struct Desktop {
     /// #3671 — how many times the desktop came back on a new X server
     /// ([`generation`]).
     generation: std::sync::atomic::AtomicU64,
+    /// #4100 — the number of the last start of an X client Remote Apps sent
+    /// a keeper ([`Desktop::start_x_client`]).
+    x_starts: std::sync::atomic::AtomicU64,
 }
 
 /// #3671 — what [`supervise`] calls, on its own thread, once an exit's
@@ -1302,6 +1407,7 @@ impl Desktop {
             tell_down: std::sync::OnceLock::new(),
             retire: std::sync::OnceLock::new(),
             generation: std::sync::atomic::AtomicU64::new(0),
+            x_starts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1451,6 +1557,10 @@ impl Desktop {
         let _op = self.op.lock().unwrap_or_else(|e| e.into_inner());
         let (handle, lifeline, mut waiting) = {
             let mut st = self.state();
+            // #4100 — no start is written once the lifeline is gone; one
+            // waiting for its answer hears the keeper's end from the thread
+            // that follows it.
+            st.answers = None;
             (
                 st.tree.take(),
                 st.lifeline.take(),
@@ -1765,6 +1875,9 @@ impl Desktop {
             wm: cfg.wm.clone(),
             apps: cfg.startup.clone(),
             grace_ms: KEEPER_GRACE.as_millis() as u64,
+            wm_delay_floor_ms: self.plan.wm_delay_floor.as_millis() as u64,
+            wm_delay_ceil_ms: self.plan.wm_delay_ceil.as_millis() as u64,
+            wm_stable_after_ms: self.plan.wm_stable_after.as_millis() as u64,
         }
         .line();
         if job.len() > KEEPER_JOB_MAX {
@@ -1784,7 +1897,13 @@ impl Desktop {
         };
         let pid = child.id() as i32;
         let input = child.stdin.take();
-        let ready = follow_keeper(child.stderr.take(), pid, self.plan.keeper_lines.clone());
+        let answers = Answers::default();
+        let ready = follow_keeper(
+            child.stderr.take(),
+            pid,
+            self.plan.keeper_lines.clone(),
+            answers.clone(),
+        );
         // The job goes out only after `ready`, so a keeper given up on here
         // never had one and started nothing; and it is stopped before its
         // input ends, never after.
@@ -1832,6 +1951,10 @@ impl Desktop {
             drop(input);
             return Err(format!("its job could not be sent: {e}"));
         }
+        // #4100 — every later write is a start of Remote Apps' (one line of at
+        // most `KEEPER_JOB_MAX`, whole or not at all): a keeper that does not
+        // read refuses it, and never holds the daemon.
+        keeper::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&input));
         // From here the keeper's exit is the desktop's failure (K1), never a
         // direct start on top of what it started. The lifeline is kept only
         // for the tree it belongs to: a stop that took the tree meanwhile
@@ -1840,6 +1963,7 @@ impl Desktop {
         let mut st = self.state();
         if !st.stopping && st.tree.as_ref().is_some_and(|t| t.keeper == Some(pid)) {
             st.lifeline = Some(input);
+            st.answers = Some(answers);
             Ok(Some(pid))
         } else {
             Ok(None)
@@ -1874,18 +1998,154 @@ impl Desktop {
             }
         }
     }
+
+    /// #4100 — who starts the X client `program` with `args` that Remote Apps
+    /// asked for on `display` ([`start_x_client`]), and how it went.
+    ///
+    /// Where this desktop's keeper runs, the keeper starts it, as its child
+    /// in the desktop's group, so that its exit is collected and the
+    /// desktop's teardown reaches it and whatever it leaves behind. Nothing
+    /// falls back to a direct start there: a start the keeper cannot take is
+    /// refused. Remote Apps starts the client itself, as before, on another
+    /// display, under the kill switch, after a keeper this daemon turned off,
+    /// and while the tree has no keeper (it refused, or was not ready in
+    /// time: the window manager was started directly too).
+    ///
+    /// Decided under the state lock, and the start written under it, never a
+    /// wait (the lifeline is non-blocking, and a start of at most
+    /// [`KEEPER_JOB_MAX`] bytes goes whole or not at all); the answer is
+    /// awaited outside it, for the start's wait and [`X_CLIENT_SLACK`].
+    fn start_x_client(&self, display: &str, program: &str, args: &[&str]) -> XStart {
+        if display != self.display
+            || !matches!(self.plan.clients, Clients::Keeper(_))
+            || self.keeper_off.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return XStart::Direct;
+        }
+        let wait = self.plan.x_client_wait;
+        let id = self
+            .x_starts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let line = keeper::Start {
+            id,
+            argv: std::iter::once(program)
+                .chain(args.iter().copied())
+                .map(String::from)
+                .collect(),
+            deadline_ms: monotonic_ms().saturating_add(wait.as_millis() as u64),
+        }
+        .line();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let answers = {
+            let st = self.state();
+            if st.stopping {
+                return XStart::Refused("the daemon is stopping".into());
+            }
+            // D1 — no X server to start it onto: a client started now would
+            // die at once, or land on the next server, outside any tree.
+            if st.up.is_none() {
+                return XStart::Refused(format!(
+                    "this device's virtual desktop is down: {}. The daemon starts it again by \
+                     itself; launch it again in a moment",
+                    st.why_down
+                ));
+            }
+            if st.tree.as_ref().and_then(|t| t.keeper).is_none() {
+                return XStart::Direct;
+            }
+            if line.len() > KEEPER_JOB_MAX {
+                return XStart::Refused(format!(
+                    "its start is {} bytes, more than {KEEPER_JOB_MAX} bytes (one write to the desktop's keeper)",
+                    line.len()
+                ));
+            }
+            let (Some(lifeline), Some(answers)) = (st.lifeline.as_ref(), st.answers.as_ref())
+            else {
+                return XStart::Refused("the desktop's keeper has no input".into());
+            };
+            {
+                let mut waiting = answers.lock().unwrap_or_else(|e| e.into_inner());
+                if waiting.closed {
+                    return XStart::Refused("the desktop's keeper is gone".into());
+                }
+                waiting.starts.insert(id, tx);
+            }
+            let fd = std::os::fd::AsRawFd::as_raw_fd(lifeline);
+            // SAFETY: `write(2)` from a live buffer of `line.len()` bytes to
+            // the daemon's end of the keeper's input. It is non-blocking, and
+            // a write of at most `PIPE_BUF` bytes is whole or fails (EAGAIN
+            // on a full pipe, EPIPE once the keeper is gone; SIGPIPE is
+            // ignored in the daemon).
+            let n = unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
+            if n != line.len() as isize {
+                let e = std::io::Error::last_os_error();
+                answers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .starts
+                    .remove(&id);
+                return XStart::Refused(format!("the desktop's keeper could not take it: {e}"));
+            }
+            answers.clone()
+        };
+        let answer = match rx.recv_timeout(wait + X_CLIENT_SLACK) {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Given up under the lock its answer is handed over under: an
+                // answer that came in between is in the channel already.
+                let gave_up = answers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .starts
+                    .remove(&id)
+                    .is_some();
+                match rx.try_recv() {
+                    Ok(answer) if !gave_up => answer,
+                    _ => {
+                        return XStart::Refused(format!(
+                            "the desktop's keeper did not answer within {:?}",
+                            wait + X_CLIENT_SLACK
+                        ));
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return XStart::Refused("the desktop's keeper is gone".into());
+            }
+        };
+        match answer {
+            keeper::Answer::Started { .. } => XStart::Started,
+            keeper::Answer::Failed {
+                os_error,
+                kind,
+                text,
+            } => XStart::Failed(match os_error {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None if kind == "NotFound" => {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, text)
+                }
+                None => std::io::Error::other(text),
+            }),
+            keeper::Answer::Refused { why } => {
+                XStart::Refused(format!("the desktop's keeper refused it: {why}"))
+            }
+        }
+    }
 }
 
 /// Follow a keeper's stderr on a thread of its own: its first `ready` or
-/// `refused: <why>` line goes to the receiver this returns, and every other
+/// `refused: <why>` line goes to the receiver this returns, its answer to a
+/// start of Remote Apps' to that start in `answers` (#4100), and every other
 /// line to the log, as a warning where [`keeper_line`] says so (a `warn: `
 /// line, or a `refused: ` line after `ready`). The thread ends with the
-/// keeper's stderr.
+/// keeper's stderr, and closes `answers` as it ends.
 #[cfg(target_os = "linux")]
 fn follow_keeper(
     stderr: Option<std::process::ChildStderr>,
     pid: i32,
     copy: Option<KeeperLines>,
+    answers: Answers,
 ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String> {
     use std::io::BufRead as _;
     let stderr = stderr.ok_or("it has no stderr")?;
@@ -1915,14 +2175,58 @@ fn follow_keeper(
                         .unwrap_or_else(|e| e.into_inner())
                         .push(line.clone());
                 }
+                if let Some((id, answer)) = keeper::Answer::parse(&line) {
+                    answered(&answers, pid, id, answer);
+                    continue;
+                }
                 match keeper_line(&line) {
                     (true, said) => warn!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}"),
                     (false, said) => info!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}"),
                 }
             }
+            // The keeper's output ended, and with it every answer still to
+            // come: each start that waits hears so now (its sender dropped),
+            // and none is written from here on.
+            let mut waiting = answers.lock().unwrap_or_else(|e| e.into_inner());
+            waiting.closed = true;
+            waiting.starts.clear();
         })
         .map_err(|e| format!("its output could not be followed: {e}"))?;
     Ok(rx)
+}
+
+/// #4100 — hand the keeper's answer to start `id` to the start that waits
+/// for it, under the lock the daemon gives the start up under (never a
+/// wait: one answer a start, into a channel of one). An answer that comes
+/// after its start gave up is logged: one that started a client warns, since
+/// that client runs although its launch failed.
+#[cfg(target_os = "linux")]
+fn answered(
+    answers: &Answers,
+    keeper_pid: i32,
+    id: u64,
+    answer: std::result::Result<keeper::Answer, String>,
+) {
+    let answer = answer.unwrap_or_else(|why| keeper::Answer::Refused { why });
+    let mut waiting = answers.lock().unwrap_or_else(|e| e.into_inner());
+    match waiting.starts.remove(&id) {
+        Some(start) => {
+            let _ = start.try_send(answer);
+        }
+        None => {
+            drop(waiting);
+            match answer {
+                keeper::Answer::Started { pid } => warn!(
+                    vd_keeper = keeper_pid,
+                    "virtual-desktop vd-keeper: Remote Apps' start {id} began client {pid} after the daemon stopped waiting for it, so its launch was reported failed (#4100)"
+                ),
+                other => info!(
+                    vd_keeper = keeper_pid,
+                    "virtual-desktop vd-keeper: an answer to Remote Apps' start {id} after the daemon stopped waiting for it: {other:?}"
+                ),
+            }
+        }
+    }
 }
 
 /// How the daemon logs a keeper's line after its first answer: whether it
@@ -3319,7 +3623,7 @@ mod tests {
         assert_eq!(
             down_detail_of("its X server (Xvfb) exited: signal 6 (aborted), core dumped"),
             "this device's virtual desktop is down: its X server (Xvfb) exited: signal 6 \
-             (aborted), core dumped. The agent starts it again by itself; reconnect in a moment"
+             (aborted), core dumped. The daemon starts it again by itself; reconnect in a moment"
         );
     }
 
@@ -4044,12 +4348,20 @@ mod supervise_tests {
             delay_floor: Duration::from_millis(20),
             delay_ceil: Duration::from_millis(80),
             stable_after: Duration::from_secs(60),
+            // #4099 — `true` exits at once: an hour, so that no test but
+            // those that set these sees the window manager started again.
+            wm_delay_floor: Duration::from_secs(3600),
+            wm_delay_ceil: Duration::from_secs(3600),
+            wm_stable_after: Duration::from_secs(3600),
             // The daemon's default (#3665). The keeper is this test binary,
             // re-run in its role; generous, since a loaded host starts it
             // late.
             clients: Clients::Keeper(KeeperCmd::test()),
             keeper_ready_timeout: Duration::from_secs(20),
             keeper_lines: None,
+            // #4100 — short, so that a start the keeper never answers fails
+            // its launch within a test's wait.
+            x_client_wait: Duration::from_secs(2),
         }
     }
 
@@ -5584,8 +5896,8 @@ mod supervise_tests {
     /// Review R1-1: the window manager goes first, and the keeper is
     /// signalled only once it has collected the window manager's exit, before
     /// it knows of the stop: that order made certain, not timed (review
-    /// R2-8). The keeper must not warn that the desktop runs on without a
-    /// window manager, then or ever. The server still runs then, so nothing
+    /// R2-8). The keeper must not warn of the window manager's exit, then
+    /// or ever. The server still runs then, so nothing
     /// else could keep the keeper quiet; it gets its SIGTERM with the
     /// daemon's own stop, the rest of the unit's. (The server's own exit in a
     /// stop is the supervisor's to report: #3671.)
@@ -5655,7 +5967,7 @@ mod supervise_tests {
     /// Review R1-1 — an X server's death ends its clients, the window manager
     /// among the first, and the supervisor's teardown then ends the rest.
     /// The keeper collects the window manager's exit before it learns of the
-    /// death, and must not warn that the desktop runs on without one: by the
+    /// death, and must not warn of it: by the
     /// time the notice is due, the daemon's teardown has cleared it, or the
     /// server (the desktop's group leader) is a zombie, which is not running.
     #[test]
@@ -5700,8 +6012,10 @@ mod supervise_tests {
     /// Review R2-2 — the notice the two tests above keep quiet is still said
     /// when it is true. A window manager that exits while its X server runs
     /// is collected by the keeper and reported with its pid once the exit is
-    /// the keeper's `NOTICE_DELAY` (2 s) old, and the desktop runs on without
-    /// it: collected and logged, nothing restarted (#3665, B2).
+    /// the keeper's `NOTICE_DELAY` (2 s) old, with the delay after which it
+    /// is started again (#4099; [`plan`]'s hour here, so nothing starts in
+    /// this test). The line said that the desktop runs on without one until
+    /// #4099 decided otherwise (#3665's B2 collected and logged only).
     #[test]
     fn a_window_manager_that_exits_while_its_server_runs_is_reported() {
         let dir = scratch("wm-exits");
@@ -5743,7 +6057,10 @@ mod supervise_tests {
             line.contains(&format!("the window manager ({})", wm.pid)),
             "the notice does not name the window manager's pid: {line}"
         );
-        assert!(line.contains("runs on without one"), "{line}");
+        assert!(
+            line.contains("— it is started again 3600s after its exit"),
+            "{line}"
+        );
         assert!(
             after >= Duration::from_secs(2),
             "said {after:?} after the signal, before the notice was due: {line}"
@@ -5752,6 +6069,1719 @@ mod supervise_tests {
         assert!(keeper_ran, "the keeper left with the window manager");
         assert_eq!(up, Some(Server::Xvfb), "the desktop went down");
         assert_eq!(starts, 0, "the desktop was started again");
+    }
+
+    // -----------------------------------------------------------------------
+    // #4099: a window manager that exits while its X server runs is started
+    // again by the keeper, through the function that started it, with the X
+    // server's backoff; never in a teardown, and never onto a server that is
+    // gone. Stand-ins only: no X server, displays `:490`-`:498`, never `:99`.
+    // -----------------------------------------------------------------------
+
+    /// One start of a window manager stand-in, as its first line wrote it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct WmStart {
+        pid: i32,
+        /// Who started it: the keeper, on the keeper's path.
+        parent: i32,
+        /// When it ran, in nanoseconds since the epoch (`date +%s%N`).
+        at_ns: i128,
+    }
+
+    /// A window manager stand-in's first line: each start appends
+    /// `$$ $PPID <now>` to `<dir>/wm.pids`, in one short write.
+    fn wm_started(dir: &Path) -> String {
+        format!(
+            "echo \"$$ $PPID $(date +%s%N)\" >> \"{}/wm.pids\"",
+            dir.display()
+        )
+    }
+
+    /// The whole lines of `<dir>/<name>` so far, each split at its blanks: a
+    /// line still being written is not read in half.
+    fn whole_lines(dir: &Path, name: &str) -> Vec<Vec<String>> {
+        let text = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let whole = text.rfind('\n').map_or("", |end| &text[..end]);
+        whole
+            .lines()
+            .map(|l| l.split_whitespace().map(String::from).collect())
+            .collect()
+    }
+
+    /// The window manager's starts so far, in order.
+    fn wm_starts(dir: &Path) -> Vec<WmStart> {
+        whole_lines(dir, "wm.pids")
+            .iter()
+            .filter_map(|f| {
+                Some(WmStart {
+                    pid: f.first()?.parse().ok()?,
+                    parent: f.get(1)?.parse().ok()?,
+                    at_ns: f.get(2)?.parse().ok()?,
+                })
+            })
+            .collect()
+    }
+
+    /// The window manager's first start, once it has run its first line.
+    fn first_start(dir: &Path) -> WmStart {
+        let mut first = None;
+        wait_for("the window manager's first start", || {
+            first = wm_starts(dir).first().copied();
+            first.is_some()
+        });
+        first.unwrap()
+    }
+
+    /// Now, on the clock `date +%s%N` reads.
+    fn wall_ns() -> i128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_nanos() as i128
+    }
+
+    /// From `from` to `to`, both in nanoseconds since the epoch; zero when
+    /// `to` came first.
+    fn gap(from: i128, to: i128) -> Duration {
+        Duration::from_nanos(u64::try_from(to - from).unwrap_or(0))
+    }
+
+    /// `look` every 10 ms until it finds something, for at most `within`:
+    /// a RED ends here in its own words, never in [`wait_for`]'s 20 s panic.
+    fn poll_for<T>(within: Duration, mut look: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(found) = look() {
+                return Some(found);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// [`desktop_keeping_lines`] on `base`, with the window manager's restart
+    /// numbers set (its delays' floor and ceiling, and how long it must run
+    /// for its exit to start them over), and `wm_body` after the window
+    /// manager's first line ([`wm_started`]).
+    fn desktop_restarting_wm(
+        dir: &Path,
+        display: &str,
+        wm_body: &str,
+        [floor, ceil, stable]: [Duration; 3],
+        base: Plan,
+    ) -> (Arc<Desktop>, i32, KeeperLines) {
+        let lines = KeeperLines::default();
+        let wm = script(dir, "wm", &format!("{}\n{wm_body}", wm_started(dir)));
+        let (desk, x_pid) = desktop_planned(
+            display,
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm,
+                    startup: vec![],
+                },
+                wm_delay_floor: floor,
+                wm_delay_ceil: ceil,
+                wm_stable_after: stable,
+                keeper_lines: Some(lines.clone()),
+                ..base
+            },
+        );
+        (desk, x_pid, lines)
+    }
+
+    /// The supervisor of `desk` on a thread of its own, handed the server and
+    /// the keeper as `bring_up` hands them.
+    fn supervised(desk: &Arc<Desktop>, x_pid: i32, keeper: i32) -> std::thread::JoinHandle<()> {
+        let desk = desk.clone();
+        std::thread::spawn(move || supervise(&desk, Some(running(&desk, x_pid, Some(keeper)))))
+    }
+
+    /// The daemon's stop, and its supervisor gone.
+    fn stopped(desk: &Desktop, supervisor: std::thread::JoinHandle<()>) {
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+    }
+
+    /// The process of start `s` once the `sleep` its script exec'd sleeps,
+    /// as `/proc` describes it: what every later look and signal checks
+    /// against ([`asleep_in_its_sleep`]).
+    fn wm_proc(s: &WmStart) -> ProcInfo {
+        asleep_in_its_sleep(s.pid)
+    }
+
+    /// `pid` once the `sleep` it exec'd is asleep in its sleep (#4197). Only
+    /// then does a look see what it holds for good, which is what it was
+    /// handed. From the exec on, its name reads `sleep` while its program
+    /// still starts: the loader holds each library open while it maps it, the
+    /// C library opens its locale's files, and a `sleep` built in Rust ignores
+    /// SIGPIPE until its `main` puts the default back. None of that sleeps
+    /// (state `S`); the program's own sleep is the first thing that does. The
+    /// name and the state come from one `/proc/<pid>/stat` line, one moment.
+    fn asleep_in_its_sleep(pid: i32) -> ProcInfo {
+        let mut stat = String::new();
+        poll_for(Duration::from_secs(20), || {
+            stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let name = stat.get(stat.find('(')? + 1..stat.rfind(')')?)?;
+            let (state, ppid, pgid, starttime) = parse_stat(&stat)?;
+            (name == "sleep" && state == "S").then_some(ProcInfo {
+                pid,
+                ppid,
+                pgid,
+                starttime,
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!("the window manager {pid} was not asleep in its sleep in 20 s: {stat:?}")
+        })
+    }
+
+    /// Signal the process this test recorded, while `/proc` still shows it.
+    fn signal_recorded(info: &ProcInfo, sig: i32) {
+        if RealProcs.same_process_now(info) {
+            RealProcs.signal(info.pid, sig);
+        }
+    }
+
+    /// The keeper's warnings about the window manager so far.
+    fn wm_warnings(lines: &KeeperLines) -> Vec<String> {
+        keeper_warnings(lines, "")
+            .0
+            .into_iter()
+            .filter(|l| l.contains("the window manager"))
+            .collect()
+    }
+
+    /// #4099, box 1 — a window manager that exits while its X server runs is
+    /// started again by the keeper, no sooner than its delay's floor after
+    /// the exit and within a second of it, with what the first one got from
+    /// the keeper: its parent, display, environment, descriptors and signals.
+    /// Nothing else moves: the server and the keeper run on, the desktop
+    /// stays up and is not started again, and the new one is the only one.
+    #[test]
+    fn a_window_manager_that_exits_while_its_server_runs_is_started_again() {
+        let dir = scratch("wm-again");
+        let floor = Duration::from_millis(200);
+        let (desk, x_pid, _lines) = desktop_restarting_wm(
+            &dir,
+            ":490",
+            "exec sleep 300",
+            [floor, Duration::from_secs(2), Duration::from_secs(60)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first = first_start(&dir);
+        let first_wm = wm_proc(&first);
+        let first_seen = seen_of(&first_wm, x_pid);
+        // Taken before the signal, so that the exit cannot come before it.
+        let signalled = wall_ns();
+        signal_recorded(&first_wm, libc::SIGTERM);
+        let again = poll_for(Duration::from_secs(5), || wm_starts(&dir).get(1).copied());
+        let again_seen = again.map(|s| seen_of(&wm_proc(&s), x_pid));
+        // Two floors more: a start the keeper wrongly kept due comes by then.
+        std::thread::sleep(2 * floor);
+        let starts = wm_starts(&dir);
+        let server_ran = is_running(x_pid);
+        let keeper_ran = is_running(keeper);
+        let up = desk.state().up;
+        let desktop_starts = runs(&dir).len();
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let again =
+            again.expect("the window manager was started once in 5 s after its exit (#4099)");
+        let after = gap(signalled, again.at_ns);
+        assert!(
+            after >= floor,
+            "started again {after:?} after the signal, sooner than its floor of {floor:?}"
+        );
+        assert!(
+            after <= floor + Duration::from_secs(1),
+            "started again only {after:?} after the signal"
+        );
+        assert_eq!(
+            first.parent, keeper,
+            "the first window manager is not the keeper's"
+        );
+        assert_eq!(
+            again.parent, keeper,
+            "the window manager was started again by another: {again:?}"
+        );
+        assert!(
+            first_seen.environ.iter().any(|v| v == "DISPLAY=:490"),
+            "{first_seen:#?}"
+        );
+        assert_eq!(
+            again_seen.as_ref(),
+            Some(&first_seen),
+            "the window manager started again did not get what the first one got"
+        );
+        assert_eq!(starts.len(), 2, "the window manager's starts: {starts:?}");
+        assert!(server_ran, "the X server stopped with its window manager");
+        assert!(keeper_ran, "the keeper left with the window manager");
+        assert_eq!(up, Some(Server::Xvfb), "the desktop went down");
+        assert_eq!(desktop_starts, 0, "the desktop was started again");
+    }
+
+    /// #4197 — a window manager is read once the `sleep` it exec'd sleeps,
+    /// never while that program is still starting. From the exec on, its
+    /// name reads `sleep`, and its loader then holds each library open while
+    /// it maps it. A stand-in named `sleep` is caught there: stopped with a
+    /// library open on fd 3. A slow start, it goes on later, lets the library
+    /// go and execs a real `sleep`, and only that one, asleep, may be read.
+    #[test]
+    fn a_window_manager_still_starting_is_read_once_it_sleeps() {
+        let dir = scratch("wm-starting");
+        // A library this process maps, so one every host has.
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let lib = maps
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(5))
+            .find(|p| p.contains(".so"))
+            .expect("a library this process maps")
+            .to_string();
+        // Its name reads `sleep` from this exec on, as a real one's does.
+        std::os::unix::fs::symlink("/bin/sh", dir.join("sleep")).unwrap();
+        let mut stand_in = Command::new(dir.join("sleep"))
+            .arg("-c")
+            .arg(format!(
+                "exec 3<\"{lib}\"; kill -STOP $$; exec 3<&-; exec sleep 300"
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = stand_in.id() as i32;
+        let _end = KillAtTheEnd(read_proc_stat(pid).into_iter().collect());
+        wait_for("the stand-in to stop with the library open", || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| parse_stat(&s).map(|(state, ..)| state == "T"))
+                .unwrap_or(false)
+        });
+        let goes_on = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            RealProcs.signal(pid, libc::SIGCONT);
+        });
+        let seen = seen_of(
+            &wm_proc(&WmStart {
+                pid,
+                parent: 0,
+                at_ns: 0,
+            }),
+            0,
+        );
+        goes_on.join().unwrap();
+        let _ = stand_in.kill();
+        let _ = stand_in.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            seen.fds.get(&3),
+            None,
+            "the window manager was read while its program was still starting: {:?}",
+            seen.fds
+        );
+    }
+
+    /// #4099, box 2 — a window manager that exits at once, every time, is
+    /// started again after each exit, each delay twice the one before, from
+    /// the floor up to the ceiling, where it stays: never sooner than its
+    /// delay, never much later than the ceiling, and each exit said in one
+    /// line, with the window manager's pid and the delay it was given.
+    #[test]
+    fn repeated_window_manager_exits_back_off_to_the_ceiling() {
+        let dir = scratch("wm-backoff");
+        let (floor, ceil) = (Duration::from_millis(100), Duration::from_millis(400));
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":491",
+            "exit 0",
+            [floor, ceil, Duration::from_secs(60)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        std::thread::sleep(Duration::from_secs(3));
+        let starts = wm_starts(&dir);
+        let said = wm_warnings(&lines);
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            starts.len() >= 2,
+            "the window manager was started {} time(s) in 3 s, and it exits at once (#4099)",
+            starts.len()
+        );
+        assert!(
+            starts.iter().all(|s| s.parent == keeper),
+            "a start that is not the keeper's ({keeper}): {starts:?}"
+        );
+        // 0.1 + 0.2 + 0.4 s: the fourth start, the first at the ceiling, is
+        // due 0.7 s after the first.
+        assert!(
+            (4..=12).contains(&starts.len()),
+            "{} starts in 3 s, with delays from {floor:?} doubling to {ceil:?}: {starts:?}",
+            starts.len()
+        );
+        let mut delay = floor;
+        for pair in starts.windows(2) {
+            let took = gap(pair[0].at_ns, pair[1].at_ns);
+            assert!(
+                took + Duration::from_millis(20) >= delay,
+                "started again {took:?} after the start before, sooner than its delay of {delay:?}: {starts:?}"
+            );
+            assert!(
+                took <= ceil + Duration::from_secs(1),
+                "started again only {took:?} after the start before: {starts:?}"
+            );
+            delay = (delay * 2).min(ceil);
+        }
+        assert!(
+            said.len() <= starts.len(),
+            "more lines than attempts: {said:?}"
+        );
+        let mut delay = floor;
+        for (line, start) in said.iter().zip(&starts) {
+            assert!(
+                line.contains(&format!("the window manager ({}) exited: ", start.pid)),
+                "the line does not name the window manager's pid {}: {line}",
+                start.pid
+            );
+            assert!(
+                line.contains(&format!(" — it is started again {delay:?} after its exit")),
+                "the line does not name its delay of {delay:?}: {line}"
+            );
+            delay = (delay * 2).min(ceil);
+        }
+    }
+
+    /// #4099, box 2 — a window manager that ran as long as the X server must
+    /// for its exit to start the delays over gets the floor again: after
+    /// three exits at once (0.1, 0.2, 0.4 s), a run of 1.5 s, past a stable
+    /// time of 1 s, is started again after 0.1 s, not 0.8 s.
+    #[test]
+    fn a_window_manager_that_stays_up_resets_the_backoff() {
+        let dir = scratch("wm-reset");
+        let d = dir.display();
+        let floor = Duration::from_millis(100);
+        // Its own run's number (the first line counted it); the fourth run
+        // lives 1.5 s, the fifth stays up, and each exit is stamped.
+        let wm_body = format!(
+            "n=$(wc -l < \"{d}/wm.pids\")\n\
+             if [ \"$n\" -ge 5 ]; then exec sleep 300; fi\n\
+             if [ \"$n\" -eq 4 ]; then sleep 1.5; fi\n\
+             echo \"$$ $(date +%s%N)\" >> \"{d}/wm.exits\""
+        );
+        let (desk, x_pid, _lines) = desktop_restarting_wm(
+            &dir,
+            ":492",
+            &wm_body,
+            [floor, Duration::from_millis(1600), Duration::from_secs(1)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let fifth = poll_for(Duration::from_secs(6), || wm_starts(&dir).get(4).copied());
+        let starts = wm_starts(&dir);
+        let exits: Vec<(i32, i128)> = whole_lines(&dir, "wm.exits")
+            .iter()
+            .filter_map(|f| Some((f.first()?.parse().ok()?, f.get(1)?.parse().ok()?)))
+            .collect();
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            starts.len() >= 2,
+            "the window manager was not started again after its first exit: no second start in 6 s (#4099)"
+        );
+        let fifth = fifth.unwrap_or_else(|| panic!("{} starts in 6 s: {starts:?}", starts.len()));
+        assert!(exits.len() >= 4, "the exits: {exits:?}");
+        for ((pid, _), start) in exits.iter().zip(&starts) {
+            assert_eq!(
+                *pid, start.pid,
+                "the exits {exits:?}, the starts {starts:?}"
+            );
+        }
+        let mut delay = floor;
+        for ((_, exited), start) in exits.iter().zip(starts.iter().skip(1)).take(3) {
+            let took = gap(*exited, start.at_ns);
+            assert!(
+                took + Duration::from_millis(20) >= delay,
+                "started again {took:?} after an exit, sooner than its delay of {delay:?}"
+            );
+            delay *= 2;
+        }
+        let ran = gap(starts[3].at_ns, exits[3].1);
+        assert!(
+            ran >= Duration::from_secs(1),
+            "the fourth run lasted {ran:?}, short of its stable time"
+        );
+        let took = gap(exits[3].1, fifth.at_ns);
+        assert!(
+            took + Duration::from_millis(20) >= floor,
+            "started again {took:?} after its exit, sooner than its floor"
+        );
+        assert!(
+            took < Duration::from_millis(400),
+            "started again {took:?} after a run of {ran:?}, past its stable time of 1 s: the delays did not start over (they would be 0.8 s)"
+        );
+    }
+
+    /// #4099, box 2 — a window manager that cannot be started (its file is
+    /// gone) is tried once at each delay, the delays doubling as for an exit,
+    /// and each failed attempt said in one line, with the window manager, its
+    /// error and the next delay. Put back, it is started by the next attempt.
+    #[test]
+    fn a_window_manager_that_cannot_be_started_is_tried_with_the_backoff() {
+        let dir = scratch("wm-gone");
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":493",
+            "exec sleep 300",
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(800),
+                Duration::from_secs(60),
+            ],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let path = dir.join("wm").display().to_string();
+        let failures = |lines: &KeeperLines| -> Vec<String> {
+            wm_warnings(lines)
+                .into_iter()
+                .filter(|l| l.contains("failed to start"))
+                .collect()
+        };
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first_wm = wm_proc(&first_start(&dir));
+        std::fs::remove_file(dir.join("wm")).unwrap();
+        // Taken before the signal, so that the exit cannot come before it.
+        let signalled = Instant::now();
+        signal_recorded(&first_wm, libc::SIGTERM);
+        let tried =
+            poll_for(Duration::from_secs(2), || failures(&lines).first().cloned()).is_some();
+        // When each of the first three failures was first seen, then the
+        // file put back whole: a new file renamed over the name.
+        let mut seen = Vec::new();
+        let mut back = None;
+        if tried {
+            while seen.len() < 3 && signalled.elapsed() < Duration::from_secs(4) {
+                let n = failures(&lines).len().min(3);
+                while seen.len() < n {
+                    seen.push(signalled.elapsed());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            script(
+                &dir,
+                "wm.new",
+                &format!("{}\nexec sleep 300", wm_started(&dir)),
+            );
+            std::fs::rename(dir.join("wm.new"), dir.join("wm")).unwrap();
+            back = poll_for(Duration::from_millis(1800), || {
+                wm_starts(&dir).get(1).copied()
+            });
+        }
+        let said = failures(&lines);
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            tried,
+            "no attempt in 2 s after the window manager's exit, with its file gone (#4099)"
+        );
+        assert_eq!(seen.len(), 3, "the failed attempts: {said:?}");
+        for (k, (at, least)) in seen.iter().zip([100, 300, 700]).enumerate() {
+            assert!(
+                *at >= Duration::from_millis(least),
+                "attempt {} seen {at:?} after the exit, sooner than its delays allow: {said:?}",
+                k + 1
+            );
+        }
+        for line in &said {
+            assert!(
+                line.contains(&format!("the window manager {path} failed to start: ")),
+                "the line does not name the window manager: {line}"
+            );
+        }
+        let stated: Vec<&str> = said
+            .iter()
+            .map(|l| {
+                l.rsplit("tried again in ")
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+            })
+            .collect();
+        assert_eq!(
+            stated.get(..3),
+            Some(&["200ms", "400ms", "800ms"][..]),
+            "the delays the failures named: {said:?}"
+        );
+        assert!(
+            stated[3..].iter().all(|d| *d == "800ms"),
+            "past the ceiling: {said:?}"
+        );
+        let back = back.expect("put back, the window manager was not started within 1.8 s");
+        assert_eq!(back.parent, keeper, "started by another: {back:?}");
+    }
+
+    /// #4099 — in production the window manager's restart takes the X
+    /// server's numbers: a second at first, doubling to five minutes, and a
+    /// second again once it ran a minute. From the daemon's plan, and from a
+    /// job line without them, as a daemon from before #4099 writes it.
+    #[test]
+    fn the_window_managers_restart_takes_the_servers_numbers() {
+        let p = Plan::of(&Config {
+            resolution: "640x480".into(),
+            wm: "openbox".into(),
+            startup: vec![],
+        });
+        assert_eq!(
+            (p.wm_delay_floor, p.wm_delay_ceil, p.wm_stable_after),
+            (
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+                Duration::from_secs(60)
+            )
+        );
+        assert_eq!(
+            (p.wm_delay_floor, p.wm_delay_ceil, p.wm_stable_after),
+            (p.delay_floor, p.delay_ceil, p.stable_after),
+            "the window manager's numbers are not the X server's"
+        );
+        let job: keeper::Job =
+            serde_json::from_str(r#"{"display":":7","group":9,"wm":"openbox","grace_ms":1500}"#)
+                .expect("a job line from before #4099");
+        assert_eq!(
+            (
+                job.wm_delay_floor_ms,
+                job.wm_delay_ceil_ms,
+                job.wm_stable_after_ms
+            ),
+            (1_000, 300_000, 60_000)
+        );
+    }
+
+    /// #4099, control — a window manager that stays up is started once.
+    #[test]
+    fn a_window_manager_that_stays_up_is_not_started_again() {
+        let dir = scratch("wm-stays");
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":494",
+            "exec sleep 300",
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(400),
+                Duration::from_secs(60),
+            ],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first = first_start(&dir);
+        std::thread::sleep(Duration::from_secs(2));
+        let starts = wm_starts(&dir);
+        let first_ran = is_running(first.pid);
+        let said = wm_warnings(&lines);
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            starts,
+            [first],
+            "a window manager that stayed up was started again"
+        );
+        assert_eq!(
+            first.parent, keeper,
+            "the window manager is not the keeper's"
+        );
+        assert!(first_ran, "the window manager did not stay up");
+        assert!(said.is_empty(), "the keeper warned: {said:?}");
+    }
+
+    /// #4099, control (the stop) — a window manager that exits in a stop is
+    /// not started again. A service manager's stop signals every process of
+    /// the unit at once; here the keeper's SIGTERM comes alone, once it has
+    /// collected the window manager's exit, so the server runs on, and only
+    /// the stop itself keeps the keeper, lingering for its input's end, from
+    /// the start it scheduled.
+    #[test]
+    fn a_window_manager_that_exits_in_a_stop_is_not_started_again() {
+        let dir = scratch("wm-stop");
+        let floor = Duration::from_millis(500);
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":495",
+            "exec sleep 300",
+            [floor, Duration::from_secs(2), Duration::from_secs(60)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first_wm = wm_proc(&first_start(&dir));
+        signal_recorded(&first_wm, libc::SIGTERM);
+        wait_for("the keeper to collect the window manager", || {
+            reaped(&first_wm)
+        });
+        // The keeper, our child, unreaped while the tree lists it.
+        RealProcs.signal(keeper, libc::SIGTERM);
+        // Past the start's due time, by a second.
+        std::thread::sleep(floor + Duration::from_secs(1));
+        let starts = wm_starts(&dir);
+        let keeper_stayed = is_running(keeper);
+        let server_ran = is_running(x_pid);
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (warned, read) = keeper_warnings(&lines, "asked to stop");
+
+        assert!(read, "the keeper's lines were not read: {lines:?}");
+        assert!(
+            keeper_stayed,
+            "the keeper left on SIGTERM alone, before the start was due"
+        );
+        assert!(
+            server_ran,
+            "the X server stopped, so its check may have kept the start out"
+        );
+        assert_eq!(
+            starts.len(),
+            1,
+            "the window manager was started again in a stop: {starts:?}"
+        );
+        assert!(warned.is_empty(), "the keeper warned in a stop: {warned:?}");
+    }
+
+    /// #4099, control (the end of input) — a window manager that exits in the
+    /// daemon's teardown is not started again: the teardown ends the keeper's
+    /// input before the start is due, and the keeper takes the desktop down.
+    #[test]
+    fn a_window_manager_that_exits_in_the_daemons_teardown_is_not_started_again() {
+        let dir = scratch("wm-teardown");
+        let floor = Duration::from_millis(500);
+        let (desk, x_pid, _lines) = desktop_restarting_wm(
+            &dir,
+            ":496",
+            "exec sleep 300",
+            [floor, Duration::from_secs(2), Duration::from_secs(60)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first_wm = wm_proc(&first_start(&dir));
+        signal_recorded(&first_wm, libc::SIGTERM);
+        wait_for("the keeper to collect the window manager", || {
+            reaped(&first_wm)
+        });
+        stopped(&desk, supervisor);
+        // Past the start's due time.
+        std::thread::sleep(floor);
+        let starts = wm_starts(&dir);
+        let keeper_gone = collected(keeper);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            starts.len(),
+            1,
+            "the window manager was started again in the daemon's teardown: {starts:?}"
+        );
+        assert!(keeper_gone, "the stop left the keeper {keeper}");
+    }
+
+    /// #4099, control (the server) — a window manager whose X server is gone
+    /// is not started again. No supervisor here: nothing takes the desktop
+    /// down, so the keeper runs on past the start's due time with its input
+    /// open, and only its look at the server, a zombie now, keeps the start
+    /// out.
+    #[test]
+    fn a_window_manager_whose_server_is_gone_is_not_started_again() {
+        let dir = scratch("wm-no-server");
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":497",
+            "exec sleep 300",
+            [
+                Duration::from_millis(200),
+                Duration::from_secs(2),
+                Duration::from_secs(60),
+            ],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let first_wm = wm_proc(&first_start(&dir));
+        // The server's stand-in, our child, unreaped: a zombie from now on.
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        wait_for("the X server to die", || !is_running(x_pid));
+        signal_recorded(&first_wm, libc::SIGKILL);
+        wait_for("the keeper to collect the window manager", || {
+            reaped(&first_wm)
+        });
+        // Ten floors past the window manager's exit.
+        std::thread::sleep(Duration::from_secs(2));
+        let starts = wm_starts(&dir);
+        let keeper_ran = is_running(keeper);
+        let said = wm_warnings(&lines);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            keeper_ran,
+            "the keeper left, so its look at the server was not what kept the start out"
+        );
+        assert_eq!(
+            starts.len(),
+            1,
+            "the window manager was started again onto a server that is gone: {starts:?}"
+        );
+        assert!(
+            said.is_empty(),
+            "the keeper warned of a desktop that did not run on: {said:?}"
+        );
+    }
+
+    /// #4099, control (the order) — an X server's death ends its clients, the
+    /// window manager among the first, so its exit reaches the keeper before
+    /// the server's (50 ms here, as in [`an_x_server_death_adds_no_keeper_warning`]).
+    /// The supervisor's teardown comes only after its stop grace (1 s, as the
+    /// daemon's), past the start's due time, so only the keeper's look at the
+    /// server keeps the start out.
+    #[test]
+    fn a_window_manager_that_exits_just_before_its_server_is_not_started_again() {
+        let dir = scratch("wm-then-server");
+        let floor = Duration::from_millis(500);
+        let (desk, x_pid, _lines) = desktop_restarting_wm(
+            &dir,
+            ":498",
+            "exec sleep 300",
+            [floor, Duration::from_secs(2), Duration::from_secs(60)],
+            plan_delayed(stand_in(&dir, "exit 1"), STOP_GRACE),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first_wm = wm_proc(&first_start(&dir));
+        let killed = Instant::now();
+        signal_recorded(&first_wm, libc::SIGKILL);
+        std::thread::sleep(Duration::from_millis(50));
+        // The server's stand-in, our child, unreaped while the tree lists it.
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        wait_for("the supervisor's teardown to collect the keeper", || {
+            collected(keeper)
+        });
+        let keeper_lived = killed.elapsed();
+        let starts: Vec<WmStart> = wm_starts(&dir)
+            .into_iter()
+            .filter(|s| s.parent == keeper)
+            .collect();
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            keeper_lived > floor + Duration::from_millis(200),
+            "the keeper was gone {keeper_lived:?} after the window manager's exit, before its start was due: this proves nothing"
+        );
+        assert_eq!(
+            starts.len(),
+            1,
+            "the window manager was started again onto a dying server: {starts:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4100: the X clients Remote Apps (FR-56) starts on a desktop whose
+    // keeper runs are the keeper's: collected when they exit, and ended with
+    // the desktop, their orphans with them. A bash session's tmux server
+    // stays outside, and without a keeper Remote Apps starts its clients as
+    // before. Stand-ins only, never the real tmux, xterm, wmctrl or xprop (a
+    // person's tmux is on the default socket); no X server, displays
+    // `:440`-`:456`, `:480`, `:482`, `:489` and `:499`, never `:99`.
+    // -----------------------------------------------------------------------
+
+    /// Remote Apps' helper programs as stand-ins in `dir`, in the order
+    /// [`crate::apps::linux_backend_for_tests`] takes them: tmux, xterm,
+    /// wmctrl and xprop.
+    ///
+    /// tmux's `new-session -d -s <name>` starts a server stand-in in a
+    /// session of its own (`setsid`, as a tmux server leaves its client's),
+    /// which writes its pid to `<dir>/server.pid`, and adds `<name>` to
+    /// `<dir>/sessions`; its `list-sessions` prints that file, and exits 1
+    /// without one, as tmux does with no server. xterm appends
+    /// `$$ <title>` to `<dir>/xterms` and sleeps. wmctrl and xprop print
+    /// nothing.
+    fn app_tools(dir: &Path) -> [String; 4] {
+        let d = dir.display();
+        [
+            script(
+                dir,
+                "tmux",
+                &format!(
+                    "case \"$1\" in\n\
+                     new-session)\n\
+                     setsid sh -c 'echo $$ > \"{d}/server.pid\"; exec sleep 300' \
+                     </dev/null >/dev/null 2>&1 &\n\
+                     echo \"$4\" >> \"{d}/sessions\" ;;\n\
+                     list-sessions)\n\
+                     [ -s \"{d}/sessions\" ] || exit 1\n\
+                     cat \"{d}/sessions\" ;;\n\
+                     *) exit 1 ;;\n\
+                     esac"
+                ),
+            ),
+            script(
+                dir,
+                "xterm",
+                &format!("echo \"$$ $2\" >> \"{d}/xterms\"\nexec sleep 300"),
+            ),
+            script(dir, "wmctrl", "exit 0"),
+            script(dir, "xprop", "exit 0"),
+        ]
+    }
+
+    /// Remote Apps' Linux backend on `display`, with the stand-ins of
+    /// [`app_tools`] for its helper programs, asking `desk` who starts each X
+    /// client, as the daemon asks its own desktop ([`start_x_client`]).
+    fn apps_on(
+        desk: &Arc<Desktop>,
+        display: &str,
+        dir: &Path,
+    ) -> Box<dyn crate::apps::WindowManager> {
+        let desk = desk.clone();
+        crate::apps::linux_backend_for_tests(
+            display,
+            app_tools(dir),
+            Arc::new(move |display: &str, program: &str, args: &[&str]| {
+                desk.start_x_client(display, program, args)
+            }),
+        )
+    }
+
+    /// A Remote Apps entry, as `resolve_app` hands it to a backend.
+    fn entry(key: &str, command: &[&str], terminal: bool, tmux: bool) -> crate::apps::ResolvedApp {
+        crate::apps::ResolvedApp {
+            key: key.into(),
+            command: command.iter().map(|s| s.to_string()).collect(),
+            terminal,
+            tmux,
+        }
+    }
+
+    /// A GUI app's stand-in `<dir>/<name>`: it writes its pid to
+    /// `<dir>/<name>.pid`, then sleeps.
+    fn gui_app(dir: &Path, name: &str) -> String {
+        script(
+            dir,
+            name,
+            &format!("echo $$ > \"{}/{name}.pid\"\nexec sleep 300", dir.display()),
+        )
+    }
+
+    /// A GUI app's stand-in that starts [`deaf_setsid_child`], writes its pid
+    /// to `<dir>/app.pid`, and exits once `<dir>/app.exit` is there.
+    fn orphaning_app(dir: &Path) -> String {
+        let d = dir.display();
+        script(
+            dir,
+            "app",
+            &format!(
+                "{}\n\
+                 echo $$ > \"{d}/app.pid\"\n\
+                 while [ ! -e \"{d}/app.exit\" ]; do sleep 0.05; done\n\
+                 exit 0",
+                deaf_setsid_child(dir)
+            ),
+        )
+    }
+
+    /// `desk`, around the server `x_pid`, with its keeper running and marked
+    /// up, as `bring_up` leaves it: a stop for when the test leaves, and the
+    /// keeper's pid.
+    fn kept_up(desk: &Arc<Desktop>, x_pid: i32) -> (StopAtTheEnd, i32) {
+        let stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let _ = running(desk, x_pid, Some(keeper));
+        (stop, keeper)
+    }
+
+    /// The process whose pid a stand-in wrote to `<dir>/<name>`, as `/proc`
+    /// describes it, within `within`: `None` when none ran.
+    fn ran(dir: &Path, name: &str, within: Duration) -> Option<ProcInfo> {
+        poll_for(within, || {
+            let pid = std::fs::read_to_string(dir.join(name))
+                .ok()?
+                .trim()
+                .parse::<i32>()
+                .ok()?;
+            read_proc_stat(pid)
+        })
+    }
+
+    /// The `n`th xterm stand-in (from 0) that ran with `title`, within
+    /// `within`.
+    fn xterm_ran(dir: &Path, title: &str, n: usize, within: Duration) -> Option<ProcInfo> {
+        poll_for(within, || {
+            let pid = whole_lines(dir, "xterms")
+                .into_iter()
+                .filter(|f| f.get(1).is_some_and(|t| t == title))
+                .nth(n)?
+                .first()?
+                .parse::<i32>()
+                .ok()?;
+            read_proc_stat(pid)
+        })
+    }
+
+    /// [`orphaning_app`]'s run: the app and its child as `/proc` describes
+    /// them, once the app was told to exit and its child has another parent
+    /// (`None` for what never ran).
+    fn orphaned(dir: &Path) -> (Option<ProcInfo>, Option<ProcInfo>) {
+        let app = ran(dir, "app.pid", Duration::from_secs(5));
+        let gc = ran(dir, "gc.pid", Duration::from_secs(5));
+        std::fs::write(dir.join("app.exit"), "").unwrap();
+        if let (Some(app), Some(gc)) = (app, gc) {
+            let _ = poll_for(Duration::from_secs(5), || {
+                read_proc_stat(gc.pid).filter(|p| p.ppid != app.pid)
+            });
+        }
+        (app, gc)
+    }
+
+    /// Who `info`'s parent is, in a failure's words.
+    fn parent_named(info: &ProcInfo, keeper: i32) -> String {
+        if info.ppid == keeper {
+            "the desktop's keeper".into()
+        } else if info.ppid == std::process::id() as i32 {
+            "the daemon".into()
+        } else {
+            format!("process {}", info.ppid)
+        }
+    }
+
+    /// How a client that must not have run was started, in a failure's words.
+    fn how_started(info: &ProcInfo, keeper: i32) -> String {
+        if info.ppid == std::process::id() as i32 {
+            "started directly, by the daemon".into()
+        } else {
+            format!("started, under {}", parent_named(info, keeper))
+        }
+    }
+
+    /// The processes a test started that no tree may reach (a client Remote
+    /// Apps started directly, as before #4100, and the orphan of one):
+    /// SIGKILLed when the test leaves, as [`KillAtTheEnd`] does, and each one
+    /// that is this process's own child reaped too, so that a RED leaves no
+    /// zombie behind it.
+    struct EndAtTheEnd(Vec<ProcInfo>);
+    impl Drop for EndAtTheEnd {
+        fn drop(&mut self) {
+            let me = std::process::id() as i32;
+            for info in &self.0 {
+                if !RealProcs.same_process_now(info) {
+                    continue;
+                }
+                RealProcs.signal(info.pid, libc::SIGKILL);
+                if read_proc_stat(info.pid).is_some_and(|now| now.ppid == me) {
+                    let _ = poll_for(Duration::from_secs(1), || {
+                        let mut status = 0;
+                        // SAFETY: `waitpid(2)` on one child of this process,
+                        // with a live out-pointer; WNOHANG never blocks.
+                        let got = unsafe { libc::waitpid(info.pid, &mut status, libc::WNOHANG) };
+                        (got != 0).then_some(())
+                    });
+                }
+            }
+        }
+    }
+
+    /// SIGCONT for a process a test stopped, when the test leaves, whatever
+    /// an assertion did.
+    struct ContAtTheEnd(ProcInfo);
+    impl Drop for ContAtTheEnd {
+        fn drop(&mut self) {
+            signal_recorded(&self.0, libc::SIGCONT);
+        }
+    }
+
+    /// #4100, box 1 — a GUI entry and a terminal entry of Remote Apps,
+    /// started on a desktop whose keeper runs, are the keeper's children in
+    /// the desktop's group, and each one's exit is collected.
+    #[test]
+    fn an_app_remote_apps_starts_runs_under_the_keeper_and_its_exit_is_collected() {
+        let dir = scratch("apps-kept");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":450", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":450", &dir);
+        let gui = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let gui_ran = ran(&dir, "probe.pid", Duration::from_secs(5));
+        let term = apps.launch(&entry("top", &["top"], true, false));
+        let term_ran = xterm_ran(&dir, "roomler:app:top", 0, Duration::from_secs(5));
+        let _ours = EndAtTheEnd(gui_ran.into_iter().chain(term_ran).collect());
+        // Each one ends, as a person closes its window: its exit is for its
+        // parent to collect.
+        let collected_within = |info: &Option<ProcInfo>| {
+            info.as_ref().is_some_and(|info| {
+                signal_recorded(info, libc::SIGTERM);
+                poll_for(Duration::from_secs(2), || reaped(info).then_some(())).is_some()
+            })
+        };
+        let gui_collected = collected_within(&gui_ran);
+        let term_collected = collected_within(&term_ran);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &gui {
+            panic!("the GUI app did not launch: {e:#}");
+        }
+        if let Err(e) = &term {
+            panic!("the terminal app did not launch: {e:#}");
+        }
+        let gui_ran = gui_ran.expect("the GUI app never ran");
+        let term_ran = term_ran.expect("the terminal app's xterm never ran");
+        for (what, info) in [("GUI app", gui_ran), ("terminal app's xterm", term_ran)] {
+            assert_eq!(
+                info.ppid,
+                keeper,
+                "the {what}'s parent is {}, not the desktop's keeper {keeper} (#4100)",
+                parent_named(&info, keeper)
+            );
+            assert_eq!(
+                info.pgid, x_pid,
+                "the {what} is not in the desktop's group (#4100)"
+            );
+        }
+        assert!(
+            gui_collected,
+            "the GUI app's exit was not collected within 2 s (#4100)"
+        );
+        assert!(
+            term_collected,
+            "the terminal app's xterm's exit was not collected within 2 s (#4100)"
+        );
+    }
+
+    /// #4100, box 1 — a bash session's xterm, and the xterm its re-attach
+    /// starts once that one ended, are the keeper's children in the
+    /// desktop's group.
+    #[test]
+    fn a_bash_sessions_xterm_and_its_reattach_run_under_the_keeper() {
+        if !have_setsid("a_bash_sessions_xterm_and_its_reattach_run_under_the_keeper") {
+            return;
+        }
+        let dir = scratch("apps-bash");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":451", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":451", &dir);
+        let launched = apps.launch(&entry("bash", &["bash"], true, true));
+        let server = ran(&dir, "server.pid", Duration::from_secs(5));
+        let first = xterm_ran(&dir, "roomler:tmux:s1", 0, Duration::from_secs(5));
+        let mut ours = EndAtTheEnd(server.into_iter().chain(first).collect());
+        // The xterm ends, as a person closes its window: the session is
+        // detached, and a focus attaches it again in a new xterm.
+        if let Some(first) = &first {
+            signal_recorded(first, libc::SIGTERM);
+            let _ = poll_for(Duration::from_secs(2), || {
+                (!still_running(first)).then_some(())
+            });
+        }
+        let focused = apps.focus("tmux:s1");
+        let again = xterm_ran(&dir, "roomler:tmux:s1", 1, Duration::from_secs(5));
+        ours.0.extend(again);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the bash entry did not launch: {e:#}");
+        }
+        if let Err(e) = &focused {
+            panic!("the re-attach did not start: {e:#}");
+        }
+        let first = first.expect("the bash session's xterm never ran");
+        let again = again.expect("the re-attach's xterm never ran");
+        for (what, info) in [
+            ("bash session's xterm", first),
+            ("re-attach's xterm", again),
+        ] {
+            assert_eq!(
+                info.ppid,
+                keeper,
+                "the {what}'s parent is {}, not the desktop's keeper {keeper} (#4100)",
+                parent_named(&info, keeper)
+            );
+            assert_eq!(
+                info.pgid, x_pid,
+                "the {what} is not in the desktop's group (#4100)"
+            );
+        }
+    }
+
+    /// #4100, box 2 — a Remote Apps client that leaves a child in a session
+    /// of its own (`setsid`, deaf to SIGTERM) and exits: the desktop's stop
+    /// ends that child, as it ends a startup app's
+    /// (`an_orphan_of_an_app_that_exited_by_itself_is_reached_by_the_next_stop`).
+    #[test]
+    fn the_desktops_stop_reaches_the_setsid_orphan_of_a_remote_app() {
+        if !have_setsid("the_desktops_stop_reaches_the_setsid_orphan_of_a_remote_app") {
+            return;
+        }
+        let dir = scratch("apps-orphan");
+        let app = orphaning_app(&dir);
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":452", "exec sleep 300");
+        let (_stop, _keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":452", &dir);
+        let launched = apps.launch(&entry("app", &[app.as_str()], false, false));
+        let (app_ran, gc) = orphaned(&dir);
+        let _ours = EndAtTheEnd(app_ran.into_iter().chain(gc).collect());
+        let asked = Instant::now();
+        desk.stop();
+        let gone =
+            gc.map(|gc| poll_for(Duration::from_secs(5), || reaped(&gc).then_some(())).is_some());
+        let took = asked.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the app did not launch: {e:#}");
+        }
+        let gc = gc.expect("the app's setsid child never ran");
+        assert_eq!(
+            gone,
+            Some(true),
+            "the setsid orphan {} of a Remote Apps client outlived the desktop's stop ({took:?}) (#4100)",
+            gc.pid
+        );
+    }
+
+    /// #4100, box 2 — the same orphan when its X server dies: the
+    /// supervisor's teardown ends it, as it ends a startup app's
+    /// (`an_orphan_of_an_app_that_died_with_its_server_does_not_outlive_the_teardown`).
+    #[test]
+    fn an_x_server_death_takes_the_setsid_orphan_of_a_remote_app() {
+        if !have_setsid("an_x_server_death_takes_the_setsid_orphan_of_a_remote_app") {
+            return;
+        }
+        let dir = scratch("apps-orphan-x");
+        let app = orphaning_app(&dir);
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":453", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let apps = apps_on(&desk, ":453", &dir);
+        let launched = apps.launch(&entry("app", &[app.as_str()], false, false));
+        let (app_ran, gc) = orphaned(&dir);
+        let _ours = EndAtTheEnd(app_ran.into_iter().chain(gc).collect());
+        let killed = Instant::now();
+        // The server's stand-in, our child, unreaped while the tree lists it.
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        let gone =
+            gc.map(|gc| poll_for(Duration::from_secs(10), || reaped(&gc).then_some(())).is_some());
+        let took = killed.elapsed();
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the app did not launch: {e:#}");
+        }
+        let gc = gc.expect("the app's setsid child never ran");
+        assert_eq!(
+            gone,
+            Some(true),
+            "the setsid orphan {} of a Remote Apps client outlived its X server's death ({took:?}) (#4100)",
+            gc.pid
+        );
+    }
+
+    /// #4100, guard — a start that reaches the keeper in its own stop (its
+    /// SIGTERM: what the desktop started is taken down, the server runs on)
+    /// is refused, and nothing runs.
+    #[test]
+    fn no_remote_app_starts_in_the_keepers_stop() {
+        let dir = scratch("apps-keeper-stop");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, lines) = desktop_keeping_lines(&dir, ":454", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":454", &dir);
+        let keeper_info = read_proc_stat(keeper).expect("the keeper runs");
+        signal_recorded(&keeper_info, libc::SIGTERM);
+        let stopping = poll_for(Duration::from_secs(10), || {
+            lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|l| l.contains("asked to stop"))
+                .then_some(())
+        });
+        let launched = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        let server_ran = is_running(x_pid);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(stopping.is_some(), "the keeper did not take its SIGTERM");
+        if let Some(info) = probe_ran {
+            panic!(
+                "a Remote Apps client was {} in the keeper's stop (#4100)",
+                how_started(&info, keeper)
+            );
+        }
+        assert!(server_ran, "the server did not run on: this proves nothing");
+        assert!(launched.is_err(), "the launch said it started");
+    }
+
+    /// #4100, guard — a start onto an X server that is gone (SIGKILLed: a
+    /// zombie no supervisor has collected) is refused, nothing runs, and the
+    /// keeper runs on.
+    #[test]
+    fn no_remote_app_starts_onto_a_server_that_is_gone() {
+        let dir = scratch("apps-server-gone");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":455", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":455", &dir);
+        let keeper_info = read_proc_stat(keeper).expect("the keeper runs");
+        // The server's stand-in, our child: a zombie until the stop reaps it.
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        let dead = poll_for(Duration::from_secs(5), || {
+            (!is_running(x_pid)).then_some(())
+        });
+        let launched = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        let keeper_ran_on = still_running(&keeper_info);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(dead.is_some(), "the server's stand-in did not die");
+        if let Some(info) = probe_ran {
+            panic!(
+                "a Remote Apps client was {} onto a server that is gone (#4100)",
+                how_started(&info, keeper)
+            );
+        }
+        assert!(launched.is_err(), "the launch said it started");
+        assert!(keeper_ran_on, "the keeper did not run on");
+    }
+
+    /// #4100, guard — a start the daemon writes right behind the job, in the
+    /// same write, is answered: the keeper hands on what it read past the
+    /// job's line instead of dropping it.
+    #[test]
+    #[allow(clippy::zombie_processes)] // the keeper is reaped by `try_wait`, or killed and waited for
+    fn a_start_written_right_behind_the_job_is_answered() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::process::CommandExt as _;
+        let dir = scratch("apps-behind-the-job");
+        let probe = gui_app(&dir, "probe");
+        let wm = script(&dir, "wm", "exec sleep 300");
+        // The desktop's group, led by a `sleep` in the server's place.
+        let mut leader = Command::new("sleep");
+        leader
+            .arg("300")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut leader = leader.spawn().unwrap();
+        let group = leader.id() as i32;
+        let mut ours = EndAtTheEnd(vec![read_proc_stat(group).expect("the group's leader")]);
+        let mut cmd = KeeperCmd::test().command();
+        cmd.process_group(group)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut keeper = cmd.spawn().unwrap();
+        let keeper_pid = keeper.id() as i32;
+        let job = keeper::Job {
+            display: ":445".into(),
+            group,
+            wm,
+            apps: vec![],
+            grace_ms: KEEPER_GRACE.as_millis() as u64,
+            wm_delay_floor_ms: 3_600_000,
+            wm_delay_ceil_ms: 3_600_000,
+            wm_stable_after_ms: 3_600_000,
+        };
+        let start = keeper::Start {
+            id: 7,
+            argv: vec![probe],
+            deadline_ms: u64::MAX,
+        };
+        let mut input = keeper.stdin.take().unwrap();
+        input
+            .write_all(format!("{}{}", job.line(), start.line()).as_bytes())
+            .unwrap();
+        // Its lines on a thread of their own, read to the end: a keeper that
+        // never speaks fails this test instead of hanging it.
+        let (said, heard) = std::sync::mpsc::channel();
+        let stderr = keeper.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if said.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let first = heard.recv_timeout(Duration::from_secs(20)).ok();
+        let answer = first.as_ref().and_then(|_| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match heard.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(line) if line.starts_with("start 7: ") => break Some(line),
+                    Ok(_) => continue,
+                    Err(_) => break None,
+                }
+            }
+        });
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        ours.0.extend(probe_ran);
+        drop(input);
+        let asked = Instant::now();
+        let mut left = false;
+        while asked.elapsed() < Duration::from_secs(10) {
+            if let Ok(Some(_)) = keeper.try_wait() {
+                left = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !left {
+            let _ = keeper.kill();
+            let _ = keeper.wait();
+        }
+        let _ = leader.kill();
+        let _ = leader.wait();
+        drop(ours);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(first.as_deref(), Some("ready"));
+        let answer = answer.unwrap_or_else(|| {
+            panic!(
+                "the keeper did not answer a start written right behind its job within 2 s (#4100)"
+            )
+        });
+        let probe_ran =
+            probe_ran.unwrap_or_else(|| panic!("the keeper answered {answer:?}, and nothing ran"));
+        assert_eq!(
+            probe_ran.ppid, keeper_pid,
+            "the start ran, but not under the keeper"
+        );
+    }
+
+    /// #4100, guard — a start longer than one atomic write to the keeper's
+    /// input (`KEEPER_JOB_MAX`, `PIPE_BUF`) is refused before anything is
+    /// written: the refusal names the bound, the keeper says nothing of it,
+    /// and nothing runs.
+    #[test]
+    fn a_start_longer_than_one_atomic_write_is_refused_before_it_is_sent() {
+        let dir = scratch("apps-long");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, lines) = desktop_keeping_lines(&dir, ":456", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":456", &dir);
+        let long = "x".repeat(KEEPER_JOB_MAX);
+        let launched = apps.launch(&entry(
+            "probe",
+            &[probe.as_str(), long.as_str()],
+            false,
+            false,
+        ));
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        let (warned, _) = keeper_warnings(&lines, "");
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Some(info) = probe_ran {
+            panic!(
+                "a start of more than {KEEPER_JOB_MAX} bytes was {} (#4100)",
+                how_started(&info, keeper)
+            );
+        }
+        let refusal = match &launched {
+            Ok(_) => panic!("the launch said it started"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            refusal.contains(&format!("more than {KEEPER_JOB_MAX} bytes")),
+            "the refusal does not name the bound: {refusal}"
+        );
+        assert!(
+            warned.is_empty(),
+            "something of it reached the keeper: {warned:?}"
+        );
+    }
+
+    /// #4100, guard — a start the daemon gave up on (its keeper stopped by
+    /// SIGSTOP past the wait) fails its launch within the wait, and never
+    /// starts later: the keeper, running again, reads it past its deadline.
+    #[test]
+    fn a_start_the_daemon_gave_up_on_never_starts() {
+        let dir = scratch("apps-gave-up");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":480", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":480", &dir);
+        let keeper_info = read_proc_stat(keeper).expect("the keeper runs");
+        signal_recorded(&keeper_info, libc::SIGSTOP);
+        let cont = ContAtTheEnd(keeper_info);
+        let asked = Instant::now();
+        let launched = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let took = asked.elapsed();
+        // The keeper runs again, and reads the start now.
+        drop(cont);
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        let wait = desk.plan.x_client_wait;
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Some(info) = probe_ran {
+            panic!(
+                "a start the daemon gave up on was {} (#4100)",
+                how_started(&info, keeper)
+            );
+        }
+        assert!(launched.is_err(), "the launch said it started");
+        assert!(
+            took < wait + Duration::from_secs(2),
+            "the launch took {took:?}, past its wait of {wait:?}"
+        );
+    }
+
+    /// #4100, box 3 (control) — a bash session's tmux server is started as
+    /// before, never through the keeper: it is neither the keeper's child nor
+    /// in the desktop's group, and it outlives the desktop's stop.
+    #[test]
+    fn a_bash_sessions_tmux_server_stays_outside_the_keeper() {
+        if !have_setsid("a_bash_sessions_tmux_server_stays_outside_the_keeper") {
+            return;
+        }
+        let dir = scratch("apps-tmux");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":482", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":482", &dir);
+        let launched = apps.launch(&entry("bash", &["bash"], true, true));
+        let server = ran(&dir, "server.pid", Duration::from_secs(5));
+        let xterm = xterm_ran(&dir, "roomler:tmux:s1", 0, Duration::from_secs(5));
+        let _ours = EndAtTheEnd(server.into_iter().chain(xterm).collect());
+        desk.stop();
+        let outlived = server.is_some_and(|s| still_running(&s));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the bash entry did not launch: {e:#}");
+        }
+        let server = server.expect("the tmux server's stand-in never ran");
+        assert_ne!(server.ppid, keeper, "the tmux server is the keeper's child");
+        assert_ne!(
+            server.pgid, x_pid,
+            "the tmux server is in the desktop's group"
+        );
+        assert!(outlived, "the desktop's stop ended the tmux server");
+    }
+
+    /// #4100, box 4 (control) — where the keeper does not run, Remote Apps
+    /// starts its clients as before: under the kill switch, after a keeper
+    /// that refused, and on another display than the desktop's, a client is
+    /// the daemon's own child, outside the desktop's group.
+    #[test]
+    fn where_the_keeper_does_not_run_remote_apps_starts_its_clients_as_before() {
+        let dir = scratch("apps-direct");
+        let sub = |name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            sub
+        };
+        let (off_dir, refused_dir, kept_dir) = (sub("off"), sub("refused"), sub("kept"));
+        // The kill switch.
+        let (off, off_x) = desktop_with(
+            &off_dir,
+            ":489",
+            "exec sleep 300",
+            Clients::Direct,
+            Duration::from_secs(20),
+        );
+        let _off = StopAtTheEnd(off.clone());
+        assert_eq!(off.start_clients(), None, "the kill switch runs no keeper");
+        let _ = running(&off, off_x, None);
+        // A keeper that refuses: the clients are started directly.
+        let refuses = script(
+            &refused_dir,
+            "keeper",
+            "echo 'refused: no subreaper on this host' >&2\nexit 2",
+        );
+        let (refused, refused_x) = desktop_with(
+            &refused_dir,
+            ":499",
+            "exec sleep 300",
+            Clients::Keeper(KeeperCmd::script(&refuses)),
+            Duration::from_secs(20),
+        );
+        let _refused = StopAtTheEnd(refused.clone());
+        assert_eq!(refused.start_clients(), None, "the keeper refused");
+        let _ = running(&refused, refused_x, None);
+        // A keeper that runs, and Remote Apps on another display.
+        let (kept, kept_x, _lines) = desktop_keeping_lines(&kept_dir, ":440", "exec sleep 300");
+        let (_kept, _keeper) = kept_up(&kept, kept_x);
+
+        let cases = [
+            (
+                "the kill switch",
+                apps_on(&off, ":489", &off_dir),
+                off_x,
+                &off_dir,
+            ),
+            (
+                "a keeper that refused",
+                apps_on(&refused, ":499", &refused_dir),
+                refused_x,
+                &refused_dir,
+            ),
+            (
+                "another display",
+                apps_on(&kept, ":441", &kept_dir),
+                kept_x,
+                &kept_dir,
+            ),
+        ];
+        let mut started = Vec::new();
+        for (case, apps, x_pid, dir) in &cases {
+            let probe = gui_app(dir, "probe");
+            let launched = apps
+                .launch(&entry("probe", &[probe.as_str()], false, false))
+                .map_err(|e| format!("{e:#}"));
+            let client = ran(dir, "probe.pid", Duration::from_secs(5));
+            started.push((*case, launched, client, *x_pid));
+        }
+        let _ours = EndAtTheEnd(started.iter().filter_map(|s| s.2).collect());
+        off.stop();
+        refused.stop();
+        kept.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let me = std::process::id() as i32;
+        for (case, launched, client, x_pid) in started {
+            if let Err(e) = launched {
+                panic!("{case}: the launch failed: {e}");
+            }
+            let info = client.unwrap_or_else(|| panic!("{case}: the client never ran"));
+            assert_eq!(
+                info.ppid, me,
+                "{case}: the client's parent is {}, not the daemon",
+                info.ppid
+            );
+            assert_ne!(
+                info.pgid, x_pid,
+                "{case}: the client is in the desktop's group"
+            );
+        }
+    }
+
+    /// #4100, box 4 (control) — a start that fails says what it said before
+    /// #4100, on the keeper's path as on the direct one: a program that is
+    /// not there, and a file that is not executable.
+    #[test]
+    fn a_start_that_fails_says_what_it_said_before() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("apps-fails");
+        let not_executable = script(&dir, "not-executable", "exit 0");
+        std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let missing = dir.join("not-there").display().to_string();
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":442", "exec sleep 300");
+        let (_stop, _keeper) = kept_up(&desk, x_pid);
+        let kept = apps_on(&desk, ":442", &dir);
+        // Another display than the desktop's: started directly.
+        let direct = apps_on(&desk, ":443", &dir);
+        let said = |apps: &dyn crate::apps::WindowManager, program: &str| {
+            apps.launch(&entry("broken", &[program], false, false))
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"))
+        };
+        let results: Vec<_> = [&missing, &not_executable]
+            .into_iter()
+            .map(|program| {
+                (
+                    program.clone(),
+                    said(&*kept, program),
+                    said(&*direct, program),
+                )
+            })
+            .collect();
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for (program, on_the_keepers_path, before) in results {
+            assert!(before.is_err(), "{program}: the direct start did not fail");
+            assert_eq!(
+                on_the_keepers_path, before,
+                "{program}: the keeper's path says otherwise"
+            );
+        }
+    }
+
+    /// #4100 (control) — a Remote Apps client's exit is not the window
+    /// manager's: with the window manager's restart numbers short, a client
+    /// that exits starts no window manager and says nothing of one.
+    #[test]
+    fn a_remote_apps_client_exit_is_not_the_window_managers() {
+        let dir = scratch("apps-not-the-wm");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":444",
+            "exec sleep 300",
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_secs(60),
+            ],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let (_stop, _keeper) = kept_up(&desk, x_pid);
+        let _first = first_start(&dir);
+        let apps = apps_on(&desk, ":444", &dir);
+        let launched = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(5));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        if let Some(probe) = &probe_ran {
+            signal_recorded(probe, libc::SIGTERM);
+        }
+        // Past the restart's ceiling, and the delay of a notice (2 s).
+        std::thread::sleep(Duration::from_millis(2500));
+        let starts = wm_starts(&dir);
+        let said = wm_warnings(&lines);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the client did not launch: {e:#}");
+        }
+        assert!(probe_ran.is_some(), "the client never ran");
+        assert_eq!(
+            starts.len(),
+            1,
+            "a client's exit started the window manager again: {starts:?}"
+        );
+        assert!(
+            said.is_empty(),
+            "a client's exit was said as the window manager's: {said:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6141,7 +8171,7 @@ mod supervise_tests {
         assert_eq!(
             reason.detail,
             "this device's virtual desktop is down: its X server (Xvfb) exited: signal 9 \
-             (killed). The agent starts it again by itself; reconnect in a moment"
+             (killed). The daemon starts it again by itself; reconnect in a moment"
         );
         // Not before the grace: a stop that comes within it is the daemon's
         // own, and its sessions are told nothing.
@@ -7225,7 +9255,17 @@ mod supervise_tests {
         );
         let _stop = StopAtTheEnd(desk.clone());
         let keeper = desk.start_clients();
-        let wm = recorded(dir, "wm.pid");
+        // Its pid is written before its `exec sleep 300`: read it once that
+        // `sleep` sleeps, never while its script or its start runs (#4197).
+        let wm = asleep_in_its_sleep(pid_in(dir, "wm.pid"));
+        let seen = seen_of(&wm, x_pid);
+        desk.stop();
+        (seen, keeper, wm.ppid)
+    }
+
+    /// What `wm`, a client of the desktop whose X server is `x_pid`, got
+    /// from whoever started it.
+    fn seen_of(wm: &ProcInfo, x_pid: i32) -> Seen {
         let mut environ: Vec<String> = std::fs::read(format!("/proc/{}/environ", wm.pid))
             .unwrap_or_default()
             .split(|b| *b == 0)
@@ -7235,7 +9275,7 @@ mod supervise_tests {
         environ.sort();
         // SAFETY: `getsid(2)` on a live pid.
         let session = unsafe { libc::getsid(wm.pid) };
-        let seen = Seen {
+        Seen {
             environ,
             cwd: std::fs::read_link(format!("/proc/{}/cwd", wm.pid)).ok(),
             umask: status_line(wm.pid, "Umask:"),
@@ -7244,9 +9284,7 @@ mod supervise_tests {
             group_is_the_servers: wm.pgid == x_pid,
             session,
             fds: fds_of(wm.pid),
-        };
-        desk.stop();
-        (seen, keeper, wm.ppid)
+        }
     }
 
     /// Is SIGHUP in a `/proc/<pid>/status` signal mask?
@@ -7454,6 +9492,9 @@ mod supervise_tests {
             wm,
             apps: vec![],
             grace_ms: KEEPER_GRACE.as_millis() as u64,
+            wm_delay_floor_ms: 3_600_000,
+            wm_delay_ceil_ms: 3_600_000,
+            wm_stable_after_ms: 3_600_000,
         };
         let mut input = keeper.stdin.take().unwrap();
         input.write_all(job.line().as_bytes()).unwrap();

@@ -93,6 +93,16 @@ pub const FLOOR_PACKETS: u64 = 3;
 /// long, so the core's rings are fixed.
 pub const GRAIN: Duration = Duration::from_millis(50);
 
+/// FR-148 D48 — B2's `held` ([`Over::held`]): the verdicts held a frame in
+/// at least this share of the whole grains of each of a span's seconds, per
+/// cent. On the `tcp_shape` loaded cells a backlogged writer's samples held
+/// 0.36 of a second's grains or more, an application-limited writer's 0.08
+/// or less: a hold or three as an outage's release drained or the next stall
+/// filled the budget, which made such a sample a P3 that set the shadow
+/// model's capacity under the link. Chosen between the two
+/// (`docs/rate-control.md`).
+pub const HELD_SHARE_PERCENT: u64 = 20;
+
 /// FR-148 D46 — a still span's release is a burst when this share of what
 /// SCTP had in flight at the span's last still reading is acknowledged by the
 /// first frame [`BURST_WITHIN`] after that reading, per mille. A head-of-line
@@ -365,6 +375,10 @@ struct Tick {
 struct Figure {
     first: u64,
     last: u64,
+    /// FR-148 D51 B4f (C11) — where the earliest of their windows started
+    /// (µs): a figure that started before the last change of pair or
+    /// association measured the old one, in part or in whole.
+    from: u64,
     bps: u64,
 }
 
@@ -509,6 +523,15 @@ fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The grains wholly inside `a` to `b`, µs: from the first that starts at or
+/// after `a` to the last that ends at or before `b` (FR-148 D48). Empty when
+/// there is none.
+fn whole_grains(a: u64, b: u64) -> std::ops::Range<u64> {
+    let grain = us(GRAIN);
+    let (lo, hi) = (a.div_ceil(grain), b / grain);
+    lo..hi.max(lo)
+}
+
 /// SCTP's own window binds and nothing waits in its queue: the vendored SCTP
 /// grows its window only while a chunk waits, so a frame goes whatever the
 /// budget (else a window a T3 cut to one packet stays there).
@@ -536,6 +559,10 @@ pub struct Budget {
     /// `hold_grain`'s.
     holds: u64,
     hold_grain: u64,
+    /// FR-148 D48, rule 4 — of those, the holds SCTP's congestion window
+    /// sized ([`Self::ramp_sized`]), by grain as `holds` keeps them. Only
+    /// [`Self::over`] reads it, for [`Over::ramp`].
+    ramp_holds: u64,
     last_acked: Option<u64>,
     still: Option<Still>,
     /// FR-148 D46 — the stall classifier: its thresholds, the release being
@@ -569,8 +596,26 @@ pub struct Budget {
     /// that starts before it is no P3 capacity ([`Over::opening`]).
     measured: bool,
     first_measured: Option<u64>,
+    /// FR-148 D51 B4b — the last step's time (µs), and the last step that held
+    /// outside a still span ([`Self::held_lately`]).
+    stepped: u64,
+    open_hold: Option<u64>,
+    /// FR-148 D51 B4f (C11) — whether the figures since the last change of
+    /// pair or association gave the rate, and when that change was (µs). A
+    /// rate the old one's figures gave still sizes the budget, as the opening
+    /// rate does, but is no reading of the new one ([`Self::held_lately`]).
+    own: bool,
+    own_from: u64,
     /// The last step's budget, `out` and rate.
     last: (u64, u64, Option<u64>),
+    /// FR-148 D48 — SCTP's fast retransmits and T3-rtx expiries at the last
+    /// step, over this budget's associations together; `None` before this
+    /// association's first step. The shadow model's window rules read it
+    /// ([`Self::loss`]).
+    loss: Option<u64>,
+    /// The associations' before this one: a new association's counts start
+    /// from 0, and the sum never runs back.
+    loss_before: u64,
     window: Window,
 }
 
@@ -584,7 +629,9 @@ pub struct Over {
     /// That span stood still for [`Budget::still_after`] or more inside the
     /// span itself, from its first still reading to its last.
     pub still_inside: bool,
-    /// The verdicts held a frame in each whole second of the span.
+    /// The verdicts held a frame in at least [`HELD_SHARE_PERCENT`] of the
+    /// grains of each whole second of the span, counting only the grains
+    /// wholly inside it (FR-148 D48).
     pub held: bool,
     /// The span starts inside the last released still span, or while its
     /// release came back: how long before the span's start that span's first
@@ -595,6 +642,17 @@ pub struct Over {
     /// window was still opening, so a hold or a backlog said nothing of the
     /// path. Before the budget's first step, every span is.
     pub opening: bool,
+    /// FR-148 D48, rule 4 — SCTP's congestion window sized a hold in a grain
+    /// wholly inside the span: the budget's window term was under its rate
+    /// and the congestion window was the smaller window
+    /// (`cwnd <= rwnd + inflight`). The association's ramp bound such a hold,
+    /// not the path. A hold the receive window sized is the viewer's, and is
+    /// not one.
+    pub ramp: bool,
+    /// FR-148 D48, rule 1 — the budget's rate at its last step, bit/s: the
+    /// most of its one-second figures over two seconds, at the sample's
+    /// close. `None` before the budget's first step.
+    pub rate: Option<u64>,
 }
 
 impl Default for Budget {
@@ -632,6 +690,7 @@ impl Budget {
             standing: None,
             holds: 0,
             hold_grain: 0,
+            ramp_holds: 0,
             last_acked: None,
             still: None,
             classifier,
@@ -644,7 +703,13 @@ impl Budget {
             still_now: false,
             measured: false,
             first_measured: None,
+            stepped: 0,
+            open_hold: None,
+            own: false,
+            own_from: 0,
             last: (0, 0, None),
+            loss: None,
+            loss_before: 0,
             window: Window::new(),
         }
     }
@@ -690,8 +755,20 @@ impl Budget {
         if verdict.holds() {
             self.age_holds(t);
             self.holds |= 1;
+            if self.ramp_sized(rate, &r.gauges) {
+                self.ramp_holds |= 1;
+            }
+            if still.is_none() {
+                self.open_hold = Some(t);
+            }
         }
+        self.stepped = t;
         self.last = (budget, out, rate);
+        self.loss = Some(
+            self.loss_before
+                .saturating_add(r.gauges.fast_retransmits)
+                .saturating_add(r.gauges.t3_expiries),
+        );
         let w = &mut self.window;
         w.offered += 1;
         w.held += u64::from(verdict.holds());
@@ -717,6 +794,25 @@ impl Budget {
     /// The least acknowledgement delay; `None` before the first SACK.
     pub fn least(&self) -> Option<Duration> {
         self.least
+    }
+
+    /// S, the queue the budget stands over the least.
+    pub fn slack(&self) -> Duration {
+        self.slack
+    }
+
+    /// FR-148 D51 B4b — a step held a frame outside a still span within
+    /// [`RATE_WINDOW`] of the last step, on this association: the link was
+    /// busy, so the rate is the link's. The governor bounds its target at that
+    /// rate while this holds, and takes it as its reading
+    /// (`RateGovernor::note_path_rate`). FR-148 D51 B4f (C11): only a rate
+    /// this pair's and this association's own figures gave; after a change of
+    /// either, nothing until they give one.
+    pub fn held_lately(&self) -> bool {
+        self.own
+            && self
+                .open_hold
+                .is_some_and(|h| self.stepped.saturating_sub(h) <= us(RATE_WINDOW))
     }
 
     /// How long the clock may stand still with bytes out before it is a stall
@@ -762,9 +858,12 @@ impl Budget {
     /// `from` to `to`, whose clock stood at `from_acked` at its start: whether
     /// a still span of the least and S met it, from its first still reading to
     /// its release's ([`Over::stood`]), and stood that long inside it; whether
-    /// the verdicts held a frame in each of its whole seconds; and whether it
+    /// the verdicts held a frame in a share of each of its whole seconds
+    /// ([`Over::held`]); and whether it
     /// starts inside the last released span, or while its release came back;
     /// and whether it starts before the first measured rate ([`Over::opening`]).
+    /// FR-148 D48: whether SCTP's congestion window sized a hold in it
+    /// ([`Over::ramp`]), and the rate at the last step ([`Over::rate`]).
     /// Nothing before the first step, and nothing of an earlier association.
     pub fn over(&self, from: Instant, to: Instant, from_acked: u64) -> Over {
         let Some(epoch) = self.epoch else {
@@ -796,40 +895,75 @@ impl Budget {
                     )
                 }),
             opening: self.first_measured.is_none_or(|m| a < m),
+            ramp: whole_grains(a, b).any(|g| self.in_mask(self.ramp_holds, g)),
+            rate: self.last.2,
         }
     }
 
     /// FR-148 D46 B2 — whether this association's figures gave the last
-    /// step's rate: the tcp_shape harness's look at the opening.
-    #[cfg(test)]
-    pub(crate) fn rate_measured(&self) -> bool {
+    /// step's rate, or the opening rate stood in. FR-148 D48: the shadow
+    /// model's window rules bound a window by a measured rate only.
+    pub fn rate_measured(&self) -> bool {
         self.measured
     }
 
-    /// Whether the verdicts held a frame in each of `parts` equal stretches
-    /// of the grains from `a` to `b`, µs. The mask keeps 64 grains: a grain
-    /// older than that, or newer than the last hold, held nothing it knows.
+    /// FR-148 D48 — SCTP's fast retransmits and T3-rtx expiries at the last
+    /// step, over this budget's associations together, so the count never
+    /// runs back; `None` before this association's first step.
+    pub fn loss(&self) -> Option<u64> {
+        self.loss
+    }
+
+    /// Whether the verdicts held a frame in at least [`HELD_SHARE_PERCENT`]
+    /// of the grains of each of `parts` equal stretches of the grains wholly
+    /// inside `a` to `b`, µs. FR-148 D48: a grain the span only partly covers
+    /// is its edge's, and the mask keeps no finer time, so a hold there (an
+    /// outage's release before the span, or the next one's start after it) is
+    /// not the span's; a span with no whole grain held nothing. And a hold or
+    /// three in a second say nothing of the path: an application-limited
+    /// writer's release drains through them.
     fn held_each(&self, a: u64, b: u64, parts: u64) -> bool {
-        let grain = us(GRAIN);
-        let (lo, hi) = (a / grain, b / grain);
-        let n = hi - lo + 1;
-        let held_in = |g: u64| {
-            g <= self.hold_grain
-                && self.hold_grain - g < 64
-                && (self.holds >> (self.hold_grain - g)) & 1 == 1
-        };
+        let grains = whole_grains(a, b);
+        if grains.is_empty() {
+            return false;
+        }
+        let (lo, n) = (grains.start, grains.end - grains.start);
         (0..parts).all(|p| {
             let first = lo + p * n / parts;
             let last = (lo + (p + 1) * n / parts).max(first + 1);
-            (first..last).any(held_in)
+            let held = (first..last)
+                .filter(|&g| self.in_mask(self.holds, g))
+                .count();
+            let held = u64::try_from(held).unwrap_or(u64::MAX);
+            held > 0 && held.saturating_mul(100) >= HELD_SHARE_PERCENT * (last - first)
         })
+    }
+
+    /// Whether `mask`, kept by grain as `holds` is, has grain `g`. The masks
+    /// keep 64 grains: a grain older than that, or newer than the last one
+    /// they moved to, held nothing they know.
+    fn in_mask(&self, mask: u64, g: u64) -> bool {
+        g <= self.hold_grain && self.hold_grain - g < 64 && (mask >> (self.hold_grain - g)) & 1 == 1
+    }
+
+    /// FR-148 D48, rule 4 — whether SCTP's congestion window, not the rate,
+    /// sized a step's budget at `rate`: its window term under the rate (as
+    /// [`Self::size`] takes the smaller), with the congestion window the
+    /// smaller of the two windows. With the receive window the smaller, the
+    /// viewer sized it: a real limit of the pair, and no ramp.
+    fn ramp_sized(&self, rate: Option<u64>, g: &Gauges) -> bool {
+        let by_window = self.by_window(g);
+        rate.is_none_or(|r| by_window < r)
+            && u64::from(g.cwnd) <= u64::from(g.rwnd).saturating_add(g.inflight_bytes)
     }
 
     /// The selected candidate pair changed: the old path's least is no floor
     /// for the new one's, and its releases say nothing of the new carrier.
+    /// FR-148 D51 B4f (C11): nor is its rate the new one's reading.
     pub fn reset_least(&mut self) {
         self.least = None;
         self.forget_releases();
+        self.forget_reading();
     }
 
     /// A new association: its clock counts from 0 and its delays are its own.
@@ -841,6 +975,8 @@ impl Budget {
         self.clock.clear();
         self.figures.clear();
         self.holds = 0;
+        self.ramp_holds = 0;
+        self.loss_before = self.loss.take().unwrap_or(self.loss_before);
         self.last_acked = None;
         self.still = None;
         self.last_still = None;
@@ -849,7 +985,16 @@ impl Budget {
         self.still_now = false;
         self.measured = false;
         self.first_measured = None;
+        self.forget_reading();
         self.forget_releases();
+    }
+
+    /// FR-148 D51 B4f (C11) — the pair or the association changed: no hold so
+    /// far and no figure so far is the new one's reading.
+    fn forget_reading(&mut self) {
+        self.open_hold = None;
+        self.own = false;
+        self.own_from = self.stepped;
     }
 
     /// FR-148 D46 — the class of the releases goes with the least: the next
@@ -1010,7 +1155,7 @@ impl Budget {
             .filter(|&(first, end, _)| first < from.at && from.at <= end)
             .map_or((from.at, from.acked), |(first, _, count)| (first, count));
         let bps = acked.saturating_sub(base).saturating_mul(8_000_000) / t.saturating_sub(start);
-        self.add_figure(t, bps);
+        self.add_figure(t, start, bps);
         while self
             .figures
             .oldest()
@@ -1028,31 +1173,46 @@ impl Budget {
         // FR-148 D46 B2 — the figures gave it, or the application-limited
         // rule keeps one they gave; else the opening rate still stands in.
         self.measured = held || most >= opening.unwrap_or(0) || self.measured;
+        // FR-148 D51 B4f (C11) — the figures gave it: are they this pair's and
+        // this association's? Those since the last change hold the most. A
+        // rate the application-limited rule keeps stays whose it was.
+        if rate == most {
+            self.own = self
+                .figures
+                .iter()
+                .filter(|f| f.from >= self.own_from)
+                .map(|f| f.bps)
+                .max()
+                == Some(most);
+        }
         self.standing = Some(rate);
         Some(rate)
     }
 
-    fn add_figure(&mut self, t: u64, bps: u64) {
+    fn add_figure(&mut self, t: u64, from: u64, bps: u64) {
         if let Some(f) = self.figures.newest_mut()
             && t.saturating_sub(f.first) < us(GRAIN)
         {
             f.bps = f.bps.max(bps);
             f.last = t;
+            f.from = f.from.min(from);
             return;
         }
         self.figures.push(Figure {
             first: t,
             last: t,
+            from,
             bps,
         });
     }
 
-    /// The holds' mask, moved on to `t`'s grain.
+    /// The holds' masks, moved on to `t`'s grain.
     fn age_holds(&mut self, t: u64) {
         let grain = t / us(GRAIN);
         if grain > self.hold_grain {
             let by = grain - self.hold_grain;
             self.holds = if by >= 64 { 0 } else { self.holds << by };
+            self.ramp_holds = if by >= 64 { 0 } else { self.ramp_holds << by };
             self.hold_grain = grain;
         }
     }
@@ -1217,6 +1377,100 @@ impl Drop for Unsent<'_> {
     }
 }
 
+/// FR-148 — the send wait: each frame's time from its hand-off to the send
+/// channel to the moment SCTP took its last chunk, the latency the transport
+/// adds before a viewer can paint it. One measure per pump, owned by its
+/// delivery sampler and kept under every mode of the in-flight budget (beside
+/// [`PumpCount`], which counts nothing with the budget off). The send task
+/// records each frame that reached the wire ([`Self::sent`]); a frame whose
+/// send failed, or a stale or dropped one, never rode the wire and records
+/// nothing (a stale frame's wait would count the rebuild gap the FFmpeg
+/// pump's epoch discard exists to erase). Each reader drains its own window:
+/// the heartbeat takes it ([`Self::take`]), and a reader between heartbeats
+/// reads it from where it last read ([`SendWaitSince`]).
+#[derive(Debug, Default)]
+pub struct SendWait {
+    sum_us: AtomicU64,
+    max_us: AtomicU64,
+    frames: AtomicU64,
+}
+
+impl SendWait {
+    /// A frame handed to the send channel at `enqueued_at` whose last chunk
+    /// SCTP took at `now`: its wait, µs, recorded. Three relaxed atomics, no
+    /// lock: the send task calls it once per frame.
+    pub fn sent(&self, enqueued_at: Instant, now: Instant) -> u64 {
+        let us = now.saturating_duration_since(enqueued_at).as_micros() as u64;
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        us
+    }
+
+    /// The heartbeat's window, taken whole: the next one starts from nothing.
+    pub fn take(&self) -> SendWaitWindow {
+        let frames = self.frames.swap(0, Ordering::Relaxed);
+        let sum_us = self.sum_us.swap(0, Ordering::Relaxed);
+        let max_us = self.max_us.swap(0, Ordering::Relaxed);
+        SendWaitWindow {
+            frames,
+            sum_us,
+            max_us,
+        }
+    }
+
+    /// The longest wait in the heartbeat's window so far, ms.
+    pub fn max_ms(&self) -> f64 {
+        self.max_us.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+}
+
+/// A heartbeat's window of [`SendWait`]: the frames that reached the wire, the
+/// sum of their waits and the longest, µs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SendWaitWindow {
+    pub frames: u64,
+    pub sum_us: u64,
+    pub max_us: u64,
+}
+
+impl SendWaitWindow {
+    /// The heartbeat's two fields, ms: `send_wait_avg_ms`, the window's average
+    /// in whole µs (0 with no frame), and `send_wait_max_ms`, its longest.
+    pub fn ms(&self) -> (f64, f64) {
+        let avg = self
+            .sum_us
+            .checked_div(self.frames)
+            .map(|us| us as f64 / 1000.0)
+            .unwrap_or(0.0);
+        (avg, self.max_us as f64 / 1000.0)
+    }
+}
+
+/// A reader of [`SendWait`] between heartbeats: where it last read the window's
+/// sum and frames. The heartbeat's take starts the window over under it, and
+/// the first read after a take is read against the old place, saturating: as
+/// the FFmpeg pump's two such readers (FR-71 T1a's sender window, FR-74 P1b's
+/// gate) have read since they were written.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SendWaitSince {
+    sum_us: u64,
+    frames: u64,
+}
+
+impl SendWaitSince {
+    /// The average wait of the frames recorded since this reader last read, ms
+    /// (`None` with none), and its place moved to now.
+    pub fn avg_ms(&mut self, wait: &SendWait) -> Option<f64> {
+        let sum_us = wait.sum_us.load(Ordering::Relaxed);
+        let frames = wait.frames.load(Ordering::Relaxed);
+        let n = frames.saturating_sub(self.frames);
+        let avg = (n > 0).then(|| sum_us.saturating_sub(self.sum_us) as f64 / n as f64 / 1000.0);
+        *self = Self { sum_us, frames };
+        avg
+    }
+}
+
 /// Whether the selected candidate pair changed: a first pair is no change, and
 /// no pair (none selected, or none read) keeps the last.
 #[derive(Debug)]
@@ -1297,11 +1551,21 @@ impl Pass {
     }
 
     /// Whether the gate's skip calls the AIMD's decrease: never inside FR-35's
-    /// opener grace (`grace`), as today, and never for the budget's hold in a
-    /// still span (D46's no-decrease rule). A pass the send channel or a
-    /// follower shut decreases as today.
+    /// opener grace (`grace`), as today, and never for a hold that shut the
+    /// pass by itself (FR-148 D51 B4a-1: the budget owns the queue, so its hold
+    /// is no AIMD event; D46's no-decrease rule spared only one in a still
+    /// span). A pass the send channel or a follower shut decreases as today.
     pub fn decreases(&self, grace: bool) -> bool {
-        !grace && !self.stalled()
+        !grace && !self.held()
+    }
+
+    /// FR-148 D51 B4a-1 — whether the gate's skip is the budget's own hold,
+    /// which the governor hears as a capacity fact and not as a decrease:
+    /// outside FR-35's opener grace, a hold that shut the pass by itself
+    /// outside a still span. One in a still span, a stall of the carrier, is
+    /// neither (D46).
+    pub fn hears_hold(&self, grace: bool) -> bool {
+        !grace && self.held() && !self.stalled()
     }
 
     /// Whether the VP9-444 watermark arm sheds a frame `over` its mark: as
@@ -1313,7 +1577,7 @@ impl Pass {
 
 /// The opening rate a pump's step reads: the governor's applied rate, or
 /// before one is applied the rate the pump opened at; 0 when neither is known.
-fn opening(applied_bps: u32, open_at_bps: Option<u32>) -> u64 {
+pub(crate) fn opening(applied_bps: u32, open_at_bps: Option<u32>) -> u64 {
     let open = if applied_bps > 0 {
         applied_bps
     } else {
@@ -2113,6 +2377,197 @@ mod tests {
         frame.sent(16_384);
     }
 
+    /// FR-148 (S1) — the send wait. Frames handed and taken by SCTP at known
+    /// instants give the window's sum, longest and count; a frame whose send
+    /// failed, or a stale or dropped one, is never recorded (the send task
+    /// records a frame only once its last chunk went:
+    /// `media_delivery::tests::both_pumps_measure_the_send_wait_once`), so it
+    /// counts nowhere. Each reader drains its own window: one between
+    /// heartbeats reads from where it last read, whatever another read, and
+    /// the heartbeat's take is whole after both read, and starts the next
+    /// window from nothing.
+    #[test]
+    fn the_send_wait_counts_the_frames_that_reached_the_wire_and_each_reader_drains_its_own_window()
+    {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let wait = SendWait::default();
+        let (mut a, mut b) = (SendWaitSince::default(), SendWaitSince::default());
+        assert_eq!(
+            wait.sent(at(0), at(20)),
+            20_000,
+            "handed at 0, on the wire at 20"
+        );
+        assert_eq!(a.avg_ms(&wait), Some(20.0), "a: the first frame");
+        assert_eq!(wait.sent(at(5), at(25)), 20_000);
+        // Handed at 12 ms, its send failed: the send task records nothing.
+        assert_eq!(wait.sent(at(10), at(40)), 30_000);
+        assert_eq!(a.avg_ms(&wait), Some(25.0), "a: the two since it read");
+        assert_eq!(
+            b.avg_ms(&wait),
+            Some(70_000.0 / 3.0 / 1000.0),
+            "b: all three, whatever a read"
+        );
+        assert_eq!(a.avg_ms(&wait), None, "a: nothing since");
+        assert_eq!(wait.max_ms(), 30.0, "the window's longest so far");
+        assert_eq!(
+            wait.take(),
+            SendWaitWindow {
+                frames: 3,
+                sum_us: 70_000,
+                max_us: 30_000
+            },
+            "the heartbeat's window, whole after both read"
+        );
+        assert_eq!(wait.take(), SendWaitWindow::default(), "taken");
+        assert_eq!(wait.max_ms(), 0.0, "the next window starts from nothing");
+        // A wire time the clock puts before the hand-off waited nothing.
+        assert_eq!(wait.sent(at(50), at(45)), 0);
+        assert_eq!(
+            wait.take(),
+            SendWaitWindow {
+                frames: 1,
+                sum_us: 0,
+                max_us: 0
+            }
+        );
+    }
+
+    /// FR-148 (S2) — the FFmpeg pump's readings hold. The same frames give
+    /// the heartbeat's `send_wait_avg_ms` and `send_wait_max_ms`, the sender
+    /// window's `send_wait_avg_ms` and `send_wait_max_ms` (FR-71 T1a) and the
+    /// direct gate's average (FR-74 P1b) that the pump's own three atomics
+    /// gave, read by today's arithmetic, kept here as the reference
+    /// (`peer.rs` at 16da4acc2): 100,000 events of frames, heartbeats and the
+    /// two readers' passes in any order, the passes that straddle a heartbeat
+    /// included, where a reader's deltas saturate against its old place and
+    /// the window's longest is the heartbeat's.
+    #[test]
+    fn the_ffmpeg_pump_s_send_wait_readings_hold() {
+        use std::sync::atomic::Ordering::Relaxed;
+        /// Today's: the pump's three atomics and its three readers.
+        #[derive(Default)]
+        struct Today {
+            sum: AtomicU64,
+            max: AtomicU64,
+            frames: AtomicU64,
+            win_sw_sum_last: u64,
+            win_sw_frames_last: u64,
+            gate_sw_sum_last: u64,
+            gate_sw_frames_last: u64,
+            direct_wait_ema_ms: f64,
+            /// Reads whose frame delta saturated across a heartbeat's swap.
+            straddled: u32,
+        }
+        impl Today {
+            fn sent(&self, waited_us: u64) {
+                self.sum.fetch_add(waited_us, Relaxed);
+                self.max.fetch_max(waited_us, Relaxed);
+                self.frames.fetch_add(1, Relaxed);
+            }
+            /// The heartbeat (`peer.rs:10041-10048`).
+            fn heartbeat(&self) -> (f64, f64) {
+                let sw_frames = self.frames.swap(0, Relaxed);
+                let send_wait_avg_ms = self
+                    .sum
+                    .swap(0, Relaxed)
+                    .checked_div(sw_frames)
+                    .map(|us| us as f64 / 1000.0)
+                    .unwrap_or(0.0);
+                let send_wait_max_ms = self.max.swap(0, Relaxed) as f64 / 1000.0;
+                (send_wait_avg_ms, send_wait_max_ms)
+            }
+            /// The sender window's pass (`peer.rs:9277-9290`, `:9308-9309`):
+            /// (`send_wait_max_ms`, `send_wait_avg_ms`).
+            fn window(&mut self) -> (f64, Option<f64>) {
+                let sw_sum_now = self.sum.load(Relaxed);
+                let sw_frames_now = self.frames.load(Relaxed);
+                self.straddled += u32::from(sw_frames_now < self.win_sw_frames_last);
+                let sw_frames = sw_frames_now.saturating_sub(self.win_sw_frames_last);
+                let sw_avg_ms = (sw_frames > 0).then(|| {
+                    sw_sum_now.saturating_sub(self.win_sw_sum_last) as f64
+                        / sw_frames as f64
+                        / 1000.0
+                });
+                let send_wait_max_ms = self.max.load(Relaxed) as f64 / 1000.0;
+                self.win_sw_sum_last = sw_sum_now;
+                self.win_sw_frames_last = sw_frames_now;
+                (send_wait_max_ms, sw_avg_ms)
+            }
+            /// The direct gate's pass (`peer.rs:8046-8057`): its EMA.
+            fn gate(&mut self) -> f64 {
+                let sum_now = self.sum.load(Relaxed);
+                let frames_now = self.frames.load(Relaxed);
+                let frames = frames_now.saturating_sub(self.gate_sw_frames_last);
+                if frames > 0 {
+                    let avg_ms = sum_now.saturating_sub(self.gate_sw_sum_last) as f64
+                        / frames as f64
+                        / 1000.0;
+                    self.direct_wait_ema_ms = 0.7 * self.direct_wait_ema_ms + 0.3 * avg_ms;
+                }
+                self.gate_sw_sum_last = sum_now;
+                self.gate_sw_frames_last = frames_now;
+                self.direct_wait_ema_ms
+            }
+        }
+        let mut today = Today::default();
+        let t0 = Instant::now();
+        let wait = SendWait::default();
+        let (mut window, mut gate) = (SendWaitSince::default(), SendWaitSince::default());
+        let mut ema = 0.0_f64;
+        let (mut clock, mut beats, mut sent) = (0_u64, 0_u32, 0_u32);
+        let mut state = 0x0053_2a17_u64;
+        for i in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            match state % 16 {
+                // A frame reaches the wire: mostly tens of ms, one in fifty up
+                // to 1.2 s.
+                0..=9 => {
+                    let waited = if (state >> 8).is_multiple_of(50) {
+                        (state >> 16) % 1_200_000
+                    } else {
+                        (state >> 16) % 40_000
+                    };
+                    clock += 1 + (state >> 40) % 40_000;
+                    let handed = t0 + Duration::from_micros(clock);
+                    let on_wire = handed + Duration::from_micros(waited);
+                    assert_eq!(wait.sent(handed, on_wire), waited, "event {i}");
+                    today.sent(waited);
+                    sent += 1;
+                }
+                // The sender window's pass: the average from its place, and
+                // the heartbeat window's longest.
+                10..=12 => {
+                    let avg = window.avg_ms(&wait);
+                    assert_eq!((wait.max_ms(), avg), today.window(), "event {i}");
+                }
+                // The direct gate's pass.
+                13 | 14 => {
+                    if let Some(avg_ms) = gate.avg_ms(&wait) {
+                        ema = 0.7 * ema + 0.3 * avg_ms;
+                    }
+                    assert_eq!(ema, today.gate(), "event {i}");
+                }
+                // The heartbeat.
+                _ => {
+                    assert_eq!(wait.take().ms(), today.heartbeat(), "event {i}");
+                    beats += 1;
+                }
+            }
+        }
+        assert!(
+            sent > 50_000 && beats > 5_000,
+            "{sent} frames, {beats} heartbeats"
+        );
+        assert!(
+            today.straddled > 1_000,
+            "{} window passes straddled a heartbeat",
+            today.straddled
+        );
+    }
+
     /// FR-148 D46's stall classifier: busy at 2 Mbit/s with 40 000 bytes in
     /// flight, a still span from 2 s to 2.8 s with 60 000, and its release,
     /// then busy to 5.95 s with 8 000. A burst brings what was in flight back
@@ -2460,6 +2915,8 @@ mod tests {
                 held: false,
                 released_from: Some((d(400), 0)),
                 opening: false,
+                ramp: false,
+                rate: b.rate_bps(),
             }
         );
         // Met by its last 200 ms of stand and its release only.
@@ -2475,6 +2932,7 @@ mod tests {
                 b.over(at(t0, from), at(t0, to), count(from)),
                 Over {
                     opening: from == 0,
+                    rate: b.rate_bps(),
                     ..Over::default()
                 },
                 "{from} to {to} ms"
@@ -2509,6 +2967,122 @@ mod tests {
             "none in its second second"
         );
         assert!(!b.over(at(t0, 3_000), at(t0, 4_950), 0).held);
+    }
+
+    /// FR-148 D48 — B2's `held` on an application-limited writer: one hold
+    /// in the grain a span starts in, before its start (an outage's release
+    /// draining), and one in the grain it ends in, after its end (the next
+    /// outage filling the budget), are the edges', not the span's; nor is one
+    /// inside it in a grain it only partly covers, as the mask keeps no finer
+    /// time. A hold in a grain wholly inside it is the span's: in a span of
+    /// four whole grains, a quarter of them, over [`HELD_SHARE_PERCENT`].
+    #[test]
+    fn a_hold_in_a_span_s_edge_grains_is_not_the_span_s() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let hold = |b: &mut Budget, t: u64, acked: u64| {
+            let verdict = b.step(at(t0, t), &read(acked, wide(10 << 20, 1), 1_500_000));
+            assert_eq!(verdict, Verdict::Hold, "at {t} ms");
+        };
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 1);
+        hold(&mut b, 2_010, acked);
+        let acked = run(&mut b, t0, 2_050, 3_950, acked, 2_000_000, 1);
+        hold(&mut b, 3_990, acked);
+        run(&mut b, t0, 4_000, 4_950, acked, 2_000_000, 1);
+        // Grains 2.00-2.05 s and 3.95-4.00 s: the holds fall outside the span.
+        assert!(!b.over(at(t0, 2_030), at(t0, 3_970), 0).held);
+        // Inside it, but in the grains it only partly covers.
+        assert!(!b.over(at(t0, 2_005), at(t0, 3_995), 0).held);
+        assert!(
+            !b.over(at(t0, 2_005), at(t0, 2_045), 0).held,
+            "no whole grain"
+        );
+        // Wholly inside, the grain a span starts in holds its hold, and so
+        // does the grain it ends in; ended 5 ms short, the one hold is in a
+        // grain the span partly covers.
+        assert!(b.over(at(t0, 1_990), at(t0, 2_240), 0).held);
+        assert!(b.over(at(t0, 3_760), at(t0, 4_000), 0).held);
+        assert!(!b.over(at(t0, 3_760), at(t0, 3_995), 0).held);
+    }
+
+    /// FR-148 D48 — B2's `held` takes a share: a second is held when the
+    /// verdicts held a frame in at least a fifth of its whole grains
+    /// ([`HELD_SHARE_PERCENT`]). Eight holds in 39 grains are; seven are not;
+    /// one hold 30 ms into a span, an application-limited writer's outage
+    /// draining as on the `tcp_shape` 80 % outage cells, is not; and each of
+    /// a span's seconds needs its own share.
+    #[test]
+    fn a_second_is_held_when_a_fifth_of_its_whole_grains_are() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 1);
+        let acked = run(&mut b, t0, 2_000, 2_350, acked, 2_000_000, 10 << 20);
+        let acked = run(&mut b, t0, 2_400, 3_950, acked, 2_000_000, 1);
+        let verdict = b.step(at(t0, 4_030), &read(acked, wide(10 << 20, 1), 1_500_000));
+        assert_eq!(verdict, Verdict::Hold);
+        let held = |b: &Budget, from: u64, to: u64| b.over(at(t0, from), at(t0, to), 0).held;
+        assert!(held(&b, 2_000, 3_990), "8 of its 39 grains");
+        assert!(!held(&b, 2_050, 4_040), "7 of 39");
+        assert!(!held(&b, 2_000, 4_000), "none in its second second");
+        assert!(held(&b, 2_000, 2_990), "8 of 19");
+        run(&mut b, t0, 4_050, 5_950, acked, 2_000_000, 1);
+        assert!(!held(&b, 4_000, 5_990), "one hold, 30 ms in");
+        assert!(held(&b, 4_000, 4_200), "the same hold, one of four grains");
+    }
+
+    /// FR-148 D48, rule 4 — a hold SCTP's congestion window sized, in a
+    /// grain wholly inside a span, is the association's ramp
+    /// ([`Over::ramp`]): a 15 kB window over the 150 ms least (none read
+    /// yet) carries 800 kbit/s, under the 2 Mbit/s rate, and 30 kB out holds.
+    /// The congestion window the smaller window, or equal to the receive
+    /// window and what is in flight, it is the ramp's; the receive window the
+    /// smaller, the viewer's; a wide window, the rate's. Neither of those is,
+    /// though both hold. A hold in an edge grain is not the span's, as for
+    /// `held`, and a new association forgets them. The count of losses the
+    /// window rules read never runs back across associations.
+    #[test]
+    fn a_hold_sctp_s_congestion_window_sized_is_the_ramp_s() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let hold = |b: &mut Budget, t: u64, acked: u64, gauges: Gauges| {
+            let verdict = b.step(at(t0, t), &read(acked, gauges, 1_500_000));
+            assert_eq!(verdict, Verdict::Hold, "at {t} ms");
+        };
+        let span = |b: &Budget, from: u64, to: u64| b.over(at(t0, from), at(t0, to), 0);
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 10 << 20);
+        assert!(near(b.rate_bps(), 2_000_000), "{:?}", b.rate_bps());
+        assert!(!span(&b, 0, 1_950).ramp, "the rate's holds");
+        hold(&mut b, 2_010, acked, g(15_000, 1 << 20, 10_000, 20_000));
+        let acked = run(&mut b, t0, 2_050, 2_950, acked, 2_000_000, 1);
+        assert!(span(&b, 2_000, 2_950).ramp, "the congestion window's");
+        assert!(!span(&b, 2_030, 2_950).ramp, "an edge grain's");
+        hold(&mut b, 3_010, acked, g(15_000, 5_000, 10_000, 20_000));
+        let acked = run(&mut b, t0, 3_050, 3_950, acked, 2_000_000, 1);
+        assert!(span(&b, 3_000, 3_950).ramp, "the equal case");
+        hold(&mut b, 4_010, acked, g(1 << 20, 5_000, 10_000, 20_000));
+        let acked = run(&mut b, t0, 4_050, 4_950, acked, 2_000_000, 1);
+        hold(&mut b, 5_010, acked, wide(10 << 20, 1));
+        let acked = run(&mut b, t0, 5_050, 5_950, acked, 2_000_000, 1);
+        for from in [4_000, 5_000] {
+            let o = span(&b, from, from + 200);
+            assert!(o.held && !o.ramp, "{from} ms: {o:?}");
+        }
+        assert!(span(&b, 3_000, 5_950).ramp);
+        let loss = |b: &mut Budget, t: u64, fast: u64, t3: u64| {
+            let gauges = Gauges {
+                fast_retransmits: fast,
+                t3_expiries: t3,
+                ..wide(1, 0)
+            };
+            b.step(at(t0, t), &read(acked, gauges, 1_500_000));
+            b.loss()
+        };
+        assert_eq!(loss(&mut b, 6_000, 3, 1), Some(4));
+        b.on_new_association();
+        assert!(!span(&b, 3_000, 5_950).ramp, "a new association's");
+        assert_eq!(b.loss(), None);
+        assert_eq!(loss(&mut b, 6_050, 0, 0), Some(4), "never runs back");
+        assert_eq!(loss(&mut b, 6_100, 1, 0), Some(5));
     }
 
     /// FR-148 D46 B2 — the budget's opening, which a P3 sample may not start
@@ -2607,7 +3181,9 @@ mod tests {
                     verdict.holds(),
                     "{what}, byte gate {byte_gate}"
                 );
-                assert!(pass.decreases(false), "{what}: no still span");
+                // FR-148 D51 B4a-1: the hold is heard, and decreases nothing.
+                assert_eq!(pass.decreases(false), !verdict.holds(), "{what}");
+                assert_eq!(pass.hears_hold(false), verdict.holds(), "{what}");
                 assert!(!pass.sheds(true), "{what}");
             }
         }
@@ -2648,9 +3224,12 @@ mod tests {
             let still = t >= 2_300;
             assert!(s.shut(&mut pass), "at {t} ms");
             assert_eq!(pass.stalled(), still, "at {t} ms");
-            assert_eq!(pass.decreases(false), !still, "at {t} ms");
+            // FR-148 D51 B4a-1: no hold decreases; one before the span is
+            // heard as the budget's, one in it is not.
+            assert!(!pass.decreases(false), "at {t} ms");
+            assert_eq!(pass.hears_hold(false), !still, "at {t} ms");
             assert!(
-                !pass.decreases(true),
+                !pass.decreases(true) && !pass.hears_hold(true),
                 "inside the opener's grace, at {t} ms"
             );
         }
@@ -2668,6 +3247,134 @@ mod tests {
         let w = s.take_window();
         assert_eq!(w.held, (18, 18));
         assert_eq!((w.acted, w.acted_stalled), ((17, 18), 11));
+    }
+
+    /// FR-148 D51 B4a-1 (C1) — a hold the budget acts on is no AIMD event.
+    /// Under `on`, on a relay session, over readings that hold while the clock
+    /// moves (no still span): each hold shuts its pass by itself and calls no
+    /// decrease; the governor hears it as the budget's hold, a capacity fact.
+    /// Inside FR-35's opener grace neither, as today. The budget reads each as
+    /// a hold of its own, outside a still span.
+    #[test]
+    fn an_acting_hold_is_no_aimd_event() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let mut acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 40_000);
+        let mut s = on_with(b);
+        // 2 Mbit/s × (S + S) = 75 000 bytes, with 100 000 out, while the
+        // clock moves at 2 Mbit/s.
+        for t in (2_000..=4_000).step_by(50) {
+            let r = read(acked, wide(100_000, 0), 1_500_000);
+            let mut pass =
+                s.gate_reading(at(t0, t), r.acked_bytes, r.gauges, r.open_bps, true, false);
+            assert!(s.shut(&mut pass), "at {t} ms");
+            assert!(pass.held() && !pass.stalled(), "at {t} ms");
+            assert!(!pass.decreases(false), "no decrease, at {t} ms");
+            assert!(pass.hears_hold(false), "heard as the budget's, at {t} ms");
+            assert!(
+                !pass.decreases(true) && !pass.hears_hold(true),
+                "inside the opener's grace, at {t} ms"
+            );
+            assert!(s.budget().held_lately(), "at {t} ms");
+            acked += 2_000_000 / 8 * 50 / 1_000;
+        }
+        let w = s.take_window();
+        assert_eq!((w.acted, w.acted_stalled), ((41, 41), 0), "{w:?}");
+    }
+
+    /// FR-148 D51 B4a-1 — C1's companion: while the budget holds, a pass the
+    /// send channel or a follower shut before its term was asked decreases as
+    /// today, and is no hold of the budget's. So does every skip of a pass the
+    /// budget does not act on: shadow, and a direct session under `on`.
+    #[test]
+    fn a_channel_skip_under_on_still_decreases() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 40_000);
+        let r = read(acked, wide(100_000, 0), 1_500_000);
+        let mut s = on_with(b.clone());
+        let pass = s.gate_reading(
+            at(t0, 2_000),
+            r.acked_bytes,
+            r.gauges,
+            r.open_bps,
+            true,
+            false,
+        );
+        assert!(pass.acts() && !pass.held(), "the channel shut it first");
+        assert!(pass.decreases(false) && !pass.hears_hold(false));
+        assert!(!pass.decreases(true) && !pass.hears_hold(true));
+        for (mode, constrained) in [(Mode::Shadow, true), (Mode::On, false)] {
+            let mut s = Shadow::for_pump(mode, true).unwrap();
+            s.budget = b.clone();
+            let mut pass = s.gate_reading(
+                at(t0, 2_000),
+                r.acked_bytes,
+                r.gauges,
+                r.open_bps,
+                constrained,
+                true,
+            );
+            assert!(
+                !pass.acts() && s.shut(&mut pass),
+                "{mode:?}: the byte gate shuts it"
+            );
+            assert!(pass.decreases(false) && !pass.hears_hold(false), "{mode:?}");
+        }
+    }
+
+    /// FR-148 D51 B4f (C11) — a reading belongs to the association and the
+    /// pair that measured it. What the governor reads from the acting budget,
+    /// for B4b's cap and B4b-2's reading alike (a hold lately and a measured
+    /// rate, as `RateGovernor::budget_held_bps` takes them), after the budget
+    /// held at 2 Mbit/s: (a) the selected pair changes, and the new one
+    /// carries 1 Mbit/s, held once a second. The standing 2 Mbit/s still
+    /// sizes the budget, as today, but is no reading. Backlogged on the new
+    /// pair, its own 1 Mbit/s reads. (b) The same over a new association, its
+    /// clock from 0.
+    #[test]
+    fn after_a_new_pair_or_association_nothing_reads_until_a_hold_there_reads_again() {
+        let reads = |b: &Budget| {
+            (b.held_lately() && b.rate_measured())
+                .then(|| b.rate_bps())
+                .flatten()
+        };
+        let t0 = Instant::now();
+        for new_association in [false, true] {
+            let mut b = Budget::new();
+            // Backlogged at 2 Mbit/s: 100 000 out over a budget of 75 000.
+            let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 100_000);
+            assert_eq!(reads(&b), Some(2_000_000), "{new_association}: it reads");
+            let mut acked = if new_association {
+                b.on_new_association();
+                0
+            } else {
+                b.reset_least();
+                acked
+            };
+            assert_eq!(reads(&b), None, "{new_association}: at the change");
+            for t in (2_000..=5_950).step_by(50) {
+                let out = if t % 1_000 == 0 { 100_000 } else { 1 };
+                b.step(at(t0, t), &read(acked, wide(out, 1), 1_500_000));
+                acked += 1_000_000 / 8 * 50 / 1_000;
+                assert_eq!(
+                    reads(&b),
+                    None,
+                    "{new_association}: held once a second, at {t} ms"
+                );
+            }
+            assert_eq!(
+                b.rate_bps(),
+                Some(2_000_000),
+                "{new_association}: the standing rate sizes the budget, as today"
+            );
+            run(&mut b, t0, 6_000, 7_500, acked, 1_000_000, 100_000);
+            assert_eq!(
+                reads(&b),
+                Some(1_000_000),
+                "{new_association}: a hold there reads again"
+            );
+        }
     }
 
     /// FR-148 D46 B3 — the budget acts only under `on`, on a constrained
@@ -2698,7 +3405,10 @@ mod tests {
                 assert_eq!(pass.acts(), acts, "{what}");
                 assert_eq!(pass.shuts(), acts || byte_gate, "{what}");
                 assert_eq!(pass.sheds(true), !acts, "{what}");
-                assert!(pass.decreases(false) && !pass.decreases(true), "{what}");
+                // FR-148 D51 B4a-1: an acting hold is heard, never decreases.
+                assert_eq!(pass.decreases(false), !acts, "{what}");
+                assert_eq!(pass.hears_hold(false), acts, "{what}");
+                assert!(!pass.decreases(true), "{what}");
                 let w = s.take_window();
                 assert_eq!(w.held, (u64::from(acts), u64::from(acts)), "{what}");
                 assert_eq!(w.acted, (0, u64::from(acts)), "{what}");

@@ -2,6 +2,8 @@
 
 **Issue:** gjovanov/roomler-ai#1086 · **Surfaced by:** FR-19 box 886 relay-node socket census ([#805](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5484369356)) · **Status:** **CLOSED 2026-09-24 — fixed in `agent-v0.4.100` (#1556), flat for 24 h on four hosts. The cause was the TURN client, not DNS; P1/P2 below were a false lead, kept as a record**
 
+**Anchors:** master `d298bd9c9` (closed 2026-09-24): this spec is the record of the work, and its line anchors read at that commit.
+
 > ⚠️ **Read this before the sections below.** P1 attributed the leak to glibc resolver
 > sockets and P2 shipped a DNS cache against it. Both were wrong about the cause: a
 > later trace saw DNS create and close sockets 27-for-27, and a 24 h census on

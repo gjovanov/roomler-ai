@@ -175,7 +175,7 @@ is kept unless all three are on:
 
 | Switch | Where it lives | Default | Who sets it | Off, fast |
 |---|---|---|---|---|
-| **The window**, `rc.session_resume_secs` (`ROOMLER__RC__SESSION_RESUME_SECS`), in seconds | the server's config, read once at boot (`crates/config/src/settings.rs:1096`) | 0: off, and the scope is not read | whoever deploys the server | 0, for the whole fleet. It lands only with the roll that restarts the pods, so the scope is faster |
+| **The window**, `rc.session_resume_secs` (`ROOMLER__RC__SESSION_RESUME_SECS`), in seconds | the server's config, read once at boot (`crates/config/src/settings.rs:1118`) | 0: off, and the scope is not read | whoever deploys the server | 0, for the whole fleet. It lands only with the roll that restarts the pods, so the scope is faster |
 | **The resume scope**, `GET` / `PUT /api/admin/rc-resume-scope`, entries of kind `all`, `org` or `device` ([api.md](api.md)) | the `rc_resume_scope` collection | empty | a platform admin. Anyone else gets the 404 every `/api/admin/*` route gives | a `PUT` without the entry, or with no entries at all. Every pod tells each device it no longer covers a window of 0 on its live connection, with no roll (`reannounce`, `crates/modules/fleet/src/resume_scope.rs:255`) |
 | **The device's switch**, `rc_sessions_survive_reattach` (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`) | the device's config, read when the daemon starts (`crates/agent-core/src/config_surface.rs:726`) | on, since FR-138 P4-1. Only `0`, `false`, `no` or `off` turns it off: an empty or unknown value is on. On with no window, a device behaves exactly as off (P4-0), so the resume scope decides which devices keep sessions | nobody, to have it on. Whoever administers the device turns it off, on the device. Remote config cannot set it: a push naming it is refused 403 `device_owned_switch`, by name ([remote-config.md](remote-config.md#6-shape)) | for one device: `roomler config set rc_sessions_survive_reattach off`, then `roomler restart`. Not `roomler config clear`: a cleared key is the default, on. `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH=0` in the service's environment wins over the key. For a class of devices, the scope is faster (the row above) |
 
@@ -280,7 +280,7 @@ flowchart LR
 | Bake + default | `Dockerfile:155` (`COPY`), `Dockerfile:161` (`ENV`) | The image names its own database; the deployment sets nothing |
 | Load | `crates/core/src/user_analytics.rs:100` | Logs `geoip database loaded` with the database's type and build date, or warns once and degrades. An **empty** value is an explicit off, with no warning |
 | Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:264` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
-| Payload | `crates/api/src/routes/stats.rs:1296` | `geoip_database`: the loaded database's own `database_type`, or `null` |
+| Payload | `crates/api/src/routes/stats.rs:1298` | `geoip_database`: the loaded database's own `database_type`, or `null` |
 | Credit | `ui/src/utils/geoipCredit.ts:35`, `ObservabilityView.vue:369` | "IP Geolocation by DB-IP" linking <https://db-ip.com> under the Countries table, shown only when the server reports a DB-IP database |
 
 **The licence.** DB-IP licenses the Lite database under
@@ -428,19 +428,19 @@ sequenceDiagram
 | A dump holds | Why |
 |---|---|
 | per thread: name, run state, kernel `wchan`, and the syscall **with its arguments** from `/proc/self/task/<tid>/syscall` | `write#1 0x1 …` on a thread in `pipe_write` means it is blocked writing stdout |
-| per thread: its stack, symbolized in-process | each thread walks its own stack in a signal handler (`SIGRTMIN+5`, `crates/api/src/stall_watchdog.rs:499`), claimed per request so a late walk can't corrupt the next (`stack_of`, `:576`) |
+| per thread: its stack, symbolized in-process | each thread walks its own stack in a signal handler (`SIGRTMIN+5`, `crates/api/src/stall_watchdog.rs:565`), claimed per request so a late walk can't corrupt the next (`stack_of`, `:642`). The handler is installed **once per process** (`install_handler`, `:516`): a caller that arrives during the install waits for it, and every caller gets its one outcome, a foreign handler on the signal included (#3564) |
 | fd 1 and fd 2: what they are, `unread_bytes`, `pipe_capacity` | `unread == capacity`: the log reader stopped reading |
 | tokio `workers` / `alive_tasks` / `global_queue_depth` | `global_queue_depth` counts tasks woken from OUTSIDE the runtime (timers, I/O, other threads) that no worker has picked up |
 | `VmRSS`, cgroup `memory.current/max/events`, memory/cpu/io **PSI**, `cpu.stat` | rules reclaim thrash and CPU throttling in or out |
 
-A sample is written in **stages**, each synced before the next (`sample_process`, `:794`): the
+A sample is written in **stages**, each synced before the next (`sample_process`, `:860`): the
 header, then every thread's `/proc` line, then stacks one thread at a time. A sample cut short by
 the kill still keeps every earlier stage. Threads in `D`/`T`/`Z` cannot run a handler, so they are
 not asked; their `/proc` line is the evidence. A sample's stack walks share a 5 s budget. At most
 one stall is dumped per 10 min, and the watchdog retires when its runtime shuts down.
 
 ⚠️ **The dump never goes through stdout or `tracing`.** The dump is written to a file (`DumpOut`,
-`stall_watchdog.rs:237`). A copy goes to stderr from a throwaway thread (`:280`), so a blocked
+`stall_watchdog.rs:229`). A copy goes to stderr from a throwaway thread (`:282`), so a blocked
 pipe blocks only that thread.
 
 ### A log pipe that stops draining must not stop the server (#1731)
@@ -450,6 +450,8 @@ enqueues its line (up to 16,384 lines queued) and returns. One `log-writer` thre
 the container's log pipe stops draining, that thread waits alone, the queue fills, and further
 lines are **dropped and counted**. Once a minute, and once the pipe drains again, the log says so:
 `log output was not draining: lines were dropped so the server kept serving (#1731) … total=N`.
+The lines carry ANSI colour codes only when stdout is a terminal and `NO_COLOR` is unset or empty
+(`crates/api/src/logging.rs:58`, #4402), so a pod's log is plain text.
 
 Before this, the fmt layer wrote stdout **synchronously under the process-wide stdout lock**. The
 server runs as many tokio workers as its CPU limit, **two** in production, so a stopped pipe froze
@@ -601,8 +603,8 @@ last tunnel release: rc.266, cut 07-28, has only `.sha256`); releases are
 published non-prerelease so `/releases/latest` stays resolvable for the fleet's
 auto-updaters. `/api/setup/{windows,linux,macos}` serve the newest `setup-v*`,
 so the wizard a new install downloads is only as current as the last lockstep
-roll — verify one by its tag, `git ls-remote origin 'refs/tags/setup-v<V>^{}'`
-(the agent-v<V> commit), and `gh release view setup-v<V> --json assets`. The
+roll — verify one by its tag, `git ls-remote origin 'refs/tags/setup-v<V>'`
+(the agent-v<V> commit; the tag is lightweight, so a `^{}` pattern lists nothing), and `gh release view setup-v<V> --json assets`. The
 recipe, the re-run after a failure, and why the release no longer records a
 `targetCommitish` (#2013) are in the `ship-it` skill §6.
 
