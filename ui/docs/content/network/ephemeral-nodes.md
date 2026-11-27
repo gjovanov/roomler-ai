@@ -48,14 +48,14 @@ asserts.
 | Behaviour | Normal device | Ephemeral device |
 |---|---|---|
 | Machine identity | Stable, derived from hardware | Random per enrollment |
-| Restarting the agent | The same device comes back | A **new** device |
+| Restarting the daemon | The same device comes back | A **new** device |
 | Clean shutdown | Stays in the list | Removes itself |
 | Disappearing without stopping | Shows offline indefinitely | Reaped automatically |
 
 :::danger A restart is a new device, by design
 Ephemeral nodes deliberately do not reuse a machine identity — two containers
 from the same image on the same host must not collide. The consequence is that
-**restarting an ephemeral agent produces a second device**, with a new address.
+**restarting the daemon on an ephemeral node produces a second device**, with a new address.
 
 If you want a machine that keeps its identity across restarts, it should not be
 ephemeral.
@@ -65,12 +65,12 @@ ephemeral.
 
 Two mechanisms, because a machine cannot always announce its own exit:
 
-- **On a clean stop**, the agent removes itself as it shuts down. A Windows
+- **On a clean stop**, the daemon removes itself as it shuts down. A Windows
   per-user install stops cleanly on `roomlerd service stop`, on sign-out and on
   shutdown. Ending its task (Task Manager, `schtasks /End`) is not a clean stop.
 - **Otherwise**, a reaper removes ephemeral devices that have stopped reporting.
 
-An update that restarts the agent does **not** count as a shutdown — otherwise
+An update that restarts the daemon does **not** count as a shutdown — otherwise
 every update would silently delete the device it was updating.
 
 ## Using it in CI
@@ -91,6 +91,6 @@ an expiry and a use limit, and revoke it if a job log ever prints it.
 
 ## Not yet available for tunnel clients
 
-Ephemeral enrollment currently applies to full agents. A tunnel-only client
+Ephemeral enrollment currently applies to full `roomlerd` installs. A tunnel-only client
 needs its own credential type, which is not built — it is deferred until there
 is evidence of need rather than implemented speculatively.

@@ -1401,6 +1401,17 @@ pub mod helper {
                         "cannot run the portal helper as the session's owner: {e}"
                     )));
                 }
+                // #3866 — the helper's folders are the session owner's own,
+                // beneath the home the drop names: none of this process's
+                // XDG folder variables goes with it.
+                for name in [
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_CACHE_HOME",
+                ] {
+                    cmd.env_remove(name);
+                }
             }
             // HOME, USER and LOGNAME are already this account's.
             RunAs::Ourselves => {}

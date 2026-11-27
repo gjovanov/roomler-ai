@@ -4481,27 +4481,87 @@ mod session_job {
 /// terminate, the watchdog's `exit(2)`), so these tests leave the way those do:
 /// a copy of this test binary plays the daemon, starts the session, and calls
 /// `exit`. What the session started is watched from outside it.
+///
+/// #4444 — a cell that goes red says where it stopped. Each step of its chain
+/// leaves a mark in the cell's folder, the stand-in's own output goes there
+/// too, and the message reads them back beside what of it still runs.
 #[cfg(all(test, windows))]
 pub(crate) mod session_lifetime {
+    use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        GetExitCodeProcess, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+        WaitForSingleObject,
     };
 
     use super::*;
 
     const STAND_IN: &str = "ROOMLERD_TEST_STAND_IN_DAEMON";
     /// Under the whole Windows suite a PowerShell one-liner took 8-10+ s on the
-    /// 4-core runner (#3002).
+    /// 4-core runner (#3002). It counts from the cell's [`Turn`], never from
+    /// its wait for one (#4444). A green cell reports in about 1.5 s on CI, so
+    /// a red at this deadline is a stall, not a slow start: its message says
+    /// where.
     const COMMAND_STARTS_WITHIN: Duration = Duration::from_secs(120);
     /// How long a process of the session may take to be gone, on a loaded
     /// runner. The kernel ends a job's processes as its last handle closes.
     pub(crate) const GONE_WITHIN: Duration = Duration::from_secs(15);
     /// How long a process that must survive is watched for.
     const STILL_THERE_FOR: Duration = Duration::from_secs(3);
+
+    /// #4444 — the marks a cell leaves in its folder. The stand-in's own
+    /// output, and the lines [`said`] writes, which name its steps:
+    const OWN_OUT: &str = "stand-in.out";
+    const OWN_ERR: &str = "stand-in.err";
+    const UP: &str = "up: the";
+    pub(crate) const RUNTIME_BUILT: &str = "its runtime is built";
+    pub(crate) const PTY_UP: &str = "its pty is up";
+    const RUN_RETURNED: &str = "the run returned";
+    /// The shell's pid, written by its first line; a nested shell's, by its.
+    const SHELL_RAN: &str = "shell";
+    const INNER_RAN: &str = "inner";
+    /// The pids the command reports, the last thing it does.
+    const STARTED: &str = "started";
+    /// What the command wrote, as the session's client got it.
+    const OUTPUT: &str = "output";
+    /// How much of the end of each file a red shows.
+    const SHOWN: usize = 4096;
+
+    /// #4444 — one cell at a time runs a PowerShell that calls `Start-Process`.
+    /// Twice on CI (2026-11-19 and 11-25) the four such cells here started
+    /// theirs within 4 s of each other, and all four stalled to their deadline
+    /// together, while a cmd cell beside them and the PowerShells started as
+    /// they failed ran in seconds. Taking turns removes that start, and a red
+    /// then names the one cell it stopped in. A cell holds its turn from before
+    /// its first process to after its last look. Tokio's mutex: the tokio
+    /// cells hold it across `.await`, and it does not poison, so a red leaves
+    /// the next cell its turn.
+    static TURNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A cell's turn ([`TURNS`]).
+    pub(crate) struct Turn {
+        _held: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Turn {
+        /// In a plain `#[test]`, which runs no runtime: `blocking_lock` panics
+        /// inside one.
+        pub(crate) fn wait() -> Self {
+            Self {
+                _held: TURNS.blocking_lock(),
+            }
+        }
+
+        /// In a tokio test.
+        pub(crate) async fn wait_async() -> Self {
+            Self {
+                _held: TURNS.lock().await,
+            }
+        }
+    }
 
     /// One process, held by a handle, so a reused pid cannot answer for it. A
     /// test leaves none running, whatever it found.
@@ -4547,14 +4607,272 @@ pub(crate) mod session_lifetime {
         std::process::exit(0)
     }
 
-    /// PowerShell that starts a long `ping` and writes this shell's pid and its
-    /// to `<dir>\started`, the last thing it does before `then`. No double
-    /// quote in it: the pty's command line does not quote what it is given.
+    /// In the stand-in, first: say it is up, on its stderr, with the daemon's
+    /// own log beside it there (#4444).
+    pub(crate) fn up(mode: &str) {
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::stderr)
+            .finish()
+            .try_init();
+        said(&format!("{UP} {mode} stand-in, pid {}", std::process::id()));
+    }
+
+    /// In the stand-in: a line of how far it has got, on its stderr, which its
+    /// cell reads back only on a red (#4444).
+    pub(crate) fn said(what: &str) {
+        eprintln!("{} {what}", clock(SystemTime::now()));
+    }
+
+    /// `t` as UTC `HH:MM:SS.mmm`, the clock a CI log's lines carry.
+    fn clock(t: SystemTime) -> String {
+        let since = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        let s = since.as_secs() % 86_400;
+        format!(
+            "{:02}:{:02}:{:02}.{:03}",
+            s / 3600,
+            s / 60 % 60,
+            s % 60,
+            since.subsec_millis()
+        )
+    }
+
+    /// In the stand-in: what the command writes, kept in `<dir>\output` for a
+    /// red to show. Holding `chunks` open, as `mem::forget` did, also keeps the
+    /// run's forwarder reading: a sink nobody holds stops it.
+    async fn keep_output(mut chunks: tokio::sync::mpsc::Receiver<Chunk>, dir: PathBuf) {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(dir.join(OUTPUT)).ok();
+        while let Some(chunk) = chunks.recv().await {
+            if let Some(file) = file.as_mut() {
+                let _ = file.write_all(&chunk.bytes);
+            }
+        }
+    }
+
+    /// PowerShell that writes its pid to `<dir>\shell` with its first line, a
+    /// .NET call that loads no module (#4444), then starts a long `ping` and
+    /// writes this shell's pid and its to `<dir>\started`, the last thing it
+    /// does before `then`. No double quote in it: the pty's command line does
+    /// not quote what it is given.
     pub(crate) fn starts_a_child_then(dir: &Path, then: &str) -> String {
         format!(
-            "$p = Start-Process ping.exe -ArgumentList '-n','300','127.0.0.1' -WindowStyle Hidden \
+            "[IO.File]::WriteAllText('{}', [string]$PID); \
+             $p = Start-Process ping.exe -ArgumentList '-n','300','127.0.0.1' -WindowStyle Hidden \
              -PassThru; Set-Content -LiteralPath '{}' -Value ('{{0}} {{1}}' -f $PID, $p.Id); {then}",
-            dir.join("started").display()
+            dir.join(SHELL_RAN).display(),
+            dir.join(STARTED).display()
+        )
+    }
+
+    /// The pids written to `path`; none while it is missing or half written.
+    fn pids_in(path: &Path) -> Vec<u32> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    }
+
+    /// A live process below one of a cell's, from a snapshot of them all.
+    struct Below {
+        pid: u32,
+        parent: u32,
+        name: String,
+        depth: usize,
+    }
+
+    /// Every live process below `roots`, the roots too, parents first; `None`
+    /// when Windows refuses the snapshot. A parent is the pid the snapshot
+    /// lists, so a process whose parent has left still shows below that pid.
+    fn processes_below(roots: &[u32]) -> Option<Vec<Below>> {
+        let all = crate::win_service::companion_procs::snapshot()?;
+        let mut found = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut next: Vec<(u32, usize)> = roots.iter().rev().map(|&pid| (pid, 0)).collect();
+        while let Some((pid, depth)) = next.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if let Some(p) = all.iter().find(|p| p.pid == pid) {
+                found.push(Below {
+                    pid,
+                    parent: p.parent,
+                    name: p.name.clone(),
+                    depth,
+                });
+            }
+            next.extend(
+                all.iter()
+                    .filter(|p| p.parent == pid && p.pid != pid)
+                    .map(|p| (p.pid, depth + 1)),
+            );
+        }
+        Some(found)
+    }
+
+    /// The first process named `name` (any case) whose parent is `parent`.
+    fn child_named(below: &[Below], parent: u32, name: &str) -> Option<u32> {
+        below
+            .iter()
+            .find(|p| p.parent == parent && p.name.eq_ignore_ascii_case(name))
+            .map(|p| p.pid)
+    }
+
+    /// How far a [`starts_a_child_then`] command got, from its marks in `dir`
+    /// and what runs in `below` (#4444): its shell's start, then its first
+    /// line, then `Start-Process`, then the pid file's write, then its run's
+    /// return.
+    fn how_far_the_command_got(dir: &Path, below: &[Below]) -> String {
+        let Some(&shell) = pids_in(&dir.join(SHELL_RAN)).first() else {
+            return match below
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case("powershell.exe"))
+            {
+                Some(p) => format!(
+                    "PowerShell's start: powershell.exe {} runs, and has not run its first line",
+                    p.pid
+                ),
+                None => "PowerShell's start: no shell ran its first line, and no powershell.exe \
+                         runs below the cell's processes"
+                    .to_string(),
+            };
+        };
+        if pids_in(&dir.join(STARTED)).len() == 2 {
+            return "after the report: the command reported its pids, and its run has not \
+                    returned"
+                .to_string();
+        }
+        match child_named(below, shell, "ping.exe") {
+            Some(ping) => format!(
+                "the pid file's write: ping.exe {ping} runs under the shell ({shell}), and \
+                 `{STARTED}` was never written"
+            ),
+            None => format!(
+                "PowerShell's Start-Process: the shell ({shell}) ran its first line, and no \
+                 ping.exe runs under it"
+            ),
+        }
+    }
+
+    /// `dir`'s files, with their sizes and when each was last written.
+    fn listing(dir: &Path) -> String {
+        let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries.flatten().collect(),
+            Err(e) => return format!("  (not read: {e})\n"),
+        };
+        entries.sort_by_key(|e| e.file_name());
+        let mut shown = String::new();
+        for e in entries {
+            let (size, at) = e
+                .metadata()
+                .map(|m| (m.len(), m.modified().ok()))
+                .unwrap_or((0, None));
+            let _ = writeln!(
+                shown,
+                "  {:<14} {size:>7} B  {}",
+                e.file_name().to_string_lossy(),
+                at.map(clock).unwrap_or_default()
+            );
+        }
+        if shown.is_empty() {
+            shown.push_str("  (empty)\n");
+        }
+        shown
+    }
+
+    /// The end of `dir\name`, indented.
+    fn tail(dir: &Path, name: &str) -> String {
+        match std::fs::read(dir.join(name)) {
+            Ok(bytes) if bytes.is_empty() => "  (empty)\n".to_string(),
+            Ok(bytes) => String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(SHOWN)..])
+                .lines()
+                .map(|line| format!("  {line}\n"))
+                .collect(),
+            Err(e) => format!("  ({e})\n"),
+        }
+    }
+
+    /// `below`, one process a line, indented by depth.
+    fn show(below: Option<&[Below]>) -> String {
+        match below {
+            None => "  (Windows refused the snapshot)\n".to_string(),
+            Some([]) => "  nothing\n".to_string(),
+            Some(below) => below
+                .iter()
+                .map(|p| {
+                    format!(
+                        "  {}{} {} (parent {})\n",
+                        "  ".repeat(p.depth),
+                        p.pid,
+                        p.name,
+                        p.parent
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// #4444 — what a cell whose shell is not a stand-in's left: where its
+    /// [`starts_a_child_then`] command stopped, its folder, and what runs
+    /// below the shell that marked its first line. Roomler SSH's quiet-shell
+    /// cells call it, which only `ssh-server` builds.
+    #[cfg_attr(not(feature = "ssh-server"), allow(dead_code))]
+    pub(crate) fn where_a_command_stopped(dir: &Path) -> String {
+        let below = processes_below(&pids_in(&dir.join(SHELL_RAN)));
+        format!(
+            "where it stopped: {}\nits folder {}:\n{}what of it runs now:\n{}",
+            how_far_the_command_got(dir, below.as_deref().unwrap_or_default()),
+            dir.display(),
+            listing(dir),
+            show(below.as_deref())
+        )
+    }
+
+    /// #4444 — the nested cell's red: how far its two shells got, the run's
+    /// outcome when it has returned (`ran`), its folder and what of it runs.
+    fn how_far_the_nested_command_got(dir: &Path, ran: Option<String>) -> String {
+        let shell = pids_in(&dir.join(SHELL_RAN)).first().copied();
+        let inner = pids_in(&dir.join(INNER_RAN)).first().copied();
+        let roots: Vec<u32> = shell.into_iter().chain(inner).collect();
+        let below = processes_below(&roots);
+        let seen = below.as_deref().unwrap_or_default();
+        let stopped = match (&ran, shell, inner) {
+            (Some(ran), _, _) => format!("the run: it returned before the command reported: {ran}"),
+            (None, None, _) => {
+                "PowerShell's start: the outer shell never ran its first line".into()
+            }
+            (None, Some(s), None) => match child_named(seen, s, "powershell.exe") {
+                Some(p) => format!(
+                    "the nested PowerShell's start: powershell.exe {p} runs under the outer shell \
+                     ({s}), and has not run its first line"
+                ),
+                None => format!(
+                    "the nested PowerShell's start: the outer shell ({s}) ran its first line, and \
+                     no powershell.exe runs under it"
+                ),
+            },
+            (None, Some(_), Some(i)) => match child_named(seen, i, "ping.exe") {
+                Some(ping) => format!(
+                    "the pid file's write: ping.exe {ping} runs under the inner shell ({i}), and \
+                     `{STARTED}` was never written"
+                ),
+                None => format!(
+                    "PowerShell's Start-Process: the inner shell ({i}) ran its first line, and no \
+                     ping.exe runs under it"
+                ),
+            },
+        };
+        format!(
+            "the command reported no process (#4444)\nwhere it stopped: {stopped}\n\
+             now {}\nits folder {}:\n{}what of it runs now:\n{}{OUTPUT}:\n{}",
+            clock(SystemTime::now()),
+            dir.display(),
+            listing(dir),
+            show(below.as_deref()),
+            tail(dir, OUTPUT)
         )
     }
 
@@ -4562,45 +4880,123 @@ pub(crate) mod session_lifetime {
     pub(crate) struct StandIn {
         child: std::process::Child,
         dir: PathBuf,
+        mode: String,
+        spawned_at: SystemTime,
+        spawn_took: Duration,
     }
 
     impl StandIn {
         /// `stand_in_test` is the full name of the test that plays the part.
-        pub(crate) fn start(stand_in_test: &str, mode: &str) -> Self {
+        /// Its stdout and stderr go to its folder, read back only on a red
+        /// (#4444). A [`Turn`] is held for it.
+        pub(crate) fn start(_turn: &Turn, stand_in_test: &str, mode: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "roomlerd-3303-{}-{:016x}",
                 std::process::id(),
                 rand::random::<u64>()
             ));
             std::fs::create_dir_all(&dir).unwrap();
+            let own = |name| std::fs::File::create(dir.join(name)).unwrap();
+            let (out, err) = (own(OWN_OUT), own(OWN_ERR));
+            let spawned_at = SystemTime::now();
+            let spawning = Instant::now();
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([stand_in_test, "--exact", "--nocapture", "--test-threads=1"])
                 .env(STAND_IN, format!("{mode}|{}", dir.display()))
                 .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stdout(out)
+                .stderr(err)
                 .spawn()
                 .expect("a copy of this test binary");
-            Self { child, dir }
+            Self {
+                child,
+                dir,
+                mode: mode.to_string(),
+                spawned_at,
+                spawn_took: spawning.elapsed(),
+            }
+        }
+
+        /// The stand-in's exit code; `None` while it runs.
+        fn exit_code(&self) -> Option<u32> {
+            use std::os::windows::io::AsRawHandle as _;
+            let mut code = 0u32;
+            // SAFETY: the child's own handle, live while `self` is; `code` is
+            // a valid out-param.
+            let read =
+                unsafe { GetExitCodeProcess(self.child.as_raw_handle() as HANDLE, &mut code) };
+            (read != 0 && code != STILL_ACTIVE as u32).then_some(code)
+        }
+
+        /// #4444 — a red's message: `what` failed, and where the stand-in and
+        /// its command got to, from its folder and what of it still runs.
+        /// `stopped` names the step when the caller knows it.
+        fn where_it_stopped(&self, what: &str, stopped: Option<String>) -> String {
+            let exit = self.exit_code();
+            let said = std::fs::read_to_string(self.dir.join(OWN_ERR)).unwrap_or_default();
+            let wrote = std::fs::metadata(self.dir.join(OWN_OUT)).map_or(0, |m| m.len());
+            let mut roots = vec![self.child.id()];
+            roots.extend(pids_in(&self.dir.join(SHELL_RAN)));
+            let below = processes_below(&roots);
+            let stopped = stopped.unwrap_or_else(|| {
+                if let Some(code) = exit {
+                    format!("the stand-in itself: it left with {code:#x} (101 is a panic)")
+                } else if !said.contains(UP) && wrote == 0 {
+                    "the stand-in's start: the copy of this test binary runs, and has written \
+                     nothing"
+                        .to_string()
+                } else if !said.contains(UP) {
+                    "the stand-in's harness: it never reached the stand-in test".to_string()
+                } else if !said.contains(RUNTIME_BUILT) {
+                    "the stand-in's runtime: it was never built".to_string()
+                } else if self.mode == "pty" && !said.contains(PTY_UP) {
+                    "the pty: its spawn never returned".to_string()
+                } else if let Some(line) = said.lines().find(|l| l.contains(RUN_RETURNED)) {
+                    format!("the run: it returned before the command reported ({line})")
+                } else {
+                    how_far_the_command_got(&self.dir, below.as_deref().unwrap_or_default())
+                }
+            });
+            let mut m = format!("{what} (#4444)\nwhere it stopped: {stopped}\n");
+            let _ = writeln!(
+                m,
+                "the {} stand-in: pid {}, {}; spawned {} (the spawn took {:?}), now {}",
+                self.mode,
+                self.child.id(),
+                exit.map_or("still running".to_string(), |c| format!("left with {c:#x}")),
+                clock(self.spawned_at),
+                self.spawn_took,
+                clock(SystemTime::now())
+            );
+            let _ = write!(
+                m,
+                "its folder {}:\n{}",
+                self.dir.display(),
+                listing(&self.dir)
+            );
+            let _ = write!(m, "what of it runs now:\n{}", show(below.as_deref()));
+            for name in [OWN_ERR, OWN_OUT, OUTPUT] {
+                let _ = write!(m, "{name}:\n{}", tail(&self.dir, name));
+            }
+            m
         }
 
         /// The shell's pid and its child's, once the session has reported them.
+        /// A stand-in that has left reports nothing more, so it fails at once.
         fn reported_pids(&self) -> Vec<u32> {
-            let started = self.dir.join("started");
+            let started = self.dir.join(STARTED);
             let deadline = Instant::now() + COMMAND_STARTS_WITHIN;
             loop {
-                let pids: Vec<u32> = std::fs::read_to_string(&started)
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
+                let pids = pids_in(&started);
                 if pids.len() == 2 {
                     return pids;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "the session reported no processes: did the stand-in run?"
-                );
+                if Instant::now() >= deadline || self.exit_code().is_some() {
+                    panic!(
+                        "{}",
+                        self.where_it_stopped("the session reported no processes", None)
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
@@ -4620,19 +5016,32 @@ pub(crate) mod session_lifetime {
         }
 
         /// Tell the stand-in to leave, and see it gone.
-        pub(crate) fn exit(mut self) {
+        pub(crate) fn exit(self) {
             std::fs::write(self.dir.join("go"), b"").unwrap();
             let deadline = Instant::now() + GONE_WITHIN;
-            while self.child.try_wait().unwrap().is_none() {
-                assert!(Instant::now() < deadline, "the stand-in did not leave");
+            while self.exit_code().is_none() {
+                if Instant::now() >= deadline {
+                    let stopped = "its leaving: it was told to go, and still runs".to_string();
+                    panic!(
+                        "{}",
+                        self.where_it_stopped("the stand-in did not leave", Some(stopped))
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
 
+        /// `name` in the stand-in's folder. A stand-in that has left writes
+        /// nothing more, so it fails at once.
         fn wait_for(&self, name: &str) {
             let deadline = Instant::now() + COMMAND_STARTS_WITHIN;
             while !self.dir.join(name).exists() {
-                assert!(Instant::now() < deadline, "the stand-in never wrote {name}");
+                if Instant::now() >= deadline || self.exit_code().is_some() {
+                    panic!(
+                        "{}",
+                        self.where_it_stopped(&format!("the stand-in never wrote {name}"), None)
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
@@ -4670,10 +5079,12 @@ pub(crate) mod session_lifetime {
         let Some((mode, dir)) = stand_in_args() else {
             return;
         };
+        up(&mode);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
+        said(RUNTIME_BUILT);
         let hold = "Start-Sleep -Seconds 300";
         let redactor = Redactor::default();
         let engine = ExecEngine::new();
@@ -4681,10 +5092,10 @@ pub(crate) mod session_lifetime {
             // Roomler SSH's path, with the session open.
             "session" => {
                 let (sink, chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
-                std::mem::forget(chunks);
+                rt.spawn(keep_output(chunks, dir.clone()));
                 let req = req(starts_a_child_then(&dir, hold), true);
                 rt.spawn(async move {
-                    engine
+                    let outcome = engine
                         .run_streamed(
                             req,
                             &redactor,
@@ -4692,18 +5103,25 @@ pub(crate) mod session_lifetime {
                             sink,
                             tokio_util::sync::CancellationToken::new(),
                         )
-                        .await
+                        .await;
+                    said(&format!("{RUN_RETURNED}: {outcome:?}"));
                 });
             }
             // Fleet RPC's path, with the command running.
             "fleet" => {
                 let req = req(starts_a_child_then(&dir, hold), false);
-                rt.spawn(async move { engine.run(req, &redactor).await });
+                rt.spawn(async move {
+                    let o = engine.run(req, &redactor).await;
+                    said(&format!(
+                        "{RUN_RETURNED}: exit {:?}, error {:?}, stdout {:?}, stderr {:?}",
+                        o.exit_code, o.error, o.stdout, o.stderr
+                    ));
+                });
             }
             // Roomler SSH's path, a command that left a child and ended.
             "ended" => {
                 let (sink, chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
-                std::mem::forget(chunks);
+                rt.spawn(keep_output(chunks, dir.clone()));
                 let outcome = rt.block_on(engine.run_streamed(
                     req(starts_a_child_then(&dir, "exit 0"), true),
                     &redactor,
@@ -4711,6 +5129,7 @@ pub(crate) mod session_lifetime {
                     sink,
                     tokio_util::sync::CancellationToken::new(),
                 ));
+                said(&format!("{RUN_RETURNED}: {outcome:?}"));
                 assert_eq!(outcome.error, None);
                 std::fs::write(dir.join("returned"), b"").unwrap();
             }
@@ -4723,7 +5142,8 @@ pub(crate) mod session_lifetime {
     /// started end with it, with no code of the daemon's running to do it.
     #[test]
     fn a_sessions_command_and_what_it_started_end_with_the_daemon() {
-        let daemon = StandIn::start(STAND_IN_TEST, "session");
+        let turn = Turn::wait();
+        let daemon = StandIn::start(&turn, STAND_IN_TEST, "session");
         let processes = daemon.wait_for_its_processes();
         daemon.exit();
         for (what, p) in ["the session's shell", "what it started"]
@@ -4739,7 +5159,8 @@ pub(crate) mod session_lifetime {
     /// control for the test above: a process it says is gone would be here.
     #[test]
     fn a_fleet_rpc_command_and_what_it_started_outlive_the_daemon() {
-        let daemon = StandIn::start(STAND_IN_TEST, "fleet");
+        let turn = Turn::wait();
+        let daemon = StandIn::start(&turn, STAND_IN_TEST, "fleet");
         let processes = daemon.wait_for_its_processes();
         daemon.exit();
         for (what, p) in ["the command's shell", "what it started"]
@@ -4758,7 +5179,8 @@ pub(crate) mod session_lifetime {
     /// has to go on. It stays through the command's end and the daemon's leaving.
     #[test]
     fn what_a_command_left_running_when_it_ended_stays() {
-        let daemon = StandIn::start(STAND_IN_TEST, "ended");
+        let turn = Turn::wait();
+        let daemon = StandIn::start(&turn, STAND_IN_TEST, "ended");
         let left = daemon.wait_for_what_it_started();
         daemon.wait_for("returned");
         assert!(
@@ -4776,26 +5198,32 @@ pub(crate) mod session_lifetime {
     /// parent has already exited is in no tree the shell leads.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_client_gone_ends_a_process_whose_parent_already_left() {
+        let _turn = Turn::wait_async().await;
         let dir = std::env::temp_dir().join(format!(
             "roomlerd-3303-{}-{:016x}",
             std::process::id(),
             rand::random::<u64>()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let started = dir.join("started");
-        // The inner shell starts `ping` and leaves; this one stays.
+        let started = dir.join(STARTED);
+        // The inner shell starts `ping` and leaves; this one stays. Each marks
+        // its first line with its pid (#4444).
         let inner = format!(
-            "$p = Start-Process ping.exe -ArgumentList '-n','300','127.0.0.1' -WindowStyle Hidden \
+            "[IO.File]::WriteAllText('{}', [string]$PID); \
+             $p = Start-Process ping.exe -ArgumentList '-n','300','127.0.0.1' -WindowStyle Hidden \
              -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id",
+            dir.join(INNER_RAN).display(),
             started.display()
         );
         let command = format!(
-            "$inner = @'\n{inner}\n'@\npowershell.exe -NoProfile -NonInteractive -Command $inner\n\
-             Start-Sleep -Seconds 300"
+            "[IO.File]::WriteAllText('{}', [string]$PID)\n$inner = @'\n{inner}\n'@\n\
+             powershell.exe -NoProfile -NonInteractive -Command $inner\nStart-Sleep -Seconds 300",
+            dir.join(SHELL_RAN).display()
         );
-        let (sink, _chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
+        let (sink, chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
+        tokio::spawn(keep_output(chunks, dir.clone()));
         let abort = tokio_util::sync::CancellationToken::new();
-        let run = {
+        let mut run = {
             let abort = abort.clone();
             tokio::spawn(async move {
                 ExecEngine::new()
@@ -4805,13 +5233,18 @@ pub(crate) mod session_lifetime {
         };
         let deadline = Instant::now() + COMMAND_STARTS_WITHIN;
         let left = loop {
-            let pid = std::fs::read_to_string(&started)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok());
-            if let Some(pid) = pid {
+            if let Some(&pid) = pids_in(&started).first() {
                 break Watched::open(pid);
             }
-            assert!(Instant::now() < deadline, "the command reported no process");
+            // A run that has returned reports nothing more: it fails at once.
+            if Instant::now() >= deadline || run.is_finished() {
+                let ran = if run.is_finished() {
+                    Some(format!("{:?}", (&mut run).await))
+                } else {
+                    None
+                };
+                panic!("{}", how_far_the_nested_command_got(&dir, ran));
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         abort.cancel();

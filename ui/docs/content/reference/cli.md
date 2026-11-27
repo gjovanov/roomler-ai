@@ -5,8 +5,8 @@ tags: [reference, cli, commands, tunnels, diagnostics]
 order: 1
 ---
 
-`roomler` is the command-line tool. On a machine that also runs the agent it is
-a thin shim onto the agent's own command surface, so the two can never disagree
+`roomler` is the command-line tool. On a machine that also runs `roomlerd` it is
+a thin shim onto the daemon's own command surface, so the two can never disagree
 about their version.
 
 :::warning `--agent` takes the hex device id
@@ -27,8 +27,8 @@ display name or the hex id — see Remote access below.
 | `roomler peers <name>…` | Only those peers — each a device name or a display name, in the order given |
 | `roomler why <peer>` | Why **one** peer rides the path it does: the ladder, each tier's eligibility, and any hold-down overriding the ranking |
 | `roomler netcheck` | This machine's measured network capability: reachability, relay verdict, floor health, NAT class |
-| `roomler flows` | Flows the local agent is currently running |
-| `roomler logs --tail <n>` | Tail the agent's log, resolved **by** the agent — the path differs per process and platform |
+| `roomler flows` | Flows the local daemon is currently running |
+| `roomler logs --tail <n>` | Tail the daemon's log, resolved **by** the daemon — the path differs per process and platform |
 | `roomler ping <peer>` | Reachability over the mesh — by device name, display name or overlay address |
 
 :::tip `why` is the command to reach for on a relay question
@@ -57,13 +57,13 @@ roomler kill <flow-id>
 | `--agent` | Hex device id of the far end. On `socks5`, **omitting** it selects mesh mode |
 | `--local` | Local port to listen on, bound to loopback |
 | `--remote` | `host:port` the far end dials |
-| `--daemon` | Hand the flow to the local agent so it outlives this command |
+| `--daemon` | Hand the flow to the local daemon so it outlives this command |
 
 Both commands stay in the foreground without `--daemon`; `Ctrl-C` tears down.
 
 ## Declared routes
 
-Forwards the agent re-establishes on every start:
+Forwards the daemon re-establishes on every start:
 
 ```bash
 roomler route add --agent <id> --local 5432 --remote localhost:5432
@@ -105,9 +105,9 @@ is verified for you, use `roomler ssh`.
 ## Diagnostics
 
 ```bash
-roomler diag host                  # evidence bundle from one device
-roomler diag pair <other-agent-id> # both ends, side by side
-roomler diagnose --agent <id>      # probe MTU, candidates and relay status from HERE
+roomler diag host                   # evidence bundle from one device
+roomler diag pair <other-device-id> # both ends, side by side
+roomler diagnose --agent <id>       # probe MTU, candidates and relay status from HERE
 ```
 
 :::tip `diag` and `diagnose` are different tools
@@ -128,7 +128,7 @@ roomler enroll --server <url> --token <token> --name <name>
 roomler self-update
 ```
 
-:::warning `self-update` refuses on a machine that runs the agent
+:::warning `self-update` refuses on a machine that runs roomlerd
 There the installer owns the whole node stack and `roomler` is a shim with
 nothing of its own to update. It is the real updater only on tunnel-only
 machines.

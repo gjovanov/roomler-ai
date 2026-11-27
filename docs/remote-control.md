@@ -249,7 +249,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
-> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3939`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
+> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`agents/roomlerd/src/signaling.rs:3939`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
 > - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:2162`, `delegate.rs:2206`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:5066`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
@@ -258,7 +258,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 | Server | Agent | Result |
 |---|---|---|
-| Older (no field) | New | Absent reads **off** (`signaling.rs:2532`, `serde(default)`) |
+| Older (no field) | New | Absent reads **off** (`crates/remote_control/src/signaling.rs:2530`, `serde(default)`) |
 | New | Older | The old agent ignores the field and keeps its old behaviour, except the loopback-TURN relay, which the Hub now withholds |
 | New, policy `auto` (FR-128) | Older than `rc-overlay-auto` | The Hub reads `auto` as `off` for it: no `rc_overlay_auto`, and no relay handed out |
 | Cross-pod | | The relay envelope carries `rc_overlay`; absent reads **off** |
@@ -996,7 +996,7 @@ that does not know the map works exactly as before.
 ⚠️ **An absent key never means "unavailable".** Agents before P0c send no map
 at all; their lists say what they claim. The map is off the wire when empty,
 and the server stores caps whole
-([`agent.rs:558`](../crates/services/src/dao/agent.rs#L558)), so an older
+([`agent.rs:585`](../crates/services/src/dao/agent.rs#L585)), so an older
 server drops it and a newer one keeps it with no migration.
 
 ⚠️ **`not-applicable` is the only code that hides a control, and it is how
@@ -3949,7 +3949,7 @@ hears the terminate and `merge_live_stats` matches nothing. So a session with no
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
 P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:955`)
 and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2856`), by the
-same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6904`) queues the sample on
+same road the tick uses: the shared `send_one_session_stats` (`agents/roomlerd/src/signaling.rs:6904`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:295`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
@@ -4068,7 +4068,7 @@ with no grep of `agent_logs`.
 | a failed read | a heartbeat whose `rate_stats` failed reads `InputForm`'s default, CPU with no reason. A real CPU form always names its reason, so this one is dropped and the reading before it stands | `SessionCounters::note_video`, `agents/roomlerd/src/session_telemetry.rs:249` |
 | the early sample | a new reading sends one `rc:session.stats` at once, by the carrier's road (§11.9), so the row has it within a heartbeat and follows a form that moves in the session's first seconds | same |
 | the wire | `video: Option<SessionVideo>` on `rc:session.stats`, absent until the pump's first heartbeat; an older server ignores it | `crates/remote_control/src/signaling.rs:771` |
-| the check | the device is the only writer, so a reading with any field that is not a short lowercase name is dropped whole, and the row keeps its last | `SessionVideo::checked`, `crates/remote_control/src/models.rs:6158` |
+| the check | the device is the only writer, so a reading with any field that is not a short lowercase name is dropped whole, and the row keeps its last | `SessionVideo::checked`, `crates/remote_control/src/models.rs:6216` |
 | the row | `remote_sessions.video`, beside `stats`, so `mark_ended`'s whole-`stats` write cannot reset it | `merge_live_stats`, `crates/services/src/dao/remote_session.rs:182` |
 
 ⚠️ **The reading cannot wait for the session's last sample.** When the viewer hangs up, the server
@@ -4117,7 +4117,7 @@ The VP9 pump now sends P1d's reading too (`vp9_libvpx`, CPU, `no_gpu_cell`,
 `agents/roomlerd/src/peer.rs:4393-4404`), so a VP9 session names its cell as an FFmpeg one does.
 The server checks every count against a bound (30 days, 240 fps, 64 followers, an hour) and drops
 a reading with one out of range whole, as it drops a bad name (`SessionVideo::checked`,
-`crates/remote_control/src/models.rs:6158`). The agent saturates every count at those bounds
+`crates/remote_control/src/models.rs:6216`). The agent saturates every count at those bounds
 (`SessionCounters::video`), so a session past one, an hour's wait for its first frame, keeps its
 cell and loses only that count's precision. The struct defaults field by field, so a later agent
 that drops a field costs that reading and never the rest of the sample.
@@ -4197,7 +4197,7 @@ cumulative for the worker's session.
 | the parse | the viewer is the untrusted side: a histogram must be exactly twelve counts that fit a `u32`, and a count must sit inside the row's bounds, so no viewer can make the agent send a reading the server drops whole | `ViewerReport::parse`, `agents/roomlerd/src/media_window.rs:389` |
 | the gate | kept only with `stats` on the session's new path | `note_viewer_decodestat`, `agents/roomlerd/src/peer.rs:10834` |
 | the tally | windows summed between two heartbeats, and the counts as last reported | `SessionCounters::note_viewer_report` / `take_viewer_window`, `agents/roomlerd/src/session_telemetry.rs:293` |
-| the reading | `frames_painted` beside `frames_encoded`, and `freezes`, bounded by `checked` (30 days at 240 fps; five freezes a second) | `SessionVideo`, `crates/remote_control/src/models.rs:6130` |
+| the reading | `frames_painted` beside `frames_encoded`, and `freezes`, bounded by `checked` (30 days at 240 fps; five freezes a second) | `SessionVideo`, `crates/remote_control/src/models.rs:6188` |
 
 ⚠️ **`frames_painted` and `freezes` are the viewer's word.** They are bounded on intake, never
 checked against what the agent sent. A read that takes painted frames as a cell's proof checks
@@ -5324,7 +5324,7 @@ with an agent release. Every pairing behaves as before FR-138, or ends the sessi
 | The page predates P1c | It ignores `resume_secs` and `rc:session.detached` and never rejoins. The device's claim resumes the session, which waits the window for a viewer and then ends `controller_hangup`, marked `limit: hold_expired`. The page's own socket loss holds the session the same way, and its next request, which names nothing in `replaces`, reaps the held one as the same person's | `a_resume_its_viewer_never_rejoins_ends_marked_hold_expired` (`crates/tests/src/rc_resume_ends_tests.rs:610`); `a_held_session_never_costs_its_own_viewer_the_slot` (`crates/tests/src/rc_resume_rejoin_tests.rs:407`), its second half |
 | The page predates D5 = A | It hangs up before it redials a session the server called detached, so the row reads `controller_hangup` (§11.18) | `a_controllers_end_during_the_gap_is_enforced_at_the_claim` (`crates/tests/src/rc_resume_rejoin_tests.rs:572`) |
 | A supervised Mac's GUI worker or daemon predates P2b | The delegated session takes the path it took before (§11.16.1's version table). A P2b daemon with an older worker claims nothing for it, and the server ends it at the hello | `p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions` (`agents/roomlerd/src/delegate.rs:3546`); `p2b_the_orders_and_both_fields_keep_a_stable_wire_and_older_frames_parse` (`:5315`) |
-| The server is rolled back during a gap, to an image at or above the floor below | The session's audit listing still reads, a kind the image does not know as `unknown`. Whether a kept session resumes is that image's claim to decide; an image that never answers the claim leaves the device to close the peer at its own deadline, so the session ends at the window | `an_audit_listing_holding_the_new_kinds_and_an_unknown_one_still_reads` (`crates/tests/src/rc_resume_tests.rs:257`); `an_audit_page_holding_an_unknown_kind_still_reads` (`crates/remote_control/src/models.rs:11494`); `a_reconnect_does_not_move_the_deadline` (`agents/roomlerd/src/session_table.rs:2572`) |
+| The server is rolled back during a gap, to an image at or above the floor below | The session's audit listing still reads, a kind the image does not know as `unknown`. Whether a kept session resumes is that image's claim to decide; an image that never answers the claim leaves the device to close the peer at its own deadline, so the session ends at the window | `an_audit_listing_holding_the_new_kinds_and_an_unknown_one_still_reads` (`crates/tests/src/rc_resume_tests.rs:257`); `an_audit_page_holding_an_unknown_kind_still_reads` (`crates/remote_control/src/models.rs:11552`); `a_reconnect_does_not_move_the_deadline` (`agents/roomlerd/src/session_table.rs:2572`) |
 
 The integration tests run on every master push that touches the server or the agent (`integration-tests.yml`), the
 agent's unit tests on Linux and on Windows in `ci.yml`, and the page's in the frontend checks.
@@ -5346,13 +5346,13 @@ session not yet live, and an external one, end as before FR-138.
 
 ⚠️ **The rollback floor.** Production has written `session_detached` and `session_resumed` since P3 turned the window
 on, on 2026-11-10, so no server rollback goes to an image built before `79cf1019b` (P1a, #3607). `AuditKind` gained its
-tolerant `Unknown` there (`crates/remote_control/src/models.rs:6962-6963`), and the session's audit listing reads a
+tolerant `Unknown` there (`crates/remote_control/src/models.rs:7020-7021`), and the session's audit listing reads a
 page as one `Vec` (`AuditListResponse`, `crates/modules/remote/src/routes.rs:163-164`; `session_audit`, `:339`): on an older
 image one unknown kind fails the whole page, FR-137 S-B5's class. The row sets no floor. `RemoteSession` denies no
-unknown field (`crates/remote_control/src/models.rs:6186-6187`), so an older image ignores `attach_seq`, `detached_at`,
+unknown field (`crates/remote_control/src/models.rs:6244-6245`), so an older image ignores `attach_seq`, `detached_at`,
 `resume_by`, `stats_at` and `end_source`, and FR-138 added no `EndReason` and no phase. An `end_source` value from a
-later image, such as D5's `redial`, reads as `Unknown` from P1a on (`EndSource`, `:6272`, its `#[serde(other)]` at
-`:6289`).
+later image, such as D5's `redial`, reads as `Unknown` from P1a on (`EndSource`, `:6330`, its `#[serde(other)]` at
+`:6347`).
 
 What a rollback above the floor still costs:
 
@@ -5808,7 +5808,7 @@ the pod-log (~1 day) and `agent_logs` (7 d) windows, a stall in `requesting`
 leaves **no server row at all** (the request never reached a hub), and
 `agent_logs` held **zero** browser-source rows — `POST /api/log/browser`
 (`crates/modules/fleet/src/agent_log.rs:207`, mounted at
-`crates/modules/fleet/src/lib.rs:544`) had existed since rc.58 without a caller.
+`crates/modules/fleet/src/lib.rs:549`) had existed since rc.58 without a caller.
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
@@ -5882,7 +5882,7 @@ route by `browser_connect_timing_record_parses` (`agent_log.rs:494`), because a
 
 **Mining it** (`roomler2`, through `scripts/prod-mongo-read.sh`, whose client runs outside
 `mongodb-0` and never prints a credential: [production-mongo-reads.md](production-mongo-reads.md)). Retention is the collection's **7 d
-TTL** (`crates/modules/fleet/src/lib.rs:877`, `crates/db/src/models/agent_log.rs:115`) — the same window
+TTL** (`crates/modules/fleet/src/lib.rs:896`, `crates/db/src/models/agent_log.rs:115`) — the same window
 as the agent's own logs, and the pod log is shorter still — so a stall must be
 mined within the week; `remote_audit` keeps its three marks for 90 d.
 
@@ -7145,6 +7145,11 @@ Both kernel-released on process death, no stale-lock cleanup needed
 after `kill -9`. Only `run` gates on the lock — `enroll`,
 `service install/uninstall`, `caps`, `displays`, `encoder-smoke`,
 `self-update` stay runnable alongside a live agent.
+On Linux the lock's folder is the account's own
+(`appdirs::own_folders`, #3866): a root process takes it in root's own
+cache folder, `/root/.cache/roomler-agent-<id>.lock`, whatever `HOME` or
+`XDG_RUNTIME_DIR` it was started with, where a daemon that systemd started
+has always taken it (`instance_lock.rs:393` `unix_lock_path`).
 
 **Machine guard** (`agents/roomlerd/src/machine_guard.rs`, #4280): one
 daemon per machine, whatever config a `run` loads. `run` takes it before
@@ -7417,8 +7422,8 @@ otherwise keep (§11.16). The reconnect is the same either way.
 
 | line | the lateness it reads | slack | after a freeze it reads |
 |---|---|---|---|
-| control WS RX deadline (`signaling.rs:2421`) | the keepalive's own due instant, which `tick()` returns (`:2364`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
-| control WS, a failed heartbeat send (`signaling.rs:2748`) or read (`:3446`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:160`, set at `:2365`). Both are read before the send, or on a read error before the closes (`session_ended`, `:122`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:100`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
+| control WS RX deadline (`agents/roomlerd/src/signaling.rs:2421`) | the keepalive's own due instant, which `tick()` returns (`:2364`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
+| control WS, a failed heartbeat send (`agents/roomlerd/src/signaling.rs:2748`) or read (`:3446`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:160`, set at `:2365`). Both are read before the send, or on a read error before the closes (`session_ended`, `:122`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:100`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
 | the reconnect after any of them (`signaling.rs:1574`) | the session's reason, `AgentDidNotRun` (`:84`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
 | `/derp` RX deadline (`agents/roomlerd/src/derp.rs:488`) | the keepalive's due instant (`:475`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
 | direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:679`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3325`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
@@ -7739,7 +7744,7 @@ org had no front until the next restart. Two things now prevent it:
   locked by `overlay::socket_inherit_tests`
   (`agents/roomlerd/src/overlay.rs:1347-1402`), which a child process
   spawned in the test cannot get past.
-- The front waits out a busy port (`overlay.rs:885-944`).
+- The front waits out a busy port (`agents/roomlerd/src/overlay.rs:885-944`).
 
 **Never leave the service stopped (#2711, Windows perMachine).** The
 watcher is the only actor that outlives the install, so its last act

@@ -1,9 +1,9 @@
 ---
-title: The agent
+title: The daemon
 description: What roomlerd actually is, why it is a single process rather than several, how it runs on each OS, and how it keeps itself updated safely.
-tags: [architecture, agent, design, windows, macos, linux]
+tags: [architecture, daemon, design, windows, macos, linux]
 hero: devices.svg
-heroAlt: One agent binary on each machine, serving remote desktop, the mesh, tunnels and SSH at once
+heroAlt: One roomlerd binary on each machine, serving remote desktop, the mesh, tunnels and SSH at once
 order: 2
 ---
 
@@ -27,14 +27,14 @@ More practically, the machine only has one of several things:
 
 | One per machine | Consequence |
 |---|---|
-| The network adapter, with a fixed name | Two agents cannot both own it |
+| The network adapter, with a fixed name | Two daemons cannot both own it |
 | The local control socket | The CLI would not know which to talk to |
-| Routing, firewall and DNS state | Two agents would fight over it |
+| Routing, firewall and DNS state | Two daemons would fight over it |
 | The updater | Two would race to replace each other's binary |
 
 :::danger This is why "install a second copy" is the wrong answer
 It is the intuitive fix for wanting a machine in two organizations, and it
-breaks on every row of that table. One agent with several enrollments is the
+breaks on every row of that table. One daemon with several enrollments is the
 supported shape — see [multi-org](/docs/network/multi-org/).
 :::
 
@@ -46,7 +46,7 @@ A Windows service (`LocalSystem`) or a scheduled task, depending on the install
 mode you chose. The system service is the one that can reach the lock screen and
 the pre-logon desktop.
 
-Alongside it: `roomler.exe` — a small shim that re-execs the agent's own command
+Alongside it: `roomler.exe` — a small shim that re-execs `roomlerd`'s own command
 surface, so the CLI and the daemon can never disagree about their version — and
 `roomler-desktop.exe`, the tray companion.
 
@@ -75,7 +75,7 @@ settings — encoder preference, mesh mode, declared tunnel routes, whether SSH
 and remote commands are permitted at all.
 
 :::danger It holds a credential
-The agent token, and the SSH host private key if SSH is enabled. Written with
+The device credential, and the SSH host private key if SSH is enabled. Written with
 restrictive permissions; the machine-global directory is hardened at install
 time. Do not copy it between machines.
 :::
@@ -87,7 +87,7 @@ a gate.
 
 ## Self-update
 
-The agent updates itself, and the update path is where most of its defensive
+The daemon updates itself, and the update path is where most of its defensive
 engineering lives:
 
 :::steps
@@ -105,6 +105,6 @@ against a key published in advance, which is why the pinned key exists.
 
 ## Resource use
 
-Idle, the agent is small: a control connection, a heartbeat and occasional path
+Idle, the daemon is small: a control connection, a heartbeat and occasional path
 measurement. Capture and encoding only run while someone is connected. The mesh
 costs a keepalive per peer.

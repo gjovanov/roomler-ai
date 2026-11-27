@@ -67,7 +67,7 @@ written.
 
 Three of twelve online peers are relayed and every one is on **TCP** — a whole
 head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 512-frame
-`OUTBOUND_QUEUE` (`crates/tunnel-core/src/transport/derp.rs:53`) FR-18 measured at ≈1.8 s.
+`OUTBOUND_QUEUE` (`crates/tunnel-core/src/transport/derp.rs:55`) FR-18 measured at ≈1.8 s.
 
 ### 2b. What the sweep does — and does not — establish
 
@@ -91,7 +91,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
 2. **The no-UDP laptop is the proof DERP must stay.** `stun/udp: NO MAPPING` means no UDP path at
    all. No relay on any port helps it. ⚠️ Note its `relay band` cell is **derived, not
    measured**: `run_measurement` short-circuits `if !stun_udp { Some(false) }`
-   (`crates/tunnel-core/src/overlay/netcheck.rs:205`). Marked as such because this spec's
+   (`crates/tunnel-core/src/overlay/netcheck.rs:207`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
    says so: `crates/remote_control/src/signaling.rs:4072` — *"a corp egress that whitelists
@@ -215,15 +215,15 @@ Four requirements, all in P0:
 
 1. A **`supports_org_relay` hello bit** (`#[serde(default)] bool`, the shape of
    `supports_server_relay_strategy`, `crates/remote_control/src/signaling.rs:1644`), gated at the existing both-ends
-   gate in `server_relay_verdict` (`crates/api/src/ws/overlay.rs:1877`). The gate is
+   gate in `server_relay_verdict` (`crates/modules/network/src/overlay.rs:2856-2858`). The gate is
    **permanent**, not "until everyone upgrades".
 2. `#[serde(other)] Unknown` (or a `deserialize_with` mapping unknown → `None`), making the
    documented behaviour real. **This is a bug fix worth landing even if FR-19 never ships.**
 3. The variant stays a **unit variant**. The session is pushed **out-of-band** as its own
    `rc:overlay.relay_session` message keyed by node id. ⚠️ `RelayStrategyWire` derives
-   **`Copy`** (`:1985`); a `session` payload would break that derive and ripple through
+   **`Copy`** (`crates/remote_control/src/signaling.rs:3883`); a `session` payload would break that derive and ripple through
    `netmap.rs:92`, `relay_link.rs:1312-1315` and three by-value returns at
-   `overlay.rs:1959/1977/2055` — and would also change the JSON from a string tag to a map.
+   `crates/modules/network/src/overlay.rs:2820/2953/3025` — and would also change the JSON from a string tag to a map.
 4. A test decoding `"org-relay"` against a **pre-FR-19 `NetmapPeer` shape**.
 
 ---
@@ -249,10 +249,11 @@ pubkey in the MAC input is public netmap data; and anyone sharing the victim's e
 population this FR targets* — can take the slot. A stolen bind black-holes the pair,
 receives the counterparty's ciphertext, and injects arbitrary UDP at its WireGuard socket.
 
-⚠️ The first draft also cited `crates/api/src/ws/derp.rs:351` (the key-equality assertion on
-DERP registration) as the precedent to copy — but that check works **because the WebSocket
-underneath it is already authenticated** by the agent JWT (`derp.rs:234` `verify_agent_token`,
-`:247` tenant match, `:284` refusal check). Copying the assertion without the channel copies
+⚠️ The first draft also cited the key-equality assertion on DERP registration (then in
+`crates/api/src/ws/derp.rs`, now `crates/modules/network/src/derp.rs:514`) as the precedent to
+copy — but that check works **because the WebSocket underneath it is already authenticated**
+by the agent JWT (`crates/modules/network/src/derp.rs:338` `verify_agent_token`, `:350` tenant
+match, `:397` refusal check). Copying the assertion without the channel copies
 a check whose authentication came from somewhere else.
 
 ### The design
@@ -291,7 +292,7 @@ implemented as a fixed `FRAME_LEN = 85`. FR-19 adopts it: **`Bind` is padded so
 this, a customer's HQ box is a DDoS reflector at roughly 3×.
 
 Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
-(`crates/tunnel-core/src/overlay/carrier_plane.rs:705`; `UNKNOWN_INIT_MIN_INTERVAL = 2 s`,
+(`crates/tunnel-core/src/overlay/carrier_plane.rs:712`; `UNKNOWN_INIT_MIN_INTERVAL = 2 s`,
 `UNKNOWN_INIT_MAX_SOURCES = 64`, `wg.rs:1007`), with a counter and a reader.
 
 ### Construction details that are security-relevant
@@ -327,7 +328,7 @@ Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
   the target population — loses its session with no recovery short of a control-plane
   re-mint, the round trip this feature exists to avoid; permit it unauthenticated and it is
   a hijack primitive. The overlay already models this event (`Carrier::set_direct_dst`,
-  `wg.rs:238`, repoints on cryptographic evidence; `Routed::SessionRoam`,
+  `crates/tunnel-core/src/overlay/wg.rs:228`, repoints on cryptographic evidence; `Routed::SessionRoam`,
   `carrier_plane.rs:773`). Re-bind keeps the same VNI and updates one `boundAddrPort`.
 
 ### Lifetimes
@@ -368,9 +369,9 @@ Verdict machinery to extend, verified against master:
 
 | what | anchor |
 |---|---|
-| Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
-| …delegating to the pure decision | `overlay.rs:3025` `relay_verdict_core` |
-| Measured caps supersede presence | `overlay.rs:2970-2981` (in `verdict_from_nodes`, `:2953`) |
+| Server verdict entry point | `crates/modules/network/src/overlay.rs:2820` `server_relay_verdict` |
+| …delegating to the pure decision | `crates/modules/network/src/overlay.rs:3025` `relay_verdict_core` |
+| Measured caps supersede presence | `crates/modules/network/src/overlay.rs:2970-2981` (in `verdict_from_nodes`, `:2953`) |
 | Wire verdict enum | `crates/remote_control/src/signaling.rs:3464` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1289` `relay_strategy` |
 
@@ -423,18 +424,18 @@ the first:
 
 ⚠️ **"Fail closed" is not implementable through the API the first draft prescribed.**
 `load_acl` returns `AclCtx` — **not** `Result` — and its error path returns `AclCtx::off()`,
-logging *"failing OPEN"* (`overlay.rs:1873-1876`, `:1889`). That is byte-identical to a
+logging *"failing OPEN"* (`crates/modules/network/src/overlay.rs:2640-2646`, the log at `:2644`). That is byte-identical to a
 tenant that genuinely has ACLs disabled, so a caller shaped like the existing precedent
-(`overlay.rs:726-750`) takes the "no ACL configured" branch on a Mongo blip and **grants**,
+(the relay request's ACL gate, `crates/modules/network/src/overlay.rs:1153-1177`) takes the "no ACL configured" branch on a Mongo blip and **grants**,
 while its author believes it fails closed. Required: a `try_load_acl(…) -> Result<AclCtx, _>`
 for the new gate, with the two existing callers keeping their posture via an explicit
 `.unwrap_or_else(|_| AclCtx::off())` — which also turns their fail-open into a visible
-decision. Same for `overlay_source_of` (`overlay.rs:2749`), which swallows both errors
+decision. Same for `overlay_source_of` (`crates/modules/network/src/overlay.rs:2749`), which swallows both errors
 (`.ok()` → `owner_user_id: None`; `unwrap_or_default()` → empty roles), silently failing to
 match a `UserId`/`RoleId`-scoped grant with no log — against `feedback_log_every_silent_drop`.
 
 **Permissions.** ⚠️ Exit-node approval requires `MANAGE_AGENTS`
-(`crates/api/src/routes/overlay_route.rs:310`, checked at `:328`), which **is** in `DEFAULT_ADMIN`
+(`crates/modules/network/src/routes/overlay_route.rs:372`, checked at `:388`), which **is** in `DEFAULT_ADMIN`
 (`crates/db/src/models/role.rs:153`), and writes no audit row. Nominating a relay makes a
 device a traffic chokepoint and a metadata observation point for the whole tenant (§12), so
 it belongs in the class `role.rs` already draws a line around — *"an admin should see every
@@ -462,7 +463,8 @@ The bullets below describe the design *once #888 lands*:
   `MANAGE_AGENTS`.
 - **`VIEW_RELAY_AUDIT`** — in `DEFAULT_ADMIN`, mirroring `VIEW_EXEC_AUDIT` (1<<28) and
   `VIEW_SSH_AUDIT` (1<<30).
-- ⚠️ `ALL = (1 << 31) - 1` (`role.rs:146`) must be bumped in the same commit;
+- ⚠️ `ALL` (`crates/db/src/models/role.rs:183`; `(1 << 31) - 1` when this was written,
+  `(1 << 35) - 1` today) must be bumped in the same commit;
   `all_contains_every_named_permission` will force it.
 - **The approval itself is audited** — it is the privilege-granting action, and the
   exit-node precedent auditing nothing is a gap to not copy.
@@ -577,7 +579,7 @@ halves are wrong:
   **Coturn is the responder.** An org relay must answer the probe itself; that is a new
   protocol, and it is why P1 ships a bind-only responder.
 - `CapVector` (`netcheck.rs:62`) is four scalars in a **single process-global slot**
-  (`:213`), shipped once per node. Reachability is a **pairwise (node × relay × port)** fact
+  (`crates/tunnel-core/src/overlay/netcheck.rs:77`), shipped once per node. Reachability is a **pairwise (node × relay × port)** fact
   — an N×M table. It cannot be a `CapVector` field; it needs its own report
   (`rc:overlay.relay_probe`).
 
@@ -585,7 +587,7 @@ halves are wrong:
 oracle-returning internal port scanner exists: set a static endpoint to `169.254.169.254:80`
 or an RFC1918 address and **every agent in the tenant — running as SYSTEM/root inside the
 customer's corp LAN — probes it and reports reachability.** The countermeasure is already
-written for this exact class: `validate_push_endpoint` (`crates/api/src/routes/push.rs:20`),
+written for this exact class: `validate_push_endpoint` (`crates/api/src/routes/push.rs:24`),
 *"every resolved address must be globally routable (loopback / RFC1918 / 169.254 metadata /
 CGNAT-and-overlay 100.64/10 / ULA / link-local v6 / v4-mapped forms all refused)"*. Validate
 `endpoints` and `relay_static_endpoints` at approval time with that ruleset, re-check after
@@ -1002,10 +1004,12 @@ COTURN flush on a host serving live conference media.
 **E2E-1 — relay selection.** All three offered to `CORPLAP-3`; lowest measured RTT wins.
 Then take mars's relay down and assert re-selection to zeus without a DERP round trip.
 ⚠️ **Not via `roomler config set`.** The first draft claimed that was *"a config change, not
-a service restart"* — false: `config_surface.rs:19` states *"Every key is read at daemon
-startup, so the whole surface is `restart_required = true`"* (hardcoded `:495`, `:509`,
-asserted by `every_key_gets_and_applies` `:2959`), and the CLI's live-apply allowlist is
-exactly `exec_enabled | remote_config_enabled` (`localclient.rs:994`). A bound UDP socket
+a service restart"* — false: the relay keys are read at daemon startup.
+`relay_server_enabled` and `relay_server_port` are `live: false`
+(`crates/agent-core/src/config_surface.rs:618`, `:629`), so both report `restart_required`
+(`:1967`); only the keys the registry marks `live` apply without a restart (`:22-23`). When
+this was written the whole surface was hardcoded `restart_required = true` and the CLI kept
+its own live-apply allowlist; FR-84 D2 moved that per-key truth into the registry (`:34`). A bound UDP socket
 does not close on a TOML write, and restarting `roomlerd` on **mars** would kill the host
 driving every `roomler exec` in this plan. **Revoke server-side** (`Agent.peer_relay_policy`
 → `rc:relay.revoke`) — which also exercises §7's revocation path.
@@ -1157,7 +1161,7 @@ property to test (E2E-2, E2E-4), not to assert.
   survive; one attempted after will not. Interacts with the C4 warm-relay design — **do not
   solve both here.**
 - **MTU — not a risk, and the first draft overstated it.** The overlay MTU is a fixed 1280
-  (`agents/roomlerd/src/overlay.rs:41`), so worst case on the wire is
+  (`agents/roomlerd/src/overlay.rs:45`), so worst case on the wire is
   1280 + 32 (WG) + 8 (Geneve) + 8 (UDP) + 20 (IPv4) = **1348**, comfortably under 1500.
   Geneve's 8 bytes is +4 over TURN's ChannelData and costs nothing against DERP (WS over
   TCP). Re-check only if the overlay MTU is ever raised. ⚠️ And do **not** cite

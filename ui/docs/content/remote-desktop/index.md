@@ -8,12 +8,12 @@ heroAlt: A browser tab showing the live screen of a remote machine, connected di
 order: 0
 ---
 
-Any machine running the agent can be opened as a **live screen in a browser
+Any machine running `roomlerd` can be opened as a **live screen in a browser
 tab**. The viewing side installs nothing — the controller is a plain browser, on
 any operating system, including one that has never heard of Roomler.
 
 :::badges
-- **Nothing to install to watch** icon:monitor — only the machine you reach runs an agent.
+- **Nothing to install to watch** icon:monitor — only the machine you reach runs the daemon.
 - **Peer-to-peer and encrypted** icon:shield — pixels and keystrokes never pass through the server in the clear.
 - **Works from awkward networks** icon:network — hotel Wi-Fi, NAT, corporate firewalls and full-tunnel VPNs.
 :::
@@ -47,7 +47,7 @@ once the two ends can talk. It coordinates; it is never a data path.
 | Side | Needs |
 |---|---|
 | **Viewer** | A current browser: Chrome, Edge or another Chromium browser works best; Safari and Firefox work too. Nothing installed. |
-| **Target** | The agent, and whatever screen-capture permission the OS demands. |
+| **Target** | The daemon (`roomlerd`), and whatever screen-capture permission the OS demands. |
 
 Chromium browsers are the recommendation: the low-latency decode path the viewer
 relies on has had the most testing there. Safari and Firefox run the viewer too,

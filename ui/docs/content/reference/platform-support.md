@@ -18,14 +18,14 @@ that is greyed out always carries the device's own reason.
 - **⛔ Ruled out** icon:danger — the OS itself prevents it. The reason is below.
 :::
 
-These tables describe agent 0.4.170; a row that names a later version is coming
+These tables describe roomlerd 0.4.170; a row that names a later version is coming
 in the next release. The engineering record behind them, with
 the code each verdict comes from, is
 [`docs/platform-support.md`](https://github.com/gjovanov/roomler-ai/blob/master/docs/platform-support.md).
 
 ## Which install does what
 
-Most of this page follows from one question: does the agent run as the
+Most of this page follows from one question: does the daemon run as the
 machine, or as you? Joining the private network on a real network adapter
 needs the machine's own identity on every OS. Showing your desktop needs a way
 into your session.
@@ -45,7 +45,7 @@ A Mac needs both halves for both, and shows up as two devices.
 :::tip No admin rights? You can still join the network
 An install that runs as you cannot create a network adapter, but it can join
 the network in **netstack mode**: set `ROOMLERD_OVERLAY_NETSTACK_SOCKS` to a
-free port for the agent, and your apps reach the other devices through that
+free port for the daemon, and your apps reach the other devices through that
 local SOCKS5 port. Roomler SSH into this machine still works. A second
 organization chooses it with `roomler org overlay <org> netstack`
 ([multi-org](/docs/network/multi-org/)).
@@ -57,19 +57,19 @@ organization chooses it with `roomler org overlay <org> netstack`
 |---|---|---|---|
 | Your desktop, with a system install and nothing configured | ✅ | 🟡 GNOME and KDE, while your session is unlocked and you can be told who is viewing | 🟡 an opt-in |
 | The lock screen and sign-in screen, nobody signed in | ✅ Machine — system | 🟡 only when you switch screen capture on yourself | ⛔ |
-| The computer's sound | ✅ | ✅ | ✅ from agent 0.4.161 |
-| Recording with sound | ✅ | ✅ | ✅ the computer's sound from agent 0.4.161; the microphone from agent 0.4.163, and where the root half runs the screen (`macos_supervise_gui_worker`) from agent 0.4.168. The first time, macOS asks whether Roomler Daemon may use the microphone, and from agent 0.4.170 the recording waits for your answer |
+| The computer's sound | ✅ | ✅ | ✅ from roomlerd 0.4.161 |
+| Recording with sound | ✅ | ✅ | ✅ the computer's sound from roomlerd 0.4.161; the microphone from roomlerd 0.4.163, and where the root half runs the screen (`macos_supervise_gui_worker`) from roomlerd 0.4.168. The first time, macOS asks whether Roomler Daemon may use the microphone, and from roomlerd 0.4.170 the recording waits for your answer |
 | Ctrl+Alt+Del | ✅ the real one, from a Machine — system install where policy allows | ⛔ sent as ordinary keys, which GNOME and KDE use to log out | ⛔ hidden: it means nothing on a Mac |
-| An approval panel on the host | ✅ | ✅ X11 · ⛔ Wayland: the desktop app asks | ✅ from agent 0.4.153 · before it, the desktop app asks |
-| "The host is locked" before you connect | ✅ | ❌ | ✅ from agent 0.4.150 |
-| "The host is locked" while you are connected | ✅ | ✅ | ✅ from agent 0.4.150 |
-| The host's cursor, drawn by your browser | ✅ | ✅ system installs, and X11 desktops from agent 0.4.147; a per-user Wayland desktop draws it into the picture | ❌ the cursor is part of the picture |
-| Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows | ✅ from agent 0.4.159 |
-| Show and switch the keyboard layout | ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148; on GNOME the layout is shown, and you switch it with GNOME's own shortcut (Super+Space) · ❌ Wayland desktops and system installs | ✅ from agent 0.4.156 |
-| Typing text on a non-US layout | ✅ | ✅ on any layout from agent 0.4.147; before it, a system install types only on a US layout, and refuses rather than mistype | ✅ |
-| Match the remote display to your window | ✅ | ✅ X11 desktops with one screen and a per-user install, from agent 0.4.148, and the agent's own virtual desktop · ❌ Wayland desktops, system installs, several screens | ✅ from agent 0.4.157, with one screen |
+| An approval panel on the host | ✅ | ✅ X11 · ⛔ Wayland: the desktop app asks | ✅ from roomlerd 0.4.153 · before it, the desktop app asks |
+| "The host is locked" before you connect | ✅ | ❌ | ✅ from roomlerd 0.4.150 |
+| "The host is locked" while you are connected | ✅ | ✅ | ✅ from roomlerd 0.4.150 |
+| The host's cursor, drawn by your browser | ✅ | ✅ system installs, and X11 desktops from roomlerd 0.4.147; a per-user Wayland desktop draws it into the picture | ❌ the cursor is part of the picture |
+| Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows | ✅ from roomlerd 0.4.159 |
+| Show and switch the keyboard layout | ✅ | ✅ X11 desktops with a per-user install, from roomlerd 0.4.148; on GNOME the layout is shown, and you switch it with GNOME's own shortcut (Super+Space) · ❌ Wayland desktops and system installs | ✅ from roomlerd 0.4.156 |
+| Typing text on a non-US layout | ✅ | ✅ on any layout from roomlerd 0.4.147; before it, a system install types only on a US layout, and refuses rather than mistype | ✅ |
+| Match the remote display to your window | ✅ | ✅ X11 desktops with one screen and a per-user install, from roomlerd 0.4.148, and the daemon's own virtual desktop · ❌ Wayland desktops, system installs, several screens | ✅ from roomlerd 0.4.157, with one screen |
 | Clipboard: text, formatted text and images | ✅ | ✅ per-user · ❌ a system install | ✅ |
-| A copied image arrives by itself | ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148 · ❌ Wayland desktops and system installs: on request | ✅ from agent 0.4.154 · before it, on request |
+| A copied image arrives by itself | ✅ | ✅ X11 desktops with a per-user install, from roomlerd 0.4.148 · ❌ Wayland desktops and system installs: on request | ✅ from roomlerd 0.4.154 · before it, on request |
 | An idle desktop costs little CPU | ✅ | ✅ | ❌ |
 | Privacy mode (the person at the computer sees a notice, not the desktop) | ✅ Windows 10 2004 and later | ❌ | ⛔ |
 | Lock the computer when the last session ends | ✅ | ✅ | ❌ |
@@ -115,7 +115,7 @@ More on [Roomler SSH](/docs/network/ssh/).
 | The desktop app | ✅ | 🟡 a `.deb` and an `.rpm`, for x86_64 and arm64; nothing for a computer with neither package manager, such as Arch | ✅ |
 | The computer stays awake during a session | ✅ | ✅ | ✅ except a closed laptop with no external display |
 | A received file lands in your own Downloads | ✅ | ✅ | ✅ |
-| The setup wizard installs the agent | ✅ | ✅ since 2026-10-30 | ✅ since 2026-10-30 |
+| The setup wizard installs roomlerd | ✅ | ✅ since 2026-10-30 | ✅ since 2026-10-30 |
 
 ## Installs and updates
 
@@ -126,9 +126,9 @@ More on [Roomler SSH](/docs/network/ssh/).
 | One-command uninstall | ✅ | ✅ | ✅ |
 | An ephemeral device removes itself when it stops | ✅ | ✅ | ✅ |
 | The tunnel client (`roomler self-update`) updates itself | ✅ | ✅ from tunnel 0.4.149 | ✅ from tunnel 0.4.149 |
-| Processors the agent runs on | 🟡 x64; ❌ ARM | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel |
+| Processors roomlerd runs on | 🟡 x64; ❌ ARM | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel |
 | Hardware video encoding on Linux ARM | — | ✅ with an NVIDIA GPU and driver 530.41 or newer, from 0.4.188 | — |
-| The tunnel client and the wizard on Linux ARM | — | ✅ from 0.4.149: the wizard with the agent release, the tunnel client with the first tunnel release from then on | — |
+| The tunnel client and the wizard on Linux ARM | — | ✅ from 0.4.149: the wizard with the roomlerd release, the tunnel client with the first tunnel release from then on | — |
 
 ## Where the operating system rules it out
 

@@ -100,7 +100,7 @@ nothing on prod cluster nodes.
   (`crates/tunnel-core/src/overlay/tun.rs:2778-2834`; no-op default at `tun.rs:95`). An
   Ubuntu cell would pass vacuously.
 - **IPAM ⇒ ubuntu.** The pre-P5d degradation is in NAT *scope* — which CIDRs get a
-  MASQUERADE rule (`crates/tunnel-core/src/overlay/nat.rs:119-133`) — which is
+  MASQUERADE rule (`crates/tunnel-core/src/overlay/nat.rs:800-822`) — which is
   platform-independent, and the ubuntu lane is the cheaper driver.
 
 ### What actually breaks on a pre-P5d agent (narrower than assumed)

@@ -255,8 +255,8 @@ person's half on it and says why.
     (`:3279-3284`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
     is not named: it keeps the config. The words are `stop_text`'s (`agents/roomler-setup/src/reinstall_guard.rs`).
   - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5854-5858`), so
-    it asks the system socket (`:4962-4966`), the root daemon's own, through the same root-only connect
-    (`:6185-6188`): `status` alone, under the same 3 s bound, believed only through `one_row_from`. A person's road is
+    it asks the system socket (`:4970-4972`), the root daemon's own, through the same root-only connect
+    (`:6191-6194`): `status` alone, under the same 3 s bound, believed only through `one_row_from`. A person's road is
     unchanged, and a person with no person socket asks nothing, never the system socket (`socket_to_ask`). The only
     root road on a Mac is a person starting the wizard as root: it never elevates itself there
     (`crates/roomler-setup-core/src/elevation.rs:231-235`), its command line has no headless mode
@@ -266,7 +266,7 @@ person's half on it and says why.
 ### 4. The terminal and the web dialog (P4)
 
 - `install.sh --overlay` on Linux, opt-in: with `--system` the TUN, per-user the netstack, as the wizard does. The
-  default stays off, as the daemon's hint says (`service.rs:556-567`, and its test at `:2871-2876`).
+  default stays off, as the daemon's hint says (`service.rs:556-567`, and its test at `:2876-2881`).
 - The dialog's Linux note says what a system install shows today (`enrollCommands.ts:239-241`). Its macOS block
   puts the wizard first where the server offers it (`enrollCommands.ts:198-203`) and says what the one-liner
   installs.

@@ -91,7 +91,7 @@ was left. That was a full `sysinfo` disk refresh, which on macOS queries every v
 and the loop's next tick waited for it. **Since FR-85 P7 the check is off the loop.**
 [`recorder.rs:141`](../agents/roomlerd/src/recording/recorder.rs#L141) `watch_free_space` asks it on a blocking
 thread every `disk_check_every` (5 s) and raises a flag. The loop only reads that flag and stops `disk_low` as
-before. [`folder.rs:300`](../agents/roomlerd/src/recording/folder.rs#L300) refreshes storage only, so the IOKit
+before. [`folder.rs:315`](../agents/roomlerd/src/recording/folder.rs#L315) refreshes storage only, so the IOKit
 walks are gone too. A check that takes 120 ms, asked every 250 ms, cost a 3-second recording 25 late ticks inside
 the loop, and costs it none now (`tests/recorder.rs`). On release 0.4.201, which carries P7, the same MacBook
 recorded 10:29 beside a relay-capped session with 0 late ticks of 18,871, and 2:33 with no session with 0 of 4,598.
@@ -289,6 +289,12 @@ but the recorder skipped would only be a courtesy.
 | Default | `Videos\Roomler`, **only if** local, not under OneDrive, and it survives a real write probe | `~/Movies/Roomler` | XDG videos dir + `Roomler` |
 | Fallback | `%USERPROFILE%\Roomler Recordings` | same rule | same rule |
 | Last resort | the recorder's data dir (`%LOCALAPPDATA%\…\recordings`, never roaming) | `~/Library/Application Support/…/recordings` | `~/.local/share/roomler/recordings` |
+
+On Linux `~`, the XDG videos folder and the data folder are the account's own
+(`appdirs::own_folders`, #3866): a person's come from `HOME`, the XDG variables
+and their `user-dirs.dirs`; a root command's home is `/root`, whatever `HOME` it
+was given, with root's own folders and `user-dirs.dirs` beneath it
+([`folder.rs:160`](../agents/roomlerd/src/recording/folder.rs#L160) `default_choice`).
 
 **The write rule** — which identity writes where, and the fallback:
 
@@ -1469,8 +1475,8 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:481` (`SessionParams::record`), `signaling.rs:4281` (sent AFTER the consent mode is resolved), `signaling.rs:3200` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1105`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1961` (`effective_record`), `signaling.rs:7147` (`Announcer::now`, which the hello and every heartbeat announce, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| The record context crosses | `delegate.rs:481` (`SessionParams::record`), `agents/roomlerd/src/signaling.rs:4281` (sent AFTER the consent mode is resolved), `agents/roomlerd/src/signaling.rs:3200` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1105`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1961` (`effective_record`), `agents/roomlerd/src/signaling.rs:7147` (`Announcer::now`, which the hello and every heartbeat announce, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
 | An OFF is live | `remote.rs:600` (`subscribe_gates`), `delegate_worker.rs:625-644` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
 | The worker's account of a recording | `delegate.rs:1874` (noted where the grant crosses), `delegate.rs:2576` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:805`). The server bounds it again to a live session of this agent |
 

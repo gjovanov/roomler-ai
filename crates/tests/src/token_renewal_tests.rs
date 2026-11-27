@@ -31,7 +31,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 /// Enroll a device with a fresh single-use token. Returns its id and agent
 /// token.
-async fn enroll(
+pub(crate) async fn enroll(
     app: &TestApp,
     seeded: &crate::fixtures::seed::SeededTenant,
     machine_id: &str,
@@ -89,7 +89,7 @@ async fn renew(app: &TestApp, token: &str) -> reqwest::Response {
 }
 
 /// An `AuthAgent` route: the device's own view of its org.
-async fn self_devices(app: &TestApp, token: &str) -> u16 {
+pub(crate) async fn self_devices(app: &TestApp, token: &str) -> u16 {
     app.auth_get("/api/agent/self/devices", token)
         .send()
         .await
@@ -119,7 +119,7 @@ async fn upgrade_status(app: &TestApp, path: &str, token: &str) -> u16 {
 /// A token signed with the test server's own secret: what an old build, or
 /// the calendar, would have produced. `exp_offset` is relative to now;
 /// `generation` None leaves the claim out entirely (a pre-FR-103 token).
-fn forge_agent_token(
+pub(crate) fn forge_agent_token(
     app: &TestApp,
     agent_id: &str,
     tenant_id: &str,

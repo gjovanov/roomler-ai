@@ -594,16 +594,14 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
-    /// `$XDG_STATE_HOME/roomler/portal-restore-token[-rd]`, falling back to
-    /// the spec's default of `$HOME/.local/state`.
+    /// `roomler/portal-restore-token[-rd]` in this account's own state folder
+    /// (#3866, `appdirs::own_folders`): `$XDG_STATE_HOME` where it names an
+    /// absolute folder, else the spec's default of `~/.local/state`, beneath
+    /// `HOME` or, without one, the home the account database names. `/tmp`
+    /// only where there is no home at all.
     pub fn for_current_user(kind: SessionKind, source: SourceKind) -> Self {
-        let base = std::env::var_os("XDG_STATE_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".local").join("state"))
-            })
+        let base = roomler_node_core::appdirs::own_folders()
+            .map(|own| own.state)
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
         // ⚠️ A window grant and a monitor grant are DIFFERENT grants: the
         // portal will not restore one from the other's token, and reusing the

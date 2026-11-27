@@ -30,7 +30,7 @@ A prompt is only useful if somebody sees it, and "somebody sees it" is harder
 than it sounds — a locked Windows machine, a headless Linux box and a Mac with
 no one logged in are all different problems.
 
-The agent tries a chain of surfaces in order and **logs which one it used**:
+The daemon tries a chain of surfaces in order and **logs which one it used**:
 
 :::steps
 1. **A native panel** on the machine's own desktop — the normal case.

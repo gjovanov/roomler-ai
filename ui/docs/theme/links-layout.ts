@@ -30,7 +30,7 @@ import { graph, organization } from './structured.ts'
 export const LINKS_URL = '/links/'
 export const LINKS_TITLE = 'Roomler: start here'
 export const LINKS_DESCRIPTION =
-  'Start free, install the agent, read the docs, or follow Roomler on YouTube, TikTok, X and Facebook.'
+  'Start free, install the daemon, read the docs, or follow Roomler on YouTube, TikTok, X and Facebook.'
 
 export interface LinksCtx {
   assets: SiteAssets
@@ -64,7 +64,7 @@ export function renderLinks(ctx: LinksCtx): string {
 
   const actions = [
     action('/register', 'Start free', { primary: true }),
-    action(`${BASE}/start/quickstart/`, 'Install the agent', { icon: 'download' }),
+    action(`${BASE}/start/quickstart/`, 'Install the daemon', { icon: 'download' }),
     action(`${BASE}/`, 'Read the docs', { icon: 'book' }),
     ctx.nav.hasBlog ? action(`${BLOG_BASE}/`, 'Read the blog', { icon: 'book' }) : '',
     action(REPO_URL, 'Source code on GitHub', { icon: 'external', external: true }),
@@ -82,7 +82,7 @@ export function renderLinks(ctx: LinksCtx): string {
       <h1 class="links-title">Roomler</h1>
       <p class="links-lead">${escapeHtml(HOME_DESCRIPTION)}</p>
       <ul class="links-actions">${actions}</ul>
-      <p class="links-note">The agent runs on ${escapeHtml(platforms)}. The code is open source.</p>
+      <p class="links-note">The daemon, roomlerd, runs on ${escapeHtml(platforms)}. The code is open source.</p>
       <h2 class="links-h2">Follow Roomler</h2>
       <ul class="links-channels">${channels}</ul>
     </div>

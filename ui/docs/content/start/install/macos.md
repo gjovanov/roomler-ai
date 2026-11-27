@@ -1,11 +1,11 @@
 ---
 title: Install on macOS
-description: Install the Roomler agent on macOS, grant the two privacy permissions it needs, and add the root half if you want the machine on the private mesh.
+description: Install the Roomler daemon on macOS, grant the two privacy permissions it needs, and add the root half if you want the machine on the private mesh.
 tags: [install, macos, getting-started, enrollment, permissions]
 order: 11
 ---
 
-macOS is the one platform where the agent runs as **two processes**, and it is
+macOS is the one platform where the daemon runs as **two processes**, and it is
 worth understanding why before you install — otherwise the second half looks
 like a bug rather than a requirement.
 
@@ -97,7 +97,7 @@ settings.
 
 You do not have to hunt for these. The **Roomler menu-bar app** names whichever
 grant is missing and gives you a button per permission that opens the right
-pane. The agent also probes both at startup, logs what is missing, and reports
+pane. The daemon also probes both at startup, logs what is missing, and reports
 it to the server — so the device list shows *"No screen access"* / *"No input
 access"* rather than letting you discover it by connecting to a blank desktop.
 
@@ -118,9 +118,9 @@ installer tells you when this has happened rather than leaving you to find out.
 | Path | What it is |
 |---|---|
 | `/Applications/Roomler.app` | The **menu-bar companion** — status, routes, and the permissions panel. No Dock tile. The only Roomler icon you should see. |
-| `/Library/Roomler/roomlerd.app` | The agent itself. A background service with nothing to launch, so deliberately not in `/Applications` — but still a bundle, because the two privacy grants attach to a bundle identity. |
+| `/Library/Roomler/roomlerd.app` | The daemon itself. A background service with nothing to launch, so deliberately not in `/Applications` — but still a bundle, because the two privacy grants attach to a bundle identity. |
 | `/usr/local/bin/roomler` | The CLI. |
-| `/usr/local/bin/roomlerd` | The agent on `PATH`, for `roomlerd enroll` and `--version`. A symlink into the bundle, not a second copy. |
+| `/usr/local/bin/roomlerd` | The daemon on `PATH`, for `roomlerd enroll` and `--version`. A symlink into the bundle, not a second copy. |
 
 Configuration lives at `/etc/roomler/config.toml` for the root half.
 
@@ -148,7 +148,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --uninstall
 ```
 
 It stops both halves through launchd **before** removing anything: the
-per-user agent and the menu-bar app (for every account that has them), then the
+user half and the menu-bar app (for every account that has them), then the
 root half and the update helper. That stop is the daemon's clean stop, so the
 routes and DNS settings it added to the Mac go with it. Then it removes
 `/Library/Roomler`, `/Applications/Roomler.app`, the CLI, the package receipt
