@@ -3852,6 +3852,10 @@ mod tests {
 
     /// [`logged`], for a future: what it logged while it was polled, beside
     /// its output. The tasks it spawned log to nobody.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     async fn logged_async<T>(f: impl Future<Output = T>) -> (T, String) {
         use tracing::instrument::WithSubscriber;
         #[derive(Clone, Default)]
