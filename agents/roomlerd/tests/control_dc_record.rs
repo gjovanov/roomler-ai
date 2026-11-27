@@ -813,18 +813,16 @@ const STOP: Duration = Duration::from_secs(30);
 
 /// #3443 — the cells that pick up a dropped recording set the controller's
 /// next session up this much later: nothing, unless
-/// `ROOMLERD_TEST_NEXT_SESSION_DELAY_MS` says how long. Longer than
-/// [`GRACE`], it fails a cell whose result hangs on how long that setup
-/// takes.
+/// `ROOMLERD_TEST_NEXT_SESSION_DELAY_MS` says how long. That falsifies them
+/// by hand: at `15000`, past [`GRACE`] and the grace-poll cells' 15 s look,
+/// a cell that set its next session up after the drop would fail with `idle`
+/// and an empty id, while these pass, because they set it up before.
 fn next_session_delay() -> Duration {
     std::env::var("ROOMLERD_TEST_NEXT_SESSION_DELAY_MS")
         .ok()
         .and_then(|ms| ms.trim().parse().ok())
         .map(Duration::from_millis)
-        // On by default in this commit, longer than the grace and the grace
-        // cells' 15 s look, so that CI shows the reworked cells passing with
-        // it. The next commit sets it to nothing.
-        .unwrap_or(Duration::from_secs(15))
+        .unwrap_or(Duration::ZERO)
 }
 
 /// #3443 — the controller's next session asks for the status, `dropped`
