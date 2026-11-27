@@ -536,6 +536,9 @@ The multi-pod design is settled and documented in
     The regional PoPs leave it unset and serve every network. Set but empty or
     malformed, the relay refuses to start
     ([`scripts/relay-pop/README.md`](../scripts/relay-pop/README.md)).
+  - Its log lines are coloured only when stdout is a terminal (#3938), so what a
+    PoP's container or a unit's journal stores is plain text
+    ([installation.md](installation.md#console-lines-colour-only-on-a-terminal-3938)).
 
 ## Cluster hosts: the media DNAT and the host's own mesh node
 

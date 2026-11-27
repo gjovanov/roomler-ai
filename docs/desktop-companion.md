@@ -117,7 +117,7 @@ sequenceDiagram
    response older than the newest it applied, and patches rows in place keyed by route id /
    flow id (`routeRows`, `:55`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
-   one rolled generation).
+   one rolled generation; its stderr is coloured only on a terminal: [installation.md](installation.md#console-lines-colour-only-on-a-terminal-3938)).
 2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4722`)
    binds the first instance (retrying while another process holds the name), then runs a
    pool of accept tasks (`accept_pipe`, `:4836`), each owning one listening instance and

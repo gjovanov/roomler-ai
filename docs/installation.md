@@ -4466,3 +4466,95 @@ The agent's `config.toml` (server URL, tokens, per-node settings like
 `%APPDATA%\roomler\roomler\` / `%PROGRAMDATA%\roomler\roomler\`
 (machine-global) / `/etc/roomler/` (root) or `~/.config/roomler/` — remove it to fully forget an
 enrollment.
+
+## Console lines: colour only on a terminal (#3938)
+
+Every Roomler binary that logs to a console colours its lines only when the stream it
+writes is a terminal and `NO_COLOR` is unset or empty. Each asks its own stream once, at
+start, with `std::io::IsTerminal`, and gives the answer to its console layer's
+`with_ansi`. Left to itself the log library colours whatever the stream is (it reads
+`NO_COLOR` and nothing else), so a pipe, a file, the journal and every script's capture
+stored `\x1b[2m`, `\x1b[32m` and `\x1b[3m` around the timestamp, the level and each field
+name. A stream that is not a terminal now gets plain text, with the same words, levels,
+targets, fields and timestamps; which lines reach a console is unchanged. The server
+follows the same rule: its note is in
+[real-time.md](real-time.md#how-an-agent-socket-ended-3517) and
+[deployment.md](deployment.md#a-log-pipe-that-stops-draining-must-not-stop-the-server-1731).
+
+| Binary | Stream | Asked at | The rule |
+|---|---|---|---|
+| `roomlerd`, every verb | stdout | `crates/agent-core/src/logging.rs:224`, given to the console layer in both branches of `init` (`console_layer`, `:1331`) | `roomler_node_core::logging::colour` (`crates/agent-core/src/logging.rs:1310`) |
+| the companion | stderr | `agents/roomler-desktop/src/desktop_log.rs:143` | the same function |
+| the Setup wizard | stderr | `agents/roomler-setup/src/main.rs:77` | the same function, as `roomlerd::logging::colour` |
+| the CLI: `roomler`, and `roomlerd cli` behind the `roomler` shim | stdout | `agents/roomler-cli/src/cli.rs:890` | a copy (`agents/roomler-cli/src/cli.rs:1288`) |
+| the DERP relay | stdout | `crates/derp-relay/src/main.rs:575` | a copy (`crates/derp-relay/src/main.rs:1142`) |
+| the server | stdout | `crates/api/src/main.rs:27` | `crates/api/src/logging.rs:58` |
+
+The rule has four homes, word for word, each with the same table test
+(`colour_only_on_a_terminal_and_never_under_no_color`). No crate that a console rule
+belongs in is shared by all of them: the relay's one Roomler dependency is the wire
+crate, and the CLI does not depend on `roomler-node-core`. Each home's doc comment names
+the others, so `git grep -n NO_COLOR -- '*.rs'` lists all four. `roomlerd cli`
+dispatches before the daemon's `logging::init` (`agents/roomlerd/src/app.rs:1515`, on a
+Mac `:1300`; `logging::init` is at `:1635`), so it logs, and colours, as the CLI does.
+
+A new console cannot skip the rule unseen. The root `clippy.toml` lists every
+tracing-subscriber constructor that starts a fmt layer or subscriber under
+`disallowed-methods` (`clippy.toml:68`), and CI's clippy lanes deny warnings. Each of
+the 50 places that start one today carries
+`#[expect(clippy::disallowed_methods, reason = "…")]` saying which it is: one of the six
+consoles above, taking its colour from its home; a file or a buffer, never coloured (the
+daemon's and the companion's log files, the buffer that keeps the daemon's first lines);
+code that never ships (the integration tests' log, a developer's example); or a test's
+own capture. Another console built without an `#[expect]` fails clippy, and one built
+with an `#[expect]` has to say in its reason how it takes colour. Two ways around the
+list remain. The `Default` impls of `fmt::Layer`, `fmt::Subscriber` and
+`fmt::SubscriberBuilder` cannot be listed, because a path can name only the trait's
+`default`, which would forbid every type's. And code that only macOS compiles is linted
+by no CI lane; none of the 50 is.
+
+What a console stream is, by the way a binary runs:
+
+| Run as | Its console stream | Lines |
+|---|---|---|
+| a person in a terminal: a console window, Windows Terminal, Git Bash, a `roomler ssh` session, a container started with `-t` | a terminal | coloured, as before |
+| `install.sh` with its output in a file or `tee`, the Setup wizard's install steps, CI | a file or a pipe | plain |
+| `install.ps1` in a console window | the console: PowerShell hands it to a native command whose output nothing captures | coloured, as before |
+| `install.ps1` with its output captured (`*>` a file, an assignment, an automation host) | a pipe | plain |
+| a Linux unit: `roomler.service`, `roomlerd.service`, `roomler-update.service` | the journal | plain |
+| macOS: the update helper; the companion | `/var/log/roomler/update.log`; `/tmp/roomler-desktop.err.log` | plain |
+| macOS: the daemon's LaunchAgent and LaunchDaemon | `/dev/null` (`agents/roomlerd/packaging/macos/com.roomler.agent.plist:49`, `com.roomler.daemon.plist:73`) | not read |
+| Windows: the per-user daemon | `NUL` ([above](#what-the-per-user-scheduled-task-runs-3292)) | not read |
+| Windows: the SystemContext worker | a console with no window | no console layer at all ([#3438](#what-the-system-workers-console-carries-3438)), unchanged |
+| Windows: the service host; the companion and the wizard started from Explorer or at sign-in | no console | nothing is written |
+| a command run by Fleet RPC (`roomler exec`) | a pipe (`agents/roomlerd/src/exec.rs:2394`) | plain |
+| the DERP relay at a PoP (`docker compose`, no `tty:`) or in a pod | a pipe | plain |
+| any of these with `NO_COLOR` set to a value | | plain |
+
+On Windows the answer is `std::io::IsTerminal`'s: a console handle is a terminal, and so
+is an MSYS or Cygwin pseudo-terminal, which Git Bash's mintty gives its programs (a pipe
+whose name starts `msys-` or `cygwin-` and holds `-pty`); a file, any other pipe, `NUL`
+and a missing handle are not. A console that does not interpret VT sequences shows the
+codes as text, as it always did: it is a terminal, and no Roomler binary turns VT
+processing on.
+
+The readers. The Setup wizard shows the install script's lines as text and strips
+nothing (`agents/roomler-setup/src/front/app.js:1802`, written with `textContent` at
+`:1916`), so a daemon's enrollment lines there read `[2m…[0m` before this change; it
+keeps them in memory only. The scripts that strip the codes with `sed`
+(`scripts/e2e-nightly.sh:258`, `scripts/fr139-restart-cell.sh:126`,
+`scripts/aws-testbox/guest-roomlerd.sh:31`) change nothing on plain text, and the PoP
+README's grep of the relay's log (`scripts/relay-pop/README.md:212`) matches message
+text, which was never coloured. `scripts/install-sh-output-check.sh` counts every
+control byte but newline and tab in the script's output
+(`scripts/install-sh-output-check.sh:475`) against a stand-in daemon (`:315`), so it
+never saw the real daemon's codes.
+
+Each place has a test that writes one event with a field through the function its
+start-up uses, into a buffer, under a scoped subscriber, and finds no ESC with colour off
+and the codes with colour on: the daemon's compact layer on stdout and through the
+log-file branch's filtered writer, #3230 (`crates/agent-core/src/logging.rs:2706`,
+`:2711`, `:2717`), the companion (`agents/roomler-desktop/src/desktop_log.rs:333`), the
+CLI (`agents/roomler-cli/src/cli.rs:1864`) and the relay
+(`crates/derp-relay/src/main.rs:2215`). The wizard's binary has no tests (`test = false`,
+the UAC naming rule), so its chain is read, not run.

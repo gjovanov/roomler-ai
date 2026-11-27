@@ -408,6 +408,7 @@ roomler forward --agent … --local 5432 --remote db.intranet:5432
 
 - Windows: `%LOCALAPPDATA%\roomler\roomler\data\logs\roomlerd.log.<date>`
 - Linux: `~/.local/share/roomler/logs/roomlerd.log.<date>` (root daemon: `/root/.local/share/roomler/logs/`; `journalctl -u roomler` works too)
+- The agent's and the CLI's console lines are coloured only on a terminal (#3938), so the journal and a captured `roomler` call hold plain text ([installation.md](installation.md#console-lines-colour-only-on-a-terminal-3938)).
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
