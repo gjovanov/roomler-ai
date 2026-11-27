@@ -220,12 +220,12 @@ When the viewer's socket is on one pod and the device's on the other, the sessio
 of the device's pod. The viewer's pod keeps only the socket's route: the owner pods it relayed a
 frame to that they took (`remote_rc_conns`, recorded at `crates/modules/remote/src/relay.rs:500-504`).
 A hub answers the terminate of a session it does not hold with `Ok`, on purpose, because the agent's
-teardown races rely on it (`crates/modules/fleet/src/hub.rs:3701-3708`). So a viewer's
+teardown races rely on it (`crates/modules/fleet/src/hub.rs:3730-3737`). So a viewer's
 `rc:terminate` never errs on its own pod. The session-scoped relay forwards only a frame that missed
 there with `SessionNotFound` (`crates/modules/remote/src/controller.rs:415-423`), so it never sees a
 hang-up either. Before #4042, nothing else carried the hang-up at the window's default of 0. The
 device was not told, and the session lived on until the socket closed or the device gave up on its
-peer. The same tab's next Connect was coalesced back into it (`hub.rs:1685`). With the window on,
+peer. The same tab's next Connect was coalesced back into it (`hub.rs:1714`). With the window on,
 the `controller_terminate` event carried it.
 
 The controller's dispatch is now `relay::dispatch` (`relay.rs:871`, called at `controller.rs:271`).
@@ -269,7 +269,7 @@ How each kind of hang-up reaches the pod that holds the session:
 | The viewer's pod dies without a word | the owner pod's janitor: every 60 s it asks the origin pod about each proxy quiet for 120 s (`rc.conn_alive`, judged by `probe_verdict`, `relay.rs:714`). It reaps a proxy whose socket is gone, or whose pod does not answer, as a close does. It never reaps while the socket lives | as a close | as a close |
 | The device ends it | the device's pod ends it, and the proxy's pump tells the viewer | the same | the same |
 | An admin ends it (`POST …/session/{id}/terminate`) | the local hub, and the ctrl lane's `terminate` (published at `crates/modules/remote/src/routes.rs:136`), which a pod applies to a session of that org it holds (`ctrl.rs:108`) | the same | the row is written first (`admin_end`, `row_end.rs:141`) |
-| Another member's `rc:terminate` of a session that is not theirs, from a socket whose route names that pod | relayed as the viewer's | refused there by the party check (`check_session_party`, `hub.rs:3443`). The refusal reaches the sender as on one pod (`rc:error`, `session_id` null), and the session stays live | the same: the row names another person, so `controller_end` writes and publishes nothing |
+| Another member's `rc:terminate` of a session that is not theirs, from a socket whose route names that pod | relayed as the viewer's | refused there by the party check (`check_session_party`, `hub.rs:3472`). The refusal reaches the sender as on one pod (`rc:error`, `session_id` null), and the session stays live | the same: the row names another person, so `controller_end` writes and publishes nothing |
 
 An external viewer's `rc:terminate` takes the same dispatch. `extauth::intercept` takes only
 `rc:extauth.*` frames (`crates/modules/remote/src/extauth.rs:1466`), and the extauth relay records
@@ -414,7 +414,7 @@ whatever its cause, and what heals a write applied behind a lost reply, or one t
 | Fan-out on `roomler:ws` (`crates/core/src/ws/dispatcher.rs:59`, `:87`, `:141`) | PUBLISH | logged; users on other pods miss that one event (at-most-once, never retried); the request that sent it still answers (a chat post: 200 in 3.0 s) | delivered: nothing to heal |
 | Online registry (`crates/core/src/ws/redis_pubsub.rs:110`, `:129`) | SADD + EXPIRE, SREM | logged; the 30 s heartbeat (`crates/api/src/state.rs:449`) writes it again | the 90 s TTL |
 | Push gate (`crates/core/src/notify.rs:39`) | EXISTS | read as offline: the web push (and a mention's email) is sent | — |
-| Agent presence (`crates/modules/fleet/src/socket.rs:436`, `:977`, `:1050`, `:1054`; `presence.rs:281`) | SET EX 90, compare-DEL, EXISTS, MGET | logged; a teardown announces the device offline and the next sweep (≤ 30 s) corrects it; the sweep skips a cycle | the next heartbeat, or the 90 s TTL |
+| Agent presence (`crates/modules/fleet/src/socket.rs:455`, `:996`, `:1069`, `:1073`; `presence.rs:281`) | SET EX 90, compare-DEL, EXISTS, MGET | logged; a teardown announces the device offline and the next sweep (≤ 30 s) corrects it; the sweep skips a cycle | the next heartbeat, or the 90 s TTL |
 | Cycle claims (`try_claim`, `redis_pubsub.rs:247`: alerts, org daily, stats rollup, presence sweep, ephemeral reaper, relay allowance, RC resume sweep, SaaS pulls) | SET NX EX | that pod skips the cycle | the claim is held and run by nobody until its TTL ends: one cycle (the org daily: that day's run, recomputed the next day) |
 | TURN usage dedupe (`crates/core/src/turn_bytes.rs:101`) | SET NX EX 7 d | warn, the total is not booked | **lasting**: that total is never booked |
 | Relay load baseline (`crates/core/src/relay_load.rs:521`) | advance_baseline (Lua) | logged, the poll goes on | **lasting**: that delta is never booked |
@@ -427,7 +427,7 @@ whatever its cause, and what heals a write applied behind a lost reply, or one t
 | Pod bus (`bus.rs:233`, `:336`) | PUBLISH | a request fails before its deadline starts; a lost reply is a deadline at the requester | handlers are idempotent |
 | Cross-pod RC relay (`crates/modules/remote/src/relay.rs:714`, `:524`) | bus requests `rc.conn_alive`, `rc.cmd` | "unknown": the janitor keeps the proxy and asks again at the next sweep; a frame that cannot be relayed is dropped with a warn, the route is kept, and the viewer's own timers recover the setup. A hang-up is dropped the same way, and its session then ends at the socket's close or by the device's own end, as before #4042 ([above](#a-viewers-hang-up-across-pods-4042)). A deadline, or the owner's answer (`alive: false`; a NACK, which to a relayed frame is also the owner's refusal of that one frame), still reaps a proxy or forgets a route. A deadline says only that the owner did not answer: after a Redis lost without a reset, it can be this pod's own deaf bus subscriber, until its probe finds it deaf ([the subscriptions](#the-subscriptions-3952): at most 45 s once the command connection answers) | nothing is written |
 | Session slots (`crates/core/src/cluster/session_slots.rs:209`, `:263`, `:346`, `:366`) | Lua claim, renew pipeline, keep, release | a claim error, or a set full only by stale leases Redis did not let go (`crates/modules/remote/src/slots.rs:206-210`), lets the session proceed uncounted (fails open, as the code intends); a keep is tried again 1, 2, 4, 8, 16 s apart while its lease can still exist (`keep_retrying`, `session_slots.rs:417`); renew and release log | a lease lapses in 90 s; a keep only lengthens a live lease, so trying it again is harmless |
-| Reads with a shorter bound of their own (`crates/modules/fleet/src/agent.rs:2564`, `crates/modules/remote/src/resume.rs:610`, `extauth.rs:305`, `rejoin.rs:360`, `controller.rs:293`, `dead_rows.rs:365`, `crates/modules/network/src/tunnel.rs:607`) | GET, MGET | their own bound fires first, as before | — |
+| Reads with a shorter bound of their own (`crates/modules/fleet/src/agent.rs:2581`, `crates/modules/remote/src/resume.rs:610`, `extauth.rs:305`, `rejoin.rs:360`, `controller.rs:293`, `dead_rows.rs:365`, `crates/modules/network/src/tunnel.rs:607`) | GET, MGET | their own bound fires first, as before | — |
 
 Paths that wait more than one bound, because they await Redis once per item: a call start (two
 commands per member, `notify.rs:270`), a post with mentions (two per mention), a member's removal
