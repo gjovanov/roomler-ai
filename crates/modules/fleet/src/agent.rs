@@ -2638,7 +2638,7 @@ fn to_agent_response(
         access_policy: a.access_policy.into(),
         routes: a.routes,
         advertised_routes: a.advertised_routes,
-        capabilities: a.capabilities,
+        capabilities: caps_as_served(a.capabilities, state.settings.rc.gui_worker_read),
         relay_home: a.relay_home,
         exec_policy: configured_only(a.exec_policy),
         exec_anchor: a.exec_anchor.map(|x| ExecAnchorView {
@@ -2656,6 +2656,14 @@ fn to_agent_response(
         peer_auth_key,
         peer_auth_fingerprint,
     }
+}
+
+/// FR-157 P2 — the caps a device response carries (stub: as stored).
+fn caps_as_served(
+    caps: roomler_ai_remote_control::models::AgentCaps,
+    _gui_worker_read: bool,
+) -> roomler_ai_remote_control::models::AgentCaps {
+    caps
 }
 
 /// FR-94 — [`roomler_ai_remote_control::models::ExecAnchor`] as the API shows
@@ -3002,6 +3010,39 @@ mod remote_config_state_tests {
             state(desired(1), None, &old),
             Some(RemoteConfigState::ReportsUnsupported)
         );
+    }
+}
+
+#[cfg(test)]
+mod gui_worker_read_tests {
+    use super::caps_as_served;
+    use roomler_ai_remote_control::models::{AgentCaps, GuiWorkerBrief};
+
+    /// FR-157 P2 — with `rc.gui_worker_read` off, a device response carries
+    /// no screen-worker word and the rest of its caps as stored; on, the word
+    /// as the device sent it.
+    #[test]
+    fn the_word_leaves_a_device_response_while_the_read_is_off() {
+        let stored = AgentCaps {
+            codecs: vec!["h264".into()],
+            permissions: Some(vec!["no-gui-session".into()]),
+            gui_worker: Some(GuiWorkerBrief {
+                state: "not-attached".into(),
+                reason: Some("gave-up".into()),
+                one_row: true,
+            }),
+            ..Default::default()
+        };
+
+        let off = caps_as_served(stored.clone(), false);
+        assert_eq!(off.gui_worker, None);
+        assert_eq!(off.permissions, stored.permissions, "the rest stays");
+        assert_eq!(off.codecs, stored.codecs);
+        let wire = serde_json::to_string(&off).unwrap();
+        assert!(!wire.contains("gui_worker"), "{wire}");
+
+        let on = caps_as_served(stored.clone(), true);
+        assert_eq!(on.gui_worker, stored.gui_worker);
     }
 }
 
