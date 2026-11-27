@@ -41,13 +41,13 @@ From #4479, every anchor read again on master `21f0923b0`.
 - **What the server does with the id.** It looks the row up by `(tenant_id, machine_id)`
   (`crates/modules/network/src/routes/tunnel.rs:177-180`), live or removed, because the unique index covers removed
   rows (`crates/modules/network/src/lib.rs:727`, `crates/services/src/dao/tunnel_client.rs:70-73`). A row it finds is
-  revived (`tunnel.rs:215-229`) within `revive_scope` (`tunnel.rs:313-343`), and the token is minted at the row's
-  `token_gen` (`tunnel.rs:283-288`), which `rehydrate` leaves alone (`tunnel_client.rs:94-95`). Only a removal
-  advances it (`tunnel_client.rs:369-379`).
+  revived (`routes/tunnel.rs:215-229`) within `revive_scope` (`routes/tunnel.rs:313-343`), and the token is minted at
+  the row's `token_gen` (`routes/tunnel.rs:283-288`), which `rehydrate` leaves alone (`tunnel_client.rs:94-95`). Only
+  a removal advances it (`tunnel_client.rs:369-379`).
 - **The three cases of #4479,** when a second machine sends an id the organization already has:
   1. the same person, the first client live: one row and two valid tokens; the list shows one client, the cap counts
      one, and removing the row ends both;
-  2. another person: 409 `SOMEONE_ELSES_TUNNEL_CLIENT` (`tunnel.rs:101-104`), although it is another machine;
+  2. another person: 409 `SOMEONE_ELSES_TUNNEL_CLIENT` (`routes/tunnel.rs:101-104`), although it is another machine;
   3. a holder of `MANAGE_AGENTS`: as case 1, and the row keeps its owner.
 - **One more consequence, from the code.** The hub keeps one socket entry per row for the overlay broker
   (`crates/modules/network/src/tunnel.rs:96-102`). Of two machines on one row, the one that connected last holds it.
@@ -73,15 +73,16 @@ From #4479, every anchor read again on master `21f0923b0`.
 | two machines, one name, no variable (#4479) | holds, unless they share a host name | holds | holds, unless they share every fact |
 | clones of one template, not renamed, enrolled after the clone | **one row** | holds | **one row**: they share the facts |
 | a clone of an enrolled machine, renamed, enrolls again | holds | holds, through the binding below | holds |
-| the same machine, its config folder lost | holds | a new row; the old one stays, offline | holds |
+| the same machine, its config folder lost | holds | **a new row**; the old one stays, offline | holds |
 | a Mac on another network | **a new id**: the host name follows the network (`machine.rs:20-23`) | holds | holds, with the hardware UUID |
 | two people on one machine | holds (the config path) | holds | holds |
 | a container created again | a new id each time, as today | a new id, unless a volume keeps the file | a new id each time |
 
 **Recommended: (b), with (c)'s read of the machine used as a binding, not as the seed.** At its first enrollment a
 client makes a random 128-bit `instance_id` (32 lowercase hex, the shape today's id has) from the OS's random source,
-and keeps it. Every failure of (a) and (c) above is the one that must not happen. The only failure of (b) is the one
-that may: a new row after the folder was lost, which the person sees and removes.
+and keeps it. (a) and (c) both put clones on one row, the failure that must not happen, and (a) also makes a new id
+when a Mac changes networks. (b) fails only where a new row may happen: after the folder was lost, which the person
+sees and removes.
 
 **The binding.** Beside the id the file keeps a hash of facts about the machine it was made on. An enrollment that
 finds a file whose hash names another machine (a copied or restored profile, a renamed clone) makes a new id. The
@@ -128,10 +129,10 @@ new one and a new row. A file none of them knows survives all of them.
 `roomler-cli` owns the identity: one function returns the request's two ids, today's `machine_id` and the
 `instance_id`. `roomler enroll` (`cli.rs:1176`) calls it. The wizard's orchestrator (`orchestrator_tunnel.rs:317-325`)
 calls it too and passes both ids to `tunnel_enroll::enroll`, so `roomler-setup-core` stays free of the tunnel crate
-(`tunnel_enroll.rs:11-13`). The wizard's copy of the derivation (`tunnel_enroll.rs:145-180`) goes, with its stale
-pointers (`:21`, `:57`, `:147` name files that moved). Its two environment reads go with it, and the wizard's test that
-lists every variable the wizard reads (`agents/roomler-setup/src/launch.rs:773-790`) loses its exemption for them
-(`:782`).
+(`tunnel_enroll.rs:11-13`). The wizard's copy of the derivation (`tunnel_enroll.rs:145-180`) goes, and the file's
+pointers to code that moved (`:21`, `:57`, `:147`) are corrected. Its two environment reads go with the copy, and the
+wizard's test that lists every variable the wizard reads (`agents/roomler-setup/src/launch.rs:773-790`) loses its
+exemption for them (`:782`).
 
 Today's derivation stays, byte for byte, as the legacy value: the lowercase hex of the first 16 bytes of
 SHA-256(name, 0, the variable or `unknown`, 0, OS, 0, architecture). It is how a row enrolled before this FR is found.
@@ -205,7 +206,9 @@ flowchart TD
   once on every path.
 - **A claim that loses a race** (its update matches nothing because another claim won) becomes a create. The cap for
   it is read before the spend, so a claim path reads the cap too. The DAO tells a lost claim from a lost scope by
-  reading the row again; a lost scope is refused 409 as today.
+  reading the row again; a lost scope is refused 409 as today. A row read again that holds this request's own
+  `instance_id` (one config enrolling twice at once, with two tokens) is a revival of it, not a create: the unique index
+  on `instance_id` would refuse that insert.
 - **The decision is one pure function** of the request, the row found by each id, the scope's answer and the cap's
   answer, so the table above is its test.
 
@@ -289,9 +292,9 @@ today's hash and lands on it again. That is an outage that fixes nothing, so it 
 | **a newer client** | today: `instance_id` ignored, the row keyed by today's hash. The client keeps its id file, and its first enrollment after the server is updated claims the row | this FR |
 
 The server is the arbiter. An absent `instance_id` in a request is an older client. An absent `instance_id` on a row
-is a row nobody has claimed. A newer server answers `keyed_by` to every request that carries an `instance_id`, and an older
-one never does. Self-hosters run
-older servers, so a newer client must work against one: it does, as today's client.
+is a row nobody has claimed. A newer server answers `keyed_by` to every request that carries an `instance_id`, and an
+older one never does. Self-hosters run older servers, so a newer client must work against one: it does, as today's
+client.
 
 ### The overlay node and the row's `machine_id`
 
@@ -300,9 +303,9 @@ A tunnel client's overlay node is keyed by its row's `machine_id`. The join read
 against it (`overlay.rs:362`, `crates/services/src/dao/overlay_node.rs:121-137`), and a removal releases the node by it
 (`overlay.rs:1917-1943`, through `end_tunnel_client` at `routes/tunnel.rs:708-733`). Writing a new `machine_id` on a
 row would leave its node under the old one: no removal would release it, and the client's next join would be refused
-`wg_key_taken_by_other`. So a claim writes `instance_id` and never touches `machine_id`. On master no `WgKeypair` is made under
-`agents/roomler-cli/src`, so the CLI built from master joins no overlay of its own; the rule holds for any row that has
-a node.
+`wg_key_taken_by_other`. So a claim writes `instance_id` and never touches `machine_id`. On master no `WgKeypair` is
+made under `agents/roomler-cli/src`, so the CLI built from master joins no overlay of its own; the rule holds for any
+row that has a node.
 
 ### The composition baseline
 
@@ -396,7 +399,7 @@ database pod, and nothing it reads by name leaves the reading process.
     .digest('hex').slice(0, 32);
   const out = {};
   db.tunnel_clients.find({ deleted_at: null }, { name: 1, os: 1, machine_id: 1, name_admin_set: 1 })
-    .limit(R0_COUNT + 100)
+    .limit(R0_COUNT + 100) // R0_COUNT: the count R0 read
     .forEach(r => {
       const k = r.os + (r.name_admin_set ? ' renamed'
         : ['x86_64', 'aarch64'].some(a => id(r.name, r.os, a) === r.machine_id) ? ' unknown' : ' other');
@@ -456,7 +459,8 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
   and it must be today's hash, computed as today. The claim then moves each legacy row to its install once.
 - **D3, does a claim mint a new token generation?** Recommended: no, as no re-enrollment does today
   (`tunnel_client.rs:94-95`). With one, the other machine on a shared row is refused at its next connect
-  (`tunnel.rs:2161-2176`) and must enroll again, and an older client there finds the same row again.
+  (`crates/modules/network/src/tunnel.rs:2161-2176`) and must enroll again, and an older client there finds the same
+  row again.
 - **D4, a legacy row outside the enroller's scope?** Recommended: a live row of someone else gets the enroller a row of
   their own, which is case 2 of #4479 fixed; a removed row stays 409 `REMOVED_TUNNEL_CLIENT`, as today, so a removal is
   still undone only by a device manager. The alternative, 409 for both, keeps case 2 for every client whose legacy hash
