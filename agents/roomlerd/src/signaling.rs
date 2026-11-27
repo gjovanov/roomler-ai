@@ -5609,7 +5609,9 @@ async fn handle_server_msg(
 
         // rc:tunnel.terminate from the server (relayed from the
         // client or admin-side teardown). Tear down our peer state.
-        ServerMsg::TunnelTerminate { session_id, reason } => {
+        ServerMsg::TunnelTerminate {
+            session_id, reason, ..
+        } => {
             info!(%session_id, ?reason, "rc:tunnel.terminate — closing peer");
             // #1761 — a setup still in flight for this session: its result,
             // when it lands, is closed rather than inserted.

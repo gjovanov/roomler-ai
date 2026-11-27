@@ -288,6 +288,7 @@ pub async fn handle_tunnel_client_socket(
                         ServerMsg::TunnelTerminate {
                             session_id: s.tunnel_session_id,
                             reason,
+                            close_connection: false,
                         },
                     );
                 }
@@ -433,6 +434,7 @@ pub async fn handle_tunnel_client_socket(
             ServerMsg::TunnelTerminate {
                 session_id: s.tunnel_session_id,
                 reason: CloseReason::ClientShutdown,
+                close_connection: false,
             },
         );
         audit_peer_close(&state, &s, &orig).await;
@@ -1898,6 +1900,7 @@ pub async fn relay_tunnel_client_msg_from_agent(
                     ServerMsg::TunnelTerminate {
                         session_id: s.tunnel_session_id,
                         reason,
+                        close_connection: false,
                     },
                 );
                 state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
@@ -1955,6 +1958,7 @@ pub async fn teardown_agent_originated_sessions(
             ServerMsg::TunnelTerminate {
                 session_id: s.tunnel_session_id,
                 reason: CloseReason::ClientShutdown,
+                close_connection: false,
             },
         );
         audit_peer_close(state, &s, orig).await;
@@ -2052,6 +2056,7 @@ async fn terminate_agent_sessions_now(state: &NetworkState, agent_id: ObjectId) 
             let msg = ServerMsg::TunnelTerminate {
                 session_id: sid,
                 reason: CloseReason::ServerTerminated,
+                close_connection: false,
             };
             if let Err(e) = tx.try_send(msg) {
                 debug!(%agent_id, session_id = %sid, %e, "terminate push dropped (client channel full/closed)");
