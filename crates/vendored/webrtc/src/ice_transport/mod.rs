@@ -128,6 +128,22 @@ impl RTCIceTransport {
         }
     }
 
+    /// Roomler patch (#3259): every remote candidate the ICE agent holds, as
+    /// its stats name it, and `None` when there is no agent: before one is
+    /// made, or after close. A prflx the agent learnt from a check and a
+    /// candidate the far end signalled at the same address are both here.
+    /// Like [`Self::local_candidates`], it never creates an agent, so a read
+    /// after close binds nothing. Unlike the peer's `get_stats`, it waits only
+    /// on the gatherer's hold of its agent, taken while one is made or taken
+    /// away, and on the agent's remote candidates, which no task holds across
+    /// I/O.
+    pub async fn remote_candidates_stats(
+        &self,
+    ) -> Option<Vec<ice::agent::agent_stats::CandidateStats>> {
+        let agent = self.gatherer.get_agent().await?;
+        Some(agent.get_remote_candidates_stats().await)
+    }
+
     /// Start incoming connectivity checks based on its configured role.
     pub async fn start(&self, params: &RTCIceParameters, role: Option<RTCIceRole>) -> Result<()> {
         if self.state() != RTCIceTransportState::New {
