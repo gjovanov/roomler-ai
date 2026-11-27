@@ -1898,7 +1898,7 @@ it. A session with no nominated pair within the wait writes no carrier line, as 
 | `session_carrier::tests::the_relay_transport_reads_the_local_relays_stamp_and_never_guesses` | every answer: `udp`, `tcp` and `tls` from a relay's stamp; `none` on host, srflx and prflx whatever a stamp says; `unknown` on a relay without a stamp, on TURN over DTLS, a STUN URL or a part the URL parser could not name, and on an unnamed type |
 | `session_carrier::tests::the_relay_transport_spellings_are_locked_and_distinct`, `the_carrier_line_names_its_fields` | the five spellings, and the carrier line's fields in order |
 | `session_carrier::tests::a_pair_on_the_agents_udp_relay_names_its_transport` | two peer connections that gather relay candidates only, from a TURN server on loopback over UDP: the agent's nominated pair reads `Relay` and `udp`, through both vendored crates |
-| the fork's `candidate_relay_test.rs`, `a_relay_candidate_names_what_carries_its_allocation` | a relay gathered over a UDP TURN URL carries `(Udp, Turn)`, and a host candidate carries none (CI's vendored-ice lane) |
+| the fork's `candidate_relay_test.rs`, `a_relay_candidate_names_what_carries_its_allocation` | a relay gathered over a UDP TURN URL carries `(Udp, Turn)`, and a host candidate carries none (CI's check "Vendored webrtc-ice tests") |
 
 FR-148's path report reads both from the fleet's logs: each session's queued samples and
 its relay transport, and per device its sessions by relay transport and, by carrier
@@ -2778,7 +2778,7 @@ Each break went through the rate estimate, whose limits stand as found (above). 
   alone, they held in four runs of five; in the fifth the two viewer's window cells
   failed, when a stall started the cap (above). With the cap on trial they held in five
   runs of five (the cap on trial, above);
-- the pacer's own tests in the fork, in the `vendored-sctp` job (`docs/tunnels.md`).
+- the pacer's own tests in the fork, in the check "Vendored webrtc-sctp tests" (`docs/testing.md`).
 
 The stall cells stay measurements. Timing can flip each one that 4a-3b's rule fails and
 this one holds: after the stall, two SACKs that a busy runner delivers 10 ms late among

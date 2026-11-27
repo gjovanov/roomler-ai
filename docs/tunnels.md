@@ -564,7 +564,7 @@ loop the same way.
 | `test_stream_a_chunk_that_races_a_read_still_wakes_it` (`stream/stream_test.rs:725`) | a chunk that races a read for the queue's lock is read, whichever takes the lock first, and a wake-up the read took but did not need is kept for the next wait | passes: it guards the data path the fix moved |
 
 With the fix each of the three passed 200 runs of 200, one at a time, and the fork's whole
-suite passed (155 tests). CI runs them with the rest in the `vendored-sctp` job.
+suite passed (155 tests). CI runs them with the rest in the check "Vendored webrtc-sctp tests".
 
 **Not covered:** two more wakes of this shape were read for #4116 and left as they are. The
 RTP sender's `stop()` sets its flag and wakes with one `notify_waiters()`
@@ -613,8 +613,8 @@ The reset's order has a unit test of its own, on one thread:
 (`crates/vendored/webrtc-sctp/src/stream/stream_test.rs:240`). While a write holds its turn,
 the shutdown returns at once and queues nothing. Once the write has queued its message and let
 go of the turn, the reset follows it. Without the reset task's wait for the turn, the queue
-ends [reset, data]. CI runs the vendored crate's tests in the `vendored-sctp` job, beside its
-drift check; how to run them by hand is in [the next section](#%EF%B8%8F-a-send-cut-short-leaves-its-stream-whole-3755).
+ends [reset, data]. CI runs the vendored crate's tests in the check "Vendored webrtc-sctp tests"
+([testing.md](testing.md#the-tests-of-the-vendored-forks-4503)); how to run them by hand is in [the next section](#%EF%B8%8F-a-send-cut-short-leaves-its-stream-whole-3755).
 
 **Not covered:** a TURNS/TCP leg that is dead but never reset. Its writes block until the OS
 gives the connection up (`crates/tcp-turn-conn/src/lib.rs:257`), with the TURN client's lock
@@ -741,16 +741,19 @@ crate's in-memory bridge, with a queue of a few KiB, and close the pair at the e
 | `test_pending_queue_pops_during_a_drop_pay_its_debt_first` (`:750`) | a stand-in for the write loop on another thread pops 0 to 3 whole chunks at each step of a begun message's drop, every one after the debt was recorded: those pops pay the debt before they give room, so none of their room is left free while anything is owed, the accounting holds, and the rest goes out whole, in order | uses the fix's accessors |
 | `test_pending_queue_a_pop_split_around_a_drop_frees_at_most_its_chunk` (`:820`) | the race that is left: a `pop` on another thread, held between what it pays and the room it gives back while a drop records its debt and reads the room, leaves at most its own chunk free while the rest is owed; a large message that begins on it and is cut adds one rest, within (1 + races) times the largest message; every later `pop` pays first; the queue drains whole, in order, to rest | uses the fix's accessors |
 
-**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:3164`), which is not
-yet one of the checks the `rust` aggregator needs. The fork is not a workspace member, so no
-other `cargo test` builds it. The job seeds the fork's standalone build with the workspace's
+**CI** runs these in the check "Vendored webrtc-sctp tests", the `webrtc-sctp` entry
+(`.github/workflows/ci.yml:3265`) of the `vendored-tests` job (`:3186`), which is not yet one
+of the checks the `rust` aggregator needs. The fork is not a workspace member, so no other
+`cargo test` builds it. The entry seeds the fork's standalone build with the workspace's
 `Cargo.lock`, so the tests run against the tokio the agent ships, and skips the two
-`fuzz_artifact_test` tests, which fail on any checkout: the crates.io tarball ships no
-`fuzz/` tree. By hand:
+`fuzz_artifact_test` tests by name, which fail on any checkout: the crates.io tarball ships no
+`fuzz/` tree. Every fork's entry is in
+[testing.md](testing.md#the-tests-of-the-vendored-forks-4503). By hand, the entry's command:
 
 ```bash
 cp Cargo.lock crates/vendored/webrtc-sctp/Cargo.lock
-cargo test --manifest-path crates/vendored/webrtc-sctp/Cargo.toml --lib -- --skip fuzz_artifact_test
+cargo test --manifest-path crates/vendored/webrtc-sctp/Cargo.toml --lib -- --exact \
+  --skip fuzz_artifact_test::packet_crash_artifacts --skip fuzz_artifact_test::param_crash_artifacts
 rm crates/vendored/webrtc-sctp/Cargo.lock   # before a revendor --regen or --check, which would read it as drift
 ```
 

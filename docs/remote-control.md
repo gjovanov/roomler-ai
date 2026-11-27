@@ -5597,10 +5597,10 @@ The vendored webrtc's own cells hold the two patches the mark rests on (FR-148 P
 id is its stream, in the handler and once open, on both DTLS roles
 (`data_channel_test::test_data_channel_accepted_id_is_its_stream_when_the_answerer_is_the_dtls_client` and
 `…_dtls_server`), and each refusal comes with its cause on a real pair
-(`sctp_transport_test::test_mark_deadline_stream_says_why_it_refused`). No CI lane runs that crate's
-tests, as `vendored-sctp` runs the SCTP fork's: they run by hand, with `--manifest-path
-crates/vendored/webrtc/Cargo.toml` and the workspace's `[patch.crates-io]` forks (`webrtc-sctp`,
-`webrtc-ice`, `rtp`) given as `--config` patches. The agent's cells above are CI's guard of both.
+(`sctp_transport_test::test_mark_deadline_stream_says_why_it_refused`). CI runs that crate's tests
+in the check "Vendored webrtc tests", with the workspace's `[patch.crates-io]` forks (`webrtc-sctp`,
+`webrtc-ice`, `rtp`) given as `--config` patches ([testing.md](testing.md#the-tests-of-the-vendored-forks-4503)).
+No rule requires that check yet, so the agent's cells above stay the required guard of both.
 
 **The kill switch** is the value `off`, which is also the default: no class is read, no channel
 marked, and every frame goes on `video-bytes` under the send task's next number, as before.
