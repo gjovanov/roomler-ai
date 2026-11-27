@@ -985,12 +985,9 @@ mod tests {
         std::sync::Arc::new(api.new_peer_connection(config).await.unwrap())
     }
 
-    /// FR-148 P0 — through the vendored webrtc-ice and webrtc: a session on
-    /// the agent's own TURN allocation over UDP reads `udp`, from the pair
-    /// the carrier line reads.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_pair_on_the_agents_udp_relay_names_its_transport() {
-        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+    /// A TURN server on loopback over UDP, which hands out its relays on
+    /// loopback, and its port.
+    async fn loopback_turn() -> (webrtc::turn::server::Server, u16) {
         use webrtc::turn;
         let listener =
             std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1012,6 +1009,16 @@ mod tests {
         })
         .await
         .unwrap();
+        (server, port)
+    }
+
+    /// FR-148 P0 — through the vendored webrtc-ice and webrtc: a session on
+    /// the agent's own TURN allocation over UDP reads `udp`, from the pair
+    /// the carrier line reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pair_on_the_agents_udp_relay_names_its_transport() {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        let (server, port) = loopback_turn().await;
         let viewer = relayed_peer(port).await;
         let agent = relayed_peer(port).await;
         let (tx, mut connected) = tokio::sync::mpsc::channel::<()>(1);
@@ -1048,6 +1055,157 @@ mod tests {
         assert_eq!(view.local_kind, CandidateKind::Relay, "{view:?}");
         assert_eq!(relay, RelayTransport::Udp, "{view:?}");
         assert_eq!(rides, None, "no rank: the agent reads no route");
+    }
+
+    /// A peer that gathers host candidates on loopback alone and asks no
+    /// server: the agent's end of a pair whose far end is relayed.
+    async fn host_peer() -> std::sync::Arc<RTCPeerConnection> {
+        use webrtc::api::setting_engine::SettingEngine;
+        use webrtc::ice::mdns::MulticastDnsMode;
+        use webrtc::ice::network_type::NetworkType;
+        let mut setting = SettingEngine::default();
+        setting.set_include_loopback_candidate(true);
+        setting.set_ip_filter(Box::new(|ip: std::net::IpAddr| ip.is_loopback()));
+        setting.set_network_types(vec![NetworkType::Udp4]);
+        setting.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        let api = webrtc::api::APIBuilder::new()
+            .with_setting_engine(setting)
+            .build();
+        std::sync::Arc::new(api.new_peer_connection(Default::default()).await.unwrap())
+    }
+
+    /// An SDP without its candidates, and its candidate lines as a trickle
+    /// sends them (`candidate:…`).
+    fn without_candidates(sdp: &str) -> (String, Vec<String>) {
+        let (mut kept, mut candidates) = (String::new(), Vec::new());
+        for line in sdp.split_inclusive('\n') {
+            match line.trim_end().strip_prefix("a=") {
+                Some(c) if c.starts_with("candidate:") => candidates.push(c.to_owned()),
+                Some("end-of-candidates") => {}
+                _ => kept.push_str(line),
+            }
+        }
+        (kept, candidates)
+    }
+
+    /// #3259 — a relay learnt as peer-reflexive. The viewer's first check
+    /// reaches the agent through the viewer's relay before the agent holds
+    /// the relay's candidate, so webrtc-ice names the remote `Prflx`. The
+    /// candidate the viewer then trickles is kept beside it (`equal` compares
+    /// the type) and the selection keeps the prflx (`find_remote_candidate`
+    /// returns the first match): the agent holds a relay at exactly the
+    /// selected remote's address and port. The carrier reads the far end's
+    /// relay, `turn_local` on this loopback relay by the address rule a
+    /// signalled relay remote takes, and FR-148's two readers follow the
+    /// label: `class_of` gives `unknown`, since the agent's own candidate is
+    /// no relay, and the path memory keys the pair by the relay's word.
+    /// Before the candidate came nothing showed a relay, and the same pair
+    /// read `direct`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_learnt_as_prflx_before_its_candidate_reads_as_the_relay() {
+        use crate::media_deadline::{CarrierClass, class_of};
+        use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+        let (server, port) = loopback_turn().await;
+        let viewer = relayed_peer(port).await;
+        let agent = host_peer().await;
+        let (tx, mut connected) = tokio::sync::mpsc::channel::<()>(1);
+        agent.on_peer_connection_state_change(Box::new(move |s| {
+            if s == RTCPeerConnectionState::Connected {
+                let _ = tx.try_send(());
+            }
+            Box::pin(async {})
+        }));
+        let _channel = viewer.create_data_channel("video", None).await.unwrap();
+        let offer = viewer.create_offer(None).await.unwrap();
+        let mut gathered = viewer.gathering_complete_promise().await;
+        viewer.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let offer = viewer.local_description().await.unwrap();
+        // The viewer's candidates are held back: they reach the agent only
+        // once the pair is up, after the check that taught it the prflx.
+        let (offer, relays) = without_candidates(&offer.sdp);
+        agent
+            .set_remote_description(RTCSessionDescription::offer(offer).unwrap())
+            .await
+            .unwrap();
+        let answer = agent.create_answer(None).await.unwrap();
+        let mut gathered = agent.gathering_complete_promise().await;
+        agent.set_local_description(answer).await.unwrap();
+        let _ = gathered.recv().await;
+        let answer = agent.local_description().await.unwrap();
+        viewer.set_remote_description(answer).await.unwrap();
+        let up = tokio::time::timeout(Duration::from_secs(15), connected.recv()).await;
+        let learnt = nominated_pair(&agent, Duration::from_secs(5)).await;
+        let mut trickled = Vec::new();
+        for candidate in &relays {
+            let init = RTCIceCandidateInit {
+                candidate: candidate.clone(),
+                ..Default::default()
+            };
+            trickled.push(
+                agent
+                    .add_ice_candidate(init)
+                    .await
+                    .map_err(|e| e.to_string()),
+            );
+        }
+        // The ICE agent adds a trickled candidate on a task of its own: read
+        // the pair until its carrier is no longer direct, 3 s at most.
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        let read = loop {
+            let read = nominated_pair(&agent, Duration::from_secs(1)).await;
+            let moved = read
+                .as_ref()
+                .is_some_and(|(view, _, _)| carrier_of(view, None) != SessionCarrier::Direct);
+            if moved || tokio::time::Instant::now() >= until {
+                break read;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        // A peer must be closed: dropping one frees none of its sockets.
+        for pc in [&agent, &viewer] {
+            let _ = pc.close().await;
+        }
+        let _ = server.close().await;
+        assert!(up.is_ok(), "the relayed pair did not connect in 15 s");
+        assert!(!relays.is_empty(), "the viewer gathered no relay candidate");
+        assert!(trickled.iter().all(Result::is_ok), "{trickled:?}");
+        let (learnt, _, _) = learnt.expect("no nominated pair before the trickle");
+        assert_eq!(
+            (learnt.local_kind, learnt.remote_kind),
+            (CandidateKind::Host, CandidateKind::Prflx),
+            "{learnt:?}"
+        );
+        assert_eq!(
+            carrier_of(&learnt, None),
+            SessionCarrier::Direct,
+            "{learnt:?}"
+        );
+        let (view, relay, rides) = read.expect("no nominated pair after the trickle");
+        assert_eq!(
+            (view.local_kind, view.remote_kind),
+            (CandidateKind::Host, CandidateKind::Prflx),
+            "{view:?}"
+        );
+        assert_eq!(relay, RelayTransport::NoRelay, "{view:?}");
+        assert_eq!(rides, None, "no rank: the agent reads no route");
+        assert_eq!(
+            carrier_of(&view, None),
+            SessionCarrier::TurnLocal,
+            "{view:?}"
+        );
+        assert_eq!(
+            class_of(&view, relay, false, None),
+            CarrierClass::Unknown,
+            "{view:?}"
+        );
+        assert_eq!(
+            crate::encode::pair_memory::carrier_word(carrier_of(&view, None), None).as_deref(),
+            Some("turn_local"),
+            "{view:?}"
+        );
     }
 
     /// FR-148 P4 step 2 (A2): under `route` the carrier record reads the ICE
