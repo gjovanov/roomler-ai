@@ -538,7 +538,76 @@ impl Rig {
     }
 }
 
+/// One session: set up, listed on the banner and attached.
 async fn rig(opts: Opts) -> Result<Rig> {
+    Ok(connect(opts).await?.attach())
+}
+
+/// #3443 — a session whose peer pair is up and whose `record` channel is open
+/// on both ends, not yet listed on the banner and with no handler on its
+/// channel: [`Pending::attach`] does both. A cell that never attaches one
+/// closes it ([`Pending::close`]).
+///
+/// The listing and the attach come after the channel's open, where a device
+/// lists a session before its peer is set up and attaches the handler as the
+/// channel arrives. No cell can tell the two apart: nothing reads the
+/// session's banner entry, or sends on its channel, until it is attached.
+struct Pending {
+    rig: Rig,
+    ctx: SessionCtx,
+    agent_dc: Arc<RTCDataChannel>,
+    granted: bool,
+    listed: bool,
+}
+
+impl Pending {
+    /// List the session on the banner and attach the device's handler.
+    fn attach(self) -> Rig {
+        let Pending {
+            rig,
+            ctx,
+            agent_dc,
+            granted,
+            listed,
+        } = self;
+        if listed {
+            rig.indicator.show_session_full(
+                rig.session_id,
+                "Tester".into(),
+                "VIEW | RECORD".into(),
+                String::new(),
+            );
+        }
+        // The attach-time gate, as `peer.rs` runs it.
+        if granted {
+            remote::attach(agent_dc, ctx);
+        } else {
+            remote::attach_refusing(agent_dc, rig.session_id, "not_granted");
+        }
+        rig
+    }
+
+    /// A session set up and then not needed. ⚠️ A WebRTC peer must be
+    /// closed: dropping it frees none of its sockets.
+    async fn close(self) {
+        let _ = self.rig.pcs.1.close().await;
+        let _ = self.rig.pcs.0.close().await;
+    }
+}
+
+/// #3443 — the controller's next session, set up now and attached later. A
+/// cell that picks up a dropped recording calls this BEFORE the drop (or the
+/// re-offer) and attaches the session after it, so only the status crosses
+/// the drop: how long the setup takes, seconds on a loaded host, is never
+/// counted against the grace. [`next_session_delay`] falsifies that by hand.
+async fn next_session(opts: Opts) -> Result<Pending> {
+    tokio::time::sleep(next_session_delay()).await;
+    connect(opts).await
+}
+
+/// One session's peer pair, set up until its `record` channel is open on both
+/// ends.
+async fn connect(opts: Opts) -> Result<Pending> {
     let s = setup();
     let (browser_pc, agent_pc) = mk_pc_pair().await?;
     let stages = dc_stage::Stages::watch(&browser_pc, &agent_pc);
@@ -564,14 +633,6 @@ async fn rig(opts: Opts) -> Result<Rig> {
     };
     let registry = device.registry.clone();
     let indicator = device.indicator.clone();
-    if opts.listed {
-        indicator.show_session_full(
-            session_id,
-            "Tester".into(),
-            "VIEW | RECORD".into(),
-            String::new(),
-        );
-    }
     let (activity_tx, activity_rx) = mpsc::channel(64);
     let ctx = SessionCtx {
         session_id,
@@ -621,12 +682,6 @@ async fn rig(opts: Opts) -> Result<Rig> {
     exchange(&browser_pc, &agent_pc, &stages).await?;
     let agent_dc =
         dc_stage::agent_channel(agent_dc_rx, &stages, &browser_dc, Duration::from_secs(30)).await?;
-    // The attach-time gate, as `peer.rs` runs it.
-    if opts.granted {
-        remote::attach(agent_dc, ctx);
-    } else {
-        remote::attach_refusing(agent_dc, session_id, "not_granted");
-    }
     let (open_tx, open_rx) = oneshot::channel::<()>();
     let open_tx = Arc::new(Mutex::new(Some(open_tx)));
     browser_dc.on_open(Box::new(move || {
@@ -650,18 +705,24 @@ async fn rig(opts: Opts) -> Result<Rig> {
             }
         }
     }
-    Ok(Rig {
-        dc: browser_dc,
-        strings: strings_rx,
-        bytes: bytes_rx,
-        activity: activity_rx,
-        registry,
-        indicator,
-        broker,
-        session_id,
-        controller_user_id,
-        pcs: (browser_pc, agent_pc),
-        _kill_rx: kill_rx,
+    Ok(Pending {
+        rig: Rig {
+            dc: browser_dc,
+            strings: strings_rx,
+            bytes: bytes_rx,
+            activity: activity_rx,
+            registry,
+            indicator,
+            broker,
+            session_id,
+            controller_user_id,
+            pcs: (browser_pc, agent_pc),
+            _kill_rx: kill_rx,
+        },
+        ctx,
+        agent_dc,
+        granted: opts.granted,
+        listed: opts.listed,
     })
 }
 
@@ -760,8 +821,9 @@ fn next_session_delay() -> Duration {
         .ok()
         .and_then(|ms| ms.trim().parse().ok())
         .map(Duration::from_millis)
-        // RED: on by default in this commit, longer than the grace and the
-        // grace cells' 15 s look, so that CI shows every cell it fails.
+        // On by default in this commit, longer than the grace and the grace
+        // cells' 15 s look, so that CI shows the reworked cells passing with
+        // it. The next commit sets it to nothing.
         .unwrap_or(Duration::from_secs(15))
 }
 
@@ -1483,6 +1545,9 @@ async fn a_dropped_session_is_picked_up_by_its_controller_cell() -> Result<()> {
     let name = v["name"].as_str().expect("a file name").to_string();
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
+    // #3443 — the controller's next session is set up before the drop and
+    // attached after it, so only its status crosses the drop.
+    let b = next_session(on_device()).await?;
     let dropped = tokio::time::Instant::now();
     a.drop_session().await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1500,8 +1565,7 @@ async fn a_dropped_session_is_picked_up_by_its_controller_cell() -> Result<()> {
     );
 
     // The controller is back, on a new session.
-    tokio::time::sleep(next_session_delay()).await;
-    let mut b = rig(on_device()).await?;
+    let mut b = b.attach();
     let (v, why) = status_since(&mut b, dropped).await?;
     assert_eq!(
         (v["state"].as_str(), v["id"].as_str(), v["name"].as_str()),
@@ -1577,15 +1641,22 @@ async fn only_its_own_controller_picks_up_a_dropped_recording_cell() -> Result<(
     assert_eq!(v["state"], "recording", "{v}");
     let name = v["name"].as_str().unwrap().to_string();
     tokio::time::sleep(Duration::from_millis(1000)).await;
-    let dropped = tokio::time::Instant::now();
-    a.drop_session().await?;
-
-    tokio::time::sleep(next_session_delay()).await;
-    let mut c = rig(Opts {
+    // #3443 — the other controller's session is set up before the drop and
+    // attached after it, so only its status crosses the drop.
+    let c = next_session(Opts {
         device: Some(device.clone()),
         ..Default::default()
     })
     .await?;
+    let dropped = tokio::time::Instant::now();
+    a.drop_session().await?;
+    // The drop is seen (the channel watch looks every 500 ms) before the
+    // other controller asks, so it asks about a recording the grace holds.
+    // This wait was the other session's setup before; without it, `idle`
+    // would also be the answer for a recording still live on its session.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let mut c = c.attach();
     assert_ne!(c.controller_user_id, a.controller_user_id);
     let (v, why) = status_since(&mut c, dropped).await?;
     assert_eq!(
@@ -2338,13 +2409,15 @@ async fn a_session_the_loop_ends_is_detached_though_its_channel_stays_open_cell(
     let name = v["name"].as_str().expect("a file name").to_string();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
+    // #3443 — the controller's next session is set up before the session
+    // ends and attached after, so only its status crosses the end.
+    let b = next_session(on_device()).await?;
     // The loop ends the session; its peer is never closed.
     let dropped = tokio::time::Instant::now();
     remote::session_ended(a.session_id);
     a.indicator.hide_session(a.session_id.to_hex());
 
-    tokio::time::sleep(next_session_delay()).await;
-    let mut b = rig(on_device()).await?;
+    let mut b = b.attach();
     let (v, why) = status_since(&mut b, dropped).await?;
     assert_eq!(
         (v["state"].as_str(), v["id"].as_str(), v["name"].as_str()),
@@ -2403,16 +2476,19 @@ async fn the_grace_never_stops_another_recording_cell() -> Result<()> {
         assert_eq!(v["state"], "recording", "{v}");
         let name_a = v["name"].as_str().unwrap().to_string();
         tokio::time::sleep(Duration::from_millis(1000)).await;
-        a.drop_session().await?;
+        // #3443 — the other controller's session is set up before the drop
+        // and attached after the host's Stop, so only its start crosses the
+        // drop. `dropped` is taken before the drop: it counts more, not less.
+        let c = next_session(on_device()).await?;
         let dropped = tokio::time::Instant::now();
+        a.drop_session().await?;
         // The drop is seen (≤ 500 ms) and the grace's first look passes.
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // The host stops it, and another controller starts a recording.
         let _ = s.manager.stop().await;
         assert!(!s.manager.state().active, "the host's Stop did not stop it");
-        tokio::time::sleep(next_session_delay()).await;
-        let mut c = rig(on_device()).await?;
+        let mut c = c.attach();
         c.send(json!({"t": "rc:record.start", "id": "n2"})).await?;
         let v = c.state(START).await?;
         assert_eq!(v["state"], "recording", "{v}");
@@ -2498,16 +2574,19 @@ async fn the_hosts_disconnect_never_stops_another_recording_cell() -> Result<()>
         assert_eq!(v["state"], "recording", "{v}");
         let name_a = v["name"].as_str().unwrap().to_string();
         tokio::time::sleep(Duration::from_millis(1000)).await;
-        a.drop_session().await?;
+        // #3443 — the other controller's session is set up before the drop
+        // and attached after the host's Stop, so only its start crosses the
+        // drop. `dropped` is taken before the drop: it counts more, not less.
+        let c = next_session(on_device()).await?;
         let dropped = tokio::time::Instant::now();
+        a.drop_session().await?;
         // The drop is seen (≤ 500 ms) and the grace's first look passes.
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // The host stops it, and another controller starts a recording.
         let _ = s.manager.stop().await;
         assert!(!s.manager.state().active, "the host's Stop did not stop it");
-        tokio::time::sleep(next_session_delay()).await;
-        let mut c = rig(on_device()).await?;
+        let mut c = c.attach();
         c.send(json!({"t": "rc:record.start", "id": "n2"})).await?;
         let v = c.state(START).await?;
         assert_eq!(v["state"], "recording", "{v}");
@@ -2585,13 +2664,16 @@ async fn a_reoffer_on_the_same_session_keeps_its_banner_cell() -> Result<()> {
     let name = v["name"].as_str().unwrap().to_string();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
+    // #3443 — the new peer is set up before the old one goes, as a re-offer
+    // builds it in production too, and attached after: the re-offer's word
+    // reaches only the old peer's handler, and only the status crosses the
+    // re-offer. The session is listed already.
+    let b = next_session(same(false)).await?;
     let dropped = tokio::time::Instant::now();
     a.reoffer(true).await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // The session is listed already.
-    tokio::time::sleep(next_session_delay()).await;
-    let mut b = rig(same(false)).await?;
+    let mut b = b.attach();
     let (v, why) = status_since(&mut b, dropped).await?;
     assert_eq!(
         (v["state"].as_str(), v["id"].as_str()),
@@ -2640,6 +2722,10 @@ async fn a_reoffer_while_the_recorder_launches_keeps_the_recording_cell() -> Res
         ..Default::default()
     };
     let mut a = rig(same(true)).await?;
+    // #3443 — the new peer is set up before the start, because the launch
+    // window is about a second and a setup can take longer, and attached once
+    // the start has returned: only the status crosses the re-offer.
+    let b = next_session(same(false)).await?;
     a.send(json!({"t": "rc:record.start", "id": "o1"})).await?;
     // Spawned, not recording yet, as in the L3 cell.
     let deadline = tokio::time::Instant::now() + START;
@@ -2667,8 +2753,7 @@ async fn a_reoffer_while_the_recorder_launches_keeps_the_recording_cell() -> Res
         // The start has returned (its `Started`), and its look at the
         // session with it.
         a_kinds = reports_until(&mut a, RecordingActivityKind::Started, START).await;
-        tokio::time::sleep(next_session_delay()).await;
-        let mut b = rig(same(false)).await?;
+        let mut b = b.attach();
         (picked, why) = status_since(&mut b, dropped).await?;
         if (picked["state"].as_str(), picked["id"].as_str()) == (Some("recording"), Some("o1")) {
             b.send(json!({"t": "rc:record.stop", "id": "o1"})).await?;
@@ -2681,6 +2766,8 @@ async fn a_reoffer_while_the_recorder_launches_keeps_the_recording_cell() -> Res
         )
         .await;
         b.drop_session().await?;
+    } else {
+        b.close().await;
     }
     let st = s.manager.state();
     a_kinds.extend(a.reports().into_iter().map(|(k, why, _)| (k, why)));
@@ -2989,6 +3076,9 @@ async fn held_by_the_grace(then: Then) -> Result<()> {
     let mut a = rig(on_device()).await?;
     a.send(json!({"t": "rc:record.start", "id": "g1"})).await?;
     let v = a.state(START).await?;
+    // #3443 — the controller's next session is set up before the channel's
+    // end and attached after it, so only its status crosses the end.
+    let b = next_session(on_device()).await?;
     let dropped = tokio::time::Instant::now();
     let _ = a.dc.close().await;
     // By now the re-attach grace holds the recording and speaks for it (the
@@ -3000,8 +3090,7 @@ async fn held_by_the_grace(then: Then) -> Result<()> {
         a.indicator.hide_session(a.session_id.to_hex());
     }
     // The controller comes back on a new session, within the grace.
-    tokio::time::sleep(next_session_delay()).await;
-    let mut b = rig(on_device()).await?;
+    let mut b = b.attach();
     let (picked, why) = status_since(&mut b, dropped).await?;
     let b_kinds: Vec<_> = b.reports().into_iter().map(|(k, _, _)| k).collect();
     if then == Then::ControllerComesBack && picked["state"] == "recording" {
