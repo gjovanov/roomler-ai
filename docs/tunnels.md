@@ -1456,9 +1456,14 @@ cannot be siblings. (Before rc.454 the macOS `.pkg` shipped **no** CLI at all.) 
 **`enroll` spends its token once** (#3328). A tunnel enrollment token enrolls one
 client; a second use answers 401 `This enrollment token has already been used`, and
 a retryable 503 means the server could not check, with the token still good. The
-client's `machine_id` is a hash of `--name`, the host name, the OS and the
+client's `machine_id` is a hash of `--name`, the `HOSTNAME` environment variable
+(`COMPUTERNAME` on Windows, `unknown` where it is not set), the OS and the
 architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1228`), so running
-`enroll` again with the same name re-enrolls the same client. That takes a fresh token
+`enroll` again with the same name, in the same environment, re-enrolls the same client.
+The variable is often not set on Linux and macOS, and two machines enrolled there under
+one name then send one id, so the server takes the second for the first (#4479);
+[FR-159](fr/FR-159-tunnel-client-identity.md) gives each client an id of its own.
+Enrolling again takes a fresh token
 minted by the client's owner while the client is live, or by a holder of
 `MANAGE_AGENTS`, the only way a removed client comes back (as the holder's own: the
 token acts for them). Anyone else's token is
