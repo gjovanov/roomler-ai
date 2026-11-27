@@ -705,6 +705,14 @@ impl Association {
         ai.mark_deadline_stream(stream_identifier)
     }
 
+    /// roomler (FR-148 P4b): the streams marked deadline-limited
+    /// (`mark_deadline_stream`), in ascending order. A read: it marks and
+    /// clears nothing, so a caller can say which stream a mark reached.
+    pub async fn deadline_streams(&self) -> Vec<u16> {
+        let ai = self.association_internal.lock().await;
+        ai.deadline_streams()
+    }
+
     /// accept_stream accepts a stream
     pub async fn accept_stream(&self) -> Option<Arc<Stream>> {
         let mut accept_ch_rx = self.accept_ch_rx.lock().await;
