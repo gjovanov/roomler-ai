@@ -854,7 +854,9 @@ pub struct HubInner {
     /// how long this pod refuses a registration below it (`hub::rotation`).
     floors: DashMap<(ObjectId, ObjectId), rotation::Floor>,
     /// FR-155 P1c — whether this pod runs the token rotation, set once at
-    /// startup ([`Hub::set_token_rotation`]).
+    /// startup ([`Hub::set_token_rotation`]). While it is on, the entry of a
+    /// higher generation stays when one of a lower generation registers
+    /// (`hub::rotation`).
     token_rotation: AtomicBool,
 }
 
@@ -962,7 +964,8 @@ impl Hub {
         supports_exec: bool,
     ) -> (ClientTx, Arc<AgentCancel>, mpsc::Receiver<ServerMsg>) {
         // FR-155 P1b — at generation 0, which only a floor someone set for
-        // this agent refuses; the agent socket registers through
+        // this agent refuses (or, P1c, an entry above it while the rotation
+        // is on); the agent socket registers through
         // `register_agent_resuming` with the generation it checked.
         let reg = self
             .register_agent_resuming(
@@ -976,7 +979,7 @@ impl Hub {
                 0,
                 ResumeHello::default(),
             )
-            .expect("no rotation floor for a registration at generation 0");
+            .expect("nothing above generation 0 for this agent on this pod");
         (reg.tx, reg.cancel, reg.rx)
     }
 
@@ -991,6 +994,8 @@ impl Hub {
     /// FR-155 P1b — `generation` is the token generation the connection was
     /// admitted under. Below a rotation's floor on this pod the registration
     /// is refused ([`BelowFloor`]) and changes nothing (`hub::rotation`).
+    /// P1c — and so is one below the entry it would replace, while the
+    /// rotation is on ([`Hub::set_token_rotation`]).
     #[allow(clippy::too_many_arguments)]
     pub fn register_agent_resuming(
         &self,
@@ -1082,8 +1087,10 @@ impl Hub {
         // FR-138 — a row created before this instant belongs to an earlier
         // connection: the registration read's line.
         let registered_at = bson::DateTime::now();
-        // FR-155 P1b — the insert, unless a rotation's floor refuses it: the
-        // two are one step under the entry's lock (`rotation`).
+        // FR-155 P1b — the insert, unless a rotation's floor refuses it (or,
+        // P1c, the entry it would replace is of a higher generation): the
+        // checks and the insert are one step under the entry's lock
+        // (`rotation`).
         if let Some(prev) = self.admit_agent(entry)? {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
             // read-loop polling `socket_rx.next()` for up to one 25 s

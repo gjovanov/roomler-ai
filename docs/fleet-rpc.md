@@ -545,7 +545,7 @@ run the command as root:
 |---|---|---|
 | The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:981`](../crates/modules/fleet/src/agent_exec.rs#L981) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:371`](../crates/modules/fleet/src/agent_exec.rs#L371) |
-| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3235`](../crates/modules/fleet/src/hub.rs#L3235) |
+| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3246`](../crates/modules/fleet/src/hub.rs#L3246) |
 | The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5849`](../agents/roomlerd/src/signaling.rs#L5849) |
 
 The word is kept per connection, never read from the stored row, for the reason
@@ -634,7 +634,7 @@ Exit status mirrors the remote command's, so `roomler exec` composes in a
 script: a refusal or failure is non-zero here too, never a silent 0.
 
 The target is a device name or a hex agent id, resolved by the server within
-the caller's org (`crates/modules/fleet/src/socket.rs:1189` `resolve_exec_target`:
+the caller's org (`crates/modules/fleet/src/socket.rs:1216` `resolve_exec_target`:
 hex id → exact name → case-insensitive name). A dashboard **display name** is
 turned into the hex id by the CLI before the request leaves — only when no
 device name matches it, and refused when two devices share it
