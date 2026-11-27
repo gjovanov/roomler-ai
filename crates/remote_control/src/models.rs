@@ -8622,6 +8622,73 @@ mod tests {
         );
     }
 
+    /// FR-67 P5 / #3332 — both health words survive every road the caps take:
+    /// the agent's JSON parsed into `AgentCaps` (the hello, and a heartbeat's
+    /// re-announce), the BSON the server stores (`AgentDao::
+    /// update_capabilities` replaces the row's caps wholesale) and the JSON it
+    /// serves back to the devices page. A word the struct does not declare is
+    /// dropped by the parse, and then no row ever shows it.
+    #[test]
+    fn the_caps_keep_the_install_verdict_and_the_crash_health() {
+        let sent = serde_json::json!({
+            "codecs": [],
+            "hw_encoders": [],
+            "last_install": {
+                "status": "InProgress",
+                "never_reported": true,
+                "expected_version": "agent-v0.4.240",
+                "started_unix": 1_795_000_000u64,
+            },
+            "crash_health": {
+                "state": "rollback_failed",
+                "crashes": 3,
+                "window_secs": 600,
+                "last_crash_unix": 1_795_000_100u64,
+                "accused_version": "0.4.240",
+                "last_known_good": "0.4.239",
+            },
+        });
+        let caps: AgentCaps = serde_json::from_value(sent.clone()).unwrap();
+        let back = serde_json::to_value(&caps).unwrap();
+        assert_eq!(back["last_install"], sent["last_install"], "{back}");
+        assert_eq!(back["crash_health"], sent["crash_health"], "{back}");
+        let stored: AgentCaps = bson::from_bson(bson::to_bson(&caps).unwrap()).unwrap();
+        let served = serde_json::to_value(&stored).unwrap();
+        assert_eq!(
+            served["last_install"], sent["last_install"],
+            "via BSON: {served}"
+        );
+        assert_eq!(
+            served["crash_health"], sent["crash_health"],
+            "via BSON: {served}"
+        );
+    }
+
+    /// FR-67 P5 / #3332 — "nothing to report" is a word, never the absence of
+    /// one: a device with no install on record and no crash says so, and that
+    /// survives the round trips apart from a hello that carries neither key
+    /// (an agent older than the words, whose row shows nothing new).
+    #[test]
+    fn nothing_to_report_stays_apart_from_an_agent_that_cannot_say() {
+        let sent = serde_json::json!({
+            "codecs": [],
+            "hw_encoders": [],
+            "last_install": { "status": "Absent" },
+            "crash_health": { "state": "ok", "crashes": 0, "window_secs": 600 },
+        });
+        let caps: AgentCaps = serde_json::from_value(sent.clone()).unwrap();
+        let stored: AgentCaps = bson::from_bson(bson::to_bson(&caps).unwrap()).unwrap();
+        let served = serde_json::to_value(&stored).unwrap();
+        assert_eq!(served["last_install"], sent["last_install"], "{served}");
+        assert_eq!(served["crash_health"], sent["crash_health"], "{served}");
+
+        let older = serde_json::json!({ "codecs": [], "hw_encoders": [] });
+        let caps: AgentCaps = serde_json::from_value(older).unwrap();
+        let served = serde_json::to_value(&caps).unwrap();
+        assert!(served.get("last_install").is_none(), "{served}");
+        assert!(served.get("crash_health").is_none(), "{served}");
+    }
+
     /// Spelled out literally rather than derived, so a rename has to be a
     /// deliberate edit here.
     #[test]

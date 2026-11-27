@@ -10799,6 +10799,96 @@ mod announce_tests {
             "nothing the row says changed"
         );
     }
+
+    /// FR-67 P5 / #3332 — the two health words ride the hello, and a change in
+    /// either is news on the next beat, once. On Windows the first hello after
+    /// an update carries `InProgress`, because the verdict lands after the new
+    /// service started (`docs/update-outcome.md` §3), and the clean-run
+    /// promotion clears a crash count five minutes into a run. Each
+    /// re-announces the caps, and a beat with no change carries none. A
+    /// secondary org's loop says the same words: they are the host's.
+    #[test]
+    fn a_changed_health_word_is_news_on_the_next_beat_once() {
+        use crate::health_words::{Words, restore_after_test, set_for_test};
+        use roomler_ai_remote_control::models::{CrashHealth, LastInstallWord};
+        let _probe = crate::encode::caps::loop_fixture();
+        let _restore = restore_after_test();
+        let at_work = LastInstallWord {
+            status: LastInstallWord::IN_PROGRESS.into(),
+            never_reported: false,
+            expected_version: Some("agent-v0.4.240".into()),
+            new_binary_version: None,
+            started_unix: Some(1_795_000_000),
+            finished_unix: None,
+        };
+        let crashing = CrashHealth {
+            state: CrashHealth::CRASHING.into(),
+            crashes: 2,
+            window_secs: 600,
+            last_crash_unix: Some(1_794_999_990),
+            accused_version: None,
+            last_known_good: Some("0.4.239".into()),
+        };
+        set_for_test(Words {
+            last_install: Some(at_work.clone()),
+            crash_health: Some(crashing.clone()),
+        });
+        let announcer = primary();
+        let mut hello = announcer.hello(None);
+        assert_eq!(hello.caps.last_install.as_ref(), Some(&at_work));
+        assert_eq!(hello.caps.crash_health.as_ref(), Some(&crashing));
+        assert!(
+            announcer.beat(&mut hello.last, None).is_none(),
+            "no change, no caps"
+        );
+        let secondary = Announcer {
+            is_primary: false,
+            ..primary()
+        };
+        let other = secondary.hello(None).caps;
+        assert_eq!(other.last_install.as_ref(), Some(&at_work));
+        assert_eq!(other.crash_health.as_ref(), Some(&crashing));
+
+        // The verdict lands.
+        let verified = LastInstallWord {
+            status: LastInstallWord::SUCCEEDED_VERIFIED.into(),
+            new_binary_version: Some("0.4.240".into()),
+            finished_unix: Some(1_795_000_020),
+            ..at_work.clone()
+        };
+        set_for_test(Words {
+            last_install: Some(verified.clone()),
+            crash_health: Some(crashing.clone()),
+        });
+        let beat = announcer
+            .beat(&mut hello.last, None)
+            .expect("the verdict is news");
+        assert_eq!(beat.last_install.as_ref(), Some(&verified));
+        assert_eq!(
+            beat.crash_health.as_ref(),
+            Some(&crashing),
+            "the other word rides along: a beat's caps replace the row's"
+        );
+        assert!(announcer.beat(&mut hello.last, None).is_none(), "once");
+
+        // The clean-run promotion.
+        let ok = CrashHealth {
+            state: CrashHealth::OK.into(),
+            crashes: 0,
+            last_crash_unix: None,
+            last_known_good: Some("0.4.240".into()),
+            ..crashing.clone()
+        };
+        set_for_test(Words {
+            last_install: Some(verified.clone()),
+            crash_health: Some(ok.clone()),
+        });
+        let beat = announcer
+            .beat(&mut hello.last, None)
+            .expect("the promotion is news");
+        assert_eq!(beat.crash_health.as_ref(), Some(&ok));
+        assert!(announcer.beat(&mut hello.last, None).is_none(), "once");
+    }
 }
 #[cfg(test)]
 mod connected_guard_tests {
