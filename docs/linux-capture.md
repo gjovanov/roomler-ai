@@ -1974,7 +1974,7 @@ never started, and the cascade fell through to Xwayland's empty root — a black
 stream on every per-user install that set `portal_capture`. Every FR-45 field
 run was under root, which hid it until the vmtest per-user cell ran with the
 keys set (#1719 run B). The rule is now three-way (`run_as`,
-`capture/portal/mod.rs:1441`): root drops, the session's owner runs as itself,
+`capture/portal/mod.rs:1452`): root drops, the session's owner runs as itself,
 anyone else is refused with both uids named — and a per-user daemon looks up
 its **own** session, not the first active one.
 
@@ -2023,7 +2023,7 @@ sequenceDiagram
 
 Every portal method returns a `Request` path and answers later as a `Response`
 **signal**, because a call can take as long as a human takes to read a dialog.
-⚠️ The subscription is armed **before** the call (`screencast.rs:685`,
+⚠️ The subscription is armed **before** the call (`screencast.rs:683`,
 `:361`, `:386`): arming afterwards is a race the portal wins whenever it
 answers without asking anyone — exactly the restore-token case.
 
@@ -2056,12 +2056,18 @@ reads as an exit. A request the portal ends without the person answering
 desktop, then a restart of the portal itself.
 
 **Tokens.** The restore token is kept **by the helper**, in
-`$XDG_STATE_HOME/roomler/portal-restore-token` (mode `0600`, the session
+`$XDG_STATE_HOME/roomler/portal-restore-token`, else beneath `~/.local/state` (mode `0600`, the session
 user's; `-rd` for a see+touch grant, `-win` for a window grant —
 `screencast.rs:597`). The daemon never receives it, by construction: an early
 `SessionReport` carried it and it turned up in plaintext in a redirected log,
 so the report now says only *whether* a grant was persisted. A caller that
 cannot hold a credential cannot leak it.
+
+A root daemon starts the helper with the session user's home and none of the
+daemon's own XDG folder variables (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
+`XDG_STATE_HOME`, `XDG_CACHE_HOME`), so the helper keeps the token in the
+session user's own state folder, whatever the daemon was started with
+(#3866, `portal/mod.rs:1404`).
 
 **What the daemon reads from the helper has a limit (#3695).** The helper
 runs as the person at the screen, so each thing the daemon reads from it is
@@ -2072,7 +2078,7 @@ checked before the daemon acts on it:
 | A frame | The payload is exactly its header's rows, `stride × height` bytes (256 MiB at most), in a pixel format the daemon knows | The frame is refused before its payload is read. The refusal is the reason the capture ends, and the media pump logs it as it rebuilds the capturer | `FrameHeader::decode`, `portal/wire.rs:114`; `read_frame`, `portal/backend.rs:587`; `stream_end`, `backend.rs:750` |
 | A frame, the helper's half | The helper sends exactly those rows: a longer buffer is cut after the last row, a buffer missing only the last row's padding gets it as zeros, and a shorter one is sent as it is, for the daemon to refuse | — | `payload`, `portal/wire.rs:136`, called at `portal/pipewire.rs:830` |
 | The handshake | At most 64 lines, each at most 64 KiB (`HANDSHAKE_LINE_MAX`), the size FR-142 gives a control frame. The longest legitimate line is the failure reason, one sentence; a `StreamStarted` line is about 200 bytes | The open fails with the limit named | `read_stream_handshake`, `portal/mod.rs:1212`; the line reader, `line_limit.rs:85` |
-| A one-shot answer: the probe, the screencast session report, the notification probe | 64 KiB in all (`ANSWER_MAX`), the handshake line's limit. The largest answer, the session report, is about 1 KiB | The caller is told why. The rest of the output is read and dropped, so the helper never waits on a full pipe | `read_answer`, `portal/mod.rs:1510`; `spawn_in_session`, `:1490` |
+| A one-shot answer: the probe, the screencast session report, the notification probe | 64 KiB in all (`ANSWER_MAX`), the handshake line's limit. The largest answer, the session report, is about 1 KiB | The caller is told why. The rest of the output is read and dropped, so the helper never waits on a full pipe | `read_answer`, `portal/mod.rs:1521`; `spawn_in_session`, `:1501` |
 
 ### 4.3 Input rides the same session (P4)
 

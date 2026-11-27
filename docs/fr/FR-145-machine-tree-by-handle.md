@@ -84,8 +84,8 @@ Sealing closes the write side only. Every reader below keeps working.
 > folder it makes is sealed when it is made. A file it writes is made fresh and published by a rename relative to
 > the held folder. A removal deletes, by handle, what the same walk opened.
 
-The bases in use: `appdirs::machine_program_data()` (`crates/agent-core/src/appdirs.rs:316-322`),
-`appdirs::machine_program_files()` (`:327-329`) and `appdirs::profile_of_account(sid)` (`:337-349`).
+The bases in use: `appdirs::machine_program_data()` (`crates/agent-core/src/appdirs.rs:516-522`),
+`appdirs::machine_program_files()` (`:527-529`) and `appdirs::profile_of_account(sid)` (`:537-549`).
 
 The writer's walk (`walk_sealed`); the clean-up's `walk` makes nothing and ends in `remove_tree`:
 
@@ -119,7 +119,7 @@ re-exported as `machine_tree::{HeldPath, Seal, Refusal, Why, TreeRemoval}`. It r
 | `HeldPath::base(base)` | opens the base itself (a reparse point refused); `GetFinalPathNameByHandleW` must equal `GetLongPathNameW(base)`, both without `\\?\` and compared case-insensitively; a `\\?\UNC\` path is refused |
 | `open_dir(name)`, `walk(names)` | each name opened below the previous handle (`NtCreateFile` with `RootDirectory`, `FILE_OPEN`, `FILE_DIRECTORY_FILE` and `FILE_OPEN_REPARSE_POINT`), a reparse point refused, its final path checked. `Ok(None)` when a name is not there. Makes nothing |
 | `sealed_dir(name, seal)`, `walk_sealed(names, seal)` | as `walk`, and a folder that is not there is made with the seal's security descriptor in `OBJECT_ATTRIBUTES` (`FILE_OPEN_IF`): sealed from its creation, with no moment in between. The last name gets the leaf policy below |
-| `HeldPath::machine(target, seal)` | `base(machine_program_data())`, then `walk_sealed` down the names below it (`appdirs::names_below`, `appdirs.rs:509-535`), so every site names its folder as it does today and the segment rule (`resolve_machine_global`, `appdirs.rs:632-640`) stays in one place. The machine folder and its parent, whether passed through or the `target` itself, are only opened (made sealed when they are not there): the leaf policy never moves or re-seals an existing one of those two, which hold the machine config and are FR-94's to repair, and the seal then goes on the files written in them |
+| `HeldPath::machine(target, seal)` | `base(machine_program_data())`, then `walk_sealed` down the names below it (`appdirs::names_below`, `appdirs.rs:709-735`), so every site names its folder as it does today and the segment rule (`resolve_machine_global`, `appdirs.rs:832-840`) stays in one place. The machine folder and its parent, whether passed through or the `target` itself, are only opened (made sealed when they are not there): the leaf policy never moves or re-seals an existing one of those two, which hold the machine config and are FR-94's to repair, and the seal then goes on the files written in them |
 | `write_file(name, bytes, seal)` | a fresh temp below the held folder (`FILE_CREATE`, so an entry already there is never written into), written and flushed (#2955), then renamed onto `name` with `FileRenameInformation` whose `RootDirectory` is the held folder. A folder at `name` fails the rename, and the temp is deleted by handle |
 | `write_file_new(name, bytes, seal)` | `FILE_CREATE` straight into `name`: the first writer wins (`Ok(false)` when it was there) |
 | `append_file(name, seal)` | for logs: `FILE_OPEN_IF` and append. A file already there must be a plain file with one link, owned by SYSTEM or Administrators; otherwise it is deleted by handle and made again |
@@ -232,7 +232,7 @@ meets a link or is refused, naming the path. `remove_tree` takes `dry_run`: its 
    domain-qualified name names exactly one account. It needs no privilege beyond the elevated operator's, so it
    works where this arm runs, a command run by hand; the session's token (`WTSQueryUserToken`, then
    `token_user_sid`, `agents/roomlerd/src/win_identity.rs:358`) would need SYSTEM's.
-2. The profile is `appdirs::profile_of_account(&sid)` (`appdirs.rs:337-349`): `ProfileList\<sid>\ProfileImagePath`,
+2. The profile is `appdirs::profile_of_account(&sid)` (`appdirs.rs:537-549`): `ProfileList\<sid>\ProfileImagePath`,
    with only `%SystemRoot%` and `%SystemDrive%` filled in, from the kernel's answers.
 3. No profile recorded: nothing is removed, and the report says why, in words that tell the cases apart: "the
    system records no profile for the session's account", or "cannot tell the session's account". Today's "no
@@ -292,7 +292,7 @@ above).
 | the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7717`) reads through the same `HeldPath` (D4) |
 | the machine config's saves (`crates/agent-core/src/config.rs:3984`, `:4754`, `:4957`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
 | the repair's and the adoption's opens (`machine_tree.rs:630-632`, `:922-924`) | `win::open` of the whole path | `HeldPath::walk` |
-| the one-time segment move (`appdirs.rs:673`, `:933`, `:956`, `:1061`, `:1179`) | renames and removes by path | per D7 |
+| the one-time segment move (`appdirs.rs:873`, `:1133`, `:1156`, `:1261`, `:1379`) | renames and removes by path | per D7 |
 | the gate (D8) | none | a test in `crates/agent-core` that fails on a new `std::fs` create, write, rename or remove of a path built from `machine_global_dir()` or `machine_program_data()` outside `machine_tree::held` |
 
 ### The kill switch
@@ -466,7 +466,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1532-1546`; the earlier anchor
   files' deletes, `exec_service.rs:1501-1514`). Options: the helper's PR; the next one. **Default: the helper's
   PR.** A few lines, and #3743's elevated tests already cover both.
-- **D7. The one-time segment move** (`appdirs.rs:673`, `:933`, `:956`, `:1061`, `:1179`). Options: onto a rename by
+- **D7. The one-time segment move** (`appdirs.rs:873`, `:1133`, `:1156`, `:1261`, `:1379`). Options: onto a rename by
   handle in P3; retire it. **Default: read first** how many Windows devices still keep only the older segment;
   retire the move if none does, else P3 moves it onto a rename by handle.
 - **D8. A gate against a new path-based SYSTEM write.** Options: none; a grep test; clippy's
