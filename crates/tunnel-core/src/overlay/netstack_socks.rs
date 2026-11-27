@@ -32,6 +32,7 @@
 //! differs. BIND is not supported.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -181,22 +182,26 @@ async fn connect_and_splice(
     port: u16,
     flows: &crate::liveness::LiveList,
 ) -> std::io::Result<()> {
-    // FR-156 P1 seam: not listed, as before.
-    let _ = flows;
     let Some(ip) = resolve_overlay_host(view, host) else {
         debug!(%host, "netstack socks: no overlay peer for CONNECT target");
         reply(&mut client, REP_HOST_UNREACHABLE).await;
         return Err(std::io::Error::other("unknown overlay host"));
     };
     let dst = SocketAddr::new(ip, port);
-    let mut upstream = match handle.connect(dst).await {
+    let upstream = match handle.connect(dst).await {
         Ok(s) => s,
         Err(e) => {
             reply(&mut client, REP_HOST_UNREACHABLE).await;
             return Err(e);
         }
     };
+    // Listed before the reply, so an app that has read the success finds its
+    // flow counted; unlisted when this returns or its task is dropped.
+    let listed = flows.join(crate::liveness::Clock::Host);
     reply(&mut client, REP_SUCCESS).await;
+    let stamp = listed.stamp();
+    let mut client = crate::liveness::Heard::new(client, Arc::clone(stamp));
+    let mut upstream = crate::liveness::Heard::new(upstream, Arc::clone(stamp));
     tokio::io::copy_bidirectional(&mut client, &mut upstream)
         .await
         .map(|_| ())

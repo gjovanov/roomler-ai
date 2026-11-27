@@ -73,9 +73,49 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// The host clock, in milliseconds.
+/// The host clock, in milliseconds, counting the time the host slept where
+/// the OS documents a clock that does (the spec's P1 design, "The clock"):
+/// Linux `CLOCK_BOOTTIME`, macOS `CLOCK_MONOTONIC`, and on Windows `Instant`,
+/// which is `QueryPerformanceCounter` and counts sleep. `Instant` itself
+/// promises nothing across a suspend, and reads Linux's `CLOCK_MONOTONIC` and
+/// macOS's `CLOCK_UPTIME_RAW`, both of which stop while the host sleeps.
 pub fn host_ms() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // Chosen once, at the first stamp: the clock that counts sleep if the
+        // kernel answers for it, else `Instant` for good, so no two readings
+        // ever mix clocks. A clock that answered once always does
+        // (`clock_gettime` fails only for a clock the kernel lacks).
+        static COUNTS_SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *COUNTS_SLEEP.get_or_init(|| clock_ms(SLEEP_CLOCK).is_some())
+            && let Some(ms) = clock_ms(SLEEP_CLOCK)
+        {
+            return ms;
+        }
+    }
     instant_ms()
+}
+
+/// The clock that keeps counting while the host sleeps.
+#[cfg(target_os = "linux")]
+const SLEEP_CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+#[cfg(target_os = "macos")]
+const SLEEP_CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+
+/// `clock_gettime(id)` in milliseconds; `None` if the kernel refuses it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clock_ms(id: libc::clockid_t) -> Option<u64> {
+    let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `ts` is valid for the call to write a whole timespec into, and
+    // it is read only after the call reported that it did.
+    if unsafe { libc::clock_gettime(id, ts.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the call returned 0, so it wrote the timespec.
+    let ts = unsafe { ts.assume_init() };
+    let secs = u64::try_from(ts.tv_sec).ok()?;
+    let nanos = u64::try_from(ts.tv_nsec).ok()?;
+    Some(secs.saturating_mul(1000).saturating_add(nanos / 1_000_000))
 }
 
 /// `Instant`, from the first reading in this process.
@@ -170,9 +210,10 @@ impl LiveList {
 
     /// The entries heard within `window`.
     pub fn heard_within(&self, window: Duration) -> usize {
-        // FR-156 P1 seam: every open entry, as before.
-        let _ = window;
-        self.len()
+        self.lock()
+            .iter()
+            .filter(|e| e.heard_within(window))
+            .count()
     }
 
     /// Whether `stamp` is listed.
@@ -274,27 +315,15 @@ mod tests {
     /// milliseconds. `None` where `Instant` already counts sleep.
     #[cfg(target_os = "linux")]
     fn stopping_clock_ms() -> Option<u64> {
-        raw_clock_ms(libc::CLOCK_MONOTONIC)
+        clock_ms(libc::CLOCK_MONOTONIC)
     }
     #[cfg(target_os = "macos")]
     fn stopping_clock_ms() -> Option<u64> {
-        raw_clock_ms(libc::CLOCK_UPTIME_RAW)
+        clock_ms(libc::CLOCK_UPTIME_RAW)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn stopping_clock_ms() -> Option<u64> {
         None
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn raw_clock_ms(id: libc::clockid_t) -> Option<u64> {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `ts` is a valid timespec for the call to write.
-        (unsafe { libc::clock_gettime(id, &mut ts) } == 0).then(|| {
-            u64::try_from(ts.tv_sec).unwrap_or(0) * 1000
-                + u64::try_from(ts.tv_nsec).unwrap_or(0) / 1_000_000
-        })
     }
 
     /// FR-156 C1 — the host clock keeps real time in milliseconds, never runs

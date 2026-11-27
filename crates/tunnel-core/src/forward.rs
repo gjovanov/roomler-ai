@@ -417,6 +417,7 @@ impl FlowDemux {
                 stats
                     .dc_recv_bytes
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                stats.moved();
                 if let Err(e) = tx.send(Bytes::copy_from_slice(payload)).await {
                     debug!(flow_id, %e, "tunnel flow mailbox closed; dropping payload");
                 }
@@ -611,6 +612,8 @@ pub async fn run_flow(
     // P3b-3: hold an `active_flows` gauge for this flow's pump lifetime
     // (no-op when not session-tracked). Drops on return AND on abort.
     let _gauge = stats.session.clone().map(FlowGauge::new);
+    // FR-156 P1: listed in the process's flows for as long as this runs.
+    let _listed = flows().list(Arc::clone(&stats.moved_at));
     // Set the DC's low-water threshold once. `on_buffered_amount_low`
     // fires whenever the SCTP send queue drops back to or below this
     // value — i.e. when we have room to push more.
@@ -776,6 +779,8 @@ pub async fn run_flow_quic(
     // P3b-3: hold an `active_flows` gauge for this flow's pump lifetime
     // (no-op when not session-tracked). Drops on return AND on abort.
     let _gauge = stats.session.clone().map(FlowGauge::new);
+    // FR-156 P1: listed in the process's flows for as long as this runs.
+    let _listed = flows().list(Arc::clone(&stats.moved_at));
     let (mut read_half, mut write_half) = tcp.into_split();
     let logger_handle = spawn_flow_logger(flow_id, Arc::clone(&stats));
 
@@ -794,6 +799,7 @@ pub async fn run_flow_quic(
                     stats_send
                         .tcp_read_bytes
                         .fetch_add(n as u64, Ordering::Relaxed);
+                    stats_send.moved();
                     stats_send.add_session_out(n as u64);
                     if let Err(e) = send.write_all(&buf[..n]).await {
                         debug!(flow_id, %e, "quic pump: stream write error");
@@ -825,6 +831,7 @@ pub async fn run_flow_quic(
                     stats_recv
                         .dc_recv_bytes
                         .fetch_add(n as u64, Ordering::Relaxed);
+                    stats_recv.moved();
                     if let Err(e) = write_half.write_all(&buf[..n]).await {
                         debug!(flow_id, %e, "quic pump: TCP write error");
                         return CloseReason::IoError;
@@ -980,6 +987,8 @@ pub async fn run_flow_udp_dc(
     idle_timeout: std::time::Duration,
     stats: Arc<FlowStats>,
 ) -> CloseReason {
+    // FR-156 P1: listed in the process's flows for as long as this runs.
+    let _listed = flows().list(Arc::clone(&stats.moved_at));
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
     loop {
         tokio::select! {
@@ -988,6 +997,7 @@ pub async fn run_flow_udp_dc(
                 Some(framed) => {
                     if let Some(dg) = deframe_udp_datagram(&framed) {
                         stats.dc_recv_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed);
+                        stats.moved();
                         match udp.send(dg).await {
                             Ok(_) => { stats.tcp_write_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed); }
                             Err(e) => debug!(flow_id, %e, "udp pump: send to target failed"),
@@ -1002,6 +1012,7 @@ pub async fn run_flow_udp_dc(
             r = udp.recv(&mut buf) => match r {
                 Ok(n) => {
                     stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    stats.moved();
                     if let Some(framed) = frame_udp_datagram(&buf[..n]) {
                         if let Err(e) = dc.send(&Bytes::from(mux::encode(flow_id, &framed))).await {
                             debug!(flow_id, %e, "udp pump: DC send failed");
@@ -1034,12 +1045,15 @@ pub async fn run_flow_udp_quic(
     idle_timeout: std::time::Duration,
     stats: Arc<FlowStats>,
 ) -> CloseReason {
+    // FR-156 P1: listed in the process's flows for as long as this runs.
+    let _listed = flows().list(Arc::clone(&stats.moved_at));
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
     loop {
         tokio::select! {
             r = quic_read_datagram(&mut recv) => match r {
                 Ok(Some(dg)) => {
                     stats.dc_recv_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed);
+                    stats.moved();
                     match udp.send(&dg).await {
                         Ok(_) => { stats.tcp_write_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed); }
                         Err(e) => debug!(flow_id, %e, "udp pump: send to target failed"),
@@ -1054,6 +1068,7 @@ pub async fn run_flow_udp_quic(
             r = udp.recv(&mut buf) => match r {
                 Ok(n) => {
                     stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    stats.moved();
                     if let Err(e) = quic_write_datagram(&mut send, &buf[..n]).await {
                         debug!(flow_id, %e, "udp pump: quic write failed");
                         return CloseReason::IoError;
@@ -1168,6 +1183,7 @@ async fn pump_tcp_to_dc(
             }
         };
         stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        stats.moved();
         stats.add_session_out(n as u64);
 
         let framed = mux::encode(flow_id, &buf[..n]);
