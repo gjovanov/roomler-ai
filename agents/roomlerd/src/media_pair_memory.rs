@@ -183,19 +183,13 @@ async fn overlay_of(remote_addr: &str) -> Option<Overlay> {
 }
 
 /// The selected pair, read once: the pump's own read of it has already
-/// waited for the nomination.
+/// waited for the nomination. It is the carrier line's read of the pair, so
+/// a prflx remote shown to be the far end's relay keys as that relay; on the
+/// pump's own path, that read waits for nothing (#3259).
 async fn selected_pair(pc: &RTCPeerConnection) -> Option<PairView> {
-    let sctp = pc.sctp();
-    let dtls = sctp.transport();
-    let ice = dtls.ice_transport();
-    let pair = ice.get_selected_candidate_pair().await?;
-    let (local, remote) = (pair.local(), pair.remote());
-    Some(PairView {
-        local_kind: local.typ.into(),
-        remote_kind: remote.typ.into(),
-        local_addr: local.address.clone(),
-        remote_addr: remote.address.clone(),
-    })
+    sc::nominated_pair(pc, Duration::ZERO, Duration::ZERO)
+        .await
+        .map(|(pair, _, _)| pair)
 }
 
 // ---------------------------------------------------------------------------
