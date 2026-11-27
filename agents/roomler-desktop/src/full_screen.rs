@@ -16,15 +16,20 @@
 //! ends (`-[NSApplication _crashOnException:]`). The companion ended this way
 //! on a Mac (0.4.236, macOS 15.7.7) seconds after a change to the menu bar,
 //! with this window on the screen and no frame of its own code on the stack.
-//! Firefox traced the same frames to the same guess and ended them the same
-//! way, by setting the bits when the window is made
-//! (<https://bugzilla.mozilla.org/show_bug.cgi?id=2031249>).
+//! Firefox traced the same frames to the same guess (the crash, bug 2031249:
+//! <https://bugzilla.mozilla.org/show_bug.cgi?id=2031249>) and ended them the
+//! same way, by setting the bits when the window is made (the fix, in
+//! bug 2038980: <https://bugzilla.mozilla.org/show_bug.cgi?id=2038980>,
+//! changeset <https://hg.mozilla.org/mozilla-central/rev/3cd1ce2d0177>).
 //!
-//! The bits set are the ones Firefox's fix sets: a resizable window may go
-//! full screen and be tiled, a fixed-size one neither. A choice the window
-//! already holds is kept. The main window is the only titled window the
-//! companion has on a Mac: its panels and the red frame are borderless, with
-//! no title bar.
+//! A resizable window is given Firefox's bits: it may go full screen and be
+//! tiled (`PRIMARY | ALLOWS_TILING`). A fixed-size one is given this file's
+//! own choice: it may neither go full screen nor be tiled
+//! (`NONE | DISALLOWS_TILING`). Firefox gives a fixed-size window the
+//! auxiliary bit (`AUXILIARY`) instead, with the same tiling bit. A choice
+//! the window already holds is kept. The main window is the only titled
+//! window the companion has on a Mac: its panels and the red frame are
+//! borderless, with no title bar.
 
 /// AppKit's `NSWindowCollectionBehavior` full-screen bits (`NSWindow.h`).
 /// The macOS build checks each one against objc2-app-kit's.
