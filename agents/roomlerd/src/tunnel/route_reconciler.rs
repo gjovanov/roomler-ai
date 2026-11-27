@@ -31,7 +31,9 @@
 //! after awaiting the config save, and the pass after awaiting the hub's
 //! create, each without looking: a pass inside `route enable`'s save left a
 //! live flow that no entry named, and the route read `backoff … 10048` until
-//! the daemon restarted.
+//! the daemon restarted. A pass that stops a flow and then creates on its
+//! port waits for the port first (`PORT_RELEASE_WAIT`), so a replace that
+//! keeps the port does not find its own old listener.
 //!
 //! Persistence: the reconciler is the daemon-side writer of the
 //! `tunnel_routes` config field. Every load-modify-save runs under the
@@ -70,6 +72,15 @@ const CREATE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// milliseconds; the bound covers a task that is gone or stuck. Past it the
 /// verb answers with its change saved, and the next pass applies it.
 const APPLY_WAIT: Duration = Duration::from_secs(5);
+
+/// #1035 — how long a create waits for a port that a flow a pass stopped
+/// still holds. A stopped flow lets go of its port only once the runtime has
+/// dropped its task, and then its listener's accept task: a few scheduler
+/// turns, so the wait normally ends at its first poll. Past the bound the
+/// create runs anyway, and fails as it would have. A port stopped longer ago
+/// than this is not waited for.
+const PORT_RELEASE_WAIT: Duration = Duration::from_secs(2);
+const PORT_RELEASE_POLL: Duration = Duration::from_millis(10);
 
 /// Runtime state the reconciler tracks per declared route id. Routes with
 /// no entry are simply not-yet-considered (next pass picks them up).
@@ -187,6 +198,12 @@ struct Inner {
     /// #1035 — a pass is running. Two at once would be two writers of the
     /// map; debug builds assert it never happens.
     in_pass: AtomicBool,
+    /// #1035 — the local port of each flow a pass stopped, and when. A create
+    /// on one of these ports within [`PORT_RELEASE_WAIT`] waits for it first
+    /// (`wait_for_port`), in the same pass or the next one: the task can start
+    /// the next pass at once, with no yield between, when a kick landed during
+    /// a pass. Written by the reconcile task alone.
+    freed: StdMutex<HashMap<u16, Instant>>,
     /// Monotonic source for generated route ids (`route-N`).
     seq: std::sync::atomic::AtomicU64,
     /// Test seam (#1035): parks the next create between the hub's answer and
@@ -246,6 +263,7 @@ impl RouteReconciler {
                 kick: Notify::new(),
                 applied: OnceLock::new(),
                 in_pass: AtomicBool::new(false),
+                freed: StdMutex::new(HashMap::new()),
                 seq: std::sync::atomic::AtomicU64::new(1),
                 #[cfg(test)]
                 gate: StdMutex::new(None),
@@ -379,7 +397,7 @@ impl RouteReconciler {
             kill
         };
         for flow_id in to_kill {
-            self.inner.hub.kill_flow(&flow_id);
+            self.stop_flow(&flow_id);
         }
 
         // 2) Flows the map lost: adopted or stopped (#1035).
@@ -456,7 +474,7 @@ impl RouteReconciler {
                 Action::Nothing => {}
                 Action::MarkFailed(flow_id, reason) => {
                     warn!(route = %route.id, %reason, "route flow failed permanently; marking route Failed");
-                    self.inner.hub.kill_flow(&flow_id);
+                    self.stop_flow(&flow_id);
                     self.inner.runtime.lock().unwrap().insert(
                         route.id.clone(),
                         RouteRuntime::Failed { reason, generation },
@@ -467,6 +485,13 @@ impl RouteReconciler {
                     self.inner
                         .creates
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // #1035 — a flow a pass just stopped may still hold this
+                    // port: a replace that keeps the port (an edit of the
+                    // route's target) stops its old flow in step 1 and creates
+                    // the new one here.
+                    if self.just_freed(route.local) {
+                        wait_for_port(route.local).await;
+                    }
                     let result = self
                         .inner
                         .hub
@@ -496,7 +521,7 @@ impl RouteReconciler {
                             route = %route.id, flow = %flow_id,
                             "the route changed while its flow was created; stopping that flow"
                         );
-                        self.inner.hub.kill_flow(flow_id);
+                        self.stop_flow(flow_id);
                         continue;
                     }
                     let mut runtime = self.inner.runtime.lock().unwrap();
@@ -616,8 +641,32 @@ impl RouteReconciler {
             }
         }
         for flow_id in stop {
-            self.inner.hub.kill_flow(&flow_id);
+            self.stop_flow(&flow_id);
         }
+    }
+
+    /// #1035 — stop hub flow `flow_id` through `kill_flow`, which also tells
+    /// the server its session (#1754), and note the port it held
+    /// (`Inner::freed`), so a create on that port waits for it.
+    fn stop_flow(&self, flow_id: &str) {
+        let port = self.inner.hub.flow_route(flow_id).map(|flow| flow.local);
+        if self.inner.hub.kill_flow(flow_id)
+            && let Some(port) = port
+        {
+            self.inner
+                .freed
+                .lock()
+                .unwrap()
+                .insert(port, Instant::now());
+        }
+    }
+
+    /// #1035 — whether a pass stopped a flow on `port` less than
+    /// [`PORT_RELEASE_WAIT`] ago. Older entries are forgotten here.
+    fn just_freed(&self, port: u16) -> bool {
+        let mut freed = self.inner.freed.lock().unwrap();
+        freed.retain(|_, at| at.elapsed() < PORT_RELEASE_WAIT);
+        freed.contains_key(&port)
     }
 
     /// #1035 — does hub flow `flow_id` serve `route` as it is declared now:
@@ -1036,6 +1085,18 @@ fn validate_shape(route: &RouteDescriptor) -> Result<(), String> {
 fn create_backoff(consecutive_failures: u32) -> Duration {
     let exp = consecutive_failures.saturating_sub(1).min(5);
     (CREATE_BACKOFF_MIN * 2u32.pow(exp)).min(CREATE_BACKOFF_MAX)
+}
+
+/// #1035 — wait until `port` binds again, at most [`PORT_RELEASE_WAIT`]. A
+/// flow `kill_flow` stopped holds its port until the runtime drops the flow's
+/// task and then its listener's accept task. The pass that stopped it runs on
+/// without yielding, and so can the next one, so a create there would find
+/// the port taken. The probe is the create's own (`probe_local_port`).
+async fn wait_for_port(port: u16) {
+    let deadline = Instant::now() + PORT_RELEASE_WAIT;
+    while super::client_mgr::probe_local_port(port).await.is_err() && Instant::now() < deadline {
+        tokio::time::sleep(PORT_RELEASE_POLL).await;
+    }
 }
 
 #[cfg(test)]

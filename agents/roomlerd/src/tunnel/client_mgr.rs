@@ -2123,8 +2123,9 @@ pub(crate) fn parse_host_port(s: &str) -> Result<(String, u16)> {
 /// immediately; the flow supervisor binds the port for real when it starts
 /// (once, for the flow's life — FR-86 P1), so this is only a validation probe
 /// — the tiny TOCTOU window before the supervisor's bind is a non-issue for an
-/// operator-paced create.
-async fn probe_local_port(local: u16) -> std::result::Result<(), String> {
+/// operator-paced create. #1035: the route reconciler also polls it, for a
+/// port that a flow it has just stopped is still letting go of.
+pub(super) async fn probe_local_port(local: u16) -> std::result::Result<(), String> {
     if local == 0 {
         return Err("local port must not be 0".into());
     }
