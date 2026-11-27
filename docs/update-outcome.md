@@ -263,7 +263,7 @@ $ roomler status
   the sentence per word, `last_install_line`, `:2974`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:2233`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4471`). `journalctl -u
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4425`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`post_install.rs:2217`): the two quiet states and a watcher
@@ -323,7 +323,7 @@ $ roomler status
 - **P5 — the fleet answer.** No wire message carries the verdict yet; the
   server still infers success from a changed `agent_version` on the next
   hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7278`,
+  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7297`,
   where `update_mode` is stamped), additive `#[serde(default)]` on
   `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
   P7's shape does not cover: on Windows the first hello after an update carries

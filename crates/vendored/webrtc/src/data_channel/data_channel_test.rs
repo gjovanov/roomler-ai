@@ -13,6 +13,7 @@ use crate::data_channel::data_channel_init::RTCDataChannelInit;
 //use log::LevelFilter;
 //use std::io::Write;
 use crate::dtls_transport::dtls_parameters::DTLSParameters;
+use crate::dtls_transport::dtls_role::DTLSRole;
 use crate::dtls_transport::RTCDtlsTransport;
 use crate::error::flatten_errs;
 use crate::ice_transport::ice_candidate::RTCIceCandidate;
@@ -1609,5 +1610,185 @@ async fn test_data_channel_ortc_e2e() -> Result<()> {
         panic!();
     }
 
+    Ok(())
+}
+
+// roomler patch (FR-148 P4b): an accepted channel's `id()` is the identifier
+// of the SCTP stream under it, from the moment the answerer's
+// `on_data_channel` handler sees it, on either DTLS role. Upstream built every
+// non-negotiated accepted channel with id 0, and only `open()`, which a local
+// channel runs and an accepted one never does, set it: roomler's mark of its
+// viewer's `video-deadline` asked for stream 0.
+
+/// The offerer's channels, in the order it creates them, and whether each is
+/// ordered: an unordered `maxRetransmits: 0` channel first, as the
+/// remote-desktop viewer creates `input` first, then two reliable ones.
+/// `signal_pair` creates a fourth, `initial_data_channel`, after them.
+const ACCEPTED: [(&str, bool); 3] = [("first", false), ("second", true), ("third", true)];
+
+/// What the answerer saw of a channel it accepted: its `id()` in the
+/// `on_data_channel` handler and once open, the identifier of the SCTP stream
+/// under it, and `negotiated()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Accepted {
+    label: String,
+    at_handler: u16,
+    at_open: u16,
+    stream: u16,
+    negotiated: bool,
+}
+
+/// One pair: the offerer creates [`ACCEPTED`] and `signal_pair` its own
+/// `initial_data_channel`, and the answerer accepts all four; the answerer is
+/// the DTLS server when `answerer_server`, else the client, upstream's
+/// answer. Returns the offerer's id of each of its four channels, in the order
+/// it created them, what the answerer saw of each channel it accepted, and the
+/// id of a channel the answerer opens once it accepted them.
+async fn accepted_on(answerer_server: bool) -> Result<(Vec<(String, u16)>, Vec<Accepted>, u16)> {
+    let mut m = MediaEngine::default();
+    m.register_default_codecs()?;
+    let offer_api = APIBuilder::new().with_media_engine(m).build();
+    let mut m = MediaEngine::default();
+    m.register_default_codecs()?;
+    let mut s = SettingEngine::default();
+    if answerer_server {
+        s.set_answering_dtls_role(DTLSRole::Server)?;
+    }
+    let answer_api = APIBuilder::new()
+        .with_media_engine(m)
+        .with_setting_engine(s)
+        .build();
+    let mut offer_pc = offer_api
+        .new_peer_connection(RTCConfiguration::default())
+        .await?;
+    let mut answer_pc = answer_api
+        .new_peer_connection(RTCConfiguration::default())
+        .await?;
+
+    for (label, ordered) in ACCEPTED {
+        let init = RTCDataChannelInit {
+            ordered: Some(ordered),
+            max_retransmits: (!ordered).then_some(0),
+            ..Default::default()
+        };
+        offer_pc.create_data_channel(label, Some(init)).await?;
+    }
+
+    let seen: Arc<Mutex<Vec<Accepted>>> = Arc::default();
+    let (open_tx, mut open_rx) = mpsc::channel::<()>(8);
+    let seen2 = Arc::clone(&seen);
+    answer_pc.on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
+        // Read in the handler, before the accept path opens the channel.
+        let at_handler = d.id();
+        let seen = Arc::clone(&seen2);
+        let open_tx = open_tx.clone();
+        let opened = Arc::clone(&d);
+        d.on_open(Box::new(move || {
+            Box::pin(async move {
+                let stream = opened
+                    .data_channel
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|dc| dc.stream_identifier())
+                    .expect("an open channel has its stream");
+                seen.lock().await.push(Accepted {
+                    label: opened.label().to_owned(),
+                    at_handler,
+                    at_open: opened.id(),
+                    stream,
+                    negotiated: opened.negotiated(),
+                });
+                let _ = open_tx.send(()).await;
+            })
+        }));
+        Box::pin(async {})
+    }));
+
+    signal_pair(&mut offer_pc, &mut answer_pc).await?;
+    for _ in 0..=ACCEPTED.len() {
+        tokio::time::timeout(Duration::from_secs(10), open_rx.recv())
+            .await
+            .expect("every accepted channel opens within 10 s");
+    }
+    let own = answer_pc.create_data_channel("own", None).await?.id();
+    // `signal_pair` pushed its channel after [`ACCEPTED`].
+    let offered = offer_pc
+        .sctp()
+        .data_channels
+        .lock()
+        .await
+        .iter()
+        .map(|dc| (dc.label().to_owned(), dc.id()))
+        .collect();
+    let seen = seen.lock().await.clone();
+    close_pair_now(&offer_pc, &answer_pc).await;
+    Ok((offered, seen, own))
+}
+
+/// The pair's ids, on a pair whose offerer is the DTLS server when
+/// `offerer_server`: each accepted channel's, in the handler and once open,
+/// against the stream under it and the offerer's id for its label; every id
+/// with its end's parity; the offerer's in the order it created them; and the
+/// answerer's own channel on a stream none of them holds.
+fn assert_ids(offered: &[(String, u16)], seen: &[Accepted], own: u16, offerer_server: bool) {
+    let labels: Vec<&str> = offered.iter().map(|(label, _)| label.as_str()).collect();
+    assert_eq!(labels, ["first", "second", "third", "initial_data_channel"]);
+    assert_eq!(seen.len(), offered.len(), "{seen:?}");
+    for a in seen {
+        assert_eq!(
+            (a.at_handler, a.at_open),
+            (a.stream, a.stream),
+            "the answerer's id of {:?}, in the handler and once open",
+            a.label
+        );
+        assert_eq!(
+            a.stream % 2 == 1,
+            offerer_server,
+            "{a:?}: the offerer's parity"
+        );
+        assert!(!a.negotiated, "{a:?}: accepted in band, never negotiated");
+    }
+    for (label, id) in offered {
+        let a = seen
+            .iter()
+            .find(|a| &a.label == label)
+            .unwrap_or_else(|| panic!("{label} was accepted"));
+        assert_eq!(a.stream, *id, "{label}: the offerer's id is the stream's");
+    }
+    assert!(
+        offered.windows(2).all(|w| w[0].1 < w[1].1),
+        "in the order created: {offered:?}"
+    );
+    assert_eq!(
+        own % 2 == 1,
+        !offerer_server,
+        "{own}: the answerer's parity"
+    );
+    assert!(
+        seen.iter().all(|a| a.stream != own),
+        "{own}: a stream of its own, {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_data_channel_accepted_id_is_its_stream_when_the_answerer_is_the_dtls_client(
+) -> Result<()> {
+    // Upstream's answer, and the remote-desktop session's today: the viewer
+    // offers and is the DTLS server, so its streams are odd, and none is 0.
+    let (offered, seen, own) = accepted_on(false).await?;
+    assert_ids(&offered, &seen, own, true);
+    let ids: Vec<u16> = offered.iter().map(|(_, id)| *id).collect();
+    assert_eq!(ids, [1, 3, 5, 7]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_data_channel_accepted_id_is_its_stream_when_the_answerer_is_the_dtls_server(
+) -> Result<()> {
+    // The other role: the offerer is the DTLS client, and its streams are
+    // even.
+    let (offered, seen, own) = accepted_on(true).await?;
+    assert_ids(&offered, &seen, own, false);
     Ok(())
 }
