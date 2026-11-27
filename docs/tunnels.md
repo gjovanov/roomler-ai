@@ -53,6 +53,105 @@ stateDiagram-v2
     Failed --> Pending: operator re-enable
 ```
 
+### One writer owns the route-to-flow map (#1035)
+
+The route reconciler holds two maps: the **declared** routes (`[[tunnel_routes]]`, what
+the operator asked for) and the **runtime** map from each route id to its hub flow
+(`Pending`, `Live { flow }`, `Failed`). Until #1035 the LocalAPI verbs and the reconcile
+pass both wrote the runtime map, each after an `.await` and without reading it again. In
+the field (agent 0.4.189, a Windows host with a SOCKS5 route), a pass that ran inside
+`route enable`'s config save created the route's flow, and the verb then wrote a fresh
+`Pending` over that `Live`. The hub kept the flow and its port, nothing pointed back to
+it, and every later create read `backoff … os error 10048` until the daemon restarted.
+
+| Who | Writes | Where |
+|---|---|---|
+| a verb (`add`, `replace`, `remove`, `set_enabled`) | the **declared** side only: the route list, and the route's **generation**, which every change to the route bumps. There is one counter for every route, so a removed and re-added id never reuses a generation. The verb saves the config, kicks the task, and answers after the pass that applies its change, waiting at most 5 s (`APPLY_WAIT`). So `route rm` still answers with the flow gone, and `route add` with the flow made or its create failure recorded | [`route_reconciler.rs:754`](../agents/roomlerd/src/tunnel/route_reconciler.rs) `add` · `:820` `replace` · `:877` `remove` · `:906` `set_enabled` · `:934` `await_applied` |
+| the reconcile task | the **runtime** map, alone. `spawn` starts one task, and a second call starts nothing. Debug builds assert that two passes never overlap | [`route_reconciler.rs:284`](../agents/roomlerd/src/tunnel/route_reconciler.rs) `spawn` · `:357` `reconcile_pass` |
+
+A pass, in order:
+
+1. **Entries.** A route that is gone or disabled loses its entry and its flow. An entry
+   that an older generation of its route wrote starts over, unless it holds a live flow
+   built from exactly the descriptor the route declares now. So `route enable` on a live
+   route keeps its flow, an enable still clears a terminal `failed` or a create backoff,
+   and a replace never keeps the old descriptor's flow.
+2. **Lost flows** (`adopt_or_stop_lost_flows`,
+   [`route_reconciler.rs:599`](../agents/roomlerd/src/tunnel/route_reconciler.rs)). A hub
+   flow tagged for a route whose entry does not hold it is **adopted** when its route is
+   enabled, declares exactly the flow's descriptor and has no live flow of its own. In
+   every other case it is **stopped**. Flows are read oldest first, so of two lost flows
+   for one route, the one adopted is the one likelier to hold the port. An ad-hoc flow
+   (`roomler forward`, `roomler socks5`) carries no tag and is never touched.
+3. **Creates.** A create commits only when its route still declares exactly the
+   descriptor the flow was built from. Otherwise a disable or a replace landed inside the
+   create's await, and the pass stops the flow it just made. A create on a port that a
+   flow was stopped on less than 2 s ago (`PORT_RELEASE_WAIT`) first waits for the port to
+   bind, polling every 10 ms for at most those 2 s (`wait_for_port`,
+   [`route_reconciler.rs:1095`](../agents/roomlerd/src/tunnel/route_reconciler.rs)). A
+   stopped flow frees its port only once the runtime has dropped its task and then its
+   listener's accept task, and a pass, or the next one when a kick landed during a pass,
+   runs on with no yield between. Without the wait, a replace that keeps the local port
+   (an edit of the route's target) found its own old listener and read
+   `backoff … 10048` until the next tick. Past the 2 s the create runs anyway and fails as
+   it would have: `backoff`, healing once the port frees.
+
+Every flow a pass stops goes through `kill_flow` (`stop_flow`,
+[`route_reconciler.rs:651`](../agents/roomlerd/src/tunnel/route_reconciler.rs)), which
+tells the server the session id
+([#1754](#%EF%B8%8F-every-client-path-that-ends-a-session-must-tell-the-exit-agent-1754)), so the
+session's TURN allocation and data channel go with the flow.
+
+**How a flow names its route.** Each flow a pass creates carries a `RouteTag` in the
+hub's per-flow record: the descriptor it was built from and the route's generation at
+the time ([`client_mgr.rs:155`](../agents/roomlerd/src/tunnel/client_mgr.rs), set by
+`create_route_flow` `:483`, read back by `flow_routes` `:507`). The tag is not on the
+wire: `roomler flows` and `route ls` read as before.
+
+**What the port-holder line says.** Once a route has been refused its port for two
+minutes, the log line `route still cannot bind its local port` names the holder
+([`port_holder.rs:154`](../agents/roomlerd/src/tunnel/port_holder.rs) `describe_flow`).
+When the holder is this daemon, the line names the tunnel flow on the port and what it is
+to the routes: a flow its route lost (the next pass adopts or stops it), another enabled
+route's serving flow (two enabled routes declare the port), or an ad-hoc flow, which
+`roomler kill fl-N` stops. Before, it read "a listener no flow owns", which misnamed
+#1035's shape: a flow did own the listener, and its route had lost the flow.
+
+```mermaid
+sequenceDiagram
+    participant V as route enable (verb)
+    participant D as declared routes
+    participant P as reconcile pass
+    participant H as tunnel hub
+
+    V->>D: enabled = true, generation bumped
+    V->>V: config save (0.7 to 1.5 s under the config lock)
+    P->>D: snapshot: enabled, generation g
+    P->>H: create the route's flow, tagged with its descriptor and g
+    H-->>P: fl-N, bound on the port
+    P->>P: entry = Live fl-N at g
+    Note over V,P: before the fix the verb now wrote a fresh Pending over Live fl-N, and fl-N was lost
+    V->>V: save done, kick the task, wait for the pass that applied g
+    P-->>V: applied g
+    Note over P,H: every later pass keeps Live fl-N, and adopts or stops any tagged flow no entry holds
+```
+
+Locked by lib tests in `route_reconciler.rs`, each shown red before the code it locks:
+
+| Test | What it locks |
+|---|---|
+| `a_reenable_that_a_pass_overtakes_keeps_the_passs_flow` | the field case: a pass inside `route enable`'s config save leaves the route on that pass's flow, with no second create |
+| `an_enable_of_a_live_route_keeps_its_flow` | an enable of a route that is already live keeps its flow |
+| `a_disable_inside_a_create_leaves_no_flow` | a disable inside a create's await: no flow, and no `Live` entry, for the disabled route |
+| `a_replace_inside_a_create_keeps_only_the_new_descriptors_flow` | a replace inside a create's await: one flow, the new descriptor's |
+| `a_lost_flow_of_a_removed_route_is_stopped`, `a_lost_flow_of_a_disabled_route_is_stopped` | a lost flow of a route since removed or disabled is stopped on the next pass |
+| `a_lost_flow_matching_its_route_is_adopted` | a lost flow built from exactly the declared descriptor is adopted: no second create, no 10048 |
+| `a_lost_flow_of_an_older_descriptor_is_stopped_not_adopted` | a lost flow of an older descriptor is stopped, and the route ends on one flow for its new shape |
+| `the_port_holder_line_names_the_lost_flow_and_its_route`, `the_port_holder_line_names_a_serving_or_an_ad_hoc_flow` | the port-holder line names the flow on the port and what it is to the routes |
+| `a_verb_answers_after_the_pass_that_applies_it` | with the reconcile task running, `add`, `replace`, `set_enabled` and `remove` each answer after the pass that applies them |
+| `a_replace_that_keeps_the_port_moves_the_route_in_one_pass` | a replace that keeps the local port moves the route onto the new descriptor's flow in one pass, with no backoff |
+| `the_pass_after_one_that_stopped_a_flow_waits_for_its_port_too` | a pass that starts at once after one that stopped a flow, with no yield between, still waits for that flow's port |
+
 ## Data-plane transports
 
 Signalling always rides the control WebSocket (`rc:tunnel.*`,
@@ -409,7 +508,7 @@ kept a task past its baseline in those 90 runs.
 **A close while a channel is still being taken up (#4103).** The SCTP transport takes up each
 channel the browser opens on a task of its own (`accept_data_channels`,
 `crates/vendored/webrtc/src/sctp_transport/mod.rs:246`), and the loop's body awaits the agent's
-`on_data_channel` handler (`:335`), which awaits in turn (`agents/roomlerd/src/peer.rs:1269`).
+`on_data_channel` handler (`:339`), which awaits in turn (`agents/roomlerd/src/peer.rs:1269`).
 Upstream's stop woke that task with one `notify_waiters()`, which wakes only the waiters of that
 instant and stores nothing, and the loop made its next wait after the body. So a stop that came
 while the task was in its body was lost: the task waited for good, holding the association, the
@@ -454,7 +553,7 @@ then shuts the channel's stream (`:455`), which sets `read_shutdown` before its 
 was set. That arm also runs the channel's `on_close` handler, as it did whenever the read
 ended the loop. A close that comes before the channel is stored shuts nothing: the accept
 loop lists the channel and calls the agent's handler before `handle_open`
-(`crates/vendored/webrtc/src/sctp_transport/mod.rs:333-343`). The association's close,
+(`crates/vendored/webrtc/src/sctp_transport/mod.rs:337-347`). The association's close,
 which the peer's close always reaches, then sets the flag on every stream, and ends that
 loop the same way.
 
@@ -988,14 +1087,14 @@ The channel (`signaling.rs:810`) has the #1754 reap channel's shape: created in
 org's peer in the primary's maps — borrowed into every `connect_once`, a sender
 retained for the loop's life so the receiver never closes. The in-flight
 bookkeeping is `PendingQuicSetups` (`agents/roomlerd/src/tunnel/quic_setup.rs`),
-fresh per connection (`agents/roomlerd/src/signaling.rs:2231`) like the session maps, and free of I/O
+fresh per connection (`agents/roomlerd/src/signaling.rs:2237`) like the session maps, and free of I/O
 so tests drive it directly:
 
 | While a setup is in flight… | Rule | Where |
 |---|---|---|
-| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5571-5579`, `quic_setup.rs:243` |
-| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5610`, `quic_setup.rs:258` |
-| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `agents/roomlerd/src/signaling.rs:3123` |
+| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5577-5585`, `quic_setup.rs:243` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5616`, `quic_setup.rs:258` |
+| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `agents/roomlerd/src/signaling.rs:3129` |
 | a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
 | more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
 | the control WS ends | the entry map dies with the connection (one log line names how many were in flight); the results reach the next connection and are closed there. The #1754 teardown and R3 parking of the **maps** are unchanged | `quic_setup.rs:335` |
@@ -1052,7 +1151,7 @@ established beside the first, promoted, the first drained.
 | `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:445`](../crates/tunnel-core/src/driver.rs) · `carry` `:606` · `dead` `:770` |
 | `FlowListener` | the flow's port: bound **once**, an accept task hands each connection to the current carrier — or **holds** it while there is none — under one lock, so "no carrier ⇒ hold" and "install ⇒ drain the hold" cannot interleave to strand one, and (#1816) the hand-off itself — `carry`, which counts the connection — runs under that lock too, so it cannot interleave with a promotion's swap | [`flow_listener.rs:90`](../crates/tunnel-core/src/flow_listener.rs) · `install` `:150` · `offer` `:197` |
 | `HoldPolicy` | the hold's bounds: at most **64** connections, each for at most **30 s**; past either bound the connection is **closed** (the client sees EOF), never refused | [`flow_listener.rs:67`](../crates/tunnel-core/src/flow_listener.rs) |
-| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1202`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1364` `run_flow_cycle` |
+| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1319`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1481` `run_flow_cycle` |
 | the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:893`](../crates/tunnel-core/src/driver.rs) |
 
 ```mermaid
@@ -1076,7 +1175,7 @@ sequenceDiagram
 
 ⚠️ **`Up` still means "it serves", not "it is bound".** The flow's port is bound
 before any session exists, so #1685's rule had to move one step: `FlowLive::mark_listening`
-([`client_mgr.rs:195`](../agents/roomlerd/src/tunnel/client_mgr.rs)) now fires when a
+([`client_mgr.rs:228`](../agents/roomlerd/src/tunnel/client_mgr.rs)) now fires when a
 carrier is **installed** — the same call that hands it the held connections — not from a
 bind hook. A route to an offline node reads `backoff` exactly as before; a held connection
 is not a serving route. (`SessionParams::on_listening` stays for `run_tunnel_session`'s
@@ -1152,7 +1251,7 @@ sequenceDiagram
 ```
 
 The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_mgr.rs) ·
-[`client_mgr.rs:778`], mapped to deadlines by [`ProbeTimer`] `:815`), reset on a netwatch
+[`client_mgr.rs:895`], mapped to deadlines by [`ProbeTimer`] `:932`), reset on a netwatch
 **Major** and after a **promotion**, at most **one candidate per flow** in flight:
 
 | Failed probes | Next probe after |
@@ -1165,10 +1264,10 @@ The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_m
 
 | Piece | What it is | Where |
 |---|---|---|
-| the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:858`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:878` |
-| the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1074`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1111` · `CandidateGuard` `:1038` |
-| promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1364`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
-| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:1001`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:972` · `spawn_drain` `:1029` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:586` |
+| the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:975`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:995` |
+| the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1191`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1228` · `CandidateGuard` `:1155` |
+| promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1481`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
+| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:1118`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:1089` · `spawn_drain` `:1146` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:586` |
 
 ⚠️ **A draining connection is NEVER cut, and there is no maximum drain time.** An RDP
 session that lives for hours keeps its old carrier for hours. The old carrier is dropped
@@ -1554,7 +1653,7 @@ to a running `roomlerd` without any token:
 | `Status` · `Peers` · `Flows` | Node status, mesh peers (carrier, RTT, upgrade state), live flows |
 | `Ping {target, timeout_ms, prefer_v6}` | Overlay reachability probe |
 | `CreateForward` · `CreateSocks5` · `KillFlow` | Imperative flow control |
-| `RouteList` · `RouteAdd` · `RouteUpdate` · `RouteRemove` · `RouteSetEnabled` | Declared-route management (`RouteDescriptor` is one type for wire + disk). `RouteUpdate` replaces a route in one save; an invalid replacement leaves the old route running. A row's `state` is the port's truth (#1685): `active` = the local listener is bound; a flow whose tunnel session is retrying reads `backoff` **with** `flow_id`, `attempts` and `last_error` (additive fields — the tag set is unchanged so an older reader still parses it), `pending` with `flow_id` while its first attempt is in flight |
+| `RouteList` · `RouteAdd` · `RouteUpdate` · `RouteRemove` · `RouteSetEnabled` | Declared-route management (`RouteDescriptor` is one type for wire + disk). `RouteUpdate` replaces a route in one save; an invalid replacement leaves the old route running. Each write verb answers after the reconcile pass that applies its change, at most 5 s later; past that it answers with the change saved, and the next pass applies it ([#1035](#one-writer-owns-the-route-to-flow-map-1035)). A row's `state` is the port's truth (#1685): `active` = the local listener is bound; a flow whose tunnel session is retrying reads `backoff` **with** `flow_id`, `attempts` and `last_error` (additive fields — the tag set is unchanged so an older reader still parses it), `pending` with `flow_id` while its first attempt is in flight |
 | `ConsentPending` · `ConsentDecide` · `ConsentRelaying` | Remote-desktop consent prompts (how the tray approves sessions under a SYSTEM service). `ConsentRelaying` is a two-row Mac's per-user half telling its root half, over the person socket, that it lists the root half's questions (#3967, [desktop-companion.md](desktop-companion.md) §10.8.1). An answer, like the banner's `RcDisconnect`, is taken only from the person at the screen the daemon shows, SYSTEM or an elevated administrator ([desktop-companion.md](desktop-companion.md) §12.4) |
 | `SetDeviceName` | Rename the node |
 | `ConfigGet` · `ConfigSet` | The config surface, grouped (FR-84 D2) |

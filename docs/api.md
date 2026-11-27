@@ -318,7 +318,7 @@ before the search runs, so `q` cannot probe them.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/admin/stats/relay/current` · `/relay/history` | Relay (TURN/DERP) load, live + series |
-| GET | `/api/admin/stats/orgs` · `/users` · `/machines` · `/calls` | Platform-wide inventories. `orgs` lists each org as `{id, name, slug, created}`, `created` an RFC 3339 time (#4189) |
+| GET | `/api/admin/stats/orgs` · `/users` · `/machines` · `/calls` | Platform-wide inventories. `orgs` lists each org as `{id, name, slug, created}`, `created` an RFC 3339 time (#4189). [FR-157](fr/FR-157-screen-worker-on-the-row.md) P2: with `ROOMLER__RC__GUI_WORKER_READ` on, `orgs` also carries `gui_workers`, every org's live Macs counted as the org overview counts them; the names are read per org, from the device list's `?gui_worker=` filter |
 | GET | `/api/admin/stats/usage` · `/usage/{user_id}` | Per-user usage across every org |
 | GET | `/api/admin/stats/attribution` | FR-88: sign-ups by campaign key, and FR-91: by blog landing page, and how many activated — counts only |
 | GET/PUT | `/api/admin/growth/exclusions` | FR-102 P1c: the orgs and people no growth number counts — the implicit set (platform admins, the orgs they own) marked beside the explicit rows; PUT replaces the explicit list (`{kind: tenant\|user, id, reason}`); anyone else gets the 404 whatever the body holds, one that does not parse included (#4254). 404 also when `growth.enabled = false` |
@@ -445,7 +445,7 @@ Both exports take `{room_id}`: a room of the path org that the caller may read. 
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `…/agent` | List enrolled devices (status, caps, overlay info). FR-55 P4: `power {policy, on_ac?, held}`, the posture the device last reported (absent from an agent that predates it: unknown, never `never`), and, on a device that is not online, `sleep {since, power}` when it announced a sleep ([power.md](power.md) §3) |
+| GET | `…/agent` | List enrolled devices (status, caps, overlay info). FR-55 P4: `power {policy, on_ac?, held}`, the posture the device last reported (absent from an agent that predates it: unknown, never `never`), and, on a device that is not online, `sleep {since, power}` when it announced a sleep ([power.md](power.md) §3). [FR-157](fr/FR-157-screen-worker-on-the-row.md) P2, only while `ROOMLER__RC__GUI_WORKER_READ` is on: a Mac's row carries `capabilities.gui_worker {state, reason?, one_row?}`, its screen worker as its daemon last said it, current only while the row's `presence` is `online`; and `?gui_worker=<state>` names the org's online Macs (online as the overviews count it, `last_presence`) whose word is that state (`unsupervised`, `attached`, `not-attached`, a newer agent's word as it is, or `unknown` for a Mac that sent none), paged like the list. An empty `gui_worker=` is a 400. With the switch off, the default, no row carries the word and the filter is answered 400 `bad_request` naming the switch, never with the unfiltered list |
 | GET | `…/device` | The unified devices grid (agents and tunnel clients), searched, sorted and paged on the server. FR-55 P4: an agent that is not online and announced a sleep carries `sleep {since, power}`, which the dashboard reads as **asleep** ([power.md](power.md) §3.4) |
 | POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use). 403 for an **archived** org |
 | POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device), `{pin?, force?}` (+ `agent_ids?` for the fleet). A push that would not be acted on is refused, never sent: FR-2's downgrade guard (`pin_downgrade`, unless `force`); since #3565 a pin to a row with no reported version, which is refused unless it is forced (`version_unreported`); and since FR-67 P7 a device whose caps say it ignores the push (`primary_org`, a secondary enrollment) or drops it (`auto_update_off`). `force` lifts only the two pin checks. One device answers **409** with the reason; the fleet route skips the device with a `refused` reason and its `refused_code`, and counts it in `refused` |
@@ -511,7 +511,7 @@ before it leaves the host.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `…/stats/overview` | Tenant overview (member-visible) |
+| GET | `…/stats/overview` | Tenant overview (member-visible). [FR-157](fr/FR-157-screen-worker-on-the-row.md) P2, only while `ROOMLER__RC__GUI_WORKER_READ` is on: `gui_workers: [{state, reason, one_row, total, online}]`, the org's live Macs grouped by their screen worker's word (`capabilities.gui_worker`). A Mac that sent no word, an agent older than FR-157 P1, counts as `state: "unknown"` with `reason` and `one_row` null, so the groups add up to every live Mac; `online` reads presence (`last_presence`), so an offline Mac's last word counts only in `total`. With the switch off, the default, there is no `gui_workers` key |
 | GET | `…/stats/mesh` | Mesh graph edges + carrier types. A node is `{id, agent_id_hex, name, overlay_ip, relay_home, status}`; it carries no time (#4189) |
 | GET | `…/stats/machines` · `/calls` · `/tunnels` | Per-domain series (MANAGE_AGENTS) |
 | GET | `…/stats/usage` · `/usage/{user_id}` | Usage (own row self-service; others need MANAGE_AGENTS) |
