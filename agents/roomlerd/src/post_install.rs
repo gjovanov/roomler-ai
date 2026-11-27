@@ -4044,4 +4044,50 @@ mod tests {
             o.note
         );
     }
+
+    /// FR-145 P2 (AC3) — a process that holds its `service-logs` writes the
+    /// install record there by handle, and keeps a wedged attempt's MSI log
+    /// with the one before it the same way. With the folder swapped for a
+    /// junction before each, they land in a sealed `service-logs` made again
+    /// and nothing where the junction leads. At its seam both go by path. In a
+    /// child, elevated.
+    #[cfg(windows)]
+    #[test]
+    fn the_record_and_the_wedged_log_go_by_handle_below_the_held_folder() {
+        use roomler_node_core::logging::held_logs::test_fixture::{
+            CHECKED, Case, child, parent, swap_for_junction,
+        };
+        let Some(Case {
+            root,
+            dir,
+            elsewhere,
+        }) = child(true)
+        else {
+            let root = tempfile::tempdir().unwrap();
+            let case = "the_record_and_the_wedged_log_go_by_handle_below_the_held_folder";
+            return parent(module_path!(), case, root.path());
+        };
+        let empty = |d: &Path| std::fs::read_dir(d).unwrap().next().is_none();
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        swap_for_junction(&dir, &elsewhere);
+        let written = write_outcome(&unreported("agent-v0.4.300", 1000)).unwrap();
+        assert_eq!(written, dir.join("last-install.json"));
+        assert!(
+            empty(&elsewhere),
+            "the record went where the junction leads"
+        );
+        assert!(read("last-install.json").contains("agent-v0.4.300"));
+
+        let staged = root.join("x.msi.log");
+        std::fs::write(&staged, "first wedge").unwrap();
+        swap_for_junction(&dir, &elsewhere);
+        let kept = keep_wedged_log(&staged, &dir).unwrap();
+        assert_eq!(kept, dir.join("msi-wedged.log"));
+        std::fs::write(&staged, "second wedge").unwrap();
+        assert_eq!(keep_wedged_log(&staged, &dir).unwrap(), kept);
+        assert!(empty(&elsewhere), "the log went where the junction leads");
+        assert_eq!(read("msi-wedged.log"), "second wedge");
+        assert_eq!(read("msi-wedged.prev.log"), "first wedge");
+        println!("{CHECKED}");
+    }
 }

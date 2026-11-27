@@ -596,4 +596,42 @@ mod tests {
         unsafe { tunnel_core::env::test_env::set("CAPS_CACHE", "1") };
         assert!(enabled());
     }
+
+    /// FR-145 P2 (AC3) — a process that holds its `service-logs` writes the
+    /// cache and reads it below that folder by handle. With the folder swapped
+    /// for a junction, the store lands in a sealed `service-logs` made again
+    /// and nothing where the junction leads; a cache where a junction leads is
+    /// never read. At its seam the cache goes by path. In a child, elevated.
+    #[cfg(windows)]
+    #[test]
+    fn the_cache_goes_by_handle_below_the_held_folder() {
+        use roomler_node_core::logging::held_logs::test_fixture::{
+            CHECKED, Case, child, parent, swap_for_junction,
+        };
+        let Some(Case { dir, elsewhere, .. }) = child(true) else {
+            let root = tempfile::tempdir().unwrap();
+            let case = "the_cache_goes_by_handle_below_the_held_folder";
+            return parent(module_path!(), case, root.path());
+        };
+        let empty = |d: &Path| std::fs::read_dir(d).unwrap().next().is_none();
+        let at = path().expect("the held folder");
+        assert_eq!(at, dir.join(FILE_NAME));
+        let file = CacheFile::new(key(), 1_000, 3986, hw_caps(), None);
+        swap_for_junction(&dir, &elsewhere);
+        store(&at, &file).unwrap();
+        assert!(empty(&elsewhere), "stored where the junction leads");
+        assert!(load_matching(&at, &key(), 1_060).is_ok(), "read back");
+
+        swap_for_junction(&dir, &elsewhere);
+        std::fs::write(
+            elsewhere.join(FILE_NAME),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(load_matching(&at, &key(), 1_060), Err(Miss::NoFile)),
+            "read where the junction leads"
+        );
+        println!("{CHECKED}");
+    }
 }

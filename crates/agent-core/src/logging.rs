@@ -56,6 +56,9 @@ use tracing_subscriber::{
 
 use crate::logs_upload::{LogLine, LogUploadLayer};
 
+#[cfg(windows)]
+pub mod held_logs;
+
 /// Holds the non-blocking appender's worker thread alive until [`finish`]
 /// takes it. A static is never dropped, so a process that exits without
 /// [`finish`] loses the lines still queued for the file.
