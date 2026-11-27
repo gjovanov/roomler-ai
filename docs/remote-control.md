@@ -3578,7 +3578,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   has an enrollment SYSTEM may run, the service host keeps its worker on the waiting arm: the signed-in person's
   own enrollment, as that person. A machine config that went missing beside its `config.toml.prev` ends that
   wait only when the copy passes every check the config itself would, as found and as it is, and holds an
-  enrollment ([`read_machine_copy`, `machine_tree.rs:1175`](../crates/agent-core/src/machine_tree.rs#L1175)).
+  enrollment ([`read_machine_copy`, `machine_tree.rs:1295`](../crates/agent-core/src/machine_tree.rs#L1295)).
   While only the copy is there, the repair leaves the tree as it found it unless the copy, the machine folder and
   its keys were the machine's as found. The order is the SYSTEM worker's ladder: the machine config, then the
   SYSTEM profile's own config, then the copy. The host asks that function third
@@ -3588,7 +3588,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   and logs why once.
 - **On a machine-wide install the keys share the machine config's check** (#3609). `peer-auth\` and each
   `<tenant>.json` and `<tenant>.controllers.json` the daemon loads are repaired to SYSTEM and Administrators
-  alone and checked with the config ([`repair`, `machine_tree.rs:640`](../crates/agent-core/src/machine_tree.rs#L640)),
+  alone and checked with the config ([`repair`, `machine_tree.rs:718`](../crates/agent-core/src/machine_tree.rs#L718)),
   so a key file another account owns keeps the service from running that enrollment as SYSTEM until it is
   fixed. Any other file in the folder (a backup, a temporary file) is neither repaired nor checked. #3666:
   outside a save the repair seals the keys folder and a key file only when they, with the rest of the tree, were the
@@ -7976,7 +7976,7 @@ config itself would, and the service starts that worker for such a copy
 restores a config from its last good copy (`config.toml.prev`), the live
 file missing or unreadable, it clears the copy's run marks first:
 `last_run_unhealthy` and `last_run_boot` (`clear_run_marks`,
-[`crates/agent-core/src/config.rs:5211`](../crates/agent-core/src/config.rs#L5211)).
+[`crates/agent-core/src/config.rs:5230`](../crates/agent-core/src/config.rs#L5230)).
 A save kept that copy while its run went on, so its mark says nothing of
 how the run ended. Before #4157 the copy kept the mark, and the start after
 a restore read the run before it as `Crashed` on the same boot, one step

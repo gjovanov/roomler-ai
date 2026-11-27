@@ -764,7 +764,7 @@ The sites on it since P1:
 | The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:1160` |
 | The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:1042`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
 | The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:349` |
-| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1650` |
+| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1770` |
 | The machine config's key files the daemon writes: a device key (`peer-auth\<tenant>.json`) and the browser keys (`<tenant>.controllers.json`), #3956 | `HeldPath::base(<machine folder>)`, then `open_or_make_dir("peer-auth", Seal::Private)`: opened as it is, or made sealed, with no leaf policy, since the keys folder is FR-94's to repair; then `write_file(.., Seal::Private)`, so each file comes out as that repair leaves it. A link at `peer-auth` leaves the key unwritten, and the hello offers none | `agents/roomlerd/src/peer_auth.rs:1193`, `crates/agent-core/src/machine_tree/held.rs:453` |
 
 P2 put the service logs on it (next table). P3 moves the remaining SYSTEM writers below
@@ -772,7 +772,7 @@ the machine folder, with a test that fails on a new path-based one; until then t
 sites write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's
 environment sends the crash recorder, the machine config's key files and the service
 logs back to their writes by path, each with one WARN naming the switch
-(`crates/agent-core/src/machine_tree.rs:381`). The clean-up's removals have no switch: a
+(`crates/agent-core/src/machine_tree.rs:459`). The clean-up's removals have no switch: a
 removal that follows a link has no safe old way to return to.
 
 The service logs since P2: a process with a `ServiceLogRole` (the service host, the
