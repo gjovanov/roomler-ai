@@ -2695,8 +2695,8 @@ async fn media_pump(
     // `next_frame`'s contract and the guard below watches it, and its open waits
     // for a seat the capture before it is letting go of. Off is the kill switch
     // for the first release: the capture and its open run as they did. The DC
-    // pumps do not ask yet (FR-98 C7), and their open stays as it is until then:
-    // `capture::open_default_async`.
+    // pumps ask behind a switch of their own, the `capture_wait` media path
+    // (FR-135 R4a, `capture::pace::dc_capture_wait`).
     let pace_capture = capture::pace::rtp_capture_wait_enabled();
     let mut empty_guard = capture::pace::EmptyGuard::new(pace_capture);
     let mut capturer = capture::open_async(
@@ -4030,9 +4030,17 @@ async fn media_pump_vp9_444_dc(
         target_fps,
         "VP9-444 DC pump starting"
     );
-    let mut capturer = capture::open_default_async(
+    // FR-135 R4a (#3275) — read once per pump, as `media_pump` reads its own.
+    // On, this pump's capture keeps `next_frame`'s contract: it opens paced, an
+    // empty rests in the guard where this pump slept, and a reopen lets go of
+    // the old capture first. Off, the default until the canary has been read,
+    // everything below runs as it did.
+    let pace_capture = capture::pace::dc_capture_wait(&media_paths);
+    let mut empty_guard = capture::pace::EmptyGuard::new(pace_capture);
+    let mut capturer = capture::open_async(
         target_fps,
         downscale,
+        pace_capture,
         media_waiting_hook(session_id, control_dc.clone()),
     )
     .await;
@@ -4134,6 +4142,8 @@ async fn media_pump_vp9_444_dc(
     let mut last_viewers: usize = 0;
 
     let mut frames_captured: u64 = 0;
+    // FR-135 R4a — with `frames_captured`, how often this pump asked its capture.
+    let mut frames_empty: u64 = 0;
     let mut frames_encoded: u64 = 0;
     // rc.166 freeze fix — these three are now owned by a dedicated DC send
     // task (spawned below, mirroring the FFmpeg pump rc.106 pattern) and
@@ -4579,6 +4589,7 @@ async fn media_pump_vp9_444_dc(
 
         // A local first, so `capturer`'s borrow ends before the idle arm asks
         // it what it waits for (FR-93 P3e).
+        let capture_started = std::time::Instant::now();
         let next_frame = capturer.next_frame().await;
         // FR-135 R0 (N7) — when the pump took this pass's real frame.
         let mut frame_captured_at: Option<std::time::Instant> = None;
@@ -4591,6 +4602,7 @@ async fn media_pump_vp9_444_dc(
                 }
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
+                empty_guard.on_frame();
                 // #3423 — and a viewer that joins from now on hears no stale notice.
                 pipeline.on_frame();
                 let arc = std::sync::Arc::new(f);
@@ -4603,6 +4615,7 @@ async fn media_pump_vp9_444_dc(
                 arc
             }
             Ok(None) => {
+                frames_empty += 1;
                 // FR-93 P3e — the display is off (P5f: this user's session is
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
@@ -4654,10 +4667,24 @@ async fn media_pump_vp9_444_dc(
                         }
                         f.clone()
                     } else {
+                        // FR-135 R4a — the capture waited for this empty, so
+                        // the pump adds no sleep of its own, here or below.
+                        if pace_capture {
+                            empty_guard
+                                .rest(capture_started.elapsed(), capturer.backend())
+                                .await;
+                            continue;
+                        }
                         tokio::time::sleep(frame_duration_floor).await;
                         continue;
                     }
                 } else {
+                    if pace_capture {
+                        empty_guard
+                            .rest(capture_started.elapsed(), capturer.backend())
+                            .await;
+                        continue;
+                    }
                     tokio::time::sleep(frame_duration_floor / 2).await;
                     continue;
                 }
@@ -4670,10 +4697,17 @@ async fn media_pump_vp9_444_dc(
                 }
                 // P3 — bounded backoff, same rationale as the track pump.
                 warn!(%session_id, %e, "VP9-444 capture error — rebuilding capturer");
+                // FR-135 R4a — let go first, as `media_pump` does: a paced open
+                // waits for a seat, and it would be waiting on the one this
+                // pump holds.
+                if pace_capture {
+                    drop(capturer);
+                }
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default_async(
+                capturer = capture::open_async(
                     target_fps,
                     downscale,
+                    pace_capture,
                     shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
@@ -5435,6 +5469,11 @@ async fn media_pump_vp9_444_dc(
                 shadow_disagree_pct = ?governor.shadow_disagree_pct(),
                 shadow_pauses = governor.shadow_pauses(),
                 shadow_reason = governor.shadow_reason(),
+                // FR-135 R4a (#3275), appended: with `frames_captured`, how
+                // often the pump asked its capture, and whether this session
+                // waits in the capture (`capture_wait`) or sleeps here.
+                frames_empty,
+                capture_wait = pace_capture,
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
             delivery.heartbeat(&pc, session_id, &mut governor, None); // FR-148 P0
@@ -6802,9 +6841,18 @@ async fn media_pump_ffmpeg_dc(
         slow_link = slow_link_profile.is_some(),
         "FFmpeg DC pump starting"
     );
-    let mut capturer = capture::open_default_async(
+    // FR-135 R4a (#3275) — read once per pump, as `media_pump` reads its own.
+    // On, this pump's capture keeps `next_frame`'s contract: it opens paced, an
+    // empty rests in the guard where this pump slept, and a reopen lets go of
+    // the old capture first. Off, the default until the canary has been read,
+    // everything below runs as it did. A session on GPU frames stays off: a
+    // capture that waits hands out none (`capture::pace::dc_capture_wait`).
+    let pace_capture = capture::pace::dc_capture_wait(&media_paths);
+    let mut empty_guard = capture::pace::EmptyGuard::new(pace_capture);
+    let mut capturer = capture::open_async(
         target_fps,
         downscale,
+        pace_capture,
         shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
     )
     .await;
@@ -7790,9 +7838,17 @@ async fn media_pump_ffmpeg_dc(
                             // reopen as `recapture`, the drop (a thread join)
                             // as `close`.
                             let t = watch.start();
-                            capturer = capture::open_default_async(
+                            // FR-135 R4a — on the waiting path the old capture
+                            // goes first: a paced open waits for a seat, and it
+                            // would wait on the one held here. Inside the
+                            // timer, where the assignment below dropped it.
+                            if pace_capture {
+                                drop(capturer);
+                            }
+                            capturer = capture::open_async(
                                 target_fps,
                                 downscale,
+                                pace_capture,
                                 shared_media_waiting_hook(
                                     session_id,
                                     control_dc.clone(),
@@ -8285,6 +8341,7 @@ async fn media_pump_ffmpeg_dc(
                 last_capture_at = std::time::Instant::now();
                 frame_captured_at = Some(last_capture_at);
                 capture_wait.on_frame();
+                empty_guard.on_frame();
                 // #3423 — and a viewer that joins from now on hears no stale notice.
                 pipeline.on_frame();
                 frames_captured += 1;
@@ -8462,6 +8519,18 @@ async fn media_pump_ffmpeg_dc(
                     }
                     f.clone()
                 } else {
+                    // FR-135 R4a — the capture waited for this empty, so the
+                    // pump adds no sleep of its own. FR-65 — still `poll`: what
+                    // is timed is the floor an empty that came straight back
+                    // owes (a pull backend whose next ask was already due).
+                    if pace_capture {
+                        let t = watch.start();
+                        empty_guard
+                            .rest(capture_start.elapsed(), capturer.backend())
+                            .await;
+                        PassWatch::stop(t, &mut poll_us);
+                        continue;
+                    }
                     // rc.99 — pace empty polls with a short sleep before
                     // retrying. rc.93 removed the top-of-loop floor (correctly
                     // — it capped the Some-rate) AND made this `continue`
@@ -8502,10 +8571,18 @@ async fn media_pump_ffmpeg_dc(
                 tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: capture error — rebuilding capturer");
                 // FR-65 — the backoff and the reopen together: `recapture`.
                 let t = watch.start();
+                // FR-135 R4a — let go first, as `media_pump` does: a paced open
+                // waits for a seat, and it would be waiting on the one this
+                // pump holds. Inside the timer, where the assignment below
+                // dropped it.
+                if pace_capture {
+                    drop(capturer);
+                }
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default_async(
+                capturer = capture::open_async(
                     target_fps,
                     downscale,
+                    pace_capture,
                     shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
@@ -10357,6 +10434,11 @@ async fn media_pump_ffmpeg_dc(
                 viewer_freezes = ?viewer.and_then(|v| v.report.freezes),
                 viewer_painted = ?viewer.and_then(|v| v.report.painted),
                 viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
+                // FR-135 R4a (#3275), appended: whether this session waits in
+                // the capture (`capture_wait`) or sleeps here on an empty. With
+                // it, `frames_captured` + `frames_empty` is the asks a read
+                // compares between the two.
+                capture_wait = pace_capture,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             delivery.heartbeat(&pc, session_id, &mut governor, seed_age); // FR-148 P0

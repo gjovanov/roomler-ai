@@ -152,8 +152,13 @@ impl Rules {
     /// default. `stats` is instruments and nothing else (FR-135 §7.1: R0's
     /// fields only add to what the reads parse), so it is on from its first
     /// release, with `rc_media_legacy=stats` as its switch.
+    ///
+    /// R4a's capture wait has new code too, and runs the old by default: the
+    /// first of §7.1's three steps for a change to what an agent does. A device
+    /// turns it on with `rc_media_canary=capture_wait`, and its flip is a
+    /// release of its own (#3275).
     pub const THIS_BUILD: Rules = Rules {
-        built: Stats.bit() | MediaPlan.bit(),
+        built: Stats.bit() | MediaPlan.bit() | CaptureWait.bit(),
         new_by_default: Stats.bit() | MediaPlan.bit(),
     };
 }
@@ -575,7 +580,7 @@ mod tests {
     /// On a build where a path has new code but a path under it is still old
     /// by default, its canary entry is refused for that requirement, and a
     /// default stands on its requirements: neither branch can fire in this
-    /// build, where only `media_plan` has new code and it stands on nothing.
+    /// build, where no path with new code stands on another.
     #[test]
     fn a_requirement_on_the_old_path_holds_a_canary_and_a_default_back() {
         let built_all = Rules {

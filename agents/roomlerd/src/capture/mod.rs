@@ -623,9 +623,10 @@ pub trait ScreenCapture: Send {
     ///   of them is a spin: [`pace::EmptyGuard`] warns once and floors each.
     ///
     /// ⚠️ One backend meets this only when asked: the SYSTEM-context capture,
-    /// through [`open_async`]'s `paced`. The two DataChannel pumps do not ask, and
-    /// sleep on an empty themselves. FR-98 C7 moves them over and deletes the
-    /// opt-in.
+    /// through [`open_async`]'s `paced`. The RTP pump asks. The two DataChannel
+    /// pumps ask on a session that runs the `capture_wait` media path
+    /// ([`pace::dc_capture_wait`], FR-135 R4a), and sleep on an empty themselves
+    /// on every other. #3275's delete removes the opt-in.
     async fn next_frame(&mut self) -> Result<Option<Frame>>;
 
     fn monitor_count(&self) -> u8;
@@ -2957,8 +2958,9 @@ pub async fn open_default_async(
 /// the open waits for a seat the capture before it is letting go of, the acquire
 /// waits for a frame (so frames stay off the GPU: a wait holds the device's lock),
 /// and GDI holds to its target. It is said here, not after the open, because the
-/// open is the first thing it changes. Only the RTP pump asks; FR-98 C7 moves the
-/// others over and deletes the choice.
+/// open is the first thing it changes. The RTP pump asks, and a DataChannel pump
+/// on a session that runs `capture_wait` ([`pace::dc_capture_wait`]); #3275's
+/// delete removes the choice.
 pub async fn open_async(
     target_fps: u32,
     downscale: DownscalePolicy,

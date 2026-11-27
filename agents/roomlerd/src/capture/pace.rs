@@ -765,8 +765,10 @@ mod tests {
     /// each sleep is the one master has. `pace_capture` is read once, from
     /// [`dc_capture_wait`], and it arms the guard, opens every capture and lets
     /// go of the old one before each reopen: a paced open waits for a seat, and
-    /// it would be waiting on the seat this pump holds. Both heartbeats end with
-    /// the arm a line came from.
+    /// it would be waiting on the seat this pump holds. In the FFmpeg pump that
+    /// let-go sits inside the reopen timer, where the assignment dropped the
+    /// old capture, so `recapture` times the same work on both arms. Both
+    /// heartbeats end with the arm a line came from.
     #[test]
     fn with_the_switch_on_no_dc_pump_sleeps_on_an_empty() {
         const OPEN: &str = "capture::open_async(target_fps, downscale, pace_capture,";
@@ -836,13 +838,13 @@ mod tests {
             pump,
             &code,
             1,
-            &format!("{LET_GO} let t = watch.start(); capturer = {OPEN}"),
+            &format!("let t = watch.start(); {LET_GO} capturer = {OPEN}"),
         );
         want(
             pump,
             &code,
             1,
-            &format!("{LET_GO} let t = watch.start(); {BACKOFF} capturer = {OPEN}"),
+            &format!("let t = watch.start(); {LET_GO} {BACKOFF} capturer = {OPEN}"),
         );
         want(pump, &code, 3, "capture::open_async(");
         want(
