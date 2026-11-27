@@ -643,7 +643,7 @@ The source gate (`crates/agent-core/src/folder_gate.rs:279-345`) holds six of th
 macOS builds: `process_home`, `default_download_dir`, `unix_lock_path`, `plist_path`, the `roomler` CLI's
 `default_config_path` and `default_choice`. Each is entered by a command typed with `sudo`, which on macOS keeps the
 caller's `HOME`. AC10 asks that none is left. Of the reads an earlier row of this table left undetermined,
-`files.rs:5579-5583` is Linux's `own_home_and_downloads` and `:7909` is a test.
+`files.rs:5579-5583` is Linux's `own_home_and_downloads` and `:7955` is a test.
 
 Not swept: `agents/roomler-setup/src/unix_daemon.rs`, the self-updater, `cleanup-legacy-install`, and fleet exec as
 root.
