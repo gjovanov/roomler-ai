@@ -419,7 +419,7 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P0 | the RED reads of F1 and F2 on the current release and server, F4's pair left enrolled; the coordinator's R0–R3 | none: it reads and changes nothing | not started |
+| P0 | the RED reads of F1 and F2 on the current release and server, F4's pair left enrolled; the coordinator's R0–R3 | none: it reads and changes nothing | started: R0–R3 read on 2026-11-27 (AC1, the field log); the lab reads are next |
 | P1 | the server: `instance_id` on the request and the row, the order of the lookups, the claim, the index, `keyed_by`, the 400, the 409 sentence for an instance match; the baseline re-recorded | `ROOMLER__RC__TUNNEL_INSTANCE_ID`, default on | not started |
 | P2 | the clients: the identity function in `roomler-cli`, the id file and its binding, `roomler enroll` and the wizard on that one function, the wizard's copy gone | `ROOMLER_TUNNEL_INSTANCE_ID=0`, and fail-open | not started |
 | P3 | the field reads F1–F5 on P1's server and P2's clients | P1's switch | not started |
