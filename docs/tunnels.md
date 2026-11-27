@@ -776,7 +776,7 @@ writer busy. The rule was written before the counted runs, and it and every run 
 | 0.4.222, three runs | 6.4 s | 661,403 to 666,457 B | 4.6 to 4.9 s after the lock, 0.5 to 0.9 s after the cut's end | every later lock and unlock shows within 2 s, on one stream from start to end |
 
 **What a person saw on 0.4.221 was a reconnect, not a chip that stays wrong.** The lock
-notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10712`) was lost, and nothing the agent
+notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10715`) was lost, and nothing the agent
 sent on the control channel after it was read. On this guest a locked session sends no video.
 The viewer's media watchdog spares only an agent that said it cannot capture or that it waits
 (`ui/src/composables/useRemoteControl.ts:5844`), and no such word could arrive. So it asked
@@ -789,7 +789,7 @@ never shows it:
 | Condition | Why | Anchor |
 |---|---|---|
 | the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4277`, `:5241`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2621` |
-| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7279`, `:2207`, `agents/roomlerd/src/peer.rs:11343`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
+| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7279`, `:2207`, `agents/roomlerd/src/peer.rs:11346`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
 | the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1534`, `:6231`, `agents/roomlerd/src/lock_state.rs:333` |
 
 A real path failure cuts both directions. The second row is read from the source: two runs on
