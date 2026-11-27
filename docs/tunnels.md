@@ -1454,7 +1454,7 @@ is theirs.
 
 | id | what it is | who sends it |
 |---|---|---|
-| `machine_id` | a hash of the client's name, the `HOSTNAME` variable (`COMPUTERNAME` on Windows, `unknown` when it is not set), the OS and the architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1228`) | every client; every server keys by it |
+| `machine_id` | a hash of the client's name, the `HOSTNAME` variable (`COMPUTERNAME` on Windows, `unknown` when it is not set), the OS and the architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1244`) | every client; every server keys by it |
 | `instance_id` | 32 lowercase hex characters the install made at random and keeps on its machine ([FR-159](fr/FR-159-tunnel-client-identity.md) D1) | an FR-159 client, beside `machine_id` (D2). No released client sends it yet: that is FR-159's P2 |
 
 The `machine_id` is a guess at the machine. Where `HOSTNAME` is not set, two machines
