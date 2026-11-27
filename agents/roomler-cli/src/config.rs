@@ -78,16 +78,26 @@ pub fn enrollment_server_url(raw: &str) -> String {
 // RETIRED-NAME-ANCHOR(4): ProjectDirs segment holding the ENROLLED credential on
 // tunnel-only hosts.
 /// Resolve the default per-user config path. On Windows this lands at
-/// `%APPDATA%\roomler\roomler-tunnel\config.toml`; on Linux/macOS the
-/// `directories` crate's `ProjectDirs::config_dir()` is honoured.
+/// `%APPDATA%\roomler\roomler-tunnel\config.toml`; on macOS the
+/// `directories` crate's `ProjectDirs::config_dir()` is honoured. #3866: on
+/// Linux it is `roomler-tunnel/config.toml` in this account's own config
+/// folder (`appdirs::own_folders`): root's own beneath `/root` for a root
+/// command, whatever `HOME` it was given, and `$XDG_CONFIG_HOME` or
+/// `~/.config` for a person's, the folder `ProjectDirs` names.
 pub fn default_config_path() -> Result<PathBuf> {
-    // RETIRED-NAME-ANCHOR(2): tunnel-only hosts keep their ENROLLED config here.
+    // RETIRED-NAME-ANCHOR(7): tunnel-only hosts keep their ENROLLED config here.
     // Renaming the segment orphans it, exactly as it would for appdirs::OLD_APP.
     // Migrating it needs the same new-then-old resolution appdirs has — P4, not a
     // drive-by. See docs/fr/FR-21.
-    let dirs = directories::ProjectDirs::from("ai", "roomler", "roomler-tunnel")
+    #[cfg(target_os = "linux")]
+    let config_dir = roomler_node_core::appdirs::own_folders()
+        .map(|own| own.config.join("roomler-tunnel"))
         .context("no platform config dir available for roomler-tunnel")?;
-    Ok(dirs.config_dir().join("config.toml"))
+    #[cfg(not(target_os = "linux"))]
+    let config_dir = directories::ProjectDirs::from("ai", "roomler", "roomler-tunnel")
+        .map(|dirs| dirs.config_dir().to_path_buf())
+        .context("no platform config dir available for roomler-tunnel")?;
+    Ok(config_dir.join("config.toml"))
 }
 
 /// Parse a tunnel config, saying where it stopped and nothing of the file (#3086):

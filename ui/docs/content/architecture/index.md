@@ -1,6 +1,6 @@
 ---
 title: Architecture
-description: How Roomler is put together — one control plane, three data planes, one agent per machine, and a server that coordinates without ever carrying your traffic.
+description: How Roomler is put together — one control plane, three data planes, one daemon per machine, and a server that coordinates without ever carrying your traffic.
 tags: [architecture, overview, security, design]
 order: 0
 ---
@@ -9,7 +9,7 @@ Roomler's shape follows from two invariants. Almost every design question in the
 product is answered by one of them.
 
 :::badges
-- **One daemon per machine** icon:shield — the agent is simultaneously the remote-desktop target, the mesh node, the tunnel endpoint and the SSH server. Not four services.
+- **One daemon per machine** icon:shield — `roomlerd` is simultaneously the remote-desktop target, the mesh node, the tunnel endpoint and the SSH server. Not four services.
 - **The server coordinates, never carries plaintext** icon:network — pixels, keystrokes, SSH bytes and tunnel payloads go peer-to-peer, or through a relay that only sees ciphertext.
 :::
 
@@ -35,7 +35,7 @@ sees](/docs/architecture/what-the-server-sees/).
 
 :::cards
 - **[System overview](/docs/architecture/system-overview/)** icon:blueprint — The pieces, and how a request moves through them.
-- **[The agent](/docs/architecture/the-agent/)** icon:terminal — What runs on a machine, and why it is one process.
+- **[The daemon](/docs/architecture/the-agent/)** icon:terminal — What runs on a machine, and why it is one process.
 - **[Connection cascade](/docs/architecture/connection-cascade/)** icon:compare — How two machines find the best path that works.
 - **[What the server sees](/docs/architecture/what-the-server-sees/)** icon:shield — Precisely what is and is not visible to the control plane.
 :::
@@ -43,9 +43,9 @@ sees](/docs/architecture/what-the-server-sees/).
 ## Why "one daemon" keeps coming up
 
 Because it explains answers that otherwise look unhelpful. *"Can I run a second
-copy for my other organization?"* — no, and not out of licensing: the agent owns
+copy for my other organization?"* — no, and not out of licensing: the daemon owns
 a network adapter with a fixed name, a single local control socket, host-global
 routing and firewall state, and one updater. Two copies fight over all of them.
 
-The supported answer is one agent with several enrollments — see
+The supported answer is one daemon with several enrollments — see
 [multi-org](/docs/network/multi-org/).

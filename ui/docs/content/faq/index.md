@@ -8,16 +8,16 @@ order: 0
 
 ## What is Roomler?
 
-Roomler is three products on one agent: a browser-based remote desktop, a private
+Roomler is three products on one daemon: a browser-based remote desktop, a private
 WireGuard-style mesh network between your machines, and team chat with video
-calls. You install one agent per machine and use everything from a browser tab.
+calls. You install one daemon, `roomlerd`, per machine and use everything from a browser tab.
 It runs on Windows, macOS and Linux, and you can host the whole thing yourself.
 
 ## Do I need to install anything to view a remote screen?
 
 No. The viewing side is a plain browser with nothing installed (Chrome, Edge or
 another Chromium browser works best; Safari and Firefox work too). Only the
-machine you are reaching runs an agent.
+machine you are reaching runs the daemon.
 
 ## Can Roomler see my screen or my keystrokes?
 
@@ -50,8 +50,8 @@ one. Nothing is held back from a self-hosted deployment. See
 ## How is this different from Tailscale?
 
 Tailscale is a better mesh network — more years, more platforms, more polish in
-that lane. Roomler's difference is that the same agent is also a remote desktop
-and an SSH server, so you are not running two agents, two control planes and two
+that lane. Roomler's difference is that the same daemon is also a remote desktop
+and an SSH server, so you are not running two daemons, two control planes and two
 audit trails on every machine. See [Roomler vs Tailscale](/docs/compare/tailscale/).
 
 ## How is this different from RustDesk or TeamViewer?
@@ -65,7 +65,7 @@ TeamViewer](/docs/compare/teamviewer/).
 
 ## Does it work behind a corporate firewall?
 
-Usually, yes. Agents need only outbound access and never an inbound port. With
+Usually, yes. The daemon needs only outbound access and never an inbound port. With
 every UDP path blocked the mesh still runs over TLS on port 443, so connectivity
 is never all-or-nothing — the connection quality degrades rather than failing.
 
@@ -86,7 +86,7 @@ network range. See [cannot connect](/docs/troubleshooting/cannot-connect/).
 
 Almost always a capture permission, not a network problem — and operating systems
 report no error when one is missing. On macOS, wallpaper-only means the Screen
-Recording grant. On Windows, freezing at the lock screen means the agent is not
+Recording grant. On Windows, freezing at the lock screen means the daemon is not
 in system service mode. See [black screen](/docs/troubleshooting/black-screen/).
 
 ## Can I reach a machine that nobody is logged into?
@@ -118,10 +118,10 @@ far.
 
 ## Can one machine be in two organizations?
 
-Yes — one agent with several enrollments. Do not install a second copy of the
-agent: it would fight the first over the network adapter, the local socket and
-the routing state. Note that joining a second organization needs an agent
-restart. See [multi-org](/docs/network/multi-org/).
+Yes — one daemon with several enrollments. Do not install a second copy of
+`roomlerd`: it would fight the first over the network adapter, the local socket and
+the routing state. Note that joining a second organization needs a restart of the
+daemon. See [multi-org](/docs/network/multi-org/).
 
 ## What happens when I remove a device?
 
@@ -140,7 +140,7 @@ releases](/docs/security/signed-releases/).
 
 ## Is it open source?
 
-Yes. The server is AGPL-3.0 and the agent that runs on your machines is MPL-2.0.
+Yes. The server is AGPL-3.0 and the daemon that runs on your machines is MPL-2.0.
 The source is at
 [github.com/gjovanov/roomler-ai](https://github.com/gjovanov/roomler-ai).
 

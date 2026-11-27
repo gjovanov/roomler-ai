@@ -2197,7 +2197,7 @@ the window on both. The line also carries `ssthresh`, `rwnd`, `cwnd`, `inflight_
 `pending_bytes`, `max_payload`, `fast_retransmits` and `t3_expiries`; an `unread` line
 carries only the session, the pump and `open_path`. No field can carry an address. It is
 written at INFO, like the other P0 lines, so the default filter ships it
-(`crates/agent-core/src/logging.rs:435`), and `ROOMLERD_PATH_MODEL=off` writes none. A
+(`crates/agent-core/src/logging.rs:492`), and `ROOMLERD_PATH_MODEL=off` writes none. A
 follower of a shared pipeline runs no pump and writes no line, and a pump that starts
 again for the same session writes its own. The cells open a pair by each path over the
 shaped link and read `init_ack` and `cookie_echo` at the first write

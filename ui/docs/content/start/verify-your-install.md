@@ -1,6 +1,6 @@
 ---
 title: Verify your install
-description: Confirm the Roomler agent is running, enrolled, reachable and on the mesh — and verify the artifact you installed was really signed by us.
+description: Confirm the Roomler daemon is running, enrolled, reachable and on the mesh — and verify the artifact you installed was really signed by us.
 tags: [install, verification, security, troubleshooting, getting-started]
 order: 16
 ---
@@ -19,7 +19,7 @@ connection is **connected**, and — if the mesh is on — its overlay address a
 name.
 
 :::warning `connected` and `overlay OFF` on one line is a real state
-An agent can be perfectly connected to the control plane while having **no mesh
+A device can be perfectly connected to the control plane while having **no mesh
 at all**. That is why the two are printed together: the connection being healthy
 says nothing about whether the machine has a private address.
 :::
@@ -38,7 +38,7 @@ omitted, so an empty-looking list is never ambiguous.
 
 | State | Meaning | What to do |
 |---|---|---|
-| **Online** | The server holds a live socket to the agent | Nothing |
+| **Online** | The server holds a live socket to the daemon | Nothing |
 | **Stale** | Heartbeating, but no server holds its live socket | Wait ~2 minutes; it self-heals |
 | **Offline** | No heartbeat at all | See [device offline](/docs/troubleshooting/device-offline/) |
 
@@ -59,7 +59,7 @@ Get-AuthenticodeSignature "C:\Program Files\Roomler\roomlerd.exe" |
 :::danger Both halves of that check are load-bearing
 A valid signature alone proves only that *someone Windows trusts* signed the
 file — and every commercial code-signing certificate chains to a trusted root.
-It is the **publisher name** that makes the signature mean "ours". The agent's
+It is the **publisher name** that makes the signature mean "ours". The daemon's
 own updater applies exactly these two checks and refuses an update that fails
 either.
 :::

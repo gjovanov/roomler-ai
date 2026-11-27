@@ -91,15 +91,15 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328), and comes back as that holder's: its new token acts for them.
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1326`; tunnel clients `crates/services/src/dao/tunnel_client.rs:369`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1353`; tunnel clients `crates/services/src/dao/tunnel_client.rs:369`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
 |---|---|
-| `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:96` |
+| `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:103` |
 | the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1425` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
-| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2169` |
+| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2170` |
 | the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:412` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
@@ -111,13 +111,13 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 The row comes back, but not what the removed device was allowed. Before #3627 a revive cleared `deleted_at` and nothing else, so the row came back with its SSH, exec and access policies, the org-relay and External access approvals, its connect code, approved routes, owner and labels, a pending config (pushed to the machine again on its first connect) and a standing key-rotation order, and the org's tunnel policies that named it applied to it again.
 
-`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:530`):
+`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:534`):
 
 | The row for `(tenant_id, machine_id)` | What the enrollment does |
 |---|---|
 | none | a new device (`AgentDao::create`), after the plan cap |
 | live: a device nobody removed (a lost token, a reinstall, `roomlerd re-enroll`) | refreshes it (`AgentDao::rehydrate`): os, version, the name unless an admin renamed it, the install method if the request says. **Everything it was allowed stays** |
-| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:339`) |
+| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:345`) |
 
 What a revive keeps, and nothing else:
 

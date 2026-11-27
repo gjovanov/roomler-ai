@@ -450,6 +450,23 @@ where
     pub async fn count(&self, filter: Document) -> DaoResult<u64> {
         Ok(self.collection.count_documents(filter).await?)
     }
+
+    /// [`Self::new`], reading the primary whatever the connection string
+    /// prefers: a `readPreference` in it moves `db`'s default, and the
+    /// collection would inherit it. Its write and read concerns stay `db`'s.
+    /// For a reader that decides on what it reads and then writes on a
+    /// compare with it (`AgentDao::find_any_in_tenant_on_the_primary`).
+    pub fn on_the_primary(db: &Database, collection_name: &str) -> Self {
+        use mongodb::options::{CollectionOptions, ReadPreference, SelectionCriteria};
+        Self {
+            collection: db.collection_with_options(
+                collection_name,
+                CollectionOptions::builder()
+                    .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+                    .build(),
+            ),
+        }
+    }
 }
 
 /// Escape user input for a Mongo `$regex` filter — every PCRE metacharacter

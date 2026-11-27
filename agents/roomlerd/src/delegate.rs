@@ -143,10 +143,10 @@ pub enum DelegateFrame {
     /// those resolve the device's `rc_overlay` against the worker's footprint.
     /// Empty, it read the `utunN` address as foreign, and a session meant to
     /// stay off the overlay offered it as a host candidate (field, 0.4.122:
-    /// `overlay_blocks=0`). Sent after [`DelegateFrame::Attached`] and again
-    /// with a [`DelegateFrame::Pong`] whenever the set has grown; the worker
-    /// adds what it is told, since the registry only grows. An older worker
-    /// skips the frame, as every reader here skips what it does not know.
+    /// `overlay_blocks=0`). Sent after [`DelegateFrame::Attached`], the moment
+    /// the set grows and ahead of any frame queued after it grew (#3359), and
+    /// behind a [`DelegateFrame::Pong`]; the worker adds what it is told. An
+    /// older worker skips the frame, as every reader here skips what it does not know.
     OverlayFootprint {
         v4_nets: Vec<(std::net::Ipv4Addr, u8)>,
     },
@@ -2158,6 +2158,10 @@ impl DelegateHost {
         )
         .await?;
         // #1882 — the worker's OWN sessions need the overlay's blocks too.
+        // #3359 — subscribed BEFORE the first read, so a block recorded
+        // between the two still wakes the push in the loop below.
+        let mut grown = tunnel_core::overlay_footprint::grown();
+        let mut hears_growth = true;
         let mut footprint_sent = Vec::new();
         if let Some(frame) = self.footprint_update(&mut footprint_sent) {
             write_frame(&mut wr, &frame).await?;
@@ -2180,9 +2184,31 @@ impl DelegateHost {
         let mut lines = crate::line_limit::Lines::new(BufReader::new(rd), DELEGATE_LINE_MAX);
         loop {
             let line = tokio::select! {
+                // #3359 — the footprint grew: the worker hears it now, not
+                // with its next ping, so its sessions filter by the block
+                // from the moment the daemon has it.
+                changed = grown.changed(), if hears_growth => {
+                    if changed.is_err() {
+                        // The sender is a process-wide static and never
+                        // closes. Should it, the ping-time check below still
+                        // pushes, and this arm stops waking for nothing.
+                        hears_growth = false;
+                    } else if let Some(frame) = self.footprint_update(&mut footprint_sent) {
+                        write_frame(&mut wr, &frame).await?;
+                    }
+                    continue;
+                }
                 queued = to_worker_rx.recv() => {
                     match queued {
                         Some(frame) => {
+                            // #3359 — whichever arm woke first, a block the
+                            // daemon recorded before this frame was queued
+                            // goes out AHEAD of it. The worker reads its
+                            // channel in order, so an offer never reaches it
+                            // ahead of a footprint the daemon already had.
+                            if let Some(update) = self.footprint_update(&mut footprint_sent) {
+                                write_frame(&mut wr, &update).await?;
+                            }
                             write_frame(&mut wr, &frame).await?;
                             continue;
                         }
@@ -2200,9 +2226,10 @@ impl DelegateHost {
             match serde_json::from_str::<DelegateFrame>(&line) {
                 Ok(DelegateFrame::Ping) => {
                     write_frame(&mut wr, &DelegateFrame::Pong).await?;
-                    // #1882 — a grown footprint rides the worker's own liveness
-                    // cadence: the overlay may join well after the worker
-                    // attached, and this loop has no timer of its own.
+                    // #1882 — and behind the pong, a grown footprint that no
+                    // growth signal announced (#3359 pushes the daemon's own
+                    // at once, above): a source other than the process's
+                    // footprint is read only here.
                     if let Some(frame) = self.footprint_update(&mut footprint_sent) {
                         write_frame(&mut wr, &frame).await?;
                     }
@@ -2944,6 +2971,7 @@ pub(crate) mod tests {
     /// #1882 — the daemon tells an attached worker the overlay's blocks: right
     /// after `attached`, and again after a `pong` once they have grown — never
     /// twice for the same set, so liveness does not turn into a broadcast.
+    /// (#3359's push at the moment of growth has cells of its own below.)
     #[tokio::test]
     async fn the_daemon_pushes_its_overlay_footprint_to_the_worker() {
         let a = (std::net::Ipv4Addr::new(100, 65, 4, 0), 22);
@@ -2983,13 +3011,22 @@ pub(crate) mod tests {
         // next ping's pong would otherwise come second).
         cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
         assert!(matches!(next(&mut lines).await, DelegateFrame::Pong));
-        // Grown: the next ping's pong carries the new set behind it.
+        // Grown: the next ping's pong carries the new set behind it. #3359 —
+        // or the set goes out ahead of the pong: another test that records a
+        // block in this process wakes the push, which then reads this source
+        // too. Either order, the grown set exactly once.
         TEST_FOOTPRINT.lock().unwrap().push(b);
         cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
-        assert!(matches!(next(&mut lines).await, DelegateFrame::Pong));
-        match next(&mut lines).await {
-            DelegateFrame::OverlayFootprint { v4_nets } => assert_eq!(v4_nets, [a, b]),
-            other => panic!("expected the grown footprint, got {other:?}"),
+        let (mut ponged, mut grown) = (false, false);
+        while !(ponged && grown) {
+            match next(&mut lines).await {
+                DelegateFrame::Pong if !ponged => ponged = true,
+                DelegateFrame::OverlayFootprint { v4_nets } if !grown => {
+                    assert_eq!(v4_nets, [a, b]);
+                    grown = true;
+                }
+                other => panic!("expected the pong and the grown footprint, got {other:?}"),
+            }
         }
 
         // ⚠️ Both halves: the daemon sees EOF only when the whole client
@@ -2998,6 +3035,135 @@ pub(crate) mod tests {
         drop(cwr);
         drop(lines);
         tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the daemon loop ends with its channel")
+            .unwrap();
+    }
+
+    /// #3359 — the next frame from the daemon, or `None` when none comes
+    /// within `wait`.
+    async fn within<R: tokio::io::AsyncBufRead + Unpin>(
+        lines: &mut tokio::io::Lines<R>,
+        wait: std::time::Duration,
+    ) -> Option<DelegateFrame> {
+        let line = tokio::time::timeout(wait, lines.next_line()).await.ok()?;
+        let line = line.unwrap().expect("a frame, not EOF");
+        Some(serde_json::from_str(&line).unwrap())
+    }
+
+    /// #3359 — read a fresh channel up to a settled point: `attached`, then
+    /// a pong behind whatever footprint went out on attach.
+    async fn settle<R, W>(lines: &mut tokio::io::Lines<R>, wr: &mut W)
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let five = std::time::Duration::from_secs(5);
+        assert!(matches!(
+            within(lines, five).await,
+            Some(DelegateFrame::Attached { .. })
+        ));
+        wr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        loop {
+            match within(lines, five).await {
+                Some(DelegateFrame::Pong) => break,
+                Some(DelegateFrame::OverlayFootprint { .. }) => continue,
+                other => panic!("expected the pong, got {other:?}"),
+            }
+        }
+    }
+
+    /// #3359 — a grown footprint goes to the worker the moment it grows, not
+    /// with the worker's next ping. The source is the process's own footprint,
+    /// as in the daemon. Once the channel has settled (a pong behind whatever
+    /// went out on attach), a block is recorded, and the frame that carries it
+    /// arrives with no ping sent.
+    #[tokio::test]
+    async fn a_grown_footprint_reaches_the_worker_without_waiting_for_a_ping() {
+        // Process-global: asserts only on a block this test owns.
+        let block = (std::net::Ipv4Addr::new(100, 72, 12, 0), 22);
+        let host = DelegateHost::new();
+        host.set_overlay_footprint(tunnel_core::overlay_footprint::v4_nets);
+        let secret = host.mint();
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (rd, wr) = tokio::io::split(server);
+        let h = host.clone();
+        let task = tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+        let (crd, mut cwr) = tokio::io::split(client);
+        let mut lines = BufReader::new(crd).lines();
+        let five = std::time::Duration::from_secs(5);
+        settle(&mut lines, &mut cwr).await;
+        tunnel_core::overlay_footprint::note_v4_blocks(&[block]);
+        // No ping from here on: a frame that carries the block is there
+        // because the footprint grew.
+        loop {
+            match within(&mut lines, std::time::Duration::from_secs(3)).await {
+                Some(DelegateFrame::OverlayFootprint { v4_nets }) if v4_nets.contains(&block) => {
+                    break;
+                }
+                // Another test's block, recorded meanwhile in this process.
+                Some(DelegateFrame::OverlayFootprint { .. }) => continue,
+                Some(other) => panic!("expected the grown footprint, got {other:?}"),
+                None => panic!(
+                    "no footprint frame within 3 s of the block being recorded, with no ping sent: \
+                     the push waits for the worker's next pong"
+                ),
+            }
+        }
+
+        drop(cwr);
+        drop(lines);
+        tokio::time::timeout(five, task)
+            .await
+            .expect("the daemon loop ends with its channel")
+            .unwrap();
+    }
+
+    /// #3359 — the worker needs no wait for its first push, because the order
+    /// closes the window: a frame queued for the worker after the footprint
+    /// grew goes out BEHIND the grown footprint. The worker reads its channel
+    /// in order, so an offer the daemon forwards never reaches it ahead of a
+    /// block the daemon had recorded by then, and the session that offer
+    /// starts filters by that block.
+    #[tokio::test]
+    async fn a_frame_for_the_worker_goes_out_behind_the_footprint_grown_before_it() {
+        // Process-global: asserts only on a block this test owns.
+        let block = (std::net::Ipv4Addr::new(100, 72, 20, 0), 22);
+        let host = DelegateHost::new();
+        host.set_overlay_footprint(tunnel_core::overlay_footprint::v4_nets);
+        let secret = host.mint();
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (rd, wr) = tokio::io::split(server);
+        let h = host.clone();
+        let task = tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+        let (crd, mut cwr) = tokio::io::split(client);
+        let mut lines = BufReader::new(crd).lines();
+        let five = std::time::Duration::from_secs(5);
+        settle(&mut lines, &mut cwr).await;
+
+        tunnel_core::overlay_footprint::note_v4_blocks(&[block]);
+        assert!(
+            host.send_to_worker(None, &ServerMsg::KeepBusyPolicy { denied: true }),
+            "queued for the worker"
+        );
+        let mut told = false;
+        loop {
+            match within(&mut lines, five).await {
+                Some(DelegateFrame::OverlayFootprint { v4_nets }) => {
+                    told |= v4_nets.contains(&block);
+                }
+                Some(DelegateFrame::ToWorker { .. }) => break,
+                other => panic!("expected the footprint, then the queued frame; got {other:?}"),
+            }
+        }
+        assert!(
+            told,
+            "the queued frame went out ahead of the block the daemon had recorded before it"
+        );
+
+        drop(cwr);
+        drop(lines);
+        tokio::time::timeout(five, task)
             .await
             .expect("the daemon loop ends with its channel")
             .unwrap();
@@ -4655,6 +4821,59 @@ mod params_tests {
         assert!(!older.contains("rc_overlay"), "{older}");
         let back: SessionParams = serde_json::from_str(&older).unwrap();
         assert!(!back.rc_overlay.unwrap_or_default().allow);
+    }
+
+    /// #3359 — the worker's half. A session the daemon handed while its
+    /// footprint was still empty (requested before the overlay knew its
+    /// blocks) keeps the overlay address out of every filter once the daemon's
+    /// push has landed in the worker: the worker records what it is told, and
+    /// each filter reads the footprint as it stands, not only the copy the
+    /// session carried.
+    #[test]
+    fn a_session_handed_an_empty_footprint_filters_once_the_push_lands() {
+        // Process-global: asserts only on a block this test owns.
+        let mut p = params(
+            &bson::oid::ObjectId::new().to_hex(),
+            roomler_ai_remote_control::permissions::Permissions::all(),
+        );
+        p.rc_overlay = Some(crate::rc_overlay::RcOverlay::resolve_ranked(
+            false,
+            None,
+            crate::rc_overlay::RankMode::Off,
+            Vec::new(),
+        ));
+        let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(p))).unwrap();
+        let handed = match worker_lane(serde_json::from_str(&wire).unwrap()) {
+            WorkerLane::Inbound(WorkerInbound::Params(p)) => {
+                p.rc_overlay.expect("the decision crossed")
+            }
+            other => panic!("expected the params on the inbound lane, got {other:?}"),
+        };
+        assert!(!handed.allow && handed.v4_nets.is_empty(), "{handed:?}");
+
+        // The daemon's push as the worker reads it off the channel, and what
+        // the worker's attach loop does with it (`delegate_worker`).
+        let block = (std::net::Ipv4Addr::new(100, 72, 16, 0), 22);
+        let push = serde_json::to_string(&DelegateFrame::OverlayFootprint {
+            v4_nets: vec![block],
+        })
+        .unwrap();
+        match worker_lane(serde_json::from_str(&push).unwrap()) {
+            WorkerLane::Here(DelegateFrame::OverlayFootprint { v4_nets }) => {
+                tunnel_core::overlay_footprint::note_v4_blocks(&v4_nets);
+            }
+            other => panic!("expected the footprint on the attach loop's lane, got {other:?}"),
+        }
+        assert_eq!(
+            crate::rc_overlay::four_filters(&handed, "100.72.16.7"),
+            [false; 4],
+            "the overlay address, in keeps_local, keeps_remote_candidate, strip_sdp and ice_servers"
+        );
+        assert_eq!(
+            crate::rc_overlay::four_filters(&handed, "100.73.9.9"),
+            [true; 4],
+            "an address in no recorded block"
+        );
     }
 
     /// FR-85 P1e-mac — the record context crosses intact, and a frame from a

@@ -81,6 +81,17 @@ describe('the link hub page', () => {
     expect(INSTALL_PAGES).toContain('/docs/start/quickstart/')
   })
 
+  it('calls the daemon the daemon, in its text, its description and the footer every page shares (FR-133 P3)', () => {
+    const doc = parse(html())
+    const said = [
+      doc.body.textContent ?? '',
+      doc.querySelector('meta[name="description"]')?.getAttribute('content') ?? '',
+      LINKS_DESCRIPTION,
+    ].join('\n')
+    expect(said).not.toMatch(/\bagents?\b/i)
+    expect(doc.querySelector('.site-footer__blurb')?.textContent).toContain('one daemon you can self-host')
+  })
+
   it('leaves the blog out when there is none, as every other page does', () => {
     const doc = parse(html({ current: 'links', hasBlog: false }))
     expect(hrefs(doc)).not.toContain('/blog/')

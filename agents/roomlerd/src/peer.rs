@@ -488,10 +488,9 @@ impl AgentPeer {
         setting.set_interface_filter(Box::new(|name: &str| !is_overlay_iface(name)));
         // #1882 — unless the device lets remote desktop use the overlay, keep
         // its ADDRESSES out of the host candidates too, whatever the interface
-        // is called: the overlay's own blocks and the derived-v6 ULA, never the
-        // whole CGNAT `/10` (the CGNAT caveat above still holds). Remote
-        // candidates and ICE servers get the same rule below and in
-        // `add_remote_candidate`.
+        // is called: the overlay's blocks as they stand when ICE asks (#3359)
+        // and the derived-v6 ULA, never the whole CGNAT `/10`. Remote
+        // candidates and ICE servers get the same rule below and in `add_remote_candidate`.
         if !rc_overlay.allow {
             let keep = rc_overlay.clone();
             setting.set_ip_filter(Box::new(move |ip| keep.keeps_local(ip)));
@@ -510,7 +509,8 @@ impl AgentPeer {
         l0::apply(&mut setting);
         info!(
             session = %session_id,
-            overlay_blocks = rc_overlay.v4_nets.len(),
+            overlay_blocks = rc_overlay.overlay_blocks(),
+            overlay_blocks_carried = rc_overlay.v4_nets.len(),
             srtp_replay_window = transport.replay_window,
             dtls_gcm_only = transport.gcm_only,
             "rc ICE: overlay {}",

@@ -384,14 +384,27 @@ fn lock_at(path: &Path, euid: u32) -> Result<AcquireOutcome> {
     Ok(AcquireOutcome::Acquired(InstanceLock { _unix: file }))
 }
 
+/// The lock file for `id`: in this account's runtime folder, else its cache
+/// folder. #3866: on Linux they are its own folders (`appdirs::own_folders`),
+/// so a root process takes its lock in root's own cache folder beneath
+/// `/root`, whatever `HOME` or `XDG_RUNTIME_DIR` it was given, and a person's
+/// in `$XDG_RUNTIME_DIR`, else their cache folder.
 #[cfg(all(unix, not(target_os = "windows")))]
 fn unix_lock_path(id: &str) -> Result<std::path::PathBuf> {
-    use directories::BaseDirs;
-    let dirs = BaseDirs::new().context("could not resolve a base dir")?;
-    let parent = dirs
-        .runtime_dir()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| dirs.cache_dir().to_path_buf());
+    #[cfg(target_os = "linux")]
+    let parent = {
+        let own =
+            roomler_node_core::appdirs::own_folders().context("could not resolve a base dir")?;
+        own.runtime.unwrap_or(own.cache)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let parent = {
+        use directories::BaseDirs;
+        let dirs = BaseDirs::new().context("could not resolve a base dir")?;
+        dirs.runtime_dir()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| dirs.cache_dir().to_path_buf())
+    };
     Ok(parent.join(format!("roomler-agent-{id}.lock")))
 }
 

@@ -6,7 +6,7 @@ order: 4
 ---
 
 MeshCentral is the closest thing to a direct predecessor: self-hosted,
-agent-based, browser-based remote control of a fleet, free and open source
+agent-based, browser-based remote control of a fleet, free and open source <!-- AGENT-WORD-KEPT: MeshCentral's own architecture, built on its agent (another program's agent) -->
 (Apache-2.0).
 
 :::tip If you already run MeshCentral and it works
@@ -18,7 +18,7 @@ This page is unlikely to move you, and that is a reasonable outcome.
 :::cards
 - **Breadth of fleet management** icon:blueprint — Hardware inventory, power control, out-of-band management, software deployment, terminal, file manager, device groups. A genuine RMM surface; Roomler's fleet features are narrower.
 - **Maturity** icon:check — More than a decade of production use, an enormous documentation corpus, and a long tail of solved deployment problems.
-- **Protocol breadth** icon:external — RDP, VNC and SSH relayed through the web interface, reaching devices that will never run its agent.
+- **Protocol breadth** icon:external — RDP, VNC and SSH relayed through the web interface, reaching devices that will never run its agent. <!-- AGENT-WORD-KEPT: MeshCentral's agent (another program's agent) -->
 - **Apache-2.0 throughout** icon:book — No licence split and no commercial edition to reason about. Simpler than Roomler's AGPL server if any copyleft is a problem for you.
 - **Runs on very little** icon:terminal — It will live happily on hardware where Roomler's stack would not.
 :::
@@ -64,14 +64,14 @@ On the same server and accounts.
 | RDP / VNC / SSH relaying to third-party devices | **No** | Yes |
 | Hardware inventory, power control, OOB | **No** | Yes |
 | Chat and video | **Included** | No |
-| Licence | AGPL server / MPL agent | Apache-2.0 |
+| Licence | AGPL server / MPL daemon | Apache-2.0 |
 | Maturity | Young | Very mature |
 
 ## Choosing
 
 :::steps
 1. **You want an RMM** — inventory, power control, out-of-band management → MeshCentral.
-2. **You need to reach devices that will never run an agent**, via RDP or VNC relaying → MeshCentral.
+2. **You need to reach devices you can never install anything on**, via RDP or VNC relaying → MeshCentral.
 3. **You want the devices to reach each other**, not just be reachable from a console → Roomler.
 4. **Server bandwidth or a server-in-the-path trust concern matters** → Roomler's peer-to-peer sessions.
 5. **Any copyleft is a procurement problem** → MeshCentral's Apache-2.0 is simpler.

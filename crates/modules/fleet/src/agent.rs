@@ -22,7 +22,11 @@ use roomler_ai_services::dao::tenant::TenantDao;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
-use roomler_core::{ApiError, extractors::auth::AuthUser};
+use roomler_core::{
+    ApiError,
+    client_ip::{PeerAddr, client_ip_or_peer},
+    extractors::auth::AuthUser,
+};
 
 use crate::FleetState;
 
@@ -878,6 +882,384 @@ pub async fn self_renew(
         agent_token,
         expires_at,
     }))
+}
+
+/// FR-155 — what `POST /api/agent/self/rotate` takes.
+#[derive(Debug, Deserialize)]
+pub struct RotateRequest {
+    /// Base64 of 32 random bytes. The server keeps only its sha256, which
+    /// lets the device ask again for an answer that was lost.
+    pub rotation_key: String,
+}
+
+/// The rotation key's sha256 as lowercase hex, or `None` unless it is the
+/// standard base64 of exactly 32 bytes.
+fn rotation_key_sha256(rotation_key: &str) -> Option<String> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(rotation_key)
+        .ok()?;
+    (key.len() == 32).then(|| hex::encode(sha2::Sha256::digest(&key)))
+}
+
+/// A first commit waits this long after the device's last rotation.
+const ROTATION_INTERVAL_MS: i64 = 60 * 60 * 1000;
+
+/// What `POST /api/agent/self/rotate` answers when it mints nothing: an
+/// [`ApiError`], or 429 for a first call within the hour of the device's last
+/// rotation.
+#[derive(Debug)]
+pub enum RotateError {
+    Api(ApiError),
+    RateLimited,
+}
+
+impl From<ApiError> for RotateError {
+    fn from(e: ApiError) -> Self {
+        Self::Api(e)
+    }
+}
+
+impl axum::response::IntoResponse for RotateError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Api(e) => e.into_response(),
+            Self::RateLimited => (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "rate_limited",
+                    "message": "this device rotated its token less than an hour ago; try again later",
+                })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// One rotation decision's audit row: who asked, from where, with which
+/// generation. Every outcome of the route goes through [`Self::record`].
+struct RotationAudit<'a> {
+    state: &'a FleetState,
+    caller: crate::auth_agent::RotationCaller,
+    client_ip: Option<String>,
+}
+
+impl RotationAudit<'_> {
+    /// Best-effort: a failed write is logged and never changes the answer.
+    async fn record(&self, decision: &str, reason: Option<&str>, gen_to: Option<u32>) {
+        let event = roomler_ai_remote_control::models::TokenRotationAuditEvent {
+            id: None,
+            tenant_id: self.caller.tenant_id,
+            agent_id: self.caller.agent_id,
+            at: DateTime::now(),
+            decision: decision.to_string(),
+            reason: reason.map(str::to_string),
+            client_ip: self.client_ip.clone(),
+            gen_from: self.caller.generation,
+            gen_to,
+        };
+        if let Err(e) = self.state.token_rotation_audit.record(&event).await {
+            tracing::warn!(
+                agent_id = %self.caller.agent_id, decision, %e,
+                "fr-155: could not record the rotation decision"
+            );
+        }
+    }
+}
+
+/// POST /api/agent/self/rotate — FR-155: a device trades its agent token for
+/// one of the next generation, and a token of any generation below it is
+/// refused from then on (`generation_refusal`). Body
+/// `{"rotation_key": "<base64 of 32 random bytes>"}`; the answer is the
+/// renewal's shape, minted at G+1.
+///
+/// Admission is its own path (`auth_agent::authenticate_for_rotation`, then
+/// the row and `auth_agent::rotation_admission`). A token of the row's
+/// generation is a first call, committed by one conditional update
+/// (`AgentDao::rotate_token`): one rotation per generation, and at most one
+/// first rotation an hour per device (429 above it). A token one generation
+/// below, with the rotation key of the rotation that made the row's
+/// generation, asks again for an answer that was lost: it is minted at the
+/// row's generation, nothing else changes, and the hour does not apply.
+///
+/// 404 to a first call while `rc.agent_token_rotation` is off (a call asking
+/// again is answered either way, so switching it off never leaves a device
+/// without the answer to a rotation already made), and to every call while
+/// `rc.token_generation_check` is off. Each decision is audited
+/// (`token_rotation_audit`) with the caller's address and the generations.
+pub async fn self_rotate(
+    State(state): State<FleetState>,
+    headers: axum::http::HeaderMap,
+    PeerAddr(peer): PeerAddr,
+    body: Result<Json<RotateRequest>, JsonRejection>,
+) -> Result<Json<RenewedAgentToken>, RotateError> {
+    let client_ip = client_ip_or_peer(&headers, peer, state.settings.app.rate_limit_trusted_hops)
+        .map(|ip| ip.to_string());
+    let caller = crate::auth_agent::authenticate_for_rotation(&state, &headers);
+
+    // Before anything else, as renewal's switch is: a rotation that refuses
+    // nothing must never be recorded as done on a device.
+    if !state.settings.rc.token_generation_check {
+        if let Ok(caller) = caller {
+            let audit = RotationAudit {
+                state: &state,
+                caller,
+                client_ip,
+            };
+            audit
+                .record("unsupported", Some("token_generation_check"), None)
+                .await;
+        }
+        return Err(ApiError::NotFound(
+            "token rotation is switched off on this server".to_string(),
+        )
+        .into());
+    }
+    // A token that does not verify names no device: refused, with no row.
+    let caller = caller?;
+    let audit = RotationAudit {
+        state: &state,
+        caller,
+        client_ip,
+    };
+
+    // The row on the primary, tombstone included, so a removed device is told so.
+    let agent = match state
+        .agents
+        .find_any_in_tenant_on_the_primary(caller.tenant_id, caller.agent_id)
+        .await
+    {
+        Ok(agent) => agent,
+        Err(DaoError::NotFound) => {
+            audit.record("refused", Some("row_gone"), None).await;
+            return Err(ApiError::Unauthorized("no such device".to_string()).into());
+        }
+        Err(e) => return Err(ApiError::Internal(format!("device lookup: {e}")).into()),
+    };
+    if let Some(reason) = crate::auth_agent::refusal_reason(&agent) {
+        let code = if agent.deleted_at.is_some() {
+            "removed"
+        } else {
+            "quarantined"
+        };
+        audit
+            .record("refused", Some(code), Some(agent.token_gen))
+            .await;
+        return Err(ApiError::Unauthorized(reason.to_string()).into());
+    }
+
+    // The body, once the caller is known (#4187's order).
+    let key_sha256 = match body {
+        Err(rejection) => {
+            audit
+                .record("refused", Some("invalid_request"), Some(agent.token_gen))
+                .await;
+            return Err(ApiError::from(rejection).into());
+        }
+        Ok(Json(request)) => match rotation_key_sha256(&request.rotation_key) {
+            Some(hash) => hash,
+            None => {
+                audit
+                    .record("refused", Some("invalid_request"), Some(agent.token_gen))
+                    .await;
+                return Err(ApiError::BadRequest(
+                    "rotation_key must be the base64 of 32 bytes".to_string(),
+                )
+                .into());
+            }
+        },
+    };
+
+    let now = chrono::Utc::now();
+    match crate::auth_agent::rotation_admission(
+        caller.generation,
+        caller.exp,
+        now.timestamp(),
+        agent.token_gen,
+        agent.token_rotation.as_ref(),
+        &key_sha256,
+    ) {
+        crate::auth_agent::RotationAdmission::Replay => {
+            return answer_again(&state, &audit, &agent).await;
+        }
+        crate::auth_agent::RotationAdmission::Refused(refusal) => {
+            return refuse_rotation(&audit, refusal, agent.token_gen).await;
+        }
+        crate::auth_agent::RotationAdmission::First => {}
+    }
+    if !state.settings.rc.agent_token_rotation {
+        audit
+            .record(
+                "unsupported",
+                Some("agent_token_rotation"),
+                Some(agent.token_gen),
+            )
+            .await;
+        return Err(ApiError::NotFound(
+            "token rotation is switched off on this server".to_string(),
+        )
+        .into());
+    }
+    let Some(next_gen) = caller.generation.checked_add(1) else {
+        return refuse_rotation(
+            &audit,
+            crate::auth_agent::RotationRefusal::Generation,
+            agent.token_gen,
+        )
+        .await;
+    };
+
+    let ttl = state.settings.rc.agent_token_ttl_secs;
+    let expires = now + chrono::Duration::seconds(ttl as i64);
+    let rotation = roomler_ai_remote_control::models::TokenRotation {
+        generation: next_gen,
+        key_sha256,
+        at: DateTime::from_millis(now.timestamp_millis()),
+    };
+    let last_rotation_before = DateTime::from_millis(now.timestamp_millis() - ROTATION_INTERVAL_MS);
+    let committed = state
+        .agents
+        .rotate_token(
+            caller.tenant_id,
+            caller.agent_id,
+            caller.generation,
+            &rotation,
+            last_rotation_before,
+            expires.timestamp(),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("token rotation: {e}")))?;
+    if committed {
+        audit.record("first", None, Some(next_gen)).await;
+        let agent_token = state
+            .auth
+            .renew_agent_token(caller.agent_id, caller.tenant_id, next_gen, Some(ttl))
+            .map_err(ApiError::from)?;
+        let expires_at = expires.to_rfc3339();
+        tracing::info!(
+            tenant_id = %caller.tenant_id, agent_id = %caller.agent_id,
+            from = caller.generation, to = next_gen, %expires_at,
+            "fr-155: agent token rotated"
+        );
+        return Ok(Json(RenewedAgentToken {
+            agent_token,
+            expires_at,
+        }));
+    }
+
+    // The update matched nothing: read the row again, on the primary, and
+    // say why. The answer to a rotation made with this same key is given; a
+    // row that meets every condition of the update but the hour waits (429);
+    // anything else is refused.
+    let row = match state
+        .agents
+        .find_any_in_tenant_on_the_primary(caller.tenant_id, caller.agent_id)
+        .await
+    {
+        Ok(row) => row,
+        Err(DaoError::NotFound) => {
+            audit.record("refused", Some("row_gone"), None).await;
+            return Err(ApiError::Unauthorized("no such device".to_string()).into());
+        }
+        Err(e) => return Err(ApiError::Internal(format!("device lookup: {e}")).into()),
+    };
+    if let Some(reason) = crate::auth_agent::refusal_reason(&row) {
+        let code = if row.deleted_at.is_some() {
+            "removed"
+        } else {
+            "quarantined"
+        };
+        audit
+            .record("refused", Some(code), Some(row.token_gen))
+            .await;
+        return Err(ApiError::Unauthorized(reason.to_string()).into());
+    }
+    match crate::auth_agent::rotation_admission(
+        caller.generation,
+        caller.exp,
+        now.timestamp(),
+        row.token_gen,
+        row.token_rotation.as_ref(),
+        &rotation.key_sha256,
+    ) {
+        crate::auth_agent::RotationAdmission::Replay => answer_again(&state, &audit, &row).await,
+        crate::auth_agent::RotationAdmission::Refused(refusal) => {
+            refuse_rotation(&audit, refusal, row.token_gen).await
+        }
+        crate::auth_agent::RotationAdmission::First => {
+            let within_the_hour = row
+                .token_rotation
+                .as_ref()
+                .is_some_and(|last| last.at >= last_rotation_before);
+            if within_the_hour {
+                audit
+                    .record("rate_limited", None, Some(row.token_gen))
+                    .await;
+                tracing::info!(
+                    agent_id = %caller.agent_id, row_gen = row.token_gen,
+                    "fr-155: a first rotation within the hour of the last one waits"
+                );
+                return Err(RotateError::RateLimited);
+            }
+            // Every condition holds as read, yet the update matched nothing.
+            audit
+                .record("refused", Some("not_committed"), Some(row.token_gen))
+                .await;
+            tracing::warn!(
+                agent_id = %caller.agent_id, row_gen = row.token_gen,
+                "fr-155: the rotation's update matched nothing on a row that meets its conditions"
+            );
+            Err(ApiError::Unauthorized("the rotation was not committed".to_string()).into())
+        }
+    }
+}
+
+/// The answer to the row's last rotation, asked again: minted at the row's
+/// generation, and the row is not written.
+async fn answer_again(
+    state: &FleetState,
+    audit: &RotationAudit<'_>,
+    row: &Agent,
+) -> Result<Json<RenewedAgentToken>, RotateError> {
+    let ttl = state.settings.rc.agent_token_ttl_secs;
+    let agent_token = state
+        .auth
+        .renew_agent_token(
+            audit.caller.agent_id,
+            audit.caller.tenant_id,
+            row.token_gen,
+            Some(ttl),
+        )
+        .map_err(ApiError::from)?;
+    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(ttl as i64)).to_rfc3339();
+    audit.record("replay", None, Some(row.token_gen)).await;
+    tracing::info!(
+        tenant_id = %audit.caller.tenant_id, agent_id = %audit.caller.agent_id,
+        token_gen = row.token_gen, %expires_at,
+        "fr-155: the answer to the device's last rotation, asked again"
+    );
+    Ok(Json(RenewedAgentToken {
+        agent_token,
+        expires_at,
+    }))
+}
+
+/// A 401 for a token the rotation's admission does not admit, audited.
+async fn refuse_rotation(
+    audit: &RotationAudit<'_>,
+    refusal: crate::auth_agent::RotationRefusal,
+    row_gen: u32,
+) -> Result<Json<RenewedAgentToken>, RotateError> {
+    audit
+        .record("refused", Some(refusal.code()), Some(row_gen))
+        .await;
+    tracing::info!(
+        agent_id = %audit.caller.agent_id, reason = refusal.code(),
+        token_gen = audit.caller.generation, row_gen,
+        "fr-155: refusing a token rotation"
+    );
+    Err(ApiError::Unauthorized(refusal.message().to_string()).into())
 }
 
 /// POST /api/agent/self/unenroll — an EPHEMERAL device removes itself

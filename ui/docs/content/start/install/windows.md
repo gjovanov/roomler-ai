@@ -1,11 +1,11 @@
 ---
 title: Install on Windows
-description: Install the Roomler agent on Windows with the signed MSI, the setup wizard or one PowerShell line — and pick the right service mode for your machine.
+description: Install the Roomler daemon on Windows with the signed MSI, the setup wizard or one PowerShell line — and pick the right service mode for your machine.
 tags: [install, windows, getting-started, enrollment]
 order: 10
 ---
 
-Windows has **three ways to run the agent**, and the choice matters more here
+Windows has **three ways to run the daemon**, and the choice matters more here
 than on the other platforms: it decides whether the machine is reachable at the
 lock screen, before anyone logs in, and through a UAC prompt.
 
@@ -70,7 +70,7 @@ through rather than at the beginning.
 
 | Item | What it is |
 |---|---|
-| `roomlerd.exe` | The agent — remote-desktop target, mesh node, tunnel endpoint, SSH server |
+| `roomlerd.exe` | The daemon — remote-desktop target, mesh node, tunnel endpoint, SSH server |
 | `roomler.exe` | The command-line tool. A small shim that re-execs the daemon's own command surface, so the CLI and the daemon can never disagree about their version |
 | `roomler-desktop.exe` | The tray companion: status, tunnels, and consent prompts |
 | `wintun.dll` + the VC runtime | The virtual network adapter and its C runtime dependency |
@@ -89,7 +89,7 @@ Get-AuthenticodeSignature "C:\Program Files\Roomler\roomlerd.exe" |
   Select-Object Status, @{n='Signer';e={$_.SignerCertificate.Subject}}
 ```
 
-`Status` should be `Valid` and the signer should name **G ROX LTD**. The agent's
+`Status` should be `Valid` and the signer should name **G ROX LTD**. The daemon's
 own auto-updater applies the same two checks — a valid signature *and* the
 expected publisher — and refuses an update that fails either.
 
@@ -108,7 +108,7 @@ roomler status
 | Machine-global config | `%PROGRAMDATA%\roomler\roomler\config.toml` |
 
 :::danger The config file holds a credential
-`config.toml` contains the agent token, and — if you enable SSH — the SSH host
+`config.toml` contains the device credential, and — if you enable SSH — the SSH host
 private key. The machine-global directory is explicitly hardened at install
 time, because ProgramData's default permissions are readable by all local users.
 Treat the file as a secret if you copy it anywhere.
@@ -116,7 +116,7 @@ Treat the file as a secret if you copy it anywhere.
 
 ## Keeping it updated
 
-The agent updates itself: it polls for a new release on a timer, verifies the
+The daemon updates itself: it polls for a new release on a timer, verifies the
 signature and the publisher, checks that the artifact's own embedded version
 matches what the release claimed, and only then hands off to the MSI. A build
 that crash-loops is rolled back to the last known-good version automatically.
