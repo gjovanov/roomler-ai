@@ -1589,7 +1589,8 @@ mod tests {
     async fn a_read_with_no_ice_agent_reads_unknown_and_the_carrier_stays_direct() {
         use CandidateKind::{Host, Prflx};
         let agent = host_peer().await;
-        let ice = agent.sctp().transport().ice_transport().clone();
+        let dtls = agent.sctp().transport();
+        let ice = dtls.ice_transport();
         let at_a_prflx = |held: Option<Vec<HeldRelay>>| {
             remote_relay_of(
                 Prflx,
@@ -1601,22 +1602,22 @@ mod tests {
         };
         // No agent yet: nothing is read, and the read makes no agent.
         assert!(ice.remote_candidates_stats().await.is_none());
-        assert_eq!(signalled_relays(&ice, REMOTE_READ_BUDGET).await, None);
+        assert_eq!(signalled_relays(ice, REMOTE_READ_BUDGET).await, None);
         assert_eq!(
-            at_a_prflx(signalled_relays(&ice, REMOTE_READ_BUDGET).await),
+            at_a_prflx(signalled_relays(ice, REMOTE_READ_BUDGET).await),
             RemoteRelay::Unknown
         );
         // The offer makes the agent: the read finishes and holds no relay.
         agent.create_data_channel("carrier", None).await.unwrap();
         let offer = agent.create_offer(None).await.unwrap();
         agent.set_local_description(offer).await.unwrap();
-        let held = signalled_relays(&ice, REMOTE_READ_BUDGET).await;
+        let held = signalled_relays(ice, REMOTE_READ_BUDGET).await;
         assert_eq!(held, Some(Vec::new()));
         assert_eq!(at_a_prflx(held), RemoteRelay::NotShown);
         // After close the agent is gone.
         agent.close().await.unwrap();
         assert!(ice.remote_candidates_stats().await.is_none());
-        let gone = at_a_prflx(signalled_relays(&ice, REMOTE_READ_BUDGET).await);
+        let gone = at_a_prflx(signalled_relays(ice, REMOTE_READ_BUDGET).await);
         assert_eq!(gone, RemoteRelay::Unknown);
         // `unknown` shows no relay: the label is what the types give.
         let view = pair_with(Host, "192.168.1.10", Prflx, "203.0.113.7", gone);
