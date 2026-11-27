@@ -2694,7 +2694,13 @@ serves it. So `sudo roomler …`, a cron job and a system service, which have no
 dir, go straight to `/var/run/roomler/roomler.sock`. On a **per-user** install the
 daemon's socket is that runtime dir's, and a command run without one (cron, `su`)
 answers `roomler daemon not running` with a note naming `XDG_RUNTIME_DIR`: run it with
-`XDG_RUNTIME_DIR=/run/user/$(id -u)`. A per-user daemon started without a private
+`XDG_RUNTIME_DIR=/run/user/$(id -u)`. Root's line names what it tried instead (#3937,
+`not_running_words_for`, `crates/localapi/src/lib.rs:5128`): `sudo roomler status` on
+such a host answers that there is no socket at `/var/run/roomler/roomler.sock`, the
+system daemon's, and that a per-user daemon answers only its own account, without
+`sudo`. It names the account `sudo` ran for when `SUDO_USER` holds a portable user
+name, and no longer asks whether the service is started: on a per-user install the
+system unit is disabled and has no config. A per-user daemon started without a private
 runtime dir serves no LocalAPI at all and logs `localapi: not served: …` with the
 reason.
 
@@ -3281,7 +3287,9 @@ the **root** half, because the two listen on different LocalAPI sockets
 (`$TMPDIR/roomler/roomler.sock`, in the person's own `/var/folders/…/T`, vs
 `/var/run/roomler/roomler.sock`). A command keeps a socket only when its own account
 or root serves it, and root never looks in a per-user temp folder (#3736). If a
-command reports "daemon not running", you are probably asking the wrong half.
+command reports "daemon not running", you are probably asking the wrong half. Under
+`sudo` the line says so itself (#3937): it names the socket it tried, the root half's,
+and says that a per-user daemon answers only its own account, without `sudo`.
 
 `roomler status` as the signed-in user carries the **root** half's overlay
 address, exit node and MagicDNS (FR-97 P2h lends them to the per-user half, which
