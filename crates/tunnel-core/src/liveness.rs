@@ -310,26 +310,34 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// The host clock, read on the clock the OS does not stop while the host
-    /// sleeps (Linux `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW`), in
-    /// milliseconds. `None` where `Instant` already counts sleep.
+    /// The clock that stops while the host sleeps (Linux `CLOCK_MONOTONIC`,
+    /// macOS `CLOCK_UPTIME_RAW`, `Instant`'s), in milliseconds, with how far
+    /// the host clock may read behind it on a host that never slept. `None`
+    /// where `Instant` already counts sleep.
     #[cfg(target_os = "linux")]
-    fn stopping_clock_ms() -> Option<u64> {
-        clock_ms(libc::CLOCK_MONOTONIC)
+    fn stopping_clock_ms() -> Option<(u64, u64)> {
+        // `CLOCK_BOOTTIME` is `CLOCK_MONOTONIC` plus the time suspended, on
+        // the same base: never behind it.
+        clock_ms(libc::CLOCK_MONOTONIC).map(|ms| (ms, 0))
     }
     #[cfg(target_os = "macos")]
-    fn stopping_clock_ms() -> Option<u64> {
-        clock_ms(libc::CLOCK_UPTIME_RAW)
+    fn stopping_clock_ms() -> Option<(u64, u64)> {
+        // `CLOCK_MONOTONIC` follows the clock's frequency adjustments, which
+        // the RAW clocks do not (clock_gettime(3)), so on a Mac that never
+        // slept it may read a slew's worth behind `CLOCK_UPTIME_RAW`. 1 % of
+        // the uptime is far above any slew, and far below the gap to a clock
+        // that starts with the process.
+        clock_ms(libc::CLOCK_UPTIME_RAW).map(|ms| (ms, ms / 100))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn stopping_clock_ms() -> Option<u64> {
+    fn stopping_clock_ms() -> Option<(u64, u64)> {
         None
     }
 
     /// FR-156 C1 — the host clock keeps real time in milliseconds, never runs
     /// back, and where `Instant` stops while the host sleeps it is the clock
-    /// that does not: since boot, and never behind the one that stops (their
-    /// gap is the time the host has slept).
+    /// that does not: since boot, and not behind the one that stops (their
+    /// gap is the time the host has slept, give or take a Mac's slew).
     #[test]
     fn the_host_clock_keeps_real_time_and_counts_the_hosts_sleep() {
         let a = host_ms();
@@ -346,12 +354,13 @@ mod tests {
             assert!(now >= last, "the host clock ran back: {last} -> {now}");
             last = now;
         }
-        if let Some(stopping) = stopping_clock_ms() {
+        if let Some((stopping, slack)) = stopping_clock_ms() {
             let host = host_ms();
             assert!(
-                host >= stopping,
+                host.saturating_add(slack) >= stopping,
                 "the host clock ({host} ms) is behind the clock that stops in sleep \
-                 ({stopping} ms): it is not the one that counts the host's sleep"
+                 ({stopping} ms, {slack} ms allowed): it is not the one that counts \
+                 the host's sleep"
             );
         }
     }
