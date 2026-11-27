@@ -964,6 +964,7 @@ mod tests {
             agent_token_hash: String::new(),
             token_gen: 0,
             token_exp: None,
+            token_rotation: None,
             status,
             last_seen_at: DateTime::now(),
             last_presence: None,

@@ -2378,9 +2378,9 @@ pub struct Agent {
     /// its `gen` claim equals this. Removing the device bumps it
     /// (`AgentDao::soft_delete`), so every token minted before the removal
     /// is refused, even after the same machine re-enrolls and revives this
-    /// row. Enrollment and renewal mint at the current value. 0 on every row
-    /// that was never removed, which is also what every pre-FR-103 token
-    /// carries.
+    /// row; so does a token rotation (FR-155, `AgentDao::rotate_token`).
+    /// Enrollment and renewal mint at the current value. 0 on a row never
+    /// removed or rotated, as on every pre-FR-103 token.
     #[serde(default)]
     pub token_gen: u32,
     /// FR-103: the `exp` of the agent token this device last connected with,
@@ -2389,6 +2389,10 @@ pub struct Agent {
     /// before it drops. `None` on rows that have not connected since FR-103.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_exp: Option<DateTime>,
+    /// FR-155: the device's last token rotation (`POST /api/agent/self/rotate`).
+    /// Absent on a row that never rotated; a revived row starts without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_rotation: Option<TokenRotation>,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
     /// P4 — the presence value (`online`/`stale`/`offline`) most recently
@@ -5717,6 +5721,60 @@ pub struct KeyRotationAuditEvent {
 
 impl KeyRotationAuditEvent {
     pub const COLLECTION: &'static str = "key_rotation_audit";
+}
+
+/// FR-155: what a token rotation records on the device row
+/// ([`Agent::token_rotation`]). It lets a device whose answer was lost ask
+/// again with the same rotation key and receive a token of the generation
+/// the rotation made, and its `at` is the once-an-hour ceiling.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TokenRotation {
+    /// The generation this rotation made.
+    #[serde(rename = "gen")]
+    pub generation: u32,
+    /// The sha256 of the rotation key's 32 bytes, lowercase hex. The key
+    /// itself is never stored.
+    pub key_sha256: String,
+    /// When the rotation committed.
+    pub at: DateTime,
+}
+
+/// FR-155 — one decision of `POST /api/agent/self/rotate`, in
+/// `token_rotation_audit`: a rotation that committed (`first`), the answer to
+/// one asked again with its rotation key (`replay`), a refusal with its reason
+/// (`refused`), a first call within the hour of the last rotation
+/// (`rate_limited`), or a call the server's switches answer 404
+/// (`unsupported`, the switch as the reason). The SERVER's record of what it
+/// decided. A request whose token does not verify names no device and has
+/// no row.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TokenRotationAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub at: DateTime,
+    /// `first`, `replay`, `refused`, `rate_limited` or `unsupported`.
+    pub decision: String,
+    /// Why, on a `refused` or `unsupported` row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The caller's address, by the server's one rule
+    /// (`roomler_core::client_ip`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
+    /// The generation of the token presented.
+    pub gen_from: u32,
+    /// The row's generation once the decision is made: one more than
+    /// `gen_from` after a `first`, and the row's as it stands otherwise.
+    /// `None` when the row was not read (it is gone, or a switch answered
+    /// first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen_to: Option<u32>,
+}
+
+impl TokenRotationAuditEvent {
+    pub const COLLECTION: &'static str = "token_rotation_audit";
 }
 
 /// What a device reported doing inside an SSH session (P8).

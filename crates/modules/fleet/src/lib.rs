@@ -53,6 +53,7 @@ use roomler_ai_services::dao::{
     external_principal::ExternalPrincipalDao, external_rc_audit::ExternalRcAuditDao,
     keep_busy_event::KeepBusyEventDao, pairing_audit::PairingAuditDao,
     rc_resume_scope::RcResumeScopeDao, setup_diagnostics::SetupDiagnosticsDao,
+    token_rotation_audit::TokenRotationAuditDao,
 };
 use roomler_core::{
     Capabilities, Core, Module, TenantCtx,
@@ -154,6 +155,9 @@ pub struct FleetState {
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
+    /// FR-155 — every decision of `POST /api/agent/self/rotate`, with the
+    /// caller's address and the generations.
+    pub token_rotation_audit: Arc<TokenRotationAuditDao>,
     /// FR-92 P7 — the permanent keep-busy history: the server's own policy
     /// changes and the devices' reported ons and offs, told apart by
     /// `source`. No TTL (operator, 2026-10-11).
@@ -343,6 +347,7 @@ impl Module for FleetState {
             external_rc_audit: Arc::new(ExternalRcAuditDao::new(db)),
             external_principals: Arc::new(ExternalPrincipalDao::new(db)),
             config_audit: Arc::new(ConfigAuditDao::new(db)),
+            token_rotation_audit: Arc::new(TokenRotationAuditDao::new(db)),
             keep_busy_events: Arc::new(KeepBusyEventDao::new(db)),
             rc_resume_scope: Arc::new(RcResumeScopeDao::new(db)),
             rc_resume_reconcile: Arc::new(tokio::sync::Mutex::new(())),
@@ -560,6 +565,9 @@ impl Module for FleetState {
             // FR-103 — a device renews its own agent token (a bounded grace
             // past `exp`, the row checked like `AuthAgent`).
             .route("/self/renew", post(agent::self_renew))
+            // FR-155 — a device trades its agent token for one of the next
+            // generation (its own admission path; off by default).
+            .route("/self/rotate", post(agent::self_rotate))
             // FR-94 — a Windows device's SYSTEM service. The anchor takes an
             // admin-issued enrollment token, and the claim and the result take
             // the service's OWN credential (`AuthAgentService`), never the
@@ -862,6 +870,17 @@ impl Module for FleetState {
                     index(bson::doc! { "tenant_id": 1, "at": -1 }),
                     index(bson::doc! { "agent_id": 1, "at": -1 }),
                     index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
+                    index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // FR-155 — the token-rotation decisions, kept as long as the
+            // config changes above.
+            IndexSet {
+                collection: "token_rotation_audit",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "tenant_id": 1, "at": -1 }),
+                    index(bson::doc! { "agent_id": 1, "at": -1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
                 ],
             },

@@ -442,6 +442,7 @@ async fn accepted_tunnel_client(
     if let Some(reason) = roomler_ai_mod_fleet::auth_agent::generation_refusal(
         generation,
         client.token_gen,
+        false, // a tunnel client does not rotate (FR-155)
         state.fleet.settings.rc.token_generation_check,
     ) {
         return Err(ApiError::Unauthorized(reason.to_string()));
