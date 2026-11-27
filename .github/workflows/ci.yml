@@ -3252,16 +3252,6 @@ jobs:
             runner: ubuntu-latest
             timeout: 15
             args: --lib
-            # The four upstream mDNS cells, skipped since FR-148 P4: one of
-            # them hung for minutes on a Windows box (measured 2026-11-17).
-            # The patch leaves src/mdns/ alone, but the two connection cells
-            # resolve the other agent's `.local` names, the path #1740
-            # patched.
-            skip: >-
-              mdns::mdns_test::test_generate_multicast_dnsname
-              mdns::mdns_test::test_multicast_dns_mixed_connection
-              mdns::mdns_test::test_multicast_dns_only_connection
-              mdns::mdns_test::test_multicast_dns_static_host_name
           - crate: webrtc-sctp
             runner: ubuntu-latest
             timeout: 15
