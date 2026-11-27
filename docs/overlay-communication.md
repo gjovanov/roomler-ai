@@ -1304,8 +1304,8 @@ match this node`), and an org-relay grant that needs them is refused.
   So the child usually exits before the daemon's run loop has heard the stop,
   and #1867's WARN used to go out on every restart. The daemon now marks its
   stop as the first thing each arm of `run`'s shutdown `select!` does
-  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5881`, `:5917`,
-  `:5929`). After the child exits, the supervisor waits out the first part of
+  (`roomlerd::note_stopping`, `agents/roomlerd/src/app.rs:5835`, `:5871`,
+  `:5883`). After the child exits, the supervisor waits out the first part of
   the backoff, at most 1 s (`STOP_GRACE`,
   `crates/tunnel-core/src/overlay/netstate.rs:1277`), before it says anything:
 
@@ -1815,7 +1815,7 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   `overlay::runtime_alive` (`agents/roomlerd/src/overlay.rs:122`): the tenant's
   runtime slot exists and its event channel is open. The daemon builds its
   LocalAPI state only with that probe (`DaemonState::for_daemon`,
-  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5238`); the
+  `localapi_state.rs:591`, from `agents/roomlerd/src/app.rs:5192`); the
   constructor without one is test-only.
 - **The mark** (`PeerInfo::control_down`, `crates/localapi/src/lib.rs:1026`) is
   additive. Its `since_ms` is when this device lost that socket, stamped by the
@@ -1824,7 +1824,7 @@ Each org's list is now decided by that org's own control socket (`fn peers`,
   the socket's 80 s receive deadline before. In a kept row `connection`,
   `stalled`, `rtt_ms` and `last_seen_ms` stay live, and `online` is the server's
   word from before the loss, never rewritten. A token refused at the upgrade is
-  kept and marked too: any HTTP 401 there refuses it (`signaling.rs:1874`), and a
+  kept and marked too: any HTTP 401 there refuses it (`signaling.rs:1880`), and a
   middlebox the machine trusts can answer one while the mesh runs on.
 - **Several orgs.** Each org's rows carry their own mark and time: the primary's
   outage no longer hides a secondary's live peers, and a secondary's outage no

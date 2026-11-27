@@ -167,10 +167,10 @@ exec roomlerd run
   ([`wix-perMachine/main.wxs:698-700`](../agents/roomlerd/wix-perMachine/main.wxs#L698-L700),
   [`win_service/lifecycle.rs:293`](../agents/roomlerd/src/win_service/lifecycle.rs#L293)).
   The worker takes either stop as an OS-initiated stop
-  ([`app.rs:5928-5935`](../agents/roomlerd/src/app.rs#L5928-L5935)), finds no
+  ([`app.rs:5882-5889`](../agents/roomlerd/src/app.rs#L5882-L5889)), finds no
   update in flight, and an ephemeral device deletes its own row, the one its
   run started as
-  ([`app.rs:6027-6036`](../agents/roomlerd/src/app.rs#L6027-L6036)).
+  ([`app.rs:5981-5990`](../agents/roomlerd/src/app.rs#L5981-L5990)).
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
@@ -254,7 +254,7 @@ A device's `ephemeral` (`crates/agent-core/src/config.rs:45-55`) is what the
 server answered the enrollment that wrote the file, on every enrollment. One
 that folds into a file already there keeps that file's settings and takes the
 rest from the fresh enrollment: the identity fields, and `ephemeral`
-(`preserve_operator_config`, `crates/agent-core/src/enrollment.rs:1049-1062`).
+(`preserve_operator_config`, `crates/agent-core/src/enrollment.rs:1051-1064`).
 That covers the three folds of `apply_enrollment` into the primary: onto a file
 with no enrollment in it (a one-row Mac person's), a `--replace`, and a
 re-enrollment into the same server and org. Before #4331 a fold kept the old
@@ -293,12 +293,12 @@ and a fold would put it on a real device's row.
 ### A second organization is never ephemeral (#4352)
 
 A secondary org (`[[orgs]]`) has no `ephemeral` (`OrgEntry`,
-`crates/agent-core/src/config.rs:1970-2028`), and a stop removes only the row
+`crates/agent-core/src/config.rs:1988-2046`), and a stop removes only the row
 its run started as ([below](#a-stop-removes-only-the-row-its-run-started-as-4352)),
 so nothing would ever remove an ephemeral secondary's row. An enrollment whose
 answer is ephemeral, and which would add an `[[orgs]]` entry or refresh one, is
-refused (`refuse_ephemeral_org`, `crates/agent-core/src/enrollment.rs:796-817`,
-decided in `apply_enrollment` at `:939-945`):
+refused (`refuse_ephemeral_org`, `crates/agent-core/src/enrollment.rs:798-819`,
+decided in `apply_enrollment` at `:941-947`):
 
 | The answer | The config file | The row |
 |---|---|---|
@@ -326,11 +326,11 @@ that swap would put an ephemeral row beside another org.
 
 The daemon keeps the row it started as: its primary's server, org, `agent_id`
 and `ephemeral` (`updater::RunRow`, taken at
-`agents/roomlerd/src/app.rs:4766`). On an OS stop the gate
+`agents/roomlerd/src/app.rs:4720`). On an OS stop the gate
 (`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
 unchanged) reads the run's own `ephemeral`, and the removal targets the run's
 own row (`updater::stop_removal`, `:5150-5179`, at
-`agents/roomlerd/src/app.rs:6027-6055`):
+`agents/roomlerd/src/app.rs:5981-6009`):
 
 | The file at the stop | The stop removes |
 |---|---|
