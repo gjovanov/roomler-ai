@@ -237,7 +237,7 @@ shows on the admin row and in `roomler status`, where the probe's reason does.
 | The failed setup is reverted first, off the select loop, and its retry starts only once the revert has finished | `runtime.rs:2970` (the retry arm), `pending_revert` | WinNAT skips an identical prefix and pf reuses the anchor's name: a retry over a half-reverted setup would stack rules that one revert cannot undo |
 | A retry waits 30 s · 2ⁿ, at most 30 min, minus up to 20 % jitter, and runs only while the offer is withdrawn | `nat_retry_delay` `nat.rs:369` | A host that keeps failing costs one setup per half hour, and a fleet does not retry in step |
 | A re-join goes out only when the routes, the failing step or the IPv6 statement change; a new reason text alone never sends one | `OfferTracker::on_setup` `nat.rs:450` | A command's stderr can differ from run to run, and every join rehydrates the node's row |
-| Every re-join is followed by what the server's rehydrate wipes: srflx (the keepalive task's own advert, else the startup snapshot), the relayed endpoint union, and a fresh netcheck | `rejoin_plan` `runtime.rs:4682`, shared with the control-WS Reattach (which sends no netcheck) | A join is an update on the server, and its rehydrate clears srflx, the NAT type, the dialer bit, the relayed endpoints and the measured capability vector |
+| Every re-join is followed by what the server's rehydrate wipes: srflx (the keepalive task's own advert, else the startup snapshot), the relayed endpoint union, and a fresh netcheck | `rejoin_plan` `runtime.rs:4684`, shared with the control-WS Reattach (which sends no netcheck) | A join is an update on the server, and its rehydrate clears srflx, the NAT type, the dialer bit, the relayed endpoints and the measured capability vector |
 | `ROOMLERD_ROUTE_OFFER_UNPROBED=1` keeps the offer whatever the setup did: no withdrawal, no retry, the partial setup kept | `OfferTracker::new` | The probe's own kill switch now covers the setup too |
 
 ### The exit states whether it serves IPv6
@@ -273,7 +273,7 @@ The exit's "no" wins over a missing pin: it is the stable reason, the one an
 operator can act on. A statement that changes under a live client is followed
 at the next reconcile, both ways. The reason reaches `roomler status` through
 `ExitNodeStatus.v6_withheld_reason` (`crates/localapi/src/lib.rs:99`), worded
-by `exit_node_state` (`agents/roomler-cli/src/localclient.rs:3186`); a netstack
+by `exit_node_state` (`agents/roomler-cli/src/localclient.rs:3199`); a netstack
 client states none, since it carries no global IPv6 at all.
 
 ### Deploy order
@@ -343,7 +343,7 @@ shows in `roomler status` (`… DNS steered` / `DNS NOT steered`).
 `process::exit` bypasses Rust's `Drop`, so the paths that hard-exit (watchdog
 stall, a fatal goodbye, a duplicate-instance loser, `roomlerd self-update` run
 by hand) never run RAII teardown. An auto-update is not one of them: it shuts
-the daemon down gracefully (`agents/roomlerd/src/updater.rs:3471`). Three sync,
+the daemon down gracefully (`agents/roomlerd/src/updater.rs:3483`). Three sync,
 context-free purges — `overlay::tun::purge_split_default()`,
 `overlay::tun::purge_stale_peer_routes()` and `overlay::dns::purge_exit_dns()`
 — are folded, with the host ledger's ([below](#exit-client-pins-fr-97-p0e)),

@@ -17,7 +17,10 @@
 //! - **[`repair`]** puts the chain back, in-process and by handle, never
 //!   through a junction or a symbolic link and with no `icacls` child (#3291).
 //!   An entry for another account on the parent is cut to read and execute
-//!   ([`parent_cut`]); the machine folder, once it holds a config that was the
+//!   ([`parent_cut`]); outside a save, only once the machine folder holds a
+//!   config, or the copy of a missing one, that was the machine's as found
+//!   (#4485: with neither, R changes nothing but the attempt record). The
+//!   machine folder, once it holds a config that was the
 //!   machine's as found or a save is writing one, becomes Administrators' with
 //!   SYSTEM and Administrators alone; the config, its `.prev`, the keys folder
 //!   and the key files get the same, and the attempt record the same with read for Users
@@ -66,9 +69,9 @@
 //!   its final path checked; what it makes sealed from creation; what it
 //!   writes made fresh and renamed into place by handle; a removal deleting
 //!   what the same walk opened. #3737's readers ([`PrivateFolder`]) walk the
-//!   same way. The crash records, the install clean-up (FR-145 P1) and the
-//!   daemon's key files in `peer-auth` (#3956: as R leaves them) use it;
-//!   the service logs and the other SYSTEM writers follow in P2 and P3.
+//!   same way. The crash records, the install clean-up (FR-145 P1), the key
+//!   files in `peer-auth` (#3956: as R leaves them) and a role process's
+//!   `service-logs` (P2) use it; the other SYSTEM writers follow in P3.
 //!
 //! Kill switches, read from the process environment only (the service's
 //! `Environment` block), never from the config: `ROOMLERD_MACHINE_TREE_REPAIR=0`
@@ -620,6 +623,13 @@ fn is_exactly(sd: &Sd, want: &[Ace]) -> bool {
 ///   parent's cut spares a right to replace the folder that an account other
 ///   than an administrator holds (`Role::Parent`).
 ///
+/// #4485 — outside a save, with neither a config nor its copy in the machine
+/// folder, R changes nothing but the attempt record: the parent and the
+/// machine folder keep their owners and entries until an elevated save of the
+/// machine config. When the parent holds an entry [`parent_cut`] would change,
+/// or an administrator's own account owns it, `left` says that it is left as
+/// it is ([`left_until_a_save`]).
+///
 /// R repairs the attempt record whatever it leaves, and says once in `left`
 /// what it leaves and why (one line for a tree it leaves as found). What was
 /// not closed stays refused, at this tick and every one after, until an
@@ -641,7 +651,11 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
     // config: a wrong answer may only keep a right the check then refuses.
     let holds_a_config = there(&tree.config());
     let holds_a_file = holds_a_config || there(&tree.prev());
-    if !writing && holds_a_file && !holds_the_machines(tree, holds_a_config, &mut out) {
+    // #4485 — outside a save, with neither file, nothing but the record changes.
+    if !writing && (!holds_a_file || !holds_the_machines(tree, holds_a_config, &mut out)) {
+        if !holds_a_file {
+            left_until_a_save(tree, &parent, &mut out);
+        }
         repair_path(&tree.record(), win::Kind::File, Role::Record, &mut out);
         return out;
     }
@@ -710,6 +724,32 @@ fn holds_the_machines(tree: &MachineTree, config: bool, out: &mut Repairs) -> bo
             ));
             false
         }
+    }
+}
+
+/// #4485 — outside a save, with neither a config nor its copy in the machine
+/// folder: one line in `left` when the parent (opened as `parent`) holds an
+/// entry [`parent_cut`] would change, or an administrator's own account owns
+/// it. Read only: the parent stays as it is until an elevated save of the
+/// machine config.
+#[cfg(windows)]
+fn left_until_a_save(tree: &MachineTree, parent: &win::Entry, out: &mut Repairs) {
+    let sd = match win::read_sd(&parent.file) {
+        Ok(sd) => sd,
+        Err(e) => {
+            out.left.push(format!(
+                "{}: reading its security: {e}",
+                tree.parent().display()
+            ));
+            return;
+        }
+    };
+    if parent_cut(&sd, |_| false).is_some() || win::classify(&sd.owner) == win::Owner::Admin {
+        out.left.push(format!(
+            "{} is left as it is until an elevated save of the machine config: the machine \
+             folder holds neither a config nor its copy",
+            tree.parent().display()
+        ));
     }
 }
 
@@ -4387,11 +4427,12 @@ mod tests {
         }
 
         /// A host with the service and no machine enrollment (waiting, or
-        /// attended): the repair leaves the machine folder as `%ProgramData%`
-        /// hands it down, so the person's own daemon may still stage files in
-        /// it, and the check says nothing at all. The parent's entry for an
-        /// account is still cut, and Users keep the right to add files and
-        /// folders that the parent inherits.
+        /// attended): the repair leaves the machine folder as it was, so the
+        /// person's own daemon may still stage files in it, and the check says
+        /// nothing at all. #4485 — `%ProgramData%\roomler` keeps an entry for
+        /// another account until an elevated save of the machine config, and
+        /// Users keep the right to add files and folders there that
+        /// `%ProgramData%` hands down.
         #[test]
         fn a_host_with_no_machine_config_keeps_its_folder_open_and_its_check_quiet() {
             if !elevated_or_skip("a waiting host") {
@@ -4407,9 +4448,14 @@ mod tests {
             repair(&tree, false);
             assert_eq!(
                 sddl(tree.folder()),
-                folder.replace("(A;OICIID;FA;;;BG)", "(A;OICIID;0x1200a9;;;BG)")
+                folder,
+                "the machine folder is as it was"
             );
             let parent = sddl(tree.parent());
+            assert!(
+                aces(&parent).contains(&"A;OICI;FA;;;BG".to_string()),
+                "another account's entry stays until an elevated save: {parent}"
+            );
             assert!(
                 aces(&parent).contains(&"A;CIID;DCLCRPCR;;;BU".to_string()),
                 "Users may still add files and folders: {parent}"
@@ -4418,6 +4464,91 @@ mod tests {
                 private_machine_config(&tree, Switches::ON),
                 Err(Refusal::Absent)
             );
+        }
+
+        /// Outside a save, a repair that finds neither a machine config nor
+        /// its copy in the machine folder changes nothing but the attempt
+        /// record: `%ProgramData%\roomler` keeps every entry it had, an
+        /// account's right to change it included, and the machine folder is
+        /// as it was.
+        #[test]
+        fn outside_a_save_a_repair_with_no_config_or_copy_changes_only_the_record() {
+            if !elevated_or_skip("a repair outside a save, with no config or copy") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            assert!(icacls(
+                tree.parent(),
+                &["/grant", "*S-1-5-32-546:(OI)(CI)F"]
+            ));
+            std::fs::write(tree.record(), b"{}").unwrap();
+            let parent = sddl(tree.parent());
+            let folder = sddl(tree.folder());
+            let repairs = repair(&tree, false);
+            assert_eq!(
+                sddl(tree.parent()),
+                parent,
+                "the parent's entries are as they were"
+            );
+            assert_eq!(
+                sddl(tree.folder()),
+                folder,
+                "the machine folder is as it was"
+            );
+            let record = tree.record().display().to_string();
+            assert!(
+                repairs.changed.iter().all(|line| line.starts_with(&record)),
+                "nothing but the record is changed: {repairs:?}"
+            );
+        }
+
+        /// #4485 — outside a save, with neither a machine config nor its copy,
+        /// what the repair leaves on `%ProgramData%\roomler` is one line in
+        /// `left`, the same at every tick, so it is logged once: for an entry
+        /// another account holds there, and for an administrator's own account
+        /// as its owner. A tree with neither gets no line, and no change.
+        #[test]
+        fn outside_a_save_a_repair_with_no_config_or_copy_says_what_it_leaves() {
+            if !elevated_or_skip("what a repair with no config or copy leaves") {
+                return;
+            }
+            let said = |tree: &MachineTree| Repairs {
+                changed: Vec::new(),
+                left: vec![format!(
+                    "{} is left as it is until an elevated save of the machine config: the \
+                     machine folder holds neither a config nor its copy",
+                    tree.parent().display()
+                )],
+            };
+            let plain_root = tempfile::tempdir().unwrap();
+            let plain = waiting_tree(plain_root.path());
+            assert_eq!(repair(&plain, false), Repairs::default(), "a plain tree");
+
+            let granted_root = tempfile::tempdir().unwrap();
+            let granted = waiting_tree(granted_root.path());
+            assert!(icacls(
+                granted.parent(),
+                &["/grant", "*S-1-5-32-546:(OI)(CI)F"]
+            ));
+            let owned_root = tempfile::tempdir().unwrap();
+            let owned = waiting_tree(owned_root.path());
+            assert!(icacls(
+                owned.parent(),
+                &["/setowner", &format!("*{}", me())]
+            ));
+            for tick in 0..2 {
+                assert_eq!(
+                    repair(&granted, false),
+                    said(&granted),
+                    "another account's entry, tick {tick}"
+                );
+                assert_eq!(
+                    repair(&owned, false),
+                    said(&owned),
+                    "an administrator's own account as the owner, tick {tick}"
+                );
+            }
         }
 
         /// W: a file the writer just made is given Administrators as its

@@ -764,16 +764,38 @@ The sites on it since P1:
 | The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:1160` |
 | The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:1042`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
 | The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:349` |
-| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1610` |
+| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1650` |
 | The machine config's key files the daemon writes: a device key (`peer-auth\<tenant>.json`) and the browser keys (`<tenant>.controllers.json`), #3956 | `HeldPath::base(<machine folder>)`, then `open_or_make_dir("peer-auth", Seal::Private)`: opened as it is, or made sealed, with no leaf policy, since the keys folder is FR-94's to repair; then `write_file(.., Seal::Private)`, so each file comes out as that repair leaves it. A link at `peer-auth` leaves the key unwritten, and the hello offers none | `agents/roomlerd/src/peer_auth.rs:1193`, `crates/agent-core/src/machine_tree/held.rs:453` |
 
-P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
-machine folder, with a test that fails on a new path-based one; until then those sites
-write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's environment
-sends the crash recorder and the machine config's key files back to their writes by
-path, each with one WARN naming the switch
-(`crates/agent-core/src/machine_tree.rs:378`). The clean-up's removals have no switch: a
+P2 put the service logs on it (next table). P3 moves the remaining SYSTEM writers below
+the machine folder, with a test that fails on a new path-based one; until then those
+sites write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's
+environment sends the crash recorder, the machine config's key files and the service
+logs back to their writes by path, each with one WARN naming the switch
+(`crates/agent-core/src/machine_tree.rs:381`). The clean-up's removals have no switch: a
 removal that follows a link has no safe old way to return to.
+
+The service logs since P2: a process with a `ServiceLogRole` (the service host, the
+SYSTEM worker, `netd`, the per-Machine package's steps) holds its `service-logs` for its
+whole life, `HeldPath::machine(.., Seal::Readable)`, and acts there only below that
+handle; an act refused there walks again once, since the folder may have been deleted or
+swapped. A process with no role, and every platform but Windows, writes as before.
+
+| Writer | By handle | Code |
+|---|---|---|
+| The day's log | `append_file("<basename>.<YYYY-MM-DD>")`, tracing-appender's daily name, a new one each UTC day, rolled forward only. A day whose file cannot be opened keeps the day before's, as tracing-appender's roll does | `crates/agent-core/src/logging/held_logs.rs:294`, `crates/agent-core/src/logging/held_logs.rs:357` |
+| The prune, the panic file, stderr's file (#3292, #3438) | `entries` and `remove_file`, by the same name and age rule; `write_file`; `append_file` twice, the cap read from the file itself, never from the folder's listing, which NTFS updates lazily for a file open for writing | `crates/agent-core/src/logging.rs:1162`, `crates/agent-core/src/logging.rs:1214`, `crates/agent-core/src/logging.rs:859` |
+| The daemon's encoder caps cache, install record, wedged MSI log and update-attempt marker | `write_file`; the cache read with `read_file`; the wedged log's slot before with `rename_file` | `agents/roomlerd/src/encode/caps_cache.rs:317`, `:337`, `agents/roomlerd/src/post_install.rs:272`, `agents/roomlerd/src/post_install.rs:1000`, `agents/roomlerd/src/updater.rs:242` |
+
+Every handle a writer keeps open there appends and reads attributes, nothing more: the
+one `append_file` gives holds `DELETE`, for what it finds at the name and deletes, so it
+is opened again by its own handle without it (`ReOpenFile`,
+`crates/agent-core/src/logging/held_logs.rs:199`). While a handle with `DELETE` is open,
+a reader that does not share deletion (PowerShell's `Get-Content`, `type`) cannot open
+the file, and a day's log is open all day. A hold that is refused (a link above
+`service-logs`) takes #3073's per-profile fallback, the reason the first line logged; what
+the hold itself logs, the leaf policy's one WARN, is logged once the log is open, since
+the hold comes before it (`crates/agent-core/src/logging/held_logs.rs:229`).
 
 ### A viewer's file transfer acts as the person at the screen (#3048, #3669, #3688)
 
@@ -1244,13 +1266,13 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
 
 **A LocalAPI client keeps an endpoint only when its own account or the system serves
 it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go
-through `localapi::connect()` ([`lib.rs:5715`](../crates/localapi/src/lib.rs#L5715)), and
+through `localapi::connect()` ([`lib.rs:5775`](../crates/localapi/src/lib.rs#L5775)), and
 each check runs on the connected endpoint, before the client sends anything:
 
 | OS | The endpoint is kept when | Otherwise |
 |---|---|---|
-| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:5057`](../crates/localapi/src/lib.rs#L5057) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5741`](../crates/localapi/src/lib.rs#L5741) `connect_first_trusted`) |
-| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5990`](../crates/localapi/src/lib.rs#L5990) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:6022`](../crates/localapi/src/lib.rs#L6022) `connect_windows_checked`) |
+| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:5057`](../crates/localapi/src/lib.rs#L5057) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5801`](../crates/localapi/src/lib.rs#L5801) `connect_first_trusted`) |
+| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:6050`](../crates/localapi/src/lib.rs#L6050) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:6082`](../crates/localapi/src/lib.rs#L6082) `connect_windows_checked`) |
 
 - **Where a per-user endpoint lives.** Only in a directory private to its account: a
   real directory, not a link, owned by that account and writable by neither its group nor
@@ -1263,11 +1285,16 @@ each check runs on the connected endpoint, before the client sends anything:
   alone. A per-user daemon serves its own per-user socket, and with no private directory
   it serves none and logs why ([`lib.rs:5071`](../crates/localapi/src/lib.rs#L5071)
   `unix_endpoints`); `roomler`'s "not running" line then says the same
-  ([`localclient.rs:2185`](../agents/roomler-cli/src/localclient.rs#L2185)).
+  ([`localclient.rs:2186`](../agents/roomler-cli/src/localclient.rs#L2186)).
+- **What root is told (#3937).** With no system socket, root's "not running" line names
+  that socket and says that a per-user daemon answers only its own account
+  ([`lib.rs:5128`](../crates/localapi/src/lib.rs#L5128) `not_running_words_for`). It
+  names the account `sudo` ran for only when `SUDO_USER` is a POSIX portable user name,
+  and only prints it: no path is built from it, and no other account's socket is tried.
 - **The pipe client's open.** `GENERIC_READ | FILE_WRITE_DATA`, at identification level
   (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`): read and write data, never the
   right to create an instance of the pipe, and the server may learn who the client is but
-  never act as it ([`lib.rs:6002`](../crates/localapi/src/lib.rs#L6002)). It works
+  never act as it ([`lib.rs:6062`](../crates/localapi/src/lib.rs#L6062)). It works
   against every daemon version.
 - ⚠️ **An attended Windows install whose person is a standard user.** There the worker,
   and so the pipe, runs as that person. A CLI run as another account, `SYSTEM` included
@@ -1374,10 +1401,10 @@ records it only in the daemon behind their own socket
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
   made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2736`, by
-  `person_peer_ok`, `:5281`). The listener makes that check before a byte is read, and a
+  `person_peer_ok`, `:5341`). The listener makes that check before a byte is read, and a
   test drives the listener itself over a real socket: another account's connection is
   closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
-  (`serve_person_listener`, `:5432`). The gate makes the check again where the decision
+  (`serve_person_listener`, `:5492`). The gate makes the check again where the decision
   is, so the rule does not rest on that one call site. An unknown peer is refused;
 - **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
   and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the
@@ -1403,7 +1430,7 @@ An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:44
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would
-leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:506`, #3525). A
+leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:563`, #3525). A
 spec that names the crate keeps its say: `RUST_LOG=debug` keeps its DEBUG lines, and
 `roomler_localapi=off` silences it. Only root sets a root daemon's `RUST_LOG`, so the
 person at the device cannot turn the record off.

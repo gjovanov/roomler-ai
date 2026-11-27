@@ -1,8 +1,10 @@
 # FR-133: Nothing a person reads calls the daemon an "agent" — it is `roomlerd`
 
-**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 shipped in 0.4.192 (#3209); P1b built ([#4440](https://github.com/gjovanov/roomler-ai/pull/4440)), the postinstall's and README.Debian's four lines; AC1 to AC4 and AC7 met 2026-11-03, AC5b met 2026-11-25; P2a shipped in 0.4.234 (#4307); P2b built (#4314), promoted 2026-11-23 (`hosted-20261123-a238604`); P2c shipped in 0.4.236 (#4343); P2d built (#4418), the tunnel gate's refusals, a server change; P2e built ([#4460](https://github.com/gjovanov/roomler-ai/pull/4460)), the server's own words, a server change; P4 built (#4412), the guard in CI's `name-audit` job ([The guard (P4)](#the-guard-p4)); P3 built (#4474), the docs site's 241 hits: 238 reworded, 3 kept; spec and claim 2026-10-30 ·
+**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** closed 2026-11-27, every criterion ticked. P1 shipped in 0.4.192 (#3209); P1b built ([#4440](https://github.com/gjovanov/roomler-ai/pull/4440)), the postinstall's and README.Debian's four lines; AC1 to AC4 and AC7 met 2026-11-03, AC5b met 2026-11-25; P2a shipped in 0.4.234 (#4307); P2b built (#4314), promoted 2026-11-23 (`hosted-20261123-a238604`); P2c shipped in 0.4.236 (#4343); P2d built (#4418), the tunnel gate's refusals, a server change; P2e built ([#4460](https://github.com/gjovanov/roomler-ai/pull/4460)), the server's own words, a server change, promoted 2026-11-26 (`hosted-20261126-8b257b8`); P4 built (#4412), the guard in CI's `name-audit` job ([The guard (P4)](#the-guard-p4)); P3 merged as #4474 and promoted 2026-11-27 (`hosted-20261127-07485f5`), the docs site's 241 hits: 238 reworded, 3 kept; AC6 met 2026-11-27; spec and claim 2026-10-30 ·
 **Related:** FR-46 ([#1051](https://github.com/gjovanov/roomler-ai/issues/1051), the retired `roomler-agent` names; its "MSI installer identity — its own program" row is this FR's P1) ·
 FR-21 (the retired-name guard, `scripts/name-audit.sh`) · FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), the wizard; its phase C renames the wizard's own words)
+
+**Anchors:** master `500b556e4` (closed 2026-11-27), read in the tree.
 
 ## Goal
 
@@ -74,7 +76,7 @@ and needs those lookups to accept both names.
 - [x] **AC1** — A fresh Windows install from the released MSI (both flavours) appears in Apps &
       Features under the new name (D1), and its UAC prompt shows the new description. **Met
       (2026-11-02, 0.4.197):** both flavours list one entry under the new name. UAC reads
-      "Roomler installer" (was "Roomler Agent installer", `.github/workflows/release-agent.yml:2006`).
+      "Roomler installer" (was "Roomler Agent installer", `.github/workflows/release-agent.yml:2026`).
       That half is the per-machine MSI's: the per-user one has no UAC prompt
       (`agents/roomlerd/wix/main.wxs:16`).
 - [x] **AC2** — An upgrade from 0.4.188 (named "Roomler Agent…") to the first release with P1
@@ -112,9 +114,13 @@ and needs those lookups to accept both names.
       other old phrases there come only from the server's own surface, outside AC5b); and P4's
       guard (#4412), whose daemon row has been 0 since #4418 (see
       [the baseline from P2d on](#the-guard-p4)).
-- [ ] **AC6** — The docs site's pages say `roomlerd`.
+- [x] **AC6** — The docs site's pages say `roomlerd`. **Met (2026-11-27,
+      `hosted-20261127-07485f5`):** 12 sampled pages of the served docs site read RED on the image
+      before P3 (old wording on 12 of 12, new on 0) and GREEN after the roll (old 0 and new above 0 on
+      12 of 12, the three kept phrases unchanged); every "agent" left on them is a name the spec keeps
+      ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7216185361)).
 - [x] **AC7** — Docs: `docs/installation.md` and the `ship-it` skill updated, with a
-      `docs/README.md` row if a doc is added. **Met:** `docs/installation.md:550` and
+      `docs/README.md` row if a doc is added. **Met:** `docs/installation.md:797` and
       `.claude/skills/ship-it/SKILL.md:66`. No doc was added, so no row.
 
 ## Open decisions
@@ -262,3 +268,5 @@ test above, and a guard row for them would need its own fixtures.
 | 2026-11-23 | `hosted-20261123-a238604`, production's served web app | ✅ **P2b.** The served bundle, read by chunk for 7 sampled strings ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7096073584)): before the roll (entry `index-CXJcFygu.js`, 08:31Z) every old string was there and no new one; after it (entry `index-CNJBMpkJ.js`, 08:46Z) no old string and every new one. This is the web app's share of AC5, which stays open (the companion ships in 0.4.234, and P4's guard is not built). |
 | 2026-11-25 | `hosted-20261125-236a9f7`, production's running server, after the roll | ✅ **P2d, and AC5b's last piece** ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7157059067)). The four reworded gate reasons are in the running binary and the gate's old cross-tenant phrase is at 0; the three other old phrases there come only from the server's own surface (the 60), which is outside AC5b. With P2a (0.4.234) and P2c (0.4.236) read GREEN and P4's guard at 0 hits for the daemon, AC5b is met and ticked. |
 | 2026-11-26 | released Windows exes: the wizard of setup-v0.4.196 and setup-v0.4.238, the companion of agent-v0.4.233 and agent-v0.4.238, read as bytes (nothing run) | ✅ **AC5** ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7179148587)). Each app's embedded front end (Tauri's brotli assets, found through the PE image's asset table) was extracted; on 0.4.238 the wizard's `app.js` and `styles.css` match its source byte for byte, CRLFs aside. P4's guard, from master `046fb2d9f`, run over the extracted files: the wizard 8 hits on 0.4.196 and 0 on 0.4.238, the companion 3 on 0.4.233 and 0 on 0.4.238. The wizard's run-time "Resolved tag" progress line and its raw-tag Done text are gone on 0.4.238, which shows a version. In the raw exe, the companion's four reworded Rust phrases read old 1, new 0 on 0.4.233 and old 0, new 1 on 0.4.238, and the wizard's Rust warning that said "the Agent token file" reads 1, then 0; unchanged phrases are the controls. With the web app's P2b read above, AC5 is met and ticked. |
+| 2026-11-26 | `hosted-20261126-8b257b8`, production's running server, after the roll | ✅ **P2e** ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7180842283)). Each phrase counted in the running server binary of both app pods (`grep -a -o -F` on the process's own executable): ten of P2e's sentences, one phrase each. Before the roll (`hosted-20261125-07e91b7`, 01:40Z) every old phrase was there and no new one; after it (02:24Z) every new phrase and no old one, with the same counts on both pods. P2d's three leftover gate phrases ("agent has been deleted", "agent is quarantined", "agent missing _id") read 0 too. The old phrases remain only in `#[cfg(test)]` modules, in tests that assert they stay gone. |
+| 2026-11-27 | `hosted-20261127-07485f5`, production's served docs site, after the roll | ✅ **AC6 (P3)** ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7216185361)). GETs of the same 12 pages of `/docs/` on both sides of the roll, three counts per page: the old sentence, its new wording and the phrase kept on purpose. On `hosted-20261126-8b257b8` (02:51Z) the old wording read 12 of 12 pages and the new one 0. On `hosted-20261127-07485f5` (10:39Z) the old wording reads 0 and the new one above 0 on 12 of 12, and the three kept phrases are unchanged at 1 each. The word "agent" fell from 4–26 per page to 0–2, and each one left is a name the spec keeps (`com.roomler.agent`, the `--agent` flag, FR-90's "agent sessions", MeshCentral's own agent). With every other box ticked, AC6 closes the FR. |

@@ -16,9 +16,9 @@
 //! | a REMOTE candidate on a mesh address, when the controller's browser runs on an overlay node; the agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN no matter which candidates the agent offered | [`RcOverlay::keeps_remote_candidate`] on every trickled candidate, [`RcOverlay::strip_sdp`] on the offer |
 //! | an ICE SERVER on a mesh address — the loopback-TURN relay the Hub appends for a corp controller | [`RcOverlay::ice_servers`] (the Hub also withholds it) |
 //!
-//! "Overlay address" is exact: the blocks this daemon's overlay routes
-//! ([`tunnel_core::overlay_footprint`]) and the derived-v6 ULA — never the
-//! whole CGNAT `/10`, which LTE modems, cloud VPCs and other meshes use too.
+//! "Overlay address" is exact: the blocks this daemon's overlay routes as they stand when a
+//! filter judges the address (#3359, [`tunnel_core::overlay_footprint`]), and the derived-v6
+//! ULA — never the whole CGNAT `/10`, which LTE modems, cloud VPCs and other meshes use too.
 //!
 //! On, nothing is filtered beyond the name rule: the behaviour from before
 //! the switch existed.
@@ -69,8 +69,8 @@ pub struct RcOverlay {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<IpAddr>,
     /// The overlay's v4 blocks, snapshotted by the DAEMON when the session is
-    /// requested. Carried rather than re-read so a delegated session's GUI
-    /// worker, which runs no overlay of its own, filters the same addresses.
+    /// requested. Carried so a delegated session's GUI worker filters by them
+    /// too; the filters read them unioned with the footprint ([`Self::blocks`]).
     /// In rank mode they are carried when the mesh is allowed too: the rank
     /// needs them to know a mesh address.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -424,7 +424,7 @@ impl RcOverlay {
     }
 
     fn blocks(&self, ip: IpAddr) -> bool {
-        (!self.allow && footprint::is_overlay_addr(&self.v4_nets, ip)) || self.exclude.contains(&ip)
+        (!self.allow && self.is_overlay_now(ip)) || self.exclude.contains(&ip)
     }
 
     /// Nothing to filter at all: `on`, or an `auto` session that rides the
@@ -811,6 +811,71 @@ fn url_host_ip(url: &str) -> Option<IpAddr> {
         hostport.rsplit_once(':').map_or(hostport, |(h, _)| h)
     };
     host.parse().ok()
+}
+
+/// #3359 — the footprint as it stands, for the four filters.
+impl RcOverlay {
+    /// Is `ip` an overlay address for this session's filters
+    /// ([`Self::blocks`])? By the footprint AS IT STANDS when the filter
+    /// judges the address ([`footprint::is_overlay_addr_now`]), unioned with
+    /// the copy the session carried (`v4_nets`, all a delegated worker held
+    /// before the daemon's first push). A session requested before the first
+    /// netmap carries an empty copy for its whole life, and still filters by
+    /// every block recorded after it. The footprint only grows, so a later
+    /// judgement can only keep more out, and neither side is ever the CGNAT
+    /// `/10`.
+    ///
+    /// ⚠️ Called from the ICE agent's gather (the `SettingEngine` IP filter):
+    /// the registry's lock is a std one, never held across an `.await`.
+    fn is_overlay_now(&self, ip: IpAddr) -> bool {
+        footprint::is_overlay_addr(&self.v4_nets, ip) || footprint::is_overlay_addr_now(ip)
+    }
+
+    /// The v4 blocks this session's filters judge by, counted for its
+    /// `rc ICE` line (`overlay_blocks`): kept off the mesh, the footprint as
+    /// it stands now unioned with the session's copy; allowed, the copy, as
+    /// before (empty, or the carrier rank's blocks). The footprint only
+    /// grows, so the gather that follows can only hold more.
+    pub fn overlay_blocks(&self) -> usize {
+        if self.allow {
+            return self.v4_nets.len();
+        }
+        let mut held = footprint::v4_nets();
+        for net in &self.v4_nets {
+            if !held.contains(net) {
+                held.push(*net);
+            }
+        }
+        held.len()
+    }
+}
+
+/// #3359 — what each of a session's four filters does with `addr`, in order:
+/// a host candidate on it ([`RcOverlay::keeps_local`]), a trickled remote
+/// candidate ([`RcOverlay::keeps_remote_candidate`]), a candidate in the offer
+/// ([`RcOverlay::strip_sdp`]) and a TURN server on it
+/// ([`RcOverlay::ice_servers`]). `true` where the filter lets it through.
+#[cfg(test)]
+pub(crate) fn four_filters(p: &RcOverlay, addr: &str) -> [bool; 4] {
+    let ip: IpAddr = addr.parse().expect("an address");
+    let candidate = format!("candidate:1 1 udp 2122260223 {addr} 54321 typ host");
+    let sdp = format!("v=0\r\na={candidate}\r\na=end-of-candidates\r\n");
+    let turn = if ip.is_ipv6() {
+        format!("turn:[{addr}]:47989")
+    } else {
+        format!("turn:{addr}:47989")
+    };
+    let servers = [IceServer {
+        urls: vec![turn],
+        username: Some("u".into()),
+        credential: Some("c".into()),
+    }];
+    [
+        p.keeps_local(ip),
+        p.keeps_remote_candidate(&candidate),
+        p.strip_sdp(&sdp).contains(addr),
+        !p.ice_servers(&servers).is_empty(),
+    ]
 }
 
 #[cfg(test)]
@@ -1221,6 +1286,77 @@ mod tests {
                 )
                 .await;
             assert_eq!(d, p);
+        }
+    }
+
+    // ---- #3359: the footprint as it stands, not as it was requested ----
+
+    /// #3359 — a session requested while the daemon starts is resolved before
+    /// any block is recorded, so its own copy is empty for its whole life. The
+    /// device's block is then recorded before the host candidates are
+    /// gathered, and from that moment every filter keeps the overlay address
+    /// out. A 100.64/10 address in no recorded block (an LTE modem, another
+    /// mesh) still passes all four: the rule never widens to the CGNAT `/10`.
+    #[test]
+    fn a_session_resolved_before_its_blocks_keeps_the_overlay_out_once_they_are_recorded() {
+        // Process-global: asserts only on a block this test owns.
+        let session = RcOverlay::resolve_ranked(false, None, RankMode::Off, Vec::new());
+        assert!(session.v4_nets.is_empty(), "resolved before any block");
+        footprint::note_v4_blocks(&[(Ipv4Addr::new(100, 72, 4, 0), 22)]);
+        assert_eq!(
+            four_filters(&session, "100.72.4.34"),
+            [false; 4],
+            "the device's overlay address, in keeps_local, keeps_remote_candidate, strip_sdp and ice_servers"
+        );
+        for not_ours in ["100.73.9.9", "100.80.1.2", "192.168.1.20"] {
+            assert_eq!(
+                four_filters(&session, not_ours),
+                [true; 4],
+                "{not_ours} is in no recorded block"
+            );
+        }
+    }
+
+    /// #3359 — `auto`, decided "stays off the mesh" at its offer, filters the
+    /// way `off` does: by the footprint as it stands when an address is
+    /// judged, whatever its copy held when it was requested.
+    #[tokio::test]
+    async fn an_auto_session_that_stays_off_filters_as_off_does() {
+        // Process-global: asserts only on a block this test owns.
+        let hints = RcOverlayAutoWire {
+            viewers: vec!["100.65.4.33".into()],
+            far_turn: Some(true),
+        };
+        let requested = RcOverlay::resolve_ranked(false, Some(&hints), RankMode::Off, Vec::new());
+        assert!(requested.auto && !requested.allow && requested.v4_nets.is_empty());
+        // A relayed mesh while the far TURN answers over UDP: the session
+        // stays off the mesh (FR-128 §3.1).
+        let stays_off = requested
+            .decide_with(
+                "s",
+                |_| async { vec![MeshCarrier::Relayed] },
+                || async { Some(true) },
+            )
+            .await;
+        assert!(stays_off.auto && !stays_off.allow, "{stays_off:?}");
+        footprint::note_v4_blocks(&[(Ipv4Addr::new(100, 72, 8, 0), 22)]);
+        assert_eq!(
+            four_filters(&stays_off, "100.72.8.21"),
+            [false; 4],
+            "the device's overlay address, in each of the four"
+        );
+        let off = RcOverlay::resolve_ranked(false, None, RankMode::Off, Vec::new());
+        for addr in [
+            "100.72.8.21",
+            "fd72:6f6f:6d6c::6448:815",
+            "100.73.9.9",
+            "192.168.1.20",
+        ] {
+            assert_eq!(
+                four_filters(&stays_off, addr),
+                four_filters(&off, addr),
+                "{addr}"
+            );
         }
     }
 

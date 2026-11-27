@@ -564,7 +564,7 @@ fn peers_of_org(peers: Vec<PeerInfo>, org: &str) -> Vec<PeerInfo> {
 /// A [`localapi::DirectoryError`] as the one line an operator acts on.
 fn explain_directory_error(e: localapi::DirectoryError) -> anyhow::Error {
     match e.code() {
-        "daemon_unreachable" => anyhow!("roomler daemon not running (is the service started?)"),
+        "daemon_unreachable" => daemon_not_running(),
         "unsupported_daemon" => anyhow!(
             "the roomler daemon on this machine predates `roomler devices` — update it \
              (`roomler peers` lists what its mesh carries)"
@@ -2182,11 +2182,24 @@ fn print_password_next_steps(state: &localapi::ExternalPasswordState) {
 /// #3736 — when this account had no per-user socket to try at all (no private
 /// runtime directory: cron, `su`, a shell without a login session), the line
 /// says so, since a per-user daemon could not be reached from here either.
+/// #3937 — root's line names the socket it tried ([`daemon_not_running`]).
 pub(crate) fn daemon_err(e: io::Error) -> anyhow::Error {
     if e.kind() == io::ErrorKind::NotFound {
-        not_running(localapi::no_per_user_socket_note())
+        daemon_not_running()
     } else {
         anyhow!("talking to the roomler daemon: {e}")
+    }
+}
+
+/// #3937 — the one "not running" line. [`daemon_err`] and the device list's
+/// `daemon_unreachable` both say it, so their words cannot drift apart.
+/// Root's names the socket it tried, the system daemon's, and whom a
+/// per-user daemon answers (`localapi::not_running_words`); every other
+/// account's, and every line on Windows, is [`not_running`]'s, as it was.
+fn daemon_not_running() -> anyhow::Error {
+    match localapi::not_running_words() {
+        Some(words) => anyhow!("{words}"),
+        None => not_running(localapi::no_per_user_socket_note()),
     }
 }
 
@@ -3737,6 +3750,22 @@ mod tests {
         assert_eq!(
             with,
             "roomler daemon not running (is the service started?); XDG_RUNTIME_DIR is not set"
+        );
+    }
+
+    /// #3937 — the two sites that tell a person no daemon answered say one
+    /// line, whichever account runs this: a connect that found no endpoint,
+    /// and the device list's `daemon_unreachable`, which once said it
+    /// without the note.
+    #[test]
+    fn every_not_running_site_says_the_same_line() {
+        let missing = || io::Error::new(io::ErrorKind::NotFound, "x");
+        let connect = daemon_err(missing()).to_string();
+        let devices = explain_directory_error(localapi::DirectoryError::Io(missing())).to_string();
+        assert_eq!(connect, devices);
+        assert!(
+            connect.starts_with("roomler daemon not running"),
+            "{connect}"
         );
     }
 
