@@ -5116,13 +5116,60 @@ pub fn no_per_user_socket_note() -> Option<String> {
 /// found no socket at `tried`, in place of the plain line, or `None` to keep
 /// that line.
 ///
-/// RED stub: master's words, for the tests to fail on.
+/// Root keeps only a socket that root serves ([`server_uid_trusted`]), the
+/// system daemon's, so a per-user daemon never answers it, and under `sudo`
+/// it has no per-user path to try ([`per_user_socket_path_for`]). Its words
+/// name the socket it tried, say whom a per-user daemon answers, and drop
+/// "is the service started?": on a per-user install the system unit has no
+/// config, and starting it loops (#3841). `sudo_user` (`SUDO_USER`) names
+/// the account `sudo` ran for when it is a portable user name
+/// ([`portable_user_name`]). It is only printed: never a path, never a
+/// socket to try (#3736). Every other account keeps its line: `None`.
 pub fn not_running_words_for(
     euid: u32,
-    _sudo_user: Option<&str>,
-    _tried: &std::path::Path,
+    sudo_user: Option<&str>,
+    tried: &std::path::Path,
 ) -> Option<String> {
-    (euid == 0).then(|| "roomler daemon not running (is the service started?)".to_string())
+    if euid != 0 {
+        return None;
+    }
+    let who = sudo_user
+        .filter(|name| portable_user_name(name))
+        .unwrap_or("that account");
+    Some(format!(
+        "roomler daemon not running: no socket at {}, the system daemon's; a per-user \
+         daemon, if this host runs one, answers only its own account: run this as {who}, \
+         without `sudo`",
+        tried.display()
+    ))
+}
+
+/// #3937 — a POSIX portable user name: one or more of `A-Za-z0-9._-`, never
+/// `-` first. Any other value names no one, so a `SUDO_USER` can put neither
+/// a control character nor a second line on the terminal.
+fn portable_user_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// #3937 — [`not_running_words_for`] for this process: its effective uid,
+/// the `SUDO_USER` it was started with, and the system socket, the one a
+/// root daemon serves.
+#[cfg(unix)]
+pub fn not_running_words() -> Option<String> {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    not_running_words_for(euid, sudo_user.as_deref(), &system_socket_path())
+}
+
+/// Windows keeps its words: one pipe serves every account.
+#[cfg(windows)]
+pub fn not_running_words() -> Option<String> {
+    None
 }
 
 /// Bind the daemon's control socket, preferring the SYSTEM path.
