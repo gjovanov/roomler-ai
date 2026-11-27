@@ -4000,13 +4000,13 @@ outage recheck to the helper's wake file (`run_periodic`,
 `agents/roomlerd/src/updater.rs:3525-3526`; `forward_triggers_to`, `:4239`),
 and the root LaunchDaemon `com.roomler.update` runs `roomlerd update-helper`,
 which checks the feed, downloads, verifies and runs `installer -pkg … -target /`
-(`mac_gate::run`, `:4571`). From 0.4.235 the helper first reads what each half
+(`mac_gate::run`, `:4572`). From 0.4.235 the helper first reads what each half
 that the install restarts is serving, and waits while either serves live work.
 Its cycle:
 
 ```mermaid
 flowchart TD
-    WK["launchd starts the helper: a boot, StartInterval (6 h),<br/>or the wake file (a push, the person's ask, an outage recheck)"] --> PR{"the release feed"}
+    WK["launchd starts the helper: a boot, StartInterval (6 h),<br/>or a write to the wake file (a push, the person's ask, an outage recheck)"] --> PR{"the release feed"}
     PR -- "up to date" --> UP["the budget resets, and the run ends"]
     PR -- "the probe failed" --> SK["check skipped: the budget is kept,<br/>and the run ends"]
     PR -- "a newer release" --> KS{"the kill switch?"}
@@ -4025,13 +4025,14 @@ flowchart TD
 
 | Step | What the helper does | Where |
 |---|---|---|
-| start | holds `update-helper.lock` (`flock`) beside the budget, so one helper runs at a time. The opt-out and the 5-min install-storm cooldown end the run before the feed is asked | `mac_gate::run`, `updater.rs:4571-4585`; `take_lock`, `:4852`; `cycle`, `:4641-4656` |
+| the wake file | first, before every gate: the helper keeps its own file at the wake path (root's, mode 0666, one link) and takes its stamp (device, inode, size, modify and change times) as the wait's baseline. Where nothing is, it makes that file; anything else at the path is replaced once. It never removes the file and never reads it, so its own run changes nothing launchd watches, and one wake is one run (#4372). Making or replacing the file is a change at the path too, so that run may be followed by one more | `settle`, `agents/roomlerd/src/helper_gate.rs:739`; its call, `updater.rs:4416-4422` |
+| start | holds `update-helper.lock` (`flock`) beside the budget, so one helper runs at a time. The opt-out and the 5-min install-storm cooldown end the run before the feed is asked | `mac_gate::run`, `updater.rs:4572-4586`; `take_lock`, `:4852`; `cycle`, `:4641-4656` |
 | the probe | asks the release feed before it reads a half. Up to date resets the budget, and a failed probe keeps it; either ends the run | `updater.rs:4660-4683`; `budget_after_probe`, `agents/roomlerd/src/helper_gate.rs:355` |
 | the readings | `live_work` from the root half, over `/var/run/roomler/roomler.sock` and kept only when root serves it, then from the console person's half, through FR-147's child `roomlerd one-row-home live-work`, which asks the daemon behind that person's own socket. Each answer is bounded at 5 s, and the child at 30 s | `read_halves`, `updater.rs:4789`; `read_root_half`, `:4799`; `read_persons_half`, `:4817`; `ASK_TIMEOUT`, `helper_gate.rs:50`; the child's verb, `agents/roomlerd/src/one_row_home.rs:21`; `CHILD_DEADLINE`, `agents/roomlerd/src/one_row.rs:1214` |
 | the arm | a fresh ask recorded by the root half (a push to its row) forces over both halves. One recorded by the person's half (a push to their row, or their "Apply update") forces over everything their half serves and the root half's remote-control sessions, never over the root half's SSH connections, runs, transfers, recording or network transition, or a root half it could not read. A wake inside a chain installs only when nothing is live, and never counts. A due cycle takes #3429's rule, with each half it could not read as one unit of live work. An ask the root half held lapses: it is fresh for 10 minutes, and the recheck after a defer for live work comes an hour later, so that cycle and the ones after it are a plain wake's, the person's own work included (#4423) | `helper_arm`, `helper_gate.rs:205`; `ASK_FRESH` (10 min), `:48`; `Budget::due`, `:178`; `periodic_gate`, `updater.rs:3808`; `TRANSFER_DEFER_RECHECK` (1 h), `:77` |
 | the second reading | after the download, unless the arm was forced: work that came meanwhile drops the download, on the same budget | `second_arm`, `helper_gate.rs:277`; `updater.rs:4741-4767` |
 | the budget | `update-defers.json` in root's log folder: 0600, at most 4 KiB, parsed strictly, written as a new file and renamed over. It resets just before `installer(8)` runs | `read_budget`, `updater.rs:4874`; `write_budget`, `:4904`; `Budget::parse`, `helper_gate.rs:152`; `budget_for`, `:450` |
-| the wait | after a defer, a look every 5 s, in this order: SIGTERM, the opt-out, the kill switch, its own program, 8 h awake, the due time, a wake at least 60 s after the last cycle | the loop, `updater.rs:4593-4636`; `next_step`, `helper_gate.rs:420`; `TICK`, `:52`; `AWAKE_CEILING`, `:56`; `UPDATE_HELPER_MIN_GAP`, `updater.rs:307` |
+| the wait | after a defer, a look every 5 s, in this order: SIGTERM, the opt-out, the kill switch, its own program, 8 h awake, the due time, a wake at least 60 s after the last cycle. A wake is a change to what is at the wake path since the look that decided the last cycle, its removal included; the file stays as it is, so a write during a cycle is the next look's wake | the loop, `updater.rs:4593-4636`; `next_step`, `helper_gate.rs:420`; `TICK`, `:52`; `AWAKE_CEILING`, `:56`; `woke`, `:638`; `Watch::cycled`, `:675`; `UPDATE_HELPER_MIN_GAP`, `updater.rs:307` |
 | the install | `installer -pkg … -target /`, as before FR-151 | `install_from_helper`, `updater.rs:4946` |
 
 **The Macs it covers.** The field cells are FR-151's, read on 0.4.235 on lab
@@ -4090,7 +4091,9 @@ that comes later, never toward a wait the helper does not keep.
 | `update-helper: up to date` | this Mac runs the newest release: the budget resets, and the run ends | `updater.rs:4672-4677` |
 | `update-helper: download skipped` | the download, or its verification, failed: the run ends with the budget kept | `updater.rs:4735-4737` |
 | `update-helper: SIGTERM while checking; exiting without installing`, and the same `while reading`, `while downloading` and `before installing` | SIGTERM ended a cycle: nothing installs | `updater.rs:4664`, `:4687`, `:4723`, `:4746`, `:4778` |
-| `update-helper: another update helper runs; exiting` | another helper holds the lock | `updater.rs:4577` |
+| `update-helper: made its own wake file step=Create` | the run's start found nothing at the wake path, as on the first run after an install, and made the helper's own file. `step=Replace` or `step=MoveAside`: something else was there, and the helper's file took its place | `settle`, `helper_gate.rs:749` |
+| `update-helper: its own wake file could not be made; a wake is a change to what is there`, `update-helper: what was moved aside from the wake path could not be removed` | the start could not put its file at the wake path, or could not remove what it moved away. The run goes on, and the wait reads a change to whatever is there | `helper_gate.rs:753`, `:818` |
+| `update-helper: another update helper runs; exiting` | another helper holds the lock | `updater.rs:4578` |
 | `update-helper: suppressed by recent-install cooldown` | an install was tried in the last 5 min: the run ends | `updater.rs:4509-4515`, `:4650-4655` |
 | `auto-update opted out — exiting` | the opt-out marker is there | `updater.rs:4646-4648` |
 | `update-helper: who is at the console could not be read`, `… the console's account could not be read`, `… the person's live-work child did not run`, `… the person's live-work reply was not read` | the person's half reads `no_answer`, which counts as live work | `read_persons_half`, `updater.rs:4817-4848` |
@@ -4102,7 +4105,7 @@ that comes later, never toward a wait the helper does not keep.
   fails, during a server roll or a network drop, the helper logs
   `update-helper: check skipped`, and the run ends with the budget kept
   (`:4678-4680`). The next run is launchd's: the plist's `StartInterval` of
-  21600 s (`agents/roomlerd/packaging/macos/com.roomler.update.plist:64-65`),
+  21600 s (`agents/roomlerd/packaging/macos/com.roomler.update.plist:66-67`),
   unless a push, the person's ask, a boot or a daemon's outage recheck writes
   the wake file first. A daemon's own timer never wakes the helper on a Mac:
   it forwards only pushes and the outage recheck (`forward_triggers`,
@@ -4117,14 +4120,14 @@ that comes later, never toward a wait the helper does not keep.
   helper whose own `installer` child runs it (`postinstall:750-753`;
   `install.log` says `roomler update helper is running (this very install)`
   for both). The helper took its program's device and inode when it started
-  (`program_id`, `updater.rs:4932-4935`, taken at `:4590`) and compares them
+  (`program_id`, `updater.rs:4932-4935`, taken at `:4591`) and compares them
   at each look (`program_replaced`, `:4604-4605`). Once the install has
   replaced the program, it logs `… why=Replaced` and exits without installing,
   with the budget kept (`next_step`, `helper_gate.rs:430-431`;
   `updater.rs:4611-4619`). So leaving it alone costs one 5 s look at most, and
   the next run is the new program's. No field cell has run such an install
   during a chain: this is the code's reading, and the unit cell C16
-  (`next_wake_spaces_wakes_and_exits_on_markers`, `helper_gate.rs:825`) holds
+  (`next_wake_spaces_wakes_and_exits_on_markers`, `helper_gate.rs:1424`) holds
   the step.
 
 #### A command the SYSTEM service runs (#4244)
@@ -4281,7 +4284,7 @@ daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
 agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3969`,
-`WatchPaths` in `com.roomler.update.plist:67-70`) so that the update helper runs
+`WatchPaths` in `com.roomler.update.plist:69-72`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way. Since FR-151 the helper reads such work first: an order to the root
 daemon's row installs over it at once, which ends it, while an order to a
