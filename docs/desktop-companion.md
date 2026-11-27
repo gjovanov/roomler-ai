@@ -130,13 +130,16 @@ sequenceDiagram
 
 A route can now be **edited** in place: `RouteUpdate` replaces the descriptor in one save
 under the config write lock and restarts its flow; an invalid replacement is refused and the
-old route keeps running (`agents/roomlerd/src/tunnel/route_reconciler.rs:437`). A daemon
+old route keeps running (`agents/roomlerd/src/tunnel/route_reconciler.rs:820`). A daemon
 that predates the verb answers "bad request", which the companion shows as *"The device
 service predates route editing"* (`explain_route_edit_error`, `src/commands.rs:3203`), never as a blank page.
 
-⚠️ A route whose edit keeps the **same local port** restarts its listener on that port. If
-the old listener is still held (the #1035 class — a listener outliving the flow that owned
-it), the new flow retries on its backoff until the port frees.
+⚠️ A route whose edit keeps the **same local port** moves onto its new flow in one
+reconcile pass (#1035). The pass stops the old flow, waits up to 2 s for that flow to let
+go of the port, then creates the new one, and `RouteUpdate` answers after that pass. A
+port that another process took in the meantime reads `backoff` as before, and the route
+retries until the port frees
+([tunnels.md](tunnels.md#one-writer-owns-the-route-to-flow-map-1035)).
 
 **A route's state is the port's truth (#1685).** `active` is shown only once the route's
 tunnel session is up and its local listener is **bound** — the daemon flips it from the bind
