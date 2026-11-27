@@ -1,6 +1,6 @@
 # FR-145: The Windows machine folder by handle — SYSTEM never writes, creates, renames or removes through a link, seals what it makes, and finds a person's profile by their SID
 
-**Issue:** [#3752](https://github.com/gjovanov/roomler-ai/issues/3752) · **Status:** P1 in progress, [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) (2026-11-12). D1–D10 take their defaults (2026-11-12), and the operator may overturn any of them
+**Issue:** [#3752](https://github.com/gjovanov/roomler-ai/issues/3752) · **Status:** P1 merged, [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) (2026-11-12); P2 in progress, [#4493](https://github.com/gjovanov/roomler-ai/pull/4493). D1–D10 take their defaults (2026-11-12), and the operator may overturn any of them
 **Builds on:** #3743 (`machine_tree`'s handle code: a folder held by its own handle, a file opened below it, a delete by handle), FR-94 ([#2035](https://github.com/gjovanov/roomler-ai/issues/2035): `machine_tree`'s repair, check and kill switches), #3702 (`appdirs::machine_program_data` and `appdirs::profile_of_account`: the machine's folders and a profile as the system records them)
 **Related:** #3737
 
@@ -190,7 +190,7 @@ Notes on the calls:
 | a folder another account owns | moved aside by handle (`FileRenameInformation`, `RootDirectory` = the parent's handle) as `<name>.moved-<unix>`, and a sealed one made. Nothing in it is deleted or changes owner. One WARN names it | a `<name>.moved-<unix>` entry beside the new folder, its content still that account's |
 | a link (a junction or a symbolic link) | the link entry itself moved aside by handle, never followed, and a sealed folder made. One WARN | a `<name>.moved-<unix>` entry; whatever the link led to is untouched |
 | anything else that is not a folder: a plain file, a file link, a hard link (as built in P1, accepted 2026-11-12) | the entry moved aside by its own handle (opened with `FILE_OPEN_REPARSE_POINT` and `DELETE`), and a sealed folder made: a file link moves as itself, a hard link moves only that name. One WARN | a `<name>.moved-<unix>` entry, its content unchanged |
-| above the leaf: a link, or a folder that cannot be opened or whose final path is elsewhere | refused (`Why::Link`, `Why::Elsewhere`), with one throttled WARN, and the site does without: a crash record is not written; the logs take the fallback they take today when `service-logs` cannot be used (`logging.rs:224-239`, `fallback_log_dir` `:327-333`). The machine folder itself is FR-94's to repair, not a log writer's | the WARN line, which names the path |
+| above the leaf: a link, or a folder that cannot be opened or whose final path is elsewhere | refused (`Why::Link`, `Why::Elsewhere`), with one throttled WARN, and the site does without: a crash record is not written; the logs take the fallback they take today when `service-logs` cannot be used (`logging.rs:235-258`, `fallback_log_dir` `:357-363`). The machine folder itself is FR-94's to repair, not a log writer's | the WARN line, which names the path |
 
 ### P1: crash records
 
@@ -251,7 +251,7 @@ is by handle too. #3743's elevated tests already cover both.
 
 ### P2: service logs
 
-`open_log_appender` (`logging.rs:346`) gets, for a process with a `ServiceLogRole` on Windows (`logging.rs:90-111`:
+`open_log_appender` (`logging.rs:376`) gets, for a process with a `ServiceLogRole` on Windows (`logging.rs:101-122`:
 the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a `HeldRollingWriter` in place of
 `tracing_appender`'s `RollingFileAppender` (D3):
 
@@ -260,20 +260,20 @@ the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a
   reuse;
 - `impl std::io::Write`: when the UTC date has changed since the last write, it opens `<basename>.<YYYY-MM-DD>`
   with `append_file(.., Seal::Readable)`. Those are `tracing_appender`'s daily names, so `rolling_basenames`, the
-  prune and the log tail read them unchanged (`logging.rs:1070-1072`);
-- wrapped in `tracing_appender::non_blocking`, as today (`logging.rs:247`);
+  prune and the log tail read them unchanged (`logging.rs:1155-1157`);
+- wrapped in `tracing_appender::non_blocking`, as today (`logging.rs:266`);
 - a refusal takes today's fallback for an unusable `service-logs`, the reason logged first (#3073,
-  `logging.rs:224-239`).
+  `logging.rs:235-258`).
 
 | Site | Today | After |
 |---|---|---|
-| the prune (`logging.rs:1095-1117`) | `read_dir`, `remove_file(entry.path())` | `entries()`, the same name and age rule, `remove_file(name)` |
+| the prune (`logging.rs:1197-1212`) | `read_dir`, `remove_file(entry.path())` | `entries()`, the same name and age rule, `remove_file(name)` |
 | the panic file (`:1119-1140`) | `fs::write` | the hook keeps the `Arc<HeldPath>`: `write_file("panic-<pid>-<ts>.log", ..)` |
 | the stderr file (`:810-816`) | `OpenOptions`, create and append | `append_file(name, Seal::Readable)` |
-| the encoder caps cache (`agents/roomlerd/src/encode/caps_cache.rs:316-328`, its path `:183-187`) | `create_dir_all`, `fs::write(tmp)`, `fs::rename` | `write_file(FILE_NAME, ..)`; its readers read with `read_file` |
-| the install outcome (`agents/roomlerd/src/post_install.rs:206-208`, `:254-297`) | `create_dir_all`, `fs::write` | `write_file("last-install.json", ..)` |
-| the wedged MSI log (`post_install.rs:984-992`) | `fs::rename` to `.prev`, `fs::copy` | `rename_file("msi-wedged.log", held, "msi-wedged.prev.log", true)`, then `write_file` of the copy, read from SYSTEM's own staging |
-| the update-attempt marker (`agents/roomlerd/src/updater.rs:230-232`, `:242-256`) | `create_dir_all`, `fs::write` | `write_file("update-attempt", ..)` |
+| the encoder caps cache (`agents/roomlerd/src/encode/caps_cache.rs:337-354`, its path `:183-187`) | `create_dir_all`, `fs::write(tmp)`, `fs::rename` | `write_file(FILE_NAME, ..)`; its readers read with `read_file` |
+| the install outcome (`agents/roomlerd/src/post_install.rs:206-208`, `:254-313`) | `create_dir_all`, `fs::write` | `write_file("last-install.json", ..)` |
+| the wedged MSI log (`post_install.rs:1000-1017`) | `fs::rename` to `.prev`, `fs::copy` | `rename_file("msi-wedged.log", held, "msi-wedged.prev.log", true)`, then `write_file` of the copy, read from SYSTEM's own staging |
+| the update-attempt marker (`agents/roomlerd/src/updater.rs:230-232`, `:242-268`) | `create_dir_all`, `fs::write` | `write_file("update-attempt", ..)` |
 
 The uploader's verdicts ledger (`crash-verdicts.txt`) is a `service-logs` writer too, and P1's since the review
 (see P1: crash records).
@@ -374,7 +374,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 | L1 a crash record lands | per-Machine, SystemContext, enrolled | as an administrator, end the worker (`taskkill /F`), which the supervisor records | a new `<ts>-<pid>.json` in `%ProgramData%\roomler\roomler\crashes`; `icacls` shows that folder sealed (`Seal::Readable`, D10); the crash is on the device's server-side crash list after the worker's next start |
 | L1b the person's worker reads the supervisor's records (added 2026-11-12, with the reader's way through above) | per-Machine, attended: the worker runs as the signed-in person | as an administrator, end the worker (`taskkill /F`), which the supervisor records; let the worker start again as the person | the record is on the device's server-side crash list after the worker's next start, and the person's worker log has no `crash records left alone` line |
 | L2 an upgrade keeps the folders | per-Machine, on the previous release, with `crashes` and `service-logs` there | upgrade to the candidate | the same folders, no `.moved-*`, now sealed; the old log files still there; the tray of an account that is not an administrator lists and opens them ("Open Logs Folder") |
-| L3 the logs write and age | L2's host | leave it across a UTC midnight (or move the guest's clock); as an administrator, add a `roomlerd-service.log.<date>` 15 days old | a new daily file per role (`roomlerd-service.log`, `roomlerd.log`, `roomlerd-netd.log`); the 15-day-old file pruned at the next start (`KEEP_DAYS` is 14, `logging.rs:78`); the tray's diagnostics bundle holds the service logs |
+| L3 the logs write and age | L2's host | leave it across a UTC midnight (or move the guest's clock); as an administrator, add a `roomlerd-service.log.<date>` 15 days old | a new daily file per role (`roomlerd-service.log`, `roomlerd.log`, `roomlerd-netd.log`); the 15-day-old file pruned at the next start (`KEEP_DAYS` is 14, `logging.rs:89`); the tray's diagnostics bundle holds the service logs |
 | L4 a machine folder a per-User install made first | a per-User install first (its daemon makes the machine folder), then the per-Machine one | a file transfer as the person; restart the service | service logs and a crash record (L1's step) land; the person's file transfer still completes |
 | L5 the per-Machine arm cleans | a per-Machine host | as an elevated operator, `roomlerd cleanup-legacy-install --target-flavour perUser` from the per-Machine exe | both segments' `service-logs` removed, with the report's lines as before |
 | L6 the per-user arm cleans the recorded profile | a per-User install by an account whose profile folder is not `C:\Users\<name>` (a renamed account, or `<name>.000`) | elevated, `roomlerd cleanup-legacy-install --target-flavour perMachine` by hand | the four trees under the profile `ProfileList` records are removed, and nothing else under `C:\Users` changes; with nobody signed in, the report says no profile was looked up |
@@ -392,15 +392,15 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:2260`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | in progress: [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) |
-| P2 | service logs: `HeldRollingWriter` and every other `service-logs` writer (the prune, the panic and stderr files, the caps cache, the install outcome, the wedged MSI log, the update marker) | the same switch: `RollingFileAppender` and today's writers | not started |
+| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:2260`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | merged: [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) |
+| P2 | service logs: `HeldRollingWriter` and every other `service-logs` writer (the prune, the panic and stderr files, the caps cache, the install outcome, the wedged MSI log, the update marker) | the same switch: `RollingFileAppender` and today's writers | in progress: [#4493](https://github.com/gjovanov/roomler-ai/pull/4493). The crash recorder's SYSTEM-worker arm and the verdicts ledger keep P1's own walk |
 | P3 | the rest: the attempt record, the machine attention file, the launch marker, the presence lock, the machine config's saves, the repair's and the adoption's opens; the segment move (D7); the gate (D8) | the same switch | not started |
-| Docs | the docs below, each in the PR of the phase it describes, the rest by P3 | none | not started |
+| Docs | the docs below, each in the PR of the phase it describes, the rest by P3 | none | in progress: P1's in [#3758](https://github.com/gjovanov/roomler-ai/pull/3758), P2's in [#4493](https://github.com/gjovanov/roomler-ai/pull/4493) |
 | Field | the read on a released build (AC6) | read only | not started |
 
 The docs:
 
-- `docs/installation.md`, the clean-up's row (`docs/installation.md:1988`) and wherever it describes
+- `docs/installation.md`, the clean-up's row (`docs/installation.md:2005`) and wherever it describes
   `cleanup-legacy-install`: every removal acts through the folder it checked and leaves a path with a link on it,
   with a report line; the per-user arm reads the profile the system records for the session's account, and removes
   nothing when none is recorded.
@@ -455,7 +455,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   what it held inside SYSTEM's folder.
 - **D3. The daily log.** Options: a writer of our own below the held folder; or `tracing_appender` kept, after a
   check at start. **Default: our own writer, `HeldRollingWriter`, in P2.** `tracing_appender` opens each day's file
-  by path at rotation (`logging.rs:234-238`), which a check at start does not cover.
+  by path at rotation (`logging.rs:252-257`), which a check at start does not cover.
 - **D4. The presence lock's folder**, which sits directly below `%ProgramData%`, outside the machine folder
   (`peer_presence.rs:83-89`). Options: keep its path, behind `HeldPath`; or move it below the machine folder.
   **Default: keep the path, behind `HeldPath`, in P3.** The leaf policy covers it, and moving it changes what its
@@ -484,7 +484,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - File-transfer staging (`files.rs:1694-1696` and its pipeline): its own design pass (D5).
 - The person's own daemon's files in their profile, which stay as they are.
 - macOS and Linux.
-- Folders SYSTEM makes for itself outside the machine folder, such as the updater's staging (`updater.rs:1179`).
+- Folders SYSTEM makes for itself outside the machine folder, such as the updater's staging (`updater.rs:1191`).
 - Uninstall: the MSIs remove no tree of the machine folder (`agents/roomlerd/wix/main.wxs:355` removes only the
   Start-menu subfolder, and `agents/roomlerd/wix-perMachine/main.wxs` removes none).
 - The clean-up's removal of the SCM service and of the Scheduled Tasks.

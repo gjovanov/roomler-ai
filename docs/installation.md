@@ -235,7 +235,7 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:399`);
 - every self-update, and the daemon's own refresh of its companion (`download_asset`,
-  `agents/roomlerd/src/updater.rs:1402`).
+  `agents/roomlerd/src/updater.rs:1414`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
@@ -1103,10 +1103,10 @@ daemon still holding its event, is stopped as before.
 
 **After every update the daemon runs, or the record says why not (FR-150 P1b).** The
 post-install watcher has always settled a per-Machine service after every verdict
-(`settle_service`, `agents/roomlerd/src/post_install.rs:1616`). Its per-user arm started the
+(`settle_service`, `agents/roomlerd/src/post_install.rs:1641`). Its per-user arm started the
 task only after a failed install, because an exit 0 means the new task's one-shots do it, and
 #3507 was an exit 0 that had registered nothing. So the per-user arm is now a ladder
-(`relaunch_user_daemon`, `post_install.rs:1207`, run by `settle_user_daemon`, `:1360`). "Up"
+(`relaunch_user_daemon`, `post_install.rs:1232`, run by `settle_user_daemon`, `:1385`). "Up"
 is the daemon's stop event held for this config (`user_stop_event_held`,
 `agents/roomlerd/src/win_service/stop_event.rs:514`), in the person's session, where the
 watcher runs too:
@@ -1142,18 +1142,18 @@ flowchart TD
   of the watcher's races Restart Manager's late stop (#2711). A failed install starts at the
   first rung, as #3292's start did.
 - **The rungs run the binary the install laid down** (`--origin-exe`; `UserDaemon::resolve`,
-  `post_install.rs:1275`), never the watcher's own image. That is a copy in the staging
+  `post_install.rs:1300`), never the watcher's own image. That is a copy in the staging
   folder, and a task registered from it would name a launcher in `%TEMP%`. The launcher is
-  spawned with no handle of the watcher's (`:1339`).
+  spawned with no handle of the watcher's (`:1364`).
 - **The record says it in three places.** The field sits in `last-install.json`, in
   `NodeStatus.last_install` (`InstallDaemon`, `crates/localapi/src/lib.rs:626`, additive both
   ways), and in the next daemon's `last install:` line, a WARN when the watcher left no daemon
-  running (`post_install.rs:2267`).
+  running (`post_install.rs:2292`).
 - **The first update onto P1b runs the old release's watcher**, so P1b protects the hops after
   it. P1a's `Roomler start-<SID>` protects that one.
 - `ROOMLERD_WATCHER_RELAUNCH=0` in the daemon's environment, which the watcher inherits, keeps
   the old arm: a start only after a failure (`start_user_daemon_after_a_failure`,
-  `post_install.rs:1081`; the switch, `:1128`).
+  `post_install.rs:1106`; the switch, `:1153`).
 
 **The first update onto the launcher looks a little different.** It runs the old
 product's table and the old daemon's own console: one terminal can flash when the old
@@ -1559,9 +1559,9 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1973`) launches `msiexec /i … /qn` elevated
-(`:2096`, `:2496`) while the service runs; the worker that launched it exits 0,
-and its host stays up (`:411`). Measured on a vmtest Win11 cell, released code,
+(`agents/roomlerd/src/updater.rs:1985`) launches `msiexec /i … /qn` elevated
+(`:2108`, `:2508`) while the service runs; the worker that launched it exits 0,
+and its host stays up (`:423`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
 
 | Run | The first Stop came from | Released code |
@@ -1620,7 +1620,7 @@ Windows compares environment names, and is added where there is none. The
 exceptions are `ROOMLERD_ENABLE_SYSTEM_SWAP` and `ROOMLER_NODE_ENABLE_SYSTEM_SWAP`,
 both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 `carry.rs:37`). The installer decides the switch: the updater passes
-`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:2234`;
+`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:2246`;
 it reads the service's environment for a per-Machine install only, so a per-user
 install's update, which has no service, logs nothing about the switch, #3889),
 and otherwise KeepSystemContext follows the record of the last
@@ -1849,11 +1849,11 @@ conhost left at Normal, the exit-DNS purge's 10 s bound logged its warning 40.1 
 
 | What the worker writes | Since #3438 | Why |
 |---|---|---|
-| tracing | The rolling log only (`crates/agent-core/src/logging.rs:260`) | The file has every line, and a console write waits for its conhost |
+| tracing | The rolling log only (`crates/agent-core/src/logging.rs:279`) | The file has every line, and a console write waits for its conhost |
 | stderr | The rolling log, the same dated file tracing writes, from the end of `init` (`:283`); `NUL` past 256 MiB in a day, as for the per-user daemon (#3292) | The watchdog's last words (`say_on_stderr`), a panic, a stack overflow and FFmpeg print only there |
 | stdout, other than tracing | The console, as before | Only tracing's lines were measured waiting there |
 
-The rule asks two things (`console_nobody_reads`, `crates/agent-core/src/logging.rs:303`):
+The rule asks two things (`console_nobody_reads`, `crates/agent-core/src/logging.rs:333`):
 the process logs for a service role, and its stdout is a console that has no window. A
 verb a person runs, in a terminal or over `roomler ssh`, keeps its console lines when it has
 no service role. The per-Machine MSI's own steps have one, the installer role
@@ -1864,7 +1864,7 @@ them. The worker says so once at its start: `logging: this console has no window
 every line goes to the log file, stderr's too (#3438)`.
 
 `a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log`
-(`crates/agent-core/src/logging.rs:2448`) pins it. It runs its own test binary again with
+(`crates/agent-core/src/logging.rs:2553`) pins it. It runs its own test binary again with
 `CREATE_NO_WINDOW`, hands the child that console as its stdout and stderr, and reads the
 console's text back; a control line proves the console is read at all. It runs in the
 Windows lane's `logging::tests::stderr_capture` step.
@@ -1889,7 +1889,11 @@ LocalSystem itself, from a scheduled task, in LocalSystem's
 ([#3230](https://github.com/gjovanov/roomler-ai/issues/3230#issuecomment-6775283704)). An upgrade
 by the updater, where msiexec runs as LocalSystem, was not run. Each step now logs into
 `%PROGRAMDATA%\Roomler\roomler\service-logs\roomlerd-installer.log`, beside the service's
-own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:123`):
+own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:134`). Since FR-145 P2
+a step writes it as the service writes its own: below `service-logs`, held by handle for the
+step's whole run and never reached through a link
+(`crates/agent-core/src/logging/held_logs.rs:294`). A link above `service-logs` sends the
+step's log to LocalSystem's profile instead, its first line naming the link (#3073). The steps:
 
 | Custom action | The verb | When it runs |
 |---|---|---|
@@ -1924,17 +1928,17 @@ this log once that step's build has #3230. Which step writes it is read from the
 seen in the field: on a clean lab guest no step had anything to repair, so none wrote it.
 
 What a step writes, in order. Its own lines have the target `roomler_node_core::logging::step`
-(`crates/agent-core/src/logging.rs:597`), which the filter keeps at INFO under any `RUST_LOG`:
+(`crates/agent-core/src/logging.rs:654`), which the filter keeps at INFO under any `RUST_LOG`:
 
 | Line | Fields | Written by |
 |---|---|---|
-| `installer step started: roomlerd <verb and arguments>` | `version`, `pid`, `account` (the process's SID, `S-1-5-18` for LocalSystem) | `begin_step` (`crates/agent-core/src/logging.rs:619`), right after `logging::init` (`agents/roomlerd/src/app.rs:1649`) |
+| `installer step started: roomlerd <verb and arguments>` | `version`, `pid`, `account` (the process's SID, `S-1-5-18` for LocalSystem) | `begin_step` (`crates/agent-core/src/logging.rs:676`), right after `logging::init` (`agents/roomlerd/src/app.rs:1649`) |
 | everything the verb logs | as the verb logs it | the verb |
-| each answer: `Service registered…`, `Service reconfigured in place…`, `Service deregistered`, the cleanup's summary, the SystemContext verbs' answers | none | `answer` (`crates/agent-core/src/logging.rs:637`): on stdout as before, and inside a step in the log |
-| `installer step ended: roomlerd <verb and arguments>`, INFO | `exit_code`, `elapsed_ms`, `result` (the last answer) | `end_step` (`crates/agent-core/src/logging.rs:656`), from `main` (`agents/roomlerd/src/app.rs:1412`) |
+| each answer: `Service registered…`, `Service reconfigured in place…`, `Service deregistered`, the cleanup's summary, the SystemContext verbs' answers | none | `answer` (`crates/agent-core/src/logging.rs:694`): on stdout as before, and inside a step in the log |
+| `installer step ended: roomlerd <verb and arguments>`, INFO | `exit_code`, `elapsed_ms`, `result` (the last answer) | `end_step` (`crates/agent-core/src/logging.rs:713`), from `main` (`agents/roomlerd/src/app.rs:1412`) |
 | `installer step failed: roomlerd <verb and arguments>`, ERROR | `exit_code`, `elapsed_ms`, `error` (the whole cause chain) | the same |
 
-`end_step` ends with `logging::finish` (`crates/agent-core/src/logging.rs:688`). It drops the
+`end_step` ends with `logging::finish` (`crates/agent-core/src/logging.rs:745`). It drops the
 file writer's guard, which writes every queued line before the process exits. The guard lives
 in a static, and no exit drops a static: without the flush, one run in six of the test below
 lost the last 1,101 of its 20,000 lines, and the answer and the end line with them. A restart
@@ -1955,7 +1959,7 @@ has no `--as-service`, and its cleanup is `--target-flavour perUser`
 
 Run by hand in a terminal, a step shows what it always showed: its answer once, and the
 verb's lines. The start and end lines go to the file only: the console's writer drops them
-(`crates/agent-core/src/logging.rs:257`). A per-layer filter on the console instead would leave the
+(`crates/agent-core/src/logging.rs:276`). A per-layer filter on the console instead would leave the
 whole stack with no level, which tracing reads as TRACE in every daemon that keeps its console,
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
@@ -1964,21 +1968,21 @@ write, the console keeps them too. One line moved:
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
-and `basename` (`crates/agent-core/src/logging.rs:111`, `:117`), and the appender, the prune
-(`rolling_basenames`, `crates/agent-core/src/logging.rs:1070`) and the `--source` reader
-(`newest_service_log`, `crates/agent-core/src/logging.rs:1004`) all read it, so netd's dated
+and `basename` (`crates/agent-core/src/logging.rs:122`, `:128`), and the appender, the prune
+(`rolling_basenames`, `crates/agent-core/src/logging.rs:1155`) and the `--source` reader
+(`newest_service_log`, `crates/agent-core/src/logging.rs:1089`) all read it, so netd's dated
 files age out too. Two transports do not return this log yet, and each needs a wire change:
 the RC data channel's `logs:fetch` reads only the serving process's own `roomlerd.log*`
 (`agents/roomlerd/src/logs_fetch.rs:52`), and an installer step starts no log upload (a
 follow-up of #3230).
 
-`logging::tests::installer_log` (`crates/agent-core/src/logging.rs:1850`) pins the folder and
+`logging::tests::installer_log` (`crates/agent-core/src/logging.rs:1955`) pins the folder and
 the names, the prune and the source. It runs a failing step in a child with stdout on `NUL`,
 as under msiexec, and finds its start line, all 20,000 of its lines, its answer and its whole
-error chain in the file (`crates/agent-core/src/logging.rs:2059`); run with a console, the same
-step shows what it always showed (`crates/agent-core/src/logging.rs:2089`). A daemon's `init`,
+error chain in the file (`crates/agent-core/src/logging.rs:2164`); run with a console, the same
+step shows what it always showed (`crates/agent-core/src/logging.rs:2194`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
-INFO, not TRACE (`crates/agent-core/src/logging.rs:2132`). The Windows lane runs the module
+INFO, not TRACE (`crates/agent-core/src/logging.rs:2237`). The Windows lane runs the module
 beside `stderr_capture` (`.github/workflows/ci.yml:1966`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8116`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8149`)
@@ -2050,11 +2054,11 @@ profile, or the machine's data folder) or is reached through a link below it (`k
   times, or a time that cannot be read, the NEW folder's copy keeps the name. The newer copy
   wins because the tree a copy sits in does not say which one is live: a device whose config
   stayed in the OLD tree writes its state there (#3747). The update marker's age is what it says
-  (`recent_update_attempt_at`, `agents/roomlerd/src/updater.rs:268`), the newest install record
-  is the one its reader takes (`newest_record_path`, `agents/roomlerd/src/post_install.rs:333`),
+  (`recent_update_attempt_at`, `agents/roomlerd/src/updater.rs:280`), the newest install record
+  is the one its reader takes (`newest_record_path`, `agents/roomlerd/src/post_install.rs:349`),
   and the host-mute, privacy-curtain and keep-busy files hold the latest state. A move keeps a
   file's modification time. Of two fragments of one day's log both are kept: a kept-beside log
-  ages out with the logs (`prune_old_logs_at`, `crates/agent-core/src/logging.rs:1095`), and the
+  ages out with the logs (`prune_old_logs_at`, `crates/agent-core/src/logging.rs:1197`), and the
   log fetch never takes one for the current log (`agents/roomlerd/src/logs_fetch.rs:67`,
   `crates/agent-core/src/appdirs.rs:1592`).
 - Nothing is overwritten or deleted. A file or a link moves only onto a free name
@@ -2402,7 +2406,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2419-2421`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2431-2433`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -3893,11 +3897,11 @@ flowchart TD
 
 | What is live | What the periodic check does | Where |
 |---|---|---|
-| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3796` |
+| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3808` |
 | a remote-control session, an SSH connection, a Fleet RPC run, a transfer or a recording | defers, and checks again in 1 h | `TRANSFER_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:77` |
 | only a network transition in the last 10 min | defers, and checks again in 2 min (R5b) | `NET_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:98` |
 | either, after 7 defers in a row | installs anyway, and warns what it cuts: a device that is never idle still takes a release about 7 h after it was due | `MAX_CONSECUTIVE_DEFERS`, `agents/roomlerd/src/updater.rs:84` |
-| live work beside a network transition, at the recheck after a long outage, under the cap | holds once, counts no defer, and reads again in 10 min (#4407, below) | `OUTAGE_RECHECK_HOLD`, `agents/roomlerd/src/updater.rs:3831` |
+| live work beside a network transition, at the recheck after a long outage, under the cap | holds once, counts no defer, and reads again in 10 min (#4407, below) | `OUTAGE_RECHECK_HOLD`, `agents/roomlerd/src/updater.rs:3843` |
 
 - **What counts.** A session in the daemon's registry. An SSH connection the
   daemon serves, or carries to the Windows service on port 2223 (FR-105,
@@ -3924,9 +3928,9 @@ flowchart TD
   outlives an hour without its socket (FR-138 keeps one for 120 s at most), but
   an SSH session on the mesh does, and so does a session another enrollment of
   the daemon serves; and a long outage often ends on a network that just moved.
-  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3244`),
+  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3256`),
   and one function picks the cycle's way (`cycle_arm`,
-  `agents/roomlerd/src/updater.rs:3886`).
+  `agents/roomlerd/src/updater.rs:3898`).
 - **A recheck that finds live work beside a network move holds once (#4407).**
   The move can end an SSH session on the mesh that the daemon still counts.
   The daemon hears the end only once the mesh carries it: within about a
@@ -3935,15 +3939,15 @@ flowchart TD
   (`agents/roomlerd/src/ssh.rs:666`). So a recheck that the gate would defer
   for live work beside a move in the last 10 min holds instead. It runs no
   check, counts no defer, and reads `Busy` again after `OUTAGE_RECHECK_HOLD`,
-  the move's own 10 min (`agents/roomlerd/src/updater.rs:3831`; the hold,
-  `:3904-3921`; the loop's arm, `:3697-3712`). The move came before the
+  the move's own 10 min (`agents/roomlerd/src/updater.rs:3843`; the hold,
+  `:3916-3933`; the loop's arm, `:3709-3724`). The move came before the
   recheck, so that read is the first check after R5b's window. A session the
   move ended is gone by then, and the check installs. A session still live
   defers by the hour and counts, as the recheck did before, so a device that
   is never idle is forced 10 min later than before, never sooner. There is
   one hold per recheck: the read after it is the timer's cycle, which never
   holds, and a recheck right after a hold takes the rule above (`after_hold`,
-  `:3585`). At the cap the recheck forces, as before. The timer's cycle, a
+  `:3597`). At the cap the recheck forces, as before. The timer's cycle, a
   push and the boot path are unchanged. A Mac is not on this path: its helper
   reads the recheck as a plain wake (FR-151), under its own rule.
 - **Only the process that installs is asked**, and it counts only what it
@@ -3993,10 +3997,10 @@ each log line are in [the helper's gate](#macos-the-root-update-helpers-gate-fr-
 
 A daemon on a Mac installs nothing. It forwards an operator's push and its
 outage recheck to the helper's wake file (`run_periodic`,
-`agents/roomlerd/src/updater.rs:3513-3514`; `forward_triggers_to`, `:4227`),
+`agents/roomlerd/src/updater.rs:3525-3526`; `forward_triggers_to`, `:4239`),
 and the root LaunchDaemon `com.roomler.update` runs `roomlerd update-helper`,
 which checks the feed, downloads, verifies and runs `installer -pkg … -target /`
-(`mac_gate::run`, `:4559`). From 0.4.235 the helper first reads what each half
+(`mac_gate::run`, `:4571`). From 0.4.235 the helper first reads what each half
 that the install restarts is serving, and waits while either serves live work.
 Its cycle:
 
@@ -4021,14 +4025,14 @@ flowchart TD
 
 | Step | What the helper does | Where |
 |---|---|---|
-| start | holds `update-helper.lock` (`flock`) beside the budget, so one helper runs at a time. The opt-out and the 5-min install-storm cooldown end the run before the feed is asked | `mac_gate::run`, `updater.rs:4559-4573`; `take_lock`, `:4840`; `cycle`, `:4629-4644` |
-| the probe | asks the release feed before it reads a half. Up to date resets the budget, and a failed probe keeps it; either ends the run | `updater.rs:4648-4671`; `budget_after_probe`, `agents/roomlerd/src/helper_gate.rs:355` |
-| the readings | `live_work` from the root half, over `/var/run/roomler/roomler.sock` and kept only when root serves it, then from the console person's half, through FR-147's child `roomlerd one-row-home live-work`, which asks the daemon behind that person's own socket. Each answer is bounded at 5 s, and the child at 30 s | `read_halves`, `updater.rs:4777`; `read_root_half`, `:4787`; `read_persons_half`, `:4805`; `ASK_TIMEOUT`, `helper_gate.rs:50`; the child's verb, `agents/roomlerd/src/one_row_home.rs:21`; `CHILD_DEADLINE`, `agents/roomlerd/src/one_row.rs:1214` |
-| the arm | a fresh ask recorded by the root half (a push to its row) forces over both halves. One recorded by the person's half (a push to their row, or their "Apply update") forces over everything their half serves and the root half's remote-control sessions, never over the root half's SSH connections, runs, transfers, recording or network transition, or a root half it could not read. A wake inside a chain installs only when nothing is live, and never counts. A due cycle takes #3429's rule, with each half it could not read as one unit of live work. An ask the root half held lapses: it is fresh for 10 minutes, and the recheck after a defer for live work comes an hour later, so that cycle and the ones after it are a plain wake's, the person's own work included (#4423) | `helper_arm`, `helper_gate.rs:205`; `ASK_FRESH` (10 min), `:48`; `Budget::due`, `:178`; `periodic_gate`, `updater.rs:3796`; `TRANSFER_DEFER_RECHECK` (1 h), `:77` |
-| the second reading | after the download, unless the arm was forced: work that came meanwhile drops the download, on the same budget | `second_arm`, `helper_gate.rs:277`; `updater.rs:4729-4755` |
-| the budget | `update-defers.json` in root's log folder: 0600, at most 4 KiB, parsed strictly, written as a new file and renamed over. It resets just before `installer(8)` runs | `read_budget`, `updater.rs:4862`; `write_budget`, `:4892`; `Budget::parse`, `helper_gate.rs:152`; `budget_for`, `:450` |
-| the wait | after a defer, a look every 5 s, in this order: SIGTERM, the opt-out, the kill switch, its own program, 8 h awake, the due time, a wake at least 60 s after the last cycle | the loop, `updater.rs:4581-4624`; `next_step`, `helper_gate.rs:420`; `TICK`, `:52`; `AWAKE_CEILING`, `:56`; `UPDATE_HELPER_MIN_GAP`, `updater.rs:295` |
-| the install | `installer -pkg … -target /`, as before FR-151 | `install_from_helper`, `updater.rs:4934` |
+| start | holds `update-helper.lock` (`flock`) beside the budget, so one helper runs at a time. The opt-out and the 5-min install-storm cooldown end the run before the feed is asked | `mac_gate::run`, `updater.rs:4571-4585`; `take_lock`, `:4852`; `cycle`, `:4641-4656` |
+| the probe | asks the release feed before it reads a half. Up to date resets the budget, and a failed probe keeps it; either ends the run | `updater.rs:4660-4683`; `budget_after_probe`, `agents/roomlerd/src/helper_gate.rs:355` |
+| the readings | `live_work` from the root half, over `/var/run/roomler/roomler.sock` and kept only when root serves it, then from the console person's half, through FR-147's child `roomlerd one-row-home live-work`, which asks the daemon behind that person's own socket. Each answer is bounded at 5 s, and the child at 30 s | `read_halves`, `updater.rs:4789`; `read_root_half`, `:4799`; `read_persons_half`, `:4817`; `ASK_TIMEOUT`, `helper_gate.rs:50`; the child's verb, `agents/roomlerd/src/one_row_home.rs:21`; `CHILD_DEADLINE`, `agents/roomlerd/src/one_row.rs:1214` |
+| the arm | a fresh ask recorded by the root half (a push to its row) forces over both halves. One recorded by the person's half (a push to their row, or their "Apply update") forces over everything their half serves and the root half's remote-control sessions, never over the root half's SSH connections, runs, transfers, recording or network transition, or a root half it could not read. A wake inside a chain installs only when nothing is live, and never counts. A due cycle takes #3429's rule, with each half it could not read as one unit of live work. An ask the root half held lapses: it is fresh for 10 minutes, and the recheck after a defer for live work comes an hour later, so that cycle and the ones after it are a plain wake's, the person's own work included (#4423) | `helper_arm`, `helper_gate.rs:205`; `ASK_FRESH` (10 min), `:48`; `Budget::due`, `:178`; `periodic_gate`, `updater.rs:3808`; `TRANSFER_DEFER_RECHECK` (1 h), `:77` |
+| the second reading | after the download, unless the arm was forced: work that came meanwhile drops the download, on the same budget | `second_arm`, `helper_gate.rs:277`; `updater.rs:4741-4767` |
+| the budget | `update-defers.json` in root's log folder: 0600, at most 4 KiB, parsed strictly, written as a new file and renamed over. It resets just before `installer(8)` runs | `read_budget`, `updater.rs:4874`; `write_budget`, `:4904`; `Budget::parse`, `helper_gate.rs:152`; `budget_for`, `:450` |
+| the wait | after a defer, a look every 5 s, in this order: SIGTERM, the opt-out, the kill switch, its own program, 8 h awake, the due time, a wake at least 60 s after the last cycle | the loop, `updater.rs:4593-4636`; `next_step`, `helper_gate.rs:420`; `TICK`, `:52`; `AWAKE_CEILING`, `:56`; `UPDATE_HELPER_MIN_GAP`, `updater.rs:307` |
+| the install | `installer -pkg … -target /`, as before FR-151 | `install_from_helper`, `updater.rs:4946` |
 
 **The Macs it covers.** The field cells are FR-151's, read on 0.4.235 on lab
 Macs on 2026-11-24 ([field log](fr/FR-151-mac-update-waits-for-live-work.md#field-log)):
@@ -4075,34 +4079,34 @@ that comes later, never toward a wait the helper does not keep.
 
 | Line | What it means | Where |
 |---|---|---|
-| `update-helper: deferring the install: busy=1 remote-control session(s) consecutive_defers=1 next_check_secs=3600 cycle=due root=not_running person=answered` | live work in a half, or a half it could not read: no install now. `busy=` names the work, and an unread half as `the root half, unread (no_answer)`. `cycle=due` counts, and `consecutive_defers` is the count so far; `cycle=wake` is a wake inside a chain, which keeps the count and the due time. `next_check_secs` is the time to the next counted cycle. Each half reads `answered`, `not_running` (no socket, a refused one, or nobody at the console), `older` (a daemon from before FR-151) or `no_answer` (no answer within the bound, an error, or a child that failed) | `defer_line`, `helper_gate.rs:326`; `updater.rs:4684-4687` |
-| `update-helper: deferring the install after the download: …` | the same, from the second reading: work came during the download, which is dropped | `updater.rs:4745-4751` |
-| `update-helper: the install goes ahead root="not_running" person="answered"` | the first reading lets the install go: nothing live, a fresh ask it may honour, or the cap | `updater.rs:4691-4695` |
-| `update-helper: forced update proceeding despite: 1 remote-control session(s)` | a forced install, and what it cuts: the root half's push, the person's ask, or the cap after 7 counted defers. A forced install that cuts nothing logs no warning | `forced_warning`, `helper_gate.rs:320`; `updater.rs:4756-4762` |
-| `update-helper: installing (installer -pkg … -target /)`, then `update-helper: installer(8) exited 0; …` | the install, as before FR-151. The budget reset just before it | `updater.rs:4770-4772`; `install_from_helper`, `:4934` |
-| `update-helper: installing over live work with no reading (the kill switch)` | `/etc/roomler/install-over-live-work` is there: no reading, as before FR-151. A waiting helper takes it up within 5 s | `updater.rs:4698-4701` |
-| `update-helper: stops waiting without installing; the budget stays for the next run why=Stopped consecutive_defers=1` | a waiting helper exits: `Stopped` (SIGTERM: a bootout, `install.sh --uninstall`, a shutdown), `OptedOut`, `Replaced` (an install replaced its program) or `Ceiling` (8 h awake) | `updater.rs:4599-4607`; `ExitWhy`, `helper_gate.rs:397` |
-| `update-helper: check skipped` | the feed could not be read, or gave no answer it could use: the run ends with the budget kept. At a waiting helper's due minute, the next counted cycle then waits for launchd (below) | `updater.rs:4666-4668` |
-| `update-helper: up to date` | this Mac runs the newest release: the budget resets, and the run ends | `updater.rs:4660-4665` |
-| `update-helper: download skipped` | the download, or its verification, failed: the run ends with the budget kept | `updater.rs:4723-4725` |
-| `update-helper: SIGTERM while checking; exiting without installing`, and the same `while reading`, `while downloading` and `before installing` | SIGTERM ended a cycle: nothing installs | `updater.rs:4652`, `:4675`, `:4711`, `:4734`, `:4766` |
-| `update-helper: another update helper runs; exiting` | another helper holds the lock | `updater.rs:4565` |
-| `update-helper: suppressed by recent-install cooldown` | an install was tried in the last 5 min: the run ends | `updater.rs:4497-4503`, `:4638-4643` |
-| `auto-update opted out — exiting` | the opt-out marker is there | `updater.rs:4634-4636` |
-| `update-helper: who is at the console could not be read`, `… the console's account could not be read`, `… the person's live-work child did not run`, `… the person's live-work reply was not read` | the person's half reads `no_answer`, which counts as live work | `read_persons_half`, `updater.rs:4805-4836` |
-| `update-helper: the defer budget could not be read; no chain is pending`, `… is not one root wrote; no chain is pending`, `… was not written; it counts in memory for this run` | the budget file is unreadable, or not root's own: the run starts with no chain. A failed write keeps the count for this run only | `updater.rs:4871`, `:4885`, `:4916` |
+| `update-helper: deferring the install: busy=1 remote-control session(s) consecutive_defers=1 next_check_secs=3600 cycle=due root=not_running person=answered` | live work in a half, or a half it could not read: no install now. `busy=` names the work, and an unread half as `the root half, unread (no_answer)`. `cycle=due` counts, and `consecutive_defers` is the count so far; `cycle=wake` is a wake inside a chain, which keeps the count and the due time. `next_check_secs` is the time to the next counted cycle. Each half reads `answered`, `not_running` (no socket, a refused one, or nobody at the console), `older` (a daemon from before FR-151) or `no_answer` (no answer within the bound, an error, or a child that failed) | `defer_line`, `helper_gate.rs:326`; `updater.rs:4696-4699` |
+| `update-helper: deferring the install after the download: …` | the same, from the second reading: work came during the download, which is dropped | `updater.rs:4757-4763` |
+| `update-helper: the install goes ahead root="not_running" person="answered"` | the first reading lets the install go: nothing live, a fresh ask it may honour, or the cap | `updater.rs:4703-4707` |
+| `update-helper: forced update proceeding despite: 1 remote-control session(s)` | a forced install, and what it cuts: the root half's push, the person's ask, or the cap after 7 counted defers. A forced install that cuts nothing logs no warning | `forced_warning`, `helper_gate.rs:320`; `updater.rs:4768-4774` |
+| `update-helper: installing (installer -pkg … -target /)`, then `update-helper: installer(8) exited 0; …` | the install, as before FR-151. The budget reset just before it | `updater.rs:4782-4784`; `install_from_helper`, `:4946` |
+| `update-helper: installing over live work with no reading (the kill switch)` | `/etc/roomler/install-over-live-work` is there: no reading, as before FR-151. A waiting helper takes it up within 5 s | `updater.rs:4710-4713` |
+| `update-helper: stops waiting without installing; the budget stays for the next run why=Stopped consecutive_defers=1` | a waiting helper exits: `Stopped` (SIGTERM: a bootout, `install.sh --uninstall`, a shutdown), `OptedOut`, `Replaced` (an install replaced its program) or `Ceiling` (8 h awake) | `updater.rs:4611-4619`; `ExitWhy`, `helper_gate.rs:397` |
+| `update-helper: check skipped` | the feed could not be read, or gave no answer it could use: the run ends with the budget kept. At a waiting helper's due minute, the next counted cycle then waits for launchd (below) | `updater.rs:4678-4680` |
+| `update-helper: up to date` | this Mac runs the newest release: the budget resets, and the run ends | `updater.rs:4672-4677` |
+| `update-helper: download skipped` | the download, or its verification, failed: the run ends with the budget kept | `updater.rs:4735-4737` |
+| `update-helper: SIGTERM while checking; exiting without installing`, and the same `while reading`, `while downloading` and `before installing` | SIGTERM ended a cycle: nothing installs | `updater.rs:4664`, `:4687`, `:4723`, `:4746`, `:4778` |
+| `update-helper: another update helper runs; exiting` | another helper holds the lock | `updater.rs:4577` |
+| `update-helper: suppressed by recent-install cooldown` | an install was tried in the last 5 min: the run ends | `updater.rs:4509-4515`, `:4650-4655` |
+| `auto-update opted out — exiting` | the opt-out marker is there | `updater.rs:4646-4648` |
+| `update-helper: who is at the console could not be read`, `… the console's account could not be read`, `… the person's live-work child did not run`, `… the person's live-work reply was not read` | the person's half reads `no_answer`, which counts as live work | `read_persons_half`, `updater.rs:4817-4848` |
+| `update-helper: the defer budget could not be read; no chain is pending`, `… is not one root wrote; no chain is pending`, `… was not written; it counts in memory for this run` | the budget file is unreadable, or not root's own: the run starts with no chain. A failed write keeps the count for this run only | `updater.rs:4883`, `:4897`, `:4928` |
 
 - **`check skipped` at a due minute.** When a waiting helper's due time comes,
   it runs a whole cycle, and the cycle asks the release feed before it reads a
-  half (`cycle`, `updater.rs:4629`; the probe, `:4648-4671`). If that probe
+  half (`cycle`, `updater.rs:4641`; the probe, `:4660-4683`). If that probe
   fails, during a server roll or a network drop, the helper logs
   `update-helper: check skipped`, and the run ends with the budget kept
-  (`:4666-4668`). The next run is launchd's: the plist's `StartInterval` of
+  (`:4678-4680`). The next run is launchd's: the plist's `StartInterval` of
   21600 s (`agents/roomlerd/packaging/macos/com.roomler.update.plist:64-65`),
   unless a push, the person's ask, a boot or a daemon's outage recheck writes
   the wake file first. A daemon's own timer never wakes the helper on a Mac:
   it forwards only pushes and the outage recheck (`forward_triggers`,
-  `updater.rs:4209`). So a counted cycle that meets a failed probe can come up
+  `updater.rs:4221`). So a counted cycle that meets a failed probe can come up
   to 6 h later instead of within the hour. The count is kept, the next run is a
   counted cycle, and nothing installs over live work in between. This is a
   reading of the code: the lab lane that read the recheck kept server rolls
@@ -4113,11 +4117,11 @@ that comes later, never toward a wait the helper does not keep.
   helper whose own `installer` child runs it (`postinstall:750-753`;
   `install.log` says `roomler update helper is running (this very install)`
   for both). The helper took its program's device and inode when it started
-  (`program_id`, `updater.rs:4920-4923`, taken at `:4578`) and compares them
-  at each look (`program_replaced`, `:4592-4593`). Once the install has
+  (`program_id`, `updater.rs:4932-4935`, taken at `:4590`) and compares them
+  at each look (`program_replaced`, `:4604-4605`). Once the install has
   replaced the program, it logs `… why=Replaced` and exits without installing,
   with the budget kept (`next_step`, `helper_gate.rs:430-431`;
-  `updater.rs:4599-4607`). So leaving it alone costs one 5 s look at most, and
+  `updater.rs:4611-4619`). So leaving it alone costs one 5 s look at most, and
   the next run is the new program's. No field cell has run such an install
   during a chain: this is the code's reading, and the unit cell C16
   (`next_wake_spaces_wakes_and_exits_on_markers`, `helper_gate.rs:825`) holds
@@ -4155,7 +4159,7 @@ sequenceDiagram
 
 - **Read at the decision.** The gate reads it once a cycle, with the rest of
   `Busy` (`busy::gate_now`, `agents/roomlerd/src/busy.rs:125`, read at
-  `agents/roomlerd/src/updater.rs:3645`): one health exchange, bounded at 5 s
+  `agents/roomlerd/src/updater.rs:3657`): one health exchange, bounded at 5 s
   (`RUNS_ASK_TIMEOUT`, `agents/roomlerd/src/exec_service.rs:793`). The
   service's answer stands over the worker's record: a service started again
   since a run was handed to it holds nothing and says 0, and nothing is
@@ -4276,7 +4280,7 @@ session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
 daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
-agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3957`,
+agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3969`,
 `WatchPaths` in `com.roomler.update.plist:67-70`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way. Since FR-151 the helper reads such work first: an order to the root
