@@ -1165,6 +1165,10 @@ struct CaptureGuard {
 }
 
 impl LogCapture {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn install(&self) -> CaptureGuard {
         let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let scoped = tracing::subscriber::set_default(

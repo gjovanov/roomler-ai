@@ -8627,6 +8627,10 @@ mod tests {
     }
 
     impl Logged {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+        )]
         fn start() -> Self {
             let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
             let writer = LogBuf(buf.clone());

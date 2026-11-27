@@ -783,8 +783,8 @@ swapped. A process with no role, and every platform but Windows, writes as befor
 
 | Writer | By handle | Code |
 |---|---|---|
-| The day's log | `append_file("<basename>.<YYYY-MM-DD>")`, tracing-appender's daily name, a new one each UTC day, rolled forward only. A day whose file cannot be opened keeps the day before's, as tracing-appender's roll does | `crates/agent-core/src/logging/held_logs.rs:294`, `crates/agent-core/src/logging/held_logs.rs:357` |
-| The prune, the panic file, stderr's file (#3292, #3438) | `entries` and `remove_file`, by the same name and age rule; `write_file`; `append_file` twice, the cap read from the file itself, never from the folder's listing, which NTFS updates lazily for a file open for writing | `crates/agent-core/src/logging.rs:1162`, `crates/agent-core/src/logging.rs:1214`, `crates/agent-core/src/logging.rs:859` |
+| The day's log | `append_file("<basename>.<YYYY-MM-DD>")`, tracing-appender's daily name, a new one each UTC day, rolled forward only. A day whose file cannot be opened keeps the day before's, as tracing-appender's roll does | `crates/agent-core/src/logging/held_logs.rs:298`, `crates/agent-core/src/logging/held_logs.rs:361` |
+| The prune, the panic file, stderr's file (#3292, #3438) | `entries` and `remove_file`, by the same name and age rule; `write_file`; `append_file` twice, the cap read from the file itself, never from the folder's listing, which NTFS updates lazily for a file open for writing | `crates/agent-core/src/logging.rs:1166`, `crates/agent-core/src/logging.rs:1218`, `crates/agent-core/src/logging.rs:863` |
 | The daemon's encoder caps cache, install record, wedged MSI log and update-attempt marker | `write_file`; the cache read with `read_file`; the wedged log's slot before with `rename_file` | `agents/roomlerd/src/encode/caps_cache.rs:317`, `:337`, `agents/roomlerd/src/post_install.rs:272`, `agents/roomlerd/src/post_install.rs:1000`, `agents/roomlerd/src/updater.rs:242` |
 
 Every handle a writer keeps open there appends and reads attributes, nothing more: the
@@ -795,7 +795,7 @@ a reader that does not share deletion (PowerShell's `Get-Content`, `type`) canno
 the file, and a day's log is open all day. A hold that is refused (a link above
 `service-logs`) takes #3073's per-profile fallback, the reason the first line logged; what
 the hold itself logs, the leaf policy's one WARN, is logged once the log is open, since
-the hold comes before it (`crates/agent-core/src/logging/held_logs.rs:229`).
+the hold comes before it (`crates/agent-core/src/logging/held_logs.rs:233`).
 
 ### A viewer's file transfer acts as the person at the screen (#3048, #3669, #3688)
 
@@ -1440,7 +1440,7 @@ An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:44
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would
-leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:563`, #3525). A
+leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:567`, #3525). A
 spec that names the crate keeps its say: `RUST_LOG=debug` keeps its DEBUG lines, and
 `roomler_localapi=off` silences it. Only root sets a root daemon's `RUST_LOG`, so the
 person at the device cannot turn the record off.

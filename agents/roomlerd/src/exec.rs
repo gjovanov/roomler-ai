@@ -4609,6 +4609,10 @@ pub(crate) mod session_lifetime {
 
     /// In the stand-in, first: say it is up, on its stderr, with the daemon's
     /// own log beside it there (#4444).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test stand-in's own stderr, read by its test (root clippy.toml, #3938)"
+    )]
     pub(crate) fn up(mode: &str) {
         use tracing_subscriber::util::SubscriberInitExt as _;
         let _ = tracing_subscriber::fmt()

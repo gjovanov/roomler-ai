@@ -220,7 +220,7 @@ the Windows path. A new spawn on that path is a decision someone writes down in 
 > registered for the capture's life (a `NoSubscriber` will do), so every callsite asks per
 > event; and assert a line the capture must see before one it must not, since a capture that
 > sees nothing passes every absence check. The pattern: `LogCapture::install` in
-> [`extauth_tests.rs:1168`](../crates/tests/src/extauth_tests.rs#L1168).
+> [`extauth_tests.rs:1172`](../crates/tests/src/extauth_tests.rs#L1172).
 
 Flakes fixed on 2026-10-30, and what each one teaches:
 
@@ -281,7 +281,7 @@ and passes.
 
 | Opt-in | Tests | What they do | CI step that sets it |
 |---|---|---|---|
-| `ROOMLERD_TEST_REAL_CLIPBOARD=1` | the clipboard round trip, every OS ([`clipboard.rs:4350`](../agents/roomlerd/src/clipboard.rs#L4350)); the change gate on X11 ([`:2629`](../agents/roomlerd/src/clipboard.rs#L2629), which also needs `ROOMLERD_TEST_X11=1`) and on a Mac ([`:3560`](../agents/roomlerd/src/clipboard.rs#L3560)) | write the clipboard; on X11, take `CLIPBOARD`, which empties it | "The real clipboard on X11", "… on a Mac", "… on Windows" ([`ci.yml:1333`](../.github/workflows/ci.yml#L1333), [`:1682`](../.github/workflows/ci.yml#L1682), [`:2158`](../.github/workflows/ci.yml#L2158)) |
+| `ROOMLERD_TEST_REAL_CLIPBOARD=1` | the clipboard round trip, every OS ([`clipboard.rs:4358`](../agents/roomlerd/src/clipboard.rs#L4358)); the change gate on X11 ([`:2629`](../agents/roomlerd/src/clipboard.rs#L2629), which also needs `ROOMLERD_TEST_X11=1`) and on a Mac ([`:3568`](../agents/roomlerd/src/clipboard.rs#L3568)) | write the clipboard; on X11, take `CLIPBOARD`, which empties it | "The real clipboard on X11", "… on a Mac", "… on Windows" ([`ci.yml:1333`](../.github/workflows/ci.yml#L1333), [`:1682`](../.github/workflows/ci.yml#L1682), [`:2158`](../.github/workflows/ci.yml#L2158)) |
 | `ROOMLERD_TEST_X11=1` | `capture::pointer::x11_tests` ([`pointer.rs:325`](../agents/roomlerd/src/capture/pointer.rs#L325)), `capture::x11_cursor::x11_tests` ([`x11_cursor.rs:422`](../agents/roomlerd/src/capture/x11_cursor.rs#L422)) and `input::layout_x11`'s `x11_real_switch_round_trip` ([`layout_x11.rs:838`](../agents/roomlerd/src/input/layout_x11.rs#L838)), which until #3813 ran on any display they reached; and, from before, `indicator::x11`, `capture::xwayland_probe_tests`, `keep_busy::host_x11` and `virtual_desktop`'s X tests | move the pointer, set the root cursor, replace the layouts with `setxkbmap` and leave `us` behind, send XTest input, put a window up | the Xvfb step, "The recorder's pointer (FR-85 P1d) and keep busy (FR-92 P3) on X11" ([`ci.yml:1224`](../.github/workflows/ci.yml#L1224)) |
 
 - **The gate.** A real-clipboard test calls `clipboard::real_clipboard_opted_in` first

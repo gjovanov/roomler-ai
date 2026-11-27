@@ -5192,6 +5192,10 @@ mod system {
             }
 
             /// Run `f` with every WARN+ event captured, and return the text.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+            )]
             fn capture_warns(f: impl FnOnce()) -> String {
                 let buf = Captured::default();
                 let subscriber = tracing_subscriber::fmt()
@@ -10100,6 +10104,10 @@ mod macos_kernel_tests {
     }
 
     impl Logs {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+        )]
         fn start() -> (Self, tracing::subscriber::DefaultGuard) {
             let logs = Self::default();
             let subscriber = tracing_subscriber::fmt()

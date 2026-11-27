@@ -27,9 +27,9 @@ twice (2026-08-07 and 2026-08-09); the verb existed both times.
 
 **What reaches that log.** The daemon keeps lines by `RUST_LOG` when its environment
 sets one, and otherwise by its default: `roomlerd` and `tunnel_core` at INFO,
-everything else at WARN (`crates/agent-core/src/logging.rs:468`). Either way it then
+everything else at WARN (`crates/agent-core/src/logging.rs:472`). Either way it then
 keeps INFO from two targets that no shipped unit names
-(`crates/agent-core/src/logging.rs:563`, #1928):
+(`crates/agent-core/src/logging.rs:567`, #1928):
 
 | Target | Its INFO lines |
 |---|---|
@@ -42,9 +42,9 @@ directive for the target, for a module under it or for any prefix of its name
 `RUST_LOG=debug` still logs both at DEBUG, and `roomler_localapi=off` keeps the crate
 silent. An empty or wholly invalid `RUST_LOG` is left alone too: `EnvFilter` then
 logs ERROR from every target. Three directives are added whatever the spec says:
-`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:506`),
-`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:517`) and
-`tunnel_core::overlay::route_guard=info` (`crates/agent-core/src/logging.rs:529`), the
+`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:510`),
+`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:521`) and
+`tunnel_core::overlay::route_guard=info` (`crates/agent-core/src/logging.rs:533`), the
 target of the overlay route guard's two INFO lines (#4380,
 [overlay-communication.md §8](overlay-communication.md#8-failure-handling)).
 

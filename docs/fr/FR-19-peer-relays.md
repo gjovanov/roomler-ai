@@ -941,8 +941,8 @@ kill switch. That is what makes E2E-3 executable before P2.
 
 New module `crates/tests/src/peer_relay_tests.rs`. Model on
 `crates/tests/src/relay_region_tests.rs:49` (40 lines; `TestApp::spawn_with_settings`,
-`fixtures/test_app.rs:207`, with both a REST and an in-process `app.state` assertion). For a
-two-pod topology copy `cluster_tests.rs:1485` via `spawn_pair` (`test_app.rs:179`).
+`fixtures/test_app.rs:211`, with both a REST and an in-process `app.state` assertion). For a
+two-pod topology copy `cluster_tests.rs:1485` via `spawn_pair` (`test_app.rs:183`).
 
 Server-decision tests — all implementable as described: `mint_refused_when_mode_off`,
 `mint_refused_without_relay_grant`, `mint_refused_cross_tenant` (404-shaped: leaks neither
@@ -970,7 +970,7 @@ every P2/P4 PR would skip this lane entirely. The workflow's own comment says to
 this: *"If a new crate becomes part of what these tests drive, add it here."* Add both paths
 in the same PR as `peer_relay_tests.rs`.
 ⚠️ Set `RUST_LOG` — the harness installs a subscriber only when it is set
-(`fixtures/test_app.rs:67`) — and use `--nocapture`.
+(`fixtures/test_app.rs:71`) — and use `--nocapture`.
 
 ### 10c. E2E on the real fleet — mars, zeus, jupiter
 

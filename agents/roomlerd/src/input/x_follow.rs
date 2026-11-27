@@ -487,6 +487,10 @@ pub(crate) mod test_seam {
     }
 
     /// What `f` logs on this thread, one string a line.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     pub(crate) fn logged(f: impl FnOnce()) -> Vec<String> {
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

@@ -1454,7 +1454,7 @@ is theirs.
 
 | id | what it is | who sends it |
 |---|---|---|
-| `machine_id` | a hash of the client's name, the `HOSTNAME` variable (`COMPUTERNAME` on Windows, `unknown` when it is not set), the OS and the architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1228`) | every client; every server keys by it |
+| `machine_id` | a hash of the client's name, the `HOSTNAME` variable (`COMPUTERNAME` on Windows, `unknown` when it is not set), the OS and the architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1244`) | every client; every server keys by it |
 | `instance_id` | 32 lowercase hex characters the install made at random and keeps on its machine ([FR-159](fr/FR-159-tunnel-client-identity.md) D1) | an FR-159 client, beside `machine_id` (D2). No released client sends it yet: that is FR-159's P2 |
 
 The `machine_id` is a guess at the machine. Where `HOSTNAME` is not set, two machines
@@ -1694,7 +1694,7 @@ client; a second use answers 401 `This enrollment token has already been used`, 
 a retryable 503 means the server could not check, with the token still good. The
 client's `machine_id` is a hash of `--name`, the `HOSTNAME` environment variable
 (`COMPUTERNAME` on Windows, `unknown` where it is not set), the OS and the
-architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1228`), so running
+architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1244`), so running
 `enroll` again with the same name, in the same environment, re-enrolls the same client.
 The variable is often not set on Linux and macOS, and two machines enrolled there under
 one name then send one id, so the server takes the second for the first (#4479);
