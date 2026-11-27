@@ -270,8 +270,8 @@ a routing hole; and the same missing notion of "own adapters" makes `non_overlay
 - Exempt own LUIDs in `evict_competing_v4/v6` (`crates/tunnel-core/src/overlay/tun.rs:3318`,
   `:3534`), `evict_foreign_in_block_v4` (`:3412`), `foreign_in_block_fp` (`:3476`); exclude own
   if_names in `non_overlay_v4_addrs`; `evict_warn` gains `competitor_alias`. (Shipped: the three
-  eviction helpers ask `route_belongs_to_us` (`:5386`) where they compared `!= ours`,
-  `foreign_in_block_fp` asks `adapter_is_ours` (FR-68 C2(a)), `non_overlay_v4_addrs` (`:6222`) counts
+  eviction helpers ask `route_belongs_to_us` (`:5354`) where they compared `!= ours`,
+  `foreign_in_block_fp` asks `adapter_is_ours` (FR-68 C2(a)), `non_overlay_v4_addrs` (`:6190`) counts
   every roomler adapter as its own, and the eviction warn carries `competitor_alias` (`:3238`).)
 - Nobody asserts the whole /96: defend `derive_overlay_v6(connected_v4.net)` masked to
   `v6_onlink_plen` (byte-identical for legacy single-org; longest-prefix still beats AnyConnect's

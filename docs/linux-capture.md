@@ -1190,15 +1190,15 @@ handle alone stays on the dead server. Once the desktop is up on a newer
 generation than its handle's, the worker takes that process-wide connection
 down through a second handle, opens a fresh one on the new server on a helper
 thread, and proves it with a read before it serves (`Follow::check`,
-`clipboard.rs:1138`; `connect_anew`, `:1263`). A session's clipboard command
+`clipboard.rs:1142`; `connect_anew`, `:1267`). A session's clipboard command
 can wait behind a follow, once per new X server and never past the bound: a
 follow that outlasts it stops blocking, the worker serves with its old handle
 meanwhile, and it takes the late answer at a later look. A follow that
 fails is tried again every 10 s while that server answers (`Retry::EVERY`,
 `:711`), and so is a first start that failed while the desktop was down:
-`shared()` and `available()` read the same rule (`:1410`). Teardown on a dead
+`shared()` and `available()` read the same rule (`:1414`). Teardown on a dead
 connection makes arboard log three lines; the follow holds back exactly those
-three and lets every other line through (`quietly_drop`, `:859`). The follow
+three and lets every other line through (`quietly_drop`, `:863`). The follow
 rests on how arboard 3.6.1 counts its handles before it closes the
 process-wide connection, so the workspace pins it to exactly that version
 (the `arboard` entry in the workspace's root `Cargo.toml`). An upgrade has to read that version's `Drop for Clipboard`
@@ -1213,7 +1213,7 @@ turns red when the rule changed.
 | The stop grace | 1 s (`STOP_GRACE`), or the restart delay when that is shorter, taken out of the delay |
 | The open sessions told | one grace after the exit |
 | The desktop's tree taken down | one grace after the exit, about 3 s after it for a child that ignores `SIGTERM` (about 2 s before) |
-| A clipboard follow | 6 s (`REBUILD_BOUND`, `clipboard.rs:1067`); the worst case measured from arboard's own waits is about 4.2 s: a new connection and its atoms, the owner check and one read of a target under arboard's 4 s timeout |
+| A clipboard follow | 6 s (`REBUILD_BOUND`, `clipboard.rs:1071`); the worst case measured from arboard's own waits is about 4.2 s: a new connection and its atoms, the owner check and one read of a target under arboard's 4 s timeout |
 | A failed follow, and a failed first start | tried again every 10 s while the server answers |
 | Log lines for one exit nobody asked for | one `WARN` for the exit; one `WARN` per open session's capture and one per damage watcher; one `WARN` per told session (FR-80's notice); at most two `INFO` for the retires; one `INFO` a clipboard follow; for input, one `INFO` a down period and one at the reopen. Nothing repeats per frame or per poll |
 

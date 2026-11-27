@@ -932,7 +932,7 @@ flowchart TD
 #3669 made each step a read takes run as the person. What a read touched outside such a step, or
 with no bound, and what its refusal said, is gathered in `agents/roomlerd/src/files/reads.rs`, with
 its tests in `files::drawer_edges` (`agents/roomlerd/src/files/drawer_edges.rs`) and
-`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:18084`).
+`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:18061`).
 
 ```mermaid
 sequenceDiagram
@@ -1112,7 +1112,7 @@ sequenceDiagram
   channel.
 - **No bound on the copy.** A large file legitimately copies for long, so only a bound on progress
   would be sound, and none is set.
-- The tests are `peer::upload_end_tests` (`agents/roomlerd/src/peer.rs:18540`). A test holds a
+- The tests are `peer::upload_end_tests` (`agents/roomlerd/src/peer.rs:18517`). A test holds a
   placement where its copy runs (`files::drawer_edges::seams::hold_placing`), a download before
   its first chunk (`hold_sending`), and a begin between its two makes (`before_the_id`).
 
@@ -1500,7 +1500,7 @@ What a viewer notices:
   ends "Remote shell works here.", where it said file transfer worked there too.
 - Windows, Linux, a per-user Mac and every session a GUI worker serves are unchanged.
 
-**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17250`), on every lane's lib
+**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17227`), on every lane's lib
 tests: the decision and its reason's words; each request's answer (`declined_reply`); and through
 the router over an in-process peer pair, both peers closed after each test, a declined channel that
 answers each request with the reason, leaves the folder asked about as it was and stays up

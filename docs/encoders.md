@@ -1983,7 +1983,7 @@ That charge does not reach the FFmpeg pump, so O18 asked what its encoders do wi
 same gap.
 
 **Every NVENC and AMF encoder holds, to the byte.** `o18_spend_after_a_hold`
-(`encoder.rs:4882-5300`) opens each encoder as a relayed session does (`new_preferred`
+(`encoder.rs:4882-5294`) opens each encoder as a relayed session does (`new_preferred`
 with `constrained`, as `FfmpegDcCodec::open` does at
 `agents/roomlerd/src/peer.rs:5503-5506`; `hevc_nvenc`
 4:4:4 through `new_hevc_adaptive`) and feeds it two arms, a fresh encoder each: three
