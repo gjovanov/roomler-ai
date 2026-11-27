@@ -18,7 +18,7 @@ fleet, and what the watch itself costs (measured, FR-65 AC1).
 | | |
 |---|---|
 | Verdict + bookkeeping | `encode::stall` (`agents/roomlerd/src/encode/stall.rs`) — a pure module on the **default** feature set, so `cargo test -p roomlerd --lib` covers it although the pump is behind `ffmpeg-encoder` |
-| The pump's sites | `peer.rs:7001` (the watch), `:7013` (the one phase list), `:7485` (the pass boundary), `:10396` (the heartbeat's rebase) |
+| The pump's sites | `peer.rs:7001` (the watch), `:7013` (the one phase list), `:7485` (the pass boundary), `:10386` (the heartbeat's rebase) |
 | Kill switch | `pump_stall_watch` / `ROOMLERD_PUMP_STALL_WATCH=0` (`encode/mod.rs:564`), restart required |
 | The bar | `pump_stall_warn_ms` / `ROOMLERD_PUMP_STALL_WARN_MS`, default 100 (`encode/mod.rs:652`) |
 | Its own cost | `roomlerd stall-watch-cost` (`stall.rs:592`, §8) |
@@ -63,23 +63,23 @@ eleven exist only for the watch and cost nothing when it is off.
 
 | Phase | What it times | Work? | Timed when the watch is off? | Since |
 |---|---|---|---|---|
-| `capture` | `capturer.next_frame().await` (`peer.rs:8266`) — mostly **waiting for the screen to change** | no | yes (heartbeat average) | rc.88 |
-| `scale` | the downscale to the plan's box (`peer.rs:8907`) | yes | yes | P7 |
-| `encode` | the encode round trip (`peer.rs:9674`) | yes | yes | rc.88 |
-| `send` | framing and the hand-off to the send task (`peer.rs:9911`) | yes | yes | rc.88 |
+| `capture` | `capturer.next_frame().await` (`peer.rs:8260`) — mostly **waiting for the screen to change** | no | yes (heartbeat average) | rc.88 |
+| `scale` | the downscale to the plan's box (`peer.rs:8901`) | yes | yes | P7 |
+| `encode` | the encode round trip (`peer.rs:9664`) | yes | yes | rc.88 |
+| `send` | framing and the hand-off to the send task (`peer.rs:9901`) | yes | yes | rc.88 |
 | `apply` | a rate/dims change to an encoder that already exists (`timed_apply!`) | yes | yes | FR-65 P0 |
-| `open` | opening an encoder, first or rebuilt (`peer.rs:9045`) | yes | yes | #1279 |
-| `pace` | the cadence sleep when the encoder cannot hold the rate (`peer.rs:8252`) | **no** | no | #1327 |
+| `open` | opening an encoder, first or rebuilt (`peer.rs:9039`) | yes | yes | #1279 |
+| `pace` | the cadence sleep when the encoder cannot hold the rate (`peer.rs:8246`) | **no** | no | #1327 |
 | `stats` | the ICE pair and LAN-reason stats reads | yes | no | #1327 |
 | `ctrl` | the control DC's lock and `rc:video-info` send | yes | no | #1327 |
-| `swap` | adopting a finished background rebuild (`peer.rs:7646`) | yes | no | #1327 |
-| `gate` | the backpressure gate, including its skip-and-sleep (`peer.rs:8134`) | yes | no | #1327 |
-| `dc_lock` | waiting for the video DataChannel's mutex after an encode (`peer.rs:9860`) | yes | no | 2026-10-30 |
-| `enc_cmd` | encoder commands other than encode/apply/open: keyframe requests, the dims spec (`peer.rs:8788`, `:9198`, `:9216`, `:9235`) | yes | no | 2026-10-30 |
-| `close` | dropping an encoder — which **joins its thread** (`peer.rs:7526`, `:7810`, `:9139`, `:9268`) | yes | no | 2026-10-30 |
-| `recapture` | rebuilding the capturer: a flip's reopen, the error arm's backoff + reopen (`peer.rs:7798`, `:8510`) | yes | no | 2026-10-30 |
-| `poll` | an empty poll's 2 ms sleep, or the yield while the display is held (`peer.rs:8357`, `:8490`) | yes | no | 2026-10-30 |
-| `heartbeat` | the heartbeat block itself (`peer.rs:10028`) | yes | no | 2026-10-30 |
+| `swap` | adopting a finished background rebuild (`peer.rs:7644`) | yes | no | #1327 |
+| `gate` | the backpressure gate, including its skip-and-sleep (`peer.rs:8128`) | yes | no | #1327 |
+| `dc_lock` | waiting for the video DataChannel's mutex after an encode (`peer.rs:9850`) | yes | no | 2026-10-30 |
+| `enc_cmd` | encoder commands other than encode/apply/open: keyframe requests, the dims spec (`peer.rs:8782`, `:9195`, `:9213`, `:9232`) | yes | no | 2026-10-30 |
+| `close` | dropping an encoder — which **joins its thread** (`peer.rs:7526`, `:7804`, `:9133`, `:9265`) | yes | no | 2026-10-30 |
+| `recapture` | rebuilding the capturer: a flip's reopen, the error arm's backoff + reopen (`peer.rs:7792`, `:8504`) | yes | no | 2026-10-30 |
+| `poll` | an empty poll's 2 ms sleep, or the yield while the display is held (`peer.rs:8351`, `:8484`) | yes | no | 2026-10-30 |
+| `heartbeat` | the heartbeat block itself (`peer.rs:10018`) | yes | no | 2026-10-30 |
 
 ⚠️ **`apply` is timed inside `swap`, `gate` and `send` on three paths** (a
 background adoption, a backpressure decrease, an overflow decrease), so on those
@@ -146,7 +146,7 @@ counted as work, its encoder open as nothing, and the pass went to `other`.
 🔑 A pass longer than the heartbeat interval **always** holds a heartbeat — the
 long pass is what makes it due — so the rule was blind to exactly the stalls
 worth finding. `PassWatch::rebase` (`stall.rs:522`) carries what the open pass
-had accrued and moves its mark past the reset (`peer.rs:10396`). The census that
+had accrued and moves its mark past the reset (`peer.rs:10386`). The census that
 found it is §6.
 
 ### 3.2 The governor reads a total that never resets (fixed 2026-10-30)
@@ -157,7 +157,7 @@ FR-79's gate asks whether the agent's own loop was free in a window
 the mark: after a window that held a stall, the next verdict read `1 − N`,
 which saturates to 0. The first verdict after a reset is the heartbeat pass's
 own — the long one. It now reads `PassWatch::stalls_total` (`stall.rs:556`,
-`peer.rs:9307`), which only grows.
+`peer.rs:9304`), which only grows.
 
 **What the two fixes change for the controller**, since a stall verdict gates
 every rate estimator: a heartbeat pass whose overrun was only a capture wait is
