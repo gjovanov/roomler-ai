@@ -4420,6 +4420,43 @@ mod tests {
             );
         }
 
+        /// Outside a save, a repair that finds neither a machine config nor
+        /// its copy in the machine folder changes nothing but the attempt
+        /// record: `%ProgramData%\roomler` keeps every entry it had, an
+        /// account's right to change it included, and the machine folder is
+        /// as it was.
+        #[test]
+        fn outside_a_save_a_repair_with_no_config_or_copy_changes_only_the_record() {
+            if !elevated_or_skip("a repair outside a save, with no config or copy") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            assert!(icacls(
+                tree.parent(),
+                &["/grant", "*S-1-5-32-546:(OI)(CI)F"]
+            ));
+            std::fs::write(tree.record(), b"{}").unwrap();
+            let parent = sddl(tree.parent());
+            let folder = sddl(tree.folder());
+            let repairs = repair(&tree, false);
+            assert_eq!(
+                sddl(tree.parent()),
+                parent,
+                "the parent's entries are as they were"
+            );
+            assert_eq!(
+                sddl(tree.folder()),
+                folder,
+                "the machine folder is as it was"
+            );
+            let record = tree.record().display().to_string();
+            assert!(
+                repairs.changed.iter().all(|line| line.starts_with(&record)),
+                "nothing but the record is changed: {repairs:?}"
+            );
+        }
+
         /// W: a file the writer just made is given Administrators as its
         /// owner and a protected DACL of SYSTEM and Administrators alone,
         /// through its handle, before it takes any name; and a file left under
