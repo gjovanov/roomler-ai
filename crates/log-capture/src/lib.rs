@@ -93,11 +93,11 @@ impl Drop for Scope {
     }
 }
 
-/// The second registered dispatcher a capture holds beside its own.
+/// The second registered dispatcher a capture holds beside its own. A
+/// `NoSubscriber` wants no line and keeps none from another dispatcher: it
+/// only keeps two registered while the capture lives (see the crate docs).
 fn second() -> Dispatch {
-    // RED (#3403): left unregistered on purpose in this commit, so the probe
-    // test shows the race. `Dispatch::none()` never registers.
-    Dispatch::none()
+    Dispatch::new(tracing::subscriber::NoSubscriber::default())
 }
 
 /// `subscriber` as this thread's default until the returned [`Scope`] drops,
