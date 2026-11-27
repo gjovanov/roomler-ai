@@ -4019,7 +4019,7 @@ recorded carrier and the path memory's key, fixed at the pump's open, still agre
 later candidate is FR-148's class at the pump's next re-check (`direct` to `unknown`) and, under
 `route`, the `from` of a later move: a read of the same pair that shows its relay becomes the last
 pair, and a read that says `unknown` changes nothing (`follow_moves`, `session_carrier.rs:815`).
-#3259's first lab case has a shape that no address the agent holds shows; it stays open.
+#3259's first lab case is not covered by this rule; it stays open on #3259.
 
 **When it reaches the server (FR-102 P9d).** The observation lands ~2.5–6 s after `Connected`
 (`NOMINATION_WAIT` 3 s + `SETTLE` 2 s + the LocalAPI budget). P9c sent the carrier only on the
