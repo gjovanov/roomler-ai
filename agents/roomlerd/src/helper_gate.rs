@@ -100,8 +100,7 @@ impl Reading {
             Reading::Answered(i) => Busy {
                 rc_sessions: i.rc_sessions as usize,
                 ssh_connections: i.ssh_connections as usize,
-                // FR-156 P1 seam: no flow counts, as before.
-                tunnel_flows: 0,
+                tunnel_flows: i.tunnel_flows as usize,
                 exec_runs: i.exec_runs as usize,
                 work: i.work as usize,
                 net_transition: i.net_transition,
@@ -217,11 +216,15 @@ pub fn helper_arm(root: &Reading, person: &Reading, budget: Budget, now: u64) ->
     // The person's own ask (a push to their row, or "Apply update") skips it
     // over their own half's work and the root half's remote-control sessions,
     // which are on that person's desktop: never over the root half's SSH
-    // connections, runs, transfers or recording, a network transition, or a
-    // root half it could not read.
+    // connections, tunnel flows, runs, transfers or recording, a network
+    // transition, or a root half it could not read.
     let root_beyond_sessions = match root {
         Reading::Answered(i) => {
-            i.ssh_connections > 0 || i.exec_runs > 0 || i.work > 0 || i.net_transition
+            i.ssh_connections > 0
+                || i.tunnel_flows > 0
+                || i.exec_runs > 0
+                || i.work > 0
+                || i.net_transition
         }
         Reading::NotRunning => false,
         Reading::Older | Reading::NoAnswer => true,

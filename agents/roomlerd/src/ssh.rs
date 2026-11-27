@@ -635,8 +635,10 @@ mod sshd {
     /// is heard ([`tunnel_core::liveness::Heard`]). With `proof` off
     /// (`ROOMLERD_LIVE_WORK_PROOF=0`), russh's defaults as before: none.
     pub(super) fn keep_alive(config: &mut russh::server::Config, proof: bool) {
-        // FR-156 P1 seam: no keepalives, as before.
-        let _ = (config, proof);
+        if proof {
+            config.keepalive_interval = Some(KEEPALIVE_INTERVAL);
+            config.keepalive_max = 0;
+        }
     }
 
     impl Ctx {
@@ -3121,8 +3123,7 @@ async fn serve_stream<S>(
 {
     use tracing::info;
 
-    // FR-156 P1 seam: the stream as is, heard only when it opened.
-    let _live = live;
+    let stream = live.heard(stream);
     let handler = sshd::Handler::new(ctx.clone(), peer);
     match russh::server::run_stream(ctx.config.clone(), stream, handler).await {
         Ok(session) => match session.await {
@@ -3214,6 +3215,12 @@ impl LiveConnection {
         Self {
             _listed: list.join(clock),
         }
+    }
+
+    /// `stream`, with every read that returns bytes heard as this
+    /// connection's client: a keepalive's answer as much as a keystroke.
+    pub(crate) fn heard<S>(&self, stream: S) -> tunnel_core::liveness::Heard<S> {
+        tunnel_core::liveness::Heard::new(stream, std::sync::Arc::clone(self._listed.stamp()))
     }
 
     /// When its client was last heard.

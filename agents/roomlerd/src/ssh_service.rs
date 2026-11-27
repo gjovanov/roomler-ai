@@ -944,8 +944,9 @@ where
     A: Fn(ConsentAsk) -> AFut + Send + Sync + 'static,
     AFut: Future<Output = ConsentAnswer> + Send + 'static,
 {
-    // FR-156 P1 seam: the client as is, heard only when it opened.
-    let _live = live;
+    // The client's side is the one heard: the SYSTEM service's keepalives
+    // and its output prove nothing of the client's life, its answers do.
+    let client = live.heard(client);
     splice_framed(client, pipe, peer, answer).await
 }
 

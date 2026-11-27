@@ -66,7 +66,7 @@ impl Busy {
 
     /// How much work a restart would CUT: the update check's `active`.
     pub fn cuttable_count(&self) -> usize {
-        self.rc_sessions + self.ssh_connections + self.exec_runs + self.work
+        self.rc_sessions + self.ssh_connections + self.tunnel_flows + self.exec_runs + self.work
     }
 
     /// Work a restart would CUT: cut after the replaced-binary watch's
@@ -91,6 +91,9 @@ impl std::fmt::Display for Busy {
         }
         if self.ssh_connections > 0 {
             parts.push(format!("{} SSH connection(s)", self.ssh_connections));
+        }
+        if self.tunnel_flows > 0 {
+            parts.push(format!("{} tunnel flow(s)", self.tunnel_flows));
         }
         if self.exec_runs > 0 {
             parts.push(format!("{} exec run(s)", self.exec_runs));
@@ -134,18 +137,22 @@ pub fn now(rc_sessions: &crate::rc_sessions::RcSessionRegistry) -> Busy {
 /// ([`tunnel_core::liveness::WINDOW`]); with `proof` off
 /// (`ROOMLERD_LIVE_WORK_PROOF=0`), every open one, as before.
 pub fn ssh_counted(open: &tunnel_core::liveness::LiveList, proof: bool) -> usize {
-    // FR-156 P1 seam: every open connection, as before.
-    let _ = proof;
-    open.len()
+    if proof {
+        open.heard_within(tunnel_core::liveness::WINDOW)
+    } else {
+        open.len()
+    }
 }
 
 /// FR-156 P1 — the tunnel flows of `listed` a restart would cut: those that
 /// moved bytes, either way, within the liveness window; with `proof` off,
 /// none, as before.
 pub fn flows_counted(listed: &tunnel_core::liveness::LiveList, proof: bool) -> usize {
-    // FR-156 P1 seam: no flow counts, as before.
-    let _ = (listed, proof);
-    0
+    if proof {
+        listed.heard_within(tunnel_core::liveness::WINDOW)
+    } else {
+        0
+    }
 }
 
 /// #4244 — what the update gate reads now: [`now`], with the Fleet RPC runs
