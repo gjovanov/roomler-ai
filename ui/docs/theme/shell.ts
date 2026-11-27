@@ -213,7 +213,7 @@ export function renderFooter(nav: ShellNav = DOCS_NAV): string {
   <div class="site-footer__inner">
     <div>
       <p class="site-footer__brand">Roomler</p>
-      <p class="site-footer__blurb">Remote desktop in a browser tab, a private WireGuard-style mesh, and team chat and video — on one agent you can self-host.</p>
+      <p class="site-footer__blurb">Remote desktop in a browser tab, a private WireGuard-style mesh, and team chat and video — on one daemon you can self-host.</p>
     </div>
     <div>
       <p class="site-footer__head">Docs</p>

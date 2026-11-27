@@ -31,13 +31,13 @@ touching the machine.
 
 Run a command on a trusted device from the dashboard or the CLI.
 
-:::warning Commands inherit the agent's identity
+:::warning Commands inherit the daemon's identity
 On Windows that is `SYSTEM`; under systemd it is `root`. This is not a
 restricted shell. Grant it to the people you would give root to, because that is
 what you are giving them.
 :::
 
-It runs over the agent's **control connection**, not the mesh — deliberately, so
+It runs over the daemon's **control connection**, not the mesh — deliberately, so
 the diagnostics you most need still work when the mesh is the broken thing.
 
 Output is redacted for credentials before it leaves the machine, and every

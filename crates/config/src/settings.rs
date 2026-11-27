@@ -1066,6 +1066,16 @@ pub struct RcSettings {
     /// switch if it ever does. Env: `ROOMLER__RC__TOKEN_GENERATION_CHECK`.
     #[serde(default = "default_true")]
     pub token_generation_check: bool,
+    /// FR-155 — serve `POST /api/agent/self/rotate`, where a device trades
+    /// its agent token for one of the next generation. Default **false**
+    /// until the phase that completes the server's half turns it on. `false`
+    /// answers 404 to a first call; a call asking again for the answer to a
+    /// rotation the server has made is answered either way. The route answers
+    /// 404 to every call while `token_generation_check` is off, since a
+    /// rotation that refuses nothing must not be recorded as done.
+    /// Env: `ROOMLER__RC__AGENT_TOKEN_ROTATION`.
+    #[serde(default)]
+    pub agent_token_rotation: bool,
     /// FR-103 — the lifetime of a freshly minted agent or tunnel-client
     /// token, in seconds. Default one year. A test knob: the integration lane
     /// and a throwaway stack shorten it to prove expiry and the renewal grace.
@@ -1132,6 +1142,7 @@ impl Default for RcSettings {
             ssh_via_service: true,
             token_renewal: true,
             token_generation_check: true,
+            agent_token_rotation: false,
             agent_token_ttl_secs: default_agent_token_ttl_secs(),
             removal_goodbye: true,
             org_session_cap: true,
@@ -1639,6 +1650,7 @@ impl Settings {
             .set_default("rc.ssh_via_service", true)?
             .set_default("rc.token_renewal", true)?
             .set_default("rc.token_generation_check", true)?
+            .set_default("rc.agent_token_rotation", false)?
             .set_default("rc.agent_token_ttl_secs", 365 * 24 * 60 * 60)?
             .set_default("rc.removal_goodbye", true)?
             .set_default("rc.org_session_cap", true)?

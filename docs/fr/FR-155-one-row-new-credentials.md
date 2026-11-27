@@ -363,7 +363,7 @@ what the design rests on. The names state the property.
 
 | # | Cell | Phase | Asserts |
 |---|---|---|---|
-| T1 | `a_rotation_issues_the_next_generation` | P1a | rotate: the new token's `gen` claim and the row are at G+1. The agent socket's upgrade and a DERP dial admit the new token and answer 401 to one of G (FR-103's assertions, `crates/tests/src/token_renewal_tests.rs:365-382`) |
+| T1 | `a_rotation_issues_the_next_generation` | P1a, P1b | rotate: the new token's `gen` claim and the row are at G+1, and an HTTP route answers 401 to a token of G (P1a). The agent socket's upgrade and a DERP dial admit the new token and answer 401 to one of G, and a renewal with the token of G after the commit is refused (P1b; FR-103's assertions, `crates/tests/src/token_renewal_tests.rs:239-250`) |
 | T2 | `a_lost_answer_is_recovered_with_the_rotation_key` | P1a | rotate, then ask again with the same token and key: 200 at G+1, and nothing else changes. With another key: 401 |
 | T3 | `one_rotation_per_generation` | P1a | one rotation per generation: the conditional update commits once at G, and the row ends at G+1 |
 | T4 | `a_rotation_ends_the_connections_of_earlier_generations` | P1b, P1c | an agent socket and a DERP registration open at G, then rotate: both end within 5 s. With two servers, a socket on B ends when A rotates. A socket opened at G+1 survives a late envelope |
@@ -448,7 +448,7 @@ rotation exists; without P3 the splice changes nothing, so P2 is safe alone.
 | Phase | What | Kill switch, or back-out | Status |
 |---|---|---|---|
 | P1a | Server: the route, its admission and replay, the conditional update with its once-an-hour ceiling (429, T13), `token_rotation` on the row, the audit with the caller's IP and its index set, the refusal reason for a generation a rotation retired (Q2), the composition baseline; the route in `docs/api.md` | `rc.agent_token_rotation`, off by default | — |
-| P1b | Server: each control socket records its generation; the commit ends the agent's sockets below the new generation on every pod (`end_below_generation`), and each pod keeps a floor at registration | the same switch, off by default | — |
+| P1b | Server: each control socket records its generation; the commit ends the agent's sockets below the new generation on every pod (`end_below_generation`), and each pod keeps a floor at registration; T1's second half (the agent socket's upgrade and a DERP dial admit G+1 and refuse G, and a renewal with the token of G after the commit is refused) | the same switch, off by default | — |
 | P1c | Server: the core hook `agent_credentials_rotated`; the network module takes the node offline, ends its DERP registrations below the new generation (with the floor) and queues an FR-40 order (`credential_rotation`); **the switch on by default** (D5) | `rc.agent_token_rotation`: 404, fleet-wide | — |
 | P2 | Device: `splice_current` in the undo and `--revert`; the child verb `refresh-legacy` | `ROOMLERD_ONE_ROW_SPLICE=0`, which fails closed | — |
 | P3 | Device: `rekey.json`, the one-row lock, the re-key in each moved enrollment's loop (Q1), `Status`'s `credentials`, the conversion's bounded wait and its report; the release notes' line on `--revert` | `ROOMLERD_CREDENTIAL_ROTATION=0` | — |
@@ -513,6 +513,9 @@ Decided by the coordinator on 2026-11-25, before this spec was written:
 
 - **D4, Macs whose root records cannot show a conversion by an earlier release:** P4's PR counts them, and the
   decision follows the count. Until then, P4 covers only the Macs that root's records identify.
+- **For P3, a replay near the token's expiry:** a rotation's answer can be lost close to the expiry of the token that
+  asked for it, and a replay needs that token unexpired. Before P3, the device either rotates only with ample life
+  left on its token, or the route admits a replay within `RENEWAL_GRACE_SECS`.
 
 ## Out of scope
 

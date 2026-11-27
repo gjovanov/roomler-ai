@@ -45,8 +45,8 @@ anything else.
 
 ## Turning it on
 
-The mesh is part of the agent, not a separate install. On Windows and Linux it
-comes up with the agent. On macOS it needs the **root half** of the install,
+The mesh is part of `roomlerd`, not a separate install. On Windows and Linux it
+comes up with the daemon. On macOS it needs the **root half** of the install,
 which is a second enrollment — see [Install on
 macOS](/docs/start/install/macos/).
 

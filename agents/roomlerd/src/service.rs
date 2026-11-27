@@ -2367,8 +2367,13 @@ mod linux {
         user_unit_path_for(UNIT)
     }
 
+    /// #3866 — the per-user unit `name` in this account's own config folder
+    /// (`appdirs::own_folders`): root's own beneath `/root` for a root command,
+    /// whatever `HOME` it was given, and `$XDG_CONFIG_HOME` or `~/.config` for
+    /// a person's.
     fn user_unit_path_for(name: &str) -> Option<std::path::PathBuf> {
-        directories::BaseDirs::new().map(|d| d.config_dir().join("systemd/user").join(name))
+        roomler_node_core::appdirs::own_folders()
+            .map(|own| own.config.join("systemd/user").join(name))
     }
 
     /// The unit `service install` writes where no packaged one exists. Wanted

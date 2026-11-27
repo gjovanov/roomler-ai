@@ -476,7 +476,7 @@ cascade's guarantees while replacing its reactive counters:
   inbound payload between the WG and tunnel routes with `payload_is_wg_or_disco`
   ([`derp_frame.rs:39`](../crates/remote_control/src/derp_frame.rs#L39)), and the server's
   relay reads the same function to decide what its tunnel shaper applies to
-  ([`modules/network/src/derp.rs:709`](../crates/modules/network/src/derp.rs#L709)). It
+  ([`modules/network/src/derp.rs:711`](../crates/modules/network/src/derp.rs#L711)). It
   read the first byte only, 1..=4, and quinn **greases QUIC's fixed bit** by default
   (RFC 9287): an end whose peer advertised the parameter clears the bit on about half of
   what it sends, so a tunnel short header can open on any byte below 0x40. Measured over a

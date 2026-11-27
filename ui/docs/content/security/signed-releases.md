@@ -5,7 +5,7 @@ tags: [security, signing, updates, verification, supply-chain]
 order: 6
 ---
 
-The agent updates itself, and it runs what it downloads **as the machine's most
+The daemon updates itself, and it runs what it downloads **as the machine's most
 privileged account** — `SYSTEM` on Windows, `root` under systemd. That makes the
 update path the most security-sensitive thing in the product, and it is built
 accordingly.
@@ -86,7 +86,7 @@ gh attestation verify roomlerd-<version>-x86_64-unknown-linux-gnu.deb --repo gjo
 
 Installers and updates are served through **your server's own origin** rather
 than from GitHub. That is not vanity: it means a corporate allow-list only has
-to trust one hostname, which is the difference between an agent that can update
+to trust one hostname, which is the difference between a daemon that can update
 itself on a managed network and one that cannot.
 
 ## No key material in CI
@@ -106,6 +106,6 @@ than implying otherwise.
 
 The standalone tunnel CLI's own `self-update` checks the same pinned key, on
 every OS, from the first tunnel release that carries the check; before it, the
-CLI checked only the manifest's hash. On machines that also run the agent this
+CLI checked only the manifest's hash. On machines that also run the daemon this
 does not apply, because there the CLI is a shim with nothing of its own to update.
 :::
