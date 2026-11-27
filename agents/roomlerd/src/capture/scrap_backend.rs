@@ -939,6 +939,10 @@ mod x11_exit_tests {
     }
 
     impl ProcessLog {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+        )]
         fn get() -> &'static ProcessLog {
             static LOG: std::sync::OnceLock<ProcessLog> = std::sync::OnceLock::new();
             LOG.get_or_init(|| {

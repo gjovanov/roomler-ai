@@ -226,6 +226,10 @@ fn for_appending(file: File) -> File {
 static EARLY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// `start`, with what it logs kept in [`EARLY`].
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a buffer that keeps the start's lines for the log: never coloured (root clippy.toml, #3938)"
+)]
 fn keeping_its_lines<T>(start: impl FnOnce() -> T) -> T {
     let text = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = Arc::clone(&text);

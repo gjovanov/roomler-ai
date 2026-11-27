@@ -2729,6 +2729,10 @@ mod retry_tests {
     }
 
     /// What `f` returns, and the lines it logs on this thread at INFO and up.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     pub(super) fn logged<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
         let lines = Lines::default();
         let writer = lines.clone();
@@ -3194,6 +3198,10 @@ mod x11_follow_tests {
     impl ProcessLog {
         /// The process's log, installed at the first call with the bridge
         /// from `log` (`try_init`). `None`: another subscriber was there first.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+        )]
         fn get() -> Option<&'static ProcessLog> {
             use tracing_subscriber::util::SubscriberInitExt as _;
             static LOG: std::sync::OnceLock<Option<ProcessLog>> = std::sync::OnceLock::new();

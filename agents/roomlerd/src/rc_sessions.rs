@@ -568,6 +568,10 @@ mod tests {
     }
 
     /// What `f` logs, as the daemon's log file writes it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn logged(f: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Buf(Arc<Mutex<Vec<u8>>>);

@@ -64,6 +64,10 @@ fn cap_pool(opts: &mut ClientOptions) {
     opts.min_pool_size = Some(0);
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the integration tests' log, into the test writer: not a shipped console (root clippy.toml, #3938)"
+)]
 fn init_tracing() {
     use std::sync::Once;
     static ONCE: Once = Once::new();

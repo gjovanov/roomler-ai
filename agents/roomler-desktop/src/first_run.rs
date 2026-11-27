@@ -1094,6 +1094,10 @@ mod tests {
     /// main window. The macOS lab reads it as the second witness beside the
     /// window itself.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn a_reopen_logs_what_it_shows() {
         // A second live dispatcher for the whole test. With only one
         // registered, a callsite that another test thread reaches first, with
@@ -1134,6 +1138,10 @@ mod tests {
     /// beside a reopen's, naming what it shows: the tour a start for a prompt
     /// held back, else the Overview. Until #3996 that click logged nothing.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn a_tray_click_logs_what_it_shows() {
         let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         let sink = LogSink::default();
