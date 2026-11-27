@@ -979,7 +979,7 @@ impl Hub {
                 0,
                 ResumeHello::default(),
             )
-            .expect("nothing above generation 0 for this agent on this pod");
+            .expect("nothing above generation 0 for this device on this pod");
         (reg.tx, reg.cancel, reg.rx)
     }
 

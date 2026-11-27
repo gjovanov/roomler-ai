@@ -976,10 +976,9 @@ async fn every_pod_ends_an_entry_below_its_rows_generation() {
 /// T18 (P1c, T14's extension): on a pod with `rc.agent_token_rotation` off,
 /// nothing that P1c adds runs, beside a rotation committed on a pod with it
 /// on (and without Redis, so nothing reaches this pod). In T15's setup the
-/// late hello registers as every registration did before P1c, and the
-/// registered socket hears what a newer registration has always sent it
-/// (`replaced_by_newer_connection`). In T17's setup the socket of G stays
-/// served through two of the check's periods.
+/// pod refuses nothing new, and a registration replaces the entry as it
+/// always has (`replaced_by_newer_connection`). In T17's setup the pod ends
+/// nothing new through two of the check's periods.
 #[tokio::test]
 async fn a_pod_switched_off_ends_and_refuses_nothing_new() {
     let db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
@@ -1017,17 +1016,19 @@ async fn a_pod_switched_off_ends_and_refuses_nothing_new() {
     match listen(&mut current, Duration::from_secs(5)).await {
         Heard::Goodbye(v) => assert_eq!(v["reason"], "replaced_by_newer_connection", "{v}"),
         other => {
-            panic!("with the switch off, the late hello registers as before P1c; heard {other:?}")
+            panic!(
+                "with the switch off, a registration replaces the entry as it always has; heard {other:?}"
+            )
         }
     }
     assert!(
         still_served(&mut late).await,
-        "with the switch off, nothing refuses the late hello"
+        "with the switch off, the pod refuses nothing new"
     );
 
     tokio::time::sleep(Duration::from_secs(2 * CHECK_SECS)).await;
     assert!(
         still_served(&mut kept).await,
-        "with the switch off, no check ends the socket of G"
+        "with the switch off, the pod ends nothing new"
     );
 }
