@@ -2034,7 +2034,9 @@ that produces it — a LAN pair records `direct`, a Check Point / symmetric-NAT 
 (or `turn_local`), an overlay pair records `overlay_direct` or, when the mesh fell, `derp` /
 `org_relay` / `overlay_turn` (cross-checked against `roomler peers --json` `relay_kind`) — and read
 the agent's `session carrier recorded (FR-102 P9c)` log line to check the value against the pair's
-addresses.
+addresses. A `turn` or `turn_local` there with `remote_typ=Prflx` is the far end's relay, learnt from
+its first check before its candidate came, and the line says so with `remote_relay="signalled"`
+(#3259, [remote-control.md §11.9](remote-control.md#119-the-carrier-a-session-rides-fr-102-p9c)).
 
 ⚠️ **An overlay pair needs the device to allow it.** #1882's `access_policy.rc_overlay` is off unless
 the device opts in, and with it off the agent drops every overlay candidate. With it on, an agent

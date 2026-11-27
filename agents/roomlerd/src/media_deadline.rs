@@ -393,10 +393,10 @@ pub fn pick(end: impl Into<TcpEnd>, deadline_open: bool) -> Channel {
 
 /// The class of the pair selected now, and whether it is off the mesh (FR-148
 /// P4b-3b: where the viewer's report counts): `unknown` and not, while none
-/// is.
+/// is. On the pump's own path: a prflx remote's read waits for nothing (#3259).
 async fn class_now(pc: &RTCPeerConnection) -> (CarrierClass, bool) {
     let Some((pair, relay, rides)) =
-        crate::session_carrier::nominated_pair(pc, Duration::ZERO).await
+        crate::session_carrier::nominated_pair(pc, Duration::ZERO, Duration::ZERO).await
     else {
         return (CarrierClass::Unknown, false);
     };
@@ -2004,7 +2004,7 @@ fn ms(d: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_carrier::CandidateKind;
+    use crate::session_carrier::{CandidateKind, RemoteRelay};
     use CarrierClass as C;
 
     /// `video-bytes`' stream in the rig, and `video-deadline`'s.
@@ -2333,6 +2333,7 @@ mod tests {
             remote_kind: remote,
             local_addr: "192.0.2.10".into(),
             remote_addr: addr.into(),
+            remote_relay: RemoteRelay::NotShown,
         };
         let (far, mesh) = ("198.51.100.7", "100.64.0.9");
         let tier = |kind: &str| Some(OverlayPath::Relay(Some(kind.into())));
@@ -2401,6 +2402,47 @@ mod tests {
                 want,
                 "{p:?} {relay:?} {rides} {overlay:?}"
             );
+        }
+    }
+
+    /// #3259 — a (host, prflx) pair whose prflx is the far end's relay
+    /// follows the carrier label: `turn` with no relay of the agent's under
+    /// it, so `unknown`, as a signalled relay remote gives. The same pair
+    /// with nothing to show a relay stays `direct`, and so does one whose
+    /// read could not say (`remote_relay` `unknown`). Either class gives the
+    /// video channel the same end: `TcpEnd::of` is unchanged.
+    #[test]
+    fn a_prflx_at_the_far_ends_relay_is_classed_as_its_relay() {
+        use CandidateKind::{Host, Prflx, Relay};
+        let pair = |remote, remote_relay| PairView {
+            local_kind: Host,
+            remote_kind: remote,
+            local_addr: "192.0.2.10".into(),
+            remote_addr: "198.51.100.7".into(),
+            remote_relay,
+        };
+        let at_the_relay = pair(Prflx, RemoteRelay::Signalled);
+        let not_shown = pair(Prflx, RemoteRelay::NotShown);
+        let unread = pair(Prflx, RemoteRelay::Unknown);
+        let signalled = pair(Relay, RemoteRelay::Signalled);
+        let none = RelayTransport::NoRelay;
+        assert_eq!(class_of(&at_the_relay, none, false, None), C::Unknown);
+        assert_eq!(class_of(&signalled, none, false, None), C::Unknown);
+        assert_eq!(class_of(&not_shown, none, false, None), C::Direct);
+        assert_eq!(class_of(&unread, none, false, None), C::Direct);
+        for off_mesh in [false, true] {
+            for viewer in [
+                None,
+                Some(ViewerRelay::Udp),
+                Some(ViewerRelay::Tcp),
+                Some(ViewerRelay::Tls),
+            ] {
+                assert_eq!(
+                    TcpEnd::of(C::Unknown, off_mesh, viewer),
+                    TcpEnd::of(C::Direct, off_mesh, viewer),
+                    "{off_mesh} {viewer:?}"
+                );
+            }
         }
     }
 

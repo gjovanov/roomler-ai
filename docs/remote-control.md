@@ -445,7 +445,7 @@ How to read them:
 | D49 | Under `route` | Where |
 |---|---|---|
 | **1. One predicate** | A pair rides the mesh when its local candidate is ranked last or sits on a mesh address, or its remote sits on one. "Mesh" is the carried v4 blocks and the derived-v6 ULA, the addresses the carrier order reads, never the whole `100.64.0.0/10`. A name (an mDNS `.local`) is not the mesh's | `rides_the_mesh`, `crates/vendored/webrtc-ice/src/agent/agent_config.rs:183`, with the addresses `RcOverlay::ice_rank` hands it (`agents/roomlerd/src/rc_overlay.rs:318`) |
-| **A2. Every reader reads it** | the follow gate, the checks above the selection, the opening and the carrier record. An address of the `/10` outside the blocks (a carrier's CGNAT, a corporate VPN) is a real path, and a pair whose local socket the mesh carries is not. Under `0`, `prio` and `1` each reads as built | `outranks_off_the_mesh`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:106`, through `AgentInternal::outranks` and `follows_renomination` (`:152`, `:162`); `RTCIceTransport::route_read`, `crates/vendored/webrtc/src/ice_transport/mod.rs:106`, read by the opening (`agents/roomlerd/src/carrier_rank.rs:188`) and the carrier record (`agents/roomlerd/src/session_carrier.rs:367`) |
+| **A2. Every reader reads it** | the follow gate, the checks above the selection, the opening and the carrier record. An address of the `/10` outside the blocks (a carrier's CGNAT, a corporate VPN) is a real path, and a pair whose local socket the mesh carries is not. Under `0`, `prio` and `1` each reads as built | `outranks_off_the_mesh`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:106`, through `AgentInternal::outranks` and `follows_renomination` (`:152`, `:162`); `RTCIceTransport::route_read`, `crates/vendored/webrtc/src/ice_transport/mod.rs:106`, read by the opening (`agents/roomlerd/src/carrier_rank.rs:188`) and the carrier record (`agents/roomlerd/src/session_carrier.rs:559`) |
 | **2. No cross pair beside a sibling** | no pair from a local candidate off the mesh to a remote on it while the session has a local candidate on the mesh or a TURN URL on the mesh. That route is then also a pair of the agent's own mesh candidates, which the rank ranks | `add_pair`, `crates/vendored/webrtc-ice/src/agent/agent_internal.rs:534`; `refuses_pair`, `:575` |
 | **R1. No sibling** | a session with neither forms the cross pair: it is the route's only pair, and rule 3 holds it like any pair on the mesh. Such a session is a Linux agent (the name rule keeps `roomler0` out of its host candidates) given no relay of the viewer's | `settle_sibling`, `agent_internal.rs:589` |
 | **3. The silent hold** | the controlled agent neither checks nor answers its pairs on the mesh while all three hold: less than 2.5 s since its checks started, no pair off the mesh selected, and a relay off the mesh can still come (an allocation on a TURN server off the mesh is still running, or a pair off the mesh has not failed). Every candidate is still signalled, and nothing restarts ICE | `holds_mesh_route`, `agent_internal.rs:668`; its checks skipped, `:494`; an inbound check dropped unanswered, `agent_selector.rs:876` |
@@ -524,7 +524,7 @@ Phase A opens a session on the mesh when no TURN pair connects inside the hold: 
 |---|---|---|
 | **B1. A budget of its own** | every pair the follow gate would follow is checked on each tick of the agent's loop, 200 ms, up to 13 checks counted on the pair, then it fails. 13 checks span 2.4 s, inside the hold's 2.5 s bound: a pair that forms after the selection gets the hold's own time again for its far side to answer (the candidate's trip through signalling, the far TURN's permission for the agent's relayed address). A dead pair costs 13 checks, once. The browser's checks still reopen a failed pair: each is answered or nominates (B2), and triggers a check of the agent's | `check_pairs_above_selection`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:249`, the budget at `:273`; `ROUTE_MOVE_CHECKS`, `crates/vendored/webrtc-ice/src/agent/agent_config.rs:130`; `CandidatePair::move_checks`, `crates/vendored/webrtc-ice/src/candidate/mod.rs:249` |
 | **B2. Answer the nomination, move on the agent's own check** | a check of the browser's with USE-CANDIDATE on a pair the agent has not validated is answered with a success, and triggers the agent's own check (RFC 8445 §7.3.1.4), when the pair is off the mesh, its remote is an address, and the follow gate would follow it: one decision for the answer and for the move. The agent takes the nomination only when its own check of the pair succeeds (§7.3.1.5), so it never sends media on a pair it has not validated. Following nominations it had not validated is how Chrome steered the agent onto a half-blackholed pair on 2026-07-27, and SCTP died in every session. A later check of the browser's on the pair without USE-CANDIDATE withdraws the nomination. A pair on the mesh is never answered this way: during the hold, silence stays its only answer (rule 3) | `answers_before_validating`, `agent_selector.rs:221`; the answer, `:963`; the move, `:848`; the withdrawal, `:980`; `CandidatePair::nomination_pending`, `candidate/mod.rs:254` |
-| **B3. The move is named** | one `session carrier moved` line at each change of the agent's selection after the opening | `follow_moves`, `agents/roomlerd/src/session_carrier.rs:523`; the line, `emit_moved`, `:583` |
+| **B3. The move is named** | one `session carrier moved` line at each change of the agent's selection after the opening | `follow_moves`, `agents/roomlerd/src/session_carrier.rs:789`; the line, `emit_moved`, `:863` |
 
 **The checks already ran at 200 ms.** A connected agent does not wait for its 2 s keepalive to check: its loop starts each round at the check interval, 200 ms, and the keepalive interval can only shorten it (`crates/vendored/webrtc-ice/src/agent/agent_internal.rs:350`, `:352`). roomlerd sets no ICE interval of its own. So phase A's checks above the selection already ran every 200 ms. What they lacked was a budget: they spent the opening's, 8 checks (`max_binding_requests` is 7), and a pair whose far side had not answered by then failed until a check of the browser's reopened it. B1 adds the budget and no cadence code. As built, the cell `b1_a_dead_pair_above_a_selection_on_the_mesh_is_checked_at_the_check_cadence_within_the_budget` counted 8 checks about 215 ms apart; with B1 it counts 13, the last 2.6 s after the candidate arrived.
 
@@ -550,7 +550,7 @@ sequenceDiagram
     Note over A: within 5 s the pumps re-read the pair (relay-escape)
 ```
 
-**The moved line.** Under `route` the observation that records the carrier also follows the session from its first pair (`observe`, `session_carrier.rs:427`, which starts `follow` at `:436`). It reads the selection every second (`MOVE_TICK`, `:84`), holding the peer weakly, until the peer is gone, closed or failed, and at each change of pair writes one line at `info`. The line's latency is never the media's: nothing waits on it, and no wire carries it. The recorded carrier, sent on `rc:session.stats`, stays the one read after the settle ([§11.9](#119-the-carrier-a-session-rides-fr-102-p9c)).
+**The moved line.** Under `route` the observation that records the carrier also follows the session from its first pair (`observe`, `session_carrier.rs:684`, which starts `follow` at `:693`). It reads the selection every second (`MOVE_TICK`, `:109`), holding the peer weakly, until the peer is gone, closed or failed, and at each change of pair writes one line at `info`. The line's latency is never the media's: nothing waits on it, and no wire carries it. The recorded carrier, sent on `rc:session.stats`, stays the one read after the settle ([§11.9](#119-the-carrier-a-session-rides-fr-102-p9c)).
 
 ```text
 INFO session carrier moved session_id=<id> from="derp" to="turn" route=turn relay_transport="udp" local_typ=Relay local_addr=203.0.113.7:61002 remote_typ=Srflx remote_addr=198.51.100.4:50000 overlay=None
@@ -3935,18 +3935,91 @@ so `mark_ended`'s whole-`stats` write cannot reset it, only when the value is a 
 device is the only writer). Absent is unknown, never direct. The P9a freeze splits the day's
 Active sessions by carrier, and the Quality tab and weekly roll-up show it. Rules, storage and
 the field plan: [growth-observability.md](growth-observability.md#remote-desktop-quality-from-what-is-recorded-p9a).
-Whether the pair rides the overlay is its remote's range (`carrier_of`, `agents/roomlerd/src/session_carrier.rs:187`),
+Whether the pair rides the overlay is its remote's range (`carrier_of`, `agents/roomlerd/src/session_carrier.rs:366`),
 except under `rc_carrier_rank=route` (FR-148 P4 step 2). There it is the ICE agent's own read of the pair, the route
-rank's predicate with the mesh's own blocks (`carrier_on`, `:201`, fed at `:367`): a remote in the `/10` outside
+rank's predicate with the mesh's own blocks (`carrier_on`, `:380`, fed at `:559`): a remote in the `/10` outside
 them is recorded as the TURN or direct path it is, and a pair whose local socket the mesh carries asks the overlay,
 whatever its remote ([§4.4](#the-route-rank-fr-148-p4-step-2)). The vocabulary is the same under every value.
 Under `route` a later change of pair is still not recorded, but it is named: one `session carrier moved` line, from
-the last pair's carrier to the new pair's, in the same words (`follow_moves`, `:523`;
+the last pair's carrier to the new pair's, in the same words (`follow_moves`, `:789`;
 [§4.4](#the-move-off-the-mesh-fr-148-p4-step-2-phase-b)).
 Since FR-148 P0 the agent's carrier line also names what carries its own TURN allocation,
 `relay_transport` (`udp`, `tcp`, `tls`, `none` or `unknown`). It is a log field only, never sent
 on `rc:session.stats`
 ([rate-control.md § The standing queue](rate-control.md#the-standing-queue-what-a-tcp-carrier-holds)).
+
+**A relay learnt as peer-reflexive (#3259).** The far end's TURN relay can reach the agent before
+its candidate does. The viewer's first check arrives from the relay's address, which no candidate
+has named yet, so webrtc-ice learns the remote as `prflx`. When the relay's candidate is trickled
+after it, webrtc-ice keeps it beside the prflx and keeps the prflx selected. The pair reads
+(`host`, `prflx`), which the rule above records as `direct`. Since #3259 such a remote counts as
+the far end's relay exactly when the agent holds a relay candidate the far end signalled at the
+prflx's address, port and transport (`remote_relay_of`,
+`agents/roomlerd/src/session_carrier.rs:316`). It then records `turn`, or `turn_local` by the
+address rule a signalled relay remote takes (`carrier_on`, `:399`). Packets from a TURN
+allocation's relayed address and port come from that relay alone, so the rule needs no timing. A
+prflx that nothing shows to be a relay stays `direct`, because a direct session behind a symmetric
+NAT learns its peer as prflx too.
+
+| The selected pair: the agent's end, the far end | `carrier` | `remote_typ` | `remote_relay` |
+|---|---|---|---|
+| host, a `relay` candidate | `turn` (`turn_local` at a loopback or overlay address) | `Relay` | `signalled` |
+| host, a `prflx` at a relay candidate the far end signalled | `turn` (`turn_local` likewise) | `Prflx` | `signalled` |
+| host, a `prflx` that no signalled relay candidate is at | `direct` | `Prflx` | `none` |
+| host, a `prflx` whose read of the held candidates did not finish | `direct` | `Prflx` | `unknown` |
+| a relay of the agent's own, any far end | by the agent's relay, as before | as webrtc-rs names it | by the far end's candidate, as above |
+
+A remote whose type webrtc-rs could not name records `unknown` in both columns, `carrier` and
+`remote_relay`.
+
+The relay candidates come from the ICE agent itself, through a patch of the vendored webrtc
+(`RTCIceTransport::remote_candidates_stats`, `crates/vendored/webrtc/src/ice_transport/mod.rs:140`),
+and not from the peer's `get_stats`, which can wait for minutes on a network that was just captured.
+Only a `prflx` remote is read this way (`signalled_relays`, `agents/roomlerd/src/session_carrier.rs:591`);
+every other remote reads by its type alone. How long the read may wait depends on where it runs
+(`relays_within`, `session_carrier.rs:602`). A read on a task of its own waits 250 ms at most
+(`REMOTE_READ_BUDGET`, `session_carrier.rs:120`). A read on the pump's own path waits for nothing: it
+polls the ICE agent's list once, outside the task's coop budget, and reads `unknown` if it would wait
+on a lock. The path memory is a shadow on every device, and a shadow's read must never put a wait on
+the live path, the session's first frame included. Neither lock is held across I/O once the agent
+is made, so a zero-wait read answers in practice.
+
+| Where the pair is read | When | The read's wait |
+|---|---|---|
+| the carrier record (`observe`): the first nomination (`session_carrier.rs:688`) and the settle read (`:696`) | once a session, on a task of its own | 250 ms at most |
+| the moved line (`follow`, `session_carrier.rs:751`) | every second, under `rc_carrier_rank = route` only, on a task of its own | 250 ms at most |
+| FR-148's deadline lane (`Lane::read`, `agents/roomlerd/src/media_deadline.rs:1174-1179`) | on the pump's own path, at its start and at each 5 s transport re-check, under the lane's `shadow` and `on` only; under `off`, the fleet's value, nothing is read | none: `unknown` if it would wait |
+| the path memory's open (`model_open`, `agents/roomlerd/src/media_pair_memory.rs:578`) | on the pump's own path, once at its open, on a constrained session the memory samples | none: `unknown` if it would wait |
+
+A read that does not finish within its budget, or finds no ICE agent, holds nothing. The remote then
+reads `unknown`, never `none`: `none` says that no relay candidate the far end signalled is at the
+remote, and such a read knows nothing, as `relay_transport` reads `unknown` where the agent cannot
+say. Neither value shows a relay, so the carrier stays `direct`, today's reading.
+
+The carrier line names the reason in one more field, last on the line, `remote_relay`
+(`emit`, `session_carrier.rs:731`): `signalled` when the remote is the far end's relay by a
+candidate the far end signalled (a `relay` remote, or a prflx at one), `unknown` when the agent
+cannot say, and `none` otherwise. `remote_typ` keeps the candidate's own type, so a field read keys
+a relayed session on `carrier` with `remote_relay`. Like `relay_transport`, it is a log field only.
+
+FR-148's readers follow the label, since they read the pair through the carrier rule. `class_of`
+(`agents/roomlerd/src/media_deadline.rs:354`) gives such a pair `unknown`: a `turn` pair whose own
+relay transport is `none` (`media_deadline.rs:377`), as a signalled relay remote gives. The video
+channel's end is the same for `unknown` as for `direct`. The path memory keys such a pair by its
+carrier's word (`selected_pair`, `agents/roomlerd/src/media_pair_memory.rs:189`, reads the pair as
+the carrier line does), on the sessions it opens a key for. **The bitrate clamp does not follow the
+label.** `current_pair_is_relay` (`agents/roomlerd/src/peer.rs:2182`) and the opening's
+`detect_constrained_transport` (`peer.rs:2056`) read the selected pair's candidate types
+themselves, so a session on a relay learnt as prflx keeps today's clamp. Whether it should follow
+is the rate path's own question (#3259's out of scope).
+
+The carrier is still recorded once, from the read after the settle. A relay candidate that reaches
+the agent after that read changes no recorded value and writes no second carrier line, so the
+recorded carrier and the path memory's key, fixed at the pump's open, still agree. What follows the
+later candidate is FR-148's class at the pump's next re-check (`direct` to `unknown`) and, under
+`route`, the `from` of a later move: a read of the same pair that shows its relay becomes the last
+pair, and a read that says `unknown` changes nothing (`follow_moves`, `session_carrier.rs:815`).
+#3259's first lab case has a shape that no address the agent holds shows; it stays open.
 
 **When it reaches the server (FR-102 P9d).** The observation lands ~2.5–6 s after `Connected`
 (`NOMINATION_WAIT` 3 s + `SETTLE` 2 s + the LocalAPI budget). P9c sent the carrier only on the
@@ -5398,10 +5471,10 @@ the control channel only call.
 
 **The classes.** The pair, what carries the agent's own relay and whether the pair rides the mesh are
 the carrier line's own reads (§11.9): `session_carrier::nominated_pair`
-(`agents/roomlerd/src/session_carrier.rs:394`), `relay_transport_of` (`:297`), and the ICE agent's
+(`agents/roomlerd/src/session_carrier.rs:647`), `relay_transport_of` (`:484`), and the ICE agent's
 route read where it has one, else a remote in the mesh's ranges (`addr_is_overlay_range`,
 `agents/roomlerd/src/peer.rs:2286`). The overlay's tier for the remote's peer comes from one LocalAPI
-`peers` call within 400 ms (`overlay_path`, `session_carrier.rs:401`), asked only for a pair on the
+`peers` call within 400 ms (`overlay_path`, `session_carrier.rs:658`), asked only for a pair on the
 mesh.
 
 | Class | The selected pair | Pick, the viewer reporting nothing or `udp` | Pick, the viewer reporting `tcp` or `tls` (P4b-3b) |
@@ -5515,7 +5588,7 @@ per pump ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a
 | a viewer older than P4b-2 | it opens no `video-deadline`. The pick finds none, the session stays on `video-bytes`, and where the carrier wanted one a line says so once per send task |
 | a `video-bytes` that arrives unordered | an older viewer's retired opt-in (`roomler-rc-unordered-video`, retired by P4b-2). The agent sends on it as today under every value: it acts only on the channel labelled `video-deadline` |
 | an agent older than P4b-3 | it attaches `video-deadline` log-only (the catch-all arm, `peer.rs:1423`), and the viewer's second channel stays one idle stream |
-| a viewer older than P4b-3b | it sends no `relay`, so the agent picks exactly as P4b-3 did. Its lines are P4b-3's but for `tcp_end`, which reads `agent` or `none` as the class is TCP or not (`an_older_viewer_gets_p4b_3_s_picks_and_lines`, `media_deadline.rs:2910`) |
+| a viewer older than P4b-3b | it sends no `relay`, so the agent picks exactly as P4b-3 did. Its lines are P4b-3's but for `tcp_end`, which reads `agent` or `none` as the class is TCP or not (`an_older_viewer_gets_p4b_3_s_picks_and_lines`, `media_deadline.rs:2952`) |
 | an agent older than P4b-3b | it reads `rc:decodestat`'s keys by name, so it ignores `relay`, and every key the message carried before is unchanged (`useRemoteControl.spec.ts` locks it). The session picks by the agent's own end |
 
 **The lines,** each with `session`:
