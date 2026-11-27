@@ -69,9 +69,9 @@
 //!   its final path checked; what it makes sealed from creation; what it
 //!   writes made fresh and renamed into place by handle; a removal deleting
 //!   what the same walk opened. #3737's readers ([`PrivateFolder`]) walk the
-//!   same way. The crash records, the install clean-up (FR-145 P1) and the
-//!   daemon's key files in `peer-auth` (#3956: as R leaves them) use it;
-//!   the service logs and the other SYSTEM writers follow in P2 and P3.
+//!   same way. The crash records, the install clean-up (FR-145 P1), the key
+//!   files in `peer-auth` (#3956: as R leaves them) and a role process's
+//!   `service-logs` (P2) use it; the other SYSTEM writers follow in P3.
 //!
 //! Kill switches, read from the process environment only (the service's
 //! `Environment` block), never from the config: `ROOMLERD_MACHINE_TREE_REPAIR=0`

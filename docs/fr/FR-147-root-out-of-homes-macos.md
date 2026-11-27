@@ -231,7 +231,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:3293`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:3312`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:1010`) and `folder_words` (`:1143`), with `r5_words` (`:1189`); `refusals` (`:1623`) says them.
 
 ### Refusals at Plan
@@ -239,7 +239,7 @@ That section is `docs/installation.md:3293`; P1 adds one-row's row to it. The li
 An ephemeral row ([FR-51](../ephemeral-nodes.md)) is refused before anything changes (#4312, ruled 2026-11-23).
 One-row stops the half that holds it, the root half at its restart and a person's at the bootout, and on such a
 stop an ephemeral row deletes itself (`agents/roomlerd/src/app.rs:5988-6055`, by
-`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`). One-row does not mark its own stops,
+`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:458-464`). One-row does not mark its own stops,
 as the updater's `update-attempt` marker does (#1683): a retired row stays offline for as long as the Mac stays
 one row, and the server's reaper deletes an offline ephemeral row however it stopped.
 
@@ -625,7 +625,7 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 
 | Where | What | Kind |
 |---|---|---|
-| `crates/agent-core/src/logging.rs:228-239`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:326-360`) |
+| `crates/agent-core/src/logging.rs:239-258`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:326-360`) |
 | `agents/roomlerd/src/instance_lock.rs:393-409` | the lock's path from `BaseDirs`, which reads `$HOME` (`:402-403`); reached by `run`. Typed by hand as `sudo roomlerd run`, the daemon takes its lock under the CALLER's `~/Library/Caches`. That is not the file the launchd daemon holds for the same config (`/var/root/Library/Caches`; the name is a hash of the config path, `lock_id`, `:108-112`, held by `flock`, `unix_acquire`, `:317-385`), so the second daemon is not refused as a second instance | write |
 | `agents/roomlerd/src/service.rs:2805-2837` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2835-2837`): typed as `sudo roomlerd service install` (or `uninstall`), a root-owned `<L>` and plist in the caller's home, the #3763 state | write |
 | `scripts/install.sh:2061-2082` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1616-1624`) | remove |
@@ -643,7 +643,7 @@ The source gate (`crates/agent-core/src/folder_gate.rs:279-345`) holds six of th
 macOS builds: `process_home`, `default_download_dir`, `unix_lock_path`, `plist_path`, the `roomler` CLI's
 `default_config_path` and `default_choice`. Each is entered by a command typed with `sudo`, which on macOS keeps the
 caller's `HOME`. AC10 asks that none is left. Of the reads an earlier row of this table left undetermined,
-`files.rs:5579-5583` is Linux's `own_home_and_downloads` and `:7909` is a test.
+`files.rs:5579-5583` is Linux's `own_home_and_downloads` and `:7955` is a test.
 
 Not swept: `agents/roomler-setup/src/unix_daemon.rs`, the self-updater, `cleanup-legacy-install`, and fleet exec as
 root.
@@ -727,7 +727,7 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3008`, its sequence at `:3062`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3025`, its sequence at `:3079`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:3273`): one-row's row, and

@@ -254,9 +254,9 @@ person's half on it and says why.
     writes it, a finished revert removes it (`:3205-3210`), and with no copy the revert says only "nothing to revert"
     (`:3279-3284`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
     is not named: it keeps the config. The words are `stop_text`'s (`agents/roomler-setup/src/reinstall_guard.rs`).
-  - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5854-5858`), so
+  - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5914-5918`), so
     it asks the system socket (`:4970-4972`), the root daemon's own, through the same root-only connect
-    (`:6191-6194`): `status` alone, under the same 3 s bound, believed only through `one_row_from`. A person's road is
+    (`:6251-6254`): `status` alone, under the same 3 s bound, believed only through `one_row_from`. A person's road is
     unchanged, and a person with no person socket asks nothing, never the system socket (`socket_to_ask`). The only
     root road on a Mac is a person starting the wizard as root: it never elevates itself there
     (`crates/roomler-setup-core/src/elevation.rs:231-235`), its command line has no headless mode
@@ -293,7 +293,7 @@ on the Devices page.
 - [ ] **AC1**: macOS 15 or later, the released wizard, **pairing**, the default choice, one-row switch on: **one**
   row, online. From that row on the Devices page: its overlay address(es) shown, a remote-desktop session that
   streams and takes input; `sudo roomler peers` lists the mesh; a ping over the overlay both ways; `roomler ssh`
-  once the device's `ssh_enabled` is on (`docs/installation.md:3175-3176`).
+  once the device's `ssh_enabled` is on (`docs/installation.md:3192-3193`).
 - [ ] **AC2**: the same with a **pasted** token: one field, one token, one row.
   P0 read, cell M2 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)): the
   paste path with the default choice still asks for two tokens and leaves two rows, so AC2 is not held yet.

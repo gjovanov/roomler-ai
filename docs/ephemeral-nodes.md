@@ -156,7 +156,7 @@ exec roomlerd run
   ([#4322](https://github.com/gjovanov/roomler-ai/issues/4322)). Run by hand
   (`msiexec`), by `install.ps1`, by the setup wizard or by an RMM push, it writes
   no marker: the updater writes one right before it spawns the installer
-  ([`updater.rs:2000`](../agents/roomlerd/src/updater.rs#L2000)). Every run that
+  ([`updater.rs:2012`](../agents/roomlerd/src/updater.rs#L2012)). Every run that
   is not a full removal restarts the service through the SCM
   (`EnableSystemContext`, `DisableSystemContext` or `KeepSystemContext`,
   [`wix-perMachine/main.wxs:689-697`](../agents/roomlerd/wix-perMachine/main.wxs#L689-L697)),
@@ -226,10 +226,10 @@ flowchart LR
   row ([above](#the-ci--container-recipe),
   [#4322](https://github.com/gjovanov/roomler-ai/issues/4322)). The
   auto-updater's own exit is the internal arm, which never unenrolls
-  ([`updater.rs:3471`](../agents/roomlerd/src/updater.rs#L3471)). A stop its
+  ([`updater.rs:3483`](../agents/roomlerd/src/updater.rs#L3483)). A stop its
   installer issues after that takes the OS-initiated arm, and the
   `update-attempt` marker written before the spawn is what keeps the row
-  ([`updater.rs:2000`](../agents/roomlerd/src/updater.rs#L2000)).
+  ([`updater.rs:2012`](../agents/roomlerd/src/updater.rs#L2012)).
 - **`service uninstall` does not stop the daemon, on purpose.** On a major
   upgrade, Windows Installer runs the old product's uninstall, which runs
   `service uninstall` from the outgoing binary (`UnregisterAutostart` in
@@ -327,9 +327,9 @@ that swap would put an ephemeral row beside another org.
 The daemon keeps the row it started as: its primary's server, org, `agent_id`
 and `ephemeral` (`updater::RunRow`, taken at
 `agents/roomlerd/src/app.rs:4766`). On an OS stop the gate
-(`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:446-452`,
+(`updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:458-464`,
 unchanged) reads the run's own `ephemeral`, and the removal targets the run's
-own row (`updater::stop_removal`, `:5150-5179`, at
+own row (`updater::stop_removal`, `:5162-5191`, at
 `agents/roomlerd/src/app.rs:6027-6055`):
 
 | The file at the stop | The stop removes |

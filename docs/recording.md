@@ -89,10 +89,11 @@ relay-capped session on `hevc_videotoolbox` beside it, and 0.64 % with none: the
 The late ticks fell exactly one every 5.02 s. Every 5 s the paced loop asked `folder::available_space` how much room
 was left. That was a full `sysinfo` disk refresh, which on macOS queries every volume and walks IOKit for each one,
 and the loop's next tick waited for it. **Since FR-85 P7 the check is off the loop.**
-[`recorder.rs:141`](../agents/roomlerd/src/recording/recorder.rs#L141) `watch_free_space` asks it on a blocking
+[`recorder.rs:144`](../agents/roomlerd/src/recording/recorder.rs#L144) `watch_free_space` asks it on a blocking
 thread every `disk_check_every` (5 s) and raises a flag. The loop only reads that flag and stops `disk_low` as
-before. [`folder.rs:315`](../agents/roomlerd/src/recording/folder.rs#L315) refreshes storage only, so the IOKit
-walks are gone too. A check that takes 120 ms, asked every 250 ms, cost a 3-second recording 25 late ticks inside
+before. P7 also had the probe refresh storage only, so the IOKit walks went too, and since #3355
+[`folder.rs:320`](../agents/roomlerd/src/recording/folder.rs#L320) reads no disk list at all: it asks the
+folder's own volume (§5). A check that takes 120 ms, asked every 250 ms, cost a 3-second recording 25 late ticks inside
 the loop, and costs it none now (`tests/recorder.rs`). On release 0.4.201, which carries P7, the same MacBook
 recorded 10:29 beside a relay-capped session with 0 late ticks of 18,871, and 2:33 with no session with 0 of 4,598.
 
@@ -393,6 +394,28 @@ Guards: the recorder refuses to start with under 2 GiB free, stops cleanly
 under 1 GiB, and stops at the maximum length. A display that changes size ends
 the file cleanly (`display_changed`) instead of scaling mid-recording.
 
+**The free space is the folder's own** (#3355). Each reader asks the recorder's
+probe (`RecordOptions::free_space`) about its own folder:
+
+| Reader | Asks about | Below | Then |
+|---|---|---|---|
+| the start gate ([`recorder.rs:417`](../agents/roomlerd/src/recording/recorder.rs#L417)) | the staging folder | 2 GiB | refused `disk_low` |
+| the continue gate, every 5 s from a blocking thread ([`recorder.rs:144`](../agents/roomlerd/src/recording/recorder.rs#L144)) | the staging folder | 1 GiB | stopped `disk_low` |
+| the stop path's remux ([`recorder.rs:858`](../agents/roomlerd/src/recording/recorder.rs#L858)) | the folder the copy goes to | the copy's size | the fragmented file is kept |
+
+The reconciler's remux and the editor's export ask `folder::available_space`
+itself, about the folder the copy goes to. That probe asks the operating system
+about the folder: `statfs` on a Mac, whose `statvfs` counts blocks in 32 bits,
+`statvfs` on other Unix, and `GetDiskFreeSpaceExW` on Windows
+([`free_space.rs:38`](../agents/roomlerd/src/free_space.rs#L38), `:54`, `:70`).
+So a folder on a tmpfs, an NFS or SMB mount or a mapped drive reads that
+volume's room. It used to match the folder against `sysinfo`'s mount list, which
+leaves those mounts out, and such a folder read the room of `/`, or nothing on
+Windows. "Can't tell" is the answer only when the query fails, for example
+because the folder is gone, and it stops nothing. A folder whose file system has
+stopped answering, such as a hard NFS mount whose server is gone, can block the
+query, as it blocks the recording's own writes there.
+
 **Crash recovery.** A recorder that died (a crash, `kill -9`, the Windows
 installer's Restart Manager during an update) leaves its partial in the staging
 dir. Every `roomlerd record` runs `recorder::reconcile_partials` over its own
@@ -414,28 +437,46 @@ error as "nothing recoverable", so it deleted the partial: a finished recording
 lost, every fragment of it (measured 2026-11-02 on Windows, 0.4.197; every
 release had it, on every OS). `mp4::finalize` now removes that temp and creates
 its own with `create_new`: the caller holds the partial's lock, so nothing else
-writes that name, and a link planted there is not written through.
+writes that name, and a link planted there is not written through. Since #3355
+the temp goes at the remux's first step
+([`mp4.rs:1037`](../agents/roomlerd/src/recording/mp4.rs#L1037)), before the
+partial is read, so it goes beside a partial that cannot be read too. A folder
+at that name is not a file: it stays, and the remux fails.
 `reconcile_partials` removes a partial only on `mp4::NothingRecoverable`: no
-`moov`, or no complete fragment. Read on release 0.4.198 (2026-11-03): a
+`moov`, or no complete fragment. A first fragment header (`moof`) that is
+corrupt or zeroed is the second case. One that does not decode ends the read
+([`mp4.rs:926-931`](../agents/roomlerd/src/recording/mp4.rs#L926-L931)), and a
+zeroed one reads as a box to the end of the file, so no fragment is complete
+([`mp4.rs:1039`](../agents/roomlerd/src/recording/mp4.rs#L1039)) and that
+partial is removed. Read on release 0.4.198 (2026-11-03): a
 Windows recorder terminated with its temp written and no final file came back
 whole at the next start, all 14,772 frames, marked `interrupted`.
 
-Every other failure, such as a full disk or a corrupt fragment, follows the stop
+Every other failure, such as a full disk or a fragment that cannot be indexed
+(a media box with no fragment header before it), follows the stop
 path's rule: the fragmented file goes under its final name, marked `interrupted`,
 the whole error chain goes to the log, and the `recovered` event names it. That
 is one attempt per partial. Read on release 0.4.198 with a folder holding the
 temp's name: `Access is denied` in the log, the partial under its final name with
 its 31 fragments, listed, and Windows' Media Player plays it. Listing, deleting and downloading never read a
 recording's contents, so this file takes them like any other. The sidecar's
-duration, frames and bytes come from its fragments. The editor reads progressive
+duration and frames come from its fragments, and its bytes from the file's size
+(`mp4::fragmented_summary`,
+[`mp4.rs:1165`](../agents/roomlerd/src/recording/mp4.rs#L1165)). A kept file
+that cannot be indexed has zero frames and a zero duration in its sidecar: only
+its size is real. The editor reads progressive
 files only and finds no video in it, as in the stop path's fragmented file. A
 partial stays for the next start only if that rename fails too, because the
-folder is gone or another program holds the file.
+folder is gone or another program holds the file. A partial whose final name is
+already taken is not remuxed or renamed at all: it stays in staging, at that
+start and at every later one
+([`recorder.rs:1100`](../agents/roomlerd/src/recording/recorder.rs#L1100)).
 
 A remux that cannot fit is not started. `mp4::finalize` compares the copy's exact
-size with `folder::available_space` first, because running the volume to zero to
-find out would stop whatever else writes there, the next recording included.
-Where the room cannot be told, the remux goes ahead.
+size with the room in the folder the copy goes to first
+([`mp4.rs:1096`](../agents/roomlerd/src/recording/mp4.rs#L1096)), because running
+the volume to zero to find out would stop whatever else writes there, the next
+recording included. Where the room cannot be told, the remux goes ahead.
 
 ⚠️ **A partial is finalized only if its `.partial.lock` can be taken**
 (`recorder::PartialLock`). The recorder takes that OS file lock before it
@@ -448,9 +489,8 @@ unrecoverable**. `a_live_partial_is_left_alone_by_the_reconciler` is red with
 the lock disabled.
 
 A recorder's own WGC capture can end it during the remux. `docs/remote-control.md`
-§5.1 has that fault, which was over a moving screen, and its fix. A recording of a
-few seconds exits before the capture thread leaves its apartment, so it never gets
-that far.
+§5.1 has that fault, which was over a moving screen, and its fix. A short recording
+can exit before its capture thread leaves the apartment.
 
 ## 6. Recording through the daemon — the local verbs (P2a)
 
@@ -1478,7 +1518,7 @@ sequenceDiagram
 | The record context crosses | `delegate.rs:481` (`SessionParams::record`), `agents/roomlerd/src/signaling.rs:4281` (sent AFTER the consent mode is resolved), `agents/roomlerd/src/signaling.rs:3200` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1105`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
 | The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1961` (`effective_record`), `agents/roomlerd/src/signaling.rs:7147` (`Announcer::now`, which the hello and every heartbeat announce, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
 | An OFF is live | `remote.rs:600` (`subscribe_gates`), `delegate_worker.rs:625-644` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
-| The worker's account of a recording | `delegate.rs:1874` (noted where the grant crosses), `delegate.rs:2576` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:805`). The server bounds it again to a live session of this agent |
+| The worker's account of a recording | `delegate.rs:1874` (noted where the grant crosses), `delegate.rs:2603` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:805`). The server bounds it again to a live session of this agent |
 
 - **Whose gates:** the worker's, which are the person's own config: the
   worker runs without `--config`, so it reads the user's. The companion's
