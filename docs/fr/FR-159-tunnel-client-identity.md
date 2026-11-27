@@ -3,8 +3,8 @@
 **Issue:** [#4511](https://github.com/gjovanov/roomler-ai/issues/4511) · **Status:** claimed 2026-11-27, from
 [#4479](https://github.com/gjovanov/roomler-ai/issues/4479). P1, the server, is built
 ([#4522](https://github.com/gjovanov/roomler-ai/pull/4522)) and live in production since 2026-11-27; its switch is
-on, and no client sends an `instance_id` before P2. Nothing else is built. D1–D5 were ruled on #4511 on 2026-11-27,
-as recommended; D6 is open, and is P2's.
+on, and no client sends an `instance_id` before P2. Nothing else is built; P0's reads are done. D1–D5 were ruled
+on #4511 on 2026-11-27, as recommended; D6 is open, and is P2's.
 **Builds on:** [#3328](https://github.com/gjovanov/roomler-ai/issues/3328) (a known machine id re-enrolls only for its
 owner or for a device manager), [FR-103](FR-103-device-credentials-renew-themselves.md) (the token generation a
 removal advances)
@@ -422,7 +422,7 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P0 | the RED reads of F1 and F2 on the current release and server, F4's pair left enrolled; the coordinator's R0–R3 | none: it reads and changes nothing | started: R0–R3 (AC1) and F2 read on 2026-11-27 (the field log); F1 is next |
+| P0 | the RED reads of F1 and F2 on the current release and server, F4's pair left enrolled; the coordinator's R0–R3 | none: it reads and changes nothing | done: R0–R3 (AC1), F2 and F1 (AC2) read on 2026-11-27 (the field log); F1's pair is kept for F4 |
 | P1 | the server: `instance_id` on the request and the row, the order of the lookups, the claim, the index, `keyed_by`, the 400, the 409 sentence for an instance match; the baseline re-recorded | `ROOMLER__RC__TUNNEL_INSTANCE_ID`, default on | done: built in #4522 (AC3, AC4, AC6), live in production since 2026-11-27 (the field log); AC5's client half is P2's |
 | P2 | the clients: the identity function in `roomler-cli`, the id file and its binding, `roomler enroll` and the wizard on that one function, the wizard's copy gone | `ROOMLER_TUNNEL_INSTANCE_ID=0`, and fail-open | not started |
 | P3 | the field reads F1–F5 on P1's server and P2's clients | P1's switch | not started |
@@ -431,7 +431,7 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 ## Acceptance criteria
 
 - [x] **AC1** (P0): R0–R3 read by the coordinator, counts only, and recorded in the field log.
-- [ ] **AC2** (P0, RED): F1 and F2 read RED on the current release and server, and F4's pair is left enrolled for P3.
+- [x] **AC2** (P0, RED): F1 and F2 read RED on the current release and server, and F4's pair is left enrolled for P3.
 - [x] **AC3** (P1): the integration tests above, each shown RED on master first, and #3328's tests unchanged and green.
 - [x] **AC4** (P1): the decision function's table test covers every row of the outcome table, and the owner scope, the
   cap before the spend and the token's single use hold on every path.
@@ -496,3 +496,4 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 | 2026-11-27 18:59Z | P1: #4522 merged as `0c3d45211`. Its tests, read by the coordinator in CI's logs. | AC3: against a stub that answers every request as master does (integration run 46013405259), the nine new tests each failed on an assertion of their own, while the three guards and #3328's six tests passed. #3328's tests are byte-identical, and their helper sends the same request. All 18 pass on master after the merge (run 46053479790). AC4: the table test `every_row_of_the_outcome_table` has a case for each of the outcome table's seven rows, green on the PR's final head (CI run 46046243571). The route reads the scope and the cap before the token's one spend, which every path takes once, and every refusal the decision makes returns before it; what is refused after it is a row that changed between the read and the write, a race. AC6: the index is in network's `index_plan`; the baseline moved by that one index in both `multi_block` values and by nothing else, and the merge's message names it. 🟢 **AC3, AC4, AC6.** |
 | 2026-11-27 19:40Z | P0: F2 on a fresh Linux lab guest, in a throwaway organization, with the tunnel client a person installs today (`tunnel-v0.4.215`, the newest tunnel release, whose enroll path is byte-identical to `agent-v0.4.239`'s), on the server before P1 (`hosted-20261127-07485f5`). | Enrolled with `HOSTNAME` set, then again with it not set, each time with a new token: **two rows**, the first derived from the host name and the second from `unknown`. 🔴 RED, as the spec says. The organization was archived after the read. |
 | 2026-11-27 19:55Z | P1 live: `hosted-20261127-0c3d452` (master `0c3d45211`) on both app pods since 19:49Z. The coordinator's read: index specs and counts only, from outside the database pod. | `tunnel_clients` holds `{tenant_id: 1, instance_id: 1}`, unique, partial on `{instance_id: {$type: "string"}}`, so the boot built it, and 0 rows hold an `instance_id`, as expected before P2. The database pod's restart count and memory were the same before and after. |
+| 2026-11-27 22:37Z | P0: F1 on two fresh Linux lab guests, each with its own host name, in a throwaway organization, with `tunnel-v0.4.215`, on P1's server (`hosted-20261127-0c3d452`). | Both enrolled under one name with `HOSTNAME` not set, each with a new token from the same person: **one row**, keyed by the hash of `unknown`, and both guests' tokens name it. The server accepts both: each guest's roster read answered 200, and the first guest's token still worked after the second had enrolled. That route applies the check the tunnel socket applies at connect; no forward was opened, since the organization has no device. As a negative control, the first guest's token from F2's organization, archived by then, was refused 401. 🔴 RED, as the spec says. Both guests are shut down with their disks, and the organization is kept with its one row, for F4 in P3. 🟢 **AC2**, with F2. |
