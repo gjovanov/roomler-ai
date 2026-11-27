@@ -112,6 +112,7 @@ CLIENT_CRATES=(
   roomler-ai-remote-control
   roomler-localapi
   tcp-turn-conn
+  roomler-log-capture
 )
 
 # Binaries we actually ship to end users. The licensing workflow asserts that no
