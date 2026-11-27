@@ -1803,7 +1803,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10248-10281`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10325-10358`):
 
 | Field | Meaning |
 |---|---|
@@ -1879,7 +1879,7 @@ constant bitrate (`libavcodec/qsvenc.c:628-631`). The runtime then pads every fr
 and `global_quality` is never read. [FR-148](fr/FR-148-path-measured-plan-follows.md)
 measured what follows on CORPLAP-1: a still screen spends the cap (about 0.9 Mbit/s of
 keepalive filler in a 1.64 Mbit/s session), and every real frame, a caret blink's too,
-is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9761`), so
+is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9838`), so
 a rebuild-bound rate apply that waits for quiet waits for good: 0 rate moves in 16,719 s.
 
 `qsv_rate_mode = qvbr` (`ROOMLERD_QSV_RATE_MODE`) opens HEVC and H.264 QSV off that
@@ -1972,7 +1972,7 @@ read on silicon.
 Under `inflight_budget = on` the in-flight budget holds frames on a relayed session
 ([FR-148](fr/FR-148-path-measured-plan-follows.md) D51, B4). Both data-channel pumps run
 that gate before they capture: the FFmpeg pump re-polls it every 2 ms
-(`agents/roomlerd/src/peer.rs:8129-8214`) and captures after it (`:8261`), and its
+(`agents/roomlerd/src/peer.rs:8185-8270`) and captures after it (`:8317`), and its
 encoder stamps each frame with the capture's time (`encoder.rs:96-99`, `:2357-2362`), so
 a hold of H ms reaches the encoder as a pts gap of one interval plus H. libvpx, the
 VP9-444 pump's encoder, grants that gap: after a 500 ms hold its next three seconds
@@ -1986,7 +1986,7 @@ same gap.
 **Every NVENC and AMF encoder holds, to the byte.** `o18_spend_after_a_hold`
 (`encoder.rs:4882-5300`) opens each encoder as a relayed session does (`new_preferred`
 with `constrained`, as `FfmpegDcCodec::open` does at
-`agents/roomlerd/src/peer.rs:5503-5506`; `hevc_nvenc`
+`agents/roomlerd/src/peer.rs:5542-5545`; `hevc_nvenc`
 4:4:4 through `new_hevc_adaptive`) and feeds it two arms, a fresh encoder each: three
 seconds at the frame interval, a 500 ms jump in the pts, three more seconds (`hold`);
 and the same frames with no jump (`interval`). The content is the libvpx cell's, a grey
@@ -2448,7 +2448,7 @@ first encode. `encode/libvpx.rs` therefore binds `env-libvpx-sys` directly:
 - **#3472 — a frame fed again carries its own time.** libvpx's one-pass CBR
   reads its frame rate off the gaps between timestamps and grants each encode
   `target ÷ that rate`. The VP9 4:4:4 data-channel pump's idle keepalive
-  re-encodes its last frame 60 ms after it (`IDLE_KEEPALIVE`, `peer.rs:4078`): the same
+  re-encodes its last frame 60 ms after it (`IDLE_KEEPALIVE`, `peer.rs:4086`): the same
   `Arc<Frame>`, so the same `monotonic_us`. That repeated pts added no time
   and still took a grant, so a damage-gated screen spent about twice its
   target: 2.0–2.4× in the field, 1.76× at 800×600 and 2.05× at 1920×1080

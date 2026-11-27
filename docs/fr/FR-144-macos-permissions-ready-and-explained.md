@@ -189,9 +189,9 @@ then shows today's two rows.
 
 | The Mac's state | The viewer says | Signal |
 |---|---|---|
-| Screen Recording off | "This Mac has not allowed roomlerd to record its screen, so there is no picture. Someone at the Mac must turn it on: Roomler menu-bar app → Permissions." | `rc:media-unavailable` `permission`, which exists (`capture/mod.rs:811-815`) |
+| Screen Recording off | "This Mac has not allowed roomlerd to record its screen, so there is no picture. Someone at the Mac must turn it on: Roomler menu-bar app → Permissions." | `rc:media-unavailable` `permission`, which exists (`capture/mod.rs:812-816`) |
 | Screen Recording stale | "macOS no longer accepts this Mac's screen permission for roomlerd. This can happen after an update. Someone at the Mac must repair it: Roomler menu-bar app → Permissions → Repair." | the same code with a `stale` detail, additive |
-| Control off | "Your clicks and keys do not reach this Mac: roomlerd is not allowed to control it (Device Control and Data Access). Someone at the Mac must turn it on." | a new `rc:` notice from the input arbiter when it drops events for want of the grant (it already re-reads the grant once a second, `docs/remote-control.md:1838-1847`) |
+| Control off | "Your clicks and keys do not reach this Mac: roomlerd is not allowed to control it (Device Control and Data Access). Someone at the Mac must turn it on." | a new `rc:` notice from the input arbiter when it drops events for want of the grant (it already re-reads the grant once a second, `docs/remote-control.md:1958-1967`) |
 | macOS is asking now, the picture is live | "The Mac is showing a macOS question for roomlerd. Click Allow in the picture." | the agent sees it: Local Network by its own sends failing with `EHOSTUNREACH`; the picker by a window above the captured display at the alert layer, owned by a system process from a per-version table, appearing as capture starts (the owners are to verify in the field per version) |
 | A question nobody can reach from here (no picture, a locked screen, the login window) | "macOS is waiting for an answer at the Mac, and it cannot be given from here. Someone at the Mac must answer it." | the same detection with no live picture |
 

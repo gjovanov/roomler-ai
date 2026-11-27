@@ -57,7 +57,7 @@ wait that should not exist.
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
 (`post_install.rs:385`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:7741`)
+(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:7861`)
 was never wired. So even on Windows — where the staged watcher does produce a
 verdict — nothing surfaces it. **P3 wires it** (2026-10-26): the daemon reads
 the record at startup and on every `roomler status`, see the P3 section below.
@@ -92,7 +92,7 @@ It was the first design, and it was refuted:
   file — see 3), and `.output()` with no timeout on the daemon's exit path is a
   genuine fleet-freeze mode.
 - **The config kill switch is inert against that mode**: config changes are
-  `restart_required` (`docs/remote-config.md:477-500`), and the failure being
+  `restart_required` (`docs/remote-config.md:479-502`), and the failure being
   guarded blocks the very exit a restart needs.
 - **It would create a failure mode that cannot exist today**: with the watcher
   surviving, PID reuse on the daemon's freed pid makes `kill(pid,0)` keep
