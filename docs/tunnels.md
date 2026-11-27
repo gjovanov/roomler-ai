@@ -1462,7 +1462,7 @@ enrolled under one name in one org send one hash, and the second lands on the fi
 row (#4479). The `instance_id` is the install's own. A row keeps the `machine_id` it was
 made with for good, because the client's overlay node is keyed by it, and it holds an
 `instance_id` once an FR-159 client has claimed it (`TunnelClient`,
-`crates/remote_control/src/models.rs:3576`). A row an FR-159 client creates takes its
+`crates/remote_control/src/models.rs:3623`). A row an FR-159 client creates takes its
 `instance_id` as its `machine_id` too (`create_row`, `routes/tunnel.rs:486`), so no legacy hash
 ever finds it.
 
@@ -1573,7 +1573,7 @@ Today's clients ignore fields they do not know.
 
 | switch | default | off means |
 |---|---|---|
-| `rc.tunnel_instance_id` (`ROOMLER__RC__TUNNEL_INSTANCE_ID`, `crates/config/src/settings.rs:1129`) | on | every request is looked up as an older client's, by `machine_id` alone; no `instance_id` is written and none is refused 400; a request that carried one is answered `keyed_by: machine_id`. A row keyed by an instance id is then not found by the legacy hash, so its client gets a new row at its next enrollment: the switch is for a fault, not a setting to leave off |
+| `rc.tunnel_instance_id` (`ROOMLER__RC__TUNNEL_INSTANCE_ID`, `crates/config/src/settings.rs:1139`) | on | every request is looked up as an older client's, by `machine_id` alone; no `instance_id` is written and none is refused 400; a request that carried one is answered `keyed_by: machine_id`. A row keyed by an instance id is then not found by the legacy hash, so its client gets a new row at its next enrollment: the switch is for a fault, not a setting to leave off |
 
 The tests: the decision's table in `tunnel_enrollment.rs`, and the integration tests from
 `two_installs_with_one_legacy_hash_get_two_rows` on in

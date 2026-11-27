@@ -170,7 +170,7 @@ the order the probe opens them. A host's probe adds an overlay of proof, and `de
 
 **It drives nothing.** `compute_caps_with` (`agents/roomlerd/src/encode/caps.rs:3970`)
 makes every open it made before and records what it found in `ProbeFindings`
-(`cell_table.rs:624`). `assemble` (`caps.rs:4548`) writes the real hello from that, with
+(`cell_table.rs:624`). `assemble` (`caps.rs:4552`) writes the real hello from that, with
 the pushes the probe used to make inline, in the same order and on the same conditions.
 The table derives beside it, and `shadow` (`caps.rs:4381`, `cell_table.rs:1286`) compares
 the two once per process and touches nothing. **The evidence is the gate**, which proves the
@@ -786,7 +786,7 @@ something holds its pipe is a unit test with a real process on each OS.
   session on that host would run the same vendor's code in-process. With `h264` chosen it
   takes OpenH264 instead. With `av1` chosen it gets no video until #3279 lands: `av1_mf` is
   denied, an FFmpeg AV1 cell that opened still puts `av1` in `codecs`,
-  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L5132) puts it first, and
+  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L5136) puts it first, and
   `MfEncoder::new_av1` refuses. A report that came before the stuck child stops offering those
   cells, so the hello does not promise what a session is refused. Only a kill that landed
   within its bound keeps Media Foundation: a later kill on a thrashing host reads as "would
@@ -930,7 +930,7 @@ nothing has produced a stuck child in the field.
   child. It is a level, so a child that came back first costs nothing. When the cells go, the answer
   in force stops offering them, as for a fault. A session starting beside a live one, or within that
   minute, can still open them.
-- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L5153)). A session picks its codec and transport
+- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L5157)). A session picks its codec and transport
   at its request, before consent, and a person can take longer than that minute (`prompt_then_email`
   waits minutes). So its offer reads both against the answer in force (`answer_now`, which never
   waits for a probe, #3439): what has gone is picked again by the

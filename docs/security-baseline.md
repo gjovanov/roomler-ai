@@ -348,7 +348,7 @@ give.
 A tunnel policy names who may reach which `host:port` through which of the org's
 devices, so writing one is granting access. Every `…/tunnel-policy` route needs
 **`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
-(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:811`; the
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:977`; the
 overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:157`).
 The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
 roles do not.

@@ -1,7 +1,9 @@
 # FR-159: A tunnel client's identity comes from the machine it runs on, not from `$HOSTNAME`
 
-**Issue:** [#4511](https://github.com/gjovanov/roomler-ai/issues/4511) · **Status:** spec, claimed 2026-11-27, from
-[#4479](https://github.com/gjovanov/roomler-ai/issues/4479); nothing built. D1–D6 are open, each with a recommendation.
+**Issue:** [#4511](https://github.com/gjovanov/roomler-ai/issues/4511) · **Status:** claimed 2026-11-27, from
+[#4479](https://github.com/gjovanov/roomler-ai/issues/4479). P1, the server, is built
+([#4522](https://github.com/gjovanov/roomler-ai/pull/4522)); its switch is on, and no client sends an `instance_id`
+before P2. Nothing else is built. D1–D5 were ruled on #4511 on 2026-11-27, as recommended; D6 is open, and is P2's.
 **Builds on:** [#3328](https://github.com/gjovanov/roomler-ai/issues/3328) (a known machine id re-enrolls only for its
 owner or for a device manager), [FR-103](FR-103-device-credentials-renew-themselves.md) (the token generation a
 removal advances)
@@ -420,7 +422,7 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 | phase | what | kill switch | status |
 |---|---|---|---|
 | P0 | the RED reads of F1 and F2 on the current release and server, F4's pair left enrolled; the coordinator's R0–R3 | none: it reads and changes nothing | started: R0–R3 read on 2026-11-27 (AC1, the field log); the lab reads are next |
-| P1 | the server: `instance_id` on the request and the row, the order of the lookups, the claim, the index, `keyed_by`, the 400, the 409 sentence for an instance match; the baseline re-recorded | `ROOMLER__RC__TUNNEL_INSTANCE_ID`, default on | not started |
+| P1 | the server: `instance_id` on the request and the row, the order of the lookups, the claim, the index, `keyed_by`, the 400, the 409 sentence for an instance match; the baseline re-recorded | `ROOMLER__RC__TUNNEL_INSTANCE_ID`, default on | built in #4522: the server, its tests (RED first) and its docs |
 | P2 | the clients: the identity function in `roomler-cli`, the id file and its binding, `roomler enroll` and the wizard on that one function, the wizard's copy gone | `ROOMLER_TUNNEL_INSTANCE_ID=0`, and fail-open | not started |
 | P3 | the field reads F1–F5 on P1's server and P2's clients | P1's switch | not started |
 | P4 | the docs: tunnel-client enrollment in `docs/tunnels.md` (the id, its file, the claim and the split, the 409s, with a diagram), the field and the index in `docs/data-model.md`, and the `docs/README.md` rows | none: docs | not started |
@@ -432,7 +434,7 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 - [ ] **AC3** (P1): the integration tests above, each shown RED on master first, and #3328's tests unchanged and green.
 - [ ] **AC4** (P1): the decision function's table test covers every row of the outcome table, and the owner scope, the
   cap before the spend and the token's single use hold on every path.
-- [ ] **AC5** (P1, old and new together): a request without `instance_id` is answered exactly as today; a newer client
+- [ ] **AC5** (old and new together; P1 for the server, P2 for the client unit test): a request without `instance_id` is answered exactly as today; a newer client
   reads an answer without `keyed_by` as keyed the old way (a client unit test).
 - [ ] **AC6** (P1): the index is in network's `index_plan`; the composition baseline is re-recorded in P1's PR with a
   message that names the index; no route, method or wire name moves.
@@ -448,27 +450,27 @@ the agent, tunnel and setup lanes, then P3 and P4. Each code PR carries its own 
 
 ## Open decisions
 
-- **D1, where does the id come from: derived from the machine, kept by the client, or both?** Recommended: kept, made
+- **D1, where does the id come from: derived from the machine, kept by the client, or both?** Ruled as recommended on #4511 (2026-11-27): kept, made
   once at random, and bound to the machine it was made on (§ Where the id comes from). A derived or seeded id collides
   wherever two machines share what it is derived from: two Windows clones that nobody renamed share their computer
   name, and the wizard gives both the same default name. A random id never does. Its one failure, a new row after the
   folder is lost, is the one the root half's rule allows (`machine.rs:169-174`).
 - **D2, the migration: does the client send again the id it enrolled with, or send the old one beside the new?**
-  Recommended: the old beside the new, with the row's `machine_id` never rewritten. A client enrolled today keeps no id
+  Ruled as recommended on #4511 (2026-11-27): the old beside the new, with the row's `machine_id` never rewritten. A client enrolled today keeps no id
   it could send again (`config.rs:15-40`), so sending today's hash again is the only way such a client can be found,
   and it must be today's hash, computed as today. The claim then moves each legacy row to its install once.
-- **D3, does a claim mint a new token generation?** Recommended: no, as no re-enrollment does today
+- **D3, does a claim mint a new token generation?** Ruled as recommended on #4511 (2026-11-27): no, as no re-enrollment does today
   (`tunnel_client.rs:94-95`). With one, the other machine on a shared row is refused at its next connect
   (`crates/modules/network/src/tunnel.rs:2161-2176`) and must enroll again, and an older client there finds the same
   row again.
-- **D4, a legacy row outside the enroller's scope?** Recommended: a live row of someone else gets the enroller a row of
+- **D4, a legacy row outside the enroller's scope?** Ruled as recommended on #4511 (2026-11-27): a live row of someone else gets the enroller a row of
   their own, which is case 2 of #4479 fixed; a removed row stays 409 `REMOVED_TUNNEL_CLIENT`, as today, so a removal is
   still undone only by a device manager. The alternative, 409 for both, keeps case 2 for every client whose legacy hash
   collides.
-- **D5, how long does the server read the legacy hash?** Recommended: no end date in this FR. Enrolling again is done
+- **D5, how long does the server read the legacy hash?** Ruled as recommended on #4511 (2026-11-27): no end date in this FR. Enrolling again is done
   by hand and rarely, so a window of one release would miss most clients, and each one it missed would get a second
   row. The P1 switch turns the reading off, and R3, read again later, decides whether a later FR ends it.
-- **D6, where is the id kept?** Recommended: in a file of its own beside `config.toml` (§ Where the id is kept). The
+- **D6, where is the id kept?** Open, and P2's to rule. Recommended: in a file of its own beside `config.toml` (§ Where the id is kept). The
   alternative, a key in `config.toml` that writers keep from now on, is lost to the first older binary that renews the
   token.
 
