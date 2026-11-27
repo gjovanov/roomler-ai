@@ -1619,9 +1619,9 @@ mod failed_mint_tests {
         cfg
     }
 
-    fn services_on(path: &PathBuf) -> RemoteConfigServices {
+    fn services_on(path: &std::path::Path) -> RemoteConfigServices {
         RemoteConfigServices::new(
-            path.clone(),
+            path.to_path_buf(),
             Arc::new(tokio::sync::Mutex::new(())),
             false,
             true,
