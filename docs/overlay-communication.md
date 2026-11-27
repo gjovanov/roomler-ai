@@ -110,7 +110,7 @@ numbers. On `rc:overlay.join` the server looks the machine up by
   capability vector, the warm relay. So a node that joins again mid-session
   (a control-WS Reattach, or an exit whose setup changed its offer, #3562)
   follows the join with what it wiped (`rejoin_plan`,
-  `crates/tunnel-core/src/overlay/runtime.rs:4682`), and an exit's re-offer
+  `crates/tunnel-core/src/overlay/runtime.rs:4684`), and an exit's re-offer
   reaches the admin row and every peer at once
   ([`overlay-exit-nodes.md`](./overlay-exit-nodes.md#the-offer-follows-the-setup-3562)).
 - **no live node** → `allocate_host` pops the head of `free_hosts` (FIFO, so an
@@ -219,7 +219,7 @@ WireGuard device, the TUN and every carrier running, one runtime per tenant
 re-attaches it (`OverlayEvent::Reattach`, `:275`) instead of starting another,
 the runtime joins again, and the full netmap the server answers that join with
 is the reconcile: whatever the runtime still holds that the netmap no longer
-lists is pruned (`crates/tunnel-core/src/overlay/runtime.rs:4221`). What the
+lists is pruned (`crates/tunnel-core/src/overlay/runtime.rs:4223`). What the
 device's own peer list says in between is in
 [§8](#the-peer-list-while-the-control-socket-is-down-4367).
 
@@ -617,7 +617,7 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2224`](../crates/tunnel-core/src/overlay/runtime.rs#L2224),
+  ([`runtime.rs:2230`](../crates/tunnel-core/src/overlay/runtime.rs#L2230),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
