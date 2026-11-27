@@ -1009,10 +1009,13 @@ flowchart TD
     CAP --> DIMS["inline plan_dims → plan_target"]
     DIMS -. "check_dims(dims, inputs)" .-> CNT
     DIMS -. "inputs moved since the snapshot" .-> APART["counted apart<br/>plan_lags · plan_stale_swaps · plan_stale_ticks"]
-    DIMS --> BUILD["inline open at the plan's target, the controller ticked first (M3a.4)<br/>or an adopted replacement · note_built(rate, dims)"]
-    BUILD --> TICK["governor.pre_encode_tick"]
-    TICK -. "after_tick(target, ceiling): republish bitrate, judge the build" .-> CNT
-    TICK -. "a replacement re-rated within the ceiling on its first tick" .-> APART
+    TOP -. "a dims swap adopted: its dims judged now, against the plan it was decided under (M3a.5)" .-> CNT
+    DIMS --> BUILD["inline open at the plan's target, the controller ticked first (M3a.4)<br/>note_built(open, dims): its dims judged now (M3a.5)"]
+    BUILD --> DROP{"a drop gate ends the pass?<br/>the drain · the decode-pressure skip"}
+    DROP -->|"yes: the build's rate waits for a pass that encodes"| TOP
+    DROP -->|no| TICK["governor.pre_encode_tick"]
+    TICK -. "after_tick(target, ceiling): republish bitrate, judge the rate of an encoder on its first frame" .-> CNT
+    TICK -. "a build re-rated within the ceiling since its rate was decided" .-> APART
     TICK --> OUT["encode → send → heartbeat<br/>plan_divergences · plan_epoch · plan_lags · plan_stale_*"]
 ```
 
@@ -1022,8 +1025,8 @@ flowchart TD
 | `queue_hard_budget_bytes` | FR-74 P1b — the larger of the soft budget and the encoder's HRD reservoir; equal to the soft budget on a relay | the pump's `hard_budget` |
 | `queue_lag_bound_ms` | the measured-wait bound that qualifies the soft budget; **0 = bytes alone trip it** (the relay's rule), which is what lets `direct_gate_trips` serve both transports | the bound the gate used |
 | `fps` | the pace in force, else the target — the loop paces itself only below the target (rc.93) | `paced_fps.unwrap_or(target_fps)` |
-| `dims` | `plan_dims` reduced by the resampler's rule; `(0, 0)` before the first frame | `target_dims(native, plan_target)` each frame, and the dims of every encoder the loop builds |
-| `bitrate_bps` | the governor's standing target on the ladder — the one input that is itself a decision (the controller is M4's) | the rate of every encoder the loop builds by itself (the inline open, an adopted replacement), judged after the controller's next tick |
+| `dims` | `plan_dims` reduced by the resampler's rule; `(0, 0)` before the first frame | `target_dims(native, plan_target)` each frame, and the dims of every encoder the loop builds: an inline open's in its own pass, a dims swap's at its adoption (M3a.5) |
+| `bitrate_bps` | the governor's standing target on the ladder — the one input that is itself a decision (the controller is M4's) | the rate of every encoder the loop builds by itself (the inline open, an adopted replacement), judged at the controller's tick on the first pass that encodes a frame with it (M3a.5) |
 | `epoch` | moves when any other field moves | — (`plan_epoch` on the heartbeat counts distinct plans) |
 
 What stays with the loop as a **fact**, deliberately: the bytes in flight, the
@@ -1055,12 +1058,14 @@ in the plan, and each logs its first occurrence once:
 |---|---|---|
 | `plan_lags` | a geometry difference whose INPUTS moved between the plan's snapshot and the inline read: a native-dims change under a live session (a display-mode switch), a resolution or Priority write landing in between, a viewer joining a shared pipeline, a refine flip or a soft-cap move. The log line names the input that moved (`moved="native"`, `"target"`, `"priority_cap"`, …) | FR-70 M3a.3 |
 | `plan_stale_swaps` | a replacement adopted after the plan moved while it opened | FR-70 M3a.1 |
-| `plan_stale_ticks` | a replacement adopted while the plan held, whose rate the controller moved on its very next tick within the frame's ceiling (a congestion decrease, often set off by the replacement's own IDR) | FR-70 M3a.3 |
+| `plan_stale_ticks` | a replacement adopted while the plan held, whose rate the controller moved on its very next tick within the frame's ceiling (a congestion decrease, often set off by the replacement's own IDR); and an inline open that consulted the controller, whose pass dropped its frame and whose first frame's tick then moved within the ceiling (`kind="open-first-tick"`) | FR-70 M3a.3, M3a.5 |
 
 The gate reads `plan_divergences` alone. A geometry divergence there had its
 inputs hold, and a bitrate divergence is an encoder built at a rate the plan
-did not stand behind: an inline open re-rated on its first tick, a replacement
-built above its frame's ceiling, or one re-rated on a tick that did not move.
+did not stand behind: the session's first open re-rated on its first tick, a
+build above its frame's ceiling, or one re-rated on a tick that did not move.
+A count only adds, so one event reads on every heartbeat after it: read a
+non-zero field from its first line, not from its heartbeats.
 Each of those is a plan bug and blocks M3b. ⚠️ A `pipe_bps` TTL expiry between
 the two reads would still read as a budget divergence: no counter classifies
 the budget fields yet, and none has been seen.
@@ -1091,6 +1096,28 @@ adopted on a still screen, a backend that does not capture again (DXGI-direct
 captures again only on a cap lifted to none) encodes nothing for about 1.7 s
 and then opens at the old size, as before, which the shadow counts as a `dims`
 divergence. Design and anchors: FR-70 §"M3a.4".
+
+**Where each build is judged (FR-70 M3a.5).** The shadow judges each encoder
+the loop builds once, against the plan of its own moment. An inline open's
+dims are judged in its own pass (`Shadow::note_built`, `plan.rs:721`), under
+the lag rule above, and a dims swap's at its adoption, against the plan of the
+inputs M2 decided it from (`Shadow::note_dims_swap_adopted`, `plan.rs:842`):
+`Shadow::swap_spawn` (`plan.rs:820`) records that plan's geometry, not the
+snapshot's. Every build's rate is judged at the first tick of a pass that
+encodes a frame with it (`Shadow::after_tick`, `plan.rs:759`). A pass can end
+before its tick, at the drain or the decode-pressure skip, and the build's
+rate then waits for that frame. A move the controller made since the rate was
+decided, within the frame's ceiling, is a stale tick, for an inline open that
+consulted the controller as for a replacement, and every build replaces the
+record of the one before, a stale adoption too. The AC10 week read on
+2026-11-27 found the two shapes this closes, one event in each session: an
+NVENC open on a pass the decode-pressure skip dropped, judged on the next pass
+after an AIMD decrease, and a QSV session resizing in fit mode, whose swap was
+recorded at the snapshot's dims and adopted as stale, which left the replaced
+encoder's record to the next tick. The cells are
+`a_native_move_through_the_capture_fallback_and_back_reads_zero_at_every_pass`
+and `a_viewer_resizing_in_fit_mode_reads_zero_at_every_pass`, in
+`encode::plan::tests`. Design and anchors: FR-70 §"M3a.5".
 
 ⚠️ **No kill switch, on purpose.** The shadow changes no decision, takes no
 await, adds no env read to the frame path (every knob is resolved once per pump
