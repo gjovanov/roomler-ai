@@ -8231,6 +8231,168 @@ mod tests {
         panic!("packet did not traverse the runtime in time");
     }
 
+    /// #3359 — the footprint is known before the address exists. A runtime
+    /// records its org's blocks when the netmap that names them arrives, BEFORE
+    /// it calls the TUN factory that gives the adapter its overlay address, so
+    /// a remote-desktop session that must stay off the mesh never meets that
+    /// address with its block unrecorded, however early it was requested.
+    /// That holds for the first runtime, a secondary org's, and a runtime
+    /// rebuilt after the first exited on a re-join that changed its network;
+    /// and a later full netmap that names a block the org has grown records
+    /// that block too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_runtime_records_its_blocks_before_it_calls_the_tun_factory() {
+        // Process-global: asserts only on blocks this test owns.
+        struct NoLinks;
+        #[async_trait]
+        impl LinkFactory for NoLinks {
+            async fn build_carrier(&self, _peer: &PeerConfig) -> Option<Arc<Carrier>> {
+                None
+            }
+        }
+        fn org(cidr: &str, cidrs: &[&str]) -> OverlayNetworkInfo {
+            OverlayNetworkInfo {
+                cidr: cidr.into(),
+                cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
+                ..net()
+            }
+        }
+        fn block(cidr: &str) -> (Ipv4Addr, u8) {
+            let (addr, plen) = cidr.split_once('/').unwrap();
+            (addr.parse().unwrap(), plen.parse().unwrap())
+        }
+        type Blocks = Vec<(Ipv4Addr, u8)>;
+        /// One runtime driven to its TUN: what the footprint held at the
+        /// moment its factory was called, and the runtime, still running.
+        struct Up {
+            at_factory: Blocks,
+            events: mpsc::Sender<OverlayEvent>,
+            task: tokio::task::JoinHandle<()>,
+            _out: mpsc::Receiver<ClientMsg>,
+            _tun: (
+                mpsc::UnboundedSender<Vec<u8>>,
+                mpsc::UnboundedReceiver<Vec<u8>>,
+            ),
+        }
+        async fn up(primary: bool, self_ip: &str, network: OverlayNetworkInfo) -> Up {
+            let seen: Arc<std::sync::Mutex<Option<Blocks>>> = Arc::default();
+            let (mock, inject, delivered) = MockTun::new();
+            let tf: TunFactory = {
+                let seen = seen.clone();
+                Box::new(move |_, _, _| {
+                    *seen.lock().unwrap() = Some(crate::overlay_footprint::v4_nets());
+                    Ok(mock.clone() as Arc<dyn TunIo>)
+                })
+            };
+            let (out, mut out_rx) = mpsc::channel::<ClientMsg>(16);
+            let (events, events_rx) = mpsc::channel::<OverlayEvent>(16);
+            let rt = OverlayRuntime::new(WgKeypair::generate(), out, Arc::new(NoLinks), tf, 1280)
+                .with_org_primary(primary);
+            let task = tokio::spawn(rt.run(events_rx, vec![]));
+            assert!(matches!(
+                out_rx.recv().await,
+                Some(ClientMsg::OverlayJoin { .. })
+            ));
+            events
+                .send(OverlayEvent::Netmap {
+                    self_ip: self_ip.into(),
+                    network,
+                    peers: vec![],
+                })
+                .await
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(at_factory) = seen.lock().unwrap().clone() {
+                    return Up {
+                        at_factory,
+                        events,
+                        task,
+                        _out: out_rx,
+                        _tun: (inject, delivered),
+                    };
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the runtime never called its TUN factory"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        // The first runtime: a server that names one block (`cidr` only).
+        let first = up(true, "100.69.4.2", org("100.69.4.0/22", &[])).await;
+        assert!(
+            first.at_factory.contains(&block("100.69.4.0/22")),
+            "the first runtime called its TUN factory before recording its block: {:?}",
+            first.at_factory
+        );
+
+        // A secondary org's runtime, its org two blocks.
+        let second = up(
+            false,
+            "100.69.8.5",
+            org("100.69.8.0/22", &["100.69.8.0/22", "100.69.12.0/22"]),
+        )
+        .await;
+        for b in ["100.69.8.0/22", "100.69.12.0/22"] {
+            assert!(
+                second.at_factory.contains(&block(b)),
+                "the secondary org's runtime called its TUN factory before recording {b}: {:?}",
+                second.at_factory
+            );
+        }
+
+        // A full netmap that names a block the org has grown, same identity:
+        // the runtime keeps running and records the new block.
+        second
+            .events
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.69.8.5".into(),
+                network: org(
+                    "100.69.8.0/22",
+                    &["100.69.8.0/22", "100.69.12.0/22", "100.69.20.0/22"],
+                ),
+                peers: vec![],
+            })
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !crate::overlay_footprint::v4_nets().contains(&block("100.69.20.0/22")) {
+            assert!(
+                Instant::now() < deadline,
+                "a full netmap that names a grown block never recorded it"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Rebuilt: a re-join whose network changed ends the first runtime (the
+        // agent then starts a fresh one), and the fresh runtime records the
+        // new block before its TUN exists.
+        first
+            .events
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.69.16.3".into(),
+                network: org("100.69.16.0/22", &[]),
+                peers: vec![],
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), first.task)
+            .await
+            .expect("a re-join with another network ends the runtime")
+            .unwrap();
+        let rebuilt = up(true, "100.69.16.3", org("100.69.16.0/22", &[])).await;
+        assert!(
+            rebuilt.at_factory.contains(&block("100.69.16.0/22")),
+            "the rebuilt runtime called its TUN factory before recording its block: {:?}",
+            rebuilt.at_factory
+        );
+
+        second.task.abort();
+        rebuilt.task.abort();
+    }
+
     /// rc.307 (B) — the reattach flow end to end: a runtime whose control-WS
     /// died gets a `Reattach` from the next session, re-JOINS on the new
     /// sender, reconciles the re-join's full netmap against LIVE state

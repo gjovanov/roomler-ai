@@ -813,6 +813,34 @@ fn url_host_ip(url: &str) -> Option<IpAddr> {
     host.parse().ok()
 }
 
+/// #3359 — what each of a session's four filters does with `addr`, in order:
+/// a host candidate on it ([`RcOverlay::keeps_local`]), a trickled remote
+/// candidate ([`RcOverlay::keeps_remote_candidate`]), a candidate in the offer
+/// ([`RcOverlay::strip_sdp`]) and a TURN server on it
+/// ([`RcOverlay::ice_servers`]). `true` where the filter lets it through.
+#[cfg(test)]
+pub(crate) fn four_filters(p: &RcOverlay, addr: &str) -> [bool; 4] {
+    let ip: IpAddr = addr.parse().expect("an address");
+    let candidate = format!("candidate:1 1 udp 2122260223 {addr} 54321 typ host");
+    let sdp = format!("v=0\r\na={candidate}\r\na=end-of-candidates\r\n");
+    let turn = if ip.is_ipv6() {
+        format!("turn:[{addr}]:47989")
+    } else {
+        format!("turn:{addr}:47989")
+    };
+    let servers = [IceServer {
+        urls: vec![turn],
+        username: Some("u".into()),
+        credential: Some("c".into()),
+    }];
+    [
+        p.keeps_local(ip),
+        p.keeps_remote_candidate(&candidate),
+        p.strip_sdp(&sdp).contains(addr),
+        !p.ice_servers(&servers).is_empty(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,6 +1249,77 @@ mod tests {
                 )
                 .await;
             assert_eq!(d, p);
+        }
+    }
+
+    // ---- #3359: the footprint as it stands, not as it was requested ----
+
+    /// #3359 — a session requested while the daemon starts is resolved before
+    /// any block is recorded, so its own copy is empty for its whole life. The
+    /// device's block is then recorded before the host candidates are
+    /// gathered, and from that moment every filter keeps the overlay address
+    /// out. A 100.64/10 address in no recorded block (an LTE modem, another
+    /// mesh) still passes all four: the rule never widens to the CGNAT `/10`.
+    #[test]
+    fn a_session_resolved_before_its_blocks_keeps_the_overlay_out_once_they_are_recorded() {
+        // Process-global: asserts only on a block this test owns.
+        let session = RcOverlay::resolve_ranked(false, None, RankMode::Off, Vec::new());
+        assert!(session.v4_nets.is_empty(), "resolved before any block");
+        footprint::note_v4_blocks(&[(Ipv4Addr::new(100, 72, 4, 0), 22)]);
+        assert_eq!(
+            four_filters(&session, "100.72.4.34"),
+            [false; 4],
+            "the device's overlay address, in keeps_local, keeps_remote_candidate, strip_sdp and ice_servers"
+        );
+        for not_ours in ["100.73.9.9", "100.80.1.2", "192.168.1.20"] {
+            assert_eq!(
+                four_filters(&session, not_ours),
+                [true; 4],
+                "{not_ours} is in no recorded block"
+            );
+        }
+    }
+
+    /// #3359 — `auto`, decided "stays off the mesh" at its offer, filters the
+    /// way `off` does: by the footprint as it stands when an address is
+    /// judged, whatever its copy held when it was requested.
+    #[tokio::test]
+    async fn an_auto_session_that_stays_off_filters_as_off_does() {
+        // Process-global: asserts only on a block this test owns.
+        let hints = RcOverlayAutoWire {
+            viewers: vec!["100.65.4.33".into()],
+            far_turn: Some(true),
+        };
+        let requested = RcOverlay::resolve_ranked(false, Some(&hints), RankMode::Off, Vec::new());
+        assert!(requested.auto && !requested.allow && requested.v4_nets.is_empty());
+        // A relayed mesh while the far TURN answers over UDP: the session
+        // stays off the mesh (FR-128 §3.1).
+        let stays_off = requested
+            .decide_with(
+                "s",
+                |_| async { vec![MeshCarrier::Relayed] },
+                || async { Some(true) },
+            )
+            .await;
+        assert!(stays_off.auto && !stays_off.allow, "{stays_off:?}");
+        footprint::note_v4_blocks(&[(Ipv4Addr::new(100, 72, 8, 0), 22)]);
+        assert_eq!(
+            four_filters(&stays_off, "100.72.8.21"),
+            [false; 4],
+            "the device's overlay address, in each of the four"
+        );
+        let off = RcOverlay::resolve_ranked(false, None, RankMode::Off, Vec::new());
+        for addr in [
+            "100.72.8.21",
+            "fd72:6f6f:6d6c::6448:815",
+            "100.73.9.9",
+            "192.168.1.20",
+        ] {
+            assert_eq!(
+                four_filters(&stays_off, addr),
+                four_filters(&off, addr),
+                "{addr}"
+            );
         }
     }
 
