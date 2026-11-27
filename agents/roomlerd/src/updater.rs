@@ -243,10 +243,22 @@ pub fn record_update_attempt() -> bool {
     let Some(p) = update_attempt_marker_path() else {
         return false;
     };
+    let stamp = format!("{}\n", chrono::Utc::now().to_rfc3339());
+    // FR-145 P2 — in a process that holds its `service-logs`, by handle.
+    #[cfg(windows)]
+    if let Some((held, name)) = crate::logging::held_logs::held_file(&p) {
+        return match held.write_file(name, stamp.as_bytes()) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+                false
+            }
+        };
+    }
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+    match std::fs::write(&p, stamp) {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
@@ -9498,6 +9510,35 @@ mod tests {
             );
             assert!(!is_transport_failure(&e), "not even attempted: {text}");
         }
+    }
+
+    /// FR-145 P2 (AC3) — a process that holds its `service-logs` writes the
+    /// update-attempt marker there by handle. With the folder swapped for a
+    /// junction, it lands in a sealed `service-logs` made again and nothing
+    /// where the junction leads, and the cooldown reads it. At its seam it goes
+    /// by path. In a child, elevated.
+    #[cfg(windows)]
+    #[test]
+    fn the_update_attempt_marker_goes_by_handle_below_the_held_folder() {
+        use roomler_node_core::logging::held_logs::test_fixture::{
+            CHECKED, Case, child, parent, swap_for_junction,
+        };
+        let Some(Case { dir, elsewhere, .. }) = child(true) else {
+            let root = tempfile::tempdir().unwrap();
+            let case = "the_update_attempt_marker_goes_by_handle_below_the_held_folder";
+            return parent(module_path!(), case, root.path());
+        };
+        swap_for_junction(&dir, &elsewhere);
+        assert!(super::record_update_attempt(), "the marker is written");
+        assert!(
+            std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "the marker went where the junction leads"
+        );
+        assert!(dir.join("update-attempt").is_file());
+        assert!(super::recent_update_attempt(
+            std::time::Duration::from_secs(60)
+        ));
+        println!("{CHECKED}");
     }
 }
 // RETIRED-NAME-ANCHOR-END
