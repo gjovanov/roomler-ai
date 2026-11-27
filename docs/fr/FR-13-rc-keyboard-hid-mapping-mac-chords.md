@@ -20,9 +20,9 @@ The viewer maps `KeyboardEvent.code` → USB-HID usage
 (`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:14862` — (2026-11-24)
 `CapsLock → 0x39` is **correct**, locked by
 `useRemoteControl.spec.ts:329`). The agent maps HID → enigo `Key` in
-`hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:457-538`) —
+`hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:537-618`) —
 which has **no arm for 0x39**, so the caller falls through
-(`enigo_backend.rs:174-182`) to:
+(`enigo_backend.rs:228-236`) to:
 
 ```rust
 enigo.key(Key::Other(code), direction)

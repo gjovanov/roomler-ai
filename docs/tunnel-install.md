@@ -231,7 +231,7 @@ roomler enroll `
 This writes the long-lived `TunnelClient` JWT to:
 
 - Windows: `%APPDATA%\roomler\roomler-tunnel\config.toml`
-- Linux: `~/.config/roomler-tunnel/config.toml`
+- Linux: `~/.config/roomler-tunnel/config.toml`, beneath `$XDG_CONFIG_HOME` where that names an absolute folder; a root command's is root's own, beneath `/root`, whatever `HOME` it was given (#3866)
 - macOS: `~/Library/Application Support/roomler-tunnel/config.toml`
 
 Verify on the **Devices** page, with the kind filter on **Tunnels**, that the row appears.

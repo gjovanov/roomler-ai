@@ -489,9 +489,14 @@ mod x11 {
         }
     }
 
+    /// The restore guard's file, in this account's runtime folder. #3866: on
+    /// Linux that is its own runtime folder (`appdirs::own_folders`), a
+    /// person's `$XDG_RUNTIME_DIR` where it names an absolute folder. A root
+    /// process has none, whatever it was started with, so it keeps no guard
+    /// and makes no switch.
     fn guard_path() -> Option<PathBuf> {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
-        Some(PathBuf::from(dir).join("roomler-display-match.json"))
+        let dir = roomler_node_core::appdirs::own_folders()?.runtime?;
+        Some(dir.join("roomler-display-match.json"))
     }
 
     fn outputs() -> Result<Vec<XOutput>, ApplyError> {

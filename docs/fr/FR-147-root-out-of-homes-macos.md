@@ -97,7 +97,7 @@ the rest, and P2 for the folder a root step made before.
 
 Notation: `<H>` is a person's home (`pw_dir`); `<F>` their roomler folder,
 `<H>/Library/Application Support/live.roomler.roomler` (the pre-rename segment on a Mac that has only that one,
-`appdirs.rs:201`); `<L>` is `<H>/Library/LaunchAgents`; `<P>` is `<L>/com.roomler.agent.plist`.
+`appdirs.rs:401`); `<L>` is `<H>/Library/LaunchAgents`; `<P>` is `<L>/com.roomler.agent.plist`.
 
 ### The rule
 
@@ -116,7 +116,7 @@ working two-row.
 
 | Step | Root (`sudo roomlerd one-row`, `migrate`, `one_row.rs:1833`; `revert_main`, `:3274`) | The person's child (`roomlerd one-row-home <verb>`, one per uid) |
 |---|---|---|
-| Read | lists `/Users` and `stat`s each entry for owner, device and inode (`scan_users`, `:3225`, with no `canonicalize`); reads the account, `appdirs::account_entry(uid)` (new beside `account_home`, `appdirs.rs:872`: `pw_name`, `pw_gid`, `pw_dir`), and its UUID; reads its own file and status as today | `read`: its home's identity; the owner, mode and kind of `<H>`, `<H>/Library`, `<L>` and `<F>`; its config and plist bytes; the names of any copies an older release kept |
+| Read | lists `/Users` and `stat`s each entry for owner, device and inode (`scan_users`, `:3225`, with no `canonicalize`); reads the account, `appdirs::account_entry(uid)` (new beside `account_home`, `appdirs.rs:1072`: `pw_name`, `pw_gid`, `pw_dir`), and its UUID; reads its own file and status as today | `read`: its home's identity; the owner, mode and kind of `<H>`, `<H>/Library`, `<L>` and `<F>`; its config and plist bytes; the names of any copies an older release kept |
 | Plan, `--dry-run` | `plan` stays pure (`one_row.rs:582`), over configs parsed from the child's bytes. `Person` (`:272`) keeps the uid, the gid, the name and the home as display text, with no `dir` and no path method | nothing |
 | Keep | writes root's records, in root's tree only | nothing: no `.pre-one-row` in a home |
 | LaunchAgent | `launchctl bootout gui/<uid>/com.roomler.agent`, by label, as before (`bootout_agent`, `:3733`) | the plist is removed by `convert` |
@@ -160,7 +160,7 @@ sequenceDiagram
 | Arguments | `one-row-home <verb> --uid <uid> --gid <pw_gid> --version <its version> [the verb's]` | the child checks itself against them |
 | Dispatch | read from the raw argv as the first statement of the binary's `main` (`agents/roomlerd/src/bin/roomlerd.rs:20`), before it calls `app::main` (`agents/roomlerd/src/app.rs:1293`, `:1378`) and so before `answer_stall_watch_cost` (`:1294`, `:1392`), any runtime and AppKit (`:1309-1347`). Synchronous: no tokio, no `logging::init` (`:1635`), no legacy-tree migration (`:1596`) | the Mac build's `main` is the AppKit one (`release-agent.yml:2915` builds `viewer-indicator-macos`), and the child starts no daemon, no log file and no window. Its stderr is its log |
 | Credentials | set by our own `pre_exec` hook, not by `Command::uid` and `Command::gid` | std empties the group list, and macOS turns an empty list into `[0]`: the child would keep group 0 |
-| Environment | `env_clear()` | the child reads no `HOME` and no knob. Its home is `appdirs::own_home()` (`appdirs.rs:862`), the account database's home for its own uid |
+| Environment | `env_clear()` | the child reads no `HOME` and no knob. Its home is `appdirs::own_home()` (`appdirs.rs:1062`), the account database's home for its own uid |
 | Working directory | `/` | a folder of root's, whatever the caller's was |
 | Descriptors | the three pipes only (`tunnel_core::child::inherit_only_stdio`, `crates/tunnel-core/src/child.rs:450-462`) | the child holds none of root's open files |
 | Session, umask | `setsid()`, `umask(0o077)` | no controlling terminal; files born private |
@@ -625,9 +625,9 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 
 | Where | What | Kind |
 |---|---|---|
-| `crates/agent-core/src/logging.rs:228-239`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:136-162`) |
-| `agents/roomlerd/src/instance_lock.rs:353-361` | the lock's path from `BaseDirs`, which reads `$HOME` (`:354-355`); reached by `run`. Typed by hand as `sudo roomlerd run`, the daemon takes its lock under the CALLER's `~/Library/Caches`. That is not the file the launchd daemon holds for the same config (`/var/root/Library/Caches`; the name is a hash of the config path, `lock_id`, `:108-112`, held by `flock`, `unix_acquire`, `:317-349`), so the second daemon is not refused as a second instance | write |
-| `agents/roomlerd/src/service.rs:2800-2832` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2830-2832`): typed as `sudo roomlerd service install` (or `uninstall`), a root-owned `<L>` and plist in the caller's home, the #3763 state | write |
+| `crates/agent-core/src/logging.rs:228-239`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:326-360`) |
+| `agents/roomlerd/src/instance_lock.rs:393-409` | the lock's path from `BaseDirs`, which reads `$HOME` (`:402-403`); reached by `run`. Typed by hand as `sudo roomlerd run`, the daemon takes its lock under the CALLER's `~/Library/Caches`. That is not the file the launchd daemon holds for the same config (`/var/root/Library/Caches`; the name is a hash of the config path, `lock_id`, `:108-112`, held by `flock`, `unix_acquire`, `:317-385`), so the second daemon is not refused as a second instance | write |
+| `agents/roomlerd/src/service.rs:2805-2837` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2835-2837`): typed as `sudo roomlerd service install` (or `uninstall`), a root-owned `<L>` and plist in the caller's home, the #3763 state | write |
 | `scripts/install.sh:2061-2082` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1616-1624`) | remove |
 | `scripts/install.sh:2095-2102` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1664`) as root | remove |
 | `scripts/install.sh:1115` | `as_root grep` of the console person's `config.toml` | read |
@@ -636,10 +636,10 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `macos_supervisor.rs:1199-1206` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
 | `agents/roomlerd/src/files.rs:220-235` (`process_home`) | `BaseDirs`, from `$HOME`: typed as `sudo roomlerd run`, the daemon's active home is the caller's, not root's `/var/root` | read |
 | `agents/roomlerd/src/files.rs:5492-5502` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
-| `agents/roomlerd/src/recording/folder.rs:160-164` (`default_choice`) | `BaseDirs` and `UserDirs`, from `$HOME`: typed as `sudo roomlerd record` (a hidden command, `app.rs:528-529`), it names the caller's Movies folder and makes it when missing (`create_dir_all`, `:250`) | write |
-| `agents/roomler-cli/src/config.rs:83-90` (`default_config_path`) | `ProjectDirs`, from `$HOME`: `sudo roomler enroll`, `forward` and `socks5` without `--config` (and without `--daemon`) run as root and read AND SAVE the caller's tunnel config, `config.toml` in the tunnel CLI's own config folder in the caller's home (the roomler CLI's `default_config_path` defines that path, `agents/roomler-cli/src/config.rs:83-90`; `enroll`: `cli.rs:1220`; `forward` and `socks5` renew a token that is due, `cli.rs:910-912`, `:928-930`, through `save_renewed_token`, `credential.rs:135`, `config.rs:198`). Not established: whether that save leaves the person's file owned by root | write |
+| `agents/roomlerd/src/recording/folder.rs:160-179` (`default_choice`) | `BaseDirs` and `UserDirs`, from `$HOME`: typed as `sudo roomlerd record` (a hidden command, `app.rs:528-529`), it names the caller's Movies folder and makes it when missing (`create_dir_all`, `:265`) | write |
+| `agents/roomler-cli/src/config.rs:87-100` (`default_config_path`) | `ProjectDirs`, from `$HOME`: `sudo roomler enroll`, `forward` and `socks5` without `--config` (and without `--daemon`) run as root and read AND SAVE the caller's tunnel config, `config.toml` in the tunnel CLI's own config folder in the caller's home (the roomler CLI's `default_config_path` defines that path, `agents/roomler-cli/src/config.rs:87-100`; `enroll`: `cli.rs:1220`; `forward` and `socks5` renew a token that is due, `cli.rs:910-912`, `:928-930`, through `save_renewed_token`, `credential.rs:135`, `config.rs:208`). Not established: whether that save leaves the person's file owned by root | write |
 
-The source gate (`crates/agent-core/src/folder_gate.rs:291-357`) holds six of these reads as tracked by this FR on
+The source gate (`crates/agent-core/src/folder_gate.rs:279-345`) holds six of these reads as tracked by this FR on
 macOS builds: `process_home`, `default_download_dir`, `unix_lock_path`, `plist_path`, the `roomler` CLI's
 `default_config_path` and `default_choice`. Each is entered by a command typed with `sudo`, which on macOS keeps the
 caller's `HOME`. AC10 asks that none is left. Of the reads an earlier row of this table left undetermined,
@@ -759,7 +759,7 @@ The docs:
 - [ ] **AC9** — Docs updated in house style (tables, the conversion as a mermaid sequence, `file:line` anchors):
   `docs/installation.md`'s three sections above, FR-43's P3c row and the module docs, linked from `docs/README.md`.
 - [ ] **AC10** (the source gate): no row of the source gate (`crates/agent-core/src/folder_gate.rs`) that is tracked
-  by this FR is left. Today six rows name #3834 on macOS builds (`folder_gate.rs:291-357`), each in P3's table with
+  by this FR is left. Today six rows name #3834 on macOS builds (`folder_gate.rs:279-345`), each in P3's table with
   its entry point.
 
 ## Open decisions

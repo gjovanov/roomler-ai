@@ -158,7 +158,22 @@ pub fn sandboxed(e: &anyhow::Error) -> Option<&'static str> {
 }
 
 fn default_choice() -> FolderChoice {
+    // #3866: on Linux the home and the Videos folder are this account's own
+    // (`appdirs::own_folders`): root's own beneath `/root` for a root
+    // command, whatever `HOME` it was given, and for a person what
+    // `directories` names.
+    #[cfg(target_os = "linux")]
+    let (home, videos) = match roomler_node_core::appdirs::own_folders() {
+        Some(own) => {
+            let videos =
+                roomler_node_core::appdirs::videos_dir(&own, |file| std::fs::read(file).ok());
+            (Some(own.home), videos)
+        }
+        None => (None, None),
+    };
+    #[cfg(not(target_os = "linux"))]
     let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    #[cfg(not(target_os = "linux"))]
     let videos = directories::UserDirs::new().and_then(|u| u.video_dir().map(Path::to_path_buf));
     let preferred = videos.map(|v| v.join("Roomler"));
     let alt = home.as_ref().map(|h| h.join("Roomler Recordings"));
