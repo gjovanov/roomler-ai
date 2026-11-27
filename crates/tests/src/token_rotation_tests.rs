@@ -12,11 +12,15 @@
 //! - both switches; and one audit row per decision, with the caller's
 //!   address and the generations.
 //!
+//! P1b and P1c: the device's agent sockets below the new generation end on
+//! every pod, and a registration admits only the device's current
+//! generation.
+//!
 //! Every server here starts with `rc.agent_token_rotation` on (its default is
 //! off until the phase that completes the server's half), except where a
 //! cell is about the switch.
 
-use crate::agent_presence_tests::connect_agent;
+use crate::agent_presence_tests::{connect_agent, open_agent_socket, say_hello};
 use crate::agent_removal_tests::{Heard, listen, still_served, wait_registered};
 use crate::fixtures::test_app::TestApp;
 use crate::token_renewal_tests::{enroll, forge_agent_token, renew, self_devices, upgrade_status};
@@ -823,5 +827,207 @@ async fn a_rotation_switched_off_ends_no_connection() {
     assert!(
         still_served(&mut socket).await,
         "nothing reached the second pod"
+    );
+}
+
+/// How often the pods of T17 and T18 run their generation check
+/// (`rc.presence_sweep_secs`, which is never under 5 s).
+const CHECK_SECS: u64 = 5;
+
+/// A pod over `db` with the rotation on and no Redis: the control event of a
+/// rotation it commits reaches no other pod. Its own check never runs within
+/// a cell.
+async fn spawn_without_redis(db: &str) -> TestApp {
+    spawn_sharing(db, "unheard", |s| {
+        s.rc.agent_token_rotation = true;
+        s.redis.url = String::new();
+        s.rc.presence_sweep_secs = 3600;
+    })
+    .await
+}
+
+/// The generation of an agent token, as the hub holds it.
+fn generation_of(token: &str) -> u32 {
+    u32::try_from(token_generation(token)).expect("a generation the hub holds")
+}
+
+/// Wait until the device has no entry on `app`'s pod.
+async fn wait_unregistered(app: &TestApp, agent: ObjectId) {
+    for _ in 0..100 {
+        if !app.state.fleet().rc_hub.is_agent_online(agent) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the device's entry never left its pod");
+}
+
+/// The socket was refused at its hello: it closed with no goodbye.
+fn assert_refused(heard: Heard, place: &str) {
+    match heard {
+        Heard::Closed => {}
+        other => panic!(
+            "{place}: a registration admits only the device's current generation, so a \
+             socket of the generation before is refused at its hello; heard {other:?}"
+        ),
+    }
+}
+
+/// T15 (P1c): a registration admits only the device's current generation,
+/// whatever the time from its upgrade to its hello. Two sockets are upgraded
+/// at G, then the token rotates to G+1 on a pod without Redis, so the only
+/// floor this pod keeps is the one the cell sets, for 1 s
+/// (`end_below_generation_for`). After that floor ended, each socket's hello
+/// is refused: the first with a socket of G+1 registered, which stays served
+/// and hears no goodbye, and the second with none, leaving no entry.
+#[tokio::test]
+async fn a_registration_admits_only_the_current_generation() {
+    let db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
+    // No round of this pod's own check runs within the cell: what refuses
+    // here is the registration.
+    let here = spawn_sharing(&db, "here", |s| {
+        s.rc.agent_token_rotation = true;
+        s.rc.presence_sweep_secs = 3600;
+    })
+    .await;
+    let rotating = spawn_without_redis(&db).await;
+    let seeded = here.seed_tenant("fr155hello").await;
+    let (agent_id, old) = enroll(&here, &seeded, "m-fr155-hello").await;
+    let (agent, tenant) = (oid(&agent_id), oid(&seeded.tenant_id));
+    let hub = &here.state.fleet().rc_hub;
+
+    let mut first = open_agent_socket(&here, &old).await;
+    let mut second = open_agent_socket(&here, &old).await;
+    let new = answered_token(rotate(&rotating, &old, &rotation_key(130)).await).await;
+    assert!(
+        !hub.end_below_generation_for(agent, tenant, generation_of(&new), Duration::from_secs(1)),
+        "no entry to end yet"
+    );
+    let mut current = connect_agent(&here, &new).await;
+    wait_registered(&here, &agent_id).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    say_hello(&mut first).await;
+    assert_refused(
+        listen(&mut first, Duration::from_secs(5)).await,
+        "with a socket of G+1 registered",
+    );
+    assert!(
+        still_served(&mut current).await,
+        "the socket of G+1 stays served and hears no goodbye"
+    );
+
+    current.close(None).await.expect("close the socket of G+1");
+    wait_unregistered(&here, agent).await;
+    say_hello(&mut second).await;
+    assert_refused(
+        listen(&mut second, Duration::from_secs(5)).await,
+        "with no socket registered",
+    );
+    assert!(
+        !hub.is_agent_online(agent),
+        "a refused registration leaves no entry"
+    );
+}
+
+/// T17 (P1c): every pod ends an entry below its row's generation within one
+/// period of its check (`rc.presence_sweep_secs`), also a pod that the
+/// rotation's control event does not reach. The socket registers at G on a
+/// pod with Redis, and the token rotates to G+1 on a pod without Redis, so
+/// its event reaches no other pod. The socket ends within one period and a
+/// margin for the check's read, and a socket of G+1 then stays served
+/// through two periods.
+#[tokio::test]
+async fn every_pod_ends_an_entry_below_its_rows_generation() {
+    let db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
+    let here = spawn_sharing(&db, "here", |s| {
+        s.rc.agent_token_rotation = true;
+        s.rc.presence_sweep_secs = CHECK_SECS;
+    })
+    .await;
+    let rotating = spawn_without_redis(&db).await;
+    let seeded = here.seed_tenant("fr155check").await;
+    let (agent_id, old) = enroll(&here, &seeded, "m-fr155-check").await;
+    let mut socket = connect_agent(&here, &old).await;
+    let agent = wait_registered(&here, &agent_id).await;
+
+    let new = answered_token(rotate(&rotating, &old, &rotation_key(140)).await).await;
+    match listen(&mut socket, Duration::from_secs(CHECK_SECS + 5)).await {
+        Heard::Closed => {}
+        other => panic!(
+            "every pod ends an entry below its row's generation within one period of its \
+             check, with no goodbye; heard {other:?}"
+        ),
+    }
+    assert!(
+        !here.state.fleet().rc_hub.is_agent_online(agent),
+        "out of the hub"
+    );
+
+    let mut current = connect_agent(&here, &new).await;
+    wait_registered(&here, &agent_id).await;
+    tokio::time::sleep(Duration::from_secs(2 * CHECK_SECS)).await;
+    assert!(
+        still_served(&mut current).await,
+        "an entry at the row's generation stays"
+    );
+}
+
+/// T18 (P1c, T14's extension): on a pod with `rc.agent_token_rotation` off,
+/// nothing that P1c adds runs, beside a rotation committed on a pod with it
+/// on (and without Redis, so nothing reaches this pod). In T15's setup the
+/// late hello registers as every registration did before P1c, and the
+/// registered socket hears what a newer registration has always sent it
+/// (`replaced_by_newer_connection`). In T17's setup the socket of G stays
+/// served through two of the check's periods.
+#[tokio::test]
+async fn a_pod_switched_off_ends_and_refuses_nothing_new() {
+    let db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
+    let off = spawn_sharing(&db, "off", |s| {
+        s.rc.agent_token_rotation = false;
+        s.rc.presence_sweep_secs = CHECK_SECS;
+    })
+    .await;
+    let rotating = spawn_without_redis(&db).await;
+    let seeded = off.seed_tenant("fr155offnew").await;
+    let tenant = oid(&seeded.tenant_id);
+
+    // T17's setup: a socket registered at G, then a rotation.
+    let (kept_id, kept_token) = enroll(&off, &seeded, "m-fr155-off-kept").await;
+    let mut kept = connect_agent(&off, &kept_token).await;
+    wait_registered(&off, &kept_id).await;
+    let _ = answered_token(rotate(&rotating, &kept_token, &rotation_key(150)).await).await;
+
+    // T15's setup: a socket upgraded at G, a rotation, this pod's floor for
+    // it ending within the cell, and a socket of G+1 registered.
+    let (late_id, late_token) = enroll(&off, &seeded, "m-fr155-off-late").await;
+    let mut late = open_agent_socket(&off, &late_token).await;
+    let new = answered_token(rotate(&rotating, &late_token, &rotation_key(151)).await).await;
+    off.state.fleet().rc_hub.end_below_generation_for(
+        oid(&late_id),
+        tenant,
+        generation_of(&new),
+        Duration::from_secs(1),
+    );
+    let mut current = connect_agent(&off, &new).await;
+    wait_registered(&off, &late_id).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    say_hello(&mut late).await;
+    match listen(&mut current, Duration::from_secs(5)).await {
+        Heard::Goodbye(v) => assert_eq!(v["reason"], "replaced_by_newer_connection", "{v}"),
+        other => {
+            panic!("with the switch off, the late hello registers as before P1c; heard {other:?}")
+        }
+    }
+    assert!(
+        still_served(&mut late).await,
+        "with the switch off, nothing refuses the late hello"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2 * CHECK_SECS)).await;
+    assert!(
+        still_served(&mut kept).await,
+        "with the switch off, no check ends the socket of G"
     );
 }

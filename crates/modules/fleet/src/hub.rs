@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -853,6 +853,9 @@ pub struct HubInner {
     /// FR-155 P1b — per (tenant, agent), the generation a rotation named and
     /// how long this pod refuses a registration below it (`hub::rotation`).
     floors: DashMap<(ObjectId, ObjectId), rotation::Floor>,
+    /// FR-155 P1c — whether this pod runs the token rotation, set once at
+    /// startup ([`Hub::set_token_rotation`]).
+    token_rotation: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -886,6 +889,7 @@ impl Hub {
                 session_slots: std::sync::OnceLock::new(),
                 slotted: DashMap::new(),
                 floors: DashMap::new(),
+                token_rotation: AtomicBool::new(false),
             }),
         }
     }
@@ -8359,6 +8363,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// FR-155 P1c, T16 — while the rotation is on, the entry of a higher
+    /// generation stays when one of a lower generation registers: that
+    /// registration is refused as one below the floor is, with the entry's
+    /// generation, and the entry, its cancel and its queue are untouched. At
+    /// the entry's generation or above, a registration replaces the entry as
+    /// before, and two at once leave the entry of the higher generation.
+    /// With the rotation off, the hub admits as before.
+    #[tokio::test]
+    async fn the_hub_keeps_the_entry_of_the_higher_generation() {
+        let hub = test_hub().await;
+        hub.set_token_rotation(true);
+        assert!(hub.token_rotation());
+        let tenant = ObjectId::new();
+        let register = |hub: &Hub, agent: ObjectId, generation: u32| {
+            hub.register_agent_resuming(
+                agent,
+                tenant,
+                ObjectId::new(),
+                OsKind::Linux,
+                2,
+                true,
+                false,
+                generation,
+                ResumeHello::default(),
+            )
+        };
+
+        let agent = ObjectId::new();
+        let mut kept = register(&hub, agent, 2).expect("no floor and no entry");
+        match register(&hub, agent, 1) {
+            Err(BelowFloor { floor }) => {
+                assert_eq!(floor, 2, "refused with the entry's generation")
+            }
+            Ok(_) => panic!(
+                "the entry of the higher generation stays, and a registration below it is refused"
+            ),
+        }
+        assert!(hub.is_agent_online(agent), "the entry stays");
+        assert_eq!(kept.cancel.reason(), None, "its cancel never fired");
+        assert!(kept.rx.try_recv().is_err(), "and it was sent nothing");
+
+        // At the entry's generation, and above it, a registration replaces
+        // the entry as before.
+        let same = register(&hub, agent, 2).expect("the entry's generation registers");
+        assert_eq!(kept.cancel.reason(), Some(CancelReason::Replaced));
+        let _above = register(&hub, agent, 3).expect("a higher generation registers");
+        assert_eq!(same.cancel.reason(), Some(CancelReason::Replaced));
+
+        // Two at once, many times: whichever runs first, the entry left is
+        // the higher generation's.
+        for _ in 0..500 {
+            let agent = ObjectId::new();
+            let gate = std::sync::Barrier::new(2);
+            let (lower, higher) = std::thread::scope(|s| {
+                let lower = s.spawn(|| {
+                    gate.wait();
+                    register(&hub, agent, 1)
+                });
+                let higher = s.spawn(|| {
+                    gate.wait();
+                    register(&hub, agent, 2)
+                });
+                (lower.join().unwrap(), higher.join().unwrap())
+            });
+            let higher = higher.expect("the higher generation registers in either order");
+            assert_eq!(
+                higher.cancel.reason(),
+                None,
+                "the entry left is the higher generation's"
+            );
+            match lower {
+                Ok(lower) => assert_eq!(lower.cancel.reason(), Some(CancelReason::Replaced)),
+                Err(BelowFloor { floor }) => assert_eq!(floor, 2),
+            }
+        }
+
+        // With the rotation off, the hub admits as before.
+        let off = test_hub().await;
+        assert!(!off.token_rotation(), "off until it is set");
+        let agent = ObjectId::new();
+        let first = register(&off, agent, 2).expect("no floor and no entry");
+        let _next =
+            register(&off, agent, 1).expect("with the rotation off, the hub admits as before");
+        assert_eq!(first.cancel.reason(), Some(CancelReason::Replaced));
     }
 
     /// FR-155 P1b — the control event a rotation on another pod sends: an

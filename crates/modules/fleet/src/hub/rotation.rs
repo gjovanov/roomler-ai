@@ -34,6 +34,7 @@
 //! reverse, and neither section awaits or touches `agents` again: a shard's
 //! lock is not reentrant.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
@@ -64,6 +65,18 @@ pub struct BelowFloor {
 }
 
 impl Hub {
+    /// FR-155 P1c — whether this pod runs the token rotation: on while
+    /// `rc.agent_token_rotation` and `rc.token_generation_check` both are.
+    /// Set once at startup.
+    pub fn set_token_rotation(&self, on: bool) {
+        self.inner.token_rotation.store(on, Ordering::Relaxed);
+    }
+
+    /// What [`Self::set_token_rotation`] set.
+    pub fn token_rotation(&self) -> bool {
+        self.inner.token_rotation.load(Ordering::Relaxed)
+    }
+
     /// The registration's half: `entry` goes into the hub unless a live floor
     /// of its tenant and agent is above the generation it was admitted under.
     /// Returns the entry it displaced.
@@ -115,8 +128,9 @@ impl Hub {
         )
     }
 
-    /// [`Self::end_below_generation`], with the floor kept for `keep`.
-    pub(super) fn end_below_generation_for(
+    /// [`Self::end_below_generation`], with the floor kept for `keep`: the
+    /// integration cells set with it a floor that ends within a cell.
+    pub fn end_below_generation_for(
         &self,
         agent_id: ObjectId,
         tenant_id: ObjectId,
