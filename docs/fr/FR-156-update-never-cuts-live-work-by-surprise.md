@@ -178,7 +178,7 @@ the person's half would never reach the helper.
 
 #### The clock
 
-A liveness age counts the time the host slept (the operator's ruling of 2026-11-27): a laptop that slept for an hour
+A liveness age counts the time the host slept (P1's design choice, not a ruling): a laptop that slept for an hour
 heard its client an hour ago, not just now. `std::time::Instant`, which tokio's clock reads outside tests, does not
 promise that. Its documentation says "it is also not specified whether system suspends count as elapsed time or not.
 The behavior varies across platforms and Rust versions" (std 1.95.0, `library/std/src/time.rs`), and it reads
@@ -556,8 +556,10 @@ The operator's rulings on D1 and D5, of 2026-11-27
 
 9. **D1: the liveness window is 90 s.** Both servers' configs take `keepalive_interval: Some(30 s)` and
    `keepalive_max: 0`, and `inactivity_timeout` stays 600 s. A connection counts while its client was heard within
-   90 s, and a flow while it moved bytes within the same 90 s. A liveness age counts the time the host slept (P1
-   design, "The clock").
+   90 s, and a flow while it moved bytes within the same 90 s.
+
+P1's design note on D1, not part of the ruling: a liveness age counts the time the host slept (Design, "The clock").
+
 10. **D5: accepted.** The keepalives keep an idle SSH session whose client answers open past 600 s. The 600 s stays a
     reaper for a dead carrier, and there is no idle-limit setting.
 
