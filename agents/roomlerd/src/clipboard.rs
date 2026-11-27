@@ -1003,7 +1003,7 @@ mod quietly_drop_tests {
     #[test]
     fn quietly_drop_holds_back_only_arboards_three_dead_connection_lines() {
         let heard = Heard::default();
-        tracing::subscriber::with_default(heard.clone(), || {
+        roomler_log_capture::with_default(heard.clone(), || {
             super::quietly_drop(SaysWhatArboardSays)
         });
         let heard = heard.0.lock().unwrap().clone();
@@ -2712,42 +2712,15 @@ mod retry_tests {
         })
     }
 
-    #[derive(Clone, Default)]
-    struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Lines {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// What `f` returns, and the lines it logs on this thread at INFO and up.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     pub(super) fn logged<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
-        let lines = Lines::default();
-        let writer = lines.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
+        let log = roomler_log_capture::Captured::default();
+        let subscriber = roomler_log_capture::fmt(log.clone())
             .without_time()
             .with_max_level(tracing::Level::INFO)
-            .with_writer(move || writer.clone())
             .finish();
-        let r = tracing::subscriber::with_default(subscriber, f);
-        let all = lines.0.lock().unwrap_or_else(|e| e.into_inner());
-        let said = String::from_utf8_lossy(&all)
-            .lines()
-            .map(String::from)
-            .collect();
+        let r = roomler_log_capture::with_default(subscriber, f);
+        let said = log.text().lines().map(String::from).collect();
         (r, said)
     }
 

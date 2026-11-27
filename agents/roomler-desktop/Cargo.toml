@@ -127,6 +127,8 @@ tauri-build = { version = "2", features = [] }
 [dev-dependencies]
 # FR-85 P5c — the edit-list save/load tests write into a real folder.
 tempfile = { workspace = true }
+# #3403 — the one way a test reads its own log lines.
+roomler-log-capture = { path = "../../crates/log-capture" }
 
 # FR-27 — the Linux companion, as its OWN Debian package.
 #

@@ -6026,42 +6026,17 @@ machine_name = "devbox"
         std::fs::write(path, toml::to_string_pretty(&table).unwrap()).unwrap();
     }
 
-    /// What a capturing test holds: its scoped subscriber, and a SECOND
-    /// registered dispatcher, never one alone. With exactly one registered,
-    /// tracing-core rebuilds a callsite's interest from the default of
-    /// whichever thread reaches it first (`Rebuilder::JustOne`) and caches it
-    /// for every thread: a parallel test with no subscriber of its own makes
-    /// it `never`, and the capture misses that line for good, though this
-    /// thread emitted it. Measured in CI on two of the save tests. With two,
-    /// every registered dispatcher is asked, as `pairing_terminal`'s captures
-    /// hold. The scope ends first, then the second.
-    struct CaptureGuard {
-        _scoped: tracing::dispatcher::DefaultGuard,
-        _second: tracing::Dispatch,
-    }
-
-    /// Everything this thread logs while the guard lives, as text.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
-    fn captured() -> (Captured, CaptureGuard) {
+    /// Everything this thread logs while the scope lives, as text, through
+    /// the one capture helper (#3403). FR-66 is a defect about SEVERITY, not
+    /// about a return value, so nothing weaker than reading the emitted events
+    /// can lock it.
+    fn captured() -> (Captured, roomler_log_capture::Scope) {
         use tracing_subscriber::layer::SubscriberExt;
-        let second = tracing::Dispatch::new(tracing_subscriber::registry());
         let cap = Captured::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(cap.clone())
-                .with_ansi(false),
+        let scope = roomler_log_capture::set_default(
+            tracing_subscriber::registry().with(roomler_log_capture::layer(cap.clone())),
         );
-        let scoped = tracing::subscriber::set_default(subscriber);
-        (
-            cap,
-            CaptureGuard {
-                _scoped: scoped,
-                _second: second,
-            },
-        )
+        (cap, scope)
     }
 
     /// #2078 — the identity an entry is found by is THIS build's (an org's
@@ -7837,34 +7812,8 @@ tenant_id = "tid2"
         assert!(cfg.last_known_good_version.is_none());
     }
 
-    /// Collects formatted tracing output so a test can assert on what was
-    /// logged. FR-66 is a defect about SEVERITY, not about a return value, so
-    /// nothing weaker than reading the emitted events can lock it.
-    #[derive(Clone, Default)]
-    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl Captured {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Captured;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
+    // What `captured` collects: the capture helper's buffer (#3403).
+    use roomler_log_capture::Captured;
 
     /// FR-66. Probing an absent optional config must be SILENT, while loading
     /// the config a process runs on must still shout — both halves in one test,

@@ -217,27 +217,15 @@ pub(crate) mod said {
     #[derive(Clone, Default)]
     pub(crate) struct Lines(Arc<Mutex<Vec<Said>>>);
 
-    /// What [`Lines::start`] hands back: this thread's scoped subscriber and a
-    /// second registered dispatcher. Two dispatchers, never one: with one,
-    /// tracing-core takes a line's interest from the default of whichever
-    /// thread reaches it first and keeps it for every thread, so a parallel
-    /// cell with no subscriber would hide the line from this one (#4375).
-    /// The scope ends first, then the second.
-    pub(crate) struct Guard {
-        _scoped: tracing::subscriber::DefaultGuard,
-        _second: tracing::Dispatch,
-    }
-
     impl Lines {
-        pub(crate) fn start() -> (Self, Guard) {
+        /// The capture, through the one capture helper (#3403): this thread's
+        /// scoped subscriber beside a second registered dispatcher, so a
+        /// parallel cell with no subscriber cannot hide a line from this one
+        /// (#4375).
+        pub(crate) fn start() -> (Self, roomler_log_capture::Scope) {
             let lines = Self::default();
-            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
             let subscriber = tracing_subscriber::registry().with(Record(lines.clone()));
-            let guard = Guard {
-                _scoped: tracing::subscriber::set_default(subscriber),
-                _second: second,
-            };
-            (lines, guard)
+            (lines, roomler_log_capture::set_default(subscriber))
         }
 
         /// The events whose text carries `words`.

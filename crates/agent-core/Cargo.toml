@@ -117,6 +117,8 @@ syn = { version = "2", features = ["full", "visit"] }
 # #3778 — and reads the tokens of a macro's arguments, which `syn` leaves
 # unparsed.
 proc-macro2 = "1"
+# #3403 — the one way a test reads its own log lines.
+roomler-log-capture = { path = "../log-capture" }
 
 # #3073's elevated test hardens from the daemon's position: it disables the
 # privileges that let icacls rewrite a DACL it has no access to, which a shell

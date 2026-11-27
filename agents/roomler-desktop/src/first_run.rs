@@ -1065,59 +1065,24 @@ mod tests {
         );
     }
 
-    /// Where the tests read what the companion logged.
-    #[derive(Clone, Default)]
-    struct LogSink(std::sync::Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
-        type Writer = LogSink;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// #3941 — one line per reopen, beside a second launch's, naming what it
     /// shows: the tour while a start for a prompt holds it back, else the
     /// main window. The macOS lab reads it as the second witness beside the
     /// window itself.
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     fn a_reopen_logs_what_it_shows() {
-        // A second live dispatcher for the whole test. With only one
-        // registered, a callsite that another test thread reaches first, with
-        // no subscriber of its own, is cached as `never`, and the subscriber
-        // below would miss the line (`agent-core`'s pairing_terminal tests
-        // hold one for the same reason).
-        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
-        let sink = LogSink::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink.clone())
-            .with_ansi(false)
+        // Through the capture helper (#3403): another test thread may reach
+        // these lines first, with no subscriber of its own.
+        let sink = roomler_log_capture::Captured::default();
+        let subscriber = roomler_log_capture::fmt(sink.clone())
             .with_target(false)
             .without_time()
             .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        roomler_log_capture::with_default(subscriber, || {
             log_reopen(&decide_reopen(false, true), false, true, false);
             log_reopen(&decide_reopen(true, false), true, false, true);
         });
-        let log = String::from_utf8(sink.0.lock().unwrap_or_else(|p| p.into_inner()).clone())
-            .expect("the log is UTF-8");
+        let log = sink.text();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2, "one line per reopen:\n{log}");
         assert!(lines[0].contains("a reopen shows the tour"), "{}", lines[0]);
@@ -1138,25 +1103,17 @@ mod tests {
     /// beside a reopen's, naming what it shows: the tour a start for a prompt
     /// held back, else the Overview. Until #3996 that click logged nothing.
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     fn a_tray_click_logs_what_it_shows() {
-        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
-        let sink = LogSink::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink.clone())
-            .with_ansi(false)
+        let sink = roomler_log_capture::Captured::default();
+        let subscriber = roomler_log_capture::fmt(sink.clone())
             .with_target(false)
             .without_time()
             .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        roomler_log_capture::with_default(subscriber, || {
             log_tray_open("icon", true, tray_open_view(true, false));
             log_tray_open("Device status", false, tray_open_view(false, true));
         });
-        let log = String::from_utf8(sink.0.lock().unwrap_or_else(|p| p.into_inner()).clone())
-            .expect("the log is UTF-8");
+        let log = sink.text();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2, "one line per click:\n{log}");
         assert!(

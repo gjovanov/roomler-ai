@@ -1310,7 +1310,7 @@ mod tests {
         use tracing::Level;
         let trace = tracing_subscriber::EnvFilter::new("trace");
         let dispatch = tracing::Dispatch::new(log_subscriber(trace, std::io::stdout, false));
-        tracing::dispatcher::with_default(&dispatch, || {
+        roomler_log_capture::with_dispatch(&dispatch, || {
             assert!(!tracing::enabled!(
                 target: "tungstenite::handshake::client",
                 Level::TRACE
@@ -1852,7 +1852,7 @@ mod tests {
             let out = Captured::default();
             let filter = tracing_subscriber::EnvFilter::new("info");
             let subscriber = log_subscriber(filter, out.clone(), colour);
-            tracing::subscriber::with_default(subscriber, || {
+            roomler_log_capture::with_default(subscriber, || {
                 tracing::info!(peers = 3, "a CLI line with a field");
             });
             let bytes = out.0.lock().unwrap().clone();

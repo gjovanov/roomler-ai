@@ -387,7 +387,7 @@ fn clause(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -631,25 +631,7 @@ mod tests {
         assert_eq!(f.chain, vec!["download installer", "download cancelled"]);
     }
 
-    /// The writer the test's log goes to.
-    #[derive(Clone, Default)]
-    struct Logged(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Logged {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     fn the_terminal_event_names_the_step_and_the_log_says_the_same() {
         let (steps, _) = crate::steps::tests::tracker();
         steps.started(&[], None);
@@ -660,13 +642,9 @@ mod tests {
             .context("creating staging file C:\\stage\\roomler.msi");
         let failure = steps.fail_as(ErrorCode::Download, false, err);
 
-        let logged = Logged::default();
-        let writer = logged.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let event = tracing::subscriber::with_default(subscriber, || failure.report());
+        let logged = roomler_log_capture::Captured::default();
+        let subscriber = roomler_log_capture::fmt(logged.clone()).finish();
+        let event = roomler_log_capture::with_default(subscriber, || failure.report());
 
         let ProgressEvent::Error {
             step,
@@ -683,7 +661,7 @@ mod tests {
         assert_eq!(words, &failure.words);
         assert_eq!(chain, &failure.chain);
         assert!(replay_log().snapshot().contains(&event));
-        let logged = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+        let logged = logged.text();
         assert!(logged.contains(&failure.words), "{logged}");
         assert!(
             logged.contains("download") && logged.contains("local_file"),

@@ -60,6 +60,9 @@
 //!   (an async test, or a capture kept in a struct).
 //! - [`with_dispatch`] / [`set_dispatch`]: the same, for a test that already
 //!   holds a [`tracing::Dispatch`].
+//! - [`with_default_async`]: for a future, the default each time it is
+//!   polled (tracing's `WithSubscriber`), never a guard held across an
+//!   `.await`, which would lend the capture to whatever else that thread polls.
 //! - [`Captured`] with [`fmt`] or [`layer`]: the plain-text buffer most
 //!   captures read, with the fmt subscriber or layer that writes into it.
 
@@ -128,11 +131,30 @@ pub fn with_dispatch<T>(dispatch: &Dispatch, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// As [`with_default`], for a future: `dispatch` (a subscriber, or a
+/// [`Dispatch`]) is the default each time the future is polled, as tracing's
+/// `WithSubscriber` makes it, beside a second registered dispatcher held
+/// until the future completes. A task the future spawns logs to nobody,
+/// unless it carries the capture too.
+pub async fn with_default_async<D, F>(dispatch: D, f: F) -> F::Output
+where
+    D: Into<Dispatch>,
+    F: Future,
+{
+    let _second = second();
+    polled(f, dispatch.into()).await
+}
+
 fn scoped(dispatch: &Dispatch, second: Dispatch) -> Scope {
     Scope {
         scope: Some(tracing::dispatcher::set_default(dispatch)),
         _second: second,
     }
+}
+
+/// `f`, polled with `dispatch` as its thread's default each time.
+fn polled<F: Future>(f: F, dispatch: Dispatch) -> tracing::instrument::WithDispatch<F> {
+    tracing::instrument::WithSubscriber::with_subscriber(f, dispatch)
 }
 
 /// What a capture's subscriber wrote, as text: a shared buffer, and the
@@ -265,6 +287,38 @@ mod tests {
         });
         assert_eq!(n, 8);
         log.saw("dispatch form");
+    }
+
+    /// The future form captures what the future logs while it is polled, and
+    /// returns its output. A line logged after it completed is not captured.
+    #[test]
+    fn with_default_async_captures_while_the_future_is_polled() {
+        fn block_on<F: Future>(f: F) -> F::Output {
+            let mut f = std::pin::pin!(f);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            loop {
+                if let std::task::Poll::Ready(out) = f.as_mut().poll(&mut cx) {
+                    return out;
+                }
+            }
+        }
+
+        let log = Captured::default();
+        let n = block_on(with_default_async(fmt(log.clone()).finish(), async {
+            tracing::warn!("polled form");
+            9
+        }));
+        assert_eq!(n, 9);
+        tracing::warn!("after the future");
+        let text = log.saw("polled form");
+        assert!(!text.contains("after the future"), "{text}");
+
+        let log = Captured::default();
+        let dispatch = Dispatch::new(fmt(log.clone()).finish());
+        block_on(with_default_async(dispatch, async {
+            tracing::warn!("polled with a dispatch");
+        }));
+        log.saw("polled with a dispatch");
     }
 
     /// A buffer capture is never coloured.

@@ -17142,49 +17142,26 @@ pub(crate) mod files_log_tests {
     /// file writes it: no colour, one event a line. A `#[tokio::test]` polls
     /// its body, and the tasks it spawns, on its own thread.
     pub(crate) struct Logged {
-        buf: Arc<std::sync::Mutex<Vec<u8>>>,
-        _default: tracing::subscriber::DefaultGuard,
-        // Two dispatchers, never one: with one, a callsite's interest is
-        // taken once for every thread (`derp`'s `logged`).
-        _second: tracing::Dispatch,
+        log: roomler_log_capture::Captured,
+        _scope: roomler_log_capture::Scope,
     }
 
     impl Logged {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-        )]
         pub(crate) fn start(level: tracing::Level) -> Self {
-            #[derive(Clone)]
-            struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
-            impl std::io::Write for Buf {
-                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                    self.0.lock().unwrap().extend_from_slice(b);
-                    Ok(b.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let writer = Buf(buf.clone());
-            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
+            let log = roomler_log_capture::Captured::default();
+            let subscriber = roomler_log_capture::fmt(log.clone())
                 .without_time()
                 .with_target(false)
                 .with_max_level(level)
-                .with_writer(move || writer.clone())
                 .finish();
             Self {
-                buf,
-                _default: tracing::subscriber::set_default(subscriber),
-                _second: second,
+                log,
+                _scope: roomler_log_capture::set_default(subscriber),
             }
         }
 
         pub(crate) fn text(&self) -> String {
-            String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+            self.log.text()
         }
     }
 

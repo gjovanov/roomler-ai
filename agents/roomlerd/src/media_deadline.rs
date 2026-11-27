@@ -2278,34 +2278,13 @@ mod tests {
     }
 
     /// What `f` logged, beside what it returned.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let writer = buf.clone();
-        // Two dispatchers, never one: with one, a callsite's interest is taken
-        // once for every thread.
-        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let subscriber = tracing_subscriber::fmt()
+        let log = roomler_log_capture::Captured::default();
+        let subscriber = roomler_log_capture::fmt(log.clone())
             .with_target(false)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
             .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        let out = roomler_log_capture::with_default(subscriber, f);
+        let text = log.text();
         (out, text)
     }
 
@@ -3894,35 +3873,13 @@ mod tests {
 
     /// [`logged`], for a future: what it logged while it was polled, beside
     /// its output. The tasks it spawned log to nobody.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     async fn logged_async<T>(f: impl Future<Output = T>) -> (T, String) {
-        use tracing::instrument::WithSubscriber;
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let writer = buf.clone();
-        // Two dispatchers, as `logged` keeps them.
-        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let subscriber = tracing_subscriber::fmt()
+        let log = roomler_log_capture::Captured::default();
+        let subscriber = roomler_log_capture::fmt(log.clone())
             .with_target(false)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
             .finish();
-        let out = f.with_subscriber(subscriber).await;
-        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
-        (out, text)
+        let out = roomler_log_capture::with_default_async(subscriber, f).await;
+        (out, log.text())
     }
 
     /// FR-148 P4b — a session's two ends, both webrtc-rs peers in this

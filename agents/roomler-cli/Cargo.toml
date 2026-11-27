@@ -121,6 +121,8 @@ embed-resource = "3"
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+# #3403 — the one way a test reads its own log lines.
+roomler-log-capture = { path = "../../crates/log-capture" }
 
 # ---------------------------------------------------------------------------
 # Packaging metadata — mirrors roomlerd. release-tunnel.yml CI lands

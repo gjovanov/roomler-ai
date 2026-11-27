@@ -4295,10 +4295,6 @@ mod tests {
     /// start of a one-row Mac's script install logged the ERROR.
     #[test]
     fn a_start_with_no_config_and_no_service_logs_no_error() {
-        // A second live dispatcher, so that no other test thread's visit
-        // caches `config::load`'s callsites as never logged (see
-        // `first_run::tests::a_reopen_logs_what_it_shows`).
-        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("config.toml");
         let (log, guard) = capture();
@@ -4337,7 +4333,6 @@ mod tests {
     /// must not be read the same way, nor hide it.
     #[test]
     fn a_broken_config_still_logs_its_error() {
-        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("config.toml");
         // All NUL, as an unclean shutdown once left one (`config::load`).
@@ -5530,52 +5525,18 @@ mod tests {
     /// A session the daemon could be asking about.
     const SESSION: &str = "0123456789abcdef01234567";
 
-    /// The lines the code under test logs, as the desktop log writes them.
-    #[derive(Clone, Default)]
-    struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Captured;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    impl Captured {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|p| p.into_inner())).into_owned()
-        }
-    }
+    // The lines the code under test logs, as the desktop log writes them:
+    // the capture helper's buffer (#3403).
+    use roomler_log_capture::Captured;
 
     /// This thread's log lines while the guard lives. The tests below are
     /// `#[tokio::test]`s, on the current thread, so a click's lines land here.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
-    fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+    fn capture() -> (Captured, roomler_log_capture::Scope) {
         let out = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(out.clone())
-            .with_ansi(false)
+        let subscriber = roomler_log_capture::fmt(out.clone())
             .with_max_level(tracing::Level::INFO)
             .finish();
-        (out, tracing::subscriber::set_default(subscriber))
+        (out, roomler_log_capture::set_default(subscriber))
     }
 
     /// #3873 — a click whose answer never comes back ends at the bound, with
@@ -6555,10 +6516,6 @@ mod tests {
         /// there, and a folder closed to it does not say.
         #[test]
         fn a_stat_tells_a_config_there_from_none_and_logs_nothing() {
-            // A second live dispatcher, so that no other test thread's visit
-            // caches a callsite as never logged (as in
-            // `a_start_with_no_config_and_no_service_logs_no_error`).
-            let _second = tracing::Dispatch::new(tracing_subscriber::registry());
             let dir = tempfile::tempdir().expect("a temp dir");
             let path = dir.path().join("config.toml");
             let (log, guard) = capture();

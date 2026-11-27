@@ -120,6 +120,8 @@ backtrace = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true
+# #3403 — the one way a test reads its own log lines.
+roomler-log-capture = { path = "../log-capture" }
 # #4218 — `gate_before_body` parses the server's sources (this crate, the
 # core and every module) to keep gated writes reading their body after the
 # gate.

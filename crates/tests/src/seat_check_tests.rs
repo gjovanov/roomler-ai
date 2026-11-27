@@ -22,7 +22,7 @@
 //! admission goes. Each cell drives its passes directly, asserts what its own
 //! passes end, and finishes within 10 s of the change it makes.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bson::{Bson, Document, doc};
@@ -34,7 +34,6 @@ use roomler_ai_mod_conference::seat_check::{
 };
 use roomler_ai_services::dao::{room::RoomDao, tenant::TenantDao};
 use roomler_core::ApiError;
-use tracing::instrument::WithSubscriber;
 
 use crate::cluster_tests::{
     UserWs, assert_seated, conf, connect_user_ws_conn, delete_org_row, delete_room_row,
@@ -197,40 +196,23 @@ impl Drop for SilentServer {
 }
 
 /// What the code under a test logs while it runs inside
-/// [`Captured::dispatch`].
+/// [`Captured::dispatch`], through the one capture helper (#3403): the
+/// helper's buffer, and its future and closure forms at each use.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
+struct Captured(roomler_log_capture::Captured);
 
 impl Captured {
     /// A subscriber that writes every event, debug and above, here.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     fn dispatch(&self) -> tracing::Dispatch {
-        let sink = self.clone();
         tracing::Dispatch::new(
-            tracing_subscriber::fmt()
-                .with_ansi(false)
+            roomler_log_capture::fmt(self.0.clone())
                 .with_max_level(tracing::Level::DEBUG)
-                .with_writer(move || sink.clone())
                 .finish(),
         )
     }
 
     fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        self.0.text()
     }
 
     /// How many lines logged here carry `wording` as a warning.
@@ -586,9 +568,11 @@ async fn a_failed_read_ends_no_seat_and_keeps_the_count() {
     passes_end_nothing(&app, &mut memory, 1, "the first reading").await;
     let log = Captured::default();
     for n in 1..=3 {
-        let read = read_seats(&refused, &mut memory)
-            .with_subscriber(log.dispatch())
-            .await;
+        let read = roomler_log_capture::with_default_async(
+            log.dispatch(),
+            read_seats(&refused, &mut memory),
+        )
+        .await;
         eprintln!("T5 failed read {n}: {:?}", read.failed);
         assert!(read.failed.is_some(), "a read on a refusing server fails");
         assert!(read.verdicts.is_empty(), "a failed read gives no verdict");
@@ -787,9 +771,11 @@ async fn a_seat_the_room_guard_admits_is_not_ended_whatever_the_reads_found() {
         last: Gone::NotInOrg,
     });
     let log = Captured::default();
-    let ended = end_seats(state, &mut memory, &read)
-        .with_subscriber(log.dispatch())
-        .await;
+    let ended = roomler_log_capture::with_default_async(
+        log.dispatch(),
+        end_seats(state, &mut memory, &read),
+    )
+    .await;
     assert!(
         ended.is_empty(),
         "a verdict ended a seat the room guard admits: {ended:?}"
@@ -843,9 +829,11 @@ async fn a_seat_whose_room_guard_cannot_answer_is_kept() {
 
     let log = Captured::default();
     for n in 1..=3 {
-        let ended = end_seats(&unreachable, &mut memory, &read)
-            .with_subscriber(log.dispatch())
-            .await;
+        let ended = roomler_log_capture::with_default_async(
+            log.dispatch(),
+            end_seats(&unreachable, &mut memory, &read),
+        )
+        .await;
         assert!(
             ended.is_empty(),
             "a seat was ended though its room guard could not answer: {ended:?}"
@@ -1080,9 +1068,9 @@ async fn a_document_that_stays_odd_warns_once() {
     let log = Captured::default();
     let mut memory = SeatCheckMemory::default();
     for pass in 1..=3 {
-        let read = read_seats(state, &mut memory)
-            .with_subscriber(log.dispatch())
-            .await;
+        let read =
+            roomler_log_capture::with_default_async(log.dispatch(), read_seats(state, &mut memory))
+                .await;
         assert!(
             read.failed.is_none() && read.verdicts.is_empty(),
             "pass {pass}: {read:?}"
@@ -1192,7 +1180,7 @@ async fn the_switch_decides_inside_spawn() {
         (Some("2"), true),
     ] {
         let log = Captured::default();
-        let started = tracing::dispatcher::with_default(&log.dispatch(), || start(state, value));
+        let started = roomler_log_capture::with_dispatch(&log.dispatch(), || start(state, value));
         let task = started.unwrap_or_else(|| panic!("{value:?} leaves the check on: a loop"));
         task.abort();
         let text = log.text();

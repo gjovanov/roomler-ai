@@ -653,10 +653,7 @@ where
 mod tests {
     use super::*;
     use crate::pairing::test_http::scripted_server;
-    use std::{
-        io,
-        sync::{Arc, Mutex},
-    };
+    use std::sync::{Arc, Mutex};
 
     /// A console that answers what it was told to, and remembers the
     /// questions it was asked.
@@ -1147,52 +1144,20 @@ mod tests {
 
     // ── the whole flow ──────────────────────────────────────────────────────
 
-    /// A log sink for the secret scan: every line the flow logs lands here.
-    #[derive(Clone, Default)]
-    struct LogSink(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for LogSink {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
-        type Writer = LogSink;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// AC3 and the token: the whole flow — start, a failed poll, a pending
     /// one, the approval, a yes — against a loopback server, with every line
     /// it prints and every line it logs scanned. The user code and the page
     /// are shown; the device code and the token appear nowhere.
     #[tokio::test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     async fn the_flow_prints_the_code_and_never_a_secret() {
-        // A second live dispatcher, held for the whole test. With exactly
-        // one registered, tracing-core rebuilds a NEW callsite's interest
-        // from the registering thread's own default (`Rebuilder::JustOne`):
-        // when another test thread — no subscriber of its own — reaches
-        // `pairing::start` first, `never` is cached for that callsite and the
-        // subscriber below misses the event, so the scan would pass on a log
-        // that never saw the flow. With two, every registered one is asked.
-        // The positive controls at the end keep that loud.
-        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
-        let sink = LogSink::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(sink.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // The secret scan reads the capture helper's buffer (#3403). The
+        // positive controls at the end keep an empty capture loud.
+        let sink = roomler_log_capture::Captured::default();
+        let _scope = roomler_log_capture::set_default(
+            roomler_log_capture::fmt(sink.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .finish(),
+        );
 
         let (base, seen) = scripted_server(vec![
             ("200 OK", STARTED),
@@ -1249,11 +1214,10 @@ mod tests {
         assert_eq!(console.asked.len(), 1);
         assert!(!console.asked[0].contains("SECRET") && !console.asked[0].contains("TOKEN"));
 
-        let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            log.contains("device pairing started") && log.contains("poll failed"),
-            "the flow did log: {log}"
-        );
+        // The positive controls: the flow's own lines, then the scan of the
+        // same text.
+        let log = sink.saw("device pairing started");
+        roomler_log_capture::saw(&log, "poll failed");
         assert!(
             !log.contains("SECRET"),
             "the device code reached the log: {log}"

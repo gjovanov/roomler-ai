@@ -33,3 +33,5 @@ roomler-ai-remote-control = { path = "../remote_control", default-features = fal
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }
 ring = "0.17"
+# #3403 — the one way a test reads its own log lines.
+roomler-log-capture = { path = "../log-capture" }
