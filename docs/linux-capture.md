@@ -985,7 +985,7 @@ stderr), a thread that follows that stderr, and the wait for `ready`, 5 s at
 most. A keeper the daemon gives up on adds up to 1 s, the wait to collect it
 after its SIGKILL. A Remote Apps launch on the desktop waits for the keeper's
 answer at most 4 s, the start's 3 s and 1 s of slack, on the blocking thread
-that serves the request (`peer.rs:11421`) and outside the daemon's state lock;
+that serves the request (`peer.rs:11424`) and outside the daemon's state lock;
 its write never waits.
 
 **What a person notices.** A program started from a terminal that the

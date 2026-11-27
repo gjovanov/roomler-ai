@@ -1682,9 +1682,9 @@ signals that session and never terminates the channel.
 A recording that a person keeps somewhere synced is theirs to sync. That is why
 the default folder stays out of OneDrive (§4).
 
-The conference module's call recordings are a different feature with its own
-storage. `crates/tests/src/recording_tests.rs` tests those, and
-`remote_recording_tests.rs` tests this one.
+The conference module's call recordings are a different thing: rows only, since
+nothing records a call (#4163). `crates/tests/src/recording_tests.rs` tests
+those rows, and `remote_recording_tests.rs` tests this feature.
 
 ### The microphone is the person's
 
