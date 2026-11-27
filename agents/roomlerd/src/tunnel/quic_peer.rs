@@ -536,6 +536,107 @@ mod tests {
         agent.close();
     }
 
+    /// Bytes both ways on one flow: client to agent, then agent to client.
+    async fn round_trip(
+        client_send: &mut SendStream,
+        agent_recv: &mut RecvStream,
+        agent_send: &mut SendStream,
+        client_recv: &mut RecvStream,
+        tag: &[u8],
+    ) {
+        client_send.write_all(tag).await.unwrap();
+        let mut got = vec![0u8; tag.len()];
+        tokio::time::timeout(Duration::from_secs(5), agent_recv.read_exact(&mut got))
+            .await
+            .expect("client to agent within 5 s")
+            .expect("client to agent read");
+        assert_eq!(got, tag);
+        agent_send.write_all(tag).await.unwrap();
+        let mut back = vec![0u8; tag.len()];
+        tokio::time::timeout(Duration::from_secs(5), client_recv.read_exact(&mut back))
+            .await
+            .expect("agent to client within 5 s")
+            .expect("agent to client read");
+        assert_eq!(back, tag);
+    }
+
+    /// #4501: one stream that ends before its 4-byte `flow_id` preamble
+    /// arrives costs that stream, never the session. The client resets a
+    /// flow's stream when its local TCP read fails
+    /// (`tunnel_core::forward::run_flow_quic`), and a local app that aborts
+    /// its connection right after the SOCKS reply does that to a brand-new
+    /// flow. The accept loop reads each preamble inline and takes that error
+    /// for the connection's end: it reports `QuicConnEnded`, the signalling
+    /// loop reaps the session and tells the client, and every in-flight flow
+    /// on it is cut. The field measured whole sessions ending this way under
+    /// live traffic, each a few milliseconds after a flow that moved no byte.
+    ///
+    /// The stray stream never carries a whole preamble, so the outcome does
+    /// not depend on which of its frames the agent reads first.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "#4501 RED on master: a stream reset before its preamble ends the accept loop, so the session is reaped"]
+    async fn a_stream_reset_before_its_preamble_costs_only_that_stream() {
+        let session_id = ObjectId::new();
+        let token = "session-token-stray";
+        let (reap_tx, mut reap_rx) = reap_channel();
+        let agent =
+            AgentQuicPeer::setup(session_id, token.to_string(), loopback(), reap_tx).unwrap();
+        let fingerprint = agent.cert_fingerprint().to_string();
+        let addr: SocketAddr = agent.addrs()[0].parse().unwrap();
+        let client = ClientQuicPeer::client(loopback(), &fingerprint).unwrap();
+        let conn = client.connect(addr).await.unwrap();
+        quic::client_authenticate(&conn, token).await.unwrap();
+
+        // Flow 1 is the in-flight connection: served, and moving bytes.
+        let (taken, opened) = tokio::join!(
+            agent.take_flow(1, Duration::from_secs(10)),
+            quic::open_flow(&conn, 1)
+        );
+        let (mut agent_send, mut agent_recv) = taken.expect("agent must receive flow 1's stream");
+        let (mut client_send, mut client_recv) = opened.expect("client opens flow 1");
+        round_trip(
+            &mut client_send,
+            &mut agent_recv,
+            &mut agent_send,
+            &mut client_recv,
+            b"before",
+        )
+        .await;
+
+        // The stray: half a preamble, then a reset. A flow whose local app
+        // went away before the agent read which flow it is.
+        let (mut stray, _stray_recv) = conn.open_bi().await.unwrap();
+        stray.write_all(&2u32.to_le_bytes()[..2]).await.unwrap();
+        stray.reset(0u32.into()).unwrap();
+
+        // A flow opened after the stray is still served, and nothing is
+        // reaped while the client lives.
+        let (third, opened3) = tokio::join!(
+            agent.take_flow(3, Duration::from_secs(5)),
+            quic::open_flow(&conn, 3)
+        );
+        let _client3 = opened3.expect("client opens flow 3");
+        let reaped = reap_rx.try_recv().ok().map(|r| r.signal);
+        assert!(
+            third.is_ok() && reaped.is_none() && !agent.accept_ended(),
+            "a stream reset before its preamble must cost only that stream: \
+             flow 3 = {:?}, reaped = {reaped:?}, accept loop ended = {}",
+            third.as_ref().map(|_| "served").map_err(|e| e.to_string()),
+            agent.accept_ended()
+        );
+
+        // The in-flight flow still moves bytes both ways.
+        round_trip(
+            &mut client_send,
+            &mut agent_recv,
+            &mut agent_send,
+            &mut client_recv,
+            b"after",
+        )
+        .await;
+        agent.close();
+    }
+
     /// A client presenting the WRONG token must NOT get its flow served:
     /// the accept loop closes the connection after auth fails, so
     /// `take_flow` times out (no stream is ever rendezvoused).
