@@ -1343,6 +1343,143 @@ agent at 0.4.199 or older is left (FR-137 D8). The other surfaces FR-90 left
 reserved are listed in
 [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 
+## How a tunnel client enrolls (#3328, FR-159)
+
+`roomler enroll` and the setup wizard trade a single-use tunnel enrollment token for the
+client's own credential at `POST /api/tunnel-client/enroll` (`enroll_tunnel_client`,
+`crates/modules/network/src/routes/tunnel.rs:185`). The request carries no user
+session: the enrollment acts for the person the token was minted for, and a row it makes
+is theirs.
+
+**Two ids name a client.**
+
+| id | what it is | who sends it |
+|---|---|---|
+| `machine_id` | a hash of the client's name, the `HOSTNAME` variable (`COMPUTERNAME` on Windows, `unknown` when it is not set), the OS and the architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1228`) | every client; every server keys by it |
+| `instance_id` | 32 lowercase hex characters the install made at random and keeps on its machine ([FR-159](fr/FR-159-tunnel-client-identity.md) D1) | an FR-159 client, beside `machine_id` (D2). No released client sends it yet: that is FR-159's P2 |
+
+The `machine_id` is a guess at the machine. Where `HOSTNAME` is not set, two machines
+enrolled under one name in one org send one hash, and the second lands on the first one's
+row (#4479). The `instance_id` is the install's own. A row keeps the `machine_id` it was
+made with for good, because the client's overlay node is keyed by it, and it holds an
+`instance_id` once an FR-159 client has claimed it (`TunnelClient`,
+`crates/remote_control/src/models.rs:3576`). A row an FR-159 client creates takes its
+`instance_id` as its `machine_id` too (`create_row`, `routes/tunnel.rs:486`), so no legacy hash
+ever finds it.
+
+**The order.** Every refusal comes before the token is spent, and the token is spent once
+on every path:
+
+| # | step | refuses |
+|---|---|---|
+| 0 | the request's `instance_id`, while `rc.tunnel_instance_id` is on (`read_instance_id`, `tunnel_enrollment.rs:50`) | **400** unless it is 32 lowercase hex |
+| 1 | the token is verified | 401 |
+| 2 | the archived-org gate (#3042) | 403 |
+| 3 | the token's person is still a member of its org | 403 `ENROLLER_LEFT_THE_ORG` |
+| 4 | the rows, by each id, and the decision (`decide`) | the 409s, and the plan's cap (403) |
+| 5 | the spend (`UsedTokenDao::spend`) | 401 spent before, 503 the ledger cannot answer |
+| 6 | the write; the membership asked again; the credential minted at the row's `token_gen` | a race only (below) |
+
+```mermaid
+flowchart TD
+    R["POST /api/tunnel-client/enroll"] --> I{"instance_id in the request?"}
+    I -- "no: an older client" --> T["the row by machine_id: revive_scope, or the cap for a new row"]
+    I -- "yes" --> A{"a row holds this instance_id?"}
+    A -- "yes, live or removed" --> V["revived within revive_scope, or 409"]
+    A -- "no" --> L{"a row has the request's machine_id?"}
+    L -- "no" --> C["a row of its own: the cap, the spend, the insert"]
+    L -- "yes, another install holds it" --> C
+    L -- "yes, no install holds it" --> Q{"revive_scope"}
+    Q -- "in scope" --> K["claimed: the revival and the instance_id in one update"]
+    Q -- "live, someone else's" --> C
+    Q -- "removed, out of scope" --> X["409 REMOVED_TUNNEL_CLIENT"]
+    K -- "matched nothing: another install claimed it first" --> C
+```
+
+| request | the row found | outcome |
+|---|---|---|
+| no `instance_id` | by `machine_id`, or none | the path of before: revived within `revive_scope` or its 409, or a new row under the cap. No `instance_id` is written and no `keyed_by` answered |
+| `instance_id` | a row holds it, live or removed | revived within `revive_scope`, or its 409 |
+| `instance_id` | none holds it; a row has the request's `machine_id` and no `instance_id`, in scope | **claimed** |
+| `instance_id` | that row is live and someone else's | a row of its own (D4) |
+| `instance_id` | that row is removed, and out of scope | 409 `REMOVED_TUNNEL_CLIENT` (D4) |
+| `instance_id` | that row holds another `instance_id` | a row of its own |
+| `instance_id` | no row at all | a row of its own |
+
+- **The decision is one pure function** (`decide`,
+  `crates/modules/network/src/tunnel_enrollment.rs:216`) of the request, the row
+  found by each id, the scope's answer and the cap's answer, and the table above is its
+  test (`every_row_of_the_outcome_table`). It asks for the scope's answer, and then for
+  the cap's, only when it needs one: an owner's revival reads neither, as before.
+- **The owner scope stands.** Every revival, by either id, goes through `revive_scope`
+  (`routes/tunnel.rs:410`), and the write holds the same scope (`ReviveScope`). An
+  `instance_id` never revives another person's row. The one refusal FR-159 lifts is
+  #4479's second case: an install that meets someone else's live row by the legacy hash
+  alone gets a row of its own, which grants nothing a new name does not.
+- **The plan's cap** counts a new row: a split (below) is one, a claim is not. A claim
+  reads the cap anyway, before the spend, because a claim that loses its race becomes a
+  new row; at the cap, that read counts a collision in `growth_daily` though the claim
+  itself takes no slot.
+
+**The claim** (`TunnelClientDao::claim`,
+`crates/services/src/dao/tunnel_client.rs:168`) is today's revival with one more
+field: one update that clears `deleted_at`, refreshes the OS and the version, and writes
+the `instance_id`, and that matches only while the row holds none. It never writes
+`machine_id`, so the overlay node keyed by it stays the row's, and it mints no new
+`token_gen` (D3): the token comes at the row's generation, as every re-enrollment's does.
+When the update matches nothing the DAO reads the row again to tell why:
+
+| the row, read again | `Claim` | the route |
+|---|---|---|
+| holds another `instance_id` | `TakenByAnother` | a row of its own, under the cap read before the spend; at the cap, 403 (the token is spent by then) |
+| holds this request's own `instance_id` (one config enrolling twice at once) | `Revived` | the row, revived within the scope: never a second insert, which the unique index would refuse |
+| holds none, and the scope no longer holds (removed meanwhile) | `OutOfScope` | 409 `REMOVED_TUNNEL_CLIENT`, as a revival that lost its scope is |
+
+**A row two machines share splits** over their two enrollments. The other machine keeps
+working on the row with the token it has (D3), and moves to a row of its own at its own
+next enrollment:
+
+```mermaid
+sequenceDiagram
+    participant X as machine X, FR-159 client
+    participant S as server
+    participant Y as machine Y, FR-159 client
+    Note over X,Y: before - both send machine_id L, and both hold tokens for row R
+    X->>S: enroll with machine_id L and instance_id Nx
+    S->>S: no row holds Nx, R has L and no instance_id, in scope
+    S-->>X: R revived and now holding Nx, the token at the generation of R
+    Note over Y: Y keeps working on R with its old token (D3)
+    Y->>S: enroll with machine_id L and instance_id Ny
+    S->>S: no row holds Ny, R has L but holds Nx
+    S-->>Y: a new row keyed by Ny, which the cap counts
+```
+
+**The answers.**
+
+| status | when | the sentence |
+|---|---|---|
+| 400 | an `instance_id` that is not 32 lowercase hex, with the switch on | `instance_id must be 32 lowercase hexadecimal characters` |
+| 409 `SOMEONE_ELSES_TUNNEL_CLIENT` | an older client's `machine_id` (any request's, while the switch is off) names someone else's live row | enroll under a different name (the name is in the hash), or ask an administrator |
+| 409 `SOMEONE_ELSES_TUNNEL_INSTANCE` (`routes/tunnel.rs:124`) | the row the request's `instance_id` holds is someone else's live row | another name changes nothing for that id: enroll from another configuration, or ask the client's owner or an administrator |
+| 409 `REMOVED_TUNNEL_CLIENT` | a removed row, by either id, and the token's person does not hold `MANAGE_AGENTS` | only a device manager brings it back |
+| 403 | the plan's cap, for a new row | `Tunnel-client limit reached …` |
+
+**`keyed_by`** is in the answer to a request that carried an `instance_id`, and only there:
+`instance_id`, or `machine_id` while the switch is off (`keyed_by`,
+`tunnel_enrollment.rs:76`). A request without one is answered exactly as before,
+and an older server never says it, which tells a newer client it was keyed the old way.
+Today's clients ignore fields they do not know.
+
+**The switch.**
+
+| switch | default | off means |
+|---|---|---|
+| `rc.tunnel_instance_id` (`ROOMLER__RC__TUNNEL_INSTANCE_ID`, `crates/config/src/settings.rs:1129`) | on | every request is looked up as an older client's, by `machine_id` alone; no `instance_id` is written and none is refused 400; a request that carried one is answered `keyed_by: machine_id`. A row keyed by an instance id is then not found by the legacy hash, so its client gets a new row at its next enrollment: the switch is for a fault, not a setting to leave off |
+
+The tests: the decision's table in `tunnel_enrollment.rs`, and the integration tests from
+`two_installs_with_one_legacy_hash_get_two_rows` on in
+`crates/tests/src/tunnel_enroll_tests.rs`, beside #3328's.
+
 ## What ends a tunnel client
 
 A tunnel client acts for the person whose enrollment token enrolled it, its
@@ -1463,8 +1600,10 @@ minted by the client's owner while the client is live, or by a holder of
 `MANAGE_AGENTS`, the only way a removed client comes back (as the holder's own: the
 token acts for them). Anyone else's token is
 refused 409 with a sentence the CLI prints, nothing is written, and that token still
-enrolls the machine under a different `--name` as a new client. The server side is in
-[api.md](api.md#authentication) and [security-baseline.md](security-baseline.md#an-enrollment-token-is-spent-once-through-one-owner-3328).
+enrolls the machine under a different `--name` as a new client. The server side is
+[above](#how-a-tunnel-client-enrolls-3328-fr-159), with the id of its own that an FR-159
+client sends beside the hash, and in [api.md](api.md#authentication) and
+[security-baseline.md](security-baseline.md#an-enrollment-token-is-spent-once-through-one-owner-3328).
 
 ## Corporate-network behaviour
 
