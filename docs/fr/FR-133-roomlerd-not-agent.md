@@ -76,7 +76,7 @@ and needs those lookups to accept both names.
 - [x] **AC1** — A fresh Windows install from the released MSI (both flavours) appears in Apps &
       Features under the new name (D1), and its UAC prompt shows the new description. **Met
       (2026-11-02, 0.4.197):** both flavours list one entry under the new name. UAC reads
-      "Roomler installer" (was "Roomler Agent installer", `.github/workflows/release-agent.yml:2006`).
+      "Roomler installer" (was "Roomler Agent installer", `.github/workflows/release-agent.yml:2026`).
       That half is the per-machine MSI's: the per-user one has no UAC prompt
       (`agents/roomlerd/wix/main.wxs:16`).
 - [x] **AC2** — An upgrade from 0.4.188 (named "Roomler Agent…") to the first release with P1
@@ -120,7 +120,7 @@ and needs those lookups to accept both names.
       12 of 12, the three kept phrases unchanged); every "agent" left on them is a name the spec keeps
       ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-7216185361)).
 - [x] **AC7** — Docs: `docs/installation.md` and the `ship-it` skill updated, with a
-      `docs/README.md` row if a doc is added. **Met:** `docs/installation.md:550` and
+      `docs/README.md` row if a doc is added. **Met:** `docs/installation.md:797` and
       `.claude/skills/ship-it/SKILL.md:66`. No doc was added, so no row.
 
 ## Open decisions
