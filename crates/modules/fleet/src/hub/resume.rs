@@ -883,8 +883,10 @@ mod tests {
             max,
             true,
             false,
+            0,
             h,
         )
+        .expect("no rotation floor here")
     }
 
     /// A session requested by `user` and its controller's receiver.

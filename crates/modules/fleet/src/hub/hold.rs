@@ -389,12 +389,14 @@ mod tests {
             max,
             true,
             false,
+            0,
             ResumeHello {
                 advertised: true,
                 window,
                 kept: Vec::new(),
             },
         )
+        .expect("no rotation floor here")
         .rx
     }
 
@@ -730,20 +732,23 @@ mod tests {
             ObjectId::new(),
         );
         let sid = ObjectId::new();
-        let reg = hub.register_agent_resuming(
-            agent,
-            tenant,
-            ObjectId::new(),
-            OsKind::Linux,
-            2,
-            true,
-            false,
-            ResumeHello {
-                advertised: true,
-                window: Some(60),
-                kept: vec![sid],
-            },
-        );
+        let reg = hub
+            .register_agent_resuming(
+                agent,
+                tenant,
+                ObjectId::new(),
+                OsKind::Linux,
+                2,
+                true,
+                false,
+                0,
+                ResumeHello {
+                    advertised: true,
+                    window: Some(60),
+                    kept: vec![sid],
+                },
+            )
+            .expect("no rotation floor here");
         hub.resume_claimed(
             agent,
             &reg.tx,
@@ -859,12 +864,14 @@ mod tests {
                 2,
                 true,
                 false,
+                0,
                 ResumeHello {
                     advertised: true,
                     window: Some(1),
                     kept,
                 },
             )
+            .expect("no rotation floor here")
         };
         let _first = connect(Vec::new());
         let (tx, _rx) = hub.register_controller(user);
