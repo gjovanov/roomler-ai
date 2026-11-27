@@ -856,6 +856,10 @@ fn shared_at<T: Clone>(
 /// thread errored with: …" at the server's death is its serving thread's,
 /// and stays.
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "production, not a capture: the drop's dead-connection ERRORs held back on this thread (#3918; root clippy.toml, #3403)"
+)]
 fn quietly_drop<T>(handle: T) {
     let all_but = tracing::Dispatch::new(AllBut(tracing::dispatcher::get_default(Clone::clone)));
     tracing::dispatcher::with_default(&all_but, move || drop(handle));

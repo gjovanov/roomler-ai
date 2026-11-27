@@ -226,13 +226,13 @@ fn for_appending(file: File) -> File {
 static EARLY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// `start`, with what it logs kept in [`EARLY`].
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a buffer that keeps the start's lines for the log: never coloured (root clippy.toml, #3938)"
-)]
 fn keeping_its_lines<T>(start: impl FnOnce() -> T) -> T {
     let text = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = Arc::clone(&text);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a buffer that keeps the start's lines for the log: never coloured (root clippy.toml, #3938)"
+    )]
     let keeper = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .with_ansi(false)
@@ -241,6 +241,10 @@ fn keeping_its_lines<T>(start: impl FnOnce() -> T) -> T {
         .with_target(false)
         .with_writer(move || Lines(Arc::clone(&sink)))
         .finish();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "production, not a capture: the start's hold, before the subscriber exists (root clippy.toml, #3403)"
+    )]
     let done = tracing::subscriber::with_default(keeper, start);
     let text = text.lock().unwrap_or_else(PoisonError::into_inner);
     EARLY

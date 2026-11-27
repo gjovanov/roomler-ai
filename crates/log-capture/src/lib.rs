@@ -5,9 +5,10 @@
 //! A test that asserts on what it logged installs a subscriber as its own
 //! thread's default, for as long as it reads, and nothing else. This crate is
 //! the only code that does that. Every capture in the workspace goes through
-//! it, and the root `clippy.toml` refuses the four scoped-default entry points
-//! of `tracing` anywhere else (`docs/testing.md`, "Reading a test's own log
-//! lines").
+//! it, and the root `clippy.toml` refuses a scoped default anywhere else:
+//! `tracing`'s four entry points, `WithSubscriber::with_subscriber` and
+//! `SubscriberInitExt::set_default` (`docs/testing.md`, "Reading a test's own
+//! log lines").
 //!
 //! # Why a capture holds TWO registered dispatchers
 //!
@@ -145,6 +146,10 @@ where
     polled(f, dispatch.into()).await
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the capture helper: the one place a test's scope is set, beside its second dispatcher (root clippy.toml, #3403)"
+)]
 fn scoped(dispatch: &Dispatch, second: Dispatch) -> Scope {
     Scope {
         scope: Some(tracing::dispatcher::set_default(dispatch)),
@@ -153,6 +158,10 @@ fn scoped(dispatch: &Dispatch, second: Dispatch) -> Scope {
 }
 
 /// `f`, polled with `dispatch` as its thread's default each time.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the capture helper: the one place a test's future is polled under its capture, beside its second dispatcher (root clippy.toml, #3403)"
+)]
 fn polled<F: Future>(f: F, dispatch: Dispatch) -> tracing::instrument::WithDispatch<F> {
     tracing::instrument::WithSubscriber::with_subscriber(f, dispatch)
 }

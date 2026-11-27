@@ -92,4 +92,34 @@ disallowed-methods = [
     { path = "tracing_subscriber::fmt::Subscriber::new", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
     { path = "tracing_subscriber::fmt::init", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
     { path = "tracing_subscriber::fmt::try_init", reason = "a console colours only on a terminal: start it under #[expect] that says how it takes colour or why it is plain (root clippy.toml, #3938)" },
+
+    # A test reads its own log lines through one helper (#3403, docs/testing.md).
+    #
+    # tracing caches a callsite's interest once per process, and a capture is per
+    # thread. With one dispatcher registered, a line takes its interest from the
+    # default of whichever thread reaches it first, so a capture misses a line its
+    # own thread logged, for good, when a test beside it with no subscriber got
+    # there first. `roomler-log-capture` (crates/log-capture, a dev-dependency
+    # only) holds a second registered dispatcher for the capture's whole life, and
+    # it is the one place a test sets a scoped default. Until it, each capture
+    # copied that by hand, and the ones without it lost lines (#3317, #4351).
+    #
+    # These six paths set a scoped default. Three production callers carry
+    # `#[expect(clippy::disallowed_methods, reason = "...")]` saying why, and none
+    # of them is a capture: roomlerd's `clipboard::quietly_drop` and enigo's
+    # `Job::Gone` drop (Linux) quiet a dead X connection's ERRORs (#3918), and the
+    # node core's `held_logs::keeping_its_lines` keeps the start's WARN lines until
+    # the subscriber exists. `WithSubscriber::with_current_subscriber` is left out
+    # on purpose: it hands the caller's dispatcher to a spawned future, which is
+    # how production passes a subscriber on, and it captures nothing.
+    #
+    # ⚠️ This catches these calls, not every way to install a subscriber: a
+    # process-global one (`set_global_default`, `init`, `try_init`) is another
+    # class and is not covered.
+    { path = "tracing::subscriber::set_default", reason = "a test reads its own log lines through roomler-log-capture, which holds the second dispatcher; production code says why under #[expect] (root clippy.toml, #3403)" },
+    { path = "tracing::subscriber::with_default", reason = "a test reads its own log lines through roomler-log-capture, which holds the second dispatcher; production code says why under #[expect] (root clippy.toml, #3403)" },
+    { path = "tracing::dispatcher::set_default", reason = "a test reads its own log lines through roomler-log-capture, which holds the second dispatcher; production code says why under #[expect] (root clippy.toml, #3403)" },
+    { path = "tracing::dispatcher::with_default", reason = "a test reads its own log lines through roomler-log-capture, which holds the second dispatcher; production code says why under #[expect] (root clippy.toml, #3403)" },
+    { path = "tracing::instrument::WithSubscriber::with_subscriber", reason = "a test reads its own log lines through roomler-log-capture, which holds the second dispatcher; production code says why under #[expect] (root clippy.toml, #3403)" },
+    { path = "tracing_subscriber::util::SubscriberInitExt::set_default", reason = "a test reads its own log lines through roomler-log-capture, which holds the second dispatcher; production code says why under #[expect] (root clippy.toml, #3403)" },
 ]
