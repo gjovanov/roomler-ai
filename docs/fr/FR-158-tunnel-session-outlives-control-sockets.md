@@ -1,6 +1,6 @@
 # FR-158: A tunnel session outlives its control sockets — a roll, an exit's redial or one bad stream never cuts the connections it carries
 
-**Issue:** [#4509](https://github.com/gjovanov/roomler-ai/issues/4509) · **Status:** claimed 2026-11-27, spec only. P0 (the root-cause map, the RED cells, this spec) is this PR; nothing is built. D1–D7 (§7) are open, each with a recommendation · **Owner:** the agent's tunnel plane (exit and client), the network module · **Anchors:** master `21f0923b0`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** [#4501](https://github.com/gjovanov/roomler-ai/issues/4501) · **Builds on:** [FR-138](FR-138-the-session-outlives-its-control-socket.md) (the same shape for remote-control sessions), R3 (PR #715: `tunnel_peers_survive_reattach` and `rc.tunnel_grace_secs`), #1754 (the tunnel reap), [FR-86](FR-86-tunnel-transport-reupgrade.md) (the flow owns its listener; make-before-break re-upgrade) · **Related:** #4492 (one writer owns the route-to-flow map), #2944 (FR-123 P1, the tunnel plane into its own crate)
+**Issue:** [#4509](https://github.com/gjovanov/roomler-ai/issues/4509) · **Status:** claimed 2026-11-27, spec only. P0 (the root-cause map, the RED cells, this spec) is this PR; nothing is built. D1–D7 (§7) were ruled on 2026-11-27, each as recommended · **Owner:** the agent's tunnel plane (exit and client), the network module · **Anchors:** master `21f0923b0`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** [#4501](https://github.com/gjovanov/roomler-ai/issues/4501) · **Builds on:** [FR-138](FR-138-the-session-outlives-its-control-socket.md) (the same shape for remote-control sessions), R3 (PR #715: `tunnel_peers_survive_reattach` and `rc.tunnel_grace_secs`), #1754 (the tunnel reap), [FR-86](FR-86-tunnel-transport-reupgrade.md) (the flow owns its listener; make-before-break re-upgrade) · **Related:** #4492 (one writer owns the route-to-flow map), #2944 (FR-123 P1, the tunnel plane into its own crate)
 
 ## Summary, for the operator
 
@@ -268,6 +268,10 @@ agent's switch is on, the server it last spoke to announced a window, and the se
   control connection only), the data path left alone.
 
 ## 7. Decisions for the operator
+
+**Ruled on 2026-11-27 by the operator: every decision as recommended.** D1 (a): one FR, with P1 first and on its own
+PR. D2: 60 s. D3 (a): a MongoDB row. D4: no stopgap. D5: out of this FR. D6: no runtime switch for P1. D7 (a): a phase
+beside P1, whose row and cells come with its PR.
 
 | | Decision | Options | Recommendation |
 |---|---|---|---|
