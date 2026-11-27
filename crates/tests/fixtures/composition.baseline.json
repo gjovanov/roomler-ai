@@ -2921,6 +2921,18 @@
           {
             "key": {
               "tenant_id": 1,
+              "instance_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "instance_id": {
+                "$type": "string"
+              }
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
               "status": 1
             }
           },
@@ -4920,6 +4932,18 @@
               "machine_id": 1
             },
             "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "instance_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "instance_id": {
+                "$type": "string"
+              }
+            }
           },
           {
             "key": {

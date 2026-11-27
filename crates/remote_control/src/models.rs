@@ -3605,12 +3605,22 @@ pub struct TunnelClient {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     /// True once an admin renamed this client server-side (see
-    /// `Agent::name_admin_set` — same rehydrate-clobber protection; a
-    /// CLIENT-side rename can't rename in place at all, it derives a new
-    /// machine_id and enrolls a new row).
+    /// `Agent::name_admin_set` — same rehydrate-clobber protection). A
+    /// CLIENT-side rename of an older client can't rename in place at all: it
+    /// derives a new machine_id and enrolls a new row. An FR-159 client found
+    /// by its `instance_id` is renamed in place, unless this is set.
     #[serde(default)]
     pub name_admin_set: bool,
+    /// The id an older client sends: a hash of its name and its host
+    /// (`roomler enroll`'s `derive_machine_id`). Written once, at the insert,
+    /// and never after: the client's overlay node is keyed by it. A row an
+    /// FR-159 client creates holds that client's `instance_id` here too.
     pub machine_id: String,
+    /// FR-159 — the id of the install that holds this row: one it made at
+    /// random and keeps on its machine. Absent on a row no FR-159 client has
+    /// claimed, and never cleared. Unique per tenant where it is a string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     pub os: OsKind,
     pub client_version: String,
     pub status: AgentStatus,

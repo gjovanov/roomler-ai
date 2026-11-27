@@ -3136,7 +3136,7 @@ title bar's container and the title bar.
 | | |
 |---|---|
 | The window | the main window, the companion's only titled window on a Mac (`tauri.conf.json`: decorations, resizable). The panels are built with `decorations(false)` (`panels.rs:346`) and the red frame's strips are borderless with an explicit behaviour (`panels.rs:831-836`): no title bar, no button. 0.4.237's red-frame changes (#4388, #4398) touch only the strips |
-| The fix | `full_screen::make_explicit` (`agents/roomler-desktop/src/full_screen.rs:79`), called once in `setup` before the window is first shown (`agents/roomler-desktop/src/main.rs:226`), sets the bits a choice needs where the window holds none (`explicit_full_screen`, `full_screen.rs:59`) |
+| The fix | `full_screen::make_explicit` (`agents/roomler-desktop/src/full_screen.rs:84`), called once in `setup` before the window is first shown (`agents/roomler-desktop/src/main.rs:226`), sets the bits a choice needs where the window holds none (`explicit_full_screen`, `full_screen.rs:64`) |
 | The bits | a resizable window: `FullScreenPrimary` and `FullScreenAllowsTiling` (0x880), the value Firefox's fix gives its windows. A fixed-size one: `FullScreenNone` and `FullScreenDisallowsTiling`. A choice the window holds is kept: AppKit raises at two of either kind. The bit values are checked against objc2-app-kit's when the Mac build compiles. Not read in the lab: what AppKit's guess gave this window before, the app being a menu-bar app (`LSUIElement`). The field cell reads the green button's action |
 | The log | `the main window's full-screen behaviour is explicit (#4419)`, with `before`, `after` and `resizable` |
 | Other OSes | nothing: `make_explicit` is empty there |

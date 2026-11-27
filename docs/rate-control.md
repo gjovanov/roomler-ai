@@ -241,7 +241,7 @@ onward). `valid` is the gate's `None`; `stall_is_ours` is V5's exception, below.
 | FR-70 P1 prior | re-anchors on a live measurement, decays on a clean window | does not move. V5b: a stall carries no number, so it no longer walks it either | `governor.rs:1961` |
 | the refutation (V5b rule q2) | a delivery that raised the floor takes out a reading it beats by 2× | nothing: a stall's shadow is its backlog draining | `governor.rs:1901` |
 | FR-79 V3b belief (shadow) | a delivery every window; a capacity when the fold accepted, or the viewer's queue grew | the delivery is still recorded; no capacity | `governor.rs:1648`, `:1714`, `:1855` |
-| pair-memory write-back (V2 + V4 + V5b) | a carried hold, else a reading, else the opener's measurement | nothing measured ⇒ nothing written | `media_pair_memory.rs:238` |
+| pair-memory write-back (V2 + V4 + V5b) | a carried hold, else a reading, else the opener's measurement | nothing measured ⇒ nothing written | `media_pair_memory.rs:232` |
 
 ### V5 — a rejected window is not a measurement, but a stall is still push-back
 
@@ -550,15 +550,15 @@ flowchart LR
 | piece | rule | anchor |
 |---|---|---|
 | the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `media_pair_memory.rs:163`, `:140` |
-| the provenance | FR-148 P1. Every entry written carries `"provenance": "measured"`. An entry with no provenance, which is every entry written before this release, or with a value this agent does not know, is **assumed**. An assumed entry seeds nothing, so the pair opens as one never seen: no slow-link profile and no opening below the floor. It is no base for `damp`, so the first measurement replaces it outright. The next write for any pair drops it, because the file is written whole and an assumed value is never stored (FR-148 §4.1). A session that measured nothing leaves it as it is, unread, until it ages out. At the open, a fresh assumed entry logs `FR-148 P1 rate memory: … read as assumed …` with `assumed_bps` and `age_s`. **Rollback:** an older agent ignores the field and reads every entry again. Its whole-file write drops the field, so after a re-upgrade those entries are assumed: one session of learning per pair and carrier | `rate_memory.rs:107`, `:164`, `:173`, `:192`; `media_pair_memory.rs:571` |
+| the provenance | FR-148 P1. Every entry written carries `"provenance": "measured"`. An entry with no provenance, which is every entry written before this release, or with a value this agent does not know, is **assumed**. An assumed entry seeds nothing, so the pair opens as one never seen: no slow-link profile and no opening below the floor. It is no base for `damp`, so the first measurement replaces it outright. The next write for any pair drops it, because the file is written whole and an assumed value is never stored (FR-148 §4.1). A session that measured nothing leaves it as it is, unread, until it ages out. At the open, a fresh assumed entry logs `FR-148 P1 rate memory: … read as assumed …` with `assumed_bps` and `age_s`. **Rollback:** an older agent ignores the field and reads every entry again. Its whole-file write drops the field, so after a re-upgrade those entries are assumed: one session of learning per pair and carrier | `rate_memory.rs:107`, `:164`, `:173`, `:192`; `media_pair_memory.rs:565` |
 | the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9431` (`opener_measured_bps`) |
-| the evidence | `RateGovernor::session_evidence_bps`: first `stable_bps()`, the highest AIMD target that held 10 s with no decrease, when above the nominal and, since V5b, carried by a valid window; then a live reading; then the last reading the session took; else 0 = nothing. ⚠️ Before V5b the first was a hold of the *target*, not a measurement: an idle session held the opener's seed for its whole length and wrote 0.85 × the memory back as evidence, and the second was `pipe_bps`, whose last source is the prior's stand-in, so a prior that stood low was written back too (field rows below) | `media_pair_memory.rs:708`; `governor.rs:926` |
-| the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence, or the first after an assumed entry ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:230`, `:79`; `media_pair_memory.rs:238` |
+| the evidence | `RateGovernor::session_evidence_bps`: first `stable_bps()`, the highest AIMD target that held 10 s with no decrease, when above the nominal and, since V5b, carried by a valid window; then a live reading; then the last reading the session took; else 0 = nothing. ⚠️ Before V5b the first was a hold of the *target*, not a measurement: an idle session held the opener's seed for its whole length and wrote 0.85 × the memory back as evidence, and the second was `pipe_bps`, whose last source is the prior's stand-in, so a prior that stood low was written back too (field rows below) | `media_pair_memory.rs:702`; `governor.rs:926` |
+| the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence, or the first after an assumed entry ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:230`, `:79`; `media_pair_memory.rs:232` |
 | the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days, or an assumed one, never seeds and is pruned on the next write | `rate_memory.rs:269`, `:22` |
-| the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `media_pair_memory.rs:247` |
+| the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `media_pair_memory.rs:241` |
 
 This memory moved out of the pump with FR-148 P1 (`RateMemoryGuard`,
-`agents/roomlerd/src/media_pair_memory.rs:210`) and is otherwise unchanged: it still
+`agents/roomlerd/src/media_pair_memory.rs:204`) and is otherwise unchanged: it still
 seeds the opener, and its file is written byte for byte as before. Beside it P1 keeps
 the path model's own memory, under a key that names the path
 ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)).
@@ -590,7 +590,7 @@ is a hold, not a measurement, and on the connect-look-leave sessions this fleet
 actually has it writes the opener's own seed back as evidence. The asymmetry
 that protects against a flooded opener (believe a drop fast) then compounds it:
 the pair that carried 6–7.6 Mbps windows is remembered at 4.4 M. A fix belongs
-with the governor (`media_pair_memory.rs:708`: require the hold to have been *carried*, or
+with the governor (`media_pair_memory.rs:702`: require the hold to have been *carried*, or
 route the first-choice evidence through the gate); nothing here is changed yet.
 The 2026-10-25 → 10-30 row is the same defect at scale: every write on that pair,
 not only the idle sessions.
@@ -1867,7 +1867,7 @@ barely longer while the queue stands still. On d the T3 abandons what is out
 P9c)`, [remote-control.md §11.9](remote-control.md#119-the-carrier-a-session-rides-fr-102-p9c))
 names, right after `carrier`, what carries the agent's own TURN allocation for the
 nominated pair: `relay_transport` (`relay_transport_of`,
-`agents/roomlerd/src/session_carrier.rs:297`; the line, `:458`). A relay candidate names
+`agents/roomlerd/src/session_carrier.rs:484`; the line, `:715`). A relay candidate names
 its relayed address, which is UDP whatever carries the allocation to the TURN server, so
 the pair alone cannot tell TURN over UDP from TURN over TCP or TLS. The vendored
 webrtc-ice stamps each relay candidate it gathers with its TURN URL's transport and
@@ -1877,7 +1877,7 @@ webrtc hands the stamp over with the selected pair
 (`RTCIceCandidatePair::local_relay_transport`,
 `crates/vendored/webrtc/src/ice_transport/ice_candidate_pair.rs:58`), both on the read
 the carrier line makes and on the pair the selection's change handler is given
-(`crates/vendored/webrtc/src/ice_transport/mod.rs:94`, `:165`).
+(`crates/vendored/webrtc/src/ice_transport/mod.rs:94`, `:181`).
 
 | The nominated pair's local candidate | `relay_transport` |
 |---|---|
@@ -3429,7 +3429,7 @@ what the close wrote.
 | An entry | one rate, its time, its provenance | the model's floor, with the class and time of the reading that set it; a push-back record |
 | Written from | `session_evidence_bps`: a carried hold, else a reading, else the opener's measurement | the model's floor and the counted push-backs, from valid windows only (D24, D25, D29, D30), and the delivery samples' push-backs under the last valid window (D46 B2) |
 | Read by | the opener: 85 % of it seeds the opening ceiling, unless the model decides | the open line; under `on`, the opener (D25, D26) |
-| Code | `RateMemoryGuard` (`agents/roomlerd/src/media_pair_memory.rs:210`) | `ModelGuard` (`:262`) over `encode::pair_memory` |
+| Code | `RateMemoryGuard` (`agents/roomlerd/src/media_pair_memory.rs:204`) | `ModelGuard` (`:256`) over `encode::pair_memory` |
 
 ```mermaid
 flowchart TD
@@ -3708,7 +3708,7 @@ profile = trusted && P ≤ T && O ≤ T
 
 | Symbol | Is |
 |---|---|
-| `N` | `nominal_bps`: the relay cap at the session's Priority dial, at least `MIN_BITRATE_BPS` (`media_pair_memory.rs:487`) |
+| `N` | `nominal_bps`: the relay cap at the session's Priority dial, at least `MIN_BITRATE_BPS` (`media_pair_memory.rs:481`) |
 | `hi` | the constrained learner's ceiling, `relay_max_hi_bps` |
 | `D` | the entry's floor |
 | `P` | the record's rate |
@@ -3720,7 +3720,7 @@ open line writes `O` and the profile beside today's rule's opening, in every mod
 ### Which rule opens the session (step 3)
 
 `Taken::decide` (`agents/roomlerd/src/encode/pair_memory.rs:685`), once, at the pump's
-open (`PumpMemory::decide`, `agents/roomlerd/src/media_pair_memory.rs:616`):
+open (`PumpMemory::decide`, `agents/roomlerd/src/media_pair_memory.rs:610`):
 
 | Switch | Key | The pair's entry | Opens by | `taken` | `taken_why` |
 |---|---|---|---|---|---|
@@ -3775,9 +3775,9 @@ place: `new_with` with `pair_memory.plan()`, and the two encoder opens read
 Both are at INFO, and only on a constrained session of the FFmpeg data-channel pump with
 the switch not `off`.
 `FR-148 P1 path memory: the pair's entry at the open` is written once the governor is
-built (`ModelGuard::open_line`, `media_pair_memory.rs:326`).
+built (`ModelGuard::open_line`, `media_pair_memory.rs:320`).
 `FR-148 P1 path memory: what the close wrote` is written as the pump drops, after
-today's file (`media_pair_memory.rs:381`). A test pins the names and their order
+today's file (`media_pair_memory.rs:375`). A test pins the names and their order
 (`the_two_lines_name_their_fields`).
 
 | Open line field | Meaning |
@@ -3862,7 +3862,7 @@ in `media_delivery`, so the env-read count of the FR-135 ratchet does not move.
 |---|---|
 | the key, the file, the session, the close, the opening | `agents/roomlerd/src/encode/pair_memory.rs:248` (`pair_key`), `:226` (`viewer_net`), `:416` (`PathMemory`), `:515` (`PathMemory::update`, the lock), `:388` (the entry's check), `:828` (`SessionMemory`), `:1251` (`close`), `:563` (`model_opening`), `:600` (`OpenPlan`), `:685` (`Taken::decide`) |
 | counted evidence (D29) | `agents/roomlerd/src/encode/pair_memory.rs:729` (`window_read`), `:750` (`pushing_against_plan`), `:796` (`Take::of`); `viewer_rate::age_is_plausible` at `agents/roomlerd/src/encode/viewer_rate.rs:709` |
-| the glue: facts, guards, the lines | `agents/roomlerd/src/media_pair_memory.rs:61` (`PairFacts`), `:210` (`RateMemoryGuard`), `:262` (`ModelGuard`), `:326` (the open line), `:381` (the write and the close line), `:518` (`open`), `:616` (`decide`), `:660` (`plan`), `:672` (`at_open`), `:705` (`window`) |
+| the glue: facts, guards, the lines | `agents/roomlerd/src/media_pair_memory.rs:61` (`PairFacts`), `:204` (`RateMemoryGuard`), `:256` (`ModelGuard`), `:320` (the open line), `:375` (the write and the close line), `:512` (`open`), `:610` (`decide`), `:654` (`plan`), `:666` (`at_open`), `:699` (`window`) |
 | the governor's opening | `agents/roomlerd/src/encode/governor.rs:597` (`new_with`), `:709` (`open_at_bps`), `:718` (`opening_of`) |
 | the gate's verdict before the fold | `agents/roomlerd/src/encode/governor.rs:1648`; `Pipe` at `agents/roomlerd/src/encode/pipe.rs:332` (`observe_delivered_in`), `:1213` (`PathModel::offer`) |
 | the samples' push-backs (D46 B2) | `agents/roomlerd/src/encode/governor.rs:1636` (the take they are filed under), `:2359` (`on_sample_push_back`), `:2370` (`note_path_stall`); `agents/roomlerd/src/encode/pipe.rs:518` (`observe_sample_capacity`), `:537` (`note_stall`), `:1016` (`PathModel::sample_pushed_back`); `agents/roomlerd/src/encode/pair_memory.rs:1071` (`sample_pushed_back_in`) |

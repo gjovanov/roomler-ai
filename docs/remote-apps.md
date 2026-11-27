@@ -330,7 +330,7 @@ restart changes it. That is why P6 added a fourth value:
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
   entry rode the same default the same way — and is assigned by the same
-  seam (`with_config_lists`, `caps.rs:3095`; `files_caps` `:4824`), which a
+  seam (`with_config_lists`, `caps.rs:3095`; `files_caps` `:4828`), which a
   test locks assignment by assignment: `detect()` itself cannot run in a
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
