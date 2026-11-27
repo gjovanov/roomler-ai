@@ -1,11 +1,12 @@
 # FR-158: A tunnel session outlives its control sockets — a roll, an exit's redial or one bad stream never cuts the connections it carries
 
-**Issue:** [#4509](https://github.com/gjovanov/roomler-ai/issues/4509) · **Status:** claimed 2026-11-27, spec only. P0 (the root-cause map, the RED cells, this spec) is this PR; nothing is built. D1–D6 (§7) are open, each with a recommendation · **Owner:** the agent's tunnel plane (exit and client), the network module · **Anchors:** master `21f0923b0`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** [#4501](https://github.com/gjovanov/roomler-ai/issues/4501) · **Builds on:** [FR-138](FR-138-the-session-outlives-its-control-socket.md) (the same shape for remote-control sessions), R3 (PR #715: `tunnel_peers_survive_reattach` and `rc.tunnel_grace_secs`), #1754 (the tunnel reap), [FR-86](FR-86-tunnel-transport-reupgrade.md) (the flow owns its listener; make-before-break re-upgrade) · **Related:** #4492 (one writer owns the route-to-flow map), #2944 (FR-123 P1, the tunnel plane into its own crate)
+**Issue:** [#4509](https://github.com/gjovanov/roomler-ai/issues/4509) · **Status:** claimed 2026-11-27, spec only. P0 (the root-cause map, the RED cells, this spec) is this PR; nothing is built. D1–D7 (§7) are open, each with a recommendation · **Owner:** the agent's tunnel plane (exit and client), the network module · **Anchors:** master `21f0923b0`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** [#4501](https://github.com/gjovanov/roomler-ai/issues/4501) · **Builds on:** [FR-138](FR-138-the-session-outlives-its-control-socket.md) (the same shape for remote-control sessions), R3 (PR #715: `tunnel_peers_survive_reattach` and `rc.tunnel_grace_secs`), #1754 (the tunnel reap), [FR-86](FR-86-tunnel-transport-reupgrade.md) (the flow owns its listener; make-before-break re-upgrade) · **Related:** #4492 (one writer owns the route-to-flow map), #2944 (FR-123 P1, the tunnel plane into its own crate)
 
 ## Summary, for the operator
 
 **Today** three things end a live tunnel session, and after each one every new connection waits until a new session
-opens:
+opens. After a roll it can fail outright instead: a client that does not hear its session end keeps a session that
+can open no new flow (F1, §2.5):
 
 1. **A server roll.** The rolled pod's teardown of each exit's control socket terminates every session aimed at that
    exit at once. Production configures no grace, and a grace would not help: its timer runs on the pod that is going
@@ -118,7 +119,7 @@ sequenceDiagram
 | The exit's accept loop reads each preamble inline; any error from it, a per-stream one included, `break`s the loop | `crates/tunnel-core/src/transport/quic.rs:591-600`; `agents/roomlerd/src/tunnel/quic_peer.rs:155-174` (`:169-172`) |
 | The loop's end is reported as `QuicConnEnded`, although the connection is healthy | `quic_peer.rs:103-125` (`:111-123`) |
 | The reap closes the peer and sends `rc:tunnel.terminate IoError`, which the server relays to the client | `signaling.rs:3061-3108` (`:3085`, `:3100-3106`); `crates/modules/network/src/agent_arms.rs:502-510` |
-| The application code 0: quinn closes a connection with code 0 when its last handle drops, and every stream holds one; with no exit-side flow mid-copy, dropping the loop's handle and the peer's stashed streams is that last drop | quinn 0.11.9 `src/connection.rs:927-941`, `:1241-1243`; `src/send_stream.rs:35`, `src/recv_stream.rs:53` |
+| The application code 0: quinn closes a connection with code 0 and no reason when its last handle drops, and every stream holds one; the reap drops the loop's handle and the peer's stashed streams | quinn 0.11.9 `src/connection.rs:927-941`, `:1241-1243`; `src/send_stream.rs:35`, `src/recv_stream.rs:53` |
 | A later forward for the reaped session is refused | `signaling.rs:5290` |
 | The trigger flow logs only when both of its pumps end, so its zero-byte line can land at the loss itself | `forward.rs:832-833` |
 
@@ -127,8 +128,8 @@ sequenceDiagram
 | Cell | Where | On master |
 |---|---|---|
 | A stream reset before its preamble costs only that stream (real quinn, in process) | `agents/roomlerd/src/tunnel/quic_peer.rs`, `a_stream_reset_before_its_preamble_costs_only_that_stream` | RED, 2026-11-27 11:37Z: `flow 3 = Err("agent quic: flow 3 stream not opened within 5s"), reaped = Some(QuicConnEnded), accept loop ended = true`. The four other `quic_peer` tests pass |
-| A roll keeps the forward on the same session, an in-flight connection moving and a new one served (two pods, both agents' real loops, quic-v1) | `crates/tests/src/tunnel_survival_tests.rs`, `an_in_flight_tunnel_connection_survives_a_rolled_pod` | the CI run is in §9 |
-| An exit's control socket cycling does the same | the same file, `an_in_flight_tunnel_connection_survives_its_exits_control_socket_cycling` | the CI run is in §9 |
+| A roll keeps the forward on the same session, an in-flight connection moving and a new one served (two pods, both agents' real loops, quic-v1) | `crates/tests/src/tunnel_survival_tests.rs`, `an_in_flight_tunnel_connection_survives_a_rolled_pod` | RED on CI, 2026-11-27 12:26Z (§9): the connection opened before the roll echoed for 12 s and the forward kept its session id, but a new connection was closed at once (`read: early eof`). This is F1 |
+| An exit's control socket cycling does the same | the same file, `an_in_flight_tunnel_connection_survives_its_exits_control_socket_cycling` | RED on CI, 12:40Z (§9): the connection opened before the cut echoed for 12 s and a new connection was served, but by a new session: the forward's session was ended and replaced |
 
 Each lands `#[ignore]`d with its reason, and the phase that fixes it removes the attribute. The integration cells
 read which session the forward runs through `TunnelClientHub::live_session_id`, a read-only accessor this PR adds.
@@ -152,7 +153,8 @@ read which session the forward runs through `TunnelClientHub::live_session_id`, 
   Nothing removes a session's demux entry when the client's socket drops (`client_mgr.rs:118`; the only removals are
   `:513`, `:632`, `:1063`, `:1605`), and the serving phase waits only for the carrier to die (`:1478-1512`;
   `driver.rs:770-800`). So when the server's terminate does not reach the client first, the session keeps its old
-  connections but every new flow's request fails to send, and nothing ends it. The comment on `ChannelSource`
+  connections but every new flow's request fails to send, and it ends only when its QUIC connection does. The roll
+  cell reads exactly this on master (§9). The comment on `ChannelSource`
   (`client_mgr.rs:703`) says a WS drop removes the entry; the code does not. P3 re-points the egress.
 - **F2. The accept loop's end is a `debug!`** (`quic_peer.rs:170`), so a field log cannot tell a stream fault from
   a connection end. P1 makes it an `info!` that says which.
@@ -244,7 +246,8 @@ agent's switch is on, the server it last spoke to announced a window, and the se
   and in the field a promote with a live SOCKS route and a live forward through two exits shows no terminate at the
   client, no reset of an in-flight connection, and no webrtc-dc-v1 fallback.
 - [ ] **AC3.** An exit's control socket cycling while its data path holds does the same: the integration cell
-  passes, and a lab read that drops an exit's control socket on purpose keeps its in-flight connection.
+  passes, and a lab read that drops an exit's control socket on purpose shows no terminate at the client and no
+  re-open, with its in-flight connection kept.
 - [ ] **AC4.** Every guarantee holds: a policy change, a revoke or a device removal during the gap ends the session at
   the claim and never later than `resume_by`; a claim for another tenant's, another agent's or an ended session is
   refused; with the window at 0 every P0 cell reads as at the pin.
@@ -273,6 +276,7 @@ agent's switch is on, the server it last spoke to announced a window, and the se
 | **D4** | A stopgap now: production's grace plus R3 on the exits | yes / no | **No.** It covers only Class 2a's control-plane half. At a roll the grace timer dies with its pod, so the client is never told, and its session keeps a dead egress (F1): its old connections may live while no new one is ever served |
 | **D5** | The data plane a network change kills (2a's stalled relay leg) | in this FR / out | **Out**: it needs a path move under the QUIC connection (a new relay leg, the client re-targeted), its own FR if the field asks |
 | **D6** | P1 without a runtime switch | a switch / none | **None**: the switch would only bring the bug back; a revert is the switch |
+| **D7** | F1 before P3: the roll cell shows a client that missed its session's end serving no new connection | (a) a phase beside P1: a session whose client's control socket drops ends at once, as the comment at `client_mgr.rs:703` already says it does, and re-opens on the new socket; (b) leave it to P3's re-pointed egress | **(a).** It turns the roll's worst case (new connections refused while any old one lives) into today's ordinary one (new connections wait for the re-open), it is small and agent-only, and it is what P3 should fall back to with its switch off |
 
 ## 8. Out of scope
 
@@ -287,4 +291,8 @@ agent's switch is on, the server it last spoke to announced a window, and the se
 
 - **2026-11-27.** The reads in §2.1: the client's daemon log 09:15–09:50Z and around the 10:35Z promote (read-only,
   on the client), the two exits' logs 09:15–09:50Z (read by the coordinator with the operator's go). P0's unit cell
-  RED at 11:37Z (§2.3); the integration cells' CI run: *added when it lands*.
+  RED at 11:37Z (§2.3). The integration cells, un-ignored at `3f02fb890`, RED on CI in
+  [run 45998021067](https://github.com/gjovanov/roomler-ai/actions/runs/45998021067): the roll at 12:26Z read
+  `in_flight: Ok, fresh: Err("read: early eof")`, the session id the same before and after; the exit's cycle at
+  12:40Z read `in_flight: Ok, fresh: Ok`, the session id different after. Each cell's half that reads Ok on master
+  stays in the cell: it is what the fix must keep.
