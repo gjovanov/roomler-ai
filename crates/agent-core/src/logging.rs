@@ -221,7 +221,7 @@ pub fn init() {
 
     let env_filter = filter();
 
-    let stdout = fmt::layer().with_target(false).compact();
+    let ansi = stdout_colour(); // #3938: a terminal, and NO_COLOR unset or empty
 
     // rc.58 — log-upload layer. Captures every tracing event into an
     // mpsc channel; `main.rs` claims the receiver via
@@ -265,6 +265,10 @@ pub fn init() {
         prune_old_logs(d, KEEP_DAYS);
         let (nb, guard) = tracing_appender::non_blocking(appender);
         let _ = GUARD.set(Mutex::new(Some(guard)));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the daemon's log file: never coloured (root clippy.toml, #3938)"
+        )]
         let file = fmt::layer()
             .with_writer(nb)
             .with_target(false)
@@ -274,7 +278,7 @@ pub fn init() {
         // Its writer drops them: a per-layer filter here would make the whole
         // stack's level TRACE (`init_keeps_the_level_of_the_default_filter`).
         let console = std::io::stdout.with_filter(|meta| meta.target() != STEP_TARGET);
-        let stdout = stdout.with_writer(console);
+        let stdout = console_layer(console, ansi);
         let _ = filtered(env_filter)
             .with((!quiet).then_some(stdout))
             .with(file)
@@ -283,7 +287,7 @@ pub fn init() {
         install_panic_hook(d.to_path_buf());
     } else {
         let _ = filtered(env_filter)
-            .with(stdout)
+            .with(console_layer(std::io::stdout, ansi))
             .with(upload_layer)
             .try_init();
         // No log dir → no panic hook. Stdout-only is the right
@@ -1290,6 +1294,53 @@ fn format_panic(
         buf.push('\n');
     }
     buf
+}
+
+/// #3938 — whether a console's log lines are coloured: only when the stream they
+/// are written to is a terminal and `NO_COLOR` is unset or empty. A pipe, a file,
+/// the journal or a service's absent console stores plain text, with the same
+/// words, levels and fields. Each caller asks its own stream once, at start.
+///
+/// Used by the daemon ([`init`], stdout), the companion (stderr) and the Setup
+/// wizard (stderr, through `roomlerd::logging`). The same rule, word for word,
+/// lives in three other homes, each with this table test: the server
+/// (`crates/api/src/logging.rs`), the DERP relay (`crates/derp-relay/src/main.rs`)
+/// and the CLI (`agents/roomler-cli/src/cli.rs`). No crate that a console rule
+/// belongs in is shared by all five.
+pub fn colour(stream_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stream_is_terminal && no_color.is_none_or(std::ffi::OsStr::is_empty)
+}
+
+/// #3938 — [`colour`] asked of this process's stdout, the stream [`init`]'s
+/// console layer writes.
+fn stdout_colour() -> bool {
+    use std::io::IsTerminal;
+    colour(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    )
+}
+
+/// #3938 — the console layer [`init`] installs, in both of its branches: the
+/// daemon's lines in the compact format with no target, written into `writer`,
+/// coloured only when `colour` says so ([`stdout_colour`]).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the daemon's console: its colour is the caller's, from stdout_colour (root clippy.toml, #3938)"
+)]
+fn console_layer<S, W>(
+    writer: W,
+    colour: bool,
+) -> fmt::Layer<S, fmt::format::DefaultFields, fmt::format::Format<fmt::format::Compact>, W>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> fmt::MakeWriter<'w> + 'static,
+{
+    fmt::layer()
+        .with_target(false)
+        .compact()
+        .with_writer(writer)
+        .with_ansi(colour)
 }
 
 #[cfg(test)]
@@ -2571,6 +2622,136 @@ mod tests {
             );
             let log = today(dir.path());
             assert!(log.contains("the-last-words"), "{log}");
+        }
+    }
+
+    /// #3938 — the console's colour. Each test writes one event with a field
+    /// through [`console_layer`], the layer [`init`] installs, into a buffer and
+    /// under a scoped subscriber: the test binary shares its process.
+    mod colour {
+        use super::super::*;
+        use std::sync::Arc;
+
+        /// What the console's stream would have received.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// The line [`console_layer`] writes into `writer`, as `out` holds it.
+        fn written<W>(out: &Captured, writer: W, colour: bool) -> String
+        where
+            W: for<'w> fmt::MakeWriter<'w> + Send + Sync + 'static,
+        {
+            let subscriber = tracing_subscriber::registry().with(console_layer(writer, colour));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(peers = 3, "a console line with a field");
+            });
+            let bytes = out.0.lock().unwrap().clone();
+            String::from_utf8(bytes).expect("the console's text is UTF-8")
+        }
+
+        /// The console as the branch with no log file installs it: stdout itself.
+        fn on_stdout(colour: bool) -> String {
+            let out = Captured::default();
+            written(&out, out.clone(), colour)
+        }
+
+        /// The console as the branch with a log file installs it: a writer that
+        /// keeps an installer step's own lines for the file (#3230).
+        fn beside_a_log_file(colour: bool) -> String {
+            let out = Captured::default();
+            let console = out.clone().with_filter(|meta| meta.target() != STEP_TARGET);
+            written(&out, console, colour)
+        }
+
+        /// The issue's captures: `roomlerd enroll`'s lines in a script's output,
+        /// read through a pipe, held `\x1b[2m`, `\x1b[32m` and `\x1b[3m`. With
+        /// colour off the line holds no ESC byte, and its text is the same.
+        fn plain(branch: &str, line: &str) {
+            assert!(
+                line.contains("a console line with a field"),
+                "{branch}: the event is written: {line:?}"
+            );
+            assert!(
+                !line.contains('\x1b'),
+                "{branch}: no colour code when colour is off: {line:?}"
+            );
+            assert!(
+                line.contains("INFO"),
+                "{branch}: the level reads as before: {line:?}"
+            );
+            assert!(
+                line.contains("peers=3"),
+                "{branch}: the field reads as before: {line:?}"
+            );
+        }
+
+        #[test]
+        fn a_console_line_without_colour_holds_no_escape_byte() {
+            plain("no log file", &on_stdout(false));
+        }
+
+        #[test]
+        fn a_console_line_beside_a_log_file_without_colour_holds_no_escape_byte() {
+            plain("a log file", &beside_a_log_file(false));
+        }
+
+        /// A terminal keeps its colour: the codes are there, around the same text.
+        #[test]
+        fn a_console_line_with_colour_holds_escape_codes() {
+            for (branch, line) in [
+                ("no log file", on_stdout(true)),
+                ("a log file", beside_a_log_file(true)),
+            ] {
+                assert!(
+                    line.contains("a console line with a field"),
+                    "{branch}: the event is written: {line:?}"
+                );
+                assert!(
+                    line.contains('\x1b'),
+                    "{branch}: a terminal gets colour codes: {line:?}"
+                );
+            }
+        }
+
+        /// The server's table, word for word (`crates/api/src/logging.rs`): colour
+        /// only on a terminal, and never under a non-empty `NO_COLOR`.
+        #[test]
+        fn colour_only_on_a_terminal_and_never_under_no_color() {
+            use std::ffi::OsStr;
+            let cases: [(bool, Option<&str>, bool); 8] = [
+                (true, None, true),
+                (true, Some(""), true),
+                (true, Some("1"), false),
+                (true, Some("0"), false),
+                (false, None, false),
+                (false, Some(""), false),
+                (false, Some("1"), false),
+                (false, Some("0"), false),
+            ];
+            for (terminal, no_color, want) in cases {
+                assert_eq!(
+                    colour(terminal, no_color.map(OsStr::new)),
+                    want,
+                    "terminal={terminal} NO_COLOR={no_color:?}"
+                );
+            }
         }
     }
 }

@@ -392,7 +392,7 @@ pub struct Observed {
     pub awake: Duration,
     /// The wall clock, unix seconds.
     pub now: u64,
-    /// The wake file came back since the last cycle.
+    /// What is at the wake path changed since the last cycle ([`wake::woke`]).
     pub wake: bool,
     /// Awake time since the last cycle ended.
     pub since_cycle: Duration,
@@ -550,6 +550,605 @@ const ASK_WAITS_FOR_THE_ROOT_HALF: &str = "Your ask is recorded: the update inst
 /// seven counted defers an hour apart.
 pub const NO_ASK_SAYS: &str = "The update installs when nothing on this Mac is in use, or \
      within about seven hours if something still is.";
+
+/// #4372 — the wake path on a Mac, as the root update helper reads it at the
+/// start of a run and while it waits. The helper keeps its own file at the
+/// wake path and reads a wake as a change to it, so its own consume no longer
+/// starts launchd again; anything else at the path is replaced once. The
+/// decisions are pure and compiled on every OS; the reads and writes are unix,
+/// and only the Mac's helper calls them (`updater::run_update_helper`). The
+/// content is never read.
+pub mod wake {
+    use std::path::{Path, PathBuf};
+
+    /// The parts of what is at the wake path that a write, a touch, a mode
+    /// change, a new link or a replacement changes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Stamp {
+        pub dev: u64,
+        pub ino: u64,
+        pub size: u64,
+        pub mtime_ns: i128,
+        pub ctime_ns: i128,
+    }
+
+    /// What kind of entry is at the wake path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        File,
+        Folder,
+        /// Neither: a link, or any other kind.
+        Other,
+    }
+
+    /// What `lstat` read at the wake path. Never followed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Entry {
+        pub kind: Kind,
+        pub owner: u32,
+        /// The permission bits, `st_mode & 0o7777`.
+        pub mode: u32,
+        pub links: u64,
+        pub stamp: Stamp,
+    }
+
+    /// The mode of the helper's own file: every local writer can wake it.
+    pub const MODE: u32 = 0o666;
+
+    impl Entry {
+        /// The helper's own file: a regular file of `owner`'s, [`MODE`], one
+        /// link.
+        pub fn is_own(&self, owner: u32) -> bool {
+            self.kind == Kind::File && self.owner == owner && self.mode == MODE && self.links == 1
+        }
+    }
+
+    /// What the run's start does at the wake path, first, before every gate.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StartStep {
+        /// The helper's own file is there: it stays as it is, and its stamp
+        /// is the wait's baseline.
+        Keep(Stamp),
+        /// Nothing is there: the helper makes its own file.
+        Create,
+        /// A folder is there: it goes into a fresh folder beside it and is
+        /// removed there, then the helper makes its own file.
+        MoveAside,
+        /// Anything else is there, or nothing could be read: the helper puts
+        /// its own file over it.
+        Replace,
+    }
+
+    impl StartStep {
+        /// Whether the step changes the wake path. launchd's `WatchPaths`
+        /// starts the job again for a change the run itself makes there.
+        pub fn changes_path(&self) -> bool {
+            !matches!(self, StartStep::Keep(_))
+        }
+    }
+
+    /// What the start does with what `lstat` found at the wake path. `owner`
+    /// is the uid the helper runs as (root).
+    pub fn start_step(found: &std::io::Result<Option<Entry>>, owner: u32) -> StartStep {
+        match found {
+            Ok(None) => StartStep::Create,
+            Ok(Some(entry)) if entry.is_own(owner) => StartStep::Keep(entry.stamp),
+            Ok(Some(entry)) if entry.kind == Kind::Folder => StartStep::MoveAside,
+            Ok(Some(_)) | Err(_) => StartStep::Replace,
+        }
+    }
+
+    /// Whether a waiting helper reads a wake: what is at the wake path is not
+    /// what the baseline read. A removal is a change, and so is a file where
+    /// there was none.
+    pub fn woke(baseline: Option<Stamp>, now: Option<Stamp>) -> bool {
+        baseline != now
+    }
+
+    /// A waiting helper's wake, read each tick ([`Watch::look`]).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Watch {
+        path: PathBuf,
+        baseline: Option<Stamp>,
+        last: Option<Stamp>,
+    }
+
+    impl Watch {
+        /// The wait's view of `path`, from what the run's start left there.
+        pub fn new(path: &Path, baseline: Option<Stamp>) -> Watch {
+            Watch {
+                path: path.to_path_buf(),
+                baseline,
+                last: baseline,
+            }
+        }
+
+        /// The wake path.
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// One tick's read of the wake path: whether it is a wake. The read
+        /// is kept for [`Watch::cycled`].
+        pub fn look_at(&mut self, now: Option<Stamp>) -> bool {
+            self.last = now;
+            woke(self.baseline, now)
+        }
+
+        /// A cycle starts from the tick that decided it: the baseline becomes
+        /// that tick's read, never a read taken after the cycle, so a write
+        /// made during the cycle is the next tick's wake.
+        pub fn cycled(&mut self) {
+            self.baseline = self.last;
+        }
+
+        /// [`Watch::look_at`] with a read of the path now.
+        #[cfg(unix)]
+        pub fn look(&mut self) -> bool {
+            let now = stamp_at(&self.path);
+            self.look_at(now)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Entry {
+        /// The entry `lstat` describes.
+        pub fn of(meta: &std::fs::Metadata) -> Entry {
+            use std::os::unix::fs::MetadataExt as _;
+            let ft = meta.file_type();
+            let kind = if ft.is_file() {
+                Kind::File
+            } else if ft.is_dir() {
+                Kind::Folder
+            } else {
+                Kind::Other
+            };
+            let ns = |secs: i64, nsec: i64| i128::from(secs) * 1_000_000_000 + i128::from(nsec);
+            Entry {
+                kind,
+                owner: meta.uid(),
+                mode: meta.mode() & 0o7777,
+                links: meta.nlink(),
+                stamp: Stamp {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                    size: meta.size(),
+                    mtime_ns: ns(meta.mtime(), meta.mtime_nsec()),
+                    ctime_ns: ns(meta.ctime(), meta.ctime_nsec()),
+                },
+            }
+        }
+    }
+
+    /// What is at `path`, by `lstat`: `None` when nothing is.
+    #[cfg(unix)]
+    pub fn read(path: &Path) -> std::io::Result<Option<Entry>> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => Ok(Some(Entry::of(&meta))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The stamp of what is at `path`; `None` when nothing is, or when it
+    /// cannot be read.
+    #[cfg(unix)]
+    pub fn stamp_at(path: &Path) -> Option<Stamp> {
+        read(path).ok().flatten().map(|entry| entry.stamp)
+    }
+
+    /// The run's start, first, before every gate: the helper's own file at
+    /// `path`, kept or made ([`start_step`]), and the wait's [`Watch`] from
+    /// its stamp. `owner` is the uid the helper runs as. The content is
+    /// neither read nor written.
+    #[cfg(unix)]
+    pub fn settle(path: &Path, owner: u32) -> Watch {
+        let step = start_step(&read(path), owner);
+        let made = match step {
+            StartStep::Keep(stamp) => return Watch::new(path, Some(stamp)),
+            StartStep::Create => create(path),
+            StartStep::MoveAside => move_aside(path).and_then(|()| create(path)),
+            StartStep::Replace => replace(path),
+        };
+        let baseline = match made {
+            Ok(stamp) => {
+                tracing::info!(?step, "update-helper: made its own wake file");
+                Some(stamp)
+            }
+            Err(e) => {
+                tracing::warn!(?step, error = %e, path = %path.display(), "update-helper: its own wake file could not be made; a wake is a change to what is there");
+                stamp_at(path)
+            }
+        };
+        Watch::new(path, baseline)
+    }
+
+    /// The helper's own file where nothing is: opened by name only with
+    /// `O_CREAT | O_EXCL | O_NOFOLLOW`, then [`MODE`] on its descriptor.
+    #[cfg(unix)]
+    fn create(path: &Path) -> std::io::Result<Stamp> {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(MODE))?;
+        Ok(Entry::of(&file.metadata()?).stamp)
+    }
+
+    /// The helper's own file over what is at `path`: a fresh file beside it
+    /// (`mkstemp`), [`MODE`] on its descriptor, then renamed over the path.
+    #[cfg(unix)]
+    fn replace(path: &Path) -> std::io::Result<Stamp> {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut template = beside(path, ".XXXXXX");
+        // SAFETY: a writable, NUL-terminated template that mkstemp fills in.
+        let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast::<libc::c_char>()) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor mkstemp just opened, owned by nothing else.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let tmp = filled(template);
+        let placed = file
+            .set_permissions(std::fs::Permissions::from_mode(MODE))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = placed {
+            // The rename did not happen, so the fresh file still has its
+            // own name and the helper removes it there; after the rename
+            // the helper never touches that name again.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(Entry::of(&file.metadata()?).stamp)
+    }
+
+    /// A folder at `path`, renamed into a fresh folder beside it (`mkdtemp`,
+    /// 0700) and removed there, as the Linux helper's consume does.
+    #[cfg(unix)]
+    fn move_aside(path: &Path) -> std::io::Result<()> {
+        let mut template = beside(path, ".aside.XXXXXX");
+        // SAFETY: a writable, NUL-terminated template that mkdtemp fills in.
+        if unsafe { libc::mkdtemp(template.as_mut_ptr().cast::<libc::c_char>()) }.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let aside = filled(template);
+        if let Err(e) = std::fs::rename(path, aside.join("moved")) {
+            let _ = std::fs::remove_dir(&aside);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::remove_dir_all(&aside) {
+            tracing::warn!(error = %e, path = %aside.display(), "update-helper: what was moved aside from the wake path could not be removed");
+        }
+        Ok(())
+    }
+
+    /// `.<name><suffix>` in `path`'s folder, NUL-terminated: a template for
+    /// `mkstemp` and `mkdtemp`.
+    #[cfg(unix)]
+    fn beside(path: &Path, suffix: &str) -> Vec<u8> {
+        use std::os::unix::ffi::OsStringExt as _;
+        let mut leaf = std::ffi::OsString::from(".");
+        leaf.push(path.file_name().unwrap_or_default());
+        leaf.push(suffix);
+        let folder = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut bytes = folder.join(leaf).into_os_string().into_vec();
+        bytes.push(0);
+        bytes
+    }
+
+    /// The path `mkstemp` or `mkdtemp` wrote into a template.
+    #[cfg(unix)]
+    fn filled(mut template: Vec<u8>) -> PathBuf {
+        use std::os::unix::ffi::OsStringExt as _;
+        template.pop();
+        PathBuf::from(std::ffi::OsString::from_vec(template))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn stamp(ino: u64) -> Stamp {
+            Stamp {
+                dev: 1,
+                ino,
+                size: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            }
+        }
+
+        /// The helper's own file: root's, [`MODE`], one link.
+        fn own() -> Entry {
+            Entry {
+                kind: Kind::File,
+                owner: 0,
+                mode: MODE,
+                links: 1,
+                stamp: stamp(7),
+            }
+        }
+
+        #[test]
+        fn a_file_where_there_was_none_is_a_wake_and_nothing_is_none() {
+            assert!(woke(None, Some(stamp(1))));
+            assert!(!woke(None, None));
+        }
+
+        /// #4372 — a change the start makes at the path is one more launchd
+        /// run, a minute later, for every wake.
+        #[test]
+        fn the_start_makes_no_change_to_the_helpers_own_file() {
+            assert!(!start_step(&Ok(Some(own())), 0).changes_path());
+        }
+
+        #[test]
+        fn an_unchanged_wake_file_is_no_wake() {
+            assert!(!woke(Some(stamp(7)), Some(stamp(7))));
+        }
+
+        /// After a cycle the baseline is the read of the tick that decided
+        /// it, so a write made during the cycle is the next tick's wake.
+        #[test]
+        fn a_write_during_a_cycle_is_the_next_ticks_wake() {
+            let mut watch = Watch::new(Path::new("/w"), Some(stamp(0)));
+            assert!(watch.look_at(Some(stamp(1))), "a write since the start");
+            watch.cycled();
+            assert!(watch.look_at(Some(stamp(2))), "a write during that cycle");
+            watch.cycled();
+            assert!(!watch.look_at(Some(stamp(2))), "served by the second cycle");
+        }
+
+        /// What the start does with each shape at the wake path. Only the
+        /// helper's own file stays as it is.
+        #[test]
+        fn the_start_keeps_only_its_own_file() {
+            let rows: [(&str, std::io::Result<Option<Entry>>, StartStep); 9] = [
+                ("nothing", Ok(None), StartStep::Create),
+                ("its own file", Ok(Some(own())), StartStep::Keep(stamp(7))),
+                (
+                    "owner 501",
+                    Ok(Some(Entry {
+                        owner: 501,
+                        ..own()
+                    })),
+                    StartStep::Replace,
+                ),
+                (
+                    "mode 0644",
+                    Ok(Some(Entry {
+                        mode: 0o644,
+                        ..own()
+                    })),
+                    StartStep::Replace,
+                ),
+                (
+                    "mode 1666",
+                    Ok(Some(Entry {
+                        mode: 0o1666,
+                        ..own()
+                    })),
+                    StartStep::Replace,
+                ),
+                (
+                    "two links",
+                    Ok(Some(Entry { links: 2, ..own() })),
+                    StartStep::Replace,
+                ),
+                (
+                    "a folder",
+                    Ok(Some(Entry {
+                        kind: Kind::Folder,
+                        ..own()
+                    })),
+                    StartStep::MoveAside,
+                ),
+                (
+                    "a link",
+                    Ok(Some(Entry {
+                        kind: Kind::Other,
+                        ..own()
+                    })),
+                    StartStep::Replace,
+                ),
+                (
+                    "unreadable",
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                    StartStep::Replace,
+                ),
+            ];
+            for (what, found, step) in &rows {
+                assert_eq!(start_step(found, 0), *step, "{what}");
+                assert_eq!(step.changes_path(), *what != "its own file", "{what}");
+            }
+        }
+
+        /// A wake is any change to what is at the wake path, its removal
+        /// included.
+        #[test]
+        fn a_wake_is_any_change_at_the_wake_path() {
+            let base = Stamp {
+                dev: 1,
+                ino: 2,
+                size: 3,
+                mtime_ns: 4,
+                ctime_ns: 5,
+            };
+            let rows = [
+                ("dev", Some(base), Some(Stamp { dev: 9, ..base }), true),
+                ("ino", Some(base), Some(Stamp { ino: 9, ..base }), true),
+                ("size", Some(base), Some(Stamp { size: 9, ..base }), true),
+                (
+                    "mtime",
+                    Some(base),
+                    Some(Stamp {
+                        mtime_ns: 9,
+                        ..base
+                    }),
+                    true,
+                ),
+                (
+                    "ctime",
+                    Some(base),
+                    Some(Stamp {
+                        ctime_ns: 9,
+                        ..base
+                    }),
+                    true,
+                ),
+                ("all equal", Some(base), Some(base), false),
+                ("the wake file was deleted", Some(base), None, true),
+                ("a file where there was none", None, Some(base), true),
+                ("nothing, then nothing", None, None, false),
+            ];
+            for (what, baseline, now, wake) in rows {
+                assert_eq!(woke(baseline, now), wake, "{what}");
+            }
+        }
+
+        #[cfg(unix)]
+        fn uid_of(path: &Path) -> u32 {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::symlink_metadata(path).unwrap().uid()
+        }
+
+        #[cfg(unix)]
+        fn names(dir: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn the_read_never_follows_a_link() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            std::fs::write(&target, b"bytes").unwrap();
+            let wake = dir.path().join("wake");
+            std::os::unix::fs::symlink(&target, &wake).unwrap();
+            let entry = read(&wake).unwrap().unwrap();
+            assert_eq!(entry.kind, Kind::Other);
+            assert_ne!(entry.stamp, read(&target).unwrap().unwrap().stamp);
+            assert_eq!(read(&dir.path().join("nothing")).unwrap(), None);
+        }
+
+        /// Where nothing is, the start makes its own file, [`MODE`] whatever
+        /// the umask, and the wait starts from its stamp.
+        #[cfg(unix)]
+        #[test]
+        fn the_start_makes_its_own_file_where_nothing_is() {
+            let dir = tempfile::tempdir().unwrap();
+            let me = uid_of(dir.path());
+            let wake = dir.path().join("wake");
+            let mut watch = settle(&wake, me);
+            let entry = read(&wake).unwrap().unwrap();
+            assert!(entry.is_own(me), "{entry:?}");
+            assert_eq!(watch.path(), wake);
+            assert!(!watch.look(), "its own new file is no wake");
+            assert_eq!(names(dir.path()), ["wake"]);
+        }
+
+        /// The start leaves its own file as it is, so the run changes nothing
+        /// that launchd watches.
+        #[cfg(unix)]
+        #[test]
+        fn the_start_leaves_its_own_file_as_it_is() {
+            let dir = tempfile::tempdir().unwrap();
+            let me = uid_of(dir.path());
+            let wake = dir.path().join("wake");
+            settle(&wake, me);
+            let before = read(&wake).unwrap().unwrap();
+            let mut watch = settle(&wake, me);
+            assert_eq!(read(&wake).unwrap().unwrap(), before);
+            assert!(!watch.look());
+        }
+
+        /// Anything else at the wake path is replaced by the helper's own
+        /// file, once: the next start keeps that file, and nothing else in
+        /// the folder changes.
+        #[cfg(unix)]
+        #[test]
+        fn anything_else_at_the_wake_path_is_replaced_once() {
+            use std::os::unix::fs::PermissionsExt as _;
+            /// What a case puts at the wake path.
+            type Make = fn(&Path);
+            let shapes: [(&str, Make); 4] = [
+                ("mode 0644", |wake| {
+                    std::fs::write(wake, b"x").unwrap();
+                    std::fs::set_permissions(wake, std::fs::Permissions::from_mode(0o644)).unwrap();
+                }),
+                ("two links", |wake| {
+                    std::fs::write(wake, b"x").unwrap();
+                    std::fs::set_permissions(wake, std::fs::Permissions::from_mode(MODE)).unwrap();
+                    std::fs::hard_link(wake, wake.with_file_name("second")).unwrap();
+                }),
+                ("a link", |wake| {
+                    std::os::unix::fs::symlink(wake.with_file_name("target"), wake).unwrap();
+                }),
+                ("a folder", |wake| {
+                    std::fs::create_dir(wake).unwrap();
+                    std::fs::write(wake.join("entry"), b"x").unwrap();
+                }),
+            ];
+            for (what, make) in shapes {
+                let dir = tempfile::tempdir().unwrap();
+                let me = uid_of(dir.path());
+                let target = dir.path().join("target");
+                std::fs::write(&target, b"target").unwrap();
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+                let wake = dir.path().join("wake");
+                make(&wake);
+                let mut watch = settle(&wake, me);
+                let made = read(&wake).unwrap().unwrap();
+                assert!(made.is_own(me), "{what}: {made:?}");
+                assert!(!watch.look(), "{what}: its own new file is no wake");
+                settle(&wake, me);
+                assert_eq!(read(&wake).unwrap().unwrap(), made, "{what}: kept");
+                let kept = read(&target).unwrap().unwrap();
+                assert_eq!(std::fs::read(&target).unwrap(), b"target", "{what}");
+                assert_eq!((kept.kind, kept.mode), (Kind::File, 0o640), "{what}");
+                let mut left = names(dir.path());
+                left.retain(|name| name != "second");
+                assert_eq!(left, ["target", "wake"], "{what}");
+            }
+        }
+
+        /// What every waker writes (`queue_update_check_at`), into the
+        /// helper's own file: a wake until a cycle serves it, and the file
+        /// stays the helper's own.
+        #[cfg(unix)]
+        #[test]
+        fn a_wake_written_into_the_helpers_own_file_is_served_once() {
+            let dir = tempfile::tempdir().unwrap();
+            let me = uid_of(dir.path());
+            let wake = dir.path().join("wake");
+            let mut watch = settle(&wake, me);
+            crate::updater::queue_update_check_at(&wake).unwrap();
+            assert!(watch.look(), "the write is a wake");
+            assert!(watch.look(), "until a cycle serves it");
+            watch.cycled();
+            assert!(!watch.look(), "served");
+            let written = read(&wake).unwrap().unwrap();
+            assert!(written.is_own(me), "written in place: {written:?}");
+            settle(&wake, me);
+            assert_eq!(
+                read(&wake).unwrap().unwrap(),
+                written,
+                "the next start keeps it"
+            );
+            std::fs::remove_file(&wake).unwrap();
+            assert!(watch.look(), "the wake file was deleted");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

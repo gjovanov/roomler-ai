@@ -23,12 +23,12 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::agent_presence_tests::{connect_agent, enroll};
 use crate::fixtures::test_app::TestApp;
 
-type Ws =
+pub(crate) type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// What the socket did within `within`.
 #[derive(Debug)]
-enum Heard {
+pub(crate) enum Heard {
     /// An `rc:goodbye` frame.
     Goodbye(Value),
     /// Our ping's pong: the server's read loop is still running.
@@ -41,7 +41,7 @@ enum Heard {
 
 /// Read until a goodbye, a pong, a close, or `within` passes. Other frames
 /// (the hello's replies) are skipped.
-async fn listen(ws: &mut Ws, within: Duration) -> Heard {
+pub(crate) async fn listen(ws: &mut Ws, within: Duration) -> Heard {
     let deadline = tokio::time::Instant::now() + within;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -65,7 +65,7 @@ async fn listen(ws: &mut Ws, within: Duration) -> Heard {
 }
 
 /// The socket is still served: a ping is answered.
-async fn still_served(ws: &mut Ws) -> bool {
+pub(crate) async fn still_served(ws: &mut Ws) -> bool {
     if ws
         .send(Message::Ping(b"2267".to_vec().into()))
         .await
@@ -76,7 +76,7 @@ async fn still_served(ws: &mut Ws) -> bool {
     matches!(listen(ws, Duration::from_secs(3)).await, Heard::Pong)
 }
 
-async fn wait_registered(app: &TestApp, agent_id: &str) -> ObjectId {
+pub(crate) async fn wait_registered(app: &TestApp, agent_id: &str) -> ObjectId {
     let aid = ObjectId::parse_str(agent_id).unwrap();
     for _ in 0..100 {
         if app.state.fleet().rc_hub.is_agent_online(aid) {

@@ -7831,6 +7831,10 @@ mod supervise_tests {
 
     /// [`supervise`] on a thread of its own, whose log is kept: a
     /// subscriber set for one thread hears that thread only.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn supervise_logged(
         desk: &Arc<Desktop>,
         first: XServer,

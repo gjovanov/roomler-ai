@@ -61,6 +61,10 @@ fn main() {
     // operator launches manually; persistent logging is the daemon's
     // job, not ours. Operators who want wizard-side logs run from a
     // terminal and observe stderr.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the wizard's console: its colour from roomlerd::logging::colour, asked of stderr (root clippy.toml, #3938)"
+    )]
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -68,6 +72,12 @@ fn main() {
         )
         .with_target(false)
         .with_writer(std::io::stderr)
+        // #3938 — coloured only when stderr is a terminal and NO_COLOR is
+        // unset or empty: the daemon's rule (`roomler_node_core::logging`).
+        .with_ansi(roomlerd::logging::colour(
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
         .try_init();
 
     // FR-129 C3 — an elevated relaunch waits for the limited copy that asked

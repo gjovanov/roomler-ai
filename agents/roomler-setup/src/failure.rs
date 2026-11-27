@@ -646,6 +646,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn the_terminal_event_names_the_step_and_the_log_says_the_same() {
         let (steps, _) = crate::steps::tests::tracker();
         steps.started(&[], None);

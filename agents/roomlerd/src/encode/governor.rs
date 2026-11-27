@@ -6991,6 +6991,10 @@ mod tests {
     /// back, and the model's floor is the busiest second. `--nocapture` prints
     /// the two lines.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn a_healthy_session_reads_application_limited() {
         let mut s = V5bSession::open(true, None);
         s.load();
