@@ -8209,4 +8209,121 @@ mod tests {
         );
         assert_eq!(err.to_string(), "permission denied: no device");
     }
+
+    /// FR-155 P1b, T12 — the pod's floor refuses a registration below the
+    /// generation a rotation named, and the sweep ends this pod's entry below
+    /// it and keeps the one at it, in either order of the two. Another
+    /// tenant's sweep ends nothing and binds nothing, and a floor expires.
+    #[tokio::test]
+    async fn the_hub_admits_no_connection_below_a_rotated_generation() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let register = |hub: &Hub, agent: ObjectId, generation: u32| {
+            hub.register_agent_resuming(
+                agent,
+                tenant,
+                ObjectId::new(),
+                OsKind::Linux,
+                2,
+                true,
+                false,
+                generation,
+                ResumeHello::default(),
+            )
+        };
+
+        // The sweep first: a registration below its floor is refused and
+        // leaves no entry, one at the floor is admitted, and a late sweep for
+        // the same rotation ends nothing.
+        let first = ObjectId::new();
+        assert!(
+            !hub.end_below_generation(first, tenant, 3),
+            "nothing to end yet"
+        );
+        match register(&hub, first, 2) {
+            Err(BelowFloor { floor }) => assert_eq!(floor, 3),
+            Ok(_) => panic!("a registration below the floor was admitted"),
+        }
+        assert!(
+            !hub.is_agent_online(first),
+            "a refused registration leaves no entry"
+        );
+        let at_floor = register(&hub, first, 3).expect("a registration at the floor");
+        assert!(!hub.end_below_generation(first, tenant, 3), "a late sweep");
+        assert!(hub.is_agent_online(first), "the entry at the floor stays");
+        assert_eq!(at_floor.cancel.reason(), None, "its cancel never fired");
+
+        // The registration first: the sweep ends the entry below the floor,
+        // with `Rotated` and a cancel that waits for a loop not yet waiting,
+        // and the floor then refuses that generation again.
+        let second = ObjectId::new();
+        let below = register(&hub, second, 0).expect("no floor yet");
+        assert!(
+            hub.end_below_generation(second, tenant, 1),
+            "the entry below the floor ends"
+        );
+        assert!(!hub.is_agent_online(second));
+        assert_eq!(below.cancel.reason(), Some(CancelReason::Rotated));
+        tokio::time::timeout(Duration::from_secs(1), below.cancel.notified())
+            .await
+            .expect("the cancel is latched for the read loop");
+        assert!(register(&hub, second, 0).is_err(), "the floor holds");
+        assert!(
+            register(&hub, second, 1).is_ok(),
+            "the new generation registers"
+        );
+
+        // Another tenant's sweep ends nothing, and its floor binds nothing.
+        let third = ObjectId::new();
+        let _kept = register(&hub, third, 0).expect("no floor");
+        assert!(!hub.end_below_generation(third, ObjectId::new(), 5));
+        assert!(
+            hub.is_agent_online(third),
+            "another tenant's sweep ends nothing"
+        );
+        assert!(
+            register(&hub, third, 0).is_ok(),
+            "and its floor binds nothing"
+        );
+
+        // A floor expires.
+        let fourth = ObjectId::new();
+        hub.end_below_generation_for(fourth, tenant, 2, Duration::ZERO);
+        assert!(
+            register(&hub, fourth, 1).is_ok(),
+            "an expired floor refuses nothing"
+        );
+
+        // The two at once, many times: whichever runs first, no entry below
+        // the floor is left, and each side saw the other.
+        for _ in 0..500 {
+            let agent = ObjectId::new();
+            let gate = std::sync::Barrier::new(2);
+            let (registered, ended) = std::thread::scope(|s| {
+                let registration = s.spawn(|| {
+                    gate.wait();
+                    register(&hub, agent, 0)
+                });
+                let sweep = s.spawn(|| {
+                    gate.wait();
+                    hub.end_below_generation(agent, tenant, 1)
+                });
+                (registration.join().unwrap(), sweep.join().unwrap())
+            });
+            assert!(
+                !hub.is_agent_online(agent),
+                "an entry below the floor outlived the race"
+            );
+            match registered {
+                Ok(reg) => {
+                    assert!(ended, "the sweep missed an admitted registration");
+                    assert_eq!(reg.cancel.reason(), Some(CancelReason::Rotated));
+                }
+                Err(BelowFloor { floor }) => {
+                    assert_eq!(floor, 1);
+                    assert!(!ended, "the sweep ended a refused registration");
+                }
+            }
+        }
+    }
 }
