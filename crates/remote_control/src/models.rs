@@ -8622,6 +8622,18 @@ mod tests {
         );
     }
 
+    /// FR-67 P5 / #3332 — the caps an agent sends, as JSON, with `words`
+    /// written in: every other key as `AgentCaps::default()` serialises it, so
+    /// the parse fails on nothing but the words (`has_input_permission`, for
+    /// one, has no serde default).
+    fn caps_json_with(words: serde_json::Value) -> serde_json::Value {
+        let mut caps = serde_json::to_value(AgentCaps::default()).unwrap();
+        for (key, value) in words.as_object().unwrap() {
+            caps[key.as_str()] = value.clone();
+        }
+        caps
+    }
+
     /// FR-67 P5 / #3332 — both health words survive every road the caps take:
     /// the agent's JSON parsed into `AgentCaps` (the hello, and a heartbeat's
     /// re-announce), the BSON the server stores (`AgentDao::
@@ -8630,9 +8642,7 @@ mod tests {
     /// dropped by the parse, and then no row ever shows it.
     #[test]
     fn the_caps_keep_the_install_verdict_and_the_crash_health() {
-        let sent = serde_json::json!({
-            "codecs": [],
-            "hw_encoders": [],
+        let sent = caps_json_with(serde_json::json!({
             "last_install": {
                 "status": "InProgress",
                 "never_reported": true,
@@ -8647,7 +8657,7 @@ mod tests {
                 "accused_version": "0.4.240",
                 "last_known_good": "0.4.239",
             },
-        });
+        }));
         let caps: AgentCaps = serde_json::from_value(sent.clone()).unwrap();
         let back = serde_json::to_value(&caps).unwrap();
         assert_eq!(back["last_install"], sent["last_install"], "{back}");
@@ -8670,19 +8680,17 @@ mod tests {
     /// (an agent older than the words, whose row shows nothing new).
     #[test]
     fn nothing_to_report_stays_apart_from_an_agent_that_cannot_say() {
-        let sent = serde_json::json!({
-            "codecs": [],
-            "hw_encoders": [],
+        let sent = caps_json_with(serde_json::json!({
             "last_install": { "status": "Absent" },
             "crash_health": { "state": "ok", "crashes": 0, "window_secs": 600 },
-        });
+        }));
         let caps: AgentCaps = serde_json::from_value(sent.clone()).unwrap();
         let stored: AgentCaps = bson::from_bson(bson::to_bson(&caps).unwrap()).unwrap();
         let served = serde_json::to_value(&stored).unwrap();
         assert_eq!(served["last_install"], sent["last_install"], "{served}");
         assert_eq!(served["crash_health"], sent["crash_health"], "{served}");
 
-        let older = serde_json::json!({ "codecs": [], "hw_encoders": [] });
+        let older = caps_json_with(serde_json::json!({}));
         let caps: AgentCaps = serde_json::from_value(older).unwrap();
         let served = serde_json::to_value(&caps).unwrap();
         assert!(served.get("last_install").is_none(), "{served}");
