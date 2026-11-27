@@ -9134,6 +9134,403 @@ mod tests {
         map[&live_sid].close();
     }
 
+    // ─── #4542: what a terminate closes at the exit ─────────────────────
+
+    /// How long a cell below waits for anything it expects.
+    const EXIT_WITHIN: Duration = Duration::from_secs(10);
+
+    /// A relay conn that records when its last `Arc` drops.
+    struct DropFlagged(relay::UdpRelayConn, Arc<AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl relay::RelayConn for DropFlagged {
+        async fn send_to(&self, buf: &[u8], dst: std::net::SocketAddr) -> std::io::Result<usize> {
+            self.0.send_to(buf, dst).await
+        }
+        async fn recv_from(
+            &self,
+            buf: &mut [u8],
+        ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+            self.0.recv_from(buf).await
+        }
+        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            self.0.local_addr()
+        }
+    }
+
+    impl Drop for DropFlagged {
+        fn drop(&mut self) {
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// One QUIC session on loopback with one TCP flow in service, as the exit
+    /// runs it: the acceptor dialed `dst` and the client opened the flow.
+    struct ExitRig {
+        sid: bson::oid::ObjectId,
+        tenant: String,
+        map: TunnelQuicPeers,
+        /// The UDP port the exit's endpoint (or its relay conn) holds.
+        port: u16,
+        /// Set when the relay conn under the exit's endpoint dropped.
+        relay_dropped: Option<Arc<AtomicBool>>,
+        conn: tunnel_core::transport::quic::QuicConnection,
+        send: tunnel_core::transport::quic::SendStream,
+        recv: tunnel_core::transport::quic::RecvStream,
+        dst: tokio::net::TcpStream,
+        replies: mpsc::Receiver<ClientMsg>,
+        reaps: mpsc::Receiver<crate::tunnel::reap::TunnelReap>,
+        _client: tunnel_core::transport::quic::QuicPeer,
+    }
+
+    async fn exit_rig(over_relay: bool) -> ExitRig {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tunnel_core::transport::quic::{self, QuicPeer};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dst_port = listener.local_addr().unwrap().port();
+        let sid = bson::oid::ObjectId::new();
+        let (reap_tx, reaps) = mpsc::channel(8);
+        let (peer, client, addr, relay_dropped) = if over_relay {
+            let agent_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = agent_sock.local_addr().unwrap();
+            let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client_addr = client_sock.local_addr().unwrap();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let agent_relay: Arc<dyn relay::RelayConn> = Arc::new(DropFlagged(
+                relay::UdpRelayConn(agent_sock),
+                Arc::clone(&dropped),
+            ));
+            let peer = Arc::new(
+                crate::tunnel::quic_peer::AgentQuicPeer::setup_over_relay(
+                    sid,
+                    "tok".to_string(),
+                    agent_relay,
+                    reap_tx,
+                )
+                .unwrap(),
+            );
+            peer.permit(client_addr).await.unwrap();
+            let client_relay: Arc<dyn relay::RelayConn> =
+                Arc::new(relay::UdpRelayConn(client_sock));
+            let csock = Arc::new(relay::RelayUdpSocket::new(client_relay).unwrap());
+            let client =
+                QuicPeer::client_over_abstract_socket(csock, peer.cert_fingerprint()).unwrap();
+            (peer, client, addr, Some(dropped))
+        } else {
+            let peer = quic_peer_for(sid, &reap_tx);
+            let addr: std::net::SocketAddr = peer.addrs()[0].parse().unwrap();
+            let client =
+                QuicPeer::client("127.0.0.1:0".parse().unwrap(), peer.cert_fingerprint()).unwrap();
+            (peer, client, addr, None)
+        };
+        let conn = client.connect(addr).await.unwrap();
+        quic::client_authenticate(&conn, "tok").await.unwrap();
+
+        let (tx, mut replies) = mpsc::channel(16);
+        let forward = Arc::clone(&peer);
+        tokio::spawn(async move {
+            let acl = crate::tunnel::acl::AgentForwardAcl {
+                enabled: true,
+                allowlist: vec![],
+            };
+            crate::tunnel::acceptor::handle_forward_request_quic(
+                sid,
+                1,
+                "127.0.0.1",
+                dst_port,
+                &acl,
+                Duration::from_secs(2),
+                &forward,
+                tx,
+            )
+            .await;
+        });
+        let (mut dst, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            replies.recv().await,
+            Some(ClientMsg::TcpForwardAccept { .. })
+        ));
+        let (mut send, mut recv) = quic::open_flow(&conn, 1).await.unwrap();
+        // One round trip, so the flow is in service end to end.
+        let mut buf = [0u8; 4];
+        send.write_all(b"ping").await.unwrap();
+        dst.read_exact(&mut buf).await.unwrap();
+        dst.write_all(b"pong").await.unwrap();
+        recv.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+
+        ExitRig {
+            sid,
+            tenant: bson::oid::ObjectId::new().to_hex(),
+            map: HashMap::from([(sid, peer)]),
+            port: addr.port(),
+            relay_dropped,
+            conn,
+            send,
+            recv,
+            dst,
+            replies,
+            reaps,
+            _client: client,
+        }
+    }
+
+    impl ExitRig {
+        /// An `rc:tunnel.terminate` for this session, from the wire, through
+        /// the arm's QUIC half. `close_connection: None` leaves the field out.
+        fn terminate(&mut self, reason: &str, close_connection: Option<bool>) {
+            let field = close_connection
+                .map(|c| format!(r#","close_connection":{c}"#))
+                .unwrap_or_default();
+            let frame = format!(
+                r#"{{"t":"rc:tunnel.terminate","session_id":"{}","reason":"{reason}"{field}}}"#,
+                self.sid.to_hex()
+            );
+            let ServerMsg::TunnelTerminate {
+                session_id,
+                close_connection,
+                ..
+            } = serde_json::from_str(&frame).expect("the frame decodes")
+            else {
+                panic!("not a terminate: {frame}");
+            };
+            terminate_quic_session(&mut self.map, &self.tenant, session_id, close_connection);
+        }
+
+        /// The accept loop ends while the connection is up (a stream without
+        /// its preamble), and the reap arm takes the peer.
+        async fn reap_while_up(&mut self) {
+            let (mut bad, _bad_recv) = self.conn.open_bi().await.unwrap();
+            bad.write_all(b"x").await.unwrap();
+            bad.finish().unwrap();
+            self.reap().await;
+        }
+
+        /// The accept loop's report arrives and the reap arm takes the peer.
+        async fn reap(&mut self) {
+            let report = tokio::time::timeout(EXIT_WITHIN, self.reaps.recv())
+                .await
+                .expect("the accept loop reports its end")
+                .expect("reap channel open");
+            assert_eq!(report.session_id, self.sid);
+            let peer = self.map.remove(&self.sid).expect("the map holds the peer");
+            reap_quic_peer(&self.tenant, self.sid, &peer);
+        }
+
+        /// Bytes still cross the flow both ways, and the connection is up.
+        async fn flow_runs(&mut self) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 4];
+            tokio::time::timeout(EXIT_WITHIN, async {
+                self.send.write_all(b"more").await.unwrap();
+                self.dst.read_exact(&mut buf).await.unwrap();
+                self.dst.write_all(b"back").await.unwrap();
+                self.recv.read_exact(&mut buf).await.unwrap();
+            })
+            .await
+            .expect("the flow still carries bytes both ways");
+            assert!(
+                self.conn.close_reason().is_none(),
+                "the connection is still up"
+            );
+        }
+
+        /// The exit's flow ended, and why.
+        async fn flow_end_at_exit(&mut self) -> CloseReason {
+            tokio::time::timeout(EXIT_WITHIN, async {
+                loop {
+                    match self.replies.recv().await {
+                        Some(ClientMsg::TcpClosed { reason, .. }) => break reason,
+                        Some(_) => continue,
+                        None => panic!("the acceptor's replies closed without TcpClosed"),
+                    }
+                }
+            })
+            .await
+            .expect("the exit's flow ends")
+        }
+
+        /// The destination's socket closed under it.
+        async fn dst_closed(&mut self) {
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 16];
+            let read = tokio::time::timeout(EXIT_WITHIN, self.dst.read(&mut buf))
+                .await
+                .expect("the destination's socket closes");
+            assert_eq!(read.unwrap_or(0), 0, "the destination reads its end");
+        }
+
+        /// The connection closed with the session's end code, a stream opened
+        /// before reads closed, the exit's flow ended and the destination's
+        /// socket closed.
+        async fn closed_by_session_end(&mut self) {
+            use crate::tunnel::quic_peer::{SESSION_END_CODE, SESSION_END_REASON};
+            use tunnel_core::transport::quic::ConnectionError;
+            match tokio::time::timeout(EXIT_WITHIN, self.conn.closed())
+                .await
+                .expect("the connection closes")
+            {
+                ConnectionError::ApplicationClosed(close) => {
+                    assert_eq!(u64::from(close.error_code), u64::from(SESSION_END_CODE));
+                    assert_eq!(&close.reason[..], SESSION_END_REASON);
+                }
+                other => panic!("expected the session's end code, got {other:?}"),
+            }
+            let mut buf = [0u8; 16];
+            assert!(
+                tokio::time::timeout(EXIT_WITHIN, self.recv.read(&mut buf))
+                    .await
+                    .expect("the stream answers")
+                    .is_err(),
+                "a stream opened before the end reads closed"
+            );
+            assert_eq!(self.flow_end_at_exit().await, CloseReason::ServerTerminated);
+            self.dst_closed().await;
+            assert!(!self.map.contains_key(&self.sid));
+        }
+
+        /// What the exit held for the session is gone: the UDP port under its
+        /// endpoint binds again, and a relay conn under it dropped.
+        async fn released(self) {
+            let ExitRig {
+                port,
+                relay_dropped,
+                map,
+                ..
+            } = self;
+            drop(map);
+            let freed = tokio::time::timeout(EXIT_WITHIN, async {
+                while std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            assert!(freed.is_ok(), "the exit's UDP port binds again");
+            if let Some(dropped) = relay_dropped {
+                assert!(
+                    dropped.load(Ordering::SeqCst),
+                    "the relay conn under the endpoint dropped"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_terminate_that_asks_to_close_closes_the_connection_and_what_runs_on_it() {
+        for reason in ["server_terminated", "client_shutdown"] {
+            let mut rig = exit_rig(false).await;
+            rig.terminate(reason, Some(true));
+            rig.closed_by_session_end().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn terminates_that_do_not_ask_and_a_control_socket_drop_keep_the_connection_open() {
+        for reason in ["server_terminated", "client_shutdown"] {
+            for field in [None, Some(false)] {
+                let mut rig = exit_rig(false).await;
+                rig.terminate(reason, field);
+                rig.flow_runs().await;
+            }
+        }
+        for survive in [false, true] {
+            let mut rig = exit_rig(false).await;
+            park_quic_peers(&mut rig.map, &rig.tenant, survive).await;
+            rig.flow_runs().await;
+            if survive {
+                rig.map = reclaim_quic_peers(&rig.tenant, true);
+                assert!(rig.map.contains_key(&rig.sid), "R3 re-adopts the peer");
+                rig.flow_runs().await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_terminate_that_asks_to_close_closes_a_peer_r3_kept() {
+        let mut rig = exit_rig(false).await;
+        park_quic_peers(&mut rig.map, &rig.tenant, true).await;
+        rig.map = reclaim_quic_peers(&rig.tenant, true);
+        rig.terminate("client_shutdown", Some(true));
+        rig.closed_by_session_end().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_terminate_that_asks_to_close_after_one_that_did_not_still_closes() {
+        let mut rig = exit_rig(false).await;
+        rig.terminate("server_terminated", None);
+        rig.flow_runs().await;
+        rig.terminate("client_shutdown", Some(true));
+        rig.closed_by_session_end().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_reap_on_a_live_connection_does_not_close_it() {
+        let mut rig = exit_rig(false).await;
+        rig.reap_while_up().await;
+        rig.flow_runs().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_terminate_that_asks_to_close_after_a_reap_of_a_live_connection_still_closes() {
+        let mut rig = exit_rig(false).await;
+        rig.reap_while_up().await;
+        rig.terminate("client_shutdown", Some(true));
+        rig.closed_by_session_end().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_reap_of_a_connection_that_ended_stops_its_flows() {
+        let mut rig = exit_rig(false).await;
+        rig.conn.close(0u32.into(), b"done");
+        rig.reap().await;
+        assert_eq!(rig.flow_end_at_exit().await, CloseReason::ServerTerminated);
+        rig.dst_closed().await;
+        rig.released().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_session_end_releases_what_the_exit_held_for_it() {
+        for over_relay in [false, true] {
+            let mut rig = exit_rig(over_relay).await;
+            rig.terminate("client_shutdown", Some(true));
+            rig.closed_by_session_end().await;
+            rig.released().await;
+        }
+    }
+
     /// #2416 — a prompt whose control socket closes before an answer is
     /// withdrawn. The waiting task gets `Cancelled` (nothing goes on the wire),
     /// and dropping the prompt clears the broker's entry and the companion's

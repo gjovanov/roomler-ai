@@ -842,4 +842,71 @@ mod tests {
         );
         agent.close();
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_session_end_stops_a_forward_waiting_for_its_stream() {
+        let session_id = ObjectId::new();
+        let (reap_tx, _reap_rx) = reap_channel();
+        let agent = Arc::new(
+            AgentQuicPeer::setup(session_id, "tok".to_string(), loopback(), reap_tx).unwrap(),
+        );
+        let waiting = Arc::clone(&agent);
+        let forward =
+            tokio::spawn(async move { waiting.take_flow(5, Duration::from_secs(60)).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        agent.end();
+
+        let taken = tokio::time::timeout(Duration::from_secs(5), forward)
+            .await
+            .expect("a forward waiting for its stream returns when the session ends")
+            .unwrap();
+        assert!(taken.is_err(), "no stream is handed over after the end");
+        assert!(
+            agent.take_flow(6, Duration::from_secs(60)).await.is_err(),
+            "nor to a forward that asks after it"
+        );
+    }
+
+    #[test]
+    fn an_ended_session_is_kept_for_its_ttl_and_the_oldest_goes_first() {
+        let t0 = Instant::now();
+        let mut ended = EndedQuicSessions::default();
+        let first = ObjectId::new();
+        let link = SessionLink::default();
+        ended.record_at(first, link.clone(), t0);
+        assert!(
+            ended.end_at(first, t0 + ENDED_SESSION_TTL - Duration::from_secs(1)),
+            "a session is reachable inside its TTL"
+        );
+        assert!(
+            !ended.end_at(first, t0),
+            "and ending it takes it out, so a second end finds nothing"
+        );
+
+        ended.record_at(first, link, t0);
+        assert!(
+            !ended.end_at(first, t0 + ENDED_SESSION_TTL),
+            "past its TTL it is gone"
+        );
+
+        let oldest = ObjectId::new();
+        ended.record_at(oldest, SessionLink::default(), t0);
+        for i in 0..ENDED_SESSIONS_CAP {
+            ended.record_at(
+                ObjectId::new(),
+                SessionLink::default(),
+                t0 + Duration::from_millis(1 + i as u64),
+            );
+        }
+        assert_eq!(ended.len(), ENDED_SESSIONS_CAP, "the cap holds");
+        assert!(
+            !ended.end_at(oldest, t0 + Duration::from_secs(1)),
+            "the oldest made room"
+        );
+    }
 }
