@@ -956,7 +956,8 @@ mod tests {
     mod on_ntfs {
         use super::*;
         use roomler_node_core::machine_tree::test_support::{
-            USERS, elevated_or_skip, icacls, local_guest, names, owner, sddl, sealed, set_dacl,
+            USERS, aces, another_account, elevated_or_skip, icacls, junction, local_guest, names,
+            owner, protected, sddl, sealed, set_dacl,
         };
         use roomler_node_core::machine_tree::{self, MachineTree};
 
@@ -964,6 +965,9 @@ mod tests {
         const THIS_TEST: &str = "machine_write::tests::on_ntfs::a_limited_setups_machine_enrollment_is_owned_by_administrators_and_sealed";
         const PERSON_TEST: &str = "machine_write::tests::on_ntfs::a_limited_setup_on_a_tree_a_person_made_comes_out_the_same";
         const PLANTED_TEST: &str = "machine_write::tests::on_ntfs::a_limited_setup_never_folds_into_a_folder_moved_into_a_parent_a_person_made";
+        const SWITCH_TEST: &str = "machine_write::tests::on_ntfs::the_repair_switch_skips_the_parents_take_and_never_its_seal";
+        /// Which parent [`the_switch_case`] finds: `link` or `plain`.
+        const CASE: &str = "ROOMLER_TEST_MACHINE_WRITE_CASE";
         const CHECKED: &str = "MACHINE WRITE CHECKED";
 
         /// `%ProgramData%`'s own DACL: SYSTEM and Administrators full control,
@@ -1082,6 +1086,260 @@ mod tests {
             );
             let written = std::fs::read_to_string(folder.join("config.toml")).unwrap();
             assert!(!written.contains("planted"), "{written}");
+        }
+
+        /// The parent Setup's seal finds ([`the_parents_seal_ends_as_it_always_has`]).
+        #[derive(Debug, Clone, Copy)]
+        enum Found {
+            /// Made below `%ProgramData%`, inheriting all it holds.
+            AsMade,
+            /// With an entry of its own that gives another account (Guests)
+            /// full control, handed down: #4485 keeps one on a waiting host
+            /// until an elevated save.
+            AnotherAccountsEntry,
+            /// Sealed by an earlier install, as a reinstall finds it.
+            SealedBefore,
+            /// With a machine folder and a config another account owns (G7).
+            BelowAnotherAccounts,
+        }
+
+        impl Found {
+            const ALL: [Found; 4] = [
+                Found::AsMade,
+                Found::AnotherAccountsEntry,
+                Found::SealedBefore,
+                Found::BelowAnotherAccounts,
+            ];
+
+            /// The parent's entries after the seal, in order.
+            fn sealed(self) -> Vec<&'static str> {
+                match self {
+                    Found::AsMade | Found::BelowAnotherAccounts => {
+                        vec!["A;OICI;FA;;;BA", "A;OICI;FA;;;SY"]
+                    }
+                    Found::AnotherAccountsEntry => {
+                        vec!["A;OICI;FA;;;BA", "A;OICI;FA;;;SY", "A;OICI;FA;;;BG"]
+                    }
+                    Found::SealedBefore => vec!["A;OICI;FA;;;SY", "A;OICI;FA;;;BA"],
+                }
+            }
+        }
+
+        /// `%ProgramData%\roomler` below a stand-in under `root`, found as
+        /// `found` says: the parent, the machine folder in it, the config in
+        /// that, and the attempt record beside it, each inheriting all it
+        /// holds before `found` changes it.
+        fn parent_found(root: &Path, found: Found) -> [PathBuf; 4] {
+            let parent = stand_in(root).join("roomler");
+            let folder = parent.join("roomler");
+            let config = folder.join("config.toml");
+            let record = parent.join("last-system-context-attempt.json");
+            std::fs::write(&config, b"x").unwrap();
+            std::fs::write(&record, b"{}").unwrap();
+            // Inherited entries only, whatever entry of its own a new entry
+            // comes with on the machine running this.
+            for entry in [&parent, &folder, &config, &record] {
+                assert!(icacls(entry, &["/reset"]), "{} inherits", entry.display());
+            }
+            match found {
+                Found::AsMade => {}
+                Found::AnotherAccountsEntry => {
+                    assert!(icacls(&parent, &["/grant", "*S-1-5-32-546:(OI)(CI)F"]));
+                }
+                Found::SealedBefore => {
+                    set_dacl(&parent, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+                    assert!(icacls(&parent, &["/setowner", "*S-1-5-32-544"]));
+                }
+                Found::BelowAnotherAccounts => {
+                    let other = another_account();
+                    for entry in [&folder, &config] {
+                        assert!(icacls(entry, &["/setowner", &format!("*{other}")]));
+                    }
+                }
+            }
+            [parent, folder, config, record]
+        }
+
+        /// #4488 — what Setup's seal of `%ProgramData%\roomler` leaves, on a
+        /// stand-in, for each parent it can find: the folder Administrators',
+        /// its DACL protected, SYSTEM and Administrators full control of it,
+        /// its subfolders and its files, and any other entry of its own kept;
+        /// each entry below it keeps its owner and inherits that DACL in place
+        /// of what it inherited before. The owner, the protected flag and each
+        /// entry with its inheritance flags, in order.
+        #[test]
+        fn the_parents_seal_ends_as_it_always_has() {
+            if !elevated_or_skip("the parent's seal") {
+                return;
+            }
+            for found in Found::ALL {
+                let root = tempfile::tempdir().unwrap();
+                let [parent, folder, config, record] = parent_found(root.path(), found);
+                let below = [(&folder, "OICIID"), (&config, "ID"), (&record, "ID")];
+                let owners: Vec<String> = below.iter().map(|(e, _)| owner(&sddl(e))).collect();
+                let warnings = seal_parent(&config);
+                assert!(warnings.is_empty(), "{found:?}: {warnings:?}");
+                let got = sddl(&parent);
+                assert_eq!(owner(&got), "BA", "{found:?}: {got}");
+                assert!(protected(&got), "{found:?}: {got}");
+                assert_eq!(aces(&got), found.sealed(), "{found:?}: {got}");
+                for ((entry, inherited), was) in below.iter().zip(&owners) {
+                    let got = sddl(entry);
+                    let what = format!("{found:?}: {}: {got}", entry.display());
+                    assert_eq!(&owner(&got), was, "it keeps its owner: {what}");
+                    assert!(!protected(&got), "{what}");
+                    let want: Vec<String> = found
+                        .sealed()
+                        .iter()
+                        .map(|ace| ace.replacen(";OICI;", &format!(";{inherited};"), 1))
+                        .collect();
+                    assert_eq!(aces(&got), want, "{what}");
+                }
+            }
+        }
+
+        /// #4488 — a parent that is not a plain folder is refused, with the
+        /// warning the person has always had: a link, never followed (what it
+        /// leads to keeps its owner and DACL), and a file at its name, which
+        /// stays a file.
+        #[test]
+        fn a_parent_that_is_not_a_plain_folder_is_refused_with_its_warning() {
+            let root = tempfile::tempdir().unwrap();
+            let elsewhere = root.path().join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("roomler")).unwrap();
+            let parent = root.path().join("roomler");
+            junction(&parent, &elsewhere);
+            let target = sddl(&elsewhere);
+            assert_eq!(
+                seal_parent(&parent.join("roomler").join("config.toml")),
+                vec![format!(
+                    "could not restrict permissions on the machine-global config directory ({} \
+                     is a link (a junction or a symbolic link), not a plain folder)",
+                    parent.display()
+                )]
+            );
+            assert_eq!(sddl(&elsewhere), target, "what it leads to is as it was");
+
+            let file = root.path().join("a-file");
+            std::fs::write(&file, b"x").unwrap();
+            let warnings = seal_parent(&file.join("roomler").join("config.toml"));
+            let said = format!(
+                "could not restrict permissions on the machine-global config directory (create {}: ",
+                file.display()
+            );
+            assert!(
+                matches!(&warnings[..], [w] if w.starts_with(&said)),
+                "{warnings:?}"
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"x", "it stays a file");
+        }
+
+        /// #4488 — `ROOMLERD_MACHINE_TREE_REPAIR=0` skips the take of the
+        /// machine config's parent and never its seal: a parent that is a
+        /// link is refused by the take, in its words, and with the switch off
+        /// by the seal, in its own; a plain parent a person made is sealed
+        /// either way, and ends the same. A child process runs each case, with
+        /// `%ProgramData%` a stand-in, as [`the_wizard_and_its_step`] does.
+        #[test]
+        fn the_repair_switch_skips_the_parents_take_and_never_its_seal() {
+            if let Some(root) = std::env::var_os(ROOT) {
+                return the_switch_case(Path::new(&root));
+            }
+            for repair_off in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let program_data = root.path().join("ProgramData");
+                std::fs::create_dir(&program_data).unwrap();
+                let elsewhere = root.path().join("elsewhere");
+                std::fs::create_dir_all(elsewhere.join("roomler")).unwrap();
+                junction(&program_data.join("roomler"), &elsewhere);
+                let target = sddl(&elsewhere);
+                run_the_case(root.path(), "link", repair_off);
+                assert_eq!(sddl(&elsewhere), target, "what it leads to is as it was");
+            }
+            if !elevated_or_skip("the parent's seal with the repair switched off") {
+                return;
+            }
+            let mut ends = Vec::new();
+            for repair_off in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let parent = stand_in(root.path()).join("roomler");
+                let person = another_account();
+                assert!(icacls(&parent, &["/setowner", &format!("*{person}")]));
+                run_the_case(root.path(), "plain", repair_off);
+                ends.push([sddl(&parent), sddl(&parent.join("roomler"))]);
+            }
+            assert_eq!(
+                ends[0], ends[1],
+                "the switch changes nothing the seal leaves"
+            );
+        }
+
+        /// One case of [`the_repair_switch_skips_the_parents_take_and_never_its_seal`],
+        /// in the child: Setup's seal of the parent of the machine config,
+        /// which is the stand-in's.
+        fn the_switch_case(root: &Path) {
+            roomler_node_core::appdirs::test_fixture::program_data_is(root.join("ProgramData"));
+            let config_path = roomlerd::config::machine_global_config_path();
+            assert!(config_path.starts_with(root), "{}", config_path.display());
+            let parent = root.join("ProgramData").join("roomler");
+            let repair_off = std::env::var_os("ROOMLERD_MACHINE_TREE_REPAIR").is_some();
+            let warnings = seal_parent(&config_path);
+            match std::env::var(CASE).as_deref() {
+                Ok("link") => {
+                    let link = format!(
+                        "{} is a link (a junction or a symbolic link), not a plain folder",
+                        parent.display()
+                    );
+                    let said = if repair_off {
+                        format!(
+                            "could not restrict permissions on the machine-global config \
+                             directory ({link})"
+                        )
+                    } else {
+                        format!(
+                            "could not take the machine-global config directory's parent for \
+                             Administrators ({link})"
+                        )
+                    };
+                    assert_eq!(warnings, vec![said]);
+                }
+                Ok("plain") => {
+                    assert!(warnings.is_empty(), "{warnings:?}");
+                    let got = sddl(&parent);
+                    assert_eq!(owner(&got), "BA", "{got}");
+                    assert!(protected(&got), "{got}");
+                    assert_eq!(aces(&got), Found::AsMade.sealed(), "{got}");
+                }
+                other => panic!("no such case: {other:?}"),
+            }
+            println!("{CHECKED}");
+        }
+
+        /// Run [`SWITCH_TEST`] in a child process for the stand-in under
+        /// `root`, finding the parent as `case` says, with the repair switched
+        /// off when `repair_off`.
+        fn run_the_case(root: &Path, case: &str, repair_off: bool) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([SWITCH_TEST, "--exact", "--nocapture", "--test-threads=1"])
+                .env(ROOT, root)
+                .env(CASE, case)
+                .env_remove("ROOMLERD_MACHINE_TREE_REPAIR")
+                .env_remove("ROOMLER_NODE_MACHINE_TREE_REPAIR");
+            if repair_off {
+                child.env("ROOMLERD_MACHINE_TREE_REPAIR", "0");
+            }
+            let out = child.output().unwrap();
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                out.status.success(),
+                "{case}, repair off {repair_off}: {said}"
+            );
+            assert!(said.contains(CHECKED), "the child ran the case: {said}");
         }
 
         /// `%ProgramData%`'s stand-in under `root`, with the parent and the
