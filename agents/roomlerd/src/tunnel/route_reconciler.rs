@@ -1959,4 +1959,36 @@ mod tests {
         assert_eq!(flows[0].target.as_deref(), Some("db2:5432"));
         assert_eq!(creates(&r), 2, "the new target's flow took one create");
     }
+
+    /// #1035 — the wait reaches across a pass boundary. The reconcile task
+    /// starts its next pass at once, with no yield between, when a kick landed
+    /// during the last one. Here a disable's pass stops the route's flow, and
+    /// the enable's pass, run right after with nothing awaited between (the
+    /// test runtime has one thread, and a verb with no task to wait for does
+    /// not yield), creates on the same port. A create that does not wait finds
+    /// the stopped flow's listener and reads `backoff … 10048`.
+    #[tokio::test]
+    async fn the_pass_after_one_that_stopped_a_flow_waits_for_its_port_too() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let f1 = route_flow(&r, "a");
+        eventually("the flow holds its port", || port_is_held(p)).await;
+
+        assert!(r.set_enabled("a", false).await.unwrap());
+        r.reconcile_pass().await;
+        assert!(
+            !r.inner.hub.has_flow(&f1),
+            "the disable's pass stopped the flow"
+        );
+        assert!(r.set_enabled("a", true).await.unwrap());
+        r.reconcile_pass().await;
+
+        let state = r.list()[0].state.clone();
+        let f2 = state
+            .flow_id()
+            .unwrap_or_else(|| panic!("the enable left the route without a flow: {state:?}"))
+            .to_string();
+        assert_eq!(hub_flows(&r), vec![f2]);
+    }
 }
