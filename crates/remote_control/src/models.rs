@@ -645,6 +645,7 @@ pub struct AgentCaps {
     /// but macOS (D1). Every reader reads `None` as
     /// [`GuiWorkerBrief::UNKNOWN`], never as attached or not. A CLAIM by the
     /// host, like `desktop`: the server counts it and never enforces on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui_worker: Option<GuiWorkerBrief>,
     /// FR-101 P2b — the device's OWN session policy (its owner's `rc_clipboard`,
     /// `rc_files`, `rc_audio`), so the hub can strip what this device will
@@ -2054,8 +2055,10 @@ pub struct GuiWorkerBrief {
     pub state: String,
     /// With `not-attached` only: `no-console-user` · `launchd-owns` ·
     /// `starting` · `gave-up` · `supervisor-off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// `macos_one_row` is set in the daemon's config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub one_row: bool,
 }
 

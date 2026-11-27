@@ -1894,11 +1894,29 @@ fn configured_only<T: Default + PartialEq, B: From<T>>(policy: T) -> Option<B> {
     (policy != T::default()).then(|| policy.into())
 }
 
+/// FR-157 P2 — the device list's filter on a Mac's screen worker.
+#[derive(Debug, Default, Deserialize)]
+pub struct DeviceListFilter {
+    /// `?gui_worker=<state>`: the org's online Macs whose word is that state
+    /// (`unsupervised`, `attached`, `not-attached`, a newer agent's word as
+    /// it is), or `unknown` for the ones that sent none. Read only while
+    /// `rc.gui_worker_read` is on.
+    #[serde(default)]
+    pub gui_worker: Option<String>,
+}
+
+/// FR-157 P2 — why the device list refuses `?gui_worker=` while the read is
+/// off: answered, never ignored, so an unfiltered list is never read as a
+/// filtered one.
+const GUI_WORKER_READ_OFF: &str =
+    "the gui_worker filter is off on this server (ROOMLER__RC__GUI_WORKER_READ)";
+
 pub async fn list_agents(
     State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<PaginationParams>,
+    Query(filter): Query<DeviceListFilter>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -1907,7 +1925,24 @@ pub async fn list_agents(
         return Err(ApiError::NotAMember);
     }
 
-    let page = state.agents.list_for_tenant(tid, &params).await?;
+    // FR-157 P2 — the filter is read after the tenant guard, like the list.
+    let page = match filter.gui_worker.as_deref() {
+        None => state.agents.list_for_tenant(tid, &params).await?,
+        Some(_) if !state.settings.rc.gui_worker_read => {
+            return Err(ApiError::BadRequest(GUI_WORKER_READ_OFF.to_string()));
+        }
+        Some("") => {
+            return Err(ApiError::BadRequest(
+                "gui_worker names no state".to_string(),
+            ));
+        }
+        Some(word) => {
+            state
+                .agents
+                .list_online_macs_by_gui_worker(tid, word, &params)
+                .await?
+        }
+    };
     let redis_fresh = agent_presence_batch(&state, &page.items).await;
     let items: Vec<AgentResponse> = page
         .items
@@ -2658,11 +2693,20 @@ fn to_agent_response(
     }
 }
 
-/// FR-157 P2 — the caps a device response carries (stub: as stored).
+/// FR-157 P2 — the caps a device response carries. While
+/// `rc.gui_worker_read` is off the screen worker's word leaves every one of
+/// them (the list's rows, a device's own read, an update's answer), so
+/// nothing a response says changes and the devices list has nothing to show;
+/// the stored row keeps the word either way. With the read on the word goes
+/// out as the device sent it, beside the row's `presence`, which says whether
+/// it is current.
 fn caps_as_served(
-    caps: roomler_ai_remote_control::models::AgentCaps,
-    _gui_worker_read: bool,
+    mut caps: roomler_ai_remote_control::models::AgentCaps,
+    gui_worker_read: bool,
 ) -> roomler_ai_remote_control::models::AgentCaps {
+    if !gui_worker_read {
+        caps.gui_worker = None;
+    }
     caps
 }
 
