@@ -279,17 +279,17 @@ Fixed since:
 > `record` channel's open. Nothing bounded it, a loaded host took seconds, and once in 76 runs the
 > grace stopped the recording first (`session_ended`), so the cell read `idle` with an empty id.
 > Each cell now sets its next session up before the drop and attaches it after
-> ([`control_dc_record.rs:603`](../agents/roomlerd/tests/control_dc_record.rs#L603)), so only
+> ([`control_dc_record.rs:609`](../agents/roomlerd/tests/control_dc_record.rs#L609)), so only
 > the status crosses the drop. Attach after, not before: `peer_replaced` marks every live handler
 > of the session, so a next session attached before a re-offer would be marked with the old one.
 > A cell that needs the drop seen before it asks now waits for that itself (the channel watch
 > looks every 500 ms), because the setup no longer hides the wait. A failed pick-up prints when
 > the status was asked and answered, counted from the drop, the grace and the recorder's last
-> stop reason and detail ([`:847`](../agents/roomlerd/tests/control_dc_record.rs#L847)), which
+> stop reason and detail ([`:853`](../agents/roomlerd/tests/control_dc_record.rs#L853)), which
 > tells the grace's stop from a recorder that ended by itself. A longer grace, a longer sleep or
 > a retry would have kept the dependency. To falsify the cells by hand,
 > `ROOMLERD_TEST_NEXT_SESSION_DELAY_MS=15000` sets each next session up 15 s later
-> ([`:820`](../agents/roomlerd/tests/control_dc_record.rs#L820)). Set up after the drop, eight
+> ([`:826`](../agents/roomlerd/tests/control_dc_record.rs#L826)). Set up after the drop, eight
 > cells fail: six read `idle` with an empty id, and the two grace-poll cells say they prove
 > nothing, because the grace looked again first. Set up before it, they pass.
 
