@@ -443,8 +443,8 @@ async fn exchange(link: &mut StepLink, request: &Request) -> std::io::Result<Ans
 /// handle (`config::take_machine_parent`: a person's daemon may have made it),
 /// then sealed through one handle to it, the one that judged it a plain folder
 /// (`config::seal_machine_parent`). A parent that is not a plain folder, or
-/// holds an entry the seal cannot write back, is left as found for the
-/// service's check to refuse. The warnings, for the person.
+/// holds an explicit entry that is neither an allow nor a deny, is not sealed:
+/// it and all it holds keep their permissions. The warnings, for the person.
 #[cfg(target_os = "windows")]
 pub(crate) fn seal_parent(config_path: &Path) -> Vec<String> {
     if let Err(e) = roomlerd::config::take_machine_parent(config_path) {
@@ -1164,8 +1164,8 @@ mod tests {
         /// stand-in, for each parent it can find: the folder Administrators',
         /// its DACL protected, SYSTEM and Administrators full control of it,
         /// its subfolders and its files, and any other entry of its own kept;
-        /// each entry below it keeps its owner and inherits that DACL in place
-        /// of what it inherited before. The owner, the protected flag and each
+        /// each entry below it keeps its owner and holds what that DACL hands
+        /// down. The owner, the protected flag and each
         /// entry with its inheritance flags, in order.
         #[test]
         fn the_parents_seal_ends_as_it_always_has() {
@@ -1266,7 +1266,7 @@ mod tests {
                 vec![format!(
                     "could not restrict permissions on the machine-global config directory ({} \
                      carries an access rule of a kind the seal cannot write back (type 9), so \
-                     nothing was changed)",
+                     it keeps its permissions)",
                     parent.display()
                 )]
             );

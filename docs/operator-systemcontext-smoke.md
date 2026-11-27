@@ -356,8 +356,8 @@ the installer and does not read the service's `Environment`: there, both are on.
 > DACL before anything is written, takes the folder for Administrators, then
 > drops its inheritance and grants in one write, and stops if it cannot take
 > it. It ends as the two `icacls` calls it replaced left it. A folder holding
-> an entry the seal cannot write back (such as one that is neither an allow
-> nor a deny) is left as found, with the wizard's warning.
+> an entry of its own that is neither an allow nor a deny is not sealed: its
+> permissions and everything in it stay as they were, and the wizard warns.
 
 Until #3609 each save of this config ran four `icacls` steps, which removed
 only `Users` and `Authenticated Users` and so kept any other account's entry

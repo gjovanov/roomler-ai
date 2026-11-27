@@ -951,9 +951,9 @@ Details worth knowing:
   written; then Administrators are made its owner, and that DACL, protected,
   with full control for SYSTEM and Administrators, is written in one call. The
   folder and what it holds end as the seal by path left them. A folder that
-  holds an entry the seal cannot write back, such as one that is neither an
-  allow nor a deny, is left as found, with the wizard's warning that the
-  folder's permissions could not be restricted. And with
+  holds an entry of its own that is neither an allow nor a deny is not sealed:
+  its permissions and everything in it stay as they were, and the wizard
+  warns. And with
   `roomlerd adopt-enrollment` they carry an
   existing machine config over only when it is private to the computer's
   administrators once the repair has run (`machine_tree.rs:1412`), and was the

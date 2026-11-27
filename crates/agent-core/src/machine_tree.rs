@@ -1130,10 +1130,10 @@ pub fn seal_machine_parent(parent: &Path) -> Result<(), String> {
     let sd = win::read_sd(&entry.file)
         .map_err(|e| format!("{}: reading its security: {e}", parent.display()))?;
     let dacl = parent_seal(&sd)
-        .map_err(|why| format!("{} {why}, so nothing was changed", parent.display()))?;
+        .map_err(|why| format!("{} {why}, so it keeps its permissions", parent.display()))?;
     win::can_write(&dacl, true).map_err(|e| {
         format!(
-            "{}: its DACL cannot be written ({e}), so nothing was changed",
+            "{}: its DACL cannot be written ({e}), so it keeps its permissions",
             parent.display()
         )
     })?;
