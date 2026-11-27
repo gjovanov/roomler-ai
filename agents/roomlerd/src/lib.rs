@@ -563,6 +563,10 @@ pub mod media_deadline;
 /// FR-133 — every needs-attention notice, rendered and read back whole.
 #[cfg(test)]
 mod notice_text_tests;
+/// #4500 — how this crate's tests bind: on loopback (docs/testing.md, "How
+/// tests bind"). Its switches into production code are the identity outside
+/// the lib's own tests.
+pub(crate) mod test_net;
 
 #[cfg(test)]
 mod tests {

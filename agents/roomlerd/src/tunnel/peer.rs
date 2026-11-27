@@ -95,7 +95,8 @@ impl AgentTunnelPeer {
                 credential: s.credential.unwrap_or_default(),
             })
             .collect();
-        let peer = Arc::new(TunnelPeer::new(rtc_ice_servers).await?);
+        // #4500 — every interface, and loopback in this crate's tests.
+        let peer = Arc::new(TunnelPeer::new_with(rtc_ice_servers, crate::test_net::GATHER).await?);
 
         // Trickle local candidates → outbound channel as
         // `rc:tunnel.ice`. Drop is fine on a closed channel — means
@@ -383,7 +384,9 @@ mod tests {
         let session_id = ObjectId::new();
 
         // Build the offerer locally — same code path as the CLI.
-        let offerer = CoreTunnelPeer::new(vec![]).await.unwrap();
+        let offerer = CoreTunnelPeer::new_with(vec![], crate::test_net::GATHER)
+            .await
+            .unwrap();
         let offer = offerer.create_offer().await.unwrap();
 
         // Outbound channel the answerer uses to trickle its local ICE
@@ -561,7 +564,9 @@ mod tests {
                     .build()
                     .expect("client runtime");
                 rt.block_on(async move {
-                    let offerer = CoreTunnelPeer::new(vec![]).await.expect("offerer");
+                    let offerer = CoreTunnelPeer::new_with(vec![], crate::test_net::GATHER)
+                        .await
+                        .expect("offerer");
                     offerer.on_local_ice_candidate(move |c| {
                         let tx = to_agent.clone();
                         Box::pin(async move {

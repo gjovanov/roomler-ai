@@ -981,7 +981,7 @@ mod tests {
             ice_transport_policy: RTCIceTransportPolicy::Relay,
             ..Default::default()
         };
-        let api = webrtc::api::APIBuilder::new().build();
+        let api = crate::test_net::api();
         std::sync::Arc::new(api.new_peer_connection(config).await.unwrap())
     }
 
@@ -989,6 +989,10 @@ mod tests {
     /// the agent's own TURN allocation over UDP reads `udp`, from the pair
     /// the carrier line reads.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(
+        windows,
+        ignore = "its TURN client socket, which webrtc-ice binds on 0.0.0.0, raises a firewall prompt on Windows (#4500)"
+    )]
     async fn a_pair_on_the_agents_udp_relay_names_its_transport() {
         use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
         use webrtc::turn;

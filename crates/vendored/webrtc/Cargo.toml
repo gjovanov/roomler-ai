@@ -73,6 +73,15 @@
 #     way: it never waits for the slot, and a held slot, no association or a
 #     stream the association does not have answers `false`. Nothing calls it
 #     yet.
+#   - src/ice_transport/ice_gatherer.rs + src/peer_connection/
+#     peer_connection_test.rs (#4500): in this crate's own tests only
+#     (`cfg(test)`, which no dependent compiles), a gatherer opens no mDNS
+#     socket unless the test asks for mDNS candidates, and gathers host
+#     candidates on loopback unless the test set a filter or a vnet
+#     (`confined_for_tests`). The three tests that bind a non-loopback socket
+#     on purpose (a STUN server on the internet, mDNS gathering) are ignored
+#     on Windows, where that bind raises a firewall prompt for every new test
+#     binary. A build for any dependent is unchanged.
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only

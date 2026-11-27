@@ -645,6 +645,10 @@ mod tests {
     /// `handle_forward_request` has no equivalent test here because its
     /// post-decide path is covered by `peer::tests`.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
     async fn quic_forward_request_accepts_then_pumps_to_dst() {
         use crate::tunnel::quic_peer::AgentQuicPeer;
         use tunnel_core::transport::quic::{self, QuicPeer};

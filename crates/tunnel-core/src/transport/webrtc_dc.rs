@@ -61,6 +61,36 @@ pub enum PeerError {
     InvalidIceCandidate(String),
 }
 
+/// #4500 — confine a peer's ICE to loopback, for a test: host candidates on
+/// 127.0.0.1 and ::1 only, and no mDNS socket (`QueryOnly`, webrtc-rs's
+/// default, opens one on the multicast port). On Windows the first UDP bind a
+/// program makes on an address other than loopback asks the person at the
+/// machine whether to allow it, and cargo names each test binary after a
+/// hash, so every new target dir is a new program and a new prompt
+/// (docs/testing.md, "How tests bind"). The one helper the workspace's tests
+/// build a webrtc-rs `SettingEngine` through. Production never calls it.
+///
+/// Not for an engine on a vnet: its addresses are virtual, so the filter
+/// would leave it none. Turn the vnet's mDNS off instead. And it leaves the
+/// socket a STUN or TURN server is reached from as webrtc-ice binds it,
+/// unspecified: a test that gathers server-reflexive or relay candidates is
+/// ignored on Windows.
+pub fn confine_to_loopback(setting_engine: &mut SettingEngine) {
+    setting_engine.set_ip_filter(Box::new(|ip| ip.is_loopback()));
+    setting_engine.set_include_loopback_candidate(true);
+    setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+}
+
+/// Where a [`TunnelPeer`] gathers its host candidates (#4500).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Gather {
+    /// On every interface, as webrtc-rs gathers by default: production.
+    #[default]
+    AllInterfaces,
+    /// On loopback only, through [`confine_to_loopback`]: a test's peer.
+    LoopbackOnly,
+}
+
 /// One end of a tunnel peer connection. Owns the `RTCPeerConnection`
 /// plus the pre-negotiated DC pool. Both offerer and answerer
 /// construct identical peers — DCs are pre-negotiated by stream id
@@ -74,8 +104,23 @@ impl TunnelPeer {
     /// Construct a peer with the standard 8-channel DC pool.
     /// Side-effects: builds an `APIBuilder` with `SettingEngine`
     /// configured for 8 MiB SCTP rwnd; allocates 8 negotiated DCs
-    /// with deterministic stream ids.
+    /// with deterministic stream ids. Gathers on every interface, except in
+    /// this crate's own tests, whose peers gather on loopback (#4500).
     pub async fn new(ice_servers: Vec<RTCIceServer>) -> Result<Self, PeerError> {
+        let gather = if cfg!(test) {
+            Gather::LoopbackOnly
+        } else {
+            Gather::AllInterfaces
+        };
+        Self::new_with(ice_servers, gather).await
+    }
+
+    /// [`Self::new`], gathering where `gather` says: a test in another crate
+    /// passes [`Gather::LoopbackOnly`] (#4500).
+    pub async fn new_with(
+        ice_servers: Vec<RTCIceServer>,
+        gather: Gather,
+    ) -> Result<Self, PeerError> {
         let mut setting_engine = SettingEngine::default();
         // The vendored fork's lock-in test guarantees this setter
         // round-trips. If the API ever drops, this line stops
@@ -92,6 +137,9 @@ impl TunnelPeer {
         // Windows — the same unreliability `roomlerd`'s
         // `mdns_resolve` module exists to route around.
         setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        if gather == Gather::LoopbackOnly {
+            confine_to_loopback(&mut setting_engine);
+        }
 
         let api = APIBuilder::new()
             .with_setting_engine(setting_engine)
