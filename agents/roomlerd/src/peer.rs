@@ -12877,10 +12877,21 @@ async fn send_clipboard_image(
 /// no worker serves this session. It says what to do: once someone is signed
 /// in, the next session is the worker's; a Mac with two rows serves its
 /// screen and files on the person's own row. The viewer shows it on the
-/// transfer, or in the drawer.
+/// transfer, or in the drawer. #4566 — on two rows: a one-row Mac's root
+/// daemon says [`FILES_ON_A_ONE_ROW_MAC`].
 pub(crate) const FILES_IN_THE_PERSONS_SESSION: &str = "File transfer on this Mac needs someone \
      signed in at its screen and runs in their session, not in this one. Reconnect once someone \
      is signed in, or connect to the Mac's user-session roomlerd.";
+
+/// #4566 — the same reason on a one-row Mac, whose root daemon is the Mac's
+/// only row (`consent_relay::one_row`), so there is no user-session roomlerd
+/// to send the viewer to. File transfer there runs in the screen worker of
+/// the person signed in at the screen, and a channel that opens in the root
+/// daemon belongs to a session no screen worker served. Worded as the
+/// no-picture sentence is (`capture::mac_no_display_hint`).
+pub(crate) const FILES_ON_A_ONE_ROW_MAC: &str = "File transfer on this Mac runs as the person \
+     signed in at its screen, in their screen worker, and none served this session. Reconnect \
+     once someone is signed in at the Mac.";
 
 /// #3757 — whether the process that holds a session's peer serves the
 /// session's `files` channel ([`files_channel`]).
@@ -12910,11 +12921,17 @@ pub(crate) enum FilesChannel {
 /// never hands its own to the daemon; a new offer is decided again where it
 /// lands. Every other process serves the channel as before. Pure, so the
 /// rule is a test on every OS.
+///
+/// #4566 — `one_row`: this is a one-row Mac's root daemon
+/// (`consent_relay::one_row`). It declines as a two-row Mac's does, and only
+/// its reason differs: [`FILES_ON_A_ONE_ROW_MAC`], which names no other row.
 pub(crate) fn files_channel(on_macos: bool, root: bool, one_row: bool) -> FilesChannel {
-    // #4566 — the red cells' input, read nowhere yet.
-    let _ = one_row;
     if on_macos && root {
-        FilesChannel::Declined(FILES_IN_THE_PERSONS_SESSION)
+        FilesChannel::Declined(if one_row {
+            FILES_ON_A_ONE_ROW_MAC
+        } else {
+            FILES_IN_THE_PERSONS_SESSION
+        })
     } else {
         FilesChannel::Served
     }
