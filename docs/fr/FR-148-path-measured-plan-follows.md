@@ -716,7 +716,7 @@ to learn what its path carries.
   yet measured, and the timer's doubling from its 1 s floor sets how long a window stalls: the 7 stalled lines read
   2.0 s five times and 4.1 s twice. Past that socket no drop reaches a line a read of `agent_logs` takes. The
   central relay writes its drops (the relay allowance, an unregistered destination, a full destination queue) as
-  paced lines to the pod's own log (`crates/modules/network/src/derp.rs:693-761`), and the pods' restart on
+  paced lines to the pod's own log (`crates/modules/network/src/derp.rs:841-909`), and the pods' restart on
   2026-11-21 at 07:10Z erased them for this window. The regional relay drops an unknown destination or a full
   destination queue in silence (`crates/derp-relay/src/main.rs:953-992`). The receiving agent counts a full or
   unrouted inbound queue, but only its live overlay status shows the counts
