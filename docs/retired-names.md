@@ -89,7 +89,7 @@ on a *condition*, each one named:
 | MSI installer identity | the WiX FileKeys, the Component and Feature Ids and the UpgradeCodes | a major-upgrade decision, not a rename. The ProductName (what Apps & Features lists) was only ever a display name, since an upgrade matches the UpgradeCode: FR-133 P1 renamed it |
 | the Apps & Features names from before FR-133 P1 | `scripts/install.ps1:109`, `agents/roomlerd/scripts/m3-a1-verify-win11.ps1:387` | no machine still carries an install from before P1: its next update replaces the entry, under the new name |
 | wire values | `crates/tunnel-core/src/transport/quic.rs:61` | **step 2 of 3 shipped with this page**: the server has answered both ALPNs since 0.4.45; the client now offers only the current one; the legacy arm goes once no client can still offer it |
-| env fallbacks | `crates/tunnel-core/src/env.rs:215`, `:225` | the retired prefix is **searched, never read** — a host that still sets one is told at startup and on `roomler status` — and the arm goes once no host can have one |
+| env fallbacks | `crates/tunnel-core/src/env.rs:195`, `:205` | the retired prefix is **searched, never read** — a host that still sets one is told at startup and on `roomler status` — and the arm goes once no host can have one |
 | a Windows rendezvous path | `agents/roomlerd/src/system_context/peer_presence.rs:83` | written today by the SystemContext worker and read by the supervisor, which can be different versions mid-update: a dual-read window first, then the rename |
 
 ⚠️ **An anchor's stated reason is a claim, not a fact.** Six have been found

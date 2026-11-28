@@ -2,28 +2,28 @@
 // Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR-BEGIN
 // This whole module IS the env-prefix fallback chain. Every occurrence of a
-// retired name in it is a prefix the chain must keep honouring
-// (`ROOMLER_AGENT_`, `ROOMLER_NODE_`), its documentation, or a test that sets one
-// to prove the field keeps working.
+// retired name in it is a prefix the chain reads or still looks for
+// (`ROOMLER_NODE_` read, `ROOMLER_AGENT_` looked for since FR-46 P2b), its docs,
+// or a test that sets one to prove the field keeps working.
 // INVARIANT: if you add a retired name here that is NOT part of that chain, that
 // is a bug, not a new exemption. docs/fr/FR-21
 //! Roomler node env-var reads with legacy-prefix fallback.
 //!
-//! The controlled-host daemon is being renamed `roomler-agent` → `roomlerd`
-//! (the unified "device / node" model — see the unification plan). Operators
-//! set tuning vars in the Windows service Environment block (e.g.
-//! `ROOMLER_AGENT_OVERLAY_DIRECT`), and those MUST keep working across the
-//! rename: silently dropping a prefix is the MajorUpgrade-drops-env-vars class
-//! of bug that already bit the fleet. So every node env read goes through
-//! [`node_env`], which tries `ROOMLERD_<SUFFIX>` first, then the interim
-//! `ROOMLER_NODE_<SUFFIX>`, then the original `ROOMLER_AGENT_<SUFFIX>`.
+//! The daemon was renamed `roomler-agent` → `roomlerd`, and operators set its
+//! tuning vars by name: in a Windows service's Environment block, or in a
+//! systemd drop-in that no package upgrade rewrites. Silently dropping a
+//! spelling they use is the MajorUpgrade-drops-env-vars class of bug that
+//! already bit the fleet: the daemon starts fine and ignores what it was told.
+//! So every node env read goes through [`node_env`] with a bare SUFFIX, and a
+//! prefix changes here, never at a call site. It reads [`PREFIXES`] in order,
+//! `ROOMLERD_<SUFFIX>` (FR-21 P3, decision D1) and then the interim
+//! `ROOMLER_NODE_<SUFFIX>`. The order is the contract: the current spelling
+//! wins where both are set, a read through a later one is recorded and warned
+//! about ([`legacy_env_uses`]), and [`node_env_os`] keeps the same order.
 //!
-//! FR-21 P3 (decision D1) makes `ROOMLERD_*` the spelling new code and docs
-//! use — it matches the binary. Both older prefixes stay readable
-//! INDEFINITELY: they are a contract with hosts already in the field, and the
-//! cost of honouring them is one `or_else` arm. Adding a preferred prefix is a
-//! change to this one function, never to the 166 call sites, because every
-//! caller passes a bare SUFFIX.
+//! FR-46 P2b (#1109) retired the original `ROOMLER_AGENT_`: ignored, but never
+//! silently. It is in [`RETIRED_PREFIXES`], SEARCHED and never read, and a host
+//! setting `ROOMLER_AGENT_*` is told at startup and on `roomler status`.
 //!
 //! S2 adds a THIRD source: config-backed fallbacks. The daemon registers the
 //! operator-grade knobs from its `config.toml` once at startup
@@ -81,11 +81,11 @@ pub fn config_fallbacks_for_child() -> Vec<(String, String)> {
 /// and `#[cfg(test)]` does not cross a crate boundary.
 ///
 /// Why this exists rather than each test hand-rolling `remove_var`: [`node_env`]
-/// reads THREE prefixes, so clearing one and asserting a default is not
-/// hermetic. That was not hypothetical — it was true of every env test in the
-/// agent (14 suffixes across 8 files), in both directions: some cleared only
-/// the retired name and so proved nothing about the current one, others cleared
-/// only the current name and would have read a stale alias.
+/// reads two spellings and [`retired_env_present`] a third, so clearing one and
+/// asserting a default is not hermetic. That was not hypothetical — it was true
+/// of every env test in the agent (14 suffixes across 8 files), both ways: some
+/// cleared only the retired name and so proved nothing about the current one,
+/// others cleared only the current name and would have read a stale alias.
 #[doc(hidden)]
 pub mod test_env {
     use super::{PREFIXES, RETIRED_PREFIXES};
@@ -167,26 +167,6 @@ pub mod test_env {
     }
 }
 
-// RETIRED-NAME-ANCHOR(4): arms 2 and 3 are the reason a rename here costs
-// nothing in the field. Both spellings are set on real hosts today — mars,
-// jupiter and zeus each carry four `ROOMLER_AGENT_*` entries in an
-// operator-authored `/etc/systemd/system/roomlerd.service.d/` drop-in, which a
-// package upgrade never rewrites. Dropping either arm silently un-configures
-// those hosts: the daemon starts fine and simply ignores what it was told.
-/// Read a Roomler node env var by suffix. Precedence, highest first:
-///
-///   1. `ROOMLERD_<suffix>`      — the current spelling (FR-21 P3, decision D1)
-///   2. `ROOMLER_NODE_<suffix>`  — the previous "new" spelling, still honoured
-///   3. `ROOMLER_AGENT_<suffix>` — the original, still honoured
-///   4. a registered config-backed fallback (S2)
-///
-/// Returns `None` if none is set (or the env value isn't valid Unicode).
-///
-/// Every knob in the daemon reads through here and passes a SUFFIX, never a
-/// full name, so adding a preferred prefix is one arm in this chain rather than
-/// an edit at 166 call sites.
-///
-/// See docs/fr/FR-21.
 /// The env-var prefixes [`node_env`] READS, most current first.
 ///
 /// One list, because three things must agree about it: both readers below and
@@ -251,6 +231,26 @@ pub fn warn_on_retired_env() {
     }
 }
 
+// RETIRED-NAME-ANCHOR(4): arm 2 is the reason a rename here costs nothing in
+// the field. Arm 3, the original `ROOMLER_AGENT_*`, went in FR-46 P2b, loudly:
+// mars, jupiter and zeus each carried four such entries in an
+// operator-authored `/etc/systemd/system/roomlerd.service.d/` drop-in, which a
+// package upgrade never rewrites. A host that still sets one is told, because
+// a dropped arm otherwise un-configures it with no sign: the daemon starts fine.
+/// Read a Roomler node env var by suffix. Precedence, highest first:
+///
+///   1. `ROOMLERD_<suffix>`      — the current spelling (FR-21 P3, decision D1)
+///   2. `ROOMLER_NODE_<suffix>`  — the previous "new" spelling, still honoured
+///   3. a registered config-backed fallback (S2)
+///
+/// Arms 1 and 2 are [`PREFIXES`], in its order. The original
+/// `ROOMLER_AGENT_<suffix>` is never read (FR-46 P2b): the chain ends above
+/// it, and [`retired_env_present`] only reports it. Returns `None` if none is
+/// set (or the env value isn't valid Unicode).
+///
+/// Every knob in the daemon reads through here and passes a SUFFIX, never a
+/// full name, so adding a preferred prefix is one arm in this chain rather than
+/// an edit at every call site. See docs/fr/FR-21 and docs/fr/FR-46.
 pub fn node_env(suffix: &str) -> Option<String> {
     PREFIXES
         .iter()
@@ -302,7 +302,7 @@ pub fn flag_value(value: Option<&str>, default: bool) -> bool {
 /// same: two readers of one knob that disagree about which prefix wins is a
 /// bug nobody would think to look for.
 ///
-// RETIRED-NAME-ANCHOR(5): the legacy arms, as in [`node_env`]. See docs/fr/FR-21.
+// RETIRED-NAME-ANCHOR(5): the legacy arm, as in [`node_env`]. See docs/fr/FR-21.
 pub fn node_env_os(suffix: &str) -> Option<std::ffi::OsString> {
     PREFIXES
         .iter()
