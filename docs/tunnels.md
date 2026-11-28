@@ -1077,8 +1077,8 @@ sequenceDiagram
 ```
 
 **What the exit does.** The `ServerMsg::TunnelTerminate` arm
-(`agents/roomlerd/src/signaling.rs:5645`) hands the QUIC half to
-`terminate_quic_session` (`:6733`):
+(`agents/roomlerd/src/signaling.rs:5647`) hands the QUIC half to
+`terminate_quic_session` (`:6735`):
 
 - **with the flag**, `AgentQuicPeer::end` (`agents/roomlerd/src/tunnel/quic_peer.rs:590`):
   the connection closes with application code `2` (`SESSION_END_CODE`, `:58`, reason
@@ -1089,7 +1089,7 @@ sequenceDiagram
   The endpoint's UDP socket, and on the relayed flavours the TURN allocation, go once
   the closed connection drains. A peer R3 parked and reclaimed is ended the same way;
 - **without it**, `AgentQuicPeer::close`, and the session's `SessionLink` is kept in
-  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6707`) for 60 s
+  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6709`) for 60 s
   (`ENDED_SESSION_TTL`, at most 64 sessions a tenant, the oldest first out). A
   terminate with the flag that arrives after one without still reaches the session
   through it and ends it.
@@ -1103,7 +1103,7 @@ forward still waiting for its stream (`take_flow`,
 ends.
 
 **The reap.** A #1754 reap (`ReapSignal::QuicConnEnded`) goes through `reap_quic_peer`
-(`agents/roomlerd/src/signaling.rs:6765`, from the reap arm at `:3111`) to
+(`agents/roomlerd/src/signaling.rs:6767`, from the reap arm at `:3113`) to
 `AgentQuicPeer::reap` (`agents/roomlerd/src/tunnel/quic_peer.rs:602`): when the
 connection itself has ended (`close_reason()` is set), it ends the session as above.
 When the accept loop ended on a connection that is still up, it only closes the peer
@@ -1190,9 +1190,9 @@ so tests drive it directly:
 
 | While a setup is in flight… | Rule | Where |
 |---|---|---|
-| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5595-5603`, `quic_setup.rs:243` |
-| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5638`, `quic_setup.rs:258` |
-| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `agents/roomlerd/src/signaling.rs:3140` |
+| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5597-5605`, `quic_setup.rs:243` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5640`, `quic_setup.rs:258` |
+| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `agents/roomlerd/src/signaling.rs:3142` |
 | a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
 | more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
 | the control WS ends | the entry map dies with the connection (one log line names how many were in flight); the results reach the next connection and are closed there. The #1754 teardown and R3 parking of the **maps** are unchanged | `quic_setup.rs:335` |
@@ -1560,7 +1560,7 @@ enrolled under one name in one org send one hash, and the second lands on the fi
 row (#4479). The `instance_id` is the install's own. A row keeps the `machine_id` it was
 made with for good, because the client's overlay node is keyed by it, and it holds an
 `instance_id` once an FR-159 client has claimed it (`TunnelClient`,
-`crates/remote_control/src/models.rs:3650`). A row an FR-159 client creates takes its
+`crates/remote_control/src/models.rs:3806`). A row an FR-159 client creates takes its
 `instance_id` as its `machine_id` too (`create_row`, `routes/tunnel.rs:486`), so no legacy hash
 ever finds it.
 
