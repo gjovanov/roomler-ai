@@ -1011,7 +1011,7 @@ Where it fires:
 
 | End | Trigger | Where |
 |---|---|---|
-| exit | `AgentTunnelPeer::close` — the one method every real teardown reaches: the `rc:tunnel.terminate` arm, the #1754 reap, and the WS-disconnect sweep (`close_all_tunnel_peers`) | [`peer.rs:351`](../agents/roomlerd/src/tunnel/peer.rs), the handle passed to the flow at [`acceptor.rs:186`](../agents/roomlerd/src/tunnel/acceptor.rs) |
+| exit | `AgentTunnelPeer::close` — the one method every real teardown reaches: the `rc:tunnel.terminate` arm, the #1754 reap, and the WS-disconnect sweep (`close_all_tunnel_peers`) | [`peer.rs:348`](../agents/roomlerd/src/tunnel/peer.rs), the handle passed to the flow at [`acceptor.rs:186`](../agents/roomlerd/src/tunnel/acceptor.rs) |
 | client | the DC carrier being dropped (`kill_flow`, the session dying, a re-upgrade drain reaching zero, the standalone CLI's session end) — a `CancelOnDrop` in `Plane::Dc` fires it from `Drop` | [`driver.rs:486`](../crates/tunnel-core/src/driver.rs) · installed at `driver.rs:1269` |
 
 ⚠️ **The exclusion is `close`, not the loop exit.** The cancel is tied to
