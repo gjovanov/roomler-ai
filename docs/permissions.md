@@ -68,7 +68,7 @@ next decision, and a role taken back or deleted stops counting there.
 | reader | decides | asked | a read that fails |
 |---|---|---|---|
 | `get_member_permissions` (`tenant.rs:712`) | the permission mask behind `require_permission` and every gate that asks for a bit | every request | the request fails; no mask is guessed. No membership row is `not_a_member` |
-| `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1058`) | a tunnel policy's `RoleId` subjects ([tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635)) | every forward, when a live policy names a role | no roles, WARN |
+| `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1035`) | a tunnel policy's `RoleId` subjects ([tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635)) | every forward, when a live policy names a role | no roles, WARN |
 | `CompileRoles` (`crates/modules/network/src/overlay.rs:2706`) | the overlay ACL's `RoleId` sources: netmap shaping, the DERP allow table, org-relay grants | every compile: the org's role ids in one query, kept for the nodes it resolves, intersected with each node owner's row | shaping: no roles, WARN; a relay grant: refused; the relay reconcile: no decision for that member |
 | `resolve_session_authz` (`crates/modules/remote/src/controller.rs:979`) | a device's remote-control allow-list (`access_policy.allowed_role_ids`) | every session request | no roles, WARN |
 | `resume_gate` (`controller.rs:1174`) | the same allow-list when a session resumes | every resume | the resume is refused, and the viewer's redial runs the whole gate |
@@ -109,8 +109,8 @@ of a grant, never the lookup.
 | add a member with roles, `POST …/member` | `INVITE_MEMBERS` | 404, the same two checks (`TenantDao::add_member`, `tenant.rs:520`) |
 | create an invite, `POST …/invite`, `…/invite/batch` | `INVITE_MEMBERS` | 404, `check_grant_roles` |
 | redeem an invite, `POST /api/invite/{code}/accept` or registering with its code | the invitee | the invite's roles the org still has (`redeemed_role_ids`, `crates/api/src/routes/invite.rs:166`). If none is left, 409 `conflict` and nothing is spent: the inviter sends a new invite. An invite that names no role gives `member` |
-| a device's remote-control, exec or SSH allow-list: `PUT …/agent/{aid}`, `…/exec-policy`, `…/ssh-policy` | `MANAGE_AGENTS` | 400 `bad_request` `Unknown role id: <hex>` (`guards::require_org_roles`, `crates/core/src/guards.rs:71`; called at `crates/modules/fleet/src/agent.rs:2091`, `crates/modules/fleet/src/agent_exec.rs:1002`, `crates/modules/network/src/routes/agent_ssh.rs:1012`) |
-| a tunnel policy's `RoleId` subject, `POST`/`PUT …/tunnel-policy` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/tunnel.rs:1162`, `:1246`) |
+| a device's remote-control, exec or SSH allow-list: `PUT …/agent/{aid}`, `…/exec-policy`, `…/ssh-policy` | `MANAGE_AGENTS` | 400 `bad_request` `Unknown role id: <hex>` (`guards::require_org_roles`, `crates/core/src/guards.rs:71`; called at `crates/modules/fleet/src/agent.rs:2088`, `crates/modules/fleet/src/agent_exec.rs:1002`, `crates/modules/network/src/routes/agent_ssh.rs:1012`) |
+| a tunnel policy's `RoleId` subject, `POST`/`PUT …/tunnel-policy` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/tunnel.rs:1139`, `:1223`) |
 | an overlay ACL rule's `RoleId` source, `POST`/`PUT …/overlay-acl` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/overlay_policy.rs:203`, `:262`) |
 
 A role named by a member-row write is an object the request resolves in the org,

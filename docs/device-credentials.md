@@ -91,7 +91,7 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328), and comes back as that holder's: its new token acts for them.
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1389`; tunnel clients `crates/services/src/dao/tunnel_client.rs:473`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1389`; tunnel clients `crates/services/src/dao/tunnel_client.rs:483`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row, and at a sixth while the token rotation is on (FR-155 P1c):
 
 | Site | Where |
@@ -100,8 +100,8 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1532` |
 | the agent socket's registration, after the hello, while the token rotation is on: a refusal registers and writes nothing, and a removed or quarantined row is the removal's to answer | `registration_generation`, on its own read of the row on the primary, `crates/modules/fleet/src/socket.rs:1360` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
-| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2360` |
-| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:578` |
+| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2236` |
+| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:575` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
 - **The service credential** has no generation: a removal clears `exec_anchor` (#2133), which ends it.

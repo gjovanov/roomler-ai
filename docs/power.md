@@ -272,9 +272,9 @@ sleep would say hello again and erase the reason.
 |---|---|---|
 | `roomler status` | `power` ([`lib.rs:221`](../crates/localapi/src/lib.rs#L221)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2490`](../agents/roomler-cli/src/localclient.rs#L2490)) |
 | `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3517`](../agents/roomler-cli/src/localclient.rs#L3517)) |
-| the dashboard's devices grid | `sleep { since, power }` ([`device.rs:123`](../crates/api/src/routes/device.rs#L123)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:97`](../ui/src/utils/devicePresence.ts#L97) `sleepTitle`) |
+| the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
-| the admin agent API | `power`, `sleep` ([`agent.rs:1381`](../crates/modules/fleet/src/agent.rs#L1381)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
+| the admin agent API | `power`, `sleep` ([`agent.rs:1378`](../crates/modules/fleet/src/agent.rs#L1378)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
 | peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3730`](../crates/remote_control/src/models.rs#L3730)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:
