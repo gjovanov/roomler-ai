@@ -1032,6 +1032,100 @@ carrier drop), and `tunnel::peer::tests::closing_the_peer_ends_its_live_flows`
 with its exclusion control `a_kept_peer_keeps_its_live_flows`
 (`agents/roomlerd/src/tunnel/peer.rs`).
 
+### A session the server ends itself closes its QUIC connection at the exit (#4542)
+
+A session the server ends itself closes its QUIC connection at the exit; a roll, a
+control-socket drop or a terminate the other half sends does not (FR-158 keeps those
+sessions).
+
+The server says which it is on the frame. `rc:tunnel.terminate` carries an additive
+flag (`crates/remote_control/src/signaling.rs:3204`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `session_id` | hex ObjectId | the session |
+| `reason` | `CloseReason` | the taxonomy a flow's close uses |
+| `close_connection` | bool; absent reads `false` | the exit closes this session's connection |
+
+An exit without the field decodes the frame unchanged (`ServerMsg` has no
+`deny_unknown_fields`), and the client ignores it.
+
+**Which terminates carry it.** Every terminate the server sends the exit for a session
+it ends itself, and no other:
+
+| Path | `close_connection` | Where |
+|---|---|---|
+| a tunnel-client connection the server ends: the connection loop tells the exit at once, and the client is told after it | `true` | `exit_end` (`crates/modules/network/src/tunnel.rs:1655`), from the end-signal arm of `handle_tunnel_client_socket` (`:181`); `signal_end` (`:1669`) sets the flag first and waits for that arm at most 5 s (`END_TOLD_WITHIN`, `:71`) |
+| that client's ack, relayed, and the connection's teardown | `true` | `Originator::exit_terminate` (`crates/modules/network/src/tunnel.rs:524`), which reads `Originator::server_ended` |
+| an agent connection the server ends itself: `Hub::kick_removed_agent` sets the connection's `ServerEnded` (`crates/modules/fleet/src/hub.rs:1331`), which `AgentCtx::server_ended` shares (`crates/core/src/agent_socket.rs:72`); the agent's relays from then on, and its teardown | `true` | `relay_tunnel_client_msg_from_agent` (`crates/modules/network/src/tunnel.rs:1772`), `teardown_agent_originated_sessions` (`:2000`) |
+| every other relay and teardown: a socket that drops, a roll, a replacement | `false` | the same sites |
+| a push to a client (`terminate_agent_sessions_now`, the relays in `agent_arms.rs`) | `false` | `crates/modules/network/src/tunnel.rs:2098`, `crates/modules/network/src/agent_arms.rs` |
+
+```mermaid
+sequenceDiagram
+    participant S as server
+    participant X as exit agent
+    participant C as client
+
+    Note over S: the server ends the session
+    S->>X: rc:tunnel.terminate { close_connection: true }
+    Note over X: AgentQuicPeer::end — flows stop, connection closed (code 2)
+    S->>C: tells the client
+    C->>S: ack (rc:tunnel.terminate)
+    S->>X: rc:tunnel.terminate { close_connection: true } (relayed)
+    Note over X: nothing left to end — a no-op
+```
+
+**What the exit does.** The `ServerMsg::TunnelTerminate` arm
+(`agents/roomlerd/src/signaling.rs:5627`) hands the QUIC half to
+`terminate_quic_session` (`:6715`):
+
+- **with the flag**, `AgentQuicPeer::end` (`agents/roomlerd/src/tunnel/quic_peer.rs:590`):
+  every flow stops, its two halves aborted, which drops its destination socket and
+  its streams; the connection closes with application code `2` (`SESSION_END_CODE`,
+  `:58`, reason `session ended`, distinct from a failed auth's `1`); the endpoint
+  closes and the accept loop stops. The endpoint's UDP socket, and on the relayed
+  flavours the TURN allocation, go once the closed connection drains. A peer R3
+  parked and reclaimed is ended the same way;
+- **without it**, `AgentQuicPeer::close`, and the session's `SessionLink` is kept in
+  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6689`) for 60 s
+  (`ENDED_SESSION_TTL`, at most 64 sessions a tenant, the oldest first out). A
+  terminate with the flag that arrives after one without still reaches the session
+  through it and ends it.
+
+A `SessionLink` (`agents/roomlerd/src/tunnel/quic_peer.rs:87`) holds a `Weak` to the
+connection and the stop every flow runs under (`run_flow_quic_until`,
+`crates/tunnel-core/src/forward.rs:763`, for TCP; a `select` for UDP,
+`agents/roomlerd/src/tunnel/acceptor.rs:519`), so a kept link holds no socket. A
+forward still waiting for its stream (`take_flow`,
+`agents/roomlerd/src/tunnel/quic_peer.rs:546` and `:559`) returns when the session
+ends.
+
+**The reap.** A #1754 reap (`ReapSignal::QuicConnEnded`) goes through `reap_quic_peer`
+(`agents/roomlerd/src/signaling.rs:6747`, from the reap arm at `:3100`) to
+`AgentQuicPeer::reap` (`agents/roomlerd/src/tunnel/quic_peer.rs:602`): when the
+connection itself has ended (`close_reason()` is set), it ends the session as above.
+When the accept loop ended on a connection that is still up, it only closes the peer
+and keeps the session's link. A reap never closes a connection that is up.
+
+Locked by lib tests: `a_tunnel_terminate_without_close_connection_decodes_unset` and
+`a_tunnel_terminate_that_asks_to_close_decodes_on_an_agent_without_the_field`
+(`crates/remote_control/src/signaling.rs`);
+`a_terminate_that_asks_to_close_closes_the_connection_and_what_runs_on_it`,
+`terminates_that_do_not_ask_and_a_control_socket_drop_keep_the_connection_open`,
+`a_terminate_that_asks_to_close_closes_a_peer_r3_kept`,
+`a_terminate_that_asks_to_close_after_one_that_did_not_still_closes`,
+`a_reap_on_a_live_connection_does_not_close_it`,
+`a_terminate_that_asks_to_close_after_a_reap_of_a_live_connection_still_closes`,
+`a_reap_of_a_connection_that_ended_stops_its_flows` and
+`a_session_end_releases_what_the_exit_held_for_it` (`agents/roomlerd/src/signaling.rs`);
+`a_session_end_stops_a_forward_waiting_for_its_stream` and
+`an_ended_session_is_kept_for_its_ttl_and_the_oldest_goes_first`
+(`agents/roomlerd/src/tunnel/quic_peer.rs`); the server side in
+`crates/modules/network/src/tunnel.rs`, `crates/modules/fleet/src/hub.rs` and
+`crates/core/src/agent_socket.rs`; and the integration cell `an_exit_is_asked_to_close_the_connection_of_a_session_the_server_ends`
+(`crates/tests/src/tunnel_tests.rs`).
+
 ### ⚠️ The exit never awaits a TURN allocation on its signaling loop (#1761)
 
 An exit agent serves every session of its org from **one** signaling loop
@@ -1096,7 +1190,7 @@ so tests drive it directly:
 | While a setup is in flight… | Rule | Where |
 |---|---|---|
 | `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5588-5596`, `quic_setup.rs:243` |
-| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5627`, `quic_setup.rs:258` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5631`, `quic_setup.rs:258` |
 | the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `agents/roomlerd/src/signaling.rs:3140` |
 | a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
 | more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
@@ -1355,7 +1449,7 @@ Locked by lib tests, each shown red with a one-line negative control:
    ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
    The forward itself reads no permission bit: the policy is the grant, made to let
    people who hold no management bit reach what a holder named them for
-   (`crates/modules/network/src/tunnel.rs:1115`). Every decision lands in
+   (`crates/modules/network/src/tunnel.rs:1149`). Every decision lands in
    `tunnel_audit` (90 d). A device the org
    removed is refused as a target while it is removed; if its machine enrolls
    again, the device is taken out of every live policy's subjects and targets
@@ -1367,7 +1461,7 @@ Locked by lib tests, each shown red with a one-line negative control:
 ### Who a forward is matched as (#3635)
 
 A forward is matched in the org whose policies decide it, the target device's
-(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1109`); a forward from
+(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1143`); a forward from
 another org is refused `cross_tenant` whatever those policies say. In that org the
 originator is matched as the person it acts for, its `owner_user_id`:
 
@@ -1376,7 +1470,7 @@ originator is matched as the person it acts for, its `owner_user_id`:
 | A tunnel client: `roomler` on its own socket, with its tunnel-client credential | the person who enrolled it; for a paired client, whoever approved the pairing | a role that person holds in the org | `TunnelClientId` = this client; an `AgentId` never matches it | yes |
 | A device opening forwards over its own device socket: `forward --daemon`, a declared route, a supervised SOCKS5 listener ([tunnel-install.md](tunnel-install.md#declared-routes-daemon-supervised--p6)) | the device's owner, as read when the device's socket connected | a role the device's owner holds in the org | `AgentId` = this device; a `TunnelClientId` never matches it | yes |
 
-The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1001`),
+The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1035`),
 through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:757`),
 the same read every gate that matches a role makes
 ([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)):
@@ -1421,7 +1515,7 @@ flowchart TD
 | `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:398`) | a device forwards on its owner's role, and is refused once the owner left the org |
 | `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:455`) | a role of another org, and a role the org deleted, grant nothing here; the rule naming the other org's role is a stored one, because a policy write takes only the org's roles |
 | `…::the_other_subject_kinds_forward_as_before` (`:539`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
-| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2190`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
+| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2256`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
 
 ### A retired agent-session grant is refused (FR-137)
 
@@ -1434,8 +1528,8 @@ reach whatever the device may reach. So:
 - `net_grant` stays on `ClientMsg::TunnelOpen`, parse-only
   (`crates/remote_control/src/signaling.rs:1363`), and no build sends it;
 - the server refuses any open that carries one, at step 3c
-  (`crates/modules/network/src/tunnel.rs:698`), before a tunnel session exists
-  (step 4, `:781`), with `rc:error {code: net_grant_refused}`
+  (`crates/modules/network/src/tunnel.rs:732`), before a tunnel session exists
+  (step 4, `:815`), with `rc:error {code: net_grant_refused}`
   (`NET_GRANT_REFUSED`, `signaling.rs:102`). An old device reads that code as the
   end of its grant, never as a reason to retry.
 

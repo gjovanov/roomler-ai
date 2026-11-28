@@ -3006,8 +3006,8 @@ the stricter of the person's and its own.
 Each org's row says what the worker has told the daemon from the connection's first
 message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
 permissions, what it can record, its Remote Apps words and its audio, and the stricter
-`rc_*` floor ([`signaling.rs:7171`](../agents/roomlerd/src/signaling.rs#L7171)), built
-into the caps by one function ([`:7225`](../agents/roomlerd/src/signaling.rs#L7225)).
+`rc_*` floor ([`signaling.rs:7257`](../agents/roomlerd/src/signaling.rs#L7257)), built
+into the caps by one function ([`:7311`](../agents/roomlerd/src/signaling.rs#L7311)).
 So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
 restarts of the daemon measured in #3992, is on the row at once, rather than the root's
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after

@@ -509,6 +509,7 @@ pub async fn handle_agent_socket(
             registered_at: resume_window.map(|_| registered_at),
             reaped: reaped_at_registration,
         },
+        server_ended: cancel.server_ended(),
     };
     let lifecycles = state.agent_socket.lifecycles();
     for (_, lc) in &lifecycles {

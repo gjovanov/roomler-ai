@@ -1572,6 +1572,7 @@ async fn dispatch_loop(
             ServerMsg::TunnelTerminate {
                 session_id: sid,
                 reason,
+                ..
             } if sid == session_id => {
                 info!(?reason, "rc:tunnel.terminate — peer torn down by server");
                 // Ack with our own terminate (mirroring the Revoked arm) so
@@ -2099,6 +2100,7 @@ async fn quic_dispatch_loop(
             ServerMsg::TunnelTerminate {
                 session_id: sid,
                 reason,
+                ..
             } if sid == session_id => {
                 info!(?reason, "rc:tunnel.terminate — peer torn down by server");
                 // Ack with our own terminate (mirroring the Revoked arm) so

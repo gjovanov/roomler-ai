@@ -97,10 +97,10 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | Site | Where |
 |---|---|
 | `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:103` |
-| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1531` |
-| the agent socket's registration, after the hello, while the token rotation is on: a refusal registers and writes nothing, and a removed or quarantined row is the removal's to answer | `registration_generation`, on its own read of the row on the primary, `crates/modules/fleet/src/socket.rs:1359` |
+| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1532` |
+| the agent socket's registration, after the hello, while the token rotation is on: a refusal registers and writes nothing, and a removed or quarantined row is the removal's to answer | `registration_generation`, on its own read of the row on the primary, `crates/modules/fleet/src/socket.rs:1360` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
-| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2170` |
+| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2236` |
 | the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:575` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
@@ -147,7 +147,7 @@ The server logs each revive: `enroll: a removed device enrolled again and starts
 
 ### A connected device is told at once (#2267)
 
-A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1315`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1457`).
+A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1324`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1457`).
 
 Before #2267 the kick only took the device out of the hub. The device kept its socket and heard nothing. It learned of its removal at its next connection, after a network change or a pod roll, and on a stable network that could take days. Nothing could be done through that socket, because every action re-checks the row, but the device's own status read "connected" throughout.
 

@@ -379,7 +379,7 @@ roles do not.
   The rest of the network module's gated writes followed in #4218, and a guard now
   holds the order in every module ([below](#a-gated-write-decides-its-gate-before-it-reads-its-body)).
 - ⚠️ **The forward itself reads no permission bit, and must not.**
-  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1035`) asks only
+  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1069`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
   people who hold no management bit reach what a holder named them for, so a bit on
   the forward would either defeat it or repeat it. When a policy names a role, the

@@ -215,6 +215,7 @@ impl AgentSocketLifecycle for NetworkAgentSocket {
             outbound_tx: ctx.tx.clone(),
             dialed_tid: ctx.dialed_tid.clone(),
             conn_established_ms: ctx.conn_established_ms,
+            server_ended: ctx.server_ended.clone(),
         };
         self.conns.insert(
             ctx.conn_id.clone(),
