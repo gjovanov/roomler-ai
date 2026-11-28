@@ -3709,3 +3709,882 @@ async fn test_assoc_pacer_the_write_loop_wakes_for_the_chunk_it_held() -> Result
     );
     Ok(())
 }
+
+// roomler (FR-148 P0, D35): the window snapshot, its gated restore and the
+// lowering (`windows.rs`), on the pair harness above: two associations joined
+// by a bridge that moves a packet only when the cell ticks it, so a flight
+// stays in flight, and nothing is acknowledged, until the cell says.
+
+use super::windows::{Lowered, RestoreRefusal, Windows};
+
+/// A message of one chunk, which fills a packet: the MTU of 1,228 bytes less
+/// the common header and the chunk's.
+const ONE_CHUNK: usize = 1_200;
+
+/// The windows the cells set before a snapshot, so that no constant passes
+/// for the snapshot's.
+const SET: Windows = Windows {
+    cwnd: 7_777,
+    ssthresh: 55_555,
+    partial_bytes_acked: 1_234,
+};
+
+/// Where the restore cells move the windows after the snapshot.
+const MOVED: Windows = Windows {
+    cwnd: 64_000,
+    ssthresh: 9_000,
+    partial_bytes_acked: 4_321,
+};
+
+/// An established pair for the windows cells, a stream open on it, the
+/// bridge empty and both loops at rest.
+async fn windows_pair() -> Result<(Arc<Bridge>, Association, Association, Arc<Stream>)> {
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
+    let (s0, _s1) = establish_session_pair(&br, &a0, &mut a1, 1).await?;
+    settle().await;
+    Ok((br, a0, a1, s0))
+}
+
+/// Lets both associations' loops run to rest: what they woke for is done,
+/// and their lock is free.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}
+
+/// The three values as `a` holds them, read under its lock.
+async fn windows_of(a: &Association) -> Windows {
+    let ai = a.association_internal.lock().await;
+    Windows {
+        cwnd: ai.cwnd,
+        ssthresh: ai.ssthresh,
+        partial_bytes_acked: ai.partial_bytes_acked,
+    }
+}
+
+/// Sets the three values under `a`'s lock. Unlike the association's own
+/// window writes, it stores no gauge and wakes nothing.
+async fn set_windows(a: &Association, w: Windows) {
+    let mut ai = a.association_internal.lock().await;
+    ai.cwnd = w.cwnd;
+    ai.ssthresh = w.ssthresh;
+    ai.partial_bytes_acked = w.partial_bytes_acked;
+}
+
+/// Writes `n` messages of one chunk each on `s`.
+async fn write_chunks(s: &Stream, n: usize) -> Result<()> {
+    let message = Bytes::from(vec![0u8; ONE_CHUNK]);
+    for _ in 0..n {
+        s.write_sctp(&message, PayloadProtocolIdentifier::Binary)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Waits, a second at most, until `a`'s gauges read `inflight` bytes in flight
+/// and `pending` waiting, then lets its loops settle. False if they never do.
+async fn until_held(a: &Association, inflight: u64, pending: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let g = a.gauges().peek();
+        if (g.inflight_bytes, g.pending_bytes) == (inflight, pending) {
+            settle().await;
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// `call`, asked again each millisecond, a second at most, while it answers
+/// `Busy`: the association's own loops hold the lock for an instant when they
+/// handle or gather a packet, which is not what the cells that use this test
+/// (`test_windows_a_held_lock_is_busy_and_never_waited_for` is).
+async fn past_busy<T>(
+    mut call: impl FnMut() -> std::result::Result<T, RestoreRefusal>,
+) -> std::result::Result<T, RestoreRefusal> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match call() {
+            Err(RestoreRefusal::Busy) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            answer => return answer,
+        }
+    }
+}
+
+/// The DATA bytes `packets` carry.
+fn data_bytes(packets: &[Packet]) -> usize {
+    packets
+        .iter()
+        .flat_map(|p| p.chunks.iter())
+        .filter_map(|c| c.as_any().downcast_ref::<ChunkPayloadData>())
+        .map(|c| c.user_data.len())
+        .sum()
+}
+
+/// roomler (FR-148 P0, D35): a restore writes back the three values the
+/// snapshot took, never constants: the cell sets them before the snapshot and
+/// moves them after it.
+#[tokio::test]
+async fn test_windows_a_restore_writes_the_snapshot_back() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(&a0, SET).await;
+    let snapshot = handle.snapshot().await;
+    set_windows(&a0, MOVED).await;
+    let restored = match &snapshot {
+        Some(snapshot) => past_busy(|| handle.try_restore(snapshot, || true)).await,
+        None => Err(RestoreRefusal::Gone),
+    };
+    let now = windows_of(&a0).await;
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(
+        snapshot,
+        Some(SET),
+        "the snapshot took what the association held"
+    );
+    assert_eq!(restored, Ok(()));
+    assert_eq!(
+        now, SET,
+        "the restore wrote the snapshot's three values back"
+    );
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a restore refuses while a chunk of any stream
+/// waits in the pending queue. It writes nothing, and never asks the gate,
+/// which comes last.
+#[tokio::test]
+async fn test_windows_a_restore_refuses_while_anything_is_pending() -> Result<()> {
+    let (br, a0, a1, s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(&a0, SET).await;
+    let snapshot = handle.snapshot().await.expect("the association is there");
+    // A window of one chunk: one leaves, one waits.
+    let moved = Windows {
+        cwnd: ONE_CHUNK as u32,
+        ..MOVED
+    };
+    set_windows(&a0, moved).await;
+    let outcome: Result<(bool, std::result::Result<(), RestoreRefusal>, bool)> = async {
+        write_chunks(&s0, 2).await?;
+        let held = until_held(&a0, ONE_CHUNK as u64, ONE_CHUNK as u64).await;
+        let asked = std::cell::Cell::new(false);
+        let refused = past_busy(|| {
+            handle.try_restore(&snapshot, || {
+                asked.set(true);
+                true
+            })
+        })
+        .await;
+        Ok((held, refused, asked.get()))
+    }
+    .await;
+    let now = windows_of(&a0).await;
+    close_association_pair(&br, a0, a1).await;
+    let (held, refused, asked) = outcome?;
+    assert!(held, "one chunk in flight and one waiting");
+    assert_eq!(refused, Err(RestoreRefusal::Pending));
+    assert!(!asked, "the gate was asked");
+    assert_eq!(now, moved, "a refused restore wrote");
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a restore refuses while a chunk is in flight,
+/// nothing waiting. It writes nothing, and never asks the gate.
+#[tokio::test]
+async fn test_windows_a_restore_refuses_while_anything_is_in_flight() -> Result<()> {
+    let (br, a0, a1, s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(&a0, SET).await;
+    let snapshot = handle.snapshot().await.expect("the association is there");
+    set_windows(&a0, MOVED).await;
+    let outcome: Result<(bool, std::result::Result<(), RestoreRefusal>, bool)> = async {
+        write_chunks(&s0, 1).await?;
+        let held = until_held(&a0, ONE_CHUNK as u64, 0).await;
+        let asked = std::cell::Cell::new(false);
+        let refused = past_busy(|| {
+            handle.try_restore(&snapshot, || {
+                asked.set(true);
+                true
+            })
+        })
+        .await;
+        Ok((held, refused, asked.get()))
+    }
+    .await;
+    let now = windows_of(&a0).await;
+    close_association_pair(&br, a0, a1).await;
+    let (held, refused, asked) = outcome?;
+    assert!(held, "one chunk in flight and none waiting");
+    assert_eq!(refused, Err(RestoreRefusal::InFlight));
+    assert!(!asked, "the gate was asked");
+    assert_eq!(now, MOVED, "a refused restore wrote");
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a restore refuses in fast recovery, whose loss
+/// response owns the window. It writes nothing, and never asks the gate.
+#[tokio::test]
+async fn test_windows_a_restore_refuses_while_in_fast_recovery() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(&a0, SET).await;
+    let snapshot = handle.snapshot().await.expect("the association is there");
+    set_windows(&a0, MOVED).await;
+    a0.association_internal.lock().await.in_fast_recovery = true;
+    let asked = std::cell::Cell::new(false);
+    let refused = past_busy(|| {
+        handle.try_restore(&snapshot, || {
+            asked.set(true);
+            true
+        })
+    })
+    .await;
+    let now = windows_of(&a0).await;
+    a0.association_internal.lock().await.in_fast_recovery = false;
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(refused, Err(RestoreRefusal::FastRecovery));
+    assert!(!asked.get(), "the gate was asked");
+    assert_eq!(now, MOVED, "a refused restore wrote");
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a restore refuses when the caller's gate says
+/// no, and writes nothing.
+#[tokio::test]
+async fn test_windows_a_restore_refuses_when_the_gate_says_no() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(&a0, SET).await;
+    let snapshot = handle.snapshot().await.expect("the association is there");
+    set_windows(&a0, MOVED).await;
+    let refused = past_busy(|| handle.try_restore(&snapshot, || false)).await;
+    let now = windows_of(&a0).await;
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(refused, Err(RestoreRefusal::Gate));
+    assert_eq!(now, MOVED, "a refused restore wrote");
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): with the association's lock held, the restore and
+/// the lowering both answer `Busy`, five times each, and the fastest of each
+/// five takes under a millisecond: neither ever waits for the lock. Five,
+/// because a loaded runner can deschedule one call for a time slice mid-call:
+/// a call that waits or spins for the lock is slow all five times, and one
+/// preemption slows one.
+#[tokio::test]
+async fn test_windows_a_held_lock_is_busy_and_never_waited_for() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    let snapshot = handle.snapshot().await.expect("the association is there");
+    let (restores, lowers) = {
+        let _held = a0.association_internal.lock().await;
+        let mut restores = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let answer = handle.try_restore(&snapshot, || true);
+            restores.push((answer, t.elapsed()));
+        }
+        let mut lowers = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let answer = handle.try_lower(&snapshot);
+            lowers.push((answer, t.elapsed()));
+        }
+        (restores, lowers)
+    };
+    close_association_pair(&br, a0, a1).await;
+    let restore_took: Vec<Duration> = restores.iter().map(|&(_, took)| took).collect();
+    let lower_took: Vec<Duration> = lowers.iter().map(|&(_, took)| took).collect();
+    println!(
+        "FR-148 D35: with the lock held, five restores took {restore_took:?}, five lowerings \
+         {lower_took:?}"
+    );
+    let restore_answers: Vec<_> = restores.iter().map(|&(answer, _)| answer).collect();
+    let lower_answers: Vec<_> = lowers.iter().map(|&(answer, _)| answer).collect();
+    assert_eq!(restore_answers, [Err(RestoreRefusal::Busy); 5]);
+    assert_eq!(lower_answers, [Err(RestoreRefusal::Busy); 5]);
+    let fastest = |took: &[Duration]| *took.iter().min().expect("five calls");
+    assert!(
+        fastest(&restore_took) < Duration::from_millis(1),
+        "the fastest of five restores took {:?}: {restore_took:?}",
+        fastest(&restore_took)
+    );
+    assert!(
+        fastest(&lower_took) < Duration::from_millis(1),
+        "the fastest of five lowerings took {:?}: {lower_took:?}",
+        fastest(&lower_took)
+    );
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): the caller's gate runs once, under the
+/// association's lock, and its yes lets the restore write.
+#[tokio::test]
+async fn test_windows_the_gate_runs_under_the_lock() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(&a0, SET).await;
+    let snapshot = handle.snapshot().await.expect("the association is there");
+    set_windows(&a0, MOVED).await;
+    let held_when_asked = std::cell::RefCell::new(Vec::new());
+    let restored = past_busy(|| {
+        handle.try_restore(&snapshot, || {
+            held_when_asked
+                .borrow_mut()
+                .push(a0.association_internal.try_lock().is_err());
+            true
+        })
+    })
+    .await;
+    let now = windows_of(&a0).await;
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(restored, Ok(()));
+    assert_eq!(
+        held_when_asked.into_inner(),
+        [true],
+        "the gate ran once, with the lock held"
+    );
+    assert_eq!(now, SET);
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): once the association and its loops are gone, a
+/// snapshot answers `None`, and the restore and the lowering `Gone`.
+#[tokio::test]
+async fn test_windows_a_gone_association_answers_gone() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    let snapshot = handle.snapshot().await.expect("the association is there");
+    let state = Arc::downgrade(&a0.association_internal);
+    close_association_pair(&br, a0, a1).await;
+    assert!(
+        gone_within_5s(&state).await,
+        "the association's state outlived it"
+    );
+    assert_eq!(handle.snapshot().await, None);
+    assert_eq!(
+        handle.try_restore(&snapshot, || true),
+        Err(RestoreRefusal::Gone)
+    );
+    assert_eq!(handle.try_lower(&snapshot), Err(RestoreRefusal::Gone));
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): after a restore the association sends from the
+/// restored window. With 32 KB written under its lock, the first gather's
+/// DATA is at most the restored window and one MTU.
+#[tokio::test]
+async fn test_windows_after_a_restore_the_first_flight_is_the_restored_window() -> Result<()> {
+    let (br, a0, a1, s0) = windows_pair().await?;
+    let handle = a0.windows();
+    let small = Windows {
+        cwnd: 6_000,
+        ssthresh: 1 << 20,
+        partial_bytes_acked: 0,
+    };
+    set_windows(&a0, small).await;
+    let snapshot = handle.snapshot().await.expect("the association is there");
+    set_windows(
+        &a0,
+        Windows {
+            cwnd: 64_000,
+            ..small
+        },
+    )
+    .await;
+    let restored = past_busy(|| handle.try_restore(&snapshot, || true)).await;
+    let outcome: Result<(usize, usize)> = async {
+        // A write enters the pending queue without the lock, so the gather
+        // below is the first to see these.
+        let mut ai = a0.association_internal.lock().await;
+        write_chunks(&s0, 27).await?;
+        let (packets, _) = ai.gather_outbound().await;
+        Ok((data_bytes(&packets), ai.mtu as usize))
+    }
+    .await;
+    close_association_pair(&br, a0, a1).await;
+    let (data, mtu) = outcome?;
+    assert_eq!(restored, Ok(()));
+    assert!(data > 0, "the first gather sent nothing");
+    assert!(
+        data <= small.cwnd as usize + mtu,
+        "the first gather sent {data} bytes of DATA, over the restored window of {} and one \
+         MTU of {mtu}",
+        small.cwnd
+    );
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a window handle, and a snapshot taken through
+/// it, keep nothing of the association alive: its state goes with it while
+/// the handle is still held.
+#[tokio::test]
+async fn test_windows_the_handle_keeps_nothing_alive() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    let _snapshot = handle.snapshot().await;
+    let state = Arc::downgrade(&a0.association_internal);
+    close_association_pair(&br, a0, a1).await;
+    let gone = gone_within_5s(&state).await;
+    drop(handle);
+    assert!(
+        gone,
+        "the association's state outlived it while a window handle was held"
+    );
+    Ok(())
+}
+
+/// Writes `chunks` messages of one chunk on `s0` with `a0`'s window at 64,000,
+/// waits until all are in flight, then lowers toward a snapshot whose window
+/// is `to`. Whether they were all in flight, and the lowering's answer.
+async fn lower_with_in_flight(
+    a0: &Association,
+    s0: &Stream,
+    chunks: usize,
+    to: u32,
+) -> Result<(bool, std::result::Result<Lowered, RestoreRefusal>)> {
+    set_windows(
+        a0,
+        Windows {
+            cwnd: 64_000,
+            ..SET
+        },
+    )
+    .await;
+    write_chunks(s0, chunks).await?;
+    let held = until_held(a0, (chunks * ONE_CHUNK) as u64, 0).await;
+    let handle = a0.windows();
+    let lowered = past_busy(|| handle.try_lower(&Windows { cwnd: to, ..SET })).await;
+    Ok((held, lowered))
+}
+
+/// roomler (FR-148 P0, D35): a lowering sets the window to the snapshot's, or
+/// to what is in flight where that is more: 12,000 in flight over a
+/// snapshot's 2,400, then 6,000 in flight under a snapshot's 20,000.
+#[tokio::test]
+async fn test_windows_a_lowering_sets_cwnd_to_the_larger_of_the_snapshot_and_in_flight(
+) -> Result<()> {
+    let (br, a0, a1, s0) = windows_pair().await?;
+    type Lowering = (bool, std::result::Result<Lowered, RestoreRefusal>);
+    let outcome: Result<(Lowering, u32, bool, Lowering, u32)> = async {
+        let above = lower_with_in_flight(&a0, &s0, 10, 2_400).await?;
+        let above_cwnd = windows_of(&a0).await.cwnd;
+        let drained = drains_within(&br, &a0, &a1, Duration::from_secs(5)).await;
+        let below = lower_with_in_flight(&a0, &s0, 5, 20_000).await?;
+        let below_cwnd = windows_of(&a0).await.cwnd;
+        Ok((above, above_cwnd, drained, below, below_cwnd))
+    }
+    .await;
+    close_association_pair(&br, a0, a1).await;
+    let ((held_above, above), above_cwnd, drained, (held_below, below), below_cwnd) = outcome?;
+    assert!(
+        held_above && held_below,
+        "the chunks were not all in flight"
+    );
+    assert!(drained, "the first flight never drained");
+    assert_eq!(
+        above,
+        Ok(Lowered {
+            before: 64_000,
+            after: 12_000
+        }),
+        "in flight above the snapshot's window: down to what is in flight"
+    );
+    assert_eq!(above_cwnd, 12_000);
+    assert_eq!(
+        below,
+        Ok(Lowered {
+            before: 64_000,
+            after: 20_000
+        }),
+        "in flight below the snapshot's window: down to the snapshot's"
+    );
+    assert_eq!(below_cwnd, 20_000);
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a lowering never raises the window. A window
+/// under the snapshot's, nothing in flight, stays; so does a window of one
+/// packet with 6,000 bytes in flight, as a T3-rtx expiry leaves it. Each
+/// answers `Ok` with the window the same before and after.
+#[tokio::test]
+async fn test_windows_a_lowering_never_raises_the_window() -> Result<()> {
+    let (br, a0, a1, s0) = windows_pair().await?;
+    type Lowering = std::result::Result<Lowered, RestoreRefusal>;
+    let outcome: Result<(Lowering, u32, bool, Lowering, u32)> = async {
+        let handle = a0.windows();
+        set_windows(&a0, Windows { cwnd: 3_000, ..SET }).await;
+        let under_snapshot = past_busy(|| {
+            handle.try_lower(&Windows {
+                cwnd: 20_000,
+                ..SET
+            })
+        })
+        .await;
+        let first = windows_of(&a0).await.cwnd;
+
+        set_windows(
+            &a0,
+            Windows {
+                cwnd: 64_000,
+                ..SET
+            },
+        )
+        .await;
+        write_chunks(&s0, 5).await?;
+        let held = until_held(&a0, 5 * ONE_CHUNK as u64, 0).await;
+        set_windows(&a0, Windows { cwnd: 1_228, ..SET }).await;
+        let under_in_flight = past_busy(|| handle.try_lower(&Windows { cwnd: 1_000, ..SET })).await;
+        let second = windows_of(&a0).await.cwnd;
+        Ok((under_snapshot, first, held, under_in_flight, second))
+    }
+    .await;
+    close_association_pair(&br, a0, a1).await;
+    let (under_snapshot, first, held, under_in_flight, second) = outcome?;
+    assert_eq!(
+        under_snapshot,
+        Ok(Lowered {
+            before: 3_000,
+            after: 3_000
+        })
+    );
+    assert_eq!(
+        first, 3_000,
+        "a lowering raised the window to the snapshot's"
+    );
+    assert!(held, "the chunks were not all in flight");
+    assert_eq!(
+        under_in_flight,
+        Ok(Lowered {
+            before: 1_228,
+            after: 1_228
+        })
+    );
+    assert_eq!(
+        second, 1_228,
+        "a lowering raised the window toward what is in flight"
+    );
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a lowering writes the window alone: the slow
+/// start threshold and `partial_bytes_acked` stay as they were, not the
+/// snapshot's.
+#[tokio::test]
+async fn test_windows_a_lowering_leaves_ssthresh_and_partial_bytes_acked_alone() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(
+        &a0,
+        Windows {
+            cwnd: 64_000,
+            ..SET
+        },
+    )
+    .await;
+    let lowered = past_busy(|| {
+        handle.try_lower(&Windows {
+            cwnd: 4_000,
+            ssthresh: 9,
+            partial_bytes_acked: 99,
+        })
+    })
+    .await;
+    let now = windows_of(&a0).await;
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(
+        lowered,
+        Ok(Lowered {
+            before: 64_000,
+            after: 4_000
+        })
+    );
+    assert_eq!(now, Windows { cwnd: 4_000, ..SET });
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a lowering refuses in fast recovery, whose loss
+/// response owns the window, and writes nothing.
+#[tokio::test]
+async fn test_windows_a_lowering_refuses_in_fast_recovery() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(
+        &a0,
+        Windows {
+            cwnd: 64_000,
+            ..SET
+        },
+    )
+    .await;
+    a0.association_internal.lock().await.in_fast_recovery = true;
+    let lowered = past_busy(|| handle.try_lower(&Windows { cwnd: 4_000, ..SET })).await;
+    let now = windows_of(&a0).await;
+    a0.association_internal.lock().await.in_fast_recovery = false;
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(lowered, Err(RestoreRefusal::FastRecovery));
+    assert_eq!(
+        now,
+        Windows {
+            cwnd: 64_000,
+            ..SET
+        },
+        "a refused lowering wrote"
+    );
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35, C4): the train's end, as 4b runs it. The window
+/// has grown far past the flight the pacer's cap holds, and chunks wait. The
+/// window is lowered first, and only then is the pacer turned off, which
+/// wakes the write loop. Nothing waiting leaves at once: the next gather
+/// releases no DATA. Then a SACK that acknowledges k bytes releases at most
+/// 2k, slow start's own growth, ack-clocked.
+#[tokio::test]
+async fn test_windows_after_a_lowering_nothing_waiting_leaves_at_once() -> Result<()> {
+    let (br, a0, a1, s0) = windows_pair().await?;
+    let train = Windows {
+        cwnd: 64_000,
+        ssthresh: 1 << 20,
+        partial_bytes_acked: 0,
+    };
+    type Outcome = (
+        bool,
+        usize,
+        std::result::Result<Lowered, RestoreRefusal>,
+        (gauges::Gauges, usize),
+        usize,
+        gauges::Gauges,
+        gauges::Gauges,
+    );
+    let outcome: Result<Outcome> = async {
+        // The pacer takes its round trip from a first chunk's SACK.
+        a0.pacer().set(true);
+        write_chunks(&s0, 1).await?;
+        flush_buffers(&br, &a0, &a1).await;
+        // 10 chunks in flight, which the cap holds, and 10 waiting, under the
+        // train's window.
+        set_windows(&a0, train).await;
+        a0.pacer().steer(pacer::WHOLE, Some(12_000));
+        write_chunks(&s0, 20).await?;
+        let held = until_held(&a0, 12_000, 12_000).await;
+        // The write loop sends a gather's packets once it has let the lock
+        // go, and the bridge takes each after a wait (15.6 ms on Windows'
+        // default timer): the 10 out are all on the bridge before the cell
+        // counts what a wake adds to them.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while br.len(0).await < 10 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let queued = br.len(0).await;
+
+        // Lowered toward the snapshot's window, which is under what is in
+        // flight; then the pacer goes off.
+        let handle = a0.windows();
+        let lowered = past_busy(|| {
+            handle.try_lower(&Windows {
+                cwnd: 4_380,
+                ..train
+            })
+        })
+        .await;
+        a0.pacer().set(false);
+        settle().await;
+        let woke = (a0.gauges().peek(), br.len(0).await);
+        let next_gather = {
+            let mut ai = a0.association_internal.lock().await;
+            let (packets, _) = ai.gather_outbound().await;
+            data_bytes(&packets)
+        };
+
+        // The bridge moves the first chunk to the peer, then its SACK back.
+        let before = a0.gauges().peek();
+        br.tick().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while br.len(1).await == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        br.tick().await;
+        while a0.gauges().peek().pending_bytes == before.pending_bytes
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        settle().await;
+        let after = a0.gauges().peek();
+        Ok((held, queued, lowered, woke, next_gather, before, after))
+    }
+    .await;
+    close_association_pair(&br, a0, a1).await;
+    let (held, queued, lowered, (woke, woke_queued), next_gather, before, after) = outcome?;
+    assert!(
+        held,
+        "the cap did not hold 10 chunks in flight with 10 waiting"
+    );
+    assert_eq!(
+        queued, 10,
+        "the 10 chunks in flight never all reached the bridge"
+    );
+    assert_eq!(
+        lowered,
+        Ok(Lowered {
+            before: 64_000,
+            after: 12_000
+        }),
+        "the window lowered to what is in flight"
+    );
+    assert_eq!(
+        (woke.inflight_bytes, woke.pending_bytes, woke_queued),
+        (12_000, 12_000, queued),
+        "the pacer's wake released DATA"
+    );
+    assert_eq!(next_gather, 0, "the next gather released DATA");
+    let released = before.pending_bytes - after.pending_bytes;
+    let acked = before.inflight_bytes + released - after.inflight_bytes;
+    println!("FR-148 D35: after the lowering, a SACK of {acked} bytes released {released}");
+    assert!(acked > 0, "no SACK acknowledged anything");
+    assert!(
+        released <= 2 * acked,
+        "a SACK of {acked} bytes released {released}, over twice what it acknowledged"
+    );
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): the restore and the lowering store the gauges,
+/// as every window write of the association does: `GaugeReader::peek` reads
+/// the restored window and threshold, then the lowered window.
+#[tokio::test]
+async fn test_windows_both_writes_store_the_gauges() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(&a0, SET).await;
+    let snapshot = handle.snapshot().await.expect("the association is there");
+    set_windows(&a0, MOVED).await;
+    let before = a0.gauges().peek();
+    let restored = past_busy(|| handle.try_restore(&snapshot, || true)).await;
+    let after_restore = a0.gauges().peek();
+    set_windows(
+        &a0,
+        Windows {
+            cwnd: 64_000,
+            ..SET
+        },
+    )
+    .await;
+    let lowered = past_busy(|| handle.try_lower(&Windows { cwnd: 5_000, ..SET })).await;
+    let after_lowering = a0.gauges().peek();
+    close_association_pair(&br, a0, a1).await;
+    assert_ne!(
+        before.cwnd, SET.cwnd,
+        "the cell's own writes store no gauge"
+    );
+    assert_eq!(restored, Ok(()));
+    assert_eq!(
+        (after_restore.cwnd, after_restore.ssthresh),
+        (SET.cwnd, SET.ssthresh)
+    );
+    assert_eq!(
+        lowered,
+        Ok(Lowered {
+            before: 64_000,
+            after: 5_000
+        })
+    );
+    assert_eq!(
+        (after_lowering.cwnd, after_lowering.ssthresh),
+        (5_000, SET.ssthresh)
+    );
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a lowering never leaves the window below one
+/// MTU, the association's own floor, the one a T3-rtx expiry keeps: slow
+/// start grows a window by `min(acked, cwnd)`, so a window of 0 would never
+/// grow back. With a window of 64,000 and nothing in flight, a lowering toward
+/// a window of 0 leaves one MTU.
+#[tokio::test]
+async fn test_windows_a_lowering_never_leaves_the_window_below_one_mtu() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(
+        &a0,
+        Windows {
+            cwnd: 64_000,
+            ..SET
+        },
+    )
+    .await;
+    let lowered = past_busy(|| handle.try_lower(&Windows { cwnd: 0, ..SET })).await;
+    let (now, mtu, in_flight) = {
+        let ai = a0.association_internal.lock().await;
+        (ai.cwnd, ai.mtu, ai.inflight_bytes())
+    };
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(in_flight, 0, "a chunk was in flight");
+    assert_eq!(
+        lowered,
+        Ok(Lowered {
+            before: 64_000,
+            after: mtu
+        })
+    );
+    assert_eq!(now, mtu, "the lowering left the window below one MTU");
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a restore never leaves the window below one MTU
+/// either. A restore of a window of 0, with nothing pending or in flight,
+/// writes one MTU, and the slow start threshold and `partial_bytes_acked` as
+/// given. The three start at `SET`, so each of them moves.
+#[tokio::test]
+async fn test_windows_a_restore_never_leaves_the_window_below_one_mtu() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(&a0, SET).await;
+    let zero = Windows {
+        cwnd: 0,
+        ssthresh: 9_000,
+        partial_bytes_acked: 0,
+    };
+    let restored = past_busy(|| handle.try_restore(&zero, || true)).await;
+    let now = windows_of(&a0).await;
+    let mtu = a0.association_internal.lock().await.mtu;
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(restored, Ok(()));
+    assert_eq!(
+        now,
+        Windows {
+            cwnd: mtu,
+            ssthresh: 9_000,
+            partial_bytes_acked: 0
+        },
+        "the restore left the window below one MTU"
+    );
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): `Windows` has no `Default`, so zeros never pass
+/// for a snapshot. Checked when the tests build, with the ambiguity that
+/// `static_assertions::assert_not_impl_any!` uses: every type takes
+/// `AmbiguousIfDefault<()>`, and a type with `Default` takes
+/// `AmbiguousIfDefault<HasDefault>` too. Without `Default` the `_` below has
+/// one answer; with it, two, and the build stops (E0283). The body runs
+/// nothing.
+#[test]
+fn windows_has_no_default() {
+    trait AmbiguousIfDefault<A> {
+        fn some_item() {}
+    }
+    impl<T> AmbiguousIfDefault<()> for T {}
+    #[allow(dead_code)]
+    struct HasDefault;
+    impl<T: Default> AmbiguousIfDefault<HasDefault> for T {}
+    let _ = <Windows as AmbiguousIfDefault<_>>::some_item;
+}

@@ -804,7 +804,8 @@ enum Loss {
 /// The two ends of the twin exchange, joined by a wire this test drives: no
 /// timer and no task, so the same script sends the same packets.
 struct Twin {
-    agent: AssociationInternal,
+    /// roomler (FR-148 P0, D35): behind a lock, for a window handle.
+    agent: Arc<Mutex<AssociationInternal>>,
     viewer: AssociationInternal,
     drawn: Drawn,
     /// Every packet in the order it went on the wire: from the agent, lost on
@@ -815,6 +816,8 @@ struct Twin {
     reads: Option<Arc<AtomicU64>>,
     /// The agent's congestion window after each step.
     windows: BTreeSet<u32>,
+    /// roomler (FR-148 P0, D35): a window handle's snapshots (`WindowWatch`).
+    watch: Option<WindowWatch>,
 }
 
 impl Twin {
@@ -825,12 +828,11 @@ impl Twin {
         let mut wire: VecDeque<(bool, Bytes)> = VecDeque::new();
         loop {
             for from_agent in [true, false] {
-                let side = if from_agent {
-                    &mut self.agent
+                let (packets, _) = if from_agent {
+                    self.agent().gather_outbound().await
                 } else {
-                    &mut self.viewer
+                    self.viewer.gather_outbound().await
                 };
-                let (packets, _) = side.gather_outbound().await;
                 for p in packets {
                     wire.push_back((from_agent, p.marshal().expect("a packet marshals")));
                 }
@@ -854,15 +856,16 @@ impl Twin {
             self.sent
                 .push((from_agent, lost, normalised(from_agent, &raw, &self.drawn)));
             if !lost {
-                let to = if from_agent {
-                    &mut self.viewer
+                if from_agent {
+                    self.viewer.handle_inbound(&raw).await
                 } else {
-                    &mut self.agent
-                };
-                to.handle_inbound(&raw).await.expect("the peer takes it");
+                    self.agent().handle_inbound(&raw).await
+                }
+                .expect("the peer takes it");
             }
             self.windows.insert(self.agent_gauges().cwnd);
             self.wait_for_reader();
+            self.snapshot().await;
         }
     }
 
@@ -878,13 +881,13 @@ impl Twin {
     }
 
     fn agent_gauges(&self) -> Gauges {
-        self.agent.pending_queue.gauges().read(false)
+        self.agent().pending_queue.gauges().read(false)
     }
 
     /// The agent's gauges are what it holds.
     fn assert_gauges_hold_the_agent(&self) {
         let g = self.agent_gauges();
-        let a = &self.agent;
+        let a = self.agent();
         assert_eq!(g.max_payload, a.max_payload_size);
         assert_eq!(g.max_payload, 1200, "1228 less 12 and 16");
         assert_eq!(g.cwnd, a.cwnd);
@@ -940,9 +943,10 @@ fn spawn_reader(
 /// with nothing lost, 24 more with one packet lost that the SACKs report (fast
 /// retransmit), and 6 more whose whole flight is lost until T3-rtx expires.
 async fn twin_exchange(
-    with_reader: bool,
+    watch: Watch,
     lost: usize,
 ) -> (Vec<(bool, bool, Vec<u8>)>, BTreeSet<u32>, Option<ReaderLog>) {
+    let with_reader = matches!(watch, Watch::Reader);
     let agent = create_association_internal(Config {
         net_conn: Arc::new(DumbConn {}),
         max_receive_buffer_size: 0,
@@ -970,7 +974,9 @@ async fn twin_exchange(
             Arc::clone(&reads),
         )
     });
+    let agent = Arc::new(Mutex::new(agent));
     let mut twin = Twin {
+        watch: WindowWatch::of(&agent, &watch),
         agent,
         viewer,
         drawn,
@@ -983,20 +989,22 @@ async fn twin_exchange(
     twin.wait_for_reader();
 
     // The handshake, as `Association::client` starts it.
+    let mut agent = twin.agent();
     let mut init = ChunkInit {
-        initial_tsn: twin.agent.my_next_tsn,
-        num_outbound_streams: twin.agent.my_max_num_outbound_streams,
-        num_inbound_streams: twin.agent.my_max_num_inbound_streams,
-        initiate_tag: twin.agent.my_verification_tag,
-        advertised_receiver_window_credit: twin.agent.max_receive_buffer_size,
+        initial_tsn: agent.my_next_tsn,
+        num_outbound_streams: agent.my_max_num_outbound_streams,
+        num_inbound_streams: agent.my_max_num_inbound_streams,
+        initiate_tag: agent.my_verification_tag,
+        advertised_receiver_window_credit: agent.max_receive_buffer_size,
         ..Default::default()
     };
     init.set_supported_extensions();
-    twin.agent.set_state(AssociationState::CookieWait);
-    twin.agent.stored_init = Some(init);
-    twin.agent.send_init().expect("an INIT to send");
+    agent.set_state(AssociationState::CookieWait);
+    agent.stored_init = Some(init);
+    agent.send_init().expect("an INIT to send");
+    drop(agent);
     twin.pump().await;
-    assert_eq!(twin.agent.get_state(), AssociationState::Established);
+    assert_eq!(twin.agent().get_state(), AssociationState::Established);
     let window = twin.viewer.max_receive_buffer_size;
     let g = twin.agent_gauges();
     assert_eq!(
@@ -1014,7 +1022,7 @@ async fn twin_exchange(
         .open_stream(1, PayloadProtocolIdentifier::Binary)
         .expect("the viewer's stream");
     let stream = twin
-        .agent
+        .agent()
         .open_stream(1, PayloadProtocolIdentifier::Binary)
         .expect("the agent's stream");
 
@@ -1048,11 +1056,11 @@ async fn twin_exchange(
     let g = twin.agent_gauges();
     assert!(g.inflight_bytes > 0, "{g:?}");
     assert_eq!(g.inflight_bytes + g.pending_bytes, 6 * 1200);
-    twin.agent
+    twin.agent()
         .on_retransmission_timeout(RtxTimerId::T3RTX, 1)
         .await;
     let g = twin.agent_gauges();
-    assert_eq!((g.t3_expiries, g.cwnd), (1, twin.agent.mtu));
+    assert_eq!((g.t3_expiries, g.cwnd), (1, twin.agent().mtu));
     twin.loss = Loss::None;
     twin.pump().await;
     twin.assert_gauges_hold_the_agent();
@@ -1070,8 +1078,8 @@ async fn twin_exchange(
 
 #[tokio::test]
 async fn test_gauges_a_reader_changes_nothing_the_association_sends() {
-    let (plain, _, _) = twin_exchange(false, 2).await;
-    let (read, windows, log) = twin_exchange(true, 2).await;
+    let (plain, _, _) = twin_exchange(Watch::Nothing, 2).await;
+    let (read, windows, log) = twin_exchange(Watch::Reader, 2).await;
     let log = log.expect("the second run had a reader");
 
     for (i, (p, r)) in plain.iter().zip(&read).enumerate() {
@@ -1087,7 +1095,7 @@ async fn test_gauges_a_reader_changes_nothing_the_association_sends() {
 
     // The comparison sees a change of one packet: the same script losing the
     // fourth packet of the flight instead of the third sends differently.
-    let (other, _, _) = twin_exchange(false, 3).await;
+    let (other, _, _) = twin_exchange(Watch::Nothing, 3).await;
     assert_ne!(other, plain);
 
     // The reader read both sides after every packet, so it saw every window
@@ -1490,4 +1498,100 @@ async fn test_pacer_the_cap_holds_new_data_and_a_retransmission_never_waits() {
         .map(|c| (c.tsn, c.nsent))
         .collect();
     assert_eq!(resent, [(10, 2)]);
+}
+
+// roomler (FR-148 P0, D35): the twin exchange, watched by a window handle.
+
+use crate::association::windows::{WindowHandle, Windows};
+
+/// What watches the twin's agent besides its packets.
+enum Watch {
+    Nothing,
+    /// A thread reading both sides' gauges (D33).
+    Reader,
+    /// A window handle onto the agent, and a snapshot taken through it after
+    /// every step, counted here.
+    Windows(Arc<AtomicU64>),
+}
+
+/// A window handle onto the twin's agent, and the count of its snapshots.
+struct WindowWatch {
+    handle: WindowHandle,
+    taken: Arc<AtomicU64>,
+}
+
+impl WindowWatch {
+    /// For `Watch::Windows`, a handle onto `agent`, made as
+    /// `Association::windows` makes one.
+    fn of(agent: &Arc<Mutex<AssociationInternal>>, watch: &Watch) -> Option<Self> {
+        match watch {
+            Watch::Windows(taken) => Some(WindowWatch {
+                handle: WindowHandle::new(Arc::downgrade(agent)),
+                taken: Arc::clone(taken),
+            }),
+            Watch::Nothing | Watch::Reader => None,
+        }
+    }
+}
+
+impl Twin {
+    /// The agent, locked. Only the twin's one task takes the lock, for a step
+    /// at most, so it is free here.
+    fn agent(&self) -> tokio::sync::MutexGuard<'_, AssociationInternal> {
+        self.agent
+            .try_lock()
+            .expect("only the twin's task takes the agent's lock")
+    }
+
+    /// With a window handle, a snapshot through it, which reads what the
+    /// agent holds.
+    async fn snapshot(&self) {
+        let Some(watch) = &self.watch else {
+            return;
+        };
+        let snapshot = watch.handle.snapshot().await.expect("the agent is there");
+        let a = self.agent();
+        assert_eq!(
+            snapshot,
+            Windows {
+                cwnd: a.cwnd,
+                ssthresh: a.ssthresh,
+                partial_bytes_acked: a.partial_bytes_acked,
+            }
+        );
+        watch.taken.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// roomler (FR-148 P0, D35): a window handle onto the agent, and a snapshot
+/// taken through it after every packet of the exchange, change nothing the
+/// association sends: the twin exchange with them and without, packet for
+/// packet (D33's twin form). The script is the gauges' twin's, so the
+/// snapshots read each kind of window write: the handshake's, slow start's
+/// growth, fast recovery's cut and a T3-rtx expiry's.
+#[tokio::test]
+async fn test_windows_a_window_handle_changes_no_packet() {
+    let (plain, plain_windows, _) = twin_exchange(Watch::Nothing, 2).await;
+    let taken = Arc::new(AtomicU64::new(0));
+    let (watched, windows, _) = twin_exchange(Watch::Windows(Arc::clone(&taken)), 2).await;
+
+    for (i, (p, w)) in plain.iter().zip(&watched).enumerate() {
+        assert_eq!(p, w, "packet {i} differs");
+    }
+    assert_eq!(plain.len(), watched.len(), "both runs sent as many packets");
+    assert!(
+        plain.len() > 100,
+        "the exchange sent {} packets",
+        plain.len()
+    );
+    assert_eq!(
+        plain_windows, windows,
+        "both runs went through the same windows"
+    );
+    let taken = taken.load(Ordering::Relaxed);
+    assert_eq!(taken, watched.len() as u64, "a snapshot after every packet");
+    eprintln!(
+        "windows twin: {} packets each run, the same, with {taken} snapshots between them; windows {windows:?}",
+        watched.len()
+    );
 }

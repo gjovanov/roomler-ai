@@ -204,6 +204,54 @@
 #     retransmission that never waits for it), and association_test.rs's
 #     `test_assoc_pacer_*` runs the write loop, which wakes for the chunk the
 #     pacer held with no SACK to wake it.
+#   - src/association/windows.rs (new), src/association/mod.rs and
+#     src/association/association_internal.rs (FR-148 P0 step 4b-1, D35): a
+#     handle onto the association's congestion window, slow start threshold
+#     and `partial_bytes_acked` (`Association::windows`), which holds a `Weak`
+#     of the association's state and so keeps nothing alive. `snapshot`
+#     reads the three under the association's lock. `try_restore` writes them
+#     back: it never waits for the lock, and writes only while nothing of any
+#     stream is pending or in flight, outside fast recovery, and when the
+#     caller's gate, asked under the lock, agrees. `try_lower` lowers the
+#     window to the snapshot's, or to the bytes in flight where that is more:
+#     it never raises the window, never touches the other two, never waits
+#     for the lock, and writes nothing in fast recovery. Both writes store
+#     the gauges, as every window write does, and a refusal says why
+#     (`RestoreRefusal`, one word each for a log line). Neither write leaves
+#     the window below one MTU, the floor a T3-rtx expiry keeps, because slow
+#     start grows a window by `min(acked, cwnd)` and one of 0 would never
+#     grow back; the association never writes a window below it, so for its
+#     own snapshots the floor changes nothing. `Windows` has no `Default`,
+#     because zeros are not a snapshot. The agent's open-time
+#     train paces a session's first flight, and in shadow it hands the
+#     association back as it found it: its first write takes the snapshot,
+#     and the restore writes it back once the flight has drained. The
+#     lowering is there because slow start grows the window by
+#     `min(acked, cwnd)` at every SACK while anything waits, not while the
+#     window is used: a paced train ends with a window several times the
+#     flight its pacer held, a message written then would leave at once at
+#     the sender's line rate into all of it, and after the train's `ready`
+#     stop, the first frame's hand-off, the restore, which needs nothing
+#     pending or in flight, may never run. Lowered to what is in flight,
+#     nothing leaves at once, and in slow start each SACK then lets out at
+#     most twice what it acknowledged. Nothing in the association calls
+#     either, so every packet, timer and window is as before unless a caller
+#     restores or lowers; `partial_bytes_acked` is crate-visible for the
+#     tests. association_test.rs's `test_windows_*` hold their tests (a
+#     restore, each refusal, a held lock answered at once, the gate under
+#     the lock, a gone association, the first flight after a restore, a
+#     handle that keeps nothing alive, the lowering's bound, a window it
+#     never raises, the two values it leaves, its refusal in fast recovery,
+#     nothing released at once after it, the gauges both writes store, and
+#     the floor under each write in
+#     `test_windows_a_lowering_never_leaves_the_window_below_one_mtu` and
+#     `test_windows_a_restore_never_leaves_the_window_below_one_mtu`),
+#     `windows_has_no_default` stops their build if `Windows` derives
+#     `Default` again, and association_internal_test.rs's
+#     `test_windows_a_window_handle_changes_no_packet` runs the scripted
+#     exchange with a handle's snapshot after every packet and without,
+#     compared packet by packet. Its twin now holds the agent's side behind
+#     a lock, which a handle needs.
 
 [package]
 edition = "2021"
