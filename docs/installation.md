@@ -2957,7 +2957,8 @@ flowchart TB
 |---|---|---|
 | Who owns the GUI half | launchd, `com.roomler.agent` | the root daemon, `macos_supervisor.rs` |
 | A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
-| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions: in the hello when the worker has already told the daemon (on a reconnect, and on a restart of the daemon when the worker speaks first), else at once when it speaks, since its word wakes the heartbeat; `no-gui-session` again at once when the worker leaves |
+| What `<name>-daemon` reports | `no-gui-session`. Since FR-157 P1 it also says the screen-worker word `unsupervised`, and so does `<name>`, the person's row | the worker's permissions: in the hello when the worker has already told the daemon (on a reconnect, and on a restart of the daemon when the worker speaks first), else at once when it speaks, since its word wakes the heartbeat; `no-gui-session` again at once when the worker leaves. Since FR-157 P1 the row also says `attached`, or `not-attached` with why (`no-console-user`, `launchd-owns`, `starting`, `gave-up`), at once on each change ([`remote-control.md`](remote-control.md) §5.1b). `<name>`, the worker's own row, says no word |
+| What `roomler status --json` shows under `gui_worker` | `"attached": false` and, since FR-157 P1, `"state": "unsupervised"`: the healthy default, not a fault. Each half says it of itself | `attached`, `permissions` and `one_row` as before (`sudo roomler status --json` asks the root half), and since FR-157 P1 the same `state` and `reason` as the row, from the same read |
 | A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
 | The GUI half killed | launchd restarts it | the supervisor respawns it within about 6 s; the control WS stays up |
 | Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
@@ -3012,7 +3013,10 @@ restarts of the daemon measured in #3992, is on the row at once, rather than the
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
 the hello, or changes later, wakes the heartbeat of each org's connection at once
 ([`delegate.rs:1677`](../agents/roomlerd/src/delegate.rs#L1677)): its caps, the person's
-floor and its leaving reach the row then, not up to 30 s later at the next one.
+floor and its leaving reach the row then, not up to 30 s later at the next one. Since
+FR-157 P1 every org's row also carries the host's screen-worker word, `attached` or
+`not-attached` with why. The worker's attach, its channel's end and each new decision of
+the supervisor wake the same heartbeats ([`remote-control.md`](remote-control.md) §5.1b).
 
 The switch is off by default. Its field proof ran on released 0.4.200 on 2026-11-05
 ([field log](fr/FR-43-macos-single-enrollment.md#2026-11-05--p3a-to-p3c-on-released-04200-one-row-end-to-end)),

@@ -1026,6 +1026,126 @@ shape is locked by `unavailable_wire_shape_is_locked`. FR-97's census
 (`scripts/fr97-caps-census.sh`) counts the map by OS as `key:code`, beside
 the words.
 
+#### A Mac's screen worker, on its row (FR-157 P1)
+
+A supervised Mac's root daemon serves its sessions through a screen worker:
+`run --supervised`, started in the person's login session (FR-43). Before
+[FR-157](fr/FR-157-screen-worker-on-the-row.md), a healthy two-row Mac and a
+one-row Mac whose worker never started read the same on their rows:
+`no-gui-session`. Since P1, a Mac's daemon also says whether its worker is
+attached, and why not. The word is `AgentCaps.gui_worker`
+([`models.rs:649`](../crates/remote_control/src/models.rs#L649)), sent as the
+caps key `gui_worker` of `rc:agent.hello` and `rc:agent.heartbeat`:
+
+```json
+"gui_worker": {"state": "not-attached", "reason": "gave-up", "one_row": true}
+```
+
+| `state` | `reason` | when |
+|---|---|---|
+| `unsupervised` | | nothing on this daemon supervises a worker: it is not root, or the supervisor is off. Both halves of the default two-row install say it. So does a loop that holds no delegate host |
+| `attached` | | a worker holds the delegation channel. This wins over the supervisor's decision |
+| `not-attached` | `no-console-user` | nobody is at the console: the login window |
+| `not-attached` | `launchd-owns` | the LaunchAgent is loaded, so launchd owns the worker |
+| `not-attached` | `starting` | a worker was spawned or is running, and has not attached yet. Also the word while the supervisor has not decided yet |
+| `not-attached` | `gave-up` | the supervisor stopped respawning after `MAX_FAST_EXITS` fast exits, or could not start at all |
+| `not-attached` | `supervisor-off` | root, with `macos_one_row` on and the supervisor off: nothing runs a worker for this row |
+
+`one_row` is the daemon's `macos_one_row`, left out when false. The
+spellings are `GuiWorkerBrief::STATES` and `::REASONS`
+([`models.rs:2067-2075`](../crates/remote_control/src/models.rs#L2067-L2075)),
+locked by `gui_worker_spellings_are_locked` and only ever added to. The daemon
+names each one through the constants beside them
+([`models.rs:2086-2101`](../crates/remote_control/src/models.rs#L2086-L2101)),
+never through a literal of its own.
+
+**One function builds it.** `gui_worker_word`
+([`macos_supervisor.rs:197-233`](../agents/roomlerd/src/macos_supervisor.rs#L197-L233))
+reads three facts the daemon already holds. The first is its switches: root,
+`macos_supervise_gui_worker` and `macos_one_row`, set once at start
+([`app.rs:5045-5052`](../agents/roomlerd/src/app.rs#L5045-L5052)). The second
+is whether a worker holds the delegation channel. The third is the
+supervisor's last `Action`. It is pure, so it is tested on every OS. The map
+from `Action` is one `match` with no catch-all arm, so a new `Action` cannot
+compile without a word. The row and `roomler status` both read it through the
+delegate host (`DelegateHost::gui_worker_word` and `worker_status`,
+[`delegate.rs:2087-2104`](../agents/roomlerd/src/delegate.rs#L2087-L2104),
+[`:2041-2053`](../agents/roomlerd/src/delegate.rs#L2041-L2053)), so the two
+never disagree.
+
+| process | loop | the word |
+|---|---|---|
+| a Mac's daemon, root or the person's | one that holds the delegate host: the primary, and every org on a one-row Mac | the host's |
+| a Mac's daemon | one that holds none: a secondary org off one row | `unsupervised`, since that loop never hands a session to the worker |
+| the `--supervised` worker | any | none: it is the screen side itself |
+| any other OS | any | none |
+
+Each connection decides this once, in `connect_once`
+([`signaling.rs:1969-1975`](../agents/roomlerd/src/signaling.rs#L1969-L1975),
+`says_word` and `word_without_host` at
+[`macos_supervisor.rs:241-260`](../agents/roomlerd/src/macos_supervisor.rs#L241-L260)).
+
+```mermaid
+sequenceDiagram
+    participant S as supervisor, in the root daemon
+    participant H as delegate host
+    participant W as screen worker
+    participant L as each loop that holds the host
+    participant R as server
+    S->>H: note_supervisor, at a new decision only
+    H-->>L: news
+    L->>R: rc:agent.heartbeat with the new word
+    W->>H: the delegation channel attaches
+    H-->>L: news, before the worker's caps
+    L->>R: rc:agent.heartbeat, state attached
+    W-xH: the channel ends
+    H-->>L: news, once the caps and the flag are both down
+    L->>R: rc:agent.heartbeat, state not-attached
+```
+
+**When it moves.** `Announcer::now` reads the word with the other words
+([`signaling.rs:7210-7215`](../agents/roomlerd/src/signaling.rs#L7210-L7215)),
+and `Announced` compares it with them
+([`:7135-7140`](../agents/roomlerd/src/signaling.rs#L7135-L7140)). So the hello
+carries it, and so does every beat on which it changed
+([`stub_caps`, `:7400`](../agents/roomlerd/src/signaling.rs#L7400)). A beat on
+which it did not change sends no caps for it. Three things wake the loops that
+hold the host, so the heartbeat announces the word at once:
+
+- **The supervisor's new decision.** The supervisor tells the host at the
+  transition it already logs once
+  ([`macos_supervisor.rs:1940-1944`](../agents/roomlerd/src/macos_supervisor.rs#L1940-L1944)),
+  never on its 5 s tick. The host wakes the loops only when the decision
+  differs from the last one
+  ([`note_supervisor`, `delegate.rs:2067-2080`](../agents/roomlerd/src/delegate.rs#L2067-L2080)).
+- **The attach.** The host wakes the loops as soon as a worker holds the
+  channel, before its caps arrive
+  ([`delegate.rs:2178-2182`](../agents/roomlerd/src/delegate.rs#L2178-L2182)).
+- **The channel's end.** The host wakes the loops once, after the caps are
+  cleared and the flag is down
+  ([`delegate.rs:2197-2203`](../agents/roomlerd/src/delegate.rs#L2197-L2203)).
+  So no beat announces the caps gone while the word still says `attached`.
+  Before P1 the end woke the loops only when the worker had sent its caps.
+
+The heartbeat's caps line logs the word as `gui_worker`
+([`signaling.rs:2732-2742`](../agents/roomlerd/src/signaling.rs#L2732-L2742)).
+
+⚠️ **The word is a claim by the host, like `desktop`.** No session decision,
+consent check, permission or ACL reads it. The server reads it only while
+`ROOMLER__RC__GUI_WORKER_READ` is on (FR-157 P2, off by default), and an older
+server drops the key.
+
+⚠️ **`permissions` keeps its meaning.** It still says what a session would get,
+and the word says why. With no worker attached, a Mac's root row still says
+`no-gui-session`.
+
+`roomler status --json` gives the same `state` and `reason` under `gui_worker`
+(FR-157 D5, [`crates/localapi/src/lib.rs:549-560`](../crates/localapi/src/lib.rs#L549-L560)),
+beside `attached`, `permissions` and `one_row`, whose meaning does not change.
+That `one_row` is the host's: both switches on. The word's `one_row` is the
+config's `macos_one_row` alone, so the two differ only on a root daemon with
+`macos_one_row` on and the supervisor off, which says `supervisor-off`.
+
 ### 5.1c Session audio is the computer's sound, never a microphone (FR-97 P3c)
 
 "Receive host audio" carries what the host plays. One rule, in
