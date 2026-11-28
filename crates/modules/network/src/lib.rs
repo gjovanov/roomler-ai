@@ -963,9 +963,10 @@ impl Module for NetworkState {
     }
 
     /// C-6 — release the directory records for the tunnel sessions and derp
-    /// registrations this pod owns, so a graceful deploy hands each entity
-    /// off with a ZERO-length ownerless window instead of waiting out the
-    /// 90 s TTLs. Runs before fleet's agent sweep (reverse composition order),
+    /// registrations this pod owns (and, #4553, its tunnel clients' presence
+    /// records), so a graceful deploy hands each entity off with a
+    /// ZERO-length ownerless window instead of waiting out the TTLs. Runs
+    /// before fleet's agent sweep (reverse composition order),
     /// exactly where the host's `shutdown_cleanup` ran it.
     fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send {
         let state = self.clone();
@@ -973,6 +974,19 @@ impl Module for NetworkState {
             let Some(dir) = &state.cluster_directory else {
                 return;
             };
+            // #4553 — tunnel-client presence records: the client reads
+            // offline on the survivor until it reconnects there, never online
+            // for a TTL after its socket died with this pod. Compare-and-
+            // delete, so a reconnect that already claimed the record on the
+            // survivor keeps it.
+            for (client, token) in state.fleet.tunnel_client_sockets.take_tokens() {
+                let _ = dir
+                    .release(
+                        &roomler_core::cluster::directory::tunnel_client_key(&client.to_hex()),
+                        &token,
+                    )
+                    .await;
+            }
             // Tunnel session records (their sessions die with this pod; the
             // CLI redials and re-opens on the survivor).
             let held: Vec<(ObjectId, String)> = state

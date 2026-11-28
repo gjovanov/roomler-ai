@@ -57,6 +57,7 @@ builders live in ONE place per namespace:
 |---|---|---|---|
 | `roomler:agent-online:<agent_id>` | **LWW** (newest live socket wins — mirrors the rc-hub's displacement rule; it is written only after the hub registered the socket, and while the token rotation is on the hub refuses a registration below the entry's generation, FR-155 P1c) | 90 s / on received heartbeat + a 30 s pod sweep | A-1/C-1 |
 | `roomler:own:tunnel:<session_id>` | LWW | 90 s / 30 s | C-3 |
+| `roomler:own:tunnel-client:<client_id>` | LWW by mint time (`claim_if_newer`: a socket made later on any pod keeps it). The client's sockets on one pod share one token, and the last of them to close releases it ([`docs/tunnels.md`](tunnels.md#how-a-tunnel-clients-presence-is-read-4553)) | 180 s / the socket's 60 s check | #4553 |
 | `roomler:own:derp:<net>:<pubkey>` | LWW (+ per-network set key) | 90 s / 30 s | C-5 |
 | `roomler:own:media:<room_id>` | **NX mutex** — media rooms have no client-owned socket; two creations = silent split-brain, so creation itself is mutually exclusive | 30 s / 10 s | C-4 |
 | `roomler:pod-alive:<pod_id>` | plain SET | 45 s / 15 s | C-1 (advisory only) |

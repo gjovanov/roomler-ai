@@ -29,7 +29,10 @@ use serde::{Deserialize, Serialize};
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
 use crate::state::AppState;
-use roomler_ai_mod_fleet::agent::{AgentPresence, agent_presence_batch, derive_agent_presence};
+use roomler_ai_mod_fleet::agent::{
+    AgentPresence, agent_presence_batch, derive_agent_presence, derive_tunnel_client_presence,
+    tunnel_client_presence_batch,
+};
 
 /// Fields are declared INLINE, deliberately not `#[serde(flatten)]
 /// PaginationParams` — axum's `Query` deserializes via serde_urlencoded,
@@ -81,9 +84,10 @@ pub struct DeviceRow {
     pub version: String,
     pub status: AgentStatus,
     /// Agents: the three-state hub+Redis+heartbeat derivation. Tunnel
-    /// clients: raw stored status mapped online/offline — they have no hub
-    /// registration or freshness trail (the known tunnel.rs "T2" gap), so a
-    /// `stale` state cannot be derived honestly.
+    /// clients: the same three states from the client's tunnel socket, this
+    /// pod's seat or any pod's directory record, and the `last_seen_at`
+    /// trail only while the directory cannot answer (#4553,
+    /// `derive_tunnel_client_presence`). `status` beside it is the admin's.
     pub presence: AgentPresence,
     pub is_online: bool,
     pub last_seen_at: String,
@@ -218,7 +222,11 @@ pub async fn list_devices(
         }
     }
 
-    let fresh = agent_presence_batch(fleet, &agents).await;
+    // Both kinds' presence reads, together: one 200 ms budget, not two.
+    let (fresh, directory) = tokio::join!(
+        agent_presence_batch(fleet, &agents),
+        tunnel_client_presence_batch(fleet, &clients),
+    );
 
     let mut rows: Vec<DeviceRow> = Vec::with_capacity(agents.len() + clients.len());
     for a in agents {
@@ -234,8 +242,15 @@ pub async fn list_devices(
         ));
     }
     for c in clients {
+        let (presence, is_online) = derive_tunnel_client_presence(fleet, &c, directory.as_ref());
         let node = c.id.and_then(|i| node_by_client.get(&i).copied());
-        rows.push(client_row(c, node, dns_domain.as_deref()));
+        rows.push(client_row(
+            c,
+            presence,
+            is_online,
+            node,
+            dns_domain.as_deref(),
+        ));
     }
 
     let page = apply_query(rows, &query);
@@ -424,11 +439,12 @@ pub(crate) fn agent_row(
 
 pub(crate) fn client_row(
     c: TunnelClient,
+    presence: AgentPresence,
+    is_online: bool,
     node: Option<&roomler_ai_remote_control::models::OverlayNode>,
     dns_domain: Option<&str>,
 ) -> DeviceRow {
     let (overlay_ip, overlay_node_id, magic_dns_name, magic_dns_fqdn) = node_bits(node, dns_domain);
-    let online = matches!(c.status, AgentStatus::Online);
     DeviceRow {
         kind: "tunnel_client",
         id: c.id.map(|i| i.to_hex()).unwrap_or_default(),
@@ -440,12 +456,8 @@ pub(crate) fn client_row(
         os: c.os,
         version: c.client_version,
         status: c.status,
-        presence: if online {
-            AgentPresence::Online
-        } else {
-            AgentPresence::Offline
-        },
-        is_online: online,
+        presence,
+        is_online,
         last_seen_at: c.last_seen_at.try_to_rfc3339_string().unwrap_or_default(),
         created_at: c.created_at.try_to_rfc3339_string().unwrap_or_default(),
         overlay_ip,

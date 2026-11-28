@@ -70,8 +70,10 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
   let seq = 0
   // The latest fetch failed: `ensureTunnelClients` asks again.
   let failed = false
-  /** #4553 — the clients connected now. STUB: master's reading. */
-  const onlineCount = computed(() => clients.value.filter((c) => c.status === 'online').length)
+  /** #4553 — the clients connected now, by the presence the server derives
+   *  from their sockets. Never by `status`: no socket writes it, so a count
+   *  of it read 0 with every client connected. */
+  const onlineCount = computed(() => clients.value.filter((c) => c.is_online === true).length)
 
   async function fetchTunnelClients(tenantId: string) {
     const mySeq = ++seq

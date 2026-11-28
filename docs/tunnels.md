@@ -1728,6 +1728,96 @@ a person who is no longer a member holds none there, so their next forward throu
   matching `RoleId` grants at once, because the forward reads its owner's roles in
   the org on every request and its owner holds none there any more.
 
+## How a tunnel client's presence is read (#4553)
+
+A tunnel client's row carries a `status`, and nothing its socket does writes it. It is
+the admin's state: `online` and `offline` both mean active, and `quarantined` ends
+the socket at its next 60 s check. Whether the client is connected is derived on
+every read from its live tunnel socket, the way an agent's presence is derived from
+its hub registration (Phase A-1). ONE function does it,
+`derive_tunnel_client_presence` (`crates/modules/fleet/src/agent.rs:2819`), beside
+`derive_agent_presence` (`:2617`), and every list that shows a tunnel client calls
+it: the unified device list and a device's own listing
+(`crates/api/src/routes/device.rs:226`, `crates/api/src/routes/agent_self.rs`), and
+`GET …/tunnel-client` with the PUT's answer
+(`crates/modules/network/src/routes/tunnel.rs:743`). Each row carries `presence` and
+`is_online` beside `status` ([api.md](api.md)).
+
+```mermaid
+flowchart TD
+    R["a list reads a tunnel client"] --> L{"a socket of it on this pod?"}
+    L -- yes --> ON["online"]
+    L -- no --> D{"the directory answered?<br/>one MGET, 200 ms"}
+    D -- "yes, a fresh record from any pod" --> ON
+    D -- "yes, no record" --> OFF["offline"]
+    D -- "no: no Redis, an error, the budget spent" --> T{"last_seen_at under 180 s old?"}
+    T -- yes --> ST["stale"]
+    T -- no --> OFF
+```
+
+| What the read finds | `presence` | `is_online` |
+|---|---|---|
+| a socket of the client is live on this pod (`TunnelClientSockets`, `agent.rs:2657`) | `online` | `true` |
+| else, a fresh record of it from any pod (`tunnel_client_presence_batch`, `agent.rs:2785`) | `online` | `true` |
+| else, the directory answered | `offline` | `false` |
+| else (no Redis, an error, or the 200 ms budget spent), and `last_seen_at` is fresh | `stale` | `false` |
+| else | `offline` | `false` |
+
+⚠️ **The heartbeat trail speaks only when the directory cannot answer.** An agent's
+`stale` is gated on the `Online` status its own socket writes at the hello and its
+clean teardown clears. A tunnel client cannot have that gate: its `status` stays the
+admin's, and with two pods a disconnect's write could land after the client
+reconnected through the other pod. Its `last_seen_at` stays fresh for up to 180 s
+after a clean close, so read on its own it would show every client that just closed,
+or just enrolled, as `stale`. A directory that answered knows the sockets; the trail
+stands in only for one that did not, and then it is never green: with Redis down, a
+pod reads a client connected to the other pod as `stale` (`tunnel_client_presence`,
+`agent.rs:2849`, and its table test).
+
+### The record its sockets write
+
+One Redis record per client, `roomler:own:tunnel-client:<client_id>`
+(`tunnel_client_key`, `crates/core/src/cluster/directory.rs:292`), in the ownership
+directory every pod reads ([multi-pod-scale-out.md](multi-pod-scale-out.md)). Its TTL is
+180 s, 3 × the socket's 60 s check (`TUNNEL_CLIENT_TTL_SECS`, `:305`), the headroom the
+agent and user records keep over their 30 s beat: one missed refresh drops neither a
+live client nor its trail.
+
+| When | What | Where |
+|---|---|---|
+| connect | `last_seen_at` is touched (the check's first run is a full period away); the socket takes a seat on this pod; a client new to this pod gets its token there; the record is claimed with `claim_if_newer`, newest wins by the time each pod minted its token | `handle_tunnel_client_socket` (`crates/modules/network/src/tunnel.rs:99-102`), `PresenceRecord::open` (`:1805`) |
+| every 60 s | the check that re-reads the row, and closes the socket of a quarantined or removed client, touches `last_seen_at` and refreshes the record with `refresh_if_mine`, the token read live: ours or gone is set again, another pod's is left alone | `spawn_revocation_check` (`:1707`), its refresh at `:1739` and, when the row could not be read, `:1765` |
+| close | the check is aborted and awaited, then the seat leaves; the client's LAST socket on this pod releases the record, compare-and-delete, so an old pod's late close never takes a newer socket's record | `:452-453`, `PresenceRecord::close` (`:1856`) |
+| pod shutdown | every token this pod holds is taken, so no refresh writes it back, then released | `NetworkState::shutdown` (`crates/modules/network/src/lib.rs:982`) |
+
+- ⚠️ **The client's sockets on one pod share one token**, as an agent's hub slot holds
+  one (`TunnelClientSockets::sit`, `agent.rs:2675`). Two `roomler` processes on one
+  machine hold two sockets, and the newer one often closes first (a short `roomler
+  ssh` beside a long-lived forward). With a token per socket, that close would delete
+  the record the other socket stands behind, and every other pod would read the client
+  offline until the next refresh, up to 60 s. Shared, the first close releases nothing;
+  the last one releases the record (`leave`, `:2735`).
+- ⚠️ **The release waits for the check.** `refresh_if_mine` writes a missing key back:
+  that is how a record lost to a Redis blip heals within one check. A refresh still in
+  flight after the release would bring the record back for its whole TTL, so the
+  teardown awaits the aborted check before the seat leaves.
+- **`status` is never written by a socket**, and `TunnelClientDao::mark_status`, which
+  had no caller, is gone.
+- **Presence is a fact the server observes.** No authorization decision reads it.
+
+Known gaps, none of them new with presence:
+
+- **A pod that crashes** releases nothing, so its clients' records live out their TTL:
+  a dead client reads `online` on the other pod for up to 180 s (an agent's record has
+  the same gap, for its 90 s).
+- **Two sockets of one client on two pods:** when the one whose pod holds the record
+  closes, the other pod's next refresh claims it again, so for up to 60 s the closing
+  socket's pod reads the client `offline` while its other socket is open.
+- **A half-open socket** keeps its seat and its record, and so reads `online`, until a
+  write to it fails: the tunnel socket has no receive deadline (`socket_rx.next()`,
+  `tunnel.rs:197`), and the 60 s check writes to the database and Redis, never to the
+  socket.
+
 ## LocalAPI
 
 The on-host control surface — how `roomler`, `roomler-desktop`, and scripts talk
