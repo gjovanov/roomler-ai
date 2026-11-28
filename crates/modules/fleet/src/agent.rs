@@ -1131,6 +1131,9 @@ pub async fn self_rotate(
         .await
         .map_err(|e| ApiError::Internal(format!("token rotation: {e}")))?;
     if committed {
+        // FR-155 P1e — where the integration cells hold the work the commit
+        // starts (`rotation_work::CommitSeam`); it returns at once otherwise.
+        state.rotation_seam.pass().await;
         // FR-155 P1b — what the commit ends: the device's connections admitted
         // below the new generation, on this pod and, through the control
         // channel, on every other, each pod keeping a floor that refuses a
