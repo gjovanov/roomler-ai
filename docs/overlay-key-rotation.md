@@ -195,9 +195,9 @@ duplicate-delivery race below. Any report about a *different* order, and any
 ## The state the dashboard shows
 
 Resolved **once, server-side**, from the order, the claim and the proof
-(`crates/modules/fleet/src/agent.rs:1593-1754`); the grid only names the states
+(`crates/modules/fleet/src/agent.rs:1581-1742`); the grid only names the states
 (`AgentsSection.vue:2199-2300`). The device row also carries `overlay_public_key` and
-`overlay_key_epoch` straight from the proof (`agent.rs:2917-2918`), so an operator
+`overlay_key_epoch` straight from the proof (`agent.rs:2905-2906`), so an operator
 can *see* the key change instead of trusting a chip.
 
 ```mermaid
@@ -225,14 +225,14 @@ flowchart TD
 | `delivered` | pushed to a live socket, no answer for **this** order yet | *rotating key…* | wait a few seconds |
 | `rotating` | the device claims `rotated` (≤ 60 s ago) but its last join still shows the previous key | *rotating key…* | wait — it is re-joining |
 | `rotated` | the join proves it (key ≠ `public_key_before` after the order), **or** the claim's `new_public_key` is what the device joined with | *key rotated · e⟨epoch⟩* | done |
-| `reported_not_joined` | claimed `rotated` > 60 s ago (`KEY_ROTATION_REJOIN_GRACE_SECS`, `agent.rs:1662`), still joined under another key | *key not re-joined* | the re-join failed — read the device log |
+| `reported_not_joined` | claimed `rotated` > 60 s ago (`KEY_ROTATION_REJOIN_GRACE_SECS`, `agent.rs:1650`), still joined under another key | *key not re-joined* | the re-join failed — read the device log |
 | `refused` | the device answered `disabled`, `rate_limited` or `unsupported` | *key rotation refused (⟨outcome⟩)*, tooltip = `report.detail` | fix the stated thing |
 | `failed` | mint or persist failed; identity unchanged | *key rotation failed* | `report.detail` says why |
 | `unsupported` | an order stands, no answer, and the device's hello lacks `key-rotate` | *roomlerd too old for key rotation* | update the device; the order stays queued and runs on the first connect that advertises the verb |
 
 ⚠️ **Compare `request_id`s, never outcomes alone.** A report about an earlier order
 says nothing about this one — the remote-configuration lesson, applied here
-(`agent.rs:1673`).
+(`agent.rs:1661`).
 
 ⚠️ **`unsupported` is a state an *offline* order reaches.** An online pre-feature
 device never gets an order recorded — the route refuses it 409 up front. The state
@@ -251,9 +251,9 @@ on every connect rather than only when nobody is watching. Three field cycles on
 
 | cycle | what the run showed | the rule it left |
 |---|---|---|
-| 1 → **P1b** | 30 ms after the re-join, the reconnect's own register re-pushed the **same** order (the `rotated` report, sent on the dying session and written by a spawned task, had not landed); the device refused the duplicate under its own ceiling, and that refusal **overwrote** the success — the grid read `refused (rate_limited)` for a rotation that worked | an order delivered < **120 s** ago is in progress, not lost: `should_redeliver` (`models.rs:6920`, `:6945`); and a refusal never overwrites a `rotated` report for the same order (`dao/agent.rs:1243-1260`) |
+| 1 → **P1b** | 30 ms after the re-join, the reconnect's own register re-pushed the **same** order (the `rotated` report, sent on the dying session and written by a spawned task, had not landed); the device refused the duplicate under its own ceiling, and that refusal **overwrote** the success — the grid read `refused (rate_limited)` for a rotation that worked | an order delivered < **120 s** ago is in progress, not lost: `should_redeliver` (`models.rs:6926`, `:6951`); and a refusal never overwrites a `rotated` report for the same order (`dao/agent.rs:1243-1260`) |
 | 2 → **P1c** | the dying-session report was **lost** this time, so the state stuck at `delivered` although the server had verified the new key at the join | the order snapshots `public_key_before`; a join under another key resolves `rotated` with or without a report; the agent **re-sends** its report on the next session, keyed per org (`agents/roomlerd/src/signaling.rs:3610-3652`) |
-| 3 → **P1d** | the cycle-2 order (report lost, no snapshot) was re-delivered on every later connect — a pod roll, then the 0.4.26 restart: **three rotations for one click** | `order_is_satisfied` (`models.rs:6930`): a verified identity change after the order satisfies it, and a satisfied order is never pushed again |
+| 3 → **P1d** | the cycle-2 order (report lost, no snapshot) was re-delivered on every later connect — a pod roll, then the 0.4.26 restart: **three rotations for one click** | `order_is_satisfied` (`models.rs:6936`): a verified identity change after the order satisfies it, and a satisfied order is never pushed again |
 
 ⚠️ The dying-session copy of the report was lost in **3 of the 4** ordered runs. The
 re-send on the new session is the reliable path, and the identity rule is what keeps
@@ -292,7 +292,7 @@ sequenceDiagram
 
 **The ledger** is per node: `overlay_nodes.retired_keys[]`, each entry
 `{ public_key, key_epoch, retired_at, reason }`, public halves only
-(`crates/remote_control/src/models.rs:3591`, `:7458`). It is written at one moment —
+(`crates/remote_control/src/models.rs:3591`, `:7464`). It is written at one moment —
 an **accepted join under a different key**, the verified identity change P1c made the
 proof — in the same write that installs the new key: a compare-and-set on
 `{_id, wg_public_key: <old>, retired_keys.public_key ≠ <old>}` that `$push`es the old key
@@ -344,7 +344,7 @@ under any other key satisfies the order (P1c and P1d hold unchanged). The frame 
 rotates.
 
 ⚠️ **The loop guard is the order already on the row** (`order_in_flight`,
-`models.rs:11354`). An order that is unsatisfied, unanswered, and delivered less than
+`models.rs:11360`). An order that is unsatisfied, unanswered, and delivered less than
 `REDELIVER_AFTER_SECS` (120 s) ago is being executed: a second retired-key join inside
 that window is refused and ordered nothing, with no second audit row. Past the window, the
 60 s ceiling bounds it. A device that refuses the order — its own switch off, say — is
@@ -436,21 +436,21 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:1070`, `:1263`, `:1292`, test `:8951`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4969-4973` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:1070`, `:1263`, `:1292`, test `:8957`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4969-4973` |
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2817`, `:1020`; owner `network` (`:2004`, `modular-monolith.md`) |
-| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3473`, `:3507`, `:3532`, `:3563`, `:5939`, `:11319`, `:11334` |
+| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3473`, `:3507`, `:3532`, `:3563`, `:5939`, `:11325`, `:11340` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
 | reconcile-on-connect | `crates/modules/fleet/src/socket.rs:363-379`, `:444-465` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:654-677`; `crates/services/src/dao/agent.rs:1269` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1234-1264` |
-| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1593-1754`, `:2910-2918` |
+| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1581-1742`, `:2898-2906` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:863-871` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6361-6503`, `:3610-3652`, `:3654-3675`, `:1459-1486` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:674-706` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:1096-1101`, `:1894-1899`, `:2024-2026`; `config_surface.rs:1266-1273` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1354-1381`, `:2197-2298`; `ui/src/stores/agents.ts:1350-1364` |
-| P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3591`, `:3609`, `:4341`, `:3574`, `:11354`, `:11636`; the node and network fields `:7458`, `:7705` |
+| P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3591`, `:3609`, `:4341`, `:3574`, `:11360`, `:11642`; the node and network fields `:7464`, `:7711` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7498` |
 | P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:381-423`, `:444-475`, `:813`, `:834`, `:883` |
 | P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:383`; nest `crates/modules/network/src/lib.rs:569`, `:627` |

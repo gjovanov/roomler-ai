@@ -252,7 +252,7 @@ shows on the admin row and in `roomler status`, where the probe's reason does.
 | Any node with `ROOMLERD_EXIT_V6_STATEMENT=0` | absent | |
 
 The field rides `rc:overlay.join` (`crates/remote_control/src/signaling.rs:1716`),
-is stored on the node's row as sent (`crates/remote_control/src/models.rs:7608`;
+is stored on the node's row as sent (`crates/remote_control/src/models.rs:7614`;
 the rehydrate `$unset`s it for a join that states nothing,
 `crates/services/src/dao/overlay_node.rs:362`), and reaches every client in its
 netmap peer (`signaling.rs:4092`, `to_netmap_peer`
