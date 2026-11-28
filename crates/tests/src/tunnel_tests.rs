@@ -1318,7 +1318,7 @@ async fn agent_tunnel_open_cross_tenant_rejected() {
 /// at the test server), so we can run its real `signaling::run` loop in-process.
 /// Mirrors `agent_tests::enrol_via_agent_lib` (duplicated so the tunnel suite
 /// stands alone).
-async fn enrol_agent_lib(
+pub(crate) async fn enrol_agent_lib(
     app: &TestApp,
     seeded: &crate::fixtures::seed::SeededTenant,
     machine_id: &str,
@@ -1354,7 +1354,7 @@ async fn enrol_agent_lib(
 /// [`TunnelClientHub`] (so the test can drive `create_forward` on the SAME hub
 /// the loop publishes its egress into). Mirrors
 /// `agent_tests::spawn_agent_signaling` + the extra P3b-2 PR-C hub arg.
-fn spawn_origin_signaling(
+pub(crate) fn spawn_origin_signaling(
     cfg: AgentConfig,
     hub: TunnelClientHub,
     stop_rx: tokio::sync::watch::Receiver<bool>,
@@ -1410,7 +1410,7 @@ fn spawn_origin_signaling(
 
 /// A free loopback TCP port (bind :0 → read the port → drop). The daemon's
 /// `create_forward` re-binds it; the tiny window is a non-issue in a test.
-async fn free_local_port() -> u16 {
+pub(crate) async fn free_local_port() -> u16 {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
     drop(l);
