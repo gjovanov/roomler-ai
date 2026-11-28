@@ -2928,6 +2928,16 @@ train at 0.97 to 1.05 of the link with 53.8 to 59.7 ms of queue in six, and the 
 0.89 to 0.95 with 45.5 to 65.3 ms in three. 4a-3b's rule broke it in a clean pass whose
 round did not count (82.4 ms).
 
+**The ruling: this rule passes.** The verdict's first test compares the two totals, and one
+run is within what chance does with three breaks between two rules: at equal rates, a given
+rule takes two or more of them half the time. Its second test, the one that would name a
+mechanism, holds: nothing this rule broke came back in a second counted pass. Each of its
+two counted breaks is a run in which it takes 4a-3c's path, and the first of them broke
+under 4a-3c's rule too, and under 4a-3b's. Over every clean pass, counted or not, this rule
+broke four runs in its six and 4a-3c's rule six in its six, and the P-a class that
+4a-3c's settling run left standing held in every pass of this rule. The verdict stays as
+written for the next settling run: the ruling decides this case and moves no threshold.
+
 **Found, and standing.**
 
 - **P-f at 0.4 Mbit/s on path C at 120 and 160 ms breaks on every rule, 4a-3b's, 4a-3c's
