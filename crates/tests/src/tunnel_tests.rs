@@ -33,6 +33,12 @@
 //!   against an admin in tenant A exfiltrating an enrollment token
 //!   that grants tunnel access into tenant B's agents).
 //!
+//! * `the_check_closes_a_socket_the_rule_refuses_within_one_period` (#4574)
+//!   — the 60 s check applies the upgrade's rule (`tunnel_admission::refusal`):
+//!   a socket per refusal the rule gives is told `rc:tunnel.revoked` with the
+//!   rule's reason and closed within one period, and a socket the rule admits
+//!   is still served once its check has run.
+//!
 //! * `agent_originates_tunnel_authorized_and_relayed_to_target` (P3b-2)
 //!   — an agent drives the tunnel-CLIENT role over its own agent WS
 //!   (`Principal::Agent`), opens a tunnel to another agent, and the
@@ -81,6 +87,7 @@
 //! field gate.
 
 use crate::fixtures::test_app::TestApp;
+use crate::tunnel_policy_permission_tests::{Ws as TunnelWs, connect_tunnel_client};
 use futures::{SinkExt, StreamExt};
 use roomlerd::config::AgentConfig;
 use roomlerd::encode::EncoderPreference;
@@ -495,6 +502,18 @@ async fn enroll_tunnel_client(
     machine_id: &str,
     machine_name: &str,
 ) -> String {
+    enroll_tunnel_client_with_token(app, seeded, machine_id, machine_name)
+        .await
+        .0
+}
+
+/// [`enroll_tunnel_client`], with the client's token: `(id, token)`.
+async fn enroll_tunnel_client_with_token(
+    app: &TestApp,
+    seeded: &crate::fixtures::seed::SeededTenant,
+    machine_id: &str,
+    machine_name: &str,
+) -> (String, String) {
     let et: Value = app
         .auth_post(
             &format!(
@@ -525,10 +544,16 @@ async fn enroll_tunnel_client(
         .json()
         .await
         .unwrap();
-    enrolled["tunnel_client_id"]
-        .as_str()
-        .expect("tunnel_client_id in enroll response")
-        .to_string()
+    (
+        enrolled["tunnel_client_id"]
+            .as_str()
+            .expect("tunnel_client_id in enroll response")
+            .to_string(),
+        enrolled["tunnel_client_token"]
+            .as_str()
+            .expect("tunnel_client_token in enroll response")
+            .to_string(),
+    )
 }
 
 /// #1829 — removal is FINAL on the per-client routes, not only in the
@@ -732,6 +757,217 @@ async fn a_live_tunnel_client_whose_deleted_at_field_is_absent_is_still_live() {
         1,
         "the listing agrees"
     );
+}
+
+/// The tunnel client's row, deleted or not.
+async fn tunnel_client_row(
+    app: &TestApp,
+    tid: bson::oid::ObjectId,
+    cid: bson::oid::ObjectId,
+) -> roomler_ai_remote_control::models::TunnelClient {
+    app.state
+        .network()
+        .tunnel_clients
+        .find_any_in_tenant(tid, cid)
+        .await
+        .expect("the tunnel client's row")
+}
+
+/// The socket answers a ping within 5 s, and no frame it reads on the way to
+/// the pong is `rc:tunnel.revoked`.
+async fn served_unrevoked(ws: &mut TunnelWs) -> Result<(), String> {
+    ws.send(Message::Ping(b"admission".to_vec().into()))
+        .await
+        .map_err(|e| format!("ping: {e}"))?;
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(until, ws.next()).await {
+            Ok(Some(Ok(Message::Pong(_)))) => return Ok(()),
+            Ok(Some(Ok(Message::Text(t))))
+                if serde_json::from_str::<Value>(&t)
+                    .is_ok_and(|v| v["t"] == "rc:tunnel.revoked") =>
+            {
+                return Err(format!("told {}", t.as_str()));
+            }
+            Ok(Some(Ok(Message::Close(frame)))) => return Err(format!("closed: {frame:?}")),
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(e))) => return Err(format!("read: {e}")),
+            Ok(None) => return Err("the socket ended".into()),
+            Err(_) => return Err("no pong in 5 s".into()),
+        }
+    }
+}
+
+/// The reason of the `rc:tunnel.revoked` the socket is told, once the socket
+/// has closed too, both by `until`.
+async fn revoked_then_closed(
+    ws: &mut TunnelWs,
+    until: tokio::time::Instant,
+) -> Result<String, String> {
+    let mut reason = None;
+    loop {
+        match tokio::time::timeout_at(until, ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let v: Value =
+                    serde_json::from_str(&t).map_err(|e| format!("{e}: {}", t.as_str()))?;
+                if v["t"] == "rc:tunnel.revoked" {
+                    reason = Some(v["reason"].as_str().unwrap_or_default().to_string());
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                return reason.ok_or_else(|| "closed, and never told rc:tunnel.revoked".into());
+            }
+            Ok(Some(Ok(_))) => {}
+            Err(_) => {
+                return Err(match reason {
+                    Some(r) => format!("told rc:tunnel.revoked ({r}), and still open"),
+                    None => "not told rc:tunnel.revoked".into(),
+                });
+            }
+        }
+    }
+}
+
+/// #4574 — the 60 s check applies the upgrade's rule,
+/// `tunnel_admission::refusal`, with the generation the socket was admitted
+/// at. One socket per refusal the rule gives, each named by its refusal, and
+/// each row changed so that the rule gives it (the generation's row stays
+/// live): every one is told `rc:tunnel.revoked` with the rule's reason, and is
+/// closed, within one period of the check (60 s, waited for here at most
+/// 75 s). A socket whose row the rule admits is still served once its check
+/// has run (its `last_seen_at` moved).
+#[tokio::test]
+async fn the_check_closes_a_socket_the_rule_refuses_within_one_period() {
+    use bson::{doc, oid::ObjectId};
+    use roomler_ai_mod_network::tunnel_admission::{Refusal, refusal};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("tunnel-admission-rule").await;
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let network = app.state.network();
+    let clients = app.db.collection::<bson::Document>("tunnel_clients");
+    // `rc.token_generation_check`, on in every test app.
+    let enforced = app.state.settings.rc.token_generation_check;
+    assert!(enforced, "the generation's case needs the switch on");
+
+    // The socket whose row the rule admits. Connected first, so its check is
+    // due no later than any other socket's.
+    let (id, token) =
+        enroll_tunnel_client_with_token(&app, &seeded, "mach-rule-admits", "Admitted").await;
+    let admitted_cid = ObjectId::parse_str(&id).unwrap();
+    // Enrollment mints the token at the row's generation.
+    let admitted_gen = tunnel_client_row(&app, tid, admitted_cid).await.token_gen;
+    let mut admitted = connect_tunnel_client(&app, &token).await;
+    // A pong means the socket's loop runs, so its connect-time `last_seen_at`
+    // write is done.
+    served_unrevoked(&mut admitted)
+        .await
+        .expect("the upgrade admits the socket");
+    let seen_at_connect = tunnel_client_row(&app, tid, admitted_cid)
+        .await
+        .last_seen_at;
+
+    // One socket per refusal the rule gives, named by it.
+    let generation = Refusal::Generation(
+        roomler_ai_mod_fleet::auth_agent::generation_refusal(0, 1, false, true)
+            .expect("fleet's generation reason"),
+    );
+    let mut refused = Vec::new();
+    for want in [
+        Refusal::Deleted,
+        Refusal::Quarantined,
+        Refusal::Unenrolled,
+        generation,
+    ] {
+        let name = match want {
+            Refusal::Deleted => "Deleted",
+            Refusal::Quarantined => "Quarantined",
+            Refusal::Unenrolled => "Unenrolled",
+            Refusal::Generation(_) => "Generation",
+        };
+        let machine = format!("mach-rule-{name}");
+        let (id, token) = enroll_tunnel_client_with_token(&app, &seeded, &machine, name).await;
+        let cid = ObjectId::parse_str(&id).unwrap();
+        // The token's generation, the row's at enrollment, as above.
+        let socket_gen = tunnel_client_row(&app, tid, cid).await.token_gen;
+        let mut ws = connect_tunnel_client(&app, &token).await;
+        served_unrevoked(&mut ws)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the upgrade admits the socket: {e}"));
+        match want {
+            Refusal::Deleted => {
+                assert!(network.tunnel_clients.soft_delete(tid, cid).await.unwrap());
+            }
+            Refusal::Quarantined => {
+                assert!(network.tunnel_clients.quarantine(tid, cid).await.unwrap());
+            }
+            Refusal::Unenrolled => {
+                clients
+                    .update_one(
+                        doc! { "_id": cid },
+                        doc! { "$set": { "status": "unenrolled" } },
+                    )
+                    .await
+                    .unwrap();
+            }
+            // The row stays live, at the next generation.
+            Refusal::Generation(_) => {
+                clients
+                    .update_one(doc! { "_id": cid }, doc! { "$inc": { "token_gen": 1 } })
+                    .await
+                    .unwrap();
+            }
+        }
+        let row = tunnel_client_row(&app, tid, cid).await;
+        assert_eq!(
+            refusal(&row, socket_gen, enforced),
+            Some(want),
+            "{name}: the rule gives it for the changed row"
+        );
+        refused.push((name, want, ws));
+    }
+
+    // Each is told the rule's reason and closed within one period. Every
+    // socket is read the whole time, side by side, so it answers whatever the
+    // server sends it meanwhile.
+    let until = tokio::time::Instant::now() + Duration::from_secs(75);
+    let readers: Vec<_> = refused
+        .into_iter()
+        .map(|(name, want, mut ws)| {
+            tokio::spawn(async move { (name, want, revoked_then_closed(&mut ws, until).await) })
+        })
+        .collect();
+
+    // The admitted socket is pinged until its check has run: its
+    // `last_seen_at`, written at connect and by the check alone, moved.
+    loop {
+        served_unrevoked(&mut admitted)
+            .await
+            .expect("the admitted socket stays served");
+        let row = tunnel_client_row(&app, tid, admitted_cid).await;
+        if row.last_seen_at > seen_at_connect {
+            assert_eq!(
+                refusal(&row, admitted_gen, enforced),
+                None,
+                "the rule admits the row"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the admitted socket's check ran within 75 s"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    served_unrevoked(&mut admitted)
+        .await
+        .expect("the admitted socket is open past its check");
+
+    for reader in readers {
+        let (name, want, told) = reader.await.expect("the reader task ends");
+        let told = told.unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(told, want.reason(), "{name}: the rule's reason");
+    }
 }
 
 #[tokio::test]

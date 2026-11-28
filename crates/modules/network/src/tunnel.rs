@@ -22,8 +22,8 @@
 //!      agent's WS; today we reply with a stub `TcpForwardAccept`
 //!      that downstream tests assert on.
 //!    - Other variants land in T2.6+ (data-plane relays).
-//! 3. Periodic revocation re-check (60 s) — re-reads `tunnel_clients.
-//!    status`, sends `TunnelRevoked` if the row turns bad mid-session.
+//! 3. Periodic revocation re-check (60 s) — re-reads the row, sends
+//!    `TunnelRevoked` when the upgrade's rule (`tunnel_admission`) refuses it.
 //!
 //! Audit context: every `tunnel forward` invocation gets one
 //! `tunnel_session_id` (assigned by the server on `TunnelOpen`).
@@ -52,6 +52,7 @@ use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
 use crate::NetworkState;
 use crate::agent_arms::pump_server_messages;
+use crate::tunnel_admission::{self, Refusal};
 use axum::{extract::WebSocketUpgrade, response::Response};
 use roomler_ai_mod_fleet::agent::{TunnelClientSeat, TunnelClientSockets};
 use roomler_core::cluster::directory::{
@@ -80,6 +81,10 @@ const END_TOLD_WITHIN: Duration = Duration::from_secs(5);
 /// signalling layer errors, or the revocation re-check kills the
 /// connection. Replaces the T1 stub message loop with real
 /// `rc:tunnel.*` dispatch.
+///
+/// `admitted_gen` is the generation of the token the upgrade admitted the
+/// socket with: the 60 s check applies the upgrade's rule with it
+/// ([`tunnel_admission::refusal`]).
 pub async fn handle_tunnel_client_socket(
     state: NetworkState,
     socket: WebSocket,
@@ -87,6 +92,7 @@ pub async fn handle_tunnel_client_socket(
     tenant_id: ObjectId,
     owner_user_id: ObjectId,
     dialed_tid: Option<String>,
+    admitted_gen: u32,
 ) {
     info!(%tunnel_client_id, %tenant_id, %owner_user_id, "tunnel-client WS connected");
     let conn_established_ms = bson::DateTime::now().timestamp_millis();
@@ -188,6 +194,7 @@ pub async fn handle_tunnel_client_socket(
         orig.server_ended.clone(),
         tunnel_client_id,
         tenant_id,
+        admitted_gen,
         presence.clone(),
     );
 
@@ -1712,6 +1719,7 @@ fn spawn_revocation_check(
     server_ended: roomler_core::ServerEnded,
     tunnel_client_id: ObjectId,
     tenant_id: ObjectId,
+    admitted_gen: u32,
     presence: PresenceRecord,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1720,32 +1728,37 @@ fn spawn_revocation_check(
         loop {
             tick.tick().await;
             // ANY, deliberately (#1829): this read's job IS the tombstone.
-            // `deleted_at` decides between the heartbeat arm and the typed
-            // `rc:tunnel.revoked` kick below, while the `Err` arm means "row
-            // unreadable" and keeps the socket OPEN (a Mongo blip must not
-            // revoke a healthy fleet). A LIVE lookup would fold a removal
-            // into that `Err` arm — and a deleted client would never be
-            // kicked, for as long as its session lived.
-            match state
+            // The upgrade's rule, `tunnel_admission::refusal`, decides
+            // between the heartbeat arm and the typed `rc:tunnel.revoked`
+            // kick below, while the `Err` arm means "row unreadable" and
+            // keeps the socket OPEN (a Mongo blip must not revoke a healthy
+            // fleet). A LIVE lookup would fold a removal into that `Err` arm
+            // — and a deleted client would never be kicked, for as long as
+            // its session lived.
+            let admission = state
                 .tunnel_clients
                 .find_any_in_tenant(tenant_id, tunnel_client_id)
                 .await
-            {
-                Ok(c)
-                    if c.deleted_at.is_none()
-                        && matches!(c.status, AgentStatus::Online | AgentStatus::Offline) =>
-                {
+                .map(|c| {
+                    tunnel_admission::refusal(
+                        &c,
+                        admitted_gen,
+                        state.fleet.settings.rc.token_generation_check,
+                    )
+                });
+            match admission {
+                Ok(None) => {
                     let _ = state.tunnel_clients.touch_heartbeat(tunnel_client_id).await;
                     presence.refresh().await;
                 }
-                Ok(_) => {
-                    info!(%tunnel_client_id, "tunnel-client revoked mid-session; closing WS");
+                Ok(Some(refusal)) => {
+                    info!(%tunnel_client_id, reason = refusal.reason(), "tunnel-client revoked mid-session; closing WS");
                     // The connection loop tells the session's exit first.
                     signal_end(&server_ended, &end_tx, END_TOLD_WITHIN).await;
                     send_msg(
                         &outbound_tx,
                         ServerMsg::TunnelRevoked {
-                            reason: "status changed to Quarantined or soft-deleted".into(),
+                            reason: refusal.reason().into(),
                         },
                     )
                     .await;
@@ -2309,8 +2322,9 @@ pub fn ws_upgrade_tunnel_client(
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
-        // Connect-time revocation check. Periodic re-check (every 60 s)
-        // lives in `ws::tunnel::handle_tunnel_client_socket`.
+        // Connect-time revocation check. The periodic re-check (every 60 s)
+        // is `spawn_revocation_check`, which `handle_tunnel_client_socket`
+        // starts. Both apply one rule, `tunnel_admission::refusal`.
         //
         // ANY, deliberately (#1829): the tombstone is what this read is FOR
         // — `deleted_at` below selects the typed `rc:tunnel.revoked` goodbye
@@ -2329,19 +2343,21 @@ pub fn ws_upgrade_tunnel_client(
                 return;
             }
         };
-        if client.deleted_at.is_some()
-            || matches!(
-                client.status,
-                roomler_ai_remote_control::models::AgentStatus::Quarantined
-            )
-        {
+        let refusal = tunnel_admission::refusal(
+            &client,
+            token_gen,
+            state.fleet.settings.rc.token_generation_check,
+        );
+        // Every refusal but the generation's takes the deleted row's
+        // goodbye, so a refusal added to the rule is never admitted here.
+        if let Some(row_refusal) = refusal.filter(|r| !matches!(r, Refusal::Generation(_))) {
             // rc.53: mirror of the agent refusal path. Tunnel-clients
             // have their own taxonomy (`ServerMsg::TunnelRevoked`) and
             // the periodic re-check in `handle_tunnel_client_socket`
             // already emits it on mid-session revocation — extend the
             // same notification to the connect-time refusal so the CLI
             // logs "tunnel revoked" instead of opaque socket close.
-            info!(%tunnel_client_id, "tunnel-client is quarantined or deleted; refusing WS with rc:tunnel.revoked");
+            info!(%tunnel_client_id, reason = row_refusal.reason(), "tunnel-client is quarantined or deleted; refusing WS with rc:tunnel.revoked");
             let revoked = roomler_ai_remote_control::signaling::ServerMsg::TunnelRevoked {
                 reason: "tunnel-client row was deleted or quarantined; re-enrol to revive".into(),
             };
@@ -2351,12 +2367,7 @@ pub fn ws_upgrade_tunnel_client(
         // FR-103 — a token minted before this client was removed and
         // re-enrolled. To the CLI that is a revoked credential: it stops and
         // says to re-enroll, which is exactly the remedy.
-        if let Some(reason) = roomler_ai_mod_fleet::auth_agent::generation_refusal(
-            token_gen,
-            client.token_gen,
-            false, // a tunnel client does not rotate (FR-155)
-            state.fleet.settings.rc.token_generation_check,
-        ) {
+        if let Some(Refusal::Generation(reason)) = refusal {
             info!(%tunnel_client_id, reason, row_gen = client.token_gen, "tunnel-client token predates its removal; refusing WS with rc:tunnel.revoked");
             let revoked = roomler_ai_remote_control::signaling::ServerMsg::TunnelRevoked {
                 reason: reason.into(),
@@ -2371,6 +2382,7 @@ pub fn ws_upgrade_tunnel_client(
             tenant_id,
             owner_user_id,
             tid,
+            token_gen,
         )
         .await;
     })
