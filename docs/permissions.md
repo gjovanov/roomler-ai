@@ -109,7 +109,7 @@ of a grant, never the lookup.
 | add a member with roles, `POST …/member` | `INVITE_MEMBERS` | 404, the same two checks (`TenantDao::add_member`, `tenant.rs:520`) |
 | create an invite, `POST …/invite`, `…/invite/batch` | `INVITE_MEMBERS` | 404, `check_grant_roles` |
 | redeem an invite, `POST /api/invite/{code}/accept` or registering with its code | the invitee | the invite's roles the org still has (`redeemed_role_ids`, `crates/api/src/routes/invite.rs:166`). If none is left, 409 `conflict` and nothing is spent: the inviter sends a new invite. An invite that names no role gives `member` |
-| a device's remote-control, exec or SSH allow-list: `PUT …/agent/{aid}`, `…/exec-policy`, `…/ssh-policy` | `MANAGE_AGENTS` | 400 `bad_request` `Unknown role id: <hex>` (`guards::require_org_roles`, `crates/core/src/guards.rs:71`; called at `crates/modules/fleet/src/agent.rs:2119`, `crates/modules/fleet/src/agent_exec.rs:1002`, `crates/modules/network/src/routes/agent_ssh.rs:1012`) |
+| a device's remote-control, exec or SSH allow-list: `PUT …/agent/{aid}`, `…/exec-policy`, `…/ssh-policy` | `MANAGE_AGENTS` | 400 `bad_request` `Unknown role id: <hex>` (`guards::require_org_roles`, `crates/core/src/guards.rs:71`; called at `crates/modules/fleet/src/agent.rs:2107`, `crates/modules/fleet/src/agent_exec.rs:1002`, `crates/modules/network/src/routes/agent_ssh.rs:1012`) |
 | a tunnel policy's `RoleId` subject, `POST`/`PUT …/tunnel-policy` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/tunnel.rs:1139`, `:1223`) |
 | an overlay ACL rule's `RoleId` source, `POST`/`PUT …/overlay-acl` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/overlay_policy.rs:203`, `:262`) |
 

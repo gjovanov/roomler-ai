@@ -163,6 +163,9 @@ pub struct FleetState {
     /// FR-155 — every decision of `POST /api/agent/self/rotate`, with the
     /// caller's address and the generations.
     pub token_rotation_audit: Arc<TokenRotationAuditDao>,
+    /// FR-155 P1e — the works of rotation commits running on this pod, which
+    /// an answer asked again here waits for (`rotation_work::InFlight`).
+    pub rotations_in_flight: Arc<rotation_work::InFlight>,
     /// FR-155 P1e — where the integration cells hold the work of a
     /// rotation's commit (`rotation_work::CommitSeam`). Unheld outside them.
     #[doc(hidden)]
@@ -362,6 +365,7 @@ impl Module for FleetState {
             external_principals: Arc::new(ExternalPrincipalDao::new(db)),
             config_audit: Arc::new(ConfigAuditDao::new(db)),
             token_rotation_audit: Arc::new(TokenRotationAuditDao::new(db)),
+            rotations_in_flight: Arc::default(),
             rotation_seam: Arc::default(),
             keep_busy_events: Arc::new(KeepBusyEventDao::new(db)),
             rc_resume_scope: Arc::new(RcResumeScopeDao::new(db)),

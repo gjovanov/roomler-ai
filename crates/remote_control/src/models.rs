@@ -5821,6 +5821,12 @@ pub struct TokenRotation {
     pub key_sha256: String,
     /// When the rotation committed.
     pub at: DateTime,
+    /// FR-155 P1e — when the work the commit started reached its end, written
+    /// by that work (`rotation_work` in the fleet module) on the pod that
+    /// committed. An answer asked again waits for it. Absent until then, and
+    /// on a rotation a pod before P1e made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<DateTime>,
 }
 
 /// FR-155 — one decision of `POST /api/agent/self/rotate`, in

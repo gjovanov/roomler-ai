@@ -30,6 +30,7 @@ use crate::retired_key_tests::{self as rk, Ws};
 use crate::token_renewal_tests::{enroll, forge_agent_token, renew, self_devices, upgrade_status};
 use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use futures::{SinkExt, StreamExt};
+use roomler_ai_mod_fleet::rotation_work::REPLAY_WAIT_SECS;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
@@ -333,7 +334,8 @@ async fn one_rotation_per_generation() {
 
 /// T6: `rc.agent_token_rotation` off answers 404 to a first call, with an
 /// `unsupported` audit row, and answers a call asking again for a rotation
-/// made before. `rc.token_generation_check` off answers 404 to every call.
+/// made before at once, also when its record carries no mark of its work's
+/// end (P1e). `rc.token_generation_check` off answers 404 to every call.
 /// Three servers over one database: the switch on, the switch off, and the
 /// generation check off.
 #[tokio::test]
@@ -358,7 +360,21 @@ async fn rotation_is_unsupported_while_switched_off() {
         404,
         "a first call"
     );
+    off.db
+        .collection::<Document>("agents")
+        .update_one(
+            doc! { "_id": oid(&agent_id) },
+            doc! { "$unset": { "token_rotation.settled_at": "" } },
+        )
+        .await
+        .unwrap();
+    let asked = tokio::time::Instant::now();
     let again = answered_token(rotate(&off, &g0, &key).await).await;
+    assert!(
+        tokio::time::Instant::now().duration_since(asked)
+            < Duration::from_secs(REPLAY_WAIT_SECS / 2),
+        "with the switch off, an answer asked again is given at once"
+    );
     assert_eq!(token_generation(&again), 1, "the rotation made before");
     assert_eq!(row_generation(&agent_row(&off, &agent_id).await), 1);
     let (fresh_id, fresh) = enroll(&off, &seeded, "m-fr155-off-fresh").await;
@@ -1574,10 +1590,6 @@ async fn a_pod_switched_off_ends_and_refuses_no_derp_registration() {
 /// How long T24 and T25 give each effect of a commit's work, once the seam
 /// lets the work go on.
 const WORK_WAIT: Duration = Duration::from_secs(10);
-
-/// The bound on an answer asked again while the work of its commit runs
-/// (P1e, `rotation_work` in the fleet module).
-const REPLAY_WAIT_SECS: u64 = 10;
 
 /// A pair of servers over one database for T24 and T25, with the rotation
 /// on. No pod's own check runs within a cell (`rc.presence_sweep_secs`), so
