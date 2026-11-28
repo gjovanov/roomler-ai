@@ -3480,8 +3480,8 @@ pub struct KeyRotationRequest {
     pub requested_by: ObjectId,
     pub requested_at: DateTime,
     /// FR-40 P2 — `None`: an operator's order. `Some(why)`: the SERVER placed
-    /// it, and `requested_by` is the zero id — today only
-    /// [`KEY_ROTATION_TRIGGER_KEY_RETIRED`]. A string, not an enum, because
+    /// it, and `requested_by` is the zero id: [`KEY_ROTATION_TRIGGER_KEY_RETIRED`]
+    /// or [`KEY_ROTATION_TRIGGER_CREDENTIAL_ROTATION`]. A string, not an enum, because
     /// this rides the agent row every agent request reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
@@ -3572,6 +3572,11 @@ pub struct OverlayIdentity {
 /// placed: the device presented a retired key at its join, and it advertises
 /// `key-rotate`, so it is ordered to rotate instead of being left off the mesh.
 pub const KEY_ROTATION_TRIGGER_KEY_RETIRED: &str = "key_retired";
+
+/// FR-155 P1d — the [`KeyRotationRequest::trigger`] of the order a token
+/// rotation places: the device's agent token moved to the next generation,
+/// and its overlay key follows it (`docs/fr/FR-155-one-row-new-credentials.md`).
+pub const KEY_ROTATION_TRIGGER_CREDENTIAL_ROTATION: &str = "credential_rotation";
 
 /// FR-40 P2 — one overlay public key a node has moved away from, kept on its
 /// [`OverlayNode`] row (`retired_keys`) so that the key can never be used to
@@ -5941,8 +5946,8 @@ pub struct KeyRotationAuditEvent {
     pub at: DateTime,
     pub request_id: String,
     /// FR-40 P2 — `None`: an operator's order. `Some(why)`: the server's own
-    /// (today only [`KEY_ROTATION_TRIGGER_KEY_RETIRED`]), with the zero
-    /// `user_id`. Copied onto the order it audits.
+    /// ([`KEY_ROTATION_TRIGGER_KEY_RETIRED`] or [`KEY_ROTATION_TRIGGER_CREDENTIAL_ROTATION`]),
+    /// with the zero `user_id`. Copied onto the order it audits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
     /// `pushed` (a live socket took it) or `queued` (the device was offline
@@ -5978,10 +5983,10 @@ pub struct TokenRotation {
 /// `token_rotation_audit`: a rotation that committed (`first`), the answer to
 /// one asked again with its rotation key (`replay`), a refusal with its reason
 /// (`refused`), a first call within the hour of the last rotation
-/// (`rate_limited`), or a call the server's switches answer 404
-/// (`unsupported`, the switch as the reason). The SERVER's record of what it
-/// decided. A request whose token does not verify names no device and has
-/// no row.
+/// (`rate_limited`), a call the server's switches answer 404 (`unsupported`,
+/// the switch as the reason), or a commit after which a module's hook failed
+/// (`hook_failed`, the modules as the reason). The SERVER's record of what it
+/// decided. A request whose token does not verify names no device: no row.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TokenRotationAuditEvent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -5989,9 +5994,9 @@ pub struct TokenRotationAuditEvent {
     pub tenant_id: ObjectId,
     pub agent_id: ObjectId,
     pub at: DateTime,
-    /// `first`, `replay`, `refused`, `rate_limited` or `unsupported`.
+    /// `first`, `replay`, `refused`, `rate_limited`, `unsupported` or `hook_failed`.
     pub decision: String,
-    /// Why, on a `refused` or `unsupported` row.
+    /// Why, on a `refused`, `unsupported` or `hook_failed` row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// The caller's address, by the server's one rule

@@ -37,6 +37,10 @@
 //! - **Network scoping**: a frame is delivered only to a pubkey registered in
 //!   the sender's own network. The `(network_id, pubkey)` registry key makes a
 //!   cross-network delivery structurally impossible.
+//! - **Token generation (FR-155 P1d)**: while the token rotation is on, a
+//!   registration admits only the device's current token generation, and a
+//!   rotation ends the device's registrations below its new generation on
+//!   every pod ([`crate::derp_rotation`]).
 //!
 //! Placement (v1): on the `roomler2` API pods (hostNetwork, :443), behind the
 //! dedicated `/derp` nginx `location`. The registry is in-memory on a
@@ -430,9 +434,14 @@ async fn admit(
                 .unwrap();
         }
     }
+    // FR-155 P1d — the registration is judged again under what the upgrade
+    // admitted.
+    let generation = claims.generation;
     ws.max_message_size(roomler_core::ws::upgrade::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(roomler_core::ws::upgrade::MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_derp_socket(state, socket, agent_id))
+        .on_upgrade(move |socket| {
+            handle_derp_socket(state, socket, agent_id, tenant_id, generation)
+        })
 }
 /// FR-40 P2 — the org's retired-key mode and, unless it is `off`, the ledger
 /// entry for the key a registration presents. Fails OPEN to the pre-P2 path:
@@ -472,10 +481,78 @@ async fn retired_key_at_derp(
     }
 }
 
+/// FR-155 P1d — how long a registration's read of the row may take before it
+/// refuses, as a read that fails does. Far below the floor's
+/// `ROTATION_FLOOR_SECS`: the argument in [`crate::derp_rotation`] needs the
+/// time from the read to the admit to stay inside the floor.
+const REGISTRATION_READ_SECS: u64 = 10;
+
+/// FR-155 P1d — what the registration's read of the row found.
+enum RegistrationGeneration {
+    /// The upgrade's checks pass on the row as the primary holds it.
+    Admit,
+    /// Removed, quarantined, or of another generation: refused, with the
+    /// upgrade's reason.
+    Refused { reason: &'static str, row_gen: u32 },
+    /// The row could not be read within [`REGISTRATION_READ_SECS`].
+    Unavailable(String),
+}
+
+/// FR-155 P1d — the upgrade's checks, run again at the registration on the
+/// row as the primary holds it, in the upgrade's order: `refusal_reason`,
+/// then `generation_refusal`. Fails closed, as the upgrade does: a row that
+/// cannot be read within [`REGISTRATION_READ_SECS`] refuses.
+async fn registration_generation(
+    state: &NetworkState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    generation: u32,
+) -> RegistrationGeneration {
+    let read = tokio::time::timeout(
+        Duration::from_secs(REGISTRATION_READ_SECS),
+        state
+            .fleet
+            .agents
+            .find_any_in_tenant_on_the_primary(tenant_id, agent_id),
+    )
+    .await;
+    let agent = match read {
+        Ok(Ok(agent)) => agent,
+        Ok(Err(e)) => return RegistrationGeneration::Unavailable(e.to_string()),
+        Err(_) => {
+            return RegistrationGeneration::Unavailable(format!(
+                "no answer within {REGISTRATION_READ_SECS} s"
+            ));
+        }
+    };
+    let refusal = roomler_ai_mod_fleet::auth_agent::refusal_reason(&agent).or_else(|| {
+        roomler_ai_mod_fleet::auth_agent::generation_refusal(
+            generation,
+            agent.token_gen,
+            roomler_ai_mod_fleet::auth_agent::generation_from_rotation(&agent),
+            state.fleet.settings.rc.token_generation_check,
+        )
+    });
+    match refusal {
+        Some(reason) => RegistrationGeneration::Refused {
+            reason,
+            row_gen: agent.token_gen,
+        },
+        None => RegistrationGeneration::Admit,
+    }
+}
+
 /// Drive one DERP connection: resolve the agent's node, validate its
 /// registration pubkey, add it to the registry, then pump frames until the
-/// socket closes.
-async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: ObjectId) {
+/// socket closes. `tenant_id` and `generation` are what its upgrade admitted
+/// it under (FR-155 P1d).
+async fn handle_derp_socket(
+    state: NetworkState,
+    socket: WebSocket,
+    agent_id: ObjectId,
+    tenant_id: ObjectId,
+    generation: u32,
+) {
     // Resolve this agent's overlay node → its network + its stored pubkey.
     // Refusals log at INFO: the client marks its mux "up" after merely
     // SENDING the registration frame, so a silent server-side refusal is a
@@ -548,23 +625,81 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
             "derp: would refuse registration — key_retired (retired_key_mode=warn; admitted)"
         );
     }
+    // FR-155 P1d — while the token rotation is on, a DERP registration admits
+    // only the device's current generation. The row is read on the primary
+    // here, after the registration frame and before anything is written, and
+    // judged by the upgrade's checks in the upgrade's order. A refusal writes
+    // nothing. Nothing is awaited from this read to the admit below, where
+    // the pod's floor refuses a registration below a rotation the pod has
+    // applied (`crate::derp_rotation`).
+    let rotation = state.fleet.rc_hub.token_rotation();
+    if rotation {
+        match registration_generation(&state, tenant_id, agent_id, generation).await {
+            RegistrationGeneration::Admit => {}
+            RegistrationGeneration::Refused { reason, row_gen } => {
+                info!(
+                    %agent_id, %tenant_id, generation, row_gen, reason, at = "registration",
+                    "derp: REFUSED at registration"
+                );
+                return;
+            }
+            RegistrationGeneration::Unavailable(e) => {
+                info!(
+                    %agent_id, %tenant_id, %e, at = "registration",
+                    "derp: REFUSED — agent row unavailable"
+                );
+                return;
+            }
+        }
+    }
     let key: DerpKey = (network_id, self_pubkey);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(DERP_SEND_QUEUE);
+    // C-5 — the cancel handle: the rehome close fires it, and (FR-155 P1d) a
+    // token rotation's end.
+    let cancel = Arc::new(tokio::sync::Notify::new());
     // Last-writer-wins on re-registration: a reconnect for the same pubkey
     // replaces the stale sender (corp middleboxes leave half-open TCP, so the
     // old entry would otherwise black-hole inbound frames). The old socket's
     // read loop keeps working as a SENDER until it notices its own close; only
     // inbound routing moves to the new connection.
-    if state.derp_registry.insert(key, out_tx.clone()).is_some() {
+    //
+    // FR-155 P1d — the registration goes into the registry and the cancels
+    // through this pod's record of its DERP connections, which refuses it,
+    // writing nothing, below the floor of a rotation the pod has applied and,
+    // while the rotation is on, below the generation of the registration in
+    // place for the key. An equal or a higher generation replaces it, as
+    // above.
+    let admitted = match state.derp_generations.admit(
+        &state.derp_registry,
+        &state.derp_cancels,
+        crate::derp_rotation::Registration {
+            tenant_id,
+            agent_id,
+            generation,
+            key,
+            tx: out_tx.clone(),
+            cancel: cancel.clone(),
+        },
+        rotation,
+    ) {
+        Ok(admitted) => admitted,
+        Err(below) => {
+            info!(
+                %agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey),
+                generation, floor = below.floor, at = "registration",
+                "derp: registration REFUSED — below the generation this pod admits for the device; closing"
+            );
+            return;
+        }
+    };
+    if admitted.replaced {
         info!(
             %agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey),
             "derp: re-registration displaced a live socket (reconnect churn — old flow was still parked)"
         );
     }
-    // C-5 — cancel handle (rehome close) + directory record + one
-    // convergence sweep over this network's registrations.
-    let cancel = Arc::new(tokio::sync::Notify::new());
-    state.derp_cancels.insert(key, cancel.clone());
+    // C-5 — directory record + one convergence sweep over this network's
+    // registrations.
     super::derp_cluster::on_derp_register(&state, network_id, &self_pubkey, agent_id).await;
     info!(%agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey), "derp: node registered");
     // Write task: drain outbound frames → WS binary, interleaved with a
@@ -623,9 +758,17 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
             // stop reading too.
             _ = &mut write => break,
             // C-5 — cluster rehome: this socket is parked on the wrong
-            // pod; close it so the reconnect re-lands converged.
+            // pod; close it so the reconnect re-lands converged. FR-155
+            // P1d: or a token rotation ended this connection.
             _ = cancel.notified() => {
-                info!(%agent_id, %network_id, "derp: closing for cluster rehome");
+                if state.derp_generations.ended(agent_id, tenant_id, admitted.id) {
+                    info!(
+                        %agent_id, %network_id, pk = %pk8(&self_pubkey), generation,
+                        "derp: closing: a token rotation ended this connection (by=rotated)"
+                    );
+                } else {
+                    info!(%agent_id, %network_id, "derp: closing for cluster rehome");
+                }
                 break;
             }
         }
@@ -637,6 +780,11 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
         .remove_if(&key, |_, tx| tx.same_channel(&out_tx))
         .is_some();
     super::derp_cluster::remove_cancel_if_ours(&state, &key, &cancel);
+    // FR-155 P1d — the record forgets the connection only after its
+    // registration left the registry (`crate::derp_rotation`).
+    state
+        .derp_generations
+        .release(agent_id, tenant_id, admitted.id);
     if removal_was_ours {
         // C-5 — release the directory record (a displaced older socket
         // skips this: the record belongs to its replacement).

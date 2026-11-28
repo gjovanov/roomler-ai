@@ -180,6 +180,33 @@ impl FleetLifecycle for NetworkHooks {
         }
         far_turn_verdict(target_reach, browser_reach(viewer_reach))
     }
+
+    /// FR-155 P1d — the rotation committed on this pod: the overlay node goes
+    /// offline, the agent's DERP registrations below `generation` end here,
+    /// and the device is ordered to rotate its overlay key
+    /// ([`crate::credential_rotation`]).
+    async fn agent_credentials_rotated(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        generation: u32,
+    ) -> anyhow::Result<()> {
+        crate::credential_rotation::run(&self.state, tenant_id, agent_id, generation).await
+    }
+
+    /// FR-155 P1d — a rotation applied from another pod's control event: the
+    /// agent's DERP registrations below `generation` end on this pod, and
+    /// the floor refuses one below it ([`crate::derp_rotation`]).
+    fn end_below_generation(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        generation: u32,
+    ) -> usize {
+        self.state
+            .derp_generations
+            .end_below_generation(agent_id, tenant_id, generation)
+    }
 }
 
 impl NetworkHooks {

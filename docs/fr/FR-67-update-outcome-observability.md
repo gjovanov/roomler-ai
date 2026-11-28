@@ -189,7 +189,7 @@ sequenceDiagram
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:471`); `UpdateRefusal` and `update_refusal()` (`:721`, `:1406`) |
 | Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5648`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3368`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3339`), else `self` |
 | Stamped at **every** announcement | `stub_caps` (`agents/roomlerd/src/signaling.rs:7428`, `:7444`) |
-| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:2323`): a 409 on one device (`:2377`), a `refused` row with its `refused_code` in a bulk (`:2518`) |
+| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:2354`): a 409 on one device (`:2408`), a `refused` row with its `refused_code` in a bulk (`:2549`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 
 > [!WARNING]
@@ -229,7 +229,7 @@ flowchart LR
 | The two words, additive on `AgentCaps` | `last_install`, `crash_health` (`crates/remote_control/src/models.rs:483`, `:493`); `LastInstallWord` (`:2144`), `CrashHealth` (`:2214`), spellings locked by `the_health_word_spellings_are_locked` |
 | Read off the signalling loop, every 30 s and at once after a promotion or a settle | `health_words::start` (`agents/roomlerd/src/health_words.rs:95`), called by `run_cmd` (`agents/roomlerd/src/app.rs:5311`); the ladder read whole from the config (`config::read_crash_ladder`, `crates/agent-core/src/config.rs:2871`), the sentinels from every attention path (`notify::read_all_attention`, `crates/agent-core/src/notify.rs:213`) |
 | Stamped at every announcement, re-announced when a word changes | `stub_caps` (`agents/roomlerd/src/signaling.rs:7450`, `:7451`); the beat compares `Announced` whole (`:7416`) |
-| Stored with the caps and served as stored | `update_hello`, `update_capabilities` (`crates/services/src/dao/agent.rs:621`, `:607`); `caps_as_served` (`crates/modules/fleet/src/agent.rs:2720`) takes out `gui_worker` alone |
+| Stored with the caps and served as stored | `update_hello`, `update_capabilities` (`crates/services/src/dao/agent.rs:621`, `:607`); `caps_as_served` (`crates/modules/fleet/src/agent.rs:2751`) takes out `gui_worker` alone |
 | Shown beside presence, never instead of it | `ui/src/utils/deviceHealth.ts`; `ui/src/components/admin/AgentsSection.vue` (the table `:306`, `:321`; the cards `:728`, `:739`); the crash marker opens `AgentCrashesDialog.vue` |
 
 - ⚠️ **`rolled_back` compares like for like**: the raw stored
