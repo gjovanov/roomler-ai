@@ -971,6 +971,14 @@ pub struct RcSettings {
     pub ws_rx_deadline_secs: u64,
     /// How often the read loop checks the deadline.
     pub ws_liveness_tick_secs: u64,
+    /// #4571 — a test's period for the server's keepalive Ping on a tunnel
+    /// client's socket, which then ends after three periods with no frame
+    /// from the client. `None` everywhere else: a deployment runs the
+    /// network module's own 30 s (so 90 s), and `serde(skip)` keeps this out
+    /// of the environment and every config file, so no deployment can set it.
+    /// The two-pod integration tests set it short.
+    #[serde(skip)]
+    pub tunnel_ping_every: Option<std::time::Duration>,
     /// P4 — per-tenant coalescing window for `device:presence` fan-out.
     /// A pod roll reconnects a whole fleet within seconds; batching turns
     /// that into one WS event per tenant instead of one per agent.
@@ -1148,6 +1156,7 @@ impl Default for RcSettings {
         Self {
             ws_rx_deadline_secs: 90,
             ws_liveness_tick_secs: 30,
+            tunnel_ping_every: None,
             presence_batch_ms: 2000,
             presence_sweep_secs: 30,
             rehome_direction_guard_ms: 5000,
