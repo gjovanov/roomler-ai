@@ -2452,7 +2452,7 @@ mod tests {
     #[test]
     fn the_switches_speak_before_the_supervisor() {
         use GuiWorkerBrief as W;
-        let cells: [((bool, bool, bool), (&str, Option<&str>)); 6] = [
+        let cells = [
             // The person's daemon on a two-row Mac, whatever its file says.
             ((false, false, false), (W::UNSUPERVISED, None)),
             ((false, false, true), (W::UNSUPERVISED, None)),
