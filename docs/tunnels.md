@@ -1077,8 +1077,8 @@ sequenceDiagram
 ```
 
 **What the exit does.** The `ServerMsg::TunnelTerminate` arm
-(`agents/roomlerd/src/signaling.rs:5627`) hands the QUIC half to
-`terminate_quic_session` (`:6715`):
+(`agents/roomlerd/src/signaling.rs:5634`) hands the QUIC half to
+`terminate_quic_session` (`:6722`):
 
 - **with the flag**, `AgentQuicPeer::end` (`agents/roomlerd/src/tunnel/quic_peer.rs:590`):
   every flow stops, its two halves aborted, which drops its destination socket and
@@ -1088,7 +1088,7 @@ sequenceDiagram
   flavours the TURN allocation, go once the closed connection drains. A peer R3
   parked and reclaimed is ended the same way;
 - **without it**, `AgentQuicPeer::close`, and the session's `SessionLink` is kept in
-  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6689`) for 60 s
+  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6696`) for 60 s
   (`ENDED_SESSION_TTL`, at most 64 sessions a tenant, the oldest first out). A
   terminate with the flag that arrives after one without still reaches the session
   through it and ends it.
@@ -1102,7 +1102,7 @@ forward still waiting for its stream (`take_flow`,
 ends.
 
 **The reap.** A #1754 reap (`ReapSignal::QuicConnEnded`) goes through `reap_quic_peer`
-(`agents/roomlerd/src/signaling.rs:6747`, from the reap arm at `:3100`) to
+(`agents/roomlerd/src/signaling.rs:6754`, from the reap arm at `:3100`) to
 `AgentQuicPeer::reap` (`agents/roomlerd/src/tunnel/quic_peer.rs:602`): when the
 connection itself has ended (`close_reason()` is set), it ends the session as above.
 When the accept loop ended on a connection that is still up, it only closes the peer
@@ -1189,8 +1189,8 @@ so tests drive it directly:
 
 | While a setup is in flight… | Rule | Where |
 |---|---|---|
-| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5577-5585`, `quic_setup.rs:243` |
-| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5620`, `quic_setup.rs:258` |
+| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5584-5592`, `quic_setup.rs:243` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5627`, `quic_setup.rs:258` |
 | the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `agents/roomlerd/src/signaling.rs:3129` |
 | a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
 | more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
