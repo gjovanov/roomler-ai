@@ -1966,6 +1966,13 @@ async fn connect_once(
         multi_org_tun: cfg.overlay_multi_org,
         is_primary: ctx.is_primary,
         survive,
+        // FR-157 P1 (D1) — a Mac's daemon says the screen-worker word on every
+        // loop, the worker none, and no other platform one.
+        gui_worker: crate::macos_supervisor::word_without_host(
+            cfg!(target_os = "macos"),
+            crate::supervision::current(),
+            cfg.macos_one_row,
+        ),
     };
     let announced::Hello {
         caps: hello_caps,
@@ -2657,10 +2664,12 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             // #3992 — the attached worker said a word after the hello: its caps,
-            // the person's floor, or its leaving. The heartbeat announces it
-            // now, not within its 30 s. The beat decides what is sent, so a
-            // word that changes nothing the row says costs no caps. Never on a
-            // loop that does not hold the host.
+            // the person's floor, or its leaving. FR-157 P1 — or the
+            // screen-worker word moved: the channel attached or ended, or the
+            // supervisor decided anew. The heartbeat announces it now, not
+            // within its 30 s. The beat decides what is sent, so a word that
+            // changes nothing the row says costs no caps. Never on a loop that
+            // does not hold the host.
             Ok(()) = next_worker_news(&mut worker_news) => {
                 let _stage = watchdog::enter(ctx.pump, "worker.news");
                 debug!("the worker said a word after the hello; the heartbeat announces it now");
@@ -2726,6 +2735,8 @@ async fn connect_once(
                             apps = ?c.apps,
                             audio = ?c.audio,
                             desktop = ?c.desktop,
+                            // FR-157 P1 — the screen-worker word it carries.
+                            gui_worker = ?c.gui_worker,
                             video_cells = c.video_cells.len(),
                             "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                         );
@@ -3889,6 +3900,11 @@ async fn handle_server_msg(
         }
         return Ok(());
     }
+    // #4543 — the daemon serves it here: a session held for its offer whose
+    // offer this is, or that ended, is let go, so it never crosses later.
+    if let Some(delegate) = delegate {
+        delegate.served_here(crate::delegate::org_key(ctx.is_primary, &ctx.label), &msg);
+    }
 
     match msg {
         ServerMsg::Request {
@@ -4314,7 +4330,9 @@ async fn handle_server_msg(
                 if !sent {
                     // No worker, or its queue is full. Not fatal — the daemon
                     // still serves the session itself, which on macOS means a
-                    // blank screen but a working, terminable session.
+                    // blank screen but a working, terminable session. #4543 —
+                    // with no worker, a one-row Mac's daemon holds them: they
+                    // cross with the offer if one has attached by then.
                     tracing::debug!(%session_id, "no worker to hand session params to");
                 }
             }
@@ -7207,6 +7225,12 @@ struct Announced {
     /// FR-138 — `rc-resume`: the switch as this connection read it, the same
     /// for its whole life.
     resume: bool,
+    /// FR-157 P1 — a Mac's screen-worker word
+    /// ([`DelegateHost::gui_worker_word`](crate::delegate::DelegateHost::gui_worker_word)):
+    /// the channel's attach and end, or a new decision of the supervisor,
+    /// reaches the server at once. `None` in the worker and on every other
+    /// platform.
+    gui_worker: Option<roomler_ai_remote_control::models::GuiWorkerBrief>,
 }
 
 /// #3992 — what a connection's announcements are built from and that stays the
@@ -7223,6 +7247,12 @@ struct Announcer<'a> {
     is_primary: bool,
     /// FR-138 — the switch, read once for this connection.
     survive: bool,
+    /// FR-157 P1 — the screen-worker word this connection says while it holds
+    /// no delegate host ([`crate::macos_supervisor::word_without_host`]):
+    /// `unsupervised` on a Mac's daemon, and `None` in the worker itself and
+    /// on every other platform, where no connection says one (D1). A
+    /// connection that holds the host says the host's word instead.
+    gui_worker: Option<roomler_ai_remote_control::models::GuiWorkerBrief>,
 }
 
 impl Announcer<'_> {
@@ -7270,6 +7300,12 @@ impl Announcer<'_> {
                 ),
             ),
             resume: self.survive,
+            // FR-157 P1 — the host's word on a loop that holds it; the word
+            // without one on a loop that does not; none where this process
+            // says none.
+            gui_worker: self.gui_worker.clone().map(|without_host| {
+                delegate.map_or(without_host, crate::delegate::DelegateHost::gui_worker_word)
+            }),
         }
     }
 
@@ -7452,6 +7488,9 @@ fn stub_caps(multi_org_tun: bool, is_primary: bool, words: &Announced) -> AgentC
     // refresher's cache (never logind on this path). Live, like the words
     // above: the heartbeat re-announces when it changes.
     caps.desktop = words.desktop.clone();
+    // FR-157 P1 — a Mac's screen-worker word, live the same way. A claim, read
+    // by no decision: off the wire where this process says none.
+    caps.gui_worker = words.gui_worker.clone();
     // FR-99 P1b — `privacy-available` where a curtain is possible here, and
     // `privacy-mode` only while the owner allows it too. Live like the record
     // words: the owner's switch moves the second, and the overlay coming up
@@ -10922,10 +10961,14 @@ mod exec_answer_tests {
 mod announce_tests {
     use super::Announcer;
     use crate::delegate::{DelegateHost, PersonFloor};
-    use roomler_ai_remote_control::models::{AgentCaps, FeaturePolicy, SessionPolicy, VideoCell};
+    use crate::macos_supervisor::{Action, WordConfig};
+    use roomler_ai_remote_control::models::{
+        AgentCaps, FeaturePolicy, GuiWorkerBrief, SessionPolicy, VideoCell,
+    };
     use std::time::Duration;
 
-    /// A primary org's loop. No SYSTEM service is anchored for this id.
+    /// A primary org's loop. No SYSTEM service is anchored for this id. Its
+    /// process says no screen-worker word, as every process off macOS.
     fn primary() -> Announcer<'static> {
         Announcer {
             agent_id: "000000000000000000003992",
@@ -10933,7 +10976,35 @@ mod announce_tests {
             multi_org_tun: false,
             is_primary: true,
             survive: false,
+            gui_worker: None,
         }
+    }
+
+    /// FR-157 P1 — the primary loop of a Mac's one-row daemon, as
+    /// `connect_once` builds it there: it says the screen-worker word.
+    fn mac_daemon() -> Announcer<'static> {
+        Announcer {
+            gui_worker: crate::macos_supervisor::word_without_host(true, None, true),
+            ..primary()
+        }
+    }
+
+    /// FR-157 P1 — a one-row Mac's root daemon, with the supervisor on.
+    fn one_row_host() -> DelegateHost {
+        let host = DelegateHost::new();
+        host.set_word_config(WordConfig {
+            is_root: true,
+            supervise: true,
+            one_row: true,
+        });
+        host
+    }
+
+    /// FR-157 P1 — the word some caps carry, as `(state, reason, one_row)`.
+    fn said(caps: &AgentCaps) -> Option<(&str, Option<&str>, bool)> {
+        caps.gui_worker
+            .as_ref()
+            .map(|w| (w.state.as_str(), w.reason.as_deref(), w.one_row))
     }
 
     /// A daemon whose worker has announced this permission pair.
@@ -11289,6 +11360,184 @@ mod announce_tests {
             announcer.beat(&mut hello.last, Some(&host)).is_none(),
             "nothing the row says changed"
         );
+    }
+
+    /// FR-157 P1 — a Mac daemon's hello carries the screen-worker word: the
+    /// host's on a loop that holds it, and `unsupervised` on one that holds
+    /// none, which never hands a session to the worker.
+    #[test]
+    fn a_macs_hello_carries_the_screen_worker_word() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = one_row_host();
+        host.note_supervisor(Action::GaveUp);
+        let hello = mac_daemon().hello(Some(&host)).caps;
+        assert_eq!(
+            said(&hello),
+            Some((
+                GuiWorkerBrief::NOT_ATTACHED,
+                Some(GuiWorkerBrief::GAVE_UP),
+                true
+            )),
+            "#3802's state, on the row"
+        );
+        assert_eq!(hello.gui_worker, Some(host.gui_worker_word()), "the host's");
+        let without_host = mac_daemon().hello(None).caps;
+        assert_eq!(
+            said(&without_host),
+            Some((GuiWorkerBrief::UNSUPERVISED, None, true))
+        );
+    }
+
+    /// FR-157 P1 (AC3) — a beat on which only the word changed announces caps
+    /// that carry it, with the permissions the hello had; and the beat after
+    /// it nothing.
+    #[test]
+    fn a_beat_on_which_only_the_word_changed_announces_caps_that_carry_it() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = one_row_host();
+        host.note_supervisor(Action::NoGuiSession);
+        let announcer = mac_daemon();
+        let hello = announcer.hello(Some(&host));
+        let hello_caps = hello.caps;
+        let mut last = hello.last;
+        assert!(
+            announcer.beat(&mut last, Some(&host)).is_none(),
+            "nothing new"
+        );
+        host.note_supervisor(Action::Spawn(501));
+        let beat = announcer
+            .beat(&mut last, Some(&host))
+            .expect("the word alone is news");
+        assert_eq!(
+            said(&beat),
+            Some((
+                GuiWorkerBrief::NOT_ATTACHED,
+                Some(GuiWorkerBrief::STARTING),
+                true
+            ))
+        );
+        assert_eq!(beat.permissions, hello_caps.permissions, "as they were");
+        assert_eq!(beat.has_input_permission, hello_caps.has_input_permission);
+        assert!(announcer.beat(&mut last, Some(&host)).is_none(), "once");
+    }
+
+    /// FR-157 P1 — a change of the supervisor's state wakes a loop that holds
+    /// the host, and the woken beat carries the word, as the attach's does.
+    #[tokio::test]
+    async fn a_supervisor_move_wakes_the_loop_and_its_beat_carries_the_word() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = one_row_host();
+        let announcer = mac_daemon();
+        let mut hello = announcer.hello(Some(&host));
+        host.note_supervisor(Action::NoGuiSession);
+        woken(&mut hello.worker_news).await;
+        let beat = announcer
+            .beat(&mut hello.last, Some(&host))
+            .expect("the woken beat carries the word");
+        assert_eq!(
+            said(&beat),
+            Some((
+                GuiWorkerBrief::NOT_ATTACHED,
+                Some(GuiWorkerBrief::NO_CONSOLE_USER),
+                true
+            ))
+        );
+    }
+
+    /// FR-157 P1 (D1) — the `--supervised` worker and every other platform
+    /// announce no word, with a host or without, in the hello and on a beat,
+    /// and their caps carry no `gui_worker` key. The same host on a Mac
+    /// daemon's loop announces one, so the silence is the process's.
+    #[test]
+    fn the_worker_and_other_platforms_announce_no_word() {
+        use crate::supervision::Supervision;
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = one_row_host();
+        host.note_supervisor(Action::Healthy);
+        let worker = Announcer {
+            gui_worker: crate::macos_supervisor::word_without_host(
+                true,
+                Some(Supervision::MacosSupervisor),
+                true,
+            ),
+            ..primary()
+        };
+        let other_os = Announcer {
+            gui_worker: crate::macos_supervisor::word_without_host(false, None, false),
+            ..primary()
+        };
+        for (who, announcer) in [("the worker", worker), ("another OS", other_os)] {
+            for caps in [
+                announcer.hello(Some(&host)).caps,
+                announcer.hello(None).caps,
+            ] {
+                assert_eq!(caps.gui_worker, None, "{who}");
+                let wire = serde_json::to_string(&caps).unwrap();
+                assert!(!wire.contains("gui_worker"), "{who}: {wire}");
+            }
+            let mut last = announcer.hello(Some(&host)).last;
+            host.note_supervisor(Action::GaveUp);
+            assert!(
+                announcer.beat(&mut last, Some(&host)).is_none(),
+                "{who}: the word's move is no news where none is said"
+            );
+            host.note_supervisor(Action::Healthy);
+        }
+        assert!(
+            mac_daemon().hello(Some(&host)).caps.gui_worker.is_some(),
+            "a Mac's daemon says it"
+        );
+    }
+
+    /// FR-157 P1 (AC4) — the word leaves `permissions` as they were in every
+    /// cell: with no worker, and with a worker that holds both, under each of
+    /// the supervisor's states, the caps a Mac's daemon announces carry the
+    /// permissions a loop that says no word announces with the same host.
+    #[test]
+    fn the_word_leaves_the_permissions_as_they_were_in_every_cell() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let lasts = [
+            None,
+            Some(Action::NoGuiSession),
+            Some(Action::LaunchdOwns),
+            Some(Action::Spawn(501)),
+            Some(Action::Healthy),
+            Some(Action::GaveUp),
+        ];
+        for worker in [false, true] {
+            for last in lasts {
+                let host = if worker {
+                    worker_said(&["screen-capture", "input"], true)
+                } else {
+                    DelegateHost::new()
+                };
+                host.set_word_config(WordConfig {
+                    is_root: true,
+                    supervise: true,
+                    one_row: true,
+                });
+                if let Some(action) = last {
+                    host.note_supervisor(action);
+                }
+                let with = mac_daemon().hello(Some(&host)).caps;
+                let without = primary().hello(Some(&host)).caps;
+                assert!(with.gui_worker.is_some(), "worker={worker} {last:?}");
+                assert_eq!(
+                    with.permissions, without.permissions,
+                    "worker={worker} {last:?}"
+                );
+                assert_eq!(
+                    with.has_input_permission, without.has_input_permission,
+                    "worker={worker} {last:?}"
+                );
+            }
+        }
+        // A loop that holds no host keeps our own pair beside its word.
+        let with = mac_daemon().hello(None).caps;
+        let without = primary().hello(None).caps;
+        assert!(with.gui_worker.is_some());
+        assert_eq!(with.permissions, without.permissions);
+        assert_eq!(with.has_input_permission, without.has_input_permission);
     }
 }
 #[cfg(test)]

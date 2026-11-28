@@ -1154,7 +1154,7 @@ flowchart TD
   folder, and a task registered from it would name a launcher in `%TEMP%`. The launcher is
   spawned with no handle of the watcher's (`:1364`).
 - **The record says it in three places.** The field sits in `last-install.json`, in
-  `NodeStatus.last_install` (`InstallDaemon`, `crates/localapi/src/lib.rs:626`, additive both
+  `NodeStatus.last_install` (`InstallDaemon`, `crates/localapi/src/lib.rs:638`, additive both
   ways), and in the next daemon's `last install:` line, a WARN when the watcher left no daemon
   running (`post_install.rs:2292`).
 - **The first update onto P1b runs the old release's watcher**, so P1b protects the hops after
@@ -1634,7 +1634,7 @@ install's update, which has no service, logs nothing about the switch, #3889),
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6411`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6419`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1703,7 +1703,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6278`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6286`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1956,7 +1956,7 @@ One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1441`). It gives the role to `service install` and
 `service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
 and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
-(`agents/roomlerd/src/app.rs:8022`) reads every custom action with an `ExeCommand` in both WiX
+(`agents/roomlerd/src/app.rs:8030`) reads every custom action with an `ExeCommand` in both WiX
 files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
 installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
 
@@ -1972,7 +1972,7 @@ whole stack with no level, which tracing reads as TRACE in every daemon that kee
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
 `service uninstall --as-service` logs `Companion login start removed.` rather than printing it
-(`agents/roomlerd/src/app.rs:6219`), and its answer stays `Service deregistered`.
+(`agents/roomlerd/src/app.rs:6227`), and its answer stays `Service deregistered`.
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
@@ -1992,8 +1992,8 @@ step shows what it always showed (`crates/agent-core/src/logging.rs:2245`). A da
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2288`). The Windows lane runs the module
 beside `stderr_capture` (`.github/workflows/ci.yml:1966`). In `roomlerd`,
-`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8116`) and
-`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8149`)
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8124`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8157`)
 pin the role per command and the end line of a failure.
 
 ### Where a step on the service account finds its folders (#3702)
@@ -2085,7 +2085,7 @@ profile, or the machine's data folder) or is reached through a link below it (`k
   daemon, which runs unelevated, merges at its next start, so the merge never runs above the
   integrity level of the folder owner's own processes. When the token cannot be read, the merge
   is left too (`DataMerge`, `crates/agent-core/src/appdirs.rs:1543`;
-  `agents/roomlerd/src/app.rs:7740`). A data folder whose NEW folder is not there still moves by
+  `agents/roomlerd/src/app.rs:7748`). A data folder whose NEW folder is not there still moves by
   one rename.
 - Every run writes a note that names what it moved, what it kept beside, and what it left for
   the next start (`crates/agent-core/src/appdirs.rs:1656`).
@@ -2687,7 +2687,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3625`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3637`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2714,7 +2714,7 @@ dir, go straight to `/var/run/roomler/roomler.sock`. On a **per-user** install t
 daemon's socket is that runtime dir's, and a command run without one (cron, `su`)
 answers `roomler daemon not running` with a note naming `XDG_RUNTIME_DIR`: run it with
 `XDG_RUNTIME_DIR=/run/user/$(id -u)`. Root's line names what it tried instead (#3937,
-`not_running_words_for`, `crates/localapi/src/lib.rs:5128`): `sudo roomler status` on
+`not_running_words_for`, `crates/localapi/src/lib.rs:5140`): `sudo roomler status` on
 such a host answers that there is no socket at `/var/run/roomler/roomler.sock`, the
 system daemon's, and that a per-user daemon answers only its own account, without
 `sudo`. It names the account `sudo` ran for when `SUDO_USER` holds a portable user
@@ -2801,8 +2801,8 @@ two privacy grants below remain the person's; the Done page says so.
 **A Mac that is one row already gets nothing from the wizard (FR-141 P3).** Before
 it offers the device install, the wizard asks the root daemon over the person
 socket it serves the console user (`/var/run/roomler-person/<uid>.sock`), which
-answers `status` (`crates/localapi/src/lib.rs:3811-3813`) with
-`gui_worker.one_row` in it (`:536-549`). When the root daemon says one row, the
+answers `status` (`crates/localapi/src/lib.rs:3823-3825`) with
+`gui_worker.one_row` in it (`:536-561`). When the root daemon says one row, the
 Welcome page says "This Mac is one device already", Continue stays off for every
 device card, and pairing start and the install's preflight refuse with the same
 words, so no token is asked for (`agents/roomler-setup/src/reinstall_guard.rs`).
@@ -2957,7 +2957,8 @@ flowchart TB
 |---|---|---|
 | Who owns the GUI half | launchd, `com.roomler.agent` | the root daemon, `macos_supervisor.rs` |
 | A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
-| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions: in the hello when the worker has already told the daemon (on a reconnect, and on a restart of the daemon when the worker speaks first), else at once when it speaks, since its word wakes the heartbeat; `no-gui-session` again at once when the worker leaves |
+| What `<name>-daemon` reports | `no-gui-session`. Since FR-157 P1 it also says the screen-worker word `unsupervised`, and so does `<name>`, the person's row | the worker's permissions: in the hello when the worker has already told the daemon (on a reconnect, and on a restart of the daemon when the worker speaks first), else at once when it speaks, since its word wakes the heartbeat; `no-gui-session` again at once when the worker leaves. Since FR-157 P1 the row also says `attached`, or `not-attached` with why (`no-console-user`, `launchd-owns`, `starting`, `gave-up`), at once on each change ([`remote-control.md`](remote-control.md) §5.1b). `<name>`, the worker's own row, says no word |
+| What `roomler status --json` shows under `gui_worker` | `"attached": false` and, since FR-157 P1, `"state": "unsupervised"`: the healthy default, not a fault. Each half says it of itself | `attached`, `permissions` and `one_row` as before (`sudo roomler status --json` asks the root half), and since FR-157 P1 the same `state` and `reason` as the row, from the same read |
 | A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
 | The GUI half killed | launchd restarts it | the supervisor respawns it within about 6 s; the control WS stays up |
 | Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
@@ -3005,14 +3006,17 @@ the stricter of the person's and its own.
 Each org's row says what the worker has told the daemon from the connection's first
 message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
 permissions, what it can record, its Remote Apps words and its audio, and the stricter
-`rc_*` floor ([`signaling.rs:7234`](../agents/roomlerd/src/signaling.rs#L7234)), built
-into the caps by one function ([`:7282`](../agents/roomlerd/src/signaling.rs#L7282)).
+`rc_*` floor ([`signaling.rs:7264`](../agents/roomlerd/src/signaling.rs#L7264)), built
+into the caps by one function ([`:7318`](../agents/roomlerd/src/signaling.rs#L7318)).
 So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
 restarts of the daemon measured in #3992, is on the row at once, rather than the root's
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
 the hello, or changes later, wakes the heartbeat of each org's connection at once
-([`delegate.rs:1677`](../agents/roomlerd/src/delegate.rs#L1677)): its caps, the person's
-floor and its leaving reach the row then, not up to 30 s later at the next one.
+([`delegate.rs:1751`](../agents/roomlerd/src/delegate.rs#L1751)): its caps, the person's
+floor and its leaving reach the row then, not up to 30 s later at the next one. Since
+FR-157 P1 every org's row also carries the host's screen-worker word, `attached` or
+`not-attached` with why. The worker's attach, its channel's end and each new decision of
+the supervisor wake the same heartbeats ([`remote-control.md`](remote-control.md) §5.1b).
 
 The switch is off by default. Its field proof ran on released 0.4.200 on 2026-11-05
 ([field log](fr/FR-43-macos-single-enrollment.md#2026-11-05--p3a-to-p3c-on-released-04200-one-row-end-to-end)),
@@ -3365,7 +3369,7 @@ console user are skipped and every root row runs as on any install
   daemon's plist sends to `/dev/null`
   (`agents/roomlerd/packaging/macos/com.roomler.daemon.plist:72-73`). The
   supervisor sets only the worker's stdin
-  (`agents/roomlerd/src/macos_supervisor.rs:1401`), so the worker's stderr is
+  (`agents/roomlerd/src/macos_supervisor.rs:1501`), so the worker's stderr is
   the one the root daemon hands to `launchctl asuser` and `sudo`, and that
   plist sends the root daemon's stderr to `/var/log/roomler/daemon.log`
   (`:74-75`). That the worker's line lands in that file is not established
@@ -3375,30 +3379,30 @@ console user are skipped and every root row runs as on any install
   `/var/root/Library/Application Support/live.roomler.roomler/logs` (the table
   above).
   The give-up line names the same folder, owner and mode
-  (`agents/roomlerd/src/macos_supervisor.rs:547`, read by `:1092` and `:1199`),
+  (`agents/roomlerd/src/macos_supervisor.rs:647`, read by `:1192` and `:1299`),
   and says in words that only an administrator of the Mac can move it aside:
   macOS renames a folder only for an account that may write in it, so the
   person's own `mv` answers `Permission denied` and moves nothing, in any
-  parent folder. The line prints a command (`:637`) only under the package's
+  parent folder. The line prints a command (`:737`) only under the package's
   rule (see "A command is printed only for an administrator's own home"
   below), read once per give-up, off the supervisor's thread and within 5 s
-  (`:1255`, `:776`): the person at the console is a member of `admin`
-  (`dseditgroup -o checkmember`, `:1305`); their home is an absolute path to a
+  (`:1355`, `:876`): the person at the console is a member of `admin`
+  (`dseditgroup -o checkmember`, `:1405`); their home is an absolute path to a
   folder, not a link; its `Library` and `Library/Application Support` are
   folders of the person's own, not links, and the folder is one name inside
-  the last (`:948`); the folder is a real folder of root's that holds no
+  the last (`:1048`); the folder is a real folder of root's that holds no
   entry named `config.toml`, and its path holds no `"`, `$`, backtick, `\`,
   `!`, control character, nor a Unicode format character that changes how a
   line displays (U+200B to U+200F, U+202A to U+202E, U+2060 to U+2069, U+FEFF)
-  (`:867`); and the account name is plain, `[A-Za-z0-9._-]`
-  (`:935`). The command then follows `<name> is an administrator of this Mac
-  and can run this:`. Every path in it is quoted for a POSIX shell (`:980`),
-  with those characters left out it survives `sh -c "…"` too (`:907`), and it
-  reads as it runs (`:893`).
+  (`:967`); and the account name is plain, `[A-Za-z0-9._-]`
+  (`:1035`). The command then follows `<name> is an administrator of this Mac
+  and can run this:`. Every path in it is quoted for a POSIX shell (`:1080`),
+  with those characters left out it survives `sh -c "…"` too (`:1007`), and it
+  reads as it runs (`:993`).
   `<aside>` is `<folder>.made-by-root-<stamp>`, where `<stamp>` is the UTC
   second of the give-up, so no name it makes is a leftover of an earlier
   round. Each command starts with one test, before anything runs
-  (`:729-732`): `sudo test ! -h '<folder>' -a -d '<folder>' -a -O '<folder>'
+  (`:829-832`): `sudo test ! -h '<folder>' -a -d '<folder>' -a -O '<folder>'
   -a ! -e '<aside>' &&`, written `<test> &&` below. Under `sudo`, `-O` means
   owned by root. The log holds one line per give-up, each with its own
   stamp, and the person is told to log out and back in, so an older line can
@@ -3410,7 +3414,7 @@ console user are skipped and every root row runs as on any install
   live folder into it):
   - When the folder holds neither copy that `sudo roomlerd one-row --revert`
     reads back from it: `<test> && sudo mv '<folder>' '<aside>'`
-    (`macos_supervisor.rs:741-746`). If the move fails, nothing moved. The
+    (`macos_supervisor.rs:841-846`). If the move fails, nothing moved. The
     worker makes the folder again, as the person, at its next start.
   - When it holds `com.roomler.agent.plist.pre-one-row` or
     `config.toml.pre-one-row`, which the revert reads there and nowhere else
@@ -3421,7 +3425,7 @@ console user are skipped and every root row runs as on any install
     sudo -u '#<uid>' cp '<folder>/<copy>' … '<folder>.new-<stamp>/' && sudo mv
     '<folder>' '<aside>' && { sudo mv '<folder>.new-<stamp>' '<folder>' || {
     sudo mv '<aside>' '<folder>'; false; }; }`
-    (`macos_supervisor.rs:747-765`). The new folder and the copies in it are
+    (`macos_supervisor.rs:847-865`). The new folder and the copies in it are
     made as the person, never by root, so the line does the same in the
     administrator's own shell and as root. Nothing moves until the copies are
     made: a `cp` that fails (a folder the person cannot enter, say) stops the
@@ -3448,10 +3452,10 @@ console user are skipped and every root row runs as on any install
     holds one of those characters, the line gives no command: it says that an
     administrator of this Mac has to move the folder aside (and copy the files
     it names back into a new folder that the person's account makes) and names
-    this section (`macos_supervisor.rs:771`).
+    this section (`macos_supervisor.rs:871`).
   - When the folder holds an entry named `config.toml` (a file, a link, a
     folder), or a read of that name fails for any reason but "not there"
-    (`macos_supervisor.rs:1117-1120`), the line says the folder holds an entry
+    (`macos_supervisor.rs:1217-1220`), the line says the folder holds an entry
     of that name, still names the copies the revert reads there, and gives no
     command: a move would set that entry aside with the folder, and with
     `macos_one_row` off a file of that name is this person's enrollment. The
@@ -3465,7 +3469,7 @@ console user are skipped and every root row runs as on any install
   - Whenever the line gives no command, the supervisor logs one line after it
     that says why, the read that refused it or the 5 s that ran out:
     `macOS supervisor: the give-up line gives no administrator's command:
-    <why>` (`agents/roomlerd/src/macos_supervisor.rs:1857`, its words `:819`).
+    <why>` (`agents/roomlerd/src/macos_supervisor.rs:1964`, its words `:919`).
 - **`sudo -u`, not `launchctl asuser`.** `sudo -u` changes the uid, gid and
   groups; `launchctl asuser` changes only the bootstrap context. `-n` because
   root needs no password and a run by the update helper has no terminal.
@@ -3590,7 +3594,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5882`).
+(`crates/localapi/src/lib.rs:5894`).
 
 On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
 the console user's `roomler …` is the screen worker the root daemon starts for
@@ -3619,9 +3623,9 @@ The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3625`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3637`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
-read-only and refuses to set by name (`localapi::person_may`, `:3811`). Whether
+read-only and refuses to set by name (`localapi::person_may`, `:3823`). Whether
 the console user should flip those from the app is the decision left open on
 #2871; until it is taken, they stay with `sudo`.
 
@@ -3634,7 +3638,7 @@ and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — rea
 
 The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
 … roomlerd run --supervised`, in a process group of its own, so that it can stop
-the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:1349`). The same
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:1449`). The same
 group is why launchd's teardown of the daemon never reaches the worker. Before
 #2987, a daemon that ended any way other than its clean shutdown (the watchdog's
 `exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
@@ -3661,9 +3665,9 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:1417`, `:1163`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:698`, `:746`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:1586`, `:513`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
-| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock (found with `pgrep -lU <uid> roomlerd`, then `sudo launchctl kickstart -k system/com.roomler.daemon`), 78 means for certain that the console user has no enrollment on this Mac, or (#4379) that their config does not load and the worker no longer restores its last good copy, the worker's own line in its log saying which (#4071: a worker that finds no config exits 78, and the supervisor records no crash for it), anything else most likely means no per-user enrollment (checked with `sudo launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps`; `macos_supervisor.rs:547`). A person's folder that another account owns comes first, whatever the end, with the administrator's command that gives it back, or the reason it gives none (#3802, `:641`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:1517`, `:1263`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:698`, `:746`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:1686`, `:613`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock (found with `pgrep -lU <uid> roomlerd`, then `sudo launchctl kickstart -k system/com.roomler.daemon`), 78 means for certain that the console user has no enrollment on this Mac, or (#4379) that their config does not load and the worker no longer restores its last good copy, the worker's own line in its log saying which (#4071: a worker that finds no config exits 78, and the supervisor records no crash for it), anything else most likely means no per-user enrollment (checked with `sudo launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps`; `macos_supervisor.rs:647`). A person's folder that another account owns comes first, whatever the end, with the administrator's command that gives it back, or the reason it gives none (#3802, `:741`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
 own after the secret. A worker from before #2987 reads one line, as it always
@@ -3742,8 +3746,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:1644`, `:1593`; `crates/tunnel-core/src/child.rs:86` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:450`, `crates/tunnel-core/src/overlay/netstate.rs:1253`, `macos_supervisor.rs:1384` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:1744`, `:1693`; `crates/tunnel-core/src/child.rs:86` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:450`, `crates/tunnel-core/src/overlay/netstate.rs:1253`, `macos_supervisor.rs:1484` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:963` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
@@ -4067,9 +4071,9 @@ serves `live_work`. So the command looks where a person may. It connects to the
 person socket root serves them (`/var/run/roomler-person/<uid>.sock`, FR-97 P2g),
 keeps the connection only when root serves it, sends nothing, and gives up after
 500 ms: the evidence of a root half that `roomler status` reads
-(`macos_root_half_serves_me`, `crates/localapi/src/lib.rs:5939-5952`). The look is
+(`macos_root_half_serves_me`, `crates/localapi/src/lib.rs:5951-5964`). The look is
 `root_half_seen` (`agents/roomlerd/src/helper_gate.rs:491-507`), the call is in
-`self_update_cmd` (`agents/roomlerd/src/app.rs:6577-6598`), and the lines are
+`self_update_cmd` (`agents/roomlerd/src/app.rs:6585-6606`), and the lines are
 `ask_recorded_says` and `NO_ASK_SAYS` (`helper_gate.rs:518-546`):
 
 | The ask | What the look finds | The line | Why it holds |

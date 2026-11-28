@@ -1,8 +1,11 @@
 # FR-157: A Mac's device row says whether its screen worker is attached, and why not
 
 **Issue:** [#4494](https://github.com/gjovanov/roomler-ai/issues/4494) · **Status:** claimed 2026-11-27, from
-[#3882](https://github.com/gjovanov/roomler-ai/issues/3882). P2, the server read, is built behind its switch, which is
-off; nothing else is. D1–D5 were ruled on #4494 on 2026-11-27, as recommended; D6 is open, and is P3's.
+[#3882](https://github.com/gjovanov/roomler-ai/issues/3882). P0, the lab's RED read, is done. P2, the server read, is
+in production behind its switch, which is off. P1, the agent's word, is merged
+([#4552](https://github.com/gjovanov/roomler-ai/pull/4552), 2026-11-28) and reaches the field with the next agent
+release. AC1 to AC4 and AC6 are met; nothing else is. D1–D5 were ruled on #4494 on 2026-11-27, as recommended; D6 is
+open, and is P3's.
 **Builds on:** [FR-43](FR-43-macos-single-enrollment.md) (the one-row Mac: the supervisor, the delegation channel,
 `Status.gui_worker`), [FR-93](FR-93-wayland-out-of-the-box.md) P2b (the `desktop` brief: a claim on the row that the
 server counts)
@@ -12,7 +15,10 @@ the host), [FR-149](FR-149-macos-consent-panel-from-the-session.md) (the session
 and #4059 (the worker's words reach the row at once)
 
 **Anchors:** read on master `ef4cd1ff9` (2026-11-27), in the tree. The ones P2 moved or added were read again on its
-pull request, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516).
+pull request, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516). P1's pull request,
+[#4552](https://github.com/gjovanov/roomler-ai/pull/4552), read again every anchor into a file it changes
+(`delegate.rs`, `signaling.rs`, `macos_supervisor.rs` and `app.rs` in `agents/roomlerd/src`, and
+`crates/localapi/src/lib.rs`), the ones into `models.rs` that it moved, and its own.
 
 ## Goal
 
@@ -35,14 +41,14 @@ host to learn it.
   2026-11-14, read on 0.4.221 and on the 0.4.222 candidate), from the root daemon and from the person's daemon alike.
   `Status` fills it on every Mac daemon that is not itself the worker
   ([`localapi_state.rs:1144-1148`](../../agents/roomlerd/src/localapi_state.rs#L1144-L1148),
-  [`app.rs:5295-5303`](../../agents/roomlerd/src/app.rs#L5295-L5303)), and the supervisor is off by default
+  [`app.rs:5257-5265`](../../agents/roomlerd/src/app.rs#L5257-L5265)), and the supervisor is off by default
   ([`macos_supervisor.rs:34-36`](../../agents/roomlerd/src/macos_supervisor.rs#L34-L36)). So `attached` alone does not
   answer the question: a field that copied it would list every healthy two-row Mac as missing its worker.
 - **What the row says today.** A Mac daemon with no GUI session advertises `permissions: ["no-gui-session"]`
   ([`encode/caps.rs:4453-4459`](../../agents/roomlerd/src/encode/caps.rs#L4453-L4459)). Once an attached worker has
   sent its caps, the row advertises the worker's permission pair instead
-  ([`delegate.rs:2004-2007`](../../agents/roomlerd/src/delegate.rs#L2004-L2007), announced at
-  [`signaling.rs:7135`](../../agents/roomlerd/src/signaling.rs#L7135)). No word says one row. The four Macs of the lab
+  ([`delegate.rs:2015-2018`](../../agents/roomlerd/src/delegate.rs#L2015-L2018), announced at
+  [`signaling.rs:7263`](../../agents/roomlerd/src/signaling.rs#L7263)). No word says one row. The four Macs of the lab
   cells below therefore collapse into two readings:
 
   | Mac | what its row carries today |
@@ -57,13 +63,13 @@ host to learn it.
   ([`agentCodecChips.ts:98`](../../ui/src/components/admin/agentCodecChips.ts#L98)), which is right for a two-row root
   row and wrong for #3802's.
 - **The lag.** In #3802's read the row lagged the attach by up to 2 min 20 s, longer than the 30 s heartbeat
-  ([`signaling.rs:2250`](../../agents/roomlerd/src/signaling.rs#L2250)). Why is not established. Two fixes reached
+  ([`signaling.rs:2263`](../../agents/roomlerd/src/signaling.rs#L2263)). Why is not established. Two fixes reached
   agents after that read, both in 0.4.228: #4043 (the hello and the heartbeat announce one snapshot) and #4059 (a word
   the worker says after the hello wakes the heartbeat,
-  [`signaling.rs:2653-2663`](../../agents/roomlerd/src/signaling.rs#L2653-L2663)). One more fact bounds it: the row's
+  [`signaling.rs:2666-2678`](../../agents/roomlerd/src/signaling.rs#L2666-L2678)). One more fact bounds it: the row's
   permissions follow the worker's caps frame
-  ([`delegate.rs:2227-2238`](../../agents/roomlerd/src/delegate.rs#L2227-L2238)), not the attach
-  ([`delegate.rs:2101-2110`](../../agents/roomlerd/src/delegate.rs#L2101-L2110)), so a worker that sends its caps late
+  ([`delegate.rs:2331-2342`](../../agents/roomlerd/src/delegate.rs#L2331-L2342)), not the attach
+  ([`delegate.rs:2169-2178`](../../agents/roomlerd/src/delegate.rs#L2169-L2178)), so a worker that sends its caps late
   moves the row late however fast the beat is. Whether any lag remains on the current release is P0's question (D2).
 
 ## Design
@@ -73,7 +79,7 @@ host to learn it.
 One optional field on `AgentCaps` ([`models.rs:310-311`](../../crates/remote_control/src/models.rs#L310-L311)),
 beside `desktop` ([`models.rs:635-641`](../../crates/remote_control/src/models.rs#L635-L641)). P2 built it, the field
 at [`models.rs:642-649`](../../crates/remote_control/src/models.rs#L642-L649) and `GuiWorkerBrief` at
-[`models.rs:2043-2080`](../../crates/remote_control/src/models.rs#L2043-L2080), the way `DesktopBrief` is built
+[`models.rs:2043-2102`](../../crates/remote_control/src/models.rs#L2043-L2102), the way `DesktopBrief` is built
 ([`models.rs:2015-2041`](../../crates/remote_control/src/models.rs#L2015-L2041)): a CLAIM by the device, counted by the
 server, never enforced on. Strings, not enums, for the additive-wire reason: a newer agent's state or reason must reach
 an older reader as a word it can show, not as a parse failure.
@@ -108,10 +114,10 @@ sends it.
 ### How a Mac's daemon fills it
 
 The state comes from two facts the daemon already holds: whether a worker holds the delegation channel (the `attached`
-flag, set at [`delegate.rs:2101-2110`](../../agents/roomlerd/src/delegate.rs#L2101-L2110) and cleared at
-[`delegate.rs:2126`](../../agents/roomlerd/src/delegate.rs#L2126)), and the supervisor's last decision
-([`decide`, `macos_supervisor.rs:137-160`](../../agents/roomlerd/src/macos_supervisor.rs#L137-L160), over the `Action`s
-at [`macos_supervisor.rs:110-134`](../../agents/roomlerd/src/macos_supervisor.rs#L110-L134)).
+flag, set at [`delegate.rs:2169-2178`](../../agents/roomlerd/src/delegate.rs#L2169-L2178) and cleared at
+[`delegate.rs:2198`](../../agents/roomlerd/src/delegate.rs#L2198)), and the supervisor's last decision
+([`decide`, `macos_supervisor.rs:138-161`](../../agents/roomlerd/src/macos_supervisor.rs#L138-L161), over the `Action`s
+at [`macos_supervisor.rs:111-135`](../../agents/roomlerd/src/macos_supervisor.rs#L111-L135)).
 
 ```mermaid
 flowchart TD
@@ -129,13 +135,13 @@ flowchart TD
 
 | the daemon | `state` | `reason` | where the daemon knows it |
 |---|---|---|---|
-| not root, or the supervisor off with `macos_one_row` off (`Action::Disabled`) | `unsupervised` | | [`macos_supervisor.rs:1720-1733`](../../agents/roomlerd/src/macos_supervisor.rs#L1720-L1733), [`:138-139`](../../agents/roomlerd/src/macos_supervisor.rs#L138-L139) |
-| root, `macos_one_row` on and the supervisor off: nothing runs a worker, so the row has no screen | `not-attached` | `supervisor-off` | the warning at [`macos_supervisor.rs:1726-1731`](../../agents/roomlerd/src/macos_supervisor.rs#L1726-L1731) |
-| a worker holds the delegation channel | `attached` | | [`delegate.rs:2101-2110`](../../agents/roomlerd/src/delegate.rs#L2101-L2110) |
-| nobody at the console | `not-attached` | `no-console-user` | [`macos_supervisor.rs:141-142`](../../agents/roomlerd/src/macos_supervisor.rs#L141-L142) |
-| the LaunchAgent is loaded, so launchd owns the worker | `not-attached` | `launchd-owns` | [`macos_supervisor.rs:148-152`](../../agents/roomlerd/src/macos_supervisor.rs#L148-L152) |
-| a worker spawned or running, and not attached yet | `not-attached` | `starting` | [`macos_supervisor.rs:155-158`](../../agents/roomlerd/src/macos_supervisor.rs#L155-L158) |
-| the supervisor stopped respawning after `MAX_FAST_EXITS` fast exits, or its run ended early (`current_exe` failed) | `not-attached` | `gave-up` | [`macos_supervisor.rs:157`](../../agents/roomlerd/src/macos_supervisor.rs#L157), [`:73`](../../agents/roomlerd/src/macos_supervisor.rs#L73), [`:1734-1743`](../../agents/roomlerd/src/macos_supervisor.rs#L1734-L1743) |
+| not root, or the supervisor off with `macos_one_row` off (`Action::Disabled`) | `unsupervised` | | [`macos_supervisor.rs:1820-1833`](../../agents/roomlerd/src/macos_supervisor.rs#L1820-L1833), [`:139-140`](../../agents/roomlerd/src/macos_supervisor.rs#L139-L140) |
+| root, `macos_one_row` on and the supervisor off: nothing runs a worker, so the row has no screen | `not-attached` | `supervisor-off` | the warning at [`macos_supervisor.rs:1826-1831`](../../agents/roomlerd/src/macos_supervisor.rs#L1826-L1831) |
+| a worker holds the delegation channel | `attached` | | [`delegate.rs:2169-2178`](../../agents/roomlerd/src/delegate.rs#L2169-L2178) |
+| nobody at the console | `not-attached` | `no-console-user` | [`macos_supervisor.rs:142-143`](../../agents/roomlerd/src/macos_supervisor.rs#L142-L143) |
+| the LaunchAgent is loaded, so launchd owns the worker | `not-attached` | `launchd-owns` | [`macos_supervisor.rs:149-153`](../../agents/roomlerd/src/macos_supervisor.rs#L149-L153) |
+| a worker spawned or running, and not attached yet | `not-attached` | `starting` | [`macos_supervisor.rs:156-159`](../../agents/roomlerd/src/macos_supervisor.rs#L156-L159) |
+| the supervisor stopped respawning after `MAX_FAST_EXITS` fast exits, or its run ended early (`current_exe` failed) | `not-attached` | `gave-up` | [`macos_supervisor.rs:158`](../../agents/roomlerd/src/macos_supervisor.rs#L158), [`:74`](../../agents/roomlerd/src/macos_supervisor.rs#L74), [`:1834-1846`](../../agents/roomlerd/src/macos_supervisor.rs#L1834-L1846) |
 
 `attached` wins over the supervisor's decision, because it is the truth about who would serve a session now. The
 mapping from `Action` is one `match` with no catch-all arm, so a new `Action` cannot compile without a word, the same
@@ -145,42 +151,76 @@ way `RpcCap::wire()` forces one for a new verb.
 supervisor does not count a worker that stays up and never attaches, so neither can the word. P2's read reports how
 many Macs are `starting`, and P4's cells say whether that state outlives a spawn in practice (D6).
 
+**P1 built it** as one pure function, `gui_worker_word`
+([`macos_supervisor.rs:197-233`](../../agents/roomlerd/src/macos_supervisor.rs#L197-L233)), over `WordInputs`
+([`:177-188`](../../agents/roomlerd/src/macos_supervisor.rs#L177-L188)). Those are the switches (`WordConfig`,
+[`:163-175`](../../agents/roomlerd/src/macos_supervisor.rs#L163-L175), set once at start at
+[`app.rs:5045-5052`](../../agents/roomlerd/src/app.rs#L5045-L5052)), `attached`, and the supervisor's last `Action`,
+which the supervisor gives the delegate host at its transition
+([`note_supervisor`, `delegate.rs:2063-2080`](../../agents/roomlerd/src/delegate.rs#L2063-L2080)). Two cells the
+flowchart leaves out are worded so. With the supervisor on and no decision yet, the word is `not-attached` with
+`starting`, since its first tick decides at once. `Action::Disabled` reads as the switches' own word. The `current_exe`
+failure is noted as `GaveUp`
+([`macos_supervisor.rs:1841-1843`](../../agents/roomlerd/src/macos_supervisor.rs#L1841-L1843)). Every spelling is a
+`GuiWorkerBrief` constant read out of `STATES` and `REASONS`
+([`models.rs:2081-2101`](../../crates/remote_control/src/models.rs#L2081-L2101)), never a literal of the agent's.
+
 ### Who sends it
 
 - **A Mac's daemon, on every loop.** On a loop that holds the delegate host (the primary, and every org on a one-row
-  Mac, [`signaling.rs:7124-7129`](../../agents/roomlerd/src/signaling.rs#L7124-L7129)) the word is the host's. On a
+  Mac, [`signaling.rs:7252-7257`](../../agents/roomlerd/src/signaling.rs#L7252-L7257)) the word is the host's. On a
   loop that holds none, it is `unsupervised`, because that loop never hands a session to the worker.
 - **Never the worker** (`--supervised`). It is the screen side itself, as `Status` already says of it
   ([`crates/localapi/src/lib.rs:491-496`](../../crates/localapi/src/lib.rs#L491-L496)).
 - **No other platform** (D1). Only macOS has a supervised worker: the delegate host exists on macOS alone
-  ([`app.rs:5085-5090`](../../agents/roomlerd/src/app.rs#L5085-L5090)), and so does the supervisor
-  ([`app.rs:5386-5400`](../../agents/roomlerd/src/app.rs#L5386-L5400)).
+  ([`app.rs:5039-5044`](../../agents/roomlerd/src/app.rs#L5039-L5044)), and so does the supervisor
+  ([`app.rs:5348-5362`](../../agents/roomlerd/src/app.rs#L5348-L5362)).
+
+P1 built it as `says_word` and `word_without_host`
+([`macos_supervisor.rs:235-260`](../../agents/roomlerd/src/macos_supervisor.rs#L235-L260)). Each connection reads
+them once ([`connect_once`, `signaling.rs:1969-1975`](../../agents/roomlerd/src/signaling.rs#L1969-L1975)). The worker
+is told apart by the supervision its process recorded at its start, `Supervision::MacosSupervisor`, as the recorder
+tells it apart ([`recording/launch.rs:523`](../../agents/roomlerd/src/recording/launch.rs#L523)). Its loop cannot
+tell: any loop of the worker but its primary holds no host, as a daemon's secondary org does.
 
 ### When it moves
 
 The word is read with the others in `Announcer::now`
-([`signaling.rs:7129`](../../agents/roomlerd/src/signaling.rs#L7129)) and compared as part of `Announced`
-([`signaling.rs:7054`](../../agents/roomlerd/src/signaling.rs#L7054)). So the hello carries it
-([`hello_with`, `signaling.rs:7237-7255`](../../agents/roomlerd/src/signaling.rs#L7237-L7255)), and so does every beat
-on which it changed ([`beat`, `signaling.rs:7260-7272`](../../agents/roomlerd/src/signaling.rs#L7260-L7272); the
-caps go out at [`signaling.rs:2714-2727`](../../agents/roomlerd/src/signaling.rs#L2714-L2727)).
+([`signaling.rs:7257`](../../agents/roomlerd/src/signaling.rs#L7257)) and compared as part of `Announced`
+([`signaling.rs:7168`](../../agents/roomlerd/src/signaling.rs#L7168)). So the hello carries it
+([`hello_with`, `signaling.rs:7371-7389`](../../agents/roomlerd/src/signaling.rs#L7371-L7389)), and so does every beat
+on which it changed ([`beat`, `signaling.rs:7394-7406`](../../agents/roomlerd/src/signaling.rs#L7394-L7406); the
+caps go out at [`signaling.rs:2729-2744`](../../agents/roomlerd/src/signaling.rs#L2729-L2744)).
 
-What P1 adds is the news. Today the host wakes the heartbeat for three things only: the worker's caps held, the
+What P1 adds is the news. Before P1 the host woke the heartbeat for three things only: the worker's caps held, the
 person's floor kept, and the caps cleared with the channel
-([`news`, `delegate.rs:1671-1679`](../../agents/roomlerd/src/delegate.rs#L1671-L1679);
-[`words_moved`, `delegate.rs:1687-1691`](../../agents/roomlerd/src/delegate.rs#L1687-L1691)). The attach tells nothing,
+([`news`, `delegate.rs:1679-1690`](../../agents/roomlerd/src/delegate.rs#L1679-L1690);
+[`words_moved`, `delegate.rs:1698-1702`](../../agents/roomlerd/src/delegate.rs#L1698-L1702)). The attach tells nothing,
 because nothing the row says changes until the worker's caps frame arrives. P1 makes two more things tell the news:
 
 - **the attach and the detach** of the delegation channel;
 - **each change of the supervisor's state**, at the transition it already logs once
-  ([`macos_supervisor.rs:1837-1866`](../../agents/roomlerd/src/macos_supervisor.rs#L1837-L1866)), never on every
+  ([`macos_supervisor.rs:1940-1973`](../../agents/roomlerd/src/macos_supervisor.rs#L1940-L1973)), never on every
   5 s tick.
 
 The heartbeat then announces the word at once (#4059's arm,
-[`signaling.rs:2653-2663`](../../agents/roomlerd/src/signaling.rs#L2653-L2663)). The word rides only a changed beat,
+[`signaling.rs:2666-2678`](../../agents/roomlerd/src/signaling.rs#L2666-L2678)). The word rides only a changed beat,
 as caps always have ([`crates/remote_control/src/signaling.rs:646-650`](../../crates/remote_control/src/signaling.rs#L646-L650)),
 so the steady state costs nothing. It must also come back down when the worker leaves, for the reason the caps do
 ([`crates/remote_control/src/signaling.rs:652-654`](../../crates/remote_control/src/signaling.rs#L652-L654)).
+
+P1 built it so. `Announcer::now` reads the word
+([`signaling.rs:7296-7301`](../../agents/roomlerd/src/signaling.rs#L7296-L7301)) into `Announced`
+([`:7221-7226`](../../agents/roomlerd/src/signaling.rs#L7221-L7226)), and `stub_caps` writes it into the caps
+([`:7486`](../../agents/roomlerd/src/signaling.rs#L7486)). The attach wakes the news as soon as the channel is held
+([`delegate.rs:2178-2182`](../../agents/roomlerd/src/delegate.rs#L2178-L2182)). The end wakes it once, after both the
+caps are cleared and the flag is down ([`delegate.rs:2197-2203`](../../agents/roomlerd/src/delegate.rs#L2197-L2203)),
+so no beat reads the caps gone with the word still `attached`. That one wake replaces the end's old one, which came only
+with caps held ([`channel_ended`, `delegate.rs:2382-2390`](../../agents/roomlerd/src/delegate.rs#L2382-L2390)). The
+supervisor tells the host at its transition
+([`macos_supervisor.rs:1940-1944`](../../agents/roomlerd/src/macos_supervisor.rs#L1940-L1944)), and the host wakes the
+news only when the decision differs from the last one. The beat's caps line logs the word
+([`signaling.rs:2739`](../../agents/roomlerd/src/signaling.rs#L2739)).
 
 ### Old and new together
 
@@ -192,7 +232,7 @@ so the steady state costs nothing. It must also come back down when the worker l
 | P1 | P1, the switch on | read, counted and shown |
 
 ⚠️ A stored word outlives its connection: an offline row keeps the last word it announced. Every read pairs the word
-with presence (`last_presence`, [`models.rs:2454`](../../crates/remote_control/src/models.rs#L2454)), as the desktop
+with presence (`last_presence`, [`models.rs:2476`](../../crates/remote_control/src/models.rs#L2476)), as the desktop
 counts already do ([`stats.rs:353-382`](../../crates/api/src/routes/stats.rs#L353-L382)), so a stale word is never
 read as current.
 
@@ -203,11 +243,18 @@ or ACL reads it. P2's reads count it and name the rows that carry it, and nothin
 
 `roomler status` on a healthy two-row Mac shows `attached: false`, which reads as a fault where there is none
 (#3882's comment). By D5's recommendation, `GuiWorkerStatus`
-([`crates/localapi/src/lib.rs:536-549`](../../crates/localapi/src/lib.rs#L536-L549), filled by
-[`worker_status`, `delegate.rs:2030-2036`](../../agents/roomlerd/src/delegate.rs#L2030-L2036)) takes the same `state`
+([`crates/localapi/src/lib.rs:536-561`](../../crates/localapi/src/lib.rs#L536-L561), filled by
+[`worker_status`, `delegate.rs:2041-2053`](../../agents/roomlerd/src/delegate.rs#L2041-L2053)) takes the same `state`
 and `reason` as additive fields, from the same function that builds the row's word, so the host and the server never
 disagree. `attached`, `permissions` and `one_row` stay, because FR-43's verify reads them
 ([`FR-43-macos-single-enrollment.md:610`](FR-43-macos-single-enrollment.md)). An older CLI ignores the new fields.
+
+P1 built it so: `state` and `reason` are left out when empty
+([`crates/localapi/src/lib.rs:549-560`](../../crates/localapi/src/lib.rs#L549-L560)), and `worker_status` reads the
+channel once for `attached` and for the word, so one `Status` never pairs two reads. It shows in `roomler status
+--json`, as `attached` did. The plain `roomler status` prints no worker line, before P1 or after it. `one_row` stays
+the host's own flag, both switches on, while the word's `one_row` is `macos_one_row` alone. The two differ only on a
+root daemon with `macos_one_row` on and the supervisor off, whose word is `supervisor-off`.
 
 ### The server read (P2, built)
 
@@ -268,11 +315,12 @@ commit message says why.
 
 | phase | test | RED on master because |
 |---|---|---|
-| P1 | the attach and the detach wake the host's news | the attach tells nothing today ([`delegate.rs:1671-1679`](../../agents/roomlerd/src/delegate.rs#L1671-L1679)) |
-| P1 | a change of the supervisor's state wakes it once, and a repeated tick of the same state does not | the supervisor tells the host nothing |
-| P1 | every `Action` maps to one `(state, reason)`, and `attached` wins over it | no mapping exists |
-| P1 | a beat on which only the word changed announces caps that carry it | no word in `Announced` |
-| P1 | the `--supervised` worker, and a build for any other OS, announce no word | no word |
+| P1, built | the attach and the detach wake the host's news (`the_attach_and_the_detach_wake_the_news`; #3992's `a_channel_that_ends_with_the_caps_held_is_news` now asks it of an end with nothing held too; in `agents/roomlerd/src/delegate.rs`) | the attach told nothing ([`delegate.rs:1679-1690`](../../agents/roomlerd/src/delegate.rs#L1679-L1690)), and neither did an end with no caps held; the stub kept both so |
+| P1, built | a change of the supervisor's state wakes it once, and a repeated tick of the same state does not (`a_change_of_the_supervisors_state_is_news_once` in `delegate.rs`; `a_supervisor_move_wakes_the_loop_and_its_beat_carries_the_word` in `signaling.rs`) | the supervisor told the host nothing |
+| P1, built | every `Action` maps to one `(state, reason)`, and `attached` wins over it; the switches speak first; every word is a locked spelling (`every_action_maps_to_one_word_and_attached_wins`, `the_switches_speak_before_the_supervisor`, `every_word_is_a_locked_spelling`, in `agents/roomlerd/src/macos_supervisor.rs`) | no mapping existed: the stub said `unsupervised` for every daemon |
+| P1, built | a beat on which only the word changed announces caps that carry it, and the hello carries the word (`a_beat_on_which_only_the_word_changed_announces_caps_that_carry_it`, `a_macs_hello_carries_the_screen_worker_word`, in `agents/roomlerd/src/signaling.rs`) | no word in `Announced` |
+| P1, built | the `--supervised` worker, and a build for any other OS, announce no word, and a Mac's daemon does (`the_worker_and_other_platforms_announce_no_word` in `signaling.rs`; `a_macs_daemon_says_the_word_and_its_worker_and_other_platforms_do_not` in `macos_supervisor.rs`) | no word: the stub's Mac daemon said none either |
+| P1, built | `permissions` is unchanged in every cell (`the_word_leaves_the_permissions_as_they_were_in_every_cell` in `signaling.rs`), and `Status` says the row's word with FR-43's three fields as they were (`the_status_says_the_word_the_row_says` in `delegate.rs`; `gui_worker_state_and_reason_are_additive_both_ways` in `crates/localapi/src/lib.rs`) | the stub said no word, and its two `Status` fields had no serde attributes, so a status without them came back with `null`s |
 | P2, built (the type is P2's) | caps without the word serialise without the key and parse to `None`; a word with an unknown key inside it parses; an older reader parses caps that carry it; the spellings are locked (`gui_worker_wire_shape_is_locked_and_additive`, `an_older_reader_parses_caps_that_carry_the_gui_worker_word`, `gui_worker_spellings_are_locked`, in `crates/remote_control/src/models.rs`) | no field: the stub without its serde attributes put `"gui_worker": null` on every hello |
 | P2, built | a device response leaves the word out while the switch is off, and keeps the rest of its caps (`gui_worker_read_tests`, `crates/modules/fleet/src/agent.rs`) | the stub served the stored caps as they are |
 | P2, built | the integration test, `crates/tests/src/gui_worker_tests.rs` (AC6): with the switch on, each state and an absent word counted in both overviews, online and in total, and the filter's rows; with it off, no `gui_workers`, no word in a row and the filter refused | no read |
@@ -285,11 +333,11 @@ its org overview, never from a command on the guest. P0 reads each one RED on th
 
 | cell | the Mac | how | RED today | GREEN after P4 |
 |---|---|---|---|---|
-| C1 | one row, a person signed in, the worker cannot start | the person's roomler folder given to root, which is #3802's cause (`person_folder_not_theirs`, read in the give-up branch at [`macos_supervisor.rs:1838-1843`](../../agents/roomlerd/src/macos_supervisor.rs#L1838-L1843)), so the worker exits on arrival until the supervisor gives up | `no-gui-session`, the same as C3's root row and C4 | `not-attached`, `gave-up`, `one_row` |
+| C1 | one row, a person signed in, the worker cannot start | the person's roomler folder given to root, which is #3802's cause (`person_folder_not_theirs`, read in the give-up branch at [`macos_supervisor.rs:1945-1950`](../../agents/roomlerd/src/macos_supervisor.rs#L1945-L1950)), so the worker exits on arrival until the supervisor gives up | `no-gui-session`, the same as C3's root row and C4 | `not-attached`, `gave-up`, `one_row` |
 | C2 | one row, healthy | a converted Mac, as FR-43's verify reads it | the worker's pair, the same as C3's person row | `attached`, `one_row` |
 | C3 | two rows, healthy | the default install, both switches off | root: `no-gui-session`; person: their pair | both rows `unsupervised` |
 | C4 | one row, at the login window | C2 restarted with nobody signed in, then a sign-in, then a log-out | `no-gui-session` | `not-attached` with `no-console-user`, then `attached`, then `not-attached` again |
-| C5 | C2's Mac, for the lag | five sign-ins, each stamped at four points: the attach line (`delegation channel attached`, [`delegate.rs:2110`](../../agents/roomlerd/src/delegate.rs#L2110)), the worker's caps line ([`delegate.rs:2232-2237`](../../agents/roomlerd/src/delegate.rs#L2232-L2237)), the beat's caps line ([`signaling.rs:2714-2727`](../../agents/roomlerd/src/signaling.rs#L2714-L2727)) and the row's change, polled from the device list every 2 s | the lag, split by layer | each within one beat (30 s) of the host's line |
+| C5 | C2's Mac, for the lag | five sign-ins, each stamped at four points: the attach line (`delegation channel attached`, [`delegate.rs:2178`](../../agents/roomlerd/src/delegate.rs#L2178)), the worker's caps line ([`delegate.rs:2336-2341`](../../agents/roomlerd/src/delegate.rs#L2336-L2341)), the beat's caps line ([`signaling.rs:2729-2744`](../../agents/roomlerd/src/signaling.rs#L2729-L2744)) and the row's change, polled from the device list every 2 s | the lag, split by layer | each within one beat (30 s) of the host's line |
 
 ## Phases
 
@@ -300,8 +348,8 @@ docs; P5 checks that they are whole.
 | phase | what | kill switch | status |
 |---|---|---|---|
 | P0 | the RED read of C1–C4 and the lag's split (C5), on the current release and the current server; no code | none: it reads and changes nothing | done: C1–C4 read RED (AC1) and C5's split (AC2) on 2026-11-27 (the field log); no layer comes near one beat, so P1 goes ahead (D2) |
-| P1 | the agent: `AgentCaps.gui_worker` in `crates/remote_control`, filled by a Mac's daemon, in the hello and at once on each attach, detach and change of the supervisor's state; `Status.gui_worker` takes the same `state` and `reason` (D5) | inert while `ROOMLER__RC__GUI_WORKER_READ` is off, and dropped by an older server | not started |
-| P2 | the server: the counts in both overviews, the device list's filter, and the word left out of every device response while the switch is off | `ROOMLER__RC__GUI_WORKER_READ`, default off | built, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516); in production since 2026-11-27 with its switch off (the field log) |
+| P1 | the agent: `AgentCaps.gui_worker` in `crates/remote_control`, filled by a Mac's daemon, in the hello and at once on each attach, detach and change of the supervisor's state; `Status.gui_worker` takes the same `state` and `reason` (D5) | inert while `ROOMLER__RC__GUI_WORKER_READ` is off, and dropped by an older server | merged 2026-11-28, [#4552](https://github.com/gjovanov/roomler-ai/pull/4552): its tests read RED on a stub, then GREEN, in CI (AC3, AC4); it reaches the field with the next agent release, and P4 reads it there |
+| P2 | the server: the counts in both overviews, the device list's filter, and the word left out of every device response while the switch is off | `ROOMLER__RC__GUI_WORKER_READ`, default off | built, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516): its integration test read RED, then GREEN, in CI (AC6); in production since 2026-11-27 with its switch off (the field log) |
 | P3 | the devices list: the chip, in the table and the cards (D6) | the same switch: off, the rows carry no word, so there is no chip | not started |
 | P4 | the field read of C1–C5 on the release with P1 and the server with P2 and P3, with the switch turned on in production (the operator's step); a wrong reading turns it off again, and the default turns on once every cell reads green | the switch | not started |
 | P5 | the docs: the field and its wire name, the chip and its page, the macOS row table, the server read, and the `docs/README.md` rows | none: docs | not started |
@@ -313,15 +361,15 @@ docs; P5 checks that they are whole.
   No row carries a word for one row or for the worker, so the server cannot tell the cells apart.
 - [x] **AC2** (P0, C5): the lag on the current release, five sign-ins stamped at the attach line, the worker's caps
   line, the beat's caps line and the row's change. The split names the layer that holds anything over one beat (D2).
-- [ ] **AC3** (P1): the unit tests above, each shown RED on master first: the attach, the detach and each change of
+- [x] **AC3** (P1): the unit tests above, each shown RED on master first: the attach, the detach and each change of
   the supervisor's state wake the host's news; a beat that changes only the word announces caps; every `Action` maps
   to one `(state, reason)` through a `match` with no catch-all arm; the worker and other platforms announce no word.
-- [ ] **AC4** (P1, old and new together): caps without the word serialise without the key and parse to `None`, so an
+- [x] **AC4** (P1, old and new together): caps without the word serialise without the key and parse to `None`, so an
   older agent's row reads `unknown`; a word with an unknown key inside it parses; `permissions` is unchanged in every
   cell.
 - [ ] **AC5** (P1, by D5): `roomler status` on a Mac shows the same `state` and `reason` as its row, so a healthy
   two-row Mac no longer shows only `attached: false`.
-- [ ] **AC6** (P2): an integration test: with the switch on, both overviews count Mac rows by `state`, `reason` and
+- [x] **AC6** (P2): an integration test: with the switch on, both overviews count Mac rows by `state`, `reason` and
   `one_row`, online and in total, with the rows that sent no word as `unknown`, and the device list's filter returns
   exactly the org's online rows in the state asked for. With the switch off, the overviews carry no `gui_workers`, the
   list's rows carry no word, and the filter is refused.
@@ -357,7 +405,7 @@ open.
 
 - **D1, one field for all platforms, or macOS only?** Recommended: one field whose name says no OS, produced only by a
   Mac's daemon in this FR. Only macOS has a supervised worker
-  ([`app.rs:5085-5090`](../../agents/roomlerd/src/app.rs#L5085-L5090)). Linux's root daemon captures with no worker,
+  ([`app.rs:5039-5044`](../../agents/roomlerd/src/app.rs#L5039-L5044)). Linux's root daemon captures with no worker,
   and already tells the server its desktop and the arm that would capture it (`capabilities.desktop`, FR-93 P2b). On
   Windows, see D3. A later platform adds a producer, not a wire change, and every reader treats an absent word as
   `unknown` on every OS.
