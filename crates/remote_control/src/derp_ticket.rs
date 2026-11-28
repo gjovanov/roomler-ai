@@ -82,9 +82,30 @@ impl DerpTicketSigner {
         &self.public_b64
     }
 
-    /// Mint a ticket for `(network hex, wg pubkey b64)`. Returns
-    /// `(token, exp_unix)`.
+    /// Mint a ticket for `(network hex, wg pubkey b64)` without the
+    /// generation, as a pod before FR-155 P1e did. Returns
+    /// `(token, exp_unix)`. The API mints with [`Self::mint_at`].
     pub fn mint(&self, network_hex: &str, wg_pubkey_b64: &str) -> Result<(String, u64), String> {
+        self.mint_claims(network_hex, wg_pubkey_b64, None)
+    }
+
+    /// FR-155 P1e — [`Self::mint`], carrying the generation of the control
+    /// socket that asked for the ticket.
+    pub fn mint_at(
+        &self,
+        network_hex: &str,
+        wg_pubkey_b64: &str,
+        generation: u32,
+    ) -> Result<(String, u64), String> {
+        self.mint_claims(network_hex, wg_pubkey_b64, Some(generation))
+    }
+
+    fn mint_claims(
+        &self,
+        network_hex: &str,
+        wg_pubkey_b64: &str,
+        generation: Option<u32>,
+    ) -> Result<(String, u64), String> {
         let exp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -95,23 +116,11 @@ impl DerpTicketSigner {
             net: network_hex.to_string(),
             pk: wg_pubkey_b64.to_string(),
             exp,
-            generation: None,
+            generation,
         };
         let token = jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &self.enc)
             .map_err(|e| format!("derp ticket mint: {e}"))?;
         Ok((token, exp))
-    }
-
-    /// FR-155 P1e — [`Self::mint`], with the generation of the control socket
-    /// that asked for the ticket.
-    pub fn mint_at(
-        &self,
-        network_hex: &str,
-        wg_pubkey_b64: &str,
-        generation: u32,
-    ) -> Result<(String, u64), String> {
-        let _ = generation;
-        self.mint(network_hex, wg_pubkey_b64)
     }
 }
 
