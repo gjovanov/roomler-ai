@@ -209,7 +209,7 @@ keeps a burst reading apart from sustained evidence: a probe moves the bracket's
 delivery raises the floor.
 
 It also supplies what two open items wait for: a capacity reading for FR-135's D12 ("Plan grant by measured
-capacity?", `docs/fr/FR-135-one-rc-media-pipeline.md:1526`) and an under-drive clause for FR-63's flip criterion.
+capacity?", `docs/fr/FR-135-one-rc-media-pipeline.md:1527`) and an under-drive clause for FR-63's flip criterion.
 
 ### 4.3 No decision lasts a session, and every plan move has a computed cost
 
@@ -416,7 +416,7 @@ flag split.
 
 **P5, one controller.** FR-63's B2 flips on the model under the amended criterion. B3 and B4's deletions follow.
 FR-135's fallback stands: if the flip is not live four weeks after R7's shadow week ends, R8 proceeds on the governor
-(`docs/fr/FR-135-one-rc-media-pipeline.md:1519`).
+(`docs/fr/FR-135-one-rc-media-pipeline.md:1520`).
 
 **P6, docs.** `docs/rate-control.md` rewritten around the model, `docs/remote-control.md`'s carrier section, the
 index row.
