@@ -4,10 +4,11 @@ Status: **parts 1 + 3 + 3b + 4 shipped (part 4 live since `hosted-20260925-d5a7a
 TRACED 2026-10-06 (prod `0.4.116`) — the 10–15 s connect is the agent's control WebSocket going
 half-open after a host network-path change, so the ladder's retry request sits undelivered until
 the far end resets the socket 11–16 s later (AC5 `[x]`, two instances traced browser ↔ server ↔
-agent). AC4's paint-inclusive number now exists (foreground first-attempt p50 1.45 s, n 232) but
-the criterion's "unchanged" has no pre-#821 baseline — the operator's call (AC4 `[~]`). Part 5
-(kill the half-open WS within seconds of a network change) is PROPOSED, not built. The FR does not
-close until AC4 is decided.** Tracking issue: `FR-22` (#819). Reader-facing doc:
+agent). AC4 is met as re-worded on 2026-11-28 by the operator's ruling, option (b): the foreground
+first-attempt paint-inclusive p50 sits inside the healthy band (1.45 s, n 232; AC4 `[x]`). Part 5
+(a half-open control WS convicted within seconds of a network change) is DECIDED the same day: it
+gets built, in phases, shadow first (§ Part 5). None of it is built yet, and the FR stays open for
+it.** Tracking issue: `FR-22` (#819). Reader-facing doc:
 `docs/remote-control.md` §12.1.
 UX rather than picture quality — but it is the first thing every session is judged on,
 and the quality work is invisible to someone still looking at a blank stage.
@@ -153,7 +154,14 @@ leaves a warning with no ending.
       Arithmetic locked by a unit test: 4 s bound + 250 ms ladder + ~3 s normal connect.
       ⚠️ Holds for a stall in `requesting`; a stall in `negotiating` still costs 15 s by
       design, because that bound is guarding ICE.
-- [~] The healthy path is not slowed: p50 TTFF unchanged within noise. **Signalling half
+- [x] The healthy path is not slowed: **the foreground, first-attempt, paint-inclusive p50 sits
+      inside the healthy band the agent-side measurement predicts (≤ ~5 s).** ⚠️ **Re-worded
+      2026-11-28 by the operator's ruling, option (b) of § Open decisions.** As first written
+      ("p50 TTFF unchanged within noise") the paint half had no possible baseline, because
+      browser timing did not exist before #821. Ticked from part 4's read of 2026-10-06 on prod
+      `0.4.116`: **n = 232, p50 1 453 ms, p90 2 505 ms** (§ Field-verification 2026-10-06). Part
+      5's reads take the number again on the build of their day, and a p50 outside the band
+      reopens this box. The record under the first wording follows. **Signalling half
       met; paint-inclusive half unproven.** Field-verified 2026-09-25 on prod `0.4.101`
       (§ Field-verification): the server-observed signalling band — consent EXCLUDED,
       `consent_prompted`→`session_started`, mined from `remote_audit` (90 d) — shows **no
@@ -180,7 +188,8 @@ leaves a warning with no ending.
       under Open decisions. **2026-10-06, the number exists** (§ Field-verification 2026-10-06):
       foreground (`hidden:false`), first-attempt, no-drop `first_frame` records in the 7 d window —
       **n = 232, p50 1 453 ms, p90 2 505 ms, max 12 820 ms** — deep inside option (b)'s "≤ ~5 s".
-      Still `[~]`: measuring it was agent work; which number the criterion means is not.
+      Still `[~]` on that day: measuring it was agent work; which number the criterion means was
+      not. **2026-11-28: the operator ruled (b), and the box is ticked as re-worded above.**
 - [x] The stall's ROOT CAUSE is identified from the new instrumentation and recorded here.
       **Identified from the part-4 records and traced end to end on two instances, 2026-10-06
       (§ Field-verification 2026-10-06):** the persisted browser marks named the phase
@@ -228,10 +237,28 @@ leaves a warning with no ending.
       carrying the docs has merged, not before. **Merged 2026-09-25 as `53dd3be24` (#1658)** and
       checked on master: §12.1 is at `docs/remote-control.md:748` with 2 mermaid diagrams, and
       the `docs/README.md` remote-control row names it.
+- [ ] **Part 5, the redial is not held by a peer's close (P5-0).** A control connection that ends
+      does not wait for its tunnel peers' closes before it redials. The closes run on. On a host
+      whose tunnel peer takes its whole close budget, the redial's `connecting` line follows the
+      end by the ladder's own wait and no more. Unit-locked, and read once on a host with a
+      webrtc-dc tunnel up.
+- [ ] **Part 5, shadow (P5a).** On a MAJOR network change an agent records what the transport said
+      about the old socket, when the rule of § Part 5 would have convicted it, and what the socket
+      then did. Over at least 7 days of fleet records, on every host class that produced a MAJOR
+      change: **0** sockets that the rule would have convicted and that answered later.
+- [ ] **Part 5, the action (P5b).** RED first, on a corporate laptop whose default route moves,
+      with the action off: the after-drop reconnect's `session_created → ready` from the part-4
+      records (`hidden:false`) reads 11–16 s. Then, with the action on, the same read is
+      **< 5 s**, and over a working week that host's control WS is cycled by the rule on no MAJOR
+      change that left the socket alive.
+- [ ] **Part 5, docs.** `docs/remote-control.md` says how a half-open control socket is convicted
+      after a network change: the rule, its diagram, the config key and the shadow record's
+      fields, in house style with `file:line` anchors, and `docs/README.md`'s row names it.
 
 ## Open decisions
 
-- **AC4's paint-inclusive half (operator).** "p50 TTFF unchanged within noise" needs a
+- **AC4's paint-inclusive half: DECIDED 2026-11-28 by the operator, option (b).** The box is
+  ticked as re-worded. The question as it stood: "p50 TTFF unchanged within noise" needs a
   pre-#821 TTFF distribution, and none can exist: the browser marks *are* #821, and until part 4
   nothing persisted them. Part 4 yields the current distribution only. Options: (a) accept the
   server-side signalling-band before/after (§ Field-verification) as AC4's evidence, on the
@@ -241,9 +268,14 @@ leaves a warning with no ending.
   4's data; (c) strike the paint half. Measuring the number is agent work; deciding which
   number the criterion means is not. **2026-10-06: the number for (b) exists** — foreground,
   first-attempt, no-drop p50 **1 453 ms**, p90 2 505 ms (n 232), § Field-verification 2026-10-06.
-- **Part 5 (operator).** Build the control-WS probe-with-deadline, or accept the 11–16 s after-drop
-  reconnect on hosts whose default route moves as the cost of not churning the control plane. The
-  trace says which seconds it would save; the risk paragraph says what it could break.
+- **Part 5: DECIDED 2026-11-28 by the operator, build it.** The question as it stood: build the
+  control-WS probe-with-deadline, or accept the 11–16 s after-drop reconnect on hosts whose
+  default route moves as the cost of not churning the control plane. § Part 5 now holds the design
+  the code of that day allows, which is not a shorter deadline, and what it could break.
+- **P5b and P5c, who turns the action on (operator).** The action cycles a device's control plane
+  on the agent's own verdict. P5a's shadow records decide whether it is offered at all. Turning
+  it on for a device beyond the lab and the canary class is the operator's word, and so is P5c's
+  default.
 
 ## Out of scope
 
@@ -265,6 +297,7 @@ leaves a warning with no ending.
 | 2026-10-06 | prod `0.4.116` | **Part 4 census, fleet-wide, read-only** (`agent_logs`, the 7 d TTL window since 2026-09-29 22:29 Z; run by the operator over Fleet RPC): **1 654** browser batches. Foreground (`hidden:false`): `first_frame` **254**, `retried` 29, `closed` 9, `abandoned` 3. Hidden (automation noise): `retried` 1 329, `first_frame` 29, `abandoned` 1. Foreground stalls: 12 at `session_created` (mostly `agent_offline` — the designed fast-fail), 2 at `first_frame`, 1 at `dc_open`; the `requesting`-phase class that left no server row is now countable, and small. **The FR-22 symptom, in the record: 14 foreground `first_frame` attempts ≥ 5 s, 7 of them `attempt=2, after_drop=true`, 14–19.5 s, and in every one of the 7 the dominant wait is `session_created → ready` at +11.4…+16.3 s.** The other slow ones: 5 first attempts on 09-30 ~14:14 Z with every phase inflated (one bad path that day), one `ready` +8.3 s (a prompt), one `probes_ready` +8.1 s (the loopback relay probe). |
 | 2026-10-06 | prod `0.4.116` | **AC4 — the paint-inclusive number.** Foreground, first-attempt, no-drop `first_frame` records: **n = 232, p50 1 453 ms, p90 2 505 ms, max 12 820 ms.** Inside option (b)'s "≤ ~5 s" band with room to spare. No pre-#821 comparison exists or can; AC4 stays `[~]` for the operator's (a)/(b)/(c) call. |
 | 2026-10-06 | prod `0.4.116`; agent `0.4.116` | **AC5 — the stall traced end to end, twice** (§ Field-verification 2026-10-06). `…1d7a` (10-06 12:47:36 Z, TTFF 19.5 s) and `…0758` (10-05 20:43:34 Z, 14.1 s), both `attempt=2, after_drop=true`, both CORPLAP-2 (consent `auto`). Browser `session_created→ready` **15 570 / 11 399 ms** = `remote_audit` `consent_prompted→consent_granted` **15 571 / 11 400 ms**. Agent log: `MAJOR network change — probing the control WS now` at 12:47:27.9 / 20:43:24.5 → the live session's ICE path moves, the ladder hangs it up 8–9 s later and re-requests 0.3 s after that → the hub's `rc:request` goes into a **half-open control WS** → the agent notices only on `ws read … WSAECONNRESET (10054)` at 12:47:50.2 / 20:43:43.4 (**22.3 / 18.9 s after its own probe**) → redial, `rc:agent.hello` +1.6 s → the pending request delivered **54 / 70 ms after hello** → AutoGrant 0 ms → offer→answer ~60 ms. In `…1d7a` a `peer close overran its budget (5000 ms, why: ws_disconnect)` sat between detection and redial — the ~4 s between 15.5 and 11.4. Not the slot (no `agent_busy`), not consent, not the carrier. **AC5 → `[x]`.** Pod logs had rotated (oldest line 14:14 Z / 21:37 Z) and were not needed: `remote_audit` is the hub's own timestamped record. |
+| 2026-11-28 | master `590f7e9ba` (a code read, no build) | **Both open decisions ruled by the operator: AC4 takes option (b) and is ticked as re-worded, and Part 5 gets built.** A read of the code before the design found what the 10-06 proposal could not know. (1) The probe with a deadline exists: one ping at the change and two windows of 10 s, and its comment records that 5 s and one strike cycled working sockets on an in-VPN host (2026-08-16). In both traces the read failed 17–19 s after the probe, before the rule's 20 s: the rule did not end those sockets, and the timing fits the Windows kernel's own retransmission limit. (2) A cycle after the probe no longer ends a session: FR-138 keeps it. (3) The second lever is half built: #3716 lets a peer's close finish in the background, but the loop still waits for each tunnel peer in turn before it redials. § Part 5 is rewritten on that. **No field read: this row is a ruling and a code read.** |
 
 ## Field-verification — 2026-10-06 (prod `0.4.116`) — the stall traced end to end
 
@@ -542,35 +575,130 @@ and the `requesting`-phase class (a browser row with no `session_id`) becomes co
 gains a *current* paint-inclusive distribution, foreground and first-attempt filtered — but
 never the pre-#821 comparison the criterion's wording asks for (§ Open decisions).
 
-### Part 5 — PROPOSED (not built): a network change must kill the control WS in seconds, not when the far end resets it
+### Part 5 — DECIDED 2026-11-28 (build it): after a network change, a half-open control WS is convicted by what its transport says, not by a shorter timer
 
-The traced mechanism (§ Field-verification 2026-10-06) is agent-side and bounded by exactly one
-latency: after `MAJOR network change — probing the control WS now`, the socket stayed
-believed-alive for **19–22 s** until a `ws read` returned `WSAECONNRESET`. Everything after
-detection took under 2 s, and the hub delivered the pending request 54–70 ms after `hello`. Two
-levers, both in `roomlerd`'s signalling loop; the server needs nothing.
+Nothing here is built. The operator ruled on 2026-11-28 that Part 5 gets built. This section is its
+design, written against master `590f7e9ba`. It replaces the proposal of 2026-10-06, whose two
+levers the code of this day has partly overtaken.
 
-1. **Probe with a deadline.** On a MAJOR network change (default route moved / NAT rebind — the
-   netstate watcher already classifies it and logs the probe), send a WS ping and require a pong
-   within a short deadline; no pong ⇒ close the socket and redial at once, through the existing
-   "network changed during reconnect backoff — retrying immediately" path. Expected effect: the
-   after-drop retry's `rc:request` lands ~2–3 s after the change instead of 11–16 s, so the
-   reconnect completes in ≈ 4 s (pc grace) + ~2 s rather than 14–19 s.
-2. **Redial before the slow peer close.** On `ws_disconnect`, start the redial concurrently with
-   the peers' teardown; `peer close overran its budget (5000 ms)` must not sit between detection
-   and `rc:agent.hello` (it cost `…1d7a` ~4 s).
+#### What the agent does today
 
-**Kill switch:** a per-device config value (`control_ws_probe_deadline_ms`, `0` = today's
-behaviour, deliverable by remote config) so a host where the probe misfires can be returned to
-the old behaviour without a release.
+| | Today | Where |
+|---|---|---|
+| On a MAJOR network change | one ping on the control WS, and the keepalive tick pulled forward to the probe's deadline | `agents/roomlerd/src/signaling.rs:2590`, `:2601` |
+| The verdict | answered (its pong, or any frame since the probe): nothing happens. Unanswered for one window of 10 s: a second ping. Unanswered for two: the socket is cycled | `agents/roomlerd/src/signaling.rs:2482`, `WS_NETCHANGE_PROBE_DEADLINE` (`:526`), `WS_NETCHANGE_PROBE_STRIKES` (`:529`) |
+| What a cycle costs | the control plane's gap. A remote-control session is kept across it, and closed only if its own connection leaves `Connected` (FR-138) | `agents/roomlerd/src/session_table.rs:182`, `:216` |
+| After the cycle | every webrtc-dc tunnel peer is closed in turn, each within 5 s, before the redial starts | `agents/roomlerd/src/signaling.rs:6633`, `PEER_CLOSE_BUDGET` (`:207`), `close_within_budget` (`:314`) |
 
-⚠️ **Risks to reason through before building** — the blast radius is the control plane of every
-enrolled machine: a false-positive probe failure on a slow-but-alive link would churn the WS on
-every path flap and, through `torn down peers … on ws disconnect`, END live sessions that would
-have survived; the deadline must sit above the measured ping RTT on the middlebox hosts (measure
-CORPLAP-1/2/3 first, the probe RTT is in the agent log); and a redial storm across a fleet whose
-default route moves at once (an office VPN cutover) must stay inside the existing reconnect
-backoff. Fail-first: on CORPLAP-2 with the flag at `0`, force a default-route move during a live
-session and read the after-drop reconnect's `session_created → ready` from the part-4 records
-(`hidden:false`) — expect 11–16 s; then the same with the deadline on — expect < 3 s. Both runs
-recorded, or the phase is not done.
+So the rule convicts a dead socket 20 s after the change. In the two traces of 2026-10-06 it never
+got that far. The read failed with os error 10054 some 17 to 19 s after the probe in both (the
+22.3 s of the first includes a peer close that overran its budget), which is before the second
+window ends. That timing fits the Windows kernel's own limit: five retransmissions of the probe's
+ping from a 300 ms floor end 18.9 s after it was written (0.3 s × 63), and the second trace reads
+18.9 s. The 2026-10-06 section reads the same error as the far end's reset. On either reading the
+rule did not end those sockets, and on Windows it buys almost nothing, because the kernel's limit
+sits a second below it. On Linux and macOS the kernel keeps retransmitting for many minutes, so
+there the rule's 20 s is the bound. P5a's records settle the reading: they carry the socket's
+retransmission count.
+
+⚠️ **A shorter deadline is not the fix, and it has been tried.** The comment above
+`WS_NETCHANGE_PROBE_DEADLINE` records it. The first cut was 5 s and one strike. On an in-VPN host
+it cycled working sockets, because under the VPN's throttle a healthy socket answers in 6–15 s, and
+every route flap fired the probe again (field 2026-08-16: reattach loops, starved netmaps and
+grants, every pair blocked). Two windows of 10 s is what that cost bought. The 2026-10-06 proposal
+("require a pong within a short deadline") would have walked back into it.
+
+Of that proposal's second lever, half is built. #3716 lets a peer's close finish in the background
+once its budget runs out. But the control loop still waits for each tunnel peer in turn, up to the
+budget each, before it redials (`close_all_tunnel_peers`). A remote-control peer is no longer in
+that wait at all, since FR-138 keeps it.
+
+#### Why a timer cannot tell the cases apart, and what can
+
+A pong that has not come says one of three things, and no deadline can tell which:
+
+| Case | The old socket | A new connection | Right action |
+|---|---|---|---|
+| Half-open (the 2026-10-06 traces) | its packets go nowhere: nothing it sends is acknowledged, and nothing arrives | works at once | cycle now |
+| Throttled but alive (2026-08-16), the whole path slow | answers in 6–15 s | as slow as the old one | keep it |
+| Throttled but alive, this flow queued | its bytes drain through a queue: acknowledgements keep arriving, late | may be fast, because its queue is empty | keep it |
+
+All three show "no pong yet". A second connection alone does not settle it, because in the third
+case it would work too. Two facts together do: **how long a new flow takes on the same path, and
+whether anything the old socket sent since the change has been acknowledged.** The kernel holds
+the second. The rule reads both.
+
+1. **Proof that the path works for a new flow.** At the probe, the agent also dials the server once
+   more through the real dial path (`agents/roomlerd/src/ws_connect.rs:280`: the remembered
+   address, TLS by name), and makes one exchange that only the origin can answer. `T` is the time
+   from the probe to that answer. No answer inside the first window means no early verdict, and
+   today's rule runs unchanged.
+2. **No progress on the old socket since the probe.** Read from the socket itself several times a
+   second: no byte received, no fall in its unacknowledged bytes, and at least one retransmission
+   timeout that happened AFTER the new flow got its answer. The kernel exposes these on all three
+   platforms. Which fields, and from which OS version, is settled in P5a's PR from each platform's
+   documentation and a read on a host. Where a host cannot say, there is no early verdict.
+3. **A floor.** At least 2 s since the probe, and at least twice `T`.
+
+All three, and the socket is convicted through the existing `ConnExit::NetChangeProbe` arm.
+Anything else, and nothing changes: the two windows of 10 s still decide. A conviction redials at
+once, without the ladder's first 1 s (`agents/roomlerd/src/signaling.rs:1605`), because the fresh
+dial has just proven what that wait is for. A redial that fails climbs the ladder as before.
+
+The retransmission after the proof is the heart of it: the kernel tried this very flow again while
+a new flow was getting through, and heard nothing. A slow path fails test 1 or the floor, because
+the fresh dial is slow too. A queued flow fails test 2, because its acknowledgements arrive. A
+socket behind a middlebox that terminates TCP also fails test 2 when its far side is dead, because
+the middlebox acknowledges locally: that host keeps today's 20 s and loses nothing.
+
+⚠️ **What the rule cannot rule out from a desk:** a path that drops one flow's packets for many
+seconds while it carries new flows, and then lets the old flow recover. Nobody has read the
+2026-08-16 throttle at the packet level, so whether the VPN hosts ever do that is unknown. That is
+why the rule ships in shadow first. P5a counts the sockets it would have convicted that later
+answered, on those hosts, before it can cycle anything.
+
+```mermaid
+flowchart TD
+    M[MAJOR network change] --> P["ping on the old socket,<br/>and one fresh dial on the same path"]
+    P --> A{old socket shows life?}
+    A -- yes --> K[keep it: nothing happens]
+    A -- no --> F{"fresh path answered<br/>inside the first window?"}
+    F -- no --> OLD["today's rule: two windows of 10 s"]
+    F -- "yes, after T" --> R{"since the probe: nothing received,<br/>nothing acknowledged, and a retransmission<br/>after the fresh answer?"}
+    R -- no --> OLD
+    R -- "yes, and 2 s and twice T have passed" --> C["cycle now: ConnExit::NetChangeProbe"]
+```
+
+#### Phases, each with its switch
+
+| Phase | What ships | Switch | Done when |
+|---|---|---|---|
+| P5-0 | the redial no longer waits for tunnel peers' closes: they start together and go on in the background, which #3716 made safe | none: it removes a wait, and every close still completes | unit-locked, and read once on a host with a webrtc-dc tunnel up |
+| P5a, **shadow** | the fresh dial and the transport reads, on every MAJOR change. **It acts on nothing.** One log line per change, which reaches `agent_logs` like any other: `T`, what the transport said, when the rule would have convicted, and what the socket then did (answered after X ms, was cycled by today's rule, or failed on a read) | `control_ws_fresh_probe` = `off` or `shadow` (the default) | 7 days of fleet records in which no socket the rule would have convicted answered later |
+| P5b, the action | the conviction, on the devices whose key says so | the same key = `act`, per device, pushed by remote config | RED, then GREEN, on the corporate-laptop class (the criteria above) |
+| P5c | `act` becomes the default | the key stays as the way back | a clean week on the fleet |
+
+P5a is the reason for the order. No test reaches this surface: the hosts that matter are the
+corporate laptop, the full-tunnel VPN and the middlebox. Shadow mode puts the rule on all of them
+and counts its false positives before it can cycle anything.
+
+#### What it could still break, and what bounds it
+
+- **A storm of fresh dials.** It is one small exchange per MAJOR change per device, and netstate
+  already damps MAJORs to one per cooldown window. An office behind one address whose route moves
+  at once sends one request per device. The exchange has to stay under the server's per-address
+  request ceiling or use a route the ceiling leaves out: P5a's PR settles which.
+- **An answer that is not the origin's.** An inspecting proxy can answer for an upstream that is
+  dead. The exchange therefore checks for the origin's own answer. A front's 502
+  (`agents/roomlerd/src/ws_connect.rs:148`) or any other answer is no proof.
+- **A redial storm.** A conviction goes through the existing reconnect path, with its backoff and
+  its flat-redial rules. Nothing new dials the control WS.
+- **A platform that cannot read its transport.** No early verdict there. The claim is per platform,
+  and P5a's records say which builds can read it.
+- **Sessions.** FR-138 keeps them across the cycle. The action is refused on a connection that
+  keeps none (`keeps_sessions()`, `agents/roomlerd/src/session_table.rs:1356`), where a false
+  conviction would end a session that had survived.
+
+**Not Part 5:** a second control WS that takes over before the first is closed. It would shrink
+the gap of a true conviction to nothing, but it needs the server to hold two sockets for one
+device, and today a second socket displaces the first with a goodbye the agent treats as final.
