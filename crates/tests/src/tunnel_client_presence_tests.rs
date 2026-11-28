@@ -26,6 +26,14 @@ type Ws =
 /// How long a list may take to show a socket opening or closing.
 const SETTLE: Duration = Duration::from_secs(5);
 
+/// Both pods with their per-address rate limit out of the way: the lists are
+/// read until they settle, more requests than the default burst, and a 429
+/// would read as an answer.
+fn unlimited(s: &mut roomler_ai_config::Settings) {
+    s.app.rate_limit_per_sec = 1_000;
+    s.app.rate_limit_burst = 10_000;
+}
+
 async fn enroll_client(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> (String, String) {
     let et: Value = app
         .auth_post(
@@ -79,34 +87,28 @@ async fn connect_client(app: &TestApp, token: &str) -> Ws {
     ws
 }
 
+/// A list as `app` serves it. Any answer but a 2xx fails here, with its
+/// status and body, rather than as a body that does not parse.
+async fn read_list(app: &TestApp, seeded: &SeededTenant, path: &str) -> Value {
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/{path}?per_page=100", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(status.is_success(), "GET {path}: {status} {body}");
+    serde_json::from_str(&body).unwrap_or_else(|e| panic!("GET {path}: {e} in {body}"))
+}
+
 /// The client's row in the device list and in the tunnel-client list, as
 /// `app` serves them (`Value::Null` for a list that does not hold it).
 async fn rows(app: &TestApp, seeded: &SeededTenant, client_id: &str) -> (Value, Value) {
-    let device: Value = app
-        .auth_get(
-            &format!("/api/tenant/{}/device?per_page=100", seeded.tenant_id),
-            &seeded.admin.access_token,
-        )
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let clients: Value = app
-        .auth_get(
-            &format!(
-                "/api/tenant/{}/tunnel-client?per_page=100",
-                seeded.tenant_id
-            ),
-            &seeded.admin.access_token,
-        )
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let device = read_list(app, seeded, "device").await;
+    let clients = read_list(app, seeded, "tunnel-client").await;
     let find = |list: &Value| {
         list["items"]
             .as_array()
@@ -150,7 +152,7 @@ async fn expect_presence(
 /// that is fresh because it closed a moment ago says nothing more.
 #[tokio::test]
 async fn a_connected_client_reads_online_on_both_pods_and_offline_once_it_closes() {
-    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let (app1, app2) = TestApp::spawn_pair(unlimited).await;
     if app1.state.redis_pubsub.is_none() {
         eprintln!("skipping: no Redis available");
         return;
@@ -180,7 +182,7 @@ async fn a_connected_client_reads_online_on_both_pods_and_offline_once_it_closes
 /// online on both pods until the socket it really holds closes.
 #[tokio::test]
 async fn a_late_close_on_the_old_pod_leaves_the_new_socket_online() {
-    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let (app1, app2) = TestApp::spawn_pair(unlimited).await;
     if app1.state.redis_pubsub.is_none() {
         eprintln!("skipping: no Redis available");
         return;
@@ -233,12 +235,78 @@ async fn a_late_close_on_the_old_pod_leaves_the_new_socket_online() {
     .await;
 }
 
+/// Two sockets of one client on ONE pod (two `roomler` processes on one
+/// machine) stand behind one record. The newer socket closes first, as a
+/// short `roomler ssh` beside a long-lived forward does: that takes nothing
+/// from the older socket, which both pods still read online, and the last
+/// socket out takes the client offline on both.
+#[tokio::test]
+async fn a_second_socket_closing_leaves_the_first_online_on_both_pods() {
+    let (app1, app2) = TestApp::spawn_pair(unlimited).await;
+    if app1.state.redis_pubsub.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let seeded = app1.seed_tenant("tcpres4").await;
+    let (client_id, token) = enroll_client(&app1, &seeded, "mach-tcpres4").await;
+
+    let mut first = connect_client(&app1, &token).await;
+    expect_presence(&app2, &seeded, &client_id, "online", "the first socket").await;
+    let mut second = connect_client(&app1, &token).await;
+    // A list cannot tell one socket from two: give the second socket's
+    // handler time to have taken its seat and claimed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let _ = second.close(None).await;
+    // Long enough for the second socket's teardown to have run: a release
+    // that took the first socket's record with it would show here.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    expect_presence(
+        &app2,
+        &seeded,
+        &client_id,
+        "online",
+        "the other pod, after the second socket closed",
+    )
+    .await;
+    expect_presence(
+        &app1,
+        &seeded,
+        &client_id,
+        "online",
+        "its own pod, after the second socket closed",
+    )
+    .await;
+
+    let _ = first.close(None).await;
+    expect_presence(
+        &app2,
+        &seeded,
+        &client_id,
+        "offline",
+        "the other pod, both closed",
+    )
+    .await;
+    expect_presence(
+        &app1,
+        &seeded,
+        &client_id,
+        "offline",
+        "its own pod, both closed",
+    )
+    .await;
+}
+
 /// With no Redis a pod sees only its own sockets. The pod that holds the
 /// socket reads it online; the other reads the heartbeat trail: stale while
 /// the trail is fresh, never online, and offline once the trail is old.
 #[tokio::test]
 async fn without_redis_the_other_pod_reads_the_trail_as_stale_never_online() {
-    let (app1, app2) = TestApp::spawn_pair(|s| s.redis.url = String::new()).await;
+    let (app1, app2) = TestApp::spawn_pair(|s| {
+        unlimited(s);
+        s.redis.url = String::new();
+    })
+    .await;
     assert!(
         app1.state.redis_pubsub.is_none() && app2.state.redis_pubsub.is_none(),
         "this test models pods with no Redis"
