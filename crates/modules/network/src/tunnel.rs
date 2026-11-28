@@ -1822,7 +1822,7 @@ impl PresenceRecord {
             {
                 Ok(true) => {}
                 Ok(false) => {
-                    debug!(%client, "another pod holds this tunnel client's presence record, for a newer socket")
+                    debug!(%client, "tunnel-client presence record already holds this token or a newer one")
                 }
                 Err(e) => warn!(
                     %client, %e,
@@ -1845,7 +1845,7 @@ impl PresenceRecord {
         {
             Ok(true) => {}
             Ok(false) => {
-                debug!(client = %self.client, "another pod holds this tunnel client's presence record, for a newer socket")
+                debug!(client = %self.client, "another pod holds this tunnel client's presence record")
             }
             Err(e) => debug!(client = %self.client, %e, "tunnel-client presence refresh failed"),
         }
