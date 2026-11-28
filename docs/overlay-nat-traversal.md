@@ -489,7 +489,7 @@ cascade's guarantees while replacing its reactive counters:
   and the DERP endpoints advertise no greasing, so nobody greases toward them
   (`derp_endpoint_config`, [`quic.rs:254`](../crates/tunnel-core/src/transport/quic.rs#L254);
   the measurement is `quic_over_derp_never_clears_the_fixed_bit`,
-  [`quic.rs:1197`](../crates/tunnel-core/src/transport/quic.rs#L1197)).
+  [`quic.rs:1282`](../crates/tunnel-core/src/transport/quic.rs#L1282)).
   ⚠️ During a rollout an old peer still advertises greasing, so a fixed build still
   greases toward it, and the old peer still reads by the first byte: the old-to-fixed
   direction is clean at once, the fixed-to-old one once the old end upgrades.

@@ -42,7 +42,7 @@ const POOL_READY_WAIT: Duration = Duration::from_secs(10);
 /// the Accept, so this only fires when the client died in that window
 /// or the QUIC connection stalled — bounded so a dialed dst socket
 /// can't leak waiting for a stream that never comes.
-const FLOW_RENDEZVOUS_WAIT: Duration = Duration::from_secs(10);
+pub(super) const FLOW_RENDEZVOUS_WAIT: Duration = Duration::from_secs(10);
 
 /// Policy + dial layer. Pure decision logic, no peer interaction —
 /// keeps the unit tests self-contained.

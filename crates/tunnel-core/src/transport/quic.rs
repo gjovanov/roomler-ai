@@ -596,13 +596,27 @@ pub async fn open_flow(conn: &Connection, flow_id: u32) -> Result<(SendStream, R
 
 /// Accept the next bidirectional flow stream and read its `flow_id`
 /// preamble. Returns `(flow_id, send, recv)`.
+///
+/// Its error does not tell one stream's failure from the connection's end:
+/// a stream reset or finished before its preamble fails it as a closed
+/// connection does. A loop that serves many flows on one connection awaits
+/// only `accept_bi` and reads each preamble on its own with
+/// [`read_flow_id`], as the exit's accept loop does (#4501).
 pub async fn accept_flow(conn: &Connection) -> Result<(u32, SendStream, RecvStream)> {
     let (send, mut recv) = conn.accept_bi().await.context("quic accept_bi")?;
+    let flow_id = read_flow_id(&mut recv).await?;
+    Ok((flow_id, send, recv))
+}
+
+/// Read the 4-byte `flow_id` preamble [`open_flow`] writes at the start of a
+/// flow stream. Its error is that stream's: reset or finished before its
+/// preamble arrived, or its connection ended.
+pub async fn read_flow_id(recv: &mut RecvStream) -> Result<u32> {
     let mut hdr = [0u8; 4];
     recv.read_exact(&mut hdr)
         .await
         .context("quic read flow_id preamble")?;
-    Ok((u32::from_le_bytes(hdr), send, recv))
+    Ok(u32::from_le_bytes(hdr))
 }
 
 /// Upper bound on the auth token length (a JWT is ~200–800 bytes; this

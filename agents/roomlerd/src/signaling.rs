@@ -9298,13 +9298,13 @@ mod tests {
             terminate_quic_session(&mut self.map, &self.tenant, session_id, close_connection);
         }
 
-        /// The accept loop ends while the connection is up (a stream without
-        /// its preamble), and the reap arm takes the peer.
-        async fn reap_while_up(&mut self) {
-            let (mut bad, _bad_recv) = self.conn.open_bi().await.unwrap();
-            bad.write_all(b"x").await.unwrap();
-            bad.finish().unwrap();
-            self.reap().await;
+        /// The reap arm takes the peer while the connection is up, as it would
+        /// on the accept loop's report. Nothing on the wire ends the loop while
+        /// the connection lives: a stream without its preamble costs only that
+        /// stream (#4501).
+        fn reap_while_up(&mut self) {
+            let peer = self.map.remove(&self.sid).expect("the map holds the peer");
+            reap_quic_peer(&self.tenant, self.sid, &peer);
         }
 
         /// The accept loop's report arrives and the reap arm takes the peer.
@@ -9487,7 +9487,7 @@ mod tests {
     )]
     async fn a_reap_on_a_live_connection_does_not_close_it() {
         let mut rig = exit_rig(false).await;
-        rig.reap_while_up().await;
+        rig.reap_while_up();
         rig.flow_runs().await;
     }
 
@@ -9498,7 +9498,7 @@ mod tests {
     )]
     async fn a_terminate_that_asks_to_close_after_a_reap_of_a_live_connection_still_closes() {
         let mut rig = exit_rig(false).await;
-        rig.reap_while_up().await;
+        rig.reap_while_up();
         rig.terminate("client_shutdown", Some(true));
         rig.closed_by_session_end().await;
     }
