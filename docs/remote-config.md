@@ -227,7 +227,7 @@ row's `agent_version`. And an environment variable beats the file
 for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
 daemon's environment reads `applied` after a restart while the environment's value
 is in force, and no restart changes that. A supervised Mac worker gets the root's
-value that way (`agents/roomlerd/src/macos_supervisor.rs:309`).
+value that way (`agents/roomlerd/src/macos_supervisor.rs:409`).
 
 ⚠️ **`config-report` is a SEPARATE capability verb from `config`**, and this is
 the `ssh` / `ssh-consent` split recurring exactly as that doc predicted it
@@ -307,7 +307,7 @@ key, recording nothing (`pushed_tribool`,
 `crates/modules/fleet/src/remote_config.rs:235`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
-(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3292`), and a test
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3314`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
 keys beside it (`agents/roomlerd/src/remote_config.rs:575`).
@@ -349,7 +349,7 @@ cell through (FR-132 P2,
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:10437`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:10484`); a prefix match would refuse the
 kill switch along with the switch. `qsv_rate_mode`, FR-148 P2's switch that opens a QSV encoder off constant bitrate ([encoders.md](encoders.md#qsv-off-constant-bitrate-fr-148-p2)), is not pushable for the same reason: `DesiredConfig` has no such field, and it is not one of `DeviceSwitch`'s keys yet, so a push naming it is dropped unread with the body's other unknown keys and answers 200 having changed nothing. `rc_carrier_rank`, FR-148 P4's switch that ranks a session's mesh candidates below every TURN relay ([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)), is not pushable the same way, and neither is `path_model`, FR-148 P1's switch that lets the path memory open a relayed session ([rate-control.md](rate-control.md#the-switch-d28)), nor `inflight_budget`, FR-148 D46's switch that computes the in-flight budget on the data-channel pumps and, under `on`, lets it hold a relayed session's frames in place of the relay byte gate and the VP9-444 watermark ([rate-control.md](rate-control.md#the-budgets-switch)).
 
 ⚠️ **A push reaches a connected device within seconds, and takes effect at the
@@ -373,7 +373,7 @@ sessions back to code the device already ran, or clears the list back to the
 built-in defaults, and never further, because nothing pushed can turn a path's new
 code on ahead of its default. The server checks the value's shape and refuses a
 spelling no device could read with a 400 (`check_media_path_list`,
-`crates/remote_control/src/models.rs:3316`, called at
+`crates/remote_control/src/models.rs:3338`, called at
 `crates/modules/fleet/src/remote_config.rs:317`), so `media-plan` or `Media_Plan`
 never reads as applied while doing nothing. It does not check the names, which
 belong to the device's build: it stores the value as given
@@ -437,7 +437,7 @@ the plan's `refused`.
 session through the loss of the control socket, is not pushable either.** It
 stays the device's decision, as `ws_flat_redial` and
 `tunnel_peers_survive_reattach` do: `DesiredConfig` has no such field
-(`crates/remote_control/src/models.rs:3122`), and the daemon reads the key when it
+(`crates/remote_control/src/models.rs:3144`), and the daemon reads the key when it
 starts (`crates/agent-core/src/config_surface.rs:726`). A body that names it is
 refused as one naming `rc_media_canary` is: a 403 whose message names this key,
 audited as `device_owned_switch`, by whole name, so a key that only starts like it
@@ -659,15 +659,15 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3625`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3637`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check
    of the folder each time a recording starts. **Gate 4 is not among them.**
    `exec_enabled`, `ssh_enabled` and `remote_config_enabled` are served
    read-only there (`ConfigEntry::read_only = "root_only"`, `person_view`,
-   `:3753`), and a `ConfigSet` of them is refused by name with the
-   administrator's command (`not_on_the_person_socket_for_key`, `:3797`): on a
+   `:3765`), and a `ConfigSet` of them is refused by name with the
+   administrator's command (`not_on_the_person_socket_for_key`, `:3809`): on a
    root-mode install gate 4 stays `sudo roomler config set exec_enabled true`,
    on both OSes. The pane shows the root daemon's value of the switch, marked,
    instead of another daemon's — on a two-half Mac the machine-side rows come

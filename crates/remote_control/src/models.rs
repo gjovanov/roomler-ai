@@ -2099,6 +2099,28 @@ impl GuiWorkerBrief {
     /// older than FR-157 P1, or a platform that sends none. No agent sends
     /// it.
     pub const UNKNOWN: &'static str = "unknown";
+
+    // FR-157 P1 — each spelling by name, for the daemon that says it. Read
+    // out of the two lists above, so a name never holds a second copy of a
+    // word, and the lock on the lists locks the names.
+    /// Nothing on this daemon supervises a worker: a session here is never
+    /// handed to one.
+    pub const UNSUPERVISED: &'static str = Self::STATES[0];
+    /// A worker holds the delegation channel.
+    pub const ATTACHED: &'static str = Self::STATES[1];
+    /// No worker holds the channel; `reason` says why.
+    pub const NOT_ATTACHED: &'static str = Self::STATES[2];
+    /// Nobody is at the console: the login window.
+    pub const NO_CONSOLE_USER: &'static str = Self::REASONS[0];
+    /// The LaunchAgent is loaded, so launchd owns the worker.
+    pub const LAUNCHD_OWNS: &'static str = Self::REASONS[1];
+    /// A worker was spawned or runs, and has not attached yet.
+    pub const STARTING: &'static str = Self::REASONS[2];
+    /// The supervisor stopped respawning.
+    pub const GAVE_UP: &'static str = Self::REASONS[3];
+    /// `macos_one_row` is on and the supervisor is off: nothing runs a
+    /// worker for this row.
+    pub const SUPERVISOR_OFF: &'static str = Self::REASONS[4];
 }
 
 /// FR-67 P5 — the last install's verdict, as a device's caps carry it
@@ -10055,6 +10077,31 @@ mod tests {
         assert!(
             !GuiWorkerBrief::STATES.contains(&GuiWorkerBrief::UNKNOWN),
             "`unknown` is the reader's word for no word, never a daemon's"
+        );
+        // FR-157 P1 — and each name says the word it is named for.
+        assert_eq!(
+            [
+                GuiWorkerBrief::UNSUPERVISED,
+                GuiWorkerBrief::ATTACHED,
+                GuiWorkerBrief::NOT_ATTACHED,
+            ],
+            ["unsupervised", "attached", "not-attached"]
+        );
+        assert_eq!(
+            [
+                GuiWorkerBrief::NO_CONSOLE_USER,
+                GuiWorkerBrief::LAUNCHD_OWNS,
+                GuiWorkerBrief::STARTING,
+                GuiWorkerBrief::GAVE_UP,
+                GuiWorkerBrief::SUPERVISOR_OFF,
+            ],
+            [
+                "no-console-user",
+                "launchd-owns",
+                "starting",
+                "gave-up",
+                "supervisor-off"
+            ]
         );
     }
 

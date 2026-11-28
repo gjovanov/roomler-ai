@@ -165,7 +165,7 @@ read the watcher's verdict at its start and settled nothing at its clean-run mar
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
-(`crates/localapi/src/lib.rs:490`), a `LastInstallStatus` (`:587`) whose
+(`crates/localapi/src/lib.rs:490`), a `LastInstallStatus` (`:599`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` stdout line spell them so
 one grep finds all three surfaces (locked by
@@ -184,10 +184,10 @@ say:
 | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) | `WATCHER STOPPED — agent-v0.4.172 started 3d ago: <note>` | WARN |
 | `Unreadable` | a file is there and does not parse; `note` carries the error chain | `record UNREADABLE — <error> (<path>)` | WARN |
 
-The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`crates/localapi/src/lib.rs:665`): the
+The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`crates/localapi/src/lib.rs:677`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
-a record older than that (`never_reported`, `:675`).
+a record older than that (`never_reported`, `:687`).
 
 > ⚠️ **Three states must stay apart, and they do by construction.** A daemon
 > that predates the field sends no `last_install` key, and the CLI prints
@@ -360,7 +360,7 @@ sequenceDiagram
     Note over UI: a marker beside presence, never instead of it
 ```
 
-**`last_install`** (`LastInstallWord`, `crates/remote_control/src/models.rs:2122`;
+**`last_install`** (`LastInstallWord`, `crates/remote_control/src/models.rs:2144`;
 the field, `:483`):
 
 | Field | What it says | From |
@@ -401,21 +401,21 @@ can name a person.
 - ⚠️ **The signalling loop never reads a record** (#3439's rule). The
   refresher is a thread of its own (`health_words::start`,
   `health_words.rs:95`, started by `run_cmd` once enrolled,
-  `agents/roomlerd/src/app.rs:5303`), and the hello and the heartbeat read only
-  its cache (`Announced::now`, `agents/roomlerd/src/signaling.rs:7262`).
+  `agents/roomlerd/src/app.rs:5311`), and the hello and the heartbeat read only
+  its cache (`Announced::now`, `agents/roomlerd/src/signaling.rs:7285`).
   `start` waits up to 2 s for the first read (`FIRST_READ_WAIT`,
   `health_words.rs:43`), before the loop connects; a hello sent before it
   landed carries neither word, and the first beat after it re-announces.
 - ⚠️ **Stamped in `stub_caps`, as P7's `update_mode` is**
-  (`signaling.rs:7421`, `:7422`). A heartbeat that re-announces replaces the
+  (`signaling.rs:7450`, `:7451`). A heartbeat that re-announces replaces the
   stored caps whole (`AgentDao::update_capabilities`,
   `crates/services/src/dao/agent.rs:607`), so a word stamped in the hello alone
   would be erased at the first re-announce. The same beat gives §3's Windows
   case its re-announce: it compares what it read with what it last announced,
-  `Announced` whole (`if now == last.0`, `signaling.rs:7387`), so the
+  `Announced` whole (`if now == last.0`, `signaling.rs:7416`), so the
   `InProgress` of the first hello after an update is replaced on the first beat
   after the verdict lands: within the refresher's 30 s, or at once, since the
-  settle asks for a read (`refresh_soon`, `app.rs:5787`).
+  settle asks for a read (`refresh_soon`, `app.rs:5795`).
 - ⚠️ **`rolled_back` compares like for like.** `last_known_good_version` is
   written only by the clean-run promotion (`record_clean_run_at`,
   `crates/agent-core/src/config.rs:2692`), from the running daemon's own
@@ -425,7 +425,7 @@ can name a person.
   daemon still on the accused build holds it too
   (`rolled_back_needs_the_last_known_good_running_not_the_mark_alone`). Five
   minutes into a clean run the promotion resets the count and the mark, and
-  asks for a read (`app.rs:5777`), and the word goes back to `ok`.
+  asks for a read (`app.rs:5785`), and the word goes back to `ok`.
 - **Host-wide.** One daemon, one updater, one ladder: every org's connection
   of a multi-org device announces the same two words.
 - **The devices page** (`docs/ui.md`, the "needs a person" chips): the install

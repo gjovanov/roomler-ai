@@ -5042,6 +5042,14 @@ async fn run_cmd(
     // needs no separate branch.
     #[cfg(target_os = "macos")]
     let delegate_host = roomlerd::delegate::DelegateHost::new();
+    // FR-157 P1 — the switches the row's screen-worker word reads, the same
+    // facts the supervisor's `run` reads below, set before any loop connects.
+    #[cfg(target_os = "macos")]
+    delegate_host.set_word_config(roomlerd::macos_supervisor::WordConfig {
+        is_root: euid_is_root(),
+        supervise: cfg.macos_supervise_gui_worker,
+        one_row: cfg.macos_one_row,
+    });
     // #1882 — the worker serves its OWN sessions too, and runs no overlay, so
     // the daemon tells it the overlay's blocks (`rc_overlay` off needs them).
     #[cfg(target_os = "macos")]
