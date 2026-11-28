@@ -88,6 +88,24 @@ so its `file:line` anchors read at that commit, and the anchor passes that re-po
 numbers after a code move leave a pinned spec alone. CI's `scripts/fr-registry-audit.sh`
 fails a closed row whose spec has no preamble pin.
 
+**A close that leaves a criterion open says where it went.** There are two forms, by what
+happened to the criterion:
+
+| What happened | In the closed spec and its issue | Where the debt is counted |
+|---|---|---|
+| It **moved** to a live FR, and the rest are met (FR-62's AC4, FR-77's P3) | the box becomes a plain bullet: "moved to FR-M (#n) ACk on <date>", with "not met" where it is not | once, as an open box on the live FR, which carries what is owed. No pin |
+| The FR closed **not planned**, superseded (the 2026-11-16 batch, FR-14) | the boxes stay as they were read, and the superseding spec maps each one | pinned in `scripts/fr-ac-debt-baseline.txt` as `FR-N=<count>  # reason`, with `nodocs FR-N  # reason` when the spec has no docs criterion |
+
+**The issue closes minutes before the PR that records its close merges.**
+`scripts/fr-verification-debt.sh` reads the issue's live state. A pin for an issue that is
+still open fails on the PR, and an issue closed with no pin on master fails on every
+`docs/fr` PR, so one of the two is red for a while, and it is the PR. The order: every other
+lane green; the issue's body and its result comment; the close; the debt lane re-run to
+green; the merge. A refused merge reopens the issue at once (#3954, #4551). Another `docs/fr`
+PR whose debt lane runs inside that window reads red, and it needs a new push after the
+merge: a re-run keeps its old merge ref. The check can be rehearsed first: run it with a
+stand-in `gh` on `PATH` that prints the issue list with the issue shown as closed.
+
 A `file:N-M` range reads start ≤ end: CI's `scripts/anchor-range-audit.sh` fails on a new
 inverted one. The 31 already on master when it landed (2026-10-21, all half-shifted) are
 pinned in `scripts/anchor-range-baseline.txt`. Fix one and delete its line; the baseline only

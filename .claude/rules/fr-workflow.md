@@ -57,6 +57,16 @@ write-up filed afterwards. Registry and full protocol: **`docs/fr/README.md`**.
    push-triggered, because closing an issue leaves no trace in the repo at all.
    Pre-existing debt is pinned per-FR in `scripts/fr-ac-debt-baseline.txt`, each
    line saying *why* that FR closed without them.
+   ⚠️ **A criterion that MOVES to a live FR is a plain bullet, never a pin** (FR-62's
+   AC4, FR-77's P3). The live FR's open box carries what is owed, so a pin would
+   count it twice. A pin is for a close that leaves its boxes unticked: not
+   planned, superseded. `docs/fr/README.md` has both forms.
+   ⚠️ **The issue closes minutes BEFORE the PR that records its close merges.** The
+   check reads live issue state: a pin for an open issue is a fault on the PR, and
+   a closed issue with no pin on master is a fault on every `docs/fr` PR. Order:
+   the other lanes green, the issue's body and result comment, the close, the debt
+   lane re-run to green, the merge. A refused merge reopens the issue at once
+   (#3954, #4551).
    ⚠️ **The commit that closes an FR pins its spec** (#4413): it adds the preamble
    pin `` **Anchors:** master `<sha>` (closed <date>) `` as its own paragraph under
    the CLOSED banner, naming the master commit the close reads. A closed spec is
