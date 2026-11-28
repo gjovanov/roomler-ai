@@ -229,7 +229,7 @@ flowchart LR
 | The two words, additive on `AgentCaps` | `last_install`, `crash_health` (`crates/remote_control/src/models.rs:483`, `:493`); `LastInstallWord` (`:2144`), `CrashHealth` (`:2214`), spellings locked by `the_health_word_spellings_are_locked` |
 | Read off the signalling loop, every 30 s and at once after a promotion or a settle | `health_words::start` (`agents/roomlerd/src/health_words.rs:95`), called by `run_cmd` (`agents/roomlerd/src/app.rs:5311`); the ladder read whole from the config (`config::read_crash_ladder`, `crates/agent-core/src/config.rs:2871`), the sentinels from every attention path (`notify::read_all_attention`, `crates/agent-core/src/notify.rs:213`) |
 | Stamped at every announcement, re-announced when a word changes | `stub_caps` (`agents/roomlerd/src/signaling.rs:7457`, `:7458`); the beat compares `Announced` whole (`:7423`) |
-| Stored with the caps and served as stored | `update_hello`, `update_capabilities` (`crates/services/src/dao/agent.rs:621`, `:607`); `caps_as_served` (`crates/modules/fleet/src/agent.rs:2751`) takes out `gui_worker` alone |
+| Stored with the caps and served as stored | `update_hello`, `update_capabilities` (`crates/services/src/dao/agent.rs:621`, `:607`); `caps_as_served` (`crates/modules/fleet/src/agent.rs:2978`) takes out `gui_worker` alone |
 | Shown beside presence, never instead of it | `ui/src/utils/deviceHealth.ts`; `ui/src/components/admin/AgentsSection.vue` (the table `:306`, `:321`; the cards `:728`, `:739`); the crash marker opens `AgentCrashesDialog.vue` |
 
 - ⚠️ **`rolled_back` compares like for like**: the raw stored
