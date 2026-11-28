@@ -92,18 +92,18 @@ pub async fn handle_agent_socket(
             return;
         }
         // #3517 — the socket ended before its hello. Nothing registered, so
-        // the disconnect line below never prints for this connection: this
-        // line says how it ended instead, with the same fields.
+        // the disconnect line below never prints for this connection: one
+        // line of its own says how it ended, with the same fields.
+        //
+        // FR-22 P5a — one such end is expected, and is no warning: a
+        // hand-over probe the device did not need. At a network change a
+        // device opens a replacement socket beside its control socket and
+        // says no hello on it. When the old socket answers first, the
+        // replacement closes with the probe's own reason, and nothing was
+        // ever registered for it. `log_before_hello` writes that end at
+        // debug and every other at warn.
         Err(end) => {
-            warn!(
-                %agent_id,
-                cause = %end.cause(),
-                code = end.code(),
-                reason = end.reason(),
-                kind = end.kind().map(tracing::field::display),
-                error = end.error(),
-                "agent opened WS without rc:agent.hello — closing"
-            );
+            end.log_before_hello(agent_id);
             return;
         }
     };

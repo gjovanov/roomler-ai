@@ -21,9 +21,11 @@ use crate::agent_presence_tests::{connect_agent, enroll, urlencode};
 use crate::fixtures::test_app::TestApp;
 use crate::session_media_plan_tests::Logged;
 use crate::tunnel_tests::{wait_agent_offline, wait_agent_online};
+use roomler_ai_remote_control::ws_close::UNUSED_HANDOVER_PROBE;
 
 const DISCONNECTED: &str = "remote-control agent WS disconnected";
 const NO_HELLO: &str = "agent opened WS without rc:agent.hello";
+const UNUSED_PROBE: &str = "agent WS closed before its hello: an unused hand-over probe";
 
 /// This thread's log lines carrying `message` and `agent_id`, once there are
 /// `n` of them (5 s at most; the caller asserts what it got).
@@ -123,6 +125,67 @@ async fn the_disconnect_line_names_how_the_agent_socket_ended() {
         ]
         .iter()
         .any(|end| found[2].contains(end)),
+        "{found:#?}"
+    );
+}
+
+/// FR-22 P5a — a hand-over probe the device did not need ends before its
+/// hello with the probe's own reason. Every device sends one at a network
+/// change, so it is a debug line, and never the warning. A reason that only
+/// starts like the probe's is still the warning: equality, never a prefix.
+#[tokio::test]
+async fn an_unused_handover_probe_ends_before_its_hello_without_a_warning() {
+    let logged = Logged::default();
+    let _log = logged.install_filter("info,roomler_ai_mod_fleet=debug");
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("probe22p5a").await;
+    let (agent_id, token) = enroll(&app, &seeded, "mach-fr22-p5a-probe").await;
+    let url = format!(
+        "ws://{}/ws?token={}&role=agent",
+        app.addr,
+        urlencode(&token)
+    );
+    let close = |reason: String| {
+        Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: reason.into(),
+        }))
+    };
+
+    // The probe's own close: one debug line, with how it ended.
+    let (mut ws, _) = connect_async(&url).await.expect("ws connect");
+    ws.send(close(UNUSED_HANDOVER_PROBE.to_owned()))
+        .await
+        .unwrap();
+    let found = lines(&logged, UNUSED_PROBE, &agent_id, 1).await;
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(found[0].contains("DEBUG"), "{found:#?}");
+    assert!(
+        found[0].contains(r#" cause=close code=1000 reason="handover-probe-unused""#),
+        "{found:#?}"
+    );
+    // Under the socket module's target, where the warning has always been.
+    assert!(
+        found[0].contains("roomler_ai_mod_fleet::socket:"),
+        "{found:#?}"
+    );
+
+    // A reason that only starts like it: the warning, as for any other end.
+    let (mut ws, _) = connect_async(&url).await.expect("ws connect");
+    ws.send(close(format!("{UNUSED_HANDOVER_PROBE}-not")))
+        .await
+        .unwrap();
+    let found = lines(&logged, NO_HELLO, &agent_id, 1).await;
+    // One warning in all: the probe's close above wrote none.
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(found[0].contains("WARN"), "{found:#?}");
+    assert!(
+        found[0].contains(r#" cause=close code=1000 reason="handover-probe-unused-not""#),
+        "{found:#?}"
+    );
+    // And the warning keeps that target, though its callsite moved.
+    assert!(
+        found[0].contains("roomler_ai_mod_fleet::socket:"),
         "{found:#?}"
     );
 }
