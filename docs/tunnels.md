@@ -1559,7 +1559,7 @@ enrolled under one name in one org send one hash, and the second lands on the fi
 row (#4479). The `instance_id` is the install's own. A row keeps the `machine_id` it was
 made with for good, because the client's overlay node is keyed by it, and it holds an
 `instance_id` once an FR-159 client has claimed it (`TunnelClient`,
-`crates/remote_control/src/models.rs:3623`). A row an FR-159 client creates takes its
+`crates/remote_control/src/models.rs:3628`). A row an FR-159 client creates takes its
 `instance_id` as its `machine_id` too (`create_row`, `routes/tunnel.rs:486`), so no legacy hash
 ever finds it.
 

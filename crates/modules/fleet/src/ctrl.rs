@@ -313,10 +313,38 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
 /// ([`crate::resume_scope::nudge`]), whatever the event carries: one that
 /// arrives late or twice applies the newest list, and a pod at window 0
 /// announces nothing.
+///
+/// FR-155 P1d: a rotation's `end_below_generation` also ends what the other
+/// modules admitted for the device below the generation on this pod (its
+/// DERP registrations), through `FleetLifecycle::end_below_generation`, with
+/// the same checks of the agent, the tenant and the generation.
 pub fn apply_rc_ctrl_on(state: &crate::FleetState, ctrl: &serde_json::Value) {
-    if ctrl.get("evt").and_then(|v| v.as_str()) == Some("resume_scope") {
-        crate::resume_scope::nudge(state);
-    } else {
-        apply_rc_ctrl(&state.rc_hub, ctrl);
+    match ctrl.get("evt").and_then(|v| v.as_str()) {
+        Some("resume_scope") => crate::resume_scope::nudge(state),
+        Some("end_below_generation") => {
+            apply_rc_ctrl(&state.rc_hub, ctrl);
+            let oid = |key: &str| {
+                ctrl.get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok())
+            };
+            let (Some(aid), Some(tid), Some(generation)) = (
+                oid("agent_id"),
+                oid("tenant_id"),
+                ctrl.get("generation")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|g| u32::try_from(g).ok()),
+            ) else {
+                return;
+            };
+            let ended = state.hooks.end_below_generation(tid, aid, generation);
+            if ended > 0 {
+                info!(
+                    agent = %aid, generation, ended,
+                    "rc ctrl: a rotation's end of the device's other connections applied from another pod"
+                );
+            }
+        }
+        _ => apply_rc_ctrl(&state.rc_hub, ctrl),
     }
 }

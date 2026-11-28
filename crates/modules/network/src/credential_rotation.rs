@@ -4,11 +4,42 @@
 //! mesh (`docs/fr/FR-155-one-row-new-credentials.md`, "The hook
 //! `agent_credentials_rotated`").
 //!
-//! This commit carries the cells only: [`run`] does nothing yet, and no path
-//! calls it.
+//! Fleet calls the hook once, on the pod where the rotation committed, after
+//! it ended the device's control sockets below the new generation (on this
+//! pod, and through the control event on every other) and before it answers
+//! the new token. [`run`] then, in this order:
+//!
+//! 1. takes the device's overlay node offline, as a leave does
+//!    (`crate::overlay::handle_overlay_leave`): the node is `Offline`, and
+//!    its peers' netmaps mark it unreachable. A control socket that the
+//!    rotation ended runs no leave of its own, so this one is the node's;
+//! 2. ends the device's DERP registrations below the new generation on this
+//!    pod ([`crate::derp_rotation`]). Every other pod ends its own when the
+//!    control event arrives, and by its own check;
+//! 3. orders the device to rotate its overlay key (FR-40, trigger
+//!    `credential_rotation`), queued for its next connection, which is at
+//!    the new generation. If the per-device limiter refuses the order, it is
+//!    placed once more after the limiter's window
+//!    ([`ORDER_AGAIN_AFTER_SECS`]).
+//!
+//! An error is the hook's answer: fleet logs, counts and audits it, and
+//! answers the new token all the same.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bson::oid::ObjectId;
+use roomler_ai_remote_control::models::KEY_ROTATION_TRIGGER_CREDENTIAL_ROTATION;
+use tracing::{info, warn};
+
+use crate::NetworkState;
+use crate::overlay::{NodeIdentity, current_node, handle_overlay_leave};
+use crate::routes::overlay_key::{KeyRotationDenyReason, OrderedBy, place_order};
+
+/// When an order that the limiter refused is placed once more: past the
+/// limiter's window, one order per device per minute
+/// (`crate::routes::overlay_key`).
+pub const ORDER_AGAIN_AFTER_SECS: u64 = 61;
 
 /// What became of the key order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,15 +69,108 @@ pub trait Effects: Send + Sync {
     fn order_again_later(&self, tenant_id: ObjectId, agent_id: ObjectId);
 }
 
-/// The hook: the effects, in order.
+/// The hook: the effects, in order. An order that cannot be written is the
+/// hook's error, after the other two effects ran. An order the limiter
+/// refuses is not: it is placed once more later.
 pub async fn run(
     effects: &impl Effects,
     tenant_id: ObjectId,
     agent_id: ObjectId,
     generation: u32,
 ) -> anyhow::Result<()> {
-    let _ = (effects, tenant_id, agent_id, generation);
+    effects.take_offline(tenant_id, agent_id).await;
+    effects.end_derp_below(tenant_id, agent_id, generation);
+    match effects.order_key_rotation(tenant_id, agent_id).await? {
+        Ordered::Placed | Ordered::Refused => {}
+        Ordered::RateLimited => {
+            info!(
+                %tenant_id, %agent_id, after_secs = ORDER_AGAIN_AFTER_SECS,
+                "fr-155: the overlay key order was rate limited; it is placed once more"
+            );
+            effects.order_again_later(tenant_id, agent_id);
+        }
+    }
     Ok(())
+}
+
+#[async_trait]
+impl Effects for NetworkState {
+    async fn take_offline(&self, _tenant_id: ObjectId, agent_id: ObjectId) {
+        handle_overlay_leave(self, NodeIdentity::Agent(agent_id)).await;
+    }
+
+    fn end_derp_below(&self, tenant_id: ObjectId, agent_id: ObjectId, generation: u32) -> usize {
+        self.derp_generations
+            .end_below_generation(agent_id, tenant_id, generation)
+    }
+
+    async fn order_key_rotation(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+    ) -> anyhow::Result<Ordered> {
+        let agent = self
+            .fleet
+            .agents
+            .find_live_in_tenant(tenant_id, agent_id)
+            .await?;
+        // The key the device holds as the order is placed (FR-40 P1c: a join
+        // under any other key afterwards is the proof that it rotated): its
+        // node's, else the one its overlay identity names.
+        let public_key_before = match current_node(self, NodeIdentity::Agent(agent_id)).await {
+            Some(node) => Some(node.wg_public_key),
+            None => agent
+                .overlay_identity
+                .as_ref()
+                .map(|identity| identity.public_key.clone()),
+        };
+        let placed = place_order(
+            self,
+            tenant_id,
+            agent_id,
+            &agent,
+            OrderedBy::Server(KEY_ROTATION_TRIGGER_CREDENTIAL_ROTATION),
+            public_key_before,
+        )
+        .await?;
+        Ok(match placed.outcome {
+            Ok(dispatch) => {
+                info!(
+                    %tenant_id, %agent_id, request_id = %placed.request_id,
+                    dispatch = dispatch.wire(),
+                    "fr-155: the device was ordered to rotate its overlay key"
+                );
+                Ordered::Placed
+            }
+            Err(KeyRotationDenyReason::RateLimited) => Ordered::RateLimited,
+            Err(reason) => {
+                warn!(
+                    %tenant_id, %agent_id, request_id = %placed.request_id,
+                    reason = reason.wire(),
+                    "fr-155: no overlay key order was placed"
+                );
+                Ordered::Refused
+            }
+        })
+    }
+
+    fn order_again_later(&self, tenant_id: ObjectId, agent_id: ObjectId) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(ORDER_AGAIN_AFTER_SECS)).await;
+            match state.order_key_rotation(tenant_id, agent_id).await {
+                Ok(Ordered::Placed) => {}
+                Ok(Ordered::RateLimited | Ordered::Refused) => warn!(
+                    %tenant_id, %agent_id,
+                    "fr-155: the overlay key order was refused once more; its audit row says why"
+                ),
+                Err(e) => warn!(
+                    %tenant_id, %agent_id, %e,
+                    "fr-155: the overlay key order could not be written"
+                ),
+            }
+        });
+    }
 }
 
 #[cfg(test)]

@@ -348,6 +348,11 @@ impl Module for NetworkState {
         derp_cluster::wire_derp_cluster(&state);
         // Split-brain observability: the per-pod DERP registry census.
         derp::spawn_registry_census(&state);
+        // FR-155 P1d — while the token rotation is on, every pod ends a DERP
+        // registration below its row's generation on the cadence of fleet's
+        // check, also a pod that the rotation's control event does not
+        // reach. Not spawned while the rotation is off.
+        derp_rotation::spawn_check(state.clone());
         // FR-51 — the ephemeral-node reaper (cluster-singleton per cycle via
         // the DB-name-scoped claim pattern). Spawns NOTHING unless
         // `rc.ephemeral_reaper_enabled` — the P1 kill switch, default off.

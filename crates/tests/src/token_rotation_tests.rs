@@ -844,7 +844,8 @@ async fn seed_node(
     network_id
 }
 
-/// A DERP socket of `token`, upgraded, its registration frame not sent yet.
+/// A DERP socket of `token`, upgraded; `send_registration` sends its
+/// registration frame.
 async fn open_derp(app: &TestApp, token: &str) -> Ws {
     let url = format!("ws://{}/derp?token={}", app.addr, rk::urlencode(token));
     let (ws, _) = tokio_tungstenite::connect_async(&url)
@@ -1323,13 +1324,13 @@ async fn a_pod_switched_off_ends_and_refuses_nothing_new() {
 }
 
 /// T19 (P1d): a DERP registration admits only the device's current
-/// generation, whatever the time from its upgrade to its registration frame.
-/// Two DERP sockets are upgraded at G, then the token rotates to G+1 on a pod
-/// without Redis, so the only floor this pod keeps is the one the cell sets,
-/// for 1 s (`DerpGenerations::end_below_generation_for`). After that floor
-/// ended, each socket's registration frame is refused: the first with a
-/// registration of G+1 in place, which stays registered and keeps relaying,
-/// and the second with none, which leaves the key unregistered.
+/// generation, whatever the timing. Two DERP sockets are upgraded at G, then
+/// the token rotates to G+1 on a pod without Redis, and the cell sets this
+/// pod's floor for 1 s (`DerpGenerations::end_below_generation_for`), so the
+/// registration's read decides. Each socket's registration frame is refused:
+/// the first with a registration of G+1 in place, which stays registered and
+/// keeps relaying, and the second with none, which leaves the key
+/// unregistered.
 #[tokio::test]
 async fn a_derp_registration_admits_only_the_current_generation() {
     let db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
@@ -1481,10 +1482,9 @@ async fn every_pod_ends_a_derp_registration_below_its_rows_generation() {
 /// T22 (P1d, T18's extension to DERP): on a pod with
 /// `rc.agent_token_rotation` off, nothing that P1d adds to DERP runs, beside a
 /// rotation committed on a pod with it on (and without Redis, so nothing
-/// reaches this pod). In T19's setup the pod refuses no registration, and the
-/// newest registration of the key is the one in place, as it always has
-/// been. In T21's setup the pod ends no DERP registration through two of the
-/// check's periods.
+/// reaches this pod). In T19's setup the pod refuses no registration, and
+/// last-writer-wins as before. In T21's setup the pod ends no DERP
+/// registration through two of the check's periods.
 #[tokio::test]
 async fn a_pod_switched_off_ends_and_refuses_no_derp_registration() {
     let db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
@@ -1514,16 +1514,16 @@ async fn a_pod_switched_off_ends_and_refuses_no_derp_registration() {
     let _ = answered_token(rotate(&rotating, &kept_token, &rotation_key(220)).await).await;
 
     // T19's setup: a socket upgraded at G, a rotation, this pod's floor for it
-    // ending within the cell, and a registration of G+1 in place.
-    let (late_id, late_token) = enroll(&off, &seeded, "m-fr155-derp-off-late").await;
+    // set for 1 s, and a registration of G+1 in place.
+    let (upgraded_id, upgraded_token) = enroll(&off, &seeded, "m-fr155-derp-off-upgraded").await;
     let (peer_id, peer_token) = enroll(&off, &seeded, "m-fr155-derp-off-peer").await;
-    let (late_key, peer_key) = ([0x72; 32], [0x73; 32]);
+    let (upgraded_key, peer_key) = ([0x72; 32], [0x73; 32]);
     seed_node(
         &off,
         &seeded,
-        &late_id,
-        "m-fr155-derp-off-late",
-        late_key,
+        &upgraded_id,
+        "m-fr155-derp-off-upgraded",
+        upgraded_key,
         "100.64.22.2",
     )
     .await;
@@ -1539,28 +1539,27 @@ async fn a_pod_switched_off_ends_and_refuses_no_derp_registration() {
     let mut peer = open_derp(&off, &peer_token).await;
     send_registration(&mut peer, peer_key).await;
     wait_derp(&off, network, peer_key, true).await;
-    let mut late = open_derp(&off, &late_token).await;
-    let new = answered_token(rotate(&rotating, &late_token, &rotation_key(221)).await).await;
+    let mut upgraded = open_derp(&off, &upgraded_token).await;
+    let new = answered_token(rotate(&rotating, &upgraded_token, &rotation_key(221)).await).await;
     off.state
         .network()
         .derp_generations
         .end_below_generation_for(
-            oid(&late_id),
+            oid(&upgraded_id),
             oid(&seeded.tenant_id),
             generation_of(&new),
             Duration::from_secs(1),
         );
     let mut current = open_derp(&off, &new).await;
-    send_registration(&mut current, late_key).await;
-    wait_derp(&off, network, late_key, true).await;
+    send_registration(&mut current, upgraded_key).await;
+    wait_derp(&off, network, upgraded_key, true).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    send_registration(&mut late, late_key).await;
+    send_registration(&mut upgraded, upgraded_key).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(
-        derp_relays(&mut peer, peer_key, &mut late, late_key).await,
-        "with the switch off, the pod refuses no registration, and the newest registration of \
-         the key is the one in place"
+        derp_relays(&mut peer, peer_key, &mut upgraded, upgraded_key).await,
+        "with the switch off, the pod refuses no registration, and last-writer-wins as before"
     );
 
     assert!(
