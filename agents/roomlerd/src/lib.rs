@@ -96,6 +96,9 @@ pub mod free_space;
 #[cfg(any(target_os = "linux", all(unix, feature = "recording")))]
 pub(crate) mod fs_identity;
 pub mod gpu_clock;
+/// FR-67 P5 / #3332 — the last install's verdict and the crash ladder's state,
+/// read off the signalling loop for every caps announcement.
+pub mod health_words;
 /// #3439 — a session asked for before the capability probe's first answer waits
 /// for it, in its connection.
 pub mod held_requests;
