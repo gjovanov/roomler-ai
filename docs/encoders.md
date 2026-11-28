@@ -966,10 +966,10 @@ in.
 
 **How it reaches the server and the viewer.** The hello and the heartbeat announce one snapshot
 (#3992). One function reads every word a connection announces, the answer's generation first
-([`Announcer::now`](../agents/roomlerd/src/signaling.rs#L7159)), and one builds the caps from it
-([`Announcer::caps`](../agents/roomlerd/src/signaling.rs#L7212)). The hello carries the first
+([`Announcer::now`](../agents/roomlerd/src/signaling.rs#L7245)), and one builds the caps from it
+([`Announcer::caps`](../agents/roomlerd/src/signaling.rs#L7298)). The hello carries the first
 snapshot, and that is what the connection has announced until a beat reads one that differs
-([`Announcer::beat`](../agents/roomlerd/src/signaling.rs#L7295)) and re-announces (FR-43 P2c);
+([`Announcer::beat`](../agents/roomlerd/src/signaling.rs#L7381)) and re-announces (FR-43 P2c);
 the server replaces the row's blob. Only the hello makes that first value, so the comparison
 starts from nothing else. The generation is part of that comparison, per connection, with no
 wire change, and since #3439 a watch on it wakes every connection, so every organization's row
@@ -977,7 +977,7 @@ gets it at once rather than within a beat. A supervised Mac's screen worker wake
 that hold its delegation host the same way: its caps, the person's floor or its leaving, once
 stored, move a second watch ([`DelegateHost::news`](../agents/roomlerd/src/delegate.rs#L1677)).
 The hello subscribes to it before it reads its words
-([`Announcer::hello_with`](../agents/roomlerd/src/signaling.rs#L7272)), so a word said in between
+([`Announcer::hello_with`](../agents/roomlerd/src/signaling.rs#L7358)), so a word said in between
 is in the hello or wakes the loop. The beat still decides what is sent, and a word that changes
 nothing the row says costs no caps. A reconnect's hello reads the answer in force. A
 viewer sees the new matrix at its next page load or 5-minute status read. A session

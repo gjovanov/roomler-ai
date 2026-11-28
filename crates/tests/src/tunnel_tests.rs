@@ -40,6 +40,12 @@
 //!   forward to the target. Locks the identity-model-(b) origination
 //!   path end-to-end.
 //!
+//! * `an_exit_is_asked_to_close_the_connection_of_a_session_the_server_ends`
+//!   (#4542) — the originator's own `rc:tunnel.terminate`, relayed to the
+//!   exit, carries `close_connection: false`; once the server ends the
+//!   originating agent (its device removed), the teardown's terminate carries
+//!   `close_connection: true`.
+//!
 //! * `agent_tunnel_open_cross_tenant_rejected` (P3b-2) — the cross-tenant
 //!   wall holds for an agent origin (a tenant-1 agent must not open a
 //!   tunnel to a tenant-2 agent).
@@ -1172,6 +1178,105 @@ async fn agent_originates_tunnel_authorized_and_relayed_to_target() {
     assert_eq!(fwd["session_id"].as_str(), Some(session_id.as_str()));
     assert_eq!(fwd["dst_host"].as_str(), Some("127.0.0.1"));
     assert_eq!(fwd["dst_port"].as_u64(), Some(9000));
+}
+
+/// Send one JSON frame on an agent WS.
+async fn send_frame(ws: &mut AgentWs, frame: Value) {
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
+}
+
+/// Open a tunnel from the agent on `ws` to `target`; returns the session id.
+async fn open_tunnel_from(ws: &mut AgentWs, target: &str) -> String {
+    send_frame(
+        ws,
+        json!({
+            "t": "rc:tunnel.open",
+            "agent_id": target,
+            "transport": "webrtc-dc-v1",
+        }),
+    )
+    .await;
+    let opened = read_until(ws, "rc:tunnel.opened")
+        .await
+        .expect("the originating agent receives rc:tunnel.opened");
+    opened["session_id"]
+        .as_str()
+        .expect("session_id in rc:tunnel.opened")
+        .to_string()
+}
+
+/// #4542 — what the exit hears for sessions an agent originated: the agent's
+/// own terminate, relayed, does not ask the exit to close the connection; once
+/// the server ends the agent itself (its device is removed), the terminate the
+/// teardown sends does.
+#[tokio::test]
+async fn an_exit_is_asked_to_close_the_connection_of_a_session_the_server_ends() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("t4542-close").await;
+    let (a_id, a_tok) = enroll_agent(&app, &seeded, "mach-4542-A", "origin-A").await;
+    let (b_id, b_tok) = enroll_agent(&app, &seeded, "mach-4542-B", "exit-B").await;
+    let mut a_ws = connect_agent_ws(&app, &a_tok, "origin-A").await;
+    let mut b_ws = connect_agent_ws(&app, &b_tok, "exit-B").await;
+    wait_agent_online(&app, &seeded, &a_id).await;
+    wait_agent_online(&app, &seeded, &b_id).await;
+    send_frame(
+        &mut a_ws,
+        json!({
+            "t": "rc:tunnel.hello",
+            "role": "client",
+            "version": "0.3.0",
+            "supported_transports": ["webrtc-dc-v1"],
+        }),
+    )
+    .await;
+
+    let first = open_tunnel_from(&mut a_ws, &b_id).await;
+    send_frame(
+        &mut a_ws,
+        json!({
+            "t": "rc:tunnel.terminate",
+            "session_id": first,
+            "reason": "client_shutdown",
+        }),
+    )
+    .await;
+    let relayed = read_until(&mut b_ws, "rc:tunnel.terminate")
+        .await
+        .expect("the exit receives the originator's terminate");
+    assert_eq!(relayed["session_id"].as_str(), Some(first.as_str()));
+    assert_eq!(
+        relayed["close_connection"],
+        json!(false),
+        "the originator's own terminate does not ask the exit to close: {relayed}"
+    );
+
+    let second = open_tunnel_from(&mut a_ws, &b_id).await;
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, a_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the removal itself");
+    assert!(
+        read_until(&mut a_ws, "rc:goodbye").await.is_some(),
+        "the removed device is told"
+    );
+    // The daemon closes its socket on the goodbye; the teardown follows.
+    let _ = a_ws.close(None).await;
+    let torn = read_until(&mut b_ws, "rc:tunnel.terminate")
+        .await
+        .expect("the exit receives the teardown's terminate");
+    assert_eq!(torn["session_id"].as_str(), Some(second.as_str()));
+    assert_eq!(
+        torn["close_connection"],
+        json!(true),
+        "a session the server ends asks the exit to close the connection: {torn}"
+    );
 }
 
 #[tokio::test]

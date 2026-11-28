@@ -255,7 +255,7 @@ The field rides `rc:overlay.join` (`crates/remote_control/src/signaling.rs:1716`
 is stored on the node's row as sent (`crates/remote_control/src/models.rs:7581`;
 the rehydrate `$unset`s it for a join that states nothing,
 `crates/services/src/dao/overlay_node.rs:362`), and reaches every client in its
-netmap peer (`signaling.rs:4088`, `to_netmap_peer`
+netmap peer (`signaling.rs:4092`, `to_netmap_peer`
 `crates/modules/network/src/overlay.rs:3223`). Absent stays absent on every
 hop: never `null`, never read as `false`.
 

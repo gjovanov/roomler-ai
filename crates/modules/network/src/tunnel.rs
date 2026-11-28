@@ -42,7 +42,7 @@ use roomler_ai_remote_control::{
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 use tunnel_core::policy::{
     GateResult, PolicySubject, Principal, ProtocolKind, ResolvedSubject, TunnelPolicy,
@@ -64,6 +64,11 @@ const OUTBOUND_CAP: usize = 256;
 /// cheap (one Mongo find_by_id per minute per active connection)
 /// and matches the existing agent heartbeat rhythm.
 const REVOCATION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long the check waits for the connection loop to have told the
+/// session's exit that the connection ends, before it tells the client
+/// either way ([`signal_end`]).
+const END_TOLD_WITHIN: Duration = Duration::from_secs(5);
 
 /// Drive a tunnel-client WS until either the client closes, the
 /// signalling layer errors, or the revocation re-check kills the
@@ -150,21 +155,39 @@ pub async fn handle_tunnel_client_socket(
         outbound_tx: outbound_tx.clone(),
         dialed_tid,
         conn_established_ms,
+        server_ended: roomler_core::ServerEnded::default(),
     };
 
     // Periodic revocation re-check task — same as T1 stub, but now
     // sends a typed `TunnelRevoked` `ServerMsg` instead of an
-    // ad-hoc JSON frame.
+    // ad-hoc JSON frame. When it ends the connection it signals this
+    // loop on `end_tx` first, and waits, at most `END_TOLD_WITHIN`, for
+    // the loop to have told the session's exit.
+    let (end_tx, mut end_rx) = mpsc::channel::<oneshot::Sender<()>>(1);
     let revocation_handle = spawn_revocation_check(
         state.clone(),
         socket_tx.clone(),
         outbound_tx.clone(),
+        end_tx,
+        orig.server_ended.clone(),
         tunnel_client_id,
         tenant_id,
     );
 
     // Main read loop.
-    while let Some(msg) = socket_rx.next().await {
+    loop {
+        let msg = tokio::select! {
+            msg = socket_rx.next() => msg,
+            Some(told) = end_rx.recv() => {
+                if let Some((agent_id, msg)) = exit_end(&orig, session.as_ref()) {
+                    info!(%tunnel_client_id, exit = %agent_id, "tunnel-client connection ends; the session's exit closes its connection");
+                    let _ = state.fleet.rc_hub.send_to_agent(agent_id, msg);
+                }
+                let _ = told.send(());
+                continue;
+            }
+        };
+        let Some(msg) = msg else { break };
         let text = match msg {
             Ok(Message::Text(t)) => t,
             Ok(Message::Close(_)) | Err(_) => break,
@@ -285,10 +308,7 @@ pub async fn handle_tunnel_client_socket(
                 {
                     let _ = state.fleet.rc_hub.send_to_agent(
                         s.agent_id,
-                        ServerMsg::TunnelTerminate {
-                            session_id: s.tunnel_session_id,
-                            reason,
-                        },
+                        orig.exit_terminate(s.tunnel_session_id, reason),
                     );
                 }
                 if let Some(s) = session.take() {
@@ -430,10 +450,7 @@ pub async fn handle_tunnel_client_socket(
         // down its side.
         let _ = state.fleet.rc_hub.send_to_agent(
             s.agent_id,
-            ServerMsg::TunnelTerminate {
-                session_id: s.tunnel_session_id,
-                reason: CloseReason::ClientShutdown,
-            },
+            orig.exit_terminate(s.tunnel_session_id, CloseReason::ClientShutdown),
         );
         audit_peer_close(&state, &s, &orig).await;
     }
@@ -492,9 +509,26 @@ pub struct Originator {
     /// target agent's WS.
     pub dialed_tid: Option<String>,
     pub conn_established_ms: i64,
+    /// Set when the server ends this originator itself: the connection
+    /// loop's end signal for a tunnel-client WS, the agent connection's
+    /// [`roomler_core::AgentCtx::server_ended`] for an agent. Every
+    /// terminate an exit gets for this originator's sessions from then on
+    /// asks it to close the session's connection ([`Self::exit_terminate`]).
+    pub server_ended: roomler_core::ServerEnded,
 }
 
 impl Originator {
+    /// The `rc:tunnel.terminate` an exit gets for one of this originator's
+    /// sessions. It asks the exit to close the session's connection once the
+    /// server ended this originator itself, and not before.
+    pub fn exit_terminate(&self, session_id: ObjectId, reason: CloseReason) -> ServerMsg {
+        ServerMsg::TunnelTerminate {
+            session_id,
+            reason,
+            close_connection: self.server_ended.get(),
+        }
+    }
+
     /// The originating tunnel-client row id, or `None` for an agent origin.
     fn tunnel_client_id(&self) -> Option<ObjectId> {
         match self.principal {
@@ -1613,10 +1647,45 @@ async fn audit_tcp_close(
 // Revocation re-check (lifted from T1 stub, now sends typed ServerMsg)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The tunnel-client connection loop's end signal: the server ends this
+/// connection itself. Sets `orig.server_ended`, so the client's ack and the
+/// teardown also ask the exit to close, and returns the terminate the
+/// session's exit gets at once: where to send it and the frame. `None` when
+/// the connection holds no session.
+fn exit_end(orig: &Originator, session: Option<&TunnelSession>) -> Option<(ObjectId, ServerMsg)> {
+    orig.server_ended.set();
+    session.map(|s| {
+        (
+            s.agent_id,
+            orig.exit_terminate(s.tunnel_session_id, CloseReason::ServerTerminated),
+        )
+    })
+}
+
+/// The check's half of the end signal. Sets `server_ended` first, so the
+/// client's ack and the teardown ask the exit to close whenever the loop
+/// gets to them, then hands the loop the signal and waits for it to have
+/// told the session's exit, at most `within`. Returns whether it did.
+async fn signal_end(
+    server_ended: &roomler_core::ServerEnded,
+    end_tx: &mpsc::Sender<oneshot::Sender<()>>,
+    within: Duration,
+) -> bool {
+    server_ended.set();
+    let told = async {
+        let (told_tx, told_rx) = oneshot::channel();
+        end_tx.send(told_tx).await.ok()?;
+        told_rx.await.ok()
+    };
+    matches!(tokio::time::timeout(within, told).await, Ok(Some(())))
+}
+
 fn spawn_revocation_check(
     state: NetworkState,
     socket_tx: Arc<Mutex<SplitSink<WebSocket, Message>>>,
     outbound_tx: mpsc::Sender<ServerMsg>,
+    end_tx: mpsc::Sender<oneshot::Sender<()>>,
+    server_ended: roomler_core::ServerEnded,
     tunnel_client_id: ObjectId,
     tenant_id: ObjectId,
 ) -> tokio::task::JoinHandle<()> {
@@ -1645,6 +1714,8 @@ fn spawn_revocation_check(
                 }
                 Ok(_) => {
                     info!(%tunnel_client_id, "tunnel-client revoked mid-session; closing WS");
+                    // The connection loop tells the session's exit first.
+                    signal_end(&server_ended, &end_tx, END_TOLD_WITHIN).await;
                     send_msg(
                         &outbound_tx,
                         ServerMsg::TunnelRevoked {
@@ -1893,13 +1964,10 @@ pub async fn relay_tunnel_client_msg_from_agent(
                 // We originated this session — tear it down like the
                 // tunnel-client socket's terminate arm: tell the target
                 // agent, drop the reply-channel registration, audit close.
-                let _ = state.fleet.rc_hub.send_to_agent(
-                    s.agent_id,
-                    ServerMsg::TunnelTerminate {
-                        session_id: s.tunnel_session_id,
-                        reason,
-                    },
-                );
+                let _ = state
+                    .fleet
+                    .rc_hub
+                    .send_to_agent(s.agent_id, orig.exit_terminate(s.tunnel_session_id, reason));
                 state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
                 unindex_session_target(
                     &state.tunnel_sessions_by_target_agent,
@@ -1952,10 +2020,7 @@ pub async fn teardown_agent_originated_sessions(
         }
         let _ = state.fleet.rc_hub.send_to_agent(
             s.agent_id,
-            ServerMsg::TunnelTerminate {
-                session_id: s.tunnel_session_id,
-                reason: CloseReason::ClientShutdown,
-            },
+            orig.exit_terminate(s.tunnel_session_id, CloseReason::ClientShutdown),
         );
         audit_peer_close(state, &s, orig).await;
     }
@@ -2052,6 +2117,7 @@ async fn terminate_agent_sessions_now(state: &NetworkState, agent_id: ObjectId) 
             let msg = ServerMsg::TunnelTerminate {
                 session_id: sid,
                 reason: CloseReason::ServerTerminated,
+                close_connection: false,
             };
             if let Err(e) = tx.try_send(msg) {
                 debug!(%agent_id, session_id = %sid, %e, "terminate push dropped (client channel full/closed)");
@@ -2193,6 +2259,176 @@ mod tests {
     use tunnel_core::policy::{
         Decision, DestinationRule, HostPattern, PolicyTarget, PortRange, evaluate,
     };
+
+    // ─── #4542: which terminates ask the exit to close the connection ──
+
+    fn originator() -> Originator {
+        let (outbound_tx, _rx) = mpsc::channel(1);
+        Originator {
+            principal: Principal::TunnelClient(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            owner_user_id: ObjectId::new(),
+            client_version: String::new(),
+            client_os: OsKind::Linux,
+            outbound_tx,
+            dialed_tid: None,
+            conn_established_ms: 0,
+            server_ended: roomler_core::ServerEnded::default(),
+        }
+    }
+
+    fn quic_session(exit: ObjectId) -> TunnelSession {
+        TunnelSession {
+            tunnel_session_id: ObjectId::new(),
+            agent_id: exit,
+            agent_tenant_id: ObjectId::new(),
+            transport: TRANSPORT_QUIC_V1.into(),
+        }
+    }
+
+    /// `(session_id, reason, close_connection)` of an `rc:tunnel.terminate`.
+    fn terminate_fields(msg: ServerMsg) -> (ObjectId, CloseReason, bool) {
+        match msg {
+            ServerMsg::TunnelTerminate {
+                session_id,
+                reason,
+                close_connection,
+            } => (session_id, reason, close_connection),
+            other => panic!("expected rc:tunnel.terminate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_exit_terminate_asks_to_close_only_once_the_server_ended_its_originator() {
+        let orig = originator();
+        let sid = ObjectId::new();
+        for reason in [CloseReason::ClientShutdown, CloseReason::ServerTerminated] {
+            assert_eq!(
+                terminate_fields(orig.exit_terminate(sid, reason)),
+                (sid, reason, false),
+                "an originator the server has not ended relays and tears down unmarked"
+            );
+        }
+
+        // A clone shares the flag, as the agent socket's clones do.
+        orig.clone().server_ended.set();
+
+        for reason in [CloseReason::ClientShutdown, CloseReason::ServerTerminated] {
+            assert_eq!(
+                terminate_fields(orig.exit_terminate(sid, reason)),
+                (sid, reason, true),
+                "once the server ended the originator, every terminate to an exit asks to close"
+            );
+        }
+    }
+
+    #[test]
+    fn the_end_signal_tells_the_sessions_exit_to_close_and_so_does_what_follows() {
+        let orig = originator();
+        let exit = ObjectId::new();
+        let s = quic_session(exit);
+
+        let (to, msg) = exit_end(&orig, Some(&s)).expect("the session's exit is told");
+
+        assert_eq!(to, exit, "the terminate goes to the session's exit");
+        assert_eq!(
+            terminate_fields(msg),
+            (s.tunnel_session_id, CloseReason::ServerTerminated, true),
+            "the end signal's terminate asks the exit to close"
+        );
+        assert!(
+            terminate_fields(
+                orig.exit_terminate(s.tunnel_session_id, CloseReason::ServerTerminated)
+            )
+            .2,
+            "the client's ack, relayed, asks the same"
+        );
+        assert!(
+            terminate_fields(orig.exit_terminate(s.tunnel_session_id, CloseReason::ClientShutdown))
+                .2,
+            "the teardown asks the same"
+        );
+    }
+
+    #[test]
+    fn the_end_signal_without_a_session_tells_no_exit() {
+        assert!(exit_end(&originator(), None).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_end_signal_returns_once_the_loop_told_the_exit() {
+        let ended = roomler_core::ServerEnded::default();
+        let (end_tx, mut end_rx) = mpsc::channel::<oneshot::Sender<()>>(1);
+        let connection_loop = tokio::spawn(async move {
+            let told = end_rx.recv().await.expect("the loop gets the signal");
+            told.send(()).expect("the check waits for the loop");
+        });
+
+        assert!(
+            signal_end(&ended, &end_tx, Duration::from_secs(5)).await,
+            "the check hears that the loop told the exit"
+        );
+        assert!(ended.get(), "the connection reads as ended by the server");
+        connection_loop.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_loop_that_does_not_answer_holds_the_end_no_longer_than_its_bound() {
+        let ended = roomler_core::ServerEnded::default();
+        let (end_tx, _end_rx) = mpsc::channel::<oneshot::Sender<()>>(1);
+        let started = std::time::Instant::now();
+
+        let told = tokio::time::timeout(
+            Duration::from_secs(5),
+            signal_end(&ended, &end_tx, Duration::from_millis(200)),
+        )
+        .await
+        .expect("the end goes on once the bound passes");
+
+        assert!(!told, "the loop did not tell the exit");
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(
+            ended.get(),
+            "the client's ack and the teardown still ask the exit to close"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loop_that_ended_does_not_hold_the_end() {
+        let ended = roomler_core::ServerEnded::default();
+        let (end_tx, end_rx) = mpsc::channel::<oneshot::Sender<()>>(1);
+        drop(end_rx);
+
+        let told = tokio::time::timeout(
+            Duration::from_secs(5),
+            signal_end(&ended, &end_tx, Duration::from_secs(60)),
+        )
+        .await
+        .expect("the end goes on at once");
+
+        assert!(!told);
+        assert!(ended.get());
+    }
+
+    #[test]
+    fn no_terminate_this_module_sends_an_exit_is_built_by_hand() {
+        fn code(src: &str) -> &str {
+            &src[..src.find("#[cfg(test)]").unwrap_or(src.len())]
+        }
+        for (file, src) in [
+            ("tunnel.rs", code(include_str!("tunnel.rs"))),
+            ("agent_arms.rs", code(include_str!("agent_arms.rs"))),
+        ] {
+            for (at, _) in src.match_indices("send_to_agent(") {
+                let call = &src[at..];
+                let call = &call[..call.find(";").unwrap_or(call.len())];
+                assert!(
+                    !call.contains("TunnelTerminate"),
+                    "{file}: a terminate an exit gets is built by Originator::exit_terminate: {call}"
+                );
+            }
+        }
+    }
 
     /// A policy granting `127.0.0.1:port` on every device to `subjects`.
     fn policy(subjects: Vec<PolicySubject>, port: u16) -> TunnelPolicy {
