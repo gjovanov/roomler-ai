@@ -101,7 +101,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | the agent socket's registration, after the hello, while the token rotation is on: a refusal registers and writes nothing, and a removed or quarantined row is the removal's to answer | `registration_generation`, on its own read of the row on the primary, `crates/modules/fleet/src/socket.rs:1360` |
 | DERP, decided before the upgrade (answers 401) | `crates/modules/network/src/derp.rs:410` |
 | DERP's registration, after the registration frame, while the token rotation is on: a refusal writes nothing, and the row is judged in the upgrade's order (removed or quarantined first, then the generation), so a row that cannot be read refuses, as at the upgrade | `registration_generation`, on its own read of the row on the primary, `crates/modules/network/src/derp.rs:505` |
-| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2360` |
+| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2371` |
 | the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:578` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
