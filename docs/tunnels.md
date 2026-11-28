@@ -1063,7 +1063,7 @@ it ends itself, and no other:
 |---|---|---|
 | a tunnel-client connection the server ends: the connection loop tells the exit at once, and the client is told after it | `true` | `exit_end` (`crates/modules/network/src/tunnel.rs:1655`), from the end-signal arm of `handle_tunnel_client_socket` (`:181`); `signal_end` (`:1669`) sets the flag first and waits for that arm at most 5 s (`END_TOLD_WITHIN`, `:71`) |
 | that client's ack, relayed, and the connection's teardown | `true` | `Originator::exit_terminate` (`crates/modules/network/src/tunnel.rs:524`), which reads `Originator::server_ended` |
-| an agent connection the server ends itself: `Hub::kick_removed_agent` sets the connection's `ServerEnded` (`crates/modules/fleet/src/hub.rs:1320`), which `AgentCtx::server_ended` shares (`crates/core/src/agent_socket.rs:72`); the agent's relays from then on, and its teardown | `true` | `relay_tunnel_client_msg_from_agent` (`crates/modules/network/src/tunnel.rs:1772`), `teardown_agent_originated_sessions` (`:2000`) |
+| an agent connection the server ends itself: `Hub::kick_removed_agent` sets the connection's `ServerEnded` (`crates/modules/fleet/src/hub.rs:1331`), which `AgentCtx::server_ended` shares (`crates/core/src/agent_socket.rs:72`); the agent's relays from then on, and its teardown | `true` | `relay_tunnel_client_msg_from_agent` (`crates/modules/network/src/tunnel.rs:1772`), `teardown_agent_originated_sessions` (`:2000`) |
 | every other relay and teardown: a socket that drops, a roll, a replacement | `false` | the same sites |
 | a push to a client (`terminate_agent_sessions_now`, the relays in `agent_arms.rs`) | `false` | `crates/modules/network/src/tunnel.rs:2098`, `crates/modules/network/src/agent_arms.rs` |
 
