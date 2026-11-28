@@ -12910,7 +12910,9 @@ pub(crate) enum FilesChannel {
 /// never hands its own to the daemon; a new offer is decided again where it
 /// lands. Every other process serves the channel as before. Pure, so the
 /// rule is a test on every OS.
-pub(crate) fn files_channel(on_macos: bool, root: bool) -> FilesChannel {
+pub(crate) fn files_channel(on_macos: bool, root: bool, one_row: bool) -> FilesChannel {
+    // #4566 — the red cells' input, read nowhere yet.
+    let _ = one_row;
     if on_macos && root {
         FilesChannel::Declined(FILES_IN_THE_PERSONS_SESSION)
     } else {
@@ -12918,9 +12920,14 @@ pub(crate) fn files_channel(on_macos: bool, root: bool) -> FilesChannel {
     }
 }
 
-/// [`files_channel`] for this process, by its own effective uid.
+/// [`files_channel`] for this process, by its own effective uid, and whether
+/// it is a one-row Mac's root daemon.
 pub(crate) fn files_channel_here() -> FilesChannel {
-    files_channel(cfg!(target_os = "macos"), effective_uid_is_root())
+    files_channel(
+        cfg!(target_os = "macos"),
+        effective_uid_is_root(),
+        crate::consent_relay::one_row(),
+    )
 }
 
 /// #3757 — whether this process's file access runs as root: its effective
@@ -17260,23 +17267,35 @@ mod files_channel_tests {
 
     /// The decision: a root process on a Mac holds the peer of a session no
     /// GUI worker serves, so it declines the channel with the reason. Red on
-    /// master, where every process served it.
+    /// master, where every process served it. #4566 — on one row too, with
+    /// its own reason (below).
     #[test]
     fn a_macs_root_daemon_declines_the_files_channel() {
-        assert_eq!(files_channel(true, true), FilesChannel::Declined(WHY));
+        assert_eq!(
+            files_channel(true, true, false),
+            FilesChannel::Declined(WHY)
+        );
+        assert!(matches!(
+            files_channel(true, true, true),
+            FilesChannel::Declined(_)
+        ));
     }
 
     /// Every other process serves the channel as before: a GUI worker (the
     /// one a delegated session's peer lives in) and a per-user install run as
     /// the person, and Linux and Windows keep their own rules (#3688, #3669).
+    /// #4566 — on one row or two: off macOS, and in a process that is not
+    /// root, the one-row input changes nothing.
     #[test]
     fn every_other_process_serves_it_as_before() {
-        for (on_macos, root) in [(true, false), (false, true), (false, false)] {
-            assert_eq!(
-                files_channel(on_macos, root),
-                FilesChannel::Served,
-                "on macOS: {on_macos}, root: {root}"
-            );
+        for one_row in [false, true] {
+            for (on_macos, root) in [(true, false), (false, true), (false, false)] {
+                assert_eq!(
+                    files_channel(on_macos, root, one_row),
+                    FilesChannel::Served,
+                    "on macOS: {on_macos}, root: {root}, one row: {one_row}"
+                );
+            }
         }
     }
 
@@ -17294,9 +17313,78 @@ mod files_channel_tests {
         }
     }
 
+    /// #4566 — a one-row Mac's root daemon is that Mac's only row: there is
+    /// no user-session roomlerd, and no other row, to send the viewer to. Its
+    /// reason names none. It says that file transfer runs as the person signed
+    /// in at the screen, that no screen worker served this session, and when a
+    /// reconnect helps, as the no-picture sentence does
+    /// (`capture::mac_no_display_hint`). Red on master, whose reason sent the
+    /// viewer to the Mac's user-session roomlerd.
+    #[test]
+    fn a_one_row_macs_declined_files_channel_names_no_row() {
+        let FilesChannel::Declined(why) = files_channel(true, true, true) else {
+            panic!("a one-row Mac's root daemon declines the channel");
+        };
+        for row in [
+            "user-session roomlerd",
+            "person's own row",
+            "-daemon row",
+            "user-session",
+        ] {
+            assert!(!why.contains(row), "{row:?} is in {why:?}");
+        }
+        assert!(!why.to_lowercase().contains("connect to"), "{why:?}");
+        for words in [
+            "runs as the person signed in at its screen",
+            "screen worker",
+            "none served this session",
+            "Reconnect once someone is signed in at the Mac.",
+        ] {
+            assert!(why.contains(words), "{words:?} is not in {why:?}");
+        }
+    }
+
+    /// #4566 — a two-row Mac's root daemon keeps its reason, byte for byte:
+    /// there the person's own row serves the screen and files.
+    #[test]
+    fn a_two_row_macs_declined_files_channel_keeps_its_reason() {
+        assert_eq!(
+            files_channel(true, true, false),
+            FilesChannel::Declined(
+                "File transfer on this Mac needs someone signed in at its screen and runs in \
+                 their session, not in this one. Reconnect once someone is signed in, or \
+                 connect to the Mac's user-session roomlerd."
+            )
+        );
+    }
+
+    /// #4566 — each reason reaches the viewer whole. It goes out through serde
+    /// (`files::FilesOutgoing::frame`), not spliced into a JSON literal by
+    /// hand, so it needs no escaping rule of its own: a listing's answer and a
+    /// transfer's carry it byte for byte, on one row or two.
+    #[test]
+    fn every_reason_reaches_the_viewer_whole() {
+        for one_row in [false, true] {
+            let FilesChannel::Declined(why) = files_channel(true, true, one_row) else {
+                panic!("a Mac's root daemon declines the channel (one row: {one_row})");
+            };
+            for frame in [
+                json!({"t": "files:dir", "req_id": "ls-1", "path": "/"}),
+                json!({"t": "files:get", "id": "dl-1", "path": "/etc/hosts"}),
+            ] {
+                let reply = declined_reply(frame.to_string().as_bytes(), why)
+                    .expect("a declined frame is answered");
+                let heard: Value = serde_json::from_str(&reply.text).expect("the answer is JSON");
+                assert_eq!(heard["message"], why, "one row: {one_row}, {frame}");
+            }
+        }
+    }
+
     /// This process's own facts: on a Mac its effective uid decides, and
     /// every other OS serves. The macOS job runs it as the runner's user
-    /// (served) and under sudo (declined).
+    /// (served) and under sudo (declined). A test process is never a one-row
+    /// Mac's root daemon (`DelegateHost::set_one_row` registers no host under
+    /// test), so its reason is the two-row one.
     #[test]
     fn this_process_follows_its_own_effective_uid() {
         let expected = if cfg!(target_os = "macos") && euid_is_root() {
@@ -17546,7 +17634,7 @@ mod files_channel_tests {
         let file = file.to_string_lossy().into_owned();
         let mut pair = Pair::open(
             Permissions::default() | Permissions::FILES,
-            files_channel(true, true),
+            files_channel(true, true, false),
         )
         .await;
         pair.ask(&json!({"t": "files:dir", "req_id": "ls-1", "path": folder}))
@@ -17643,7 +17731,7 @@ mod files_channel_tests {
     /// its words, whoever serves it: the grant is asked first, as before.
     #[tokio::test]
     async fn a_session_without_files_keeps_the_not_granted_channel() {
-        let mut pair = Pair::open(Permissions::default(), files_channel(true, true)).await;
+        let mut pair = Pair::open(Permissions::default(), files_channel(true, true, false)).await;
         pair.ask(&json!({"t": "files:begin", "id": "up-9", "name": "a.txt", "size": 3}))
             .await;
         let answered = pair.heard(1).await;
