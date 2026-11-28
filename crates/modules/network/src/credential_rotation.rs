@@ -19,11 +19,11 @@
 //! 3. (P1e) commits the device's generation floor for the regional relays
 //!    (`roomler_core::relay_floors`): one per key a ticket minted below the
 //!    new generation can name, the node's key and each key it retired within
-//!    a ticket's life. The floor is stored where every pod reads it and
-//!    pushed to every relay that takes floors, at once and bounded, so a
-//!    relay the API reaches holds it before the route answers; each relay
-//!    then refuses a ticket below it and ends a connection below it. A relay
-//!    the push does not reach has it on the next poll;
+//!    a ticket's life and the floor's margin. The floor is stored where every
+//!    pod reads it and pushed to every relay that takes floors, at once and
+//!    bounded, so a relay the API reaches holds it before the route answers;
+//!    each relay then refuses a ticket below it and ends a connection below
+//!    it. A relay the push does not reach has it on the next poll;
 //! 4. orders the device to rotate its overlay key (FR-40, trigger
 //!    `credential_rotation`), queued for its next connection, which is at
 //!    the new generation. If the per-device limiter refuses the order, it is
@@ -117,8 +117,11 @@ pub async fn run(
 /// `network_hex` whose key is `current_key`, and which retired the keys
 /// `retired` (each with when, in unix seconds). There is one floor at
 /// `generation` for the node's key and one for each key it retired within
-/// `DERP_TICKET_TTL` plus `DERP_TICKET_LEEWAY_SECS` of `now`, so a relay
-/// admits a registration of any of those keys only at `generation` or above.
+/// `DERP_TICKET_TTL`, `DERP_TICKET_LEEWAY_SECS` and the floor's own margin
+/// (`FLOOR_MARGIN_SECS`) of `now`, so a relay admits a registration of any of
+/// those keys only at `generation` or above. The margin covers, as it does
+/// for the floor's end, the ticket arm's read between the node's key and the
+/// mint, and the pods' clocks differing.
 pub fn floors_for<'a>(
     network_hex: &str,
     current_key: &str,
@@ -129,11 +132,12 @@ pub fn floors_for<'a>(
     use roomler_ai_remote_control::derp_ticket::{
         DERP_TICKET_LEEWAY_SECS, DERP_TICKET_TTL, GenerationFloor,
     };
-    let ticket_life = DERP_TICKET_TTL.as_secs() + DERP_TICKET_LEEWAY_SECS;
-    let until = roomler_core::relay_floors::floor_until(now);
+    use roomler_core::relay_floors::{FLOOR_MARGIN_SECS, floor_until};
+    let window = DERP_TICKET_TTL.as_secs() + DERP_TICKET_LEEWAY_SECS + FLOOR_MARGIN_SECS;
+    let until = floor_until(now);
     let mut keys = vec![current_key.to_string()];
     for (key, retired_at) in retired {
-        if retired_at.saturating_add(ticket_life) >= now && !keys.iter().any(|k| k == key) {
+        if retired_at.saturating_add(window) >= now && !keys.iter().any(|k| k == key) {
             keys.push(key.to_string());
         }
     }
@@ -396,16 +400,18 @@ mod tests {
     }
 
     /// P1e: a rotation's floors name the node's key and each key it retired
-    /// within a ticket's life and its leeway, at the new generation, until
-    /// past every ticket minted below it.
+    /// within a ticket's life, its leeway and the floor's margin, at the new
+    /// generation, until past every ticket minted below it.
     #[test]
     fn a_rotations_floors_name_every_key_a_ticket_below_it_can_name() {
         use roomler_ai_remote_control::derp_ticket::{DERP_TICKET_LEEWAY_SECS, DERP_TICKET_TTL};
         let now: u64 = 1_800_000_000;
-        let life = DERP_TICKET_TTL.as_secs() + DERP_TICKET_LEEWAY_SECS;
+        let window = DERP_TICKET_TTL.as_secs()
+            + DERP_TICKET_LEEWAY_SECS
+            + roomler_core::relay_floors::FLOOR_MARGIN_SECS;
         let retired = [
-            ("within", now - life),
-            ("past", now - life - 1),
+            ("within", now - window),
+            ("past", now - window - 1),
             ("current", now - 60),
         ];
         let floors = floors_for("6a54bf440b4fd609a7356f97", "current", retired, 8, now);
@@ -413,7 +419,7 @@ mod tests {
         assert_eq!(
             keys,
             vec!["current", "within"],
-            "the node's key, and each key it retired within a ticket's life"
+            "the node's key, and each key it retired within a ticket's life and the margin"
         );
         assert!(floors.iter().all(|f| f.generation == 8
             && f.until == roomler_core::relay_floors::floor_until(now)
