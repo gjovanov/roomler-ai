@@ -2029,7 +2029,7 @@ answers without asking anyone — exactly the restore-token case.
 
 The daemon side is `PortalCapture::open` (`portal/backend.rs:117`). It reads
 the handshake under a **120 s deadline** (`HANDSHAKE_DEADLINE`,
-`backend.rs:771`) because a portal `Start` blocks until the dialog is answered
+`backend.rs:777`) because a portal `Start` blocks until the dialog is answered
 and `open_default` runs synchronously on a media-pump worker — an unanswered
 dialog fails the open with *"a consent dialog left unanswered, most likely"*
 and the cascade falls through, instead of parking that worker forever. Frames
@@ -2075,7 +2075,7 @@ checked before the daemon acts on it:
 
 | What the daemon reads | The limit | Over it | Where |
 |---|---|---|---|
-| A frame | The payload is exactly its header's rows, `stride × height` bytes (256 MiB at most), in a pixel format the daemon knows | The frame is refused before its payload is read. The refusal is the reason the capture ends, and the media pump logs it as it rebuilds the capturer | `FrameHeader::decode`, `portal/wire.rs:114`; `read_frame`, `portal/backend.rs:587`; `stream_end`, `backend.rs:750` |
+| A frame | The payload is exactly its header's rows, `stride × height` bytes (256 MiB at most), in a pixel format the daemon knows | The frame is refused before its payload is read. The refusal is the reason the capture ends, and the media pump logs it as it rebuilds the capturer | `FrameHeader::decode`, `portal/wire.rs:114`; `read_frame`, `portal/backend.rs:587`; `stream_end`, `backend.rs:755` |
 | A frame, the helper's half | The helper sends exactly those rows: a longer buffer is cut after the last row, a buffer missing only the last row's padding gets it as zeros, and a shorter one is sent as it is, for the daemon to refuse | — | `payload`, `portal/wire.rs:136`, called at `portal/pipewire.rs:830` |
 | The handshake | At most 64 lines, each at most 64 KiB (`HANDSHAKE_LINE_MAX`), the size FR-142 gives a control frame. The longest legitimate line is the failure reason, one sentence; a `StreamStarted` line is about 200 bytes | The open fails with the limit named | `read_stream_handshake`, `portal/mod.rs:1212`; the line reader, `line_limit.rs:85` |
 | A one-shot answer: the probe, the screencast session report, the notification probe | 64 KiB in all (`ANSWER_MAX`), the handshake line's limit. The largest answer, the session report, is about 1 KiB | The caller is told why. The rest of the output is read and dropped, so the helper never waits on a full pipe | `read_answer`, `portal/mod.rs:1521`; `spawn_in_session`, `:1501` |
@@ -2226,7 +2226,7 @@ time, and `CreateSession` timed out activating `…impl.portal.desktop.gnome`.
 ### 4.6 One request per host, and an open that holds no worker (FR-93 P2d)
 
 An attended open shows the person at the screen a dialog and waits for them for
-up to `HANDSHAKE_DEADLINE` (120 s, `portal/backend.rs:771`). The FR-93 lab ran
+up to `HANDSHAKE_DEADLINE` (120 s, `portal/backend.rs:777`). The FR-93 lab ran
 the portal automatically on KDE and measured what that did with nobody answering:
 
 - **A dialog storm.** The viewer's media watchdog re-creates a session that has
@@ -2714,6 +2714,7 @@ sequenceDiagram
 | the newer evidence | logind's answer is kept with the time its read began, in one word, and "away" counts only when that read began after the capture's last frame | a frame proves the compositor draws this session. On the way back the frames come before the next read, and a still desktop's first empty tick would otherwise tell the controller "away" again just after its picture came back (measured: the notice went, came back, went) |
 | the notice | `rc:media-waiting` with `for: "session_away"`. The pump holds its keepalives from the first empty frame while away, and tells the controller once it has sent nothing for 2 s (`QUIET_BEFORE_TELL`) | the viewer ends a wait at the first watchdog tick (one a second) that counted a frame, and the notice travels on the control channel while the last frames travel on the video one. Told at once, a keepalive sent just before the notice was counted just after it and cleared it, and the viewer re-created the session 10 s later (measured). The same spell guards P3e's `display_wake` |
 | the hold yields | while it holds, the pump yields to the runtime on every empty tick | mutter's frame wait blocks in place and never yields, so a held pump could not be aborted: a viewer that left during the switch left its pump running, the screencast up (GNOME's sharing indicator with it) and the shared pipeline registered, and each reconnect joined that pipeline as a follower of a pump that sent nothing (measured) |
+| the wait yields | the frame wait passes one yield after every 250 ms with no frame, before it says "nothing this tick" (`portal/backend.rs:648`) | the hold's yield covers a held pump only. A pump with no frame yet holds nothing and reaches no other await, so the same wait kept it past its abort. A recording's first-frame deadline wraps a loop of the same wait (`recording/recorder.rs:437`), and a deadline fires only where the wait it wraps returns to it, so it could not fire while no frame came. Both are #4570, shown by the tests `a_pump_with_no_frame_yet_ends_at_its_abort` and `a_deadline_around_waits_with_no_frame_fires` and not yet read on a host. With no frame an abort or a deadline now lands within one wait |
 | the return | nothing reopens: the session's next frame clears the notice, or, on a still desktop, the keepalive the pump sends again once the session is back | mutter draws the session again by itself, and its stream never ended |
 | per-user only | a root daemon has no watcher | its captures are not one user's: the DRM arm reads whatever the seat shows, the login screen included |
 | both PipeWire arms | the watcher is in `PortalCapture`, which the mutter arm and the desktop portal share | only the mutter arm has been measured through a user switch (§6) |

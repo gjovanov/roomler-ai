@@ -616,8 +616,8 @@ pub trait ScreenCapture: Send {
     ///   `Ok(None)` and sleeps on nothing. So an `Ok(None)` comes after a bounded
     ///   wait for a frame (an event, a timer, an acquire with a timeout), not at
     ///   once. WGC, the portal, scrap and DRM wait in here.
-    /// - **The wait is bounded.** A pump reads its keepalive, its teardown and
-    ///   its pending settings between calls, so nothing here waits for long.
+    /// - **The wait is bounded, and an empty one suspends the task.** A pump reads
+    ///   its keepalive and settings between calls, and its teardown is an abort.
     /// - **Stray instant empties are fine.** A pull backend's next ask can be
     ///   already due after a slow encode, and the ask after it sleeps. A stream
     ///   of them is a spin: [`pace::EmptyGuard`] warns once and floors each.

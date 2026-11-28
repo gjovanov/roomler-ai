@@ -641,8 +641,13 @@ impl ScreenCapture for PortalCapture {
             }
             // No frame inside the window is not an error: a still screen
             // legitimately produces nothing, and `Ok(None)` is the pump's
-            // "nothing this tick".
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            // "nothing this tick". #4570 — it is said after one yield: the
+            // wait above blocks in place, a caller with no frame yet has no
+            // other await, and an abort or a deadline lands where one suspends.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tokio::task::yield_now().await;
+                Ok(None)
+            }
             // FR-93 P6c — why the helper ended is in its exit status, which
             // follows its stdout closing within moments. #3695 — unless the
             // reader refused a frame: then that is why.
@@ -760,7 +765,8 @@ fn stream_end(
 
 /// How long a single `next_frame` waits before reporting "nothing this tick".
 /// Long enough not to spin on a still screen, short enough that the pump stays
-/// responsive to a resize or a teardown.
+/// responsive to a resize or a teardown: with no frame, an abort or a deadline
+/// lands at the yield that follows a timeout (#4570), so within one such wait.
 const FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How long `open` waits for the helper's stream handshake before giving up.
