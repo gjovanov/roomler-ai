@@ -2476,10 +2476,13 @@ async fn connect_once(
                 // netstate PR-2 — the net-change probe verdict. Answered =
                 // its pong cleared `outstanding_ping`, or ANY frame arrived
                 // after the probe went out (both prove the socket survived
-                // the transition). Unanswered past the tight deadline =
-                // cycle NOW, single strike — the network moved under the
-                // socket and every second of blind trust stalls the whole
-                // grants/netmap plane behind a dead WS.
+                // the transition). Unanswered for
+                // `WS_NETCHANGE_PROBE_STRIKES` windows of
+                // `WS_NETCHANGE_PROBE_DEADLINE` (2 × 10 s) = cycle: the
+                // network moved under the socket, and every second of blind
+                // trust stalls the whole grants/netmap plane behind a dead
+                // WS. One window is no verdict: a throttled corporate path
+                // answers in 6-15 s (the deadline's own comment).
                 if let Some((probed, misses)) = netchange_probe {
                     if outstanding_ping.is_none() || last_rx.elapsed() < probed.elapsed() {
                         netchange_probe = None;
@@ -2601,10 +2604,12 @@ async fn connect_once(
                 // re-earns its hold verdict from scratch.
                 *slowness_cycles = 0;
                 // netstate PR-2 — the network materially moved. Probe the
-                // WS immediately (one ping, 5 s verdict at the pulled-
-                // forward keepalive tick) instead of trusting a socket the
-                // transition may have killed for another 45-90 s. A probe
-                // already in flight rides — its verdict covers this change.
+                // WS immediately (one ping now, its verdict at the pulled-
+                // forward keepalive ticks, two windows of
+                // `WS_NETCHANGE_PROBE_DEADLINE`) instead of trusting a
+                // socket the transition may have killed for another
+                // 45-90 s. A probe already in flight rides — its verdict
+                // covers this change.
                 if netchange_probe.is_none() {
                     info!(change = %summary, "MAJOR network change — probing the control WS now");
                     if let Err(e) =
@@ -6668,6 +6673,18 @@ fn waits_for_tunnel_closes(exit: ConnExit) -> bool {
 /// T2.10d: tear down every tunnel peer when the control connection ends by
 /// `exit`. Cheap no-op when the map is empty (normal for agents that never
 /// serve a tunnel).
+///
+/// FR-22 P5-0 — every close starts at once, on a task of its own, through
+/// [`close_within_budget`]: no peer waits for the one before it, and an
+/// overrun still says so. The caller waits for them only where
+/// [`waits_for_tunnel_closes`] says the process may end next. Before, the
+/// closes ran one after the other and every exit waited for each, so the
+/// dial after a network change could start N budgets late, with the device
+/// unreachable meanwhile.
+///
+/// ⚠️ A task is what starts a close. `AgentTunnelPeer::close` does nothing
+/// until it is polled, so "not waiting" must never become "dropping the
+/// future": that would leave the close to the `Drop` net under it.
 async fn close_all_tunnel_peers<P: TunnelPeerClose>(
     tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<P>>,
     exit: ConnExit,
@@ -6677,17 +6694,35 @@ async fn close_all_tunnel_peers<P: TunnelPeerClose>(
     }
     let count = tunnel_peers.len();
     let started = tokio::time::Instant::now();
-    for (session_id, peer) in tunnel_peers.drain() {
-        // Same bound as the session table's — a webrtc close on a captured
-        // network must not stall the signaling loop into the watchdog.
-        close_within_budget(peer.close(), session_id, "tunnel_ws_disconnect").await;
+    let closes: Vec<tokio::task::JoinHandle<()>> = tunnel_peers
+        .drain()
+        .map(|(session_id, peer)| {
+            tokio::spawn(async move {
+                // Same bound as the session table's.
+                close_within_budget(peer.close(), session_id, "tunnel_ws_disconnect").await;
+            })
+        })
+        .collect();
+    let all_closed = async move {
+        for close in closes {
+            // The peer's own close catches its panics (`peer_close`), so this
+            // is the rest of it: a flow's cancel, or the runtime going away.
+            if let Err(e) = close.await {
+                warn!(%e, "a tunnel peer's close did not run to its end");
+            }
+        }
+        info!(
+            count,
+            exit = exit.label(),
+            took_ms = started.elapsed().as_millis() as u64,
+            "torn down agent tunnel peers on ws disconnect"
+        );
+    };
+    if waits_for_tunnel_closes(exit) {
+        all_closed.await;
+    } else {
+        tokio::spawn(all_closed);
     }
-    info!(
-        count,
-        exit = exit.label(),
-        took_ms = started.elapsed().as_millis() as u64,
-        "torn down agent tunnel peers on ws disconnect"
-    );
 }
 
 /// #1754 — what the reap arm took out of the session maps for a session
