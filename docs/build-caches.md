@@ -142,9 +142,9 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 | The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1134`, `:1654`, `:2744` |
 | The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:404` |
 | CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:29` |
-| The integration shards and `ci.yml`'s macOS overlay check | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1572` |
-| `ci.yml`'s Windows clippy lane (#3940) | 11,000 MB | `ci.yml:1931` |
-| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:507`, `:237`, `:658`; `:1204`, `:2338`, `:2518`, `:3046` |
+| The integration shards and `ci.yml`'s macOS overlay check | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1581` |
+| `ci.yml`'s Windows clippy lane (#3940) | 11,000 MB | `ci.yml:1940` |
+| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:507`, `:237`, `:667`; `:1213`, `:2347`, `:2527`, `:3055` |
 
 **A cold build has to fit under its cap.** If it does not, every restore drops the cache, every
 run builds cold, and each master run publishes the same size again, so the GC never recovers.
@@ -168,9 +168,9 @@ first master run built the unit lane cold (1,795 crates) and hit the 30-minute c
 30 min 15 s, with the second part of its 2.6 GB archive still uploading. That part landed two
 seconds after the cut. The unit and lint lanes now allow 45 and 40 minutes (`ci.yml:477`,
 `:159`), about 1.5 times their measured cold runs (FR-6 wave 36). The macOS overlay check
-allows 35 (`ci.yml:1538`): its cold run took 22 min 33 s on 2026-10-30, after its cache crossed
+allows 35 (`ci.yml:1547`): its cold run took 22 min 33 s on 2026-10-30, after its cache crossed
 its 6,000 MB cap, against a 25-minute ceiling (FR-6 wave 37). The Windows clippy lane allows 55
-(`ci.yml:1890`) since #3940: its cold runs took up to 32 min against 40 before the companion's
+(`ci.yml:1899`) since #3940: its cold runs took up to 32 min against 40 before the companion's
 step joined them. Every other `ci.yml` lane with a cold run on record allows about 1.5 times it
 or more. A forced cold run on 2026-11-01 gave
 Windows sessions and the FR-85 recorder their first: 11.1 min against 40 and 8.9 against 30.
@@ -286,9 +286,9 @@ container starts exactly as before.
 
 | Subcommand | Does | Callers |
 |---|---|---|
-| `prepare [BOUND...]` (`:544`) | probe and failover, a bounded refresh, the apt-fast stand-in. It never fails the step | the composite (`ci-linux-system-deps/action.yml:63`); `ffmpeg-encoder-check` (`ci.yml:2350`); `recording-ffmpeg` (`ci.yml:2527`); release-agent's `build-linux` and `build-linux-companion`, before their cached steps (`release-agent.yml:313`, `:793`) |
-| `fallback PKG...` (`:614`) | bounded install, `--no-install-recommends`; with no resolver, one `::error` | the composite's verify steps (`action.yml:130`, `:186`); `ci.yml:2374`, `:2535` |
-| `install [BOUND...] [OPT...] -- PKG...` (`:634`) | `dpkg --configure -a`, probe and failover, bounded refresh, bounded two-phase install with exactly the caller's options. It adds no option, so recommends stay wherever the step had them | the recorder-audio lane's xvfb and xclip (`ci.yml:1301`, `:1337`, `:1445`); release-agent's fallbacks (`:364`, `:826`), `rpm` (`:884`), and the arm64 installs (`:972`, `:1107`); `apt-seed-install` (`action.yml:69`); release-tunnel (`:166`) |
+| `prepare [BOUND...]` (`:544`) | probe and failover, a bounded refresh, the apt-fast stand-in. It never fails the step | the composite (`ci-linux-system-deps/action.yml:63`); `ffmpeg-encoder-check` (`ci.yml:2359`); `recording-ffmpeg` (`ci.yml:2536`); release-agent's `build-linux` and `build-linux-companion`, before their cached steps (`release-agent.yml:313`, `:793`) |
+| `fallback PKG...` (`:614`) | bounded install, `--no-install-recommends`; with no resolver, one `::error` | the composite's verify steps (`action.yml:130`, `:186`); `ci.yml:2383`, `:2544` |
+| `install [BOUND...] [OPT...] -- PKG...` (`:634`) | `dpkg --configure -a`, probe and failover, bounded refresh, bounded two-phase install with exactly the caller's options. It adds no option, so recommends stay wherever the step had them | the recorder-audio lane's xvfb and xclip (`ci.yml:1310`, `:1346`, `:1454`); release-agent's fallbacks (`:364`, `:835`), `rpm` (`:893`), and the arm64 installs (`:981`, `:1116`); `apt-seed-install` (`action.yml:69`); release-tunnel (`:166`) |
 | `reach [--containers] [HOST...]` (`:672`) | probe and failover alone, for apt that runs elsewhere; one `::error` when the names do not resolve | `ui-phone-smoke.yml:78` (Playwright's `--with-deps` runs apt itself); the bundle checks' containers (`release-agent.yml:665`, `:1240`); every `deb-bare-check.sh` run (`release-agent.yml:1358`, `release-tunnel.yml:334`, `deb-bare-image.yml:78`) |
 | the stand-in (`:575`) | what cache-apt-pkgs-action's cold path runs as `apt-fast`: the bounded two-phase install. On failure it removes `~/cache-apt-pkgs`, so the action saves no empty set | every cached-apt step after a `prepare` |
 

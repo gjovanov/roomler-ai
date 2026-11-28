@@ -1900,7 +1900,7 @@ by the updater, where msiexec runs as LocalSystem, was not run. Each step now lo
 own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:134`). Since FR-145 P2
 a step writes it as the service writes its own: below `service-logs`, held by handle for the
 step's whole run and never reached through a link
-(`crates/agent-core/src/logging/held_logs.rs:298`). A link above `service-logs` sends the
+(`crates/agent-core/src/logging/held_logs.rs:302`). A link above `service-logs` sends the
 step's log to LocalSystem's profile instead, its first line naming the link (#3073). The steps:
 
 | Custom action | The verb | When it runs |
@@ -1991,7 +1991,7 @@ error chain in the file (`crates/agent-core/src/logging.rs:2215`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:2245`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2288`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1966`). In `roomlerd`,
+beside `stderr_capture` (`.github/workflows/ci.yml:1975`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:8116`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:8149`)
 pin the role per command and the end line of a failure.
@@ -2326,7 +2326,7 @@ neither line: its CLI names itself after an install (`installed: roomler <v>`, `
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
 feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
-records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3151-3162`).
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3160-3171`).
 Since #3931 it also runs every mode with every stand-in reading its stdin on every call, under dash
 with the script padded so that one of dash's 8 KiB reads ends inside the main block (from the
 `# ─── main ─` line to the end), and with the script cut short at sampled lines above the main block,
@@ -2385,7 +2385,7 @@ and with `set -o pipefail` (bash, zsh) the pipeline's status is curl's.
 
 The daemon's `.deb` has to start on a host with nothing on it: a bare server, a
 container, a cluster node. FFmpeg, libvpx and libva ride in the package, so
-`depends` is short (`agents/roomlerd/Cargo.toml:956`), and every name in it backs
+`depends` is short (`agents/roomlerd/Cargo.toml:958`), and every name in it backs
 a library the binary links directly:
 
 | `Depends` | Why it reads this way |
@@ -4277,9 +4277,9 @@ SIGPIPE, and the failed pipe read as "idle", as did a print that failed.
 container: a case for each reading, one where launchctl writes its answer in
 pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
-macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3149-3150`), and "macOS overlay
+macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3158-3159`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
-`:1550-1555`).
+`:1559-1564`).
 
 **A helper that waits for live work reads `running` too** (FR-151). An install
 the helper did not start finds it so during a chain, and leaves it alone. The

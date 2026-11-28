@@ -1955,18 +1955,13 @@ sockaddrs: <DST,GATEWAY>
     }
 
     impl Logs {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-        )]
-        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        /// The capture, through the one capture helper (#3403).
+        fn start() -> (Self, roomler_log_capture::Scope) {
             let logs = Self::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_ansi(false)
+            let subscriber = roomler_log_capture::fmt(logs.clone())
                 .with_max_level(tracing::Level::INFO)
                 .finish();
-            (logs, tracing::subscriber::set_default(subscriber))
+            (logs, roomler_log_capture::set_default(subscriber))
         }
 
         /// The lines at `level` that say `needle`.

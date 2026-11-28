@@ -5161,49 +5161,17 @@ mod system {
                 assert_eq!(overlapping_sibling(&existing, "roomler-abc", mine), None);
             }
 
-            /// A `tracing` writer into a buffer, so a test can read the WARN
-            /// line `register` formats rather than only the decision behind
-            /// it. Installed thread-scoped (`with_default`), so a parallel
-            /// test's events never land in it.
-            #[derive(Clone, Default)]
-            struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-            impl std::io::Write for Captured {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0.lock().unwrap().extend_from_slice(buf);
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-
-            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-                type Writer = Captured;
-                fn make_writer(&'a self) -> Captured {
-                    self.clone()
-                }
-            }
-
-            impl Captured {
-                fn text(&self) -> String {
-                    String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-                }
-            }
-
-            /// Run `f` with every WARN+ event captured, and return the text.
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-            )]
+            /// Run `f` with every WARN+ event captured, and return the text:
+            /// the WARN line `register` formats, rather than only the
+            /// decision behind it. Installed thread-scoped, through the one
+            /// capture helper (#3403), so a parallel test's events never land
+            /// in it.
             fn capture_warns(f: impl FnOnce()) -> String {
-                let buf = Captured::default();
-                let subscriber = tracing_subscriber::fmt()
-                    .with_writer(buf.clone())
-                    .with_ansi(false)
+                let buf = roomler_log_capture::Captured::default();
+                let subscriber = roomler_log_capture::fmt(buf.clone())
                     .with_max_level(tracing::Level::WARN)
                     .finish();
-                tracing::subscriber::with_default(subscriber, f);
+                roomler_log_capture::with_default(subscriber, f);
                 buf.text()
             }
 
@@ -10104,18 +10072,13 @@ mod macos_kernel_tests {
     }
 
     impl Logs {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-        )]
-        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        /// The capture, through the one capture helper (#3403).
+        fn start() -> (Self, roomler_log_capture::Scope) {
             let logs = Self::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_ansi(false)
+            let subscriber = roomler_log_capture::fmt(logs.clone())
                 .with_max_level(tracing::Level::INFO)
                 .finish();
-            (logs, tracing::subscriber::set_default(subscriber))
+            (logs, roomler_log_capture::set_default(subscriber))
         }
 
         fn text(&self) -> String {

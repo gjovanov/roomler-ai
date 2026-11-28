@@ -1251,7 +1251,7 @@ sequenceDiagram
 - **The frame goes through the input arbiter like a key**, so it needs the
   input floor and the session's input permission, as typing does. The injector
   then checks again
-  ([`enigo_backend.rs:329`](../agents/roomlerd/src/input/enigo_backend.rs#L329)):
+  ([`enigo_backend.rs:333`](../agents/roomlerd/src/input/enigo_backend.rs#L333)):
   the policy can change between the hello and the click, and a viewer is not
   trusted to have read the hello.
 - **The relay** ([`sas_relay.rs:43`](../agents/roomlerd/src/win_service/sas_relay.rs#L43))
@@ -2441,7 +2441,7 @@ logged in fast 4 times out of 4.
 `caps_for_frame` (`:292`) now reads once per run of typing. A read stands for as
 long as frames keep coming within `CAPS_FRESH_FOR`, 2 s of each other, on one
 foreground thread. A CapsLock key frame clears it (`caps_changed`, `:309`, called
-from `agents/roomlerd/src/input/enigo_backend.rs:278`), so the letters after it
+from `agents/roomlerd/src/input/enigo_backend.rs:282`), so the letters after it
 take the new state (read with CapsLock toggled twice inside a run of typing,
 `abcDEFabcDEFabcDEF`). Injecting 1,147 characters went from about 3.7 s to about
 0.9 s, because the attach was costing about 2.5 ms a character.
@@ -3145,12 +3145,12 @@ it: there is no hub timer for SSH, and the Windows worker relay waits the window
 
 | Test | Shows |
 |---|---|
-| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:9137`](../agents/roomlerd/src/signaling.rs#L9137)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
-| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:9208`](../agents/roomlerd/src/signaling.rs#L9208)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
-| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:9250`](../agents/roomlerd/src/signaling.rs#L9250)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
-| `an_auto_grant_logs_no_surfaces_going_up_and_is_granted_as_before` ([`:9298`](../agents/roomlerd/src/signaling.rs#L9298)) | #4016: a question that asked no surface logs no "still going up" line, and is granted as before |
-| `only_a_question_decided_while_its_surfaces_go_up_logs_that_they_were` ([`:9348`](../agents/roomlerd/src/signaling.rs#L9348)) | #4016: the line, once, for a question decided while its surfaces go up; none, and the verdict kept, when the verdict came first |
-| `a_question_that_ended_before_its_surfaces_says_so_in_their_line` ([`:9422`](../agents/roomlerd/src/signaling.rs#L9422)) | #4016: a verdict that comes after its question was answered says the question had ended; one that comes while it stands logs the plain line |
+| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:9115`](../agents/roomlerd/src/signaling.rs#L9115)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
+| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:9186`](../agents/roomlerd/src/signaling.rs#L9186)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
+| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:9228`](../agents/roomlerd/src/signaling.rs#L9228)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
+| `an_auto_grant_logs_no_surfaces_going_up_and_is_granted_as_before` ([`:9276`](../agents/roomlerd/src/signaling.rs#L9276)) | #4016: a question that asked no surface logs no "still going up" line, and is granted as before |
+| `only_a_question_decided_while_its_surfaces_go_up_logs_that_they_were` ([`:9326`](../agents/roomlerd/src/signaling.rs#L9326)) | #4016: the line, once, for a question decided while its surfaces go up; none, and the verdict kept, when the verdict came first |
+| `a_question_that_ended_before_its_surfaces_says_so_in_their_line` ([`:9400`](../agents/roomlerd/src/signaling.rs#L9400)) | #4016: a verdict that comes after its question was answered says the question had ended; one that comes while it stands logs the plain line |
 | `a_marker_is_rewritten_only_while_its_question_stands` ([`consent.rs:1253`](../agents/roomlerd/src/consent.rs#L1253)) | the notification's marker rewrite writes nothing for a question that ended |
 
 ⚠️ **A click on a notification's body is not an answer** (FR-93 P6f). GNOME 50
@@ -5422,7 +5422,7 @@ session not yet live, and an external one, end as before FR-138.
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1180`) |
 | each row above | each arm is the loop's one call into the table, and nothing else closes the connection's peers | `every_arm_of_the_connection_ends_through_the_table` (`agents/roomlerd/src/session_table.rs:2438`) |
-| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:976`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:9053`) |
+| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:976`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:9031`) |
 | an external session (FR-52, D3) | built with no link, so it closes at every exit. The server ends it at the drop and refuses a claim of it | `an_external_session_is_built_without_a_link` (`agents/roomlerd/src/session_table.rs:3351`); `a_delegated_or_external_session_closes_at_a_transient_exit` (`:2513`); `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:976`); `a_claim_of_an_external_session_is_refused` (`crates/tests/src/rc_resume_pd_tests.rs:379`) |
 
 ⚠️ **The rollback floor.** Production has written `session_detached` and `session_resumed` since P3 turned the window
@@ -5604,7 +5604,7 @@ per pump ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a
 | a viewer older than P4b-2 | it opens no `video-deadline`. The pick finds none, the session stays on `video-bytes`, and where the carrier wanted one a line says so once per send task |
 | a `video-bytes` that arrives unordered | an older viewer's retired opt-in (`roomler-rc-unordered-video`, retired by P4b-2). The agent sends on it as today under every value: it acts only on the channel labelled `video-deadline` |
 | an agent older than P4b-3 | it attaches `video-deadline` log-only (the catch-all arm, `peer.rs:1423`), and the viewer's second channel stays one idle stream |
-| a viewer older than P4b-3b | it sends no `relay`, so the agent picks exactly as P4b-3 did. Its lines are P4b-3's but for `tcp_end`, which reads `agent` or `none` as the class is TCP or not (`an_older_viewer_gets_p4b_3_s_picks_and_lines`, `media_deadline.rs:2985`) |
+| a viewer older than P4b-3b | it sends no `relay`, so the agent picks exactly as P4b-3 did. Its lines are P4b-3's but for `tcp_end`, which reads `agent` or `none` as the class is TCP or not (`an_older_viewer_gets_p4b_3_s_picks_and_lines`, `media_deadline.rs:2964`) |
 | an agent older than P4b-3b | it reads `rc:decodestat`'s keys by name, so it ignores `relay`, and every key the message carried before is unchanged (`useRemoteControl.spec.ts` locks it). The session picks by the agent's own end |
 
 **The lines,** each with `session`:
@@ -6531,8 +6531,8 @@ to-activate, so the browser never sees a bait-and-switch.
 - **The watcher on X11 (FR-97 P3e-3a)**: an X11 session gets Windows'
   sequence number in another form. XFixes reports every change of the
   CLIPBOARD selection's owner, which is what a copy is
-  (`agents/roomlerd/src/clipboard.rs:1319` `x11_gate`), so a tick whose
-  counter did not move reads nothing (`clipboard.rs:1846`). That makes
+  (`agents/roomlerd/src/clipboard.rs:1323` `x11_gate`), so a tick whose
+  counter did not move reads nothing (`clipboard.rs:1850`). That makes
   copied images affordable, and they are watched now, where before an
   image waited for the clipboard button; text no longer costs a read and
   a hash every second, and the worker ticks at Windows' 200 ms behind the
@@ -6553,9 +6553,9 @@ to-activate, so the browser never sees a bait-and-switch.
   the worker takes arboard's process-wide connection down through a second
   handle, opens a fresh one on the new server on a helper thread and proves it
   with a read, under a 6 s bound, and the gate opens again (`x11_follow`,
-  `agents/roomlerd/src/clipboard.rs:1035`; `Follow::check`, `:1138`). A
+  `agents/roomlerd/src/clipboard.rs:1039`; `Follow::check`, `:1142`). A
   follow that failed, and a first start (`Clipboard::shared`, `:459`) or a
-  gate check (`available`, `:1410`) that failed while the desktop was down,
+  gate check (`available`, `:1414`) that failed while the desktop was down,
   are tried again at most every 10 s once its server answers (`Retry`,
   `:700`). A session the desktop's restart left behind keeps the daemon's
   clipboard: until it reconnects it receives the new desktop's copies, and its
@@ -6572,17 +6572,17 @@ to-activate, so the browser never sees a bait-and-switch.
   [`linux-capture.md` §2.4](linux-capture.md#24-what-an-x-server-exit-does-to-everything-that-was-open-3671-3918).
 - **The watcher on a Mac (FR-97 P2e-1)**: the same gate, from
   `NSPasteboard`'s change count, which the pasteboard server moves on every
-  write by any app (`agents/roomlerd/src/clipboard.rs:1452` `mac_gate`). The
-  tick and the early return are X11's (`clipboard.rs:671`, `:1846`), so
+  write by any app (`agents/roomlerd/src/clipboard.rs:1456` `mac_gate`). The
+  tick and the early return are X11's (`clipboard.rs:671`, `:1850`), so
   copied images are watched on a Mac too, and text is read when it changed.
   Measured first, on macOS 27 (FR-97 §8): without the gate a session read the
   general pasteboard's text and html every second. Apple's pasteboard privacy
   may ask the person before an app reads what another app copied, and a read
   the gate skips cannot ask. The count is read inside an autorelease pool of
-  its own (`clipboard.rs:1493`), because the clipboard worker is not the main
+  its own (`clipboard.rs:1497`), because the clipboard worker is not the main
   thread. `unavailable["clipboard-image-events"]` goes away wherever the
   switch is on (`agents/roomlerd/src/encode/caps.rs:2815`), without asking this
-  process's own pasteboard (`clipboard.rs:1503`): on a supervised Mac the root
+  process's own pasteboard (`clipboard.rs:1507`): on a supervised Mac the root
   daemon says the hello, while a delegated session's clipboard runs in the GUI
   worker. A root daemon outside the console session cannot reach the
   pasteboard server at all (its lookup fails, measured), so its count never
@@ -6750,7 +6750,7 @@ to-activate, so the browser never sees a bait-and-switch.
   answer, ends the dropping, and an accepted one takes its id off the list. A
   chunk or an end for an upload never begun is answered as before, and so is
   everything on the declined (#3757) and FILES-denied channels. Tests:
-  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17693`), over
+  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17670`), over
   a real channel through the production router, and
   `files::refused_begin_tests` (`files.rs:14126`).
   **A refused folder is said, not hidden** (#2930). The agent falls back to

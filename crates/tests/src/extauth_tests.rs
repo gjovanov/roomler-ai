@@ -1147,41 +1147,19 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
     }
 }
 
-/// What `install` hands back: the scoped subscriber, and a SECOND registered
-/// dispatcher, never one alone. With exactly one registered, tracing-core
-/// rebuilds a callsite's interest from the default of whichever thread reaches
-/// it first (`Rebuilder::JustOne`) and caches it for every thread. A parallel
-/// test with no subscriber of its own makes it `never`, and the capture misses
-/// that line for good, though this thread emitted it. It can be any line: the
-/// lane installs no global subscriber, so nothing registers a callsite before
-/// the first capture does. Measured on CI, run 41584702058: "login VERIFIED by
-/// the device" missed while `the_org_hears_of_a_persons_first_session_once`
-/// logged in beside it. With two, every registered dispatcher is asked, as
-/// `roomler-node-core`'s config tests hold it. The scope ends first, then the
-/// second.
-struct CaptureGuard {
-    _scoped: tracing::subscriber::DefaultGuard,
-    _second: tracing::Dispatch,
-}
-
 impl LogCapture {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
-    fn install(&self) -> CaptureGuard {
-        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let scoped = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
+    /// This thread's capture until the scope drops, through the one capture
+    /// helper (#3403), which holds the second registered dispatcher. Measured
+    /// on CI before it, run 41584702058: "login VERIFIED by the device" missed
+    /// while `the_org_hears_of_a_persons_first_session_once` logged in beside
+    /// it. The lane installs no global subscriber, so any line can be the
+    /// first to register.
+    fn install(&self) -> roomler_log_capture::Scope {
+        roomler_log_capture::set_default(
+            roomler_log_capture::fmt(self.clone())
                 .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .with_writer(self.clone())
                 .finish(),
-        );
-        CaptureGuard {
-            _scoped: scoped,
-            _second: second,
-        }
+        )
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -1195,8 +1173,8 @@ impl LogCapture {
 
 /// The capture sees every line its own thread logs, even one another thread
 /// reached first. With one registered dispatcher that thread's `never` would be
-/// cached for both (`CaptureGuard`), which is how CI lost a line the capture
-/// test asserts on.
+/// cached for both (the capture helper's second dispatcher prevents it), which
+/// is how CI lost a line the capture test asserts on.
 #[test]
 fn the_capture_sees_a_line_another_thread_reached_first() {
     fn reach() {

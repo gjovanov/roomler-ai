@@ -6991,10 +6991,6 @@ mod tests {
     /// back, and the model's floor is the busiest second. `--nocapture` prints
     /// the two lines.
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     fn a_healthy_session_reads_application_limited() {
         let mut s = V5bSession::open(true, None);
         s.load();
@@ -7015,14 +7011,11 @@ mod tests {
             idle.model_floor.unwrap().age,
             busy.model_floor.unwrap().age + Duration::from_secs(30)
         );
-        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let subscriber = tracing_subscriber::fmt()
+        let subscriber = roomler_log_capture::fmt(tracing_subscriber::fmt::TestWriter::new())
             .with_target(false)
-            .with_ansi(false)
-            .with_test_writer()
             .finish();
         let session = bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap();
-        tracing::subscriber::with_default(subscriber, || {
+        roomler_log_capture::with_default(subscriber, || {
             crate::media_delivery::emit_model(session, &busy);
             crate::media_delivery::emit_model(session, &idle);
         });

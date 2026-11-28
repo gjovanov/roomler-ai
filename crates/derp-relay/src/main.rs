@@ -2203,7 +2203,7 @@ mod tests {
             let out = Captured::default();
             let filter = tracing_subscriber::EnvFilter::new("info");
             let subscriber = log_subscriber(filter, out.clone(), colour).finish();
-            tracing::subscriber::with_default(subscriber, || {
+            roomler_log_capture::with_default(subscriber, || {
                 info!(peers = 3, "a relay line with a field");
             });
             let bytes = out.0.lock().unwrap().clone();

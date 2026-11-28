@@ -892,6 +892,8 @@ roomler-node-core = { path = "../../crates/agent-core", features = ["test-fixtur
 # File-DC integration test (tests/file_dc.rs) needs the zip crate
 # to unpack the agent's streaming-zip output and verify content.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# #3403 — the one way a test reads its own log lines.
+roomler-log-capture = { path = "../../crates/log-capture" }
 
 # ---------------------------------------------------------------------------
 # Packaging metadata

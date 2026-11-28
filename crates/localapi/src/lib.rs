@@ -12672,7 +12672,7 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         // This test's thread runs the loop too (a current-thread runtime).
         let logged = Logged::default();
-        let _logging = tracing::subscriber::set_default(logged.clone());
+        let _logging = roomler_log_capture::set_default(logged.clone());
         let me = own_uid().unwrap();
         let dir = std::env::temp_dir().join(format!("roomler-4202-loop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -12788,7 +12788,7 @@ mod tests {
         }
 
         let logged = Logged::default();
-        tracing::subscriber::with_default(logged.clone(), || {
+        roomler_log_capture::with_default(logged.clone(), || {
             PersonDrop::of(None).log(Some(4242), 501);
             PersonDrop::of(Some(&left)).log(None, 501);
             PersonDrop::of(Some(&unread)).log(None, 501);

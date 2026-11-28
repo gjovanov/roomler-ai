@@ -133,6 +133,8 @@ roomler-node-core = { path = "../../crates/agent-core", features = ["test-fixtur
 # FR-129 C - `spawn_gate.rs` parses the source of the wizard's Windows path, with
 # its `cfg` applied, to see how each spawn names its program.
 syn = { version = "2", features = ["full", "visit"] }
+# #3403 — the one way a test reads its own log lines.
+roomler-log-capture = { path = "../../crates/log-capture" }
 quote = "1"
 # #3432 — the failure table's TLS server, with a certificate no one trusts.
 # Ring-only, as the rest of the tree resolves them (no aws-lc-rs).

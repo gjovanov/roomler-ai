@@ -860,7 +860,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt as _;
         let (layer, mut rx) = LogUploadLayer::new();
         let message = String::from("rich transfer n1 ended at 0 of 2 declared bytes");
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+        roomler_log_capture::with_default(tracing_subscriber::registry().with(layer), || {
             tracing::warn!(id = "n1", ?message, "clipboard: rich write failed");
             tracing::warn!(id = "n1", %message, "clipboard: rich write failed");
             tracing::warn!(message = "a field's text", "the line's text");

@@ -28,6 +28,11 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# #3403 — the one way a test reads its own log lines. A dev-dependency only, so
+# the crate stays a leaf for everything that links it.
+roomler-log-capture = { path = "../log-capture" }
+
 [target.'cfg(unix)'.dependencies]
 # FR-85 — `geteuid`, for the console-user check on the recording verbs (the
 # peer's uid itself comes from tokio's `peer_cred`).

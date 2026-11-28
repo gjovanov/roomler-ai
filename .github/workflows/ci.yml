@@ -576,6 +576,15 @@ jobs:
           -p roomler-ai-mod-remote
           -p roomler-ai-mod-conference
 
+      # #3403 — the capture helper, the one way a test reads its own log lines.
+      # Its probe (`tests/another_thread_first.rs`) is the only test in its own
+      # binary: another thread reaches a fresh line first, and the capture's
+      # thread still sees it. It turns red if the helper stops holding a second
+      # registered dispatcher, or if a tracing upgrade changes the behaviour the
+      # helper works around. Not `--lib` only: the probe is an integration test.
+      - name: Run the log-capture helper's tests (#3403)
+        run: cargo test -p roomler-log-capture
+
       # #3736 — the LocalAPI client keeps a socket only when its own account or
       # root serves it. The step above proves the rule and the candidate loop
       # as the runner; this one proves the kernel's credentials across real

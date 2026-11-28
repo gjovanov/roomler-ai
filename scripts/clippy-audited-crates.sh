@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # clippy-audited-crates.sh — the `--all-targets` clippy lane of ci.yml's rust-lint job,
-# and of scripts/ci-local.sh: the server crates audited green under `--all-targets`, plus
-# EVERY `roomler-ai-mod-*` workspace member.
+# and of scripts/ci-local.sh: the server crates audited green under `--all-targets`, the
+# capture helper and the crates whose tests capture that no other Linux lane lints (#3403),
+# plus EVERY `roomler-ai-mod-*` workspace member.
 #
 # WHY THE MODULE LIST IS READ, NOT WRITTEN
 #
@@ -22,7 +23,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-AUDITED=(roomler-ai-api roomler-ai-services roomler-ai-tests roomler-core)
+# roomler-log-capture (#3403): the capture helper, the one crate allowed to call
+# tracing's scoped-default entry points (root clippy.toml); its probe test is linted too.
+# roomler-cli, derp-relay, roomler-node-core, roomler-localapi (#3403): their tests read
+# their own log lines, and no other Linux lane lints their test targets (the node core and
+# LocalAPI are linted on Windows only, the CLI and the relay nowhere), so the root
+# clippy.toml's scoped-default entries would not hold in them. roomler-ai-tests already
+# builds roomlerd and so all four's dependencies: they add few crates to this lane.
+AUDITED=(roomler-ai-api roomler-ai-services roomler-ai-tests roomler-core roomler-log-capture
+  roomler-cli derp-relay roomler-node-core roomler-localapi)
 
 if grep -rnE 'items_after_test_module' crates/modules Cargo.toml; then
   echo "::error::a module crate allows clippy::items_after_test_module — move its test module to the end of the file instead (#3594)" >&2

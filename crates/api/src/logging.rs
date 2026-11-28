@@ -182,7 +182,7 @@ mod tests {
     fn written(colour: bool) -> String {
         let out = Captured::default();
         let subscriber = tracing_subscriber::registry().with(layer(out.clone(), colour));
-        tracing::subscriber::with_default(subscriber, || {
+        roomler_log_capture::with_default(subscriber, || {
             tracing::info!(peers = 3, "a line with a field");
         });
         let bytes = out.0.lock().unwrap().clone();

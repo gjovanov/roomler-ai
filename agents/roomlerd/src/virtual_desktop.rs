@@ -7789,28 +7789,16 @@ mod supervise_tests {
     // stop of the daemon asked for. Stand-ins only: no X server, never `:99`.
     // -----------------------------------------------------------------------
 
-    /// A log, as the daemon's log file writes it.
+    /// A log, as the daemon's log file writes it: the capture helper's buffer
+    /// (#3403).
     #[derive(Clone, Default)]
-    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
+    struct LogBuf(roomler_log_capture::Captured);
 
     impl LogBuf {
         /// The lines that say `text`, at any level.
         fn lines_with(&self, text: &str) -> Vec<String> {
-            let all = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            String::from_utf8_lossy(&all)
+            self.0
+                .text()
                 .lines()
                 .filter(|l| l.contains(text))
                 .map(|l| l.trim_start().to_string())
@@ -7819,8 +7807,8 @@ mod supervise_tests {
 
         /// The lines logged at WARN or above.
         fn warnings(&self) -> Vec<String> {
-            let text = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            String::from_utf8_lossy(&text)
+            self.0
+                .text()
                 .lines()
                 .map(str::trim_start)
                 .filter(|l| l.starts_with("WARN") || l.starts_with("ERROR"))
@@ -7831,28 +7819,19 @@ mod supervise_tests {
 
     /// [`supervise`] on a thread of its own, whose log is kept: a
     /// subscriber set for one thread hears that thread only.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
     fn supervise_logged(
         desk: &Arc<Desktop>,
         first: XServer,
     ) -> (std::thread::JoinHandle<()>, LogBuf) {
         let log = LogBuf::default();
-        let writer = log.clone();
+        let writer = log.0.clone();
         let desk = desk.clone();
         let supervisor = std::thread::spawn(move || {
-            // Two dispatchers, never one: with one, a callsite's interest is
-            // taken once for every thread.
-            let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-            let subscriber = tracing_subscriber::fmt()
+            let subscriber = roomler_log_capture::fmt(writer)
                 .with_target(false)
-                .with_ansi(false)
                 .without_time()
-                .with_writer(move || writer.clone())
                 .finish();
-            tracing::subscriber::with_default(subscriber, || supervise(&desk, Some(first)));
+            roomler_log_capture::with_default(subscriber, || supervise(&desk, Some(first)));
         });
         (supervisor, log)
     }

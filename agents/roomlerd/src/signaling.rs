@@ -8604,53 +8604,30 @@ mod tests {
 
     /// #4010, #4016 — the lines logged on this thread while it lives, as the
     /// daemon's log file writes them. A `#[tokio::test]` polls every task it
-    /// spawns on this thread, so their lines land here too. Two dispatchers,
-    /// never one: with one, a callsite's interest is taken once for every
-    /// thread.
+    /// spawns on this thread, so their lines land here too. Through the one
+    /// capture helper (#3403).
     struct Logged {
-        buf: Arc<std::sync::Mutex<Vec<u8>>>,
-        _default: tracing::subscriber::DefaultGuard,
-        _second: tracing::Dispatch,
-    }
-
-    #[derive(Clone)]
-    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+        log: roomler_log_capture::Captured,
+        _scope: roomler_log_capture::Scope,
     }
 
     impl Logged {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-        )]
         fn start() -> Self {
-            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let writer = LogBuf(buf.clone());
-            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-            let subscriber = tracing_subscriber::fmt()
+            let log = roomler_log_capture::Captured::default();
+            let subscriber = roomler_log_capture::fmt(log.clone())
                 .with_target(false)
-                .with_ansi(false)
                 .without_time()
-                .with_writer(move || writer.clone())
                 .finish();
             Self {
-                buf,
-                _default: tracing::subscriber::set_default(subscriber),
-                _second: second,
+                log,
+                _scope: roomler_log_capture::set_default(subscriber),
             }
         }
 
         /// The lines logged so far that contain `needle`, in order.
         fn lines_with(&self, needle: &str) -> Vec<String> {
-            String::from_utf8_lossy(&self.buf.lock().unwrap())
+            self.log
+                .text()
                 .lines()
                 .filter(|l| l.contains(needle))
                 .map(str::to_string)
@@ -8659,7 +8636,8 @@ mod tests {
 
         /// Where the first line that contains every one of `needles` is.
         fn first(&self, needles: &[&str]) -> usize {
-            String::from_utf8_lossy(&self.buf.lock().unwrap())
+            self.log
+                .text()
                 .lines()
                 .position(|l| needles.iter().all(|n| l.contains(n)))
                 .unwrap_or_else(|| panic!("no line with {needles:?}"))

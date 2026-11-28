@@ -52,7 +52,7 @@ flowchart TD
 |---|---|---|---|
 | **ANCHOR** | `RETIRED-NAME-ANCHOR` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | code that resolves, matches or writes the retired name at runtime — a read-fallback over a pre-rename tree, a sweep that deletes the old unit, a wire value a deployed peer still sends | `anchors` must equal the baseline in both directions (`:563`, `:581`): a deleted anchor and a stale floor both fail |
 | **RECORD** | `RETIRED-NAME-RECORD` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | prose and fixtures that name the retired thing *in order to explain it* — a field log quoting real output, a migration note, the table above | `records` must equal the baseline in both directions (`:595`) |
-| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:609`); the `name-audit` job in `.github/workflows/ci.yml:2816` runs it on every PR (`:2858`) |
+| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:609`); the `name-audit` job in `.github/workflows/ci.yml:2825` runs it on every PR (`:2867`) |
 
 🔑 **The falsifiable rule**: *if deleting the live code would also delete this
 occurrence, it is an ANCHOR; if the occurrence would survive, it is a RECORD.*
@@ -70,7 +70,7 @@ comment would otherwise have exempted the regression.
 Both counts move only with `scripts/name-audit.sh --update-baseline`, committed
 in the same PR, whose body says which anchor retired (and which field state no
 longer exists) or which record was added (and what it records). The CI job
-prints the summary beside its verdict (`ci.yml:2861`), so a reviewer can diff
+prints the summary beside its verdict (`ci.yml:2870`), so a reviewer can diff
 the number against the claim. A marker that covers nothing fails `--check`
 (`:555`): an empty exemption is the one that silently widens.
 
@@ -139,7 +139,7 @@ its memory limit — an 80-second read outage, self-healed.
 
 ## The sister guard: the word "agent" (FR-133)
 
-The `name-audit` job runs a second guard as its last step (`.github/workflows/ci.yml:2864`):
+The `name-audit` job runs a second guard as its last step (`.github/workflows/ci.yml:2873`):
 `scripts/says-roomlerd.cjs`, FR-133 P4's. It hunts a retired *word*, not a retired name: nothing a
 person reads calls the daemon an "agent", except the wire and OS identities FR-133 keeps, each
 listed in the script with its reason. It has this page's shape (one script, a committed baseline

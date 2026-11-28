@@ -136,6 +136,10 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
                 // the server: drop it with nothing listening on this thread.
                 // The arbiter has said why, once.
                 let quiet = tracing::Dispatch::none();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "production, not a capture: enigo's drop logs to nobody on a dead connection (#3918; root clippy.toml, #3403)"
+                )]
                 tracing::dispatcher::with_default(&quiet, move || drop(enigo));
                 return;
             }

@@ -783,7 +783,7 @@ swapped. A process with no role, and every platform but Windows, writes as befor
 
 | Writer | By handle | Code |
 |---|---|---|
-| The day's log | `append_file("<basename>.<YYYY-MM-DD>")`, tracing-appender's daily name, a new one each UTC day, rolled forward only. A day whose file cannot be opened keeps the day before's, as tracing-appender's roll does | `crates/agent-core/src/logging/held_logs.rs:298`, `crates/agent-core/src/logging/held_logs.rs:361` |
+| The day's log | `append_file("<basename>.<YYYY-MM-DD>")`, tracing-appender's daily name, a new one each UTC day, rolled forward only. A day whose file cannot be opened keeps the day before's, as tracing-appender's roll does | `crates/agent-core/src/logging/held_logs.rs:302`, `crates/agent-core/src/logging/held_logs.rs:365` |
 | The prune, the panic file, stderr's file (#3292, #3438) | `entries` and `remove_file`, by the same name and age rule; `write_file`; `append_file` twice, the cap read from the file itself, never from the folder's listing, which NTFS updates lazily for a file open for writing | `crates/agent-core/src/logging.rs:1166`, `crates/agent-core/src/logging.rs:1218`, `crates/agent-core/src/logging.rs:863` |
 | The daemon's encoder caps cache, install record, wedged MSI log and update-attempt marker | `write_file`; the cache read with `read_file`; the wedged log's slot before with `rename_file` | `agents/roomlerd/src/encode/caps_cache.rs:317`, `:337`, `agents/roomlerd/src/post_install.rs:272`, `agents/roomlerd/src/post_install.rs:1000`, `agents/roomlerd/src/updater.rs:242` |
 
@@ -795,7 +795,7 @@ a reader that does not share deletion (PowerShell's `Get-Content`, `type`) canno
 the file, and a day's log is open all day. A hold that is refused (a link above
 `service-logs`) takes #3073's per-profile fallback, the reason the first line logged; what
 the hold itself logs, the leaf policy's one WARN, is logged once the log is open, since
-the hold comes before it (`crates/agent-core/src/logging/held_logs.rs:233`).
+the hold comes before it (`crates/agent-core/src/logging/held_logs.rs:229`).
 
 ### A viewer's file transfer acts as the person at the screen (#3048, #3669, #3688)
 

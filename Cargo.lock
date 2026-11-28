@@ -2428,6 +2428,7 @@ dependencies = [
  "redis",
  "ring",
  "roomler-ai-remote-control",
+ "roomler-log-capture",
  "serde",
  "serde_json",
  "tokio",
@@ -8258,6 +8259,7 @@ dependencies = [
  "roomler-ai-remote-control",
  "roomler-ai-services",
  "roomler-core",
+ "roomler-log-capture",
  "serde",
  "serde_json",
  "sha1 0.10.6",
@@ -8406,11 +8408,11 @@ dependencies = [
  "roomler-ai-services",
  "roomler-ai-tunnel-core",
  "roomler-core",
+ "roomler-log-capture",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -8558,6 +8560,7 @@ dependencies = [
  "roomler-ai-services",
  "roomler-cli",
  "roomler-core",
+ "roomler-log-capture",
  "roomlerd",
  "serde",
  "serde_json",
@@ -8597,6 +8600,7 @@ dependencies = [
  "ring",
  "roomler-ai-remote-control",
  "roomler-localapi",
+ "roomler-log-capture",
  "rustls",
  "serde",
  "serde_json",
@@ -8640,6 +8644,7 @@ dependencies = [
  "reqwest 0.12.28",
  "roomler-ai-remote-control",
  "roomler-ai-tunnel-core",
+ "roomler-log-capture",
  "roomler-node-core",
  "rpassword",
  "serde",
@@ -8712,6 +8717,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "roomler-localapi",
+ "roomler-log-capture",
  "roomler-node-core",
  "serde",
  "serde_json",
@@ -8733,11 +8739,20 @@ version = "0.4.239"
 dependencies = [
  "async-trait",
  "libc",
+ "roomler-log-capture",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "roomler-log-capture"
+version = "0.4.239"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -8762,6 +8777,7 @@ dependencies = [
  "roomler-ai-remote-control",
  "roomler-ai-tunnel-core",
  "roomler-localapi",
+ "roomler-log-capture",
  "serde",
  "serde_ignored",
  "serde_json",
@@ -8793,6 +8809,7 @@ dependencies = [
  "roomler-ai-remote-control",
  "roomler-cli",
  "roomler-localapi",
+ "roomler-log-capture",
  "roomler-node-core",
  "roomler-setup-core",
  "roomlerd",
@@ -8893,6 +8910,7 @@ dependencies = [
  "roomler-ai-remote-control",
  "roomler-ai-tunnel-core",
  "roomler-cli",
+ "roomler-log-capture",
  "roomler-node-core",
  "russh",
  "scrap",

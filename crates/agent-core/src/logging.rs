@@ -1579,7 +1579,7 @@ mod tests {
     /// callsite's cached interest, so no other test's filter answers for this one.
     fn kept(rust_log: Option<&str>, check: impl FnOnce() -> bool) -> bool {
         let dispatch = tracing::Dispatch::new(filtered(filter_for(rust_log)));
-        tracing::dispatcher::with_default(&dispatch, check)
+        roomler_log_capture::with_dispatch(&dispatch, check)
     }
 
     /// #3656 — tungstenite writes a client's whole upgrade request at TRACE,
@@ -2659,7 +2659,7 @@ mod tests {
             W: for<'w> fmt::MakeWriter<'w> + Send + Sync + 'static,
         {
             let subscriber = tracing_subscriber::registry().with(console_layer(writer, colour));
-            tracing::subscriber::with_default(subscriber, || {
+            roomler_log_capture::with_default(subscriber, || {
                 tracing::info!(peers = 3, "a console line with a field");
             });
             let bytes = out.0.lock().unwrap().clone();

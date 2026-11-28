@@ -1972,13 +1972,10 @@ mod tests {
         let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
         let session = "34330000000000000000d2d2";
         let late = Arc::new(Mutex::new(None));
-        // ⚠️ A second dispatcher, alive as long as this one. With only one
-        // registered, tracing takes the interest of a callsite first hit on
-        // ANOTHER thread from that thread's own default (none) and caches
-        // "never" for every thread. The other tests resolve prompts at the
-        // same time, and this hook then never heard the decision.
-        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
-        let _log = tracing::subscriber::set_default(tracing_subscriber::registry().with(
+        // Through the capture helper (#3403): the other tests resolve prompts
+        // at the same time, and a hook alone beside them once never heard the
+        // decision.
+        let _log = roomler_log_capture::set_default(tracing_subscriber::registry().with(
             AnswerAtTheDecision {
                 broker: broker.clone(),
                 session,
@@ -2364,11 +2361,10 @@ mod tests {
         #[test]
         fn the_ready_line_names_the_folder_or_says_the_file_channel_is_off() {
             use tracing_subscriber::layer::SubscriberExt;
-            // ⚠️ A second dispatcher, as in `a_decided_question_takes_no_more_answers`:
-            // another test may reach these log lines first, on a thread with none.
-            let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+            // Through the capture helper (#3403): another test may reach these
+            // log lines first, on a thread with no subscriber.
             let seen = Arc::new(Mutex::new(Vec::new()));
-            let _log = tracing::subscriber::set_default(
+            let _log = roomler_log_capture::set_default(
                 tracing_subscriber::registry().with(Lines(seen.clone())),
             );
             let own = fixture_dir("ready-line");

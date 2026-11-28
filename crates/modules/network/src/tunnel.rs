@@ -2254,44 +2254,16 @@ mod tests {
         )
     }
 
-    /// A `tracing` writer into a buffer, so a test reads the WARN line the
-    /// gate writes. Installed thread-scoped (`with_default`), so a parallel
-    /// test's events never land in it.
-    #[derive(Clone, Default)]
-    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Captured;
-        fn make_writer(&'a self) -> Captured {
-            self.clone()
-        }
-    }
-
     /// Run `f` with every WARN+ event captured; return its value and the text.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
-    )]
+    /// Installed thread-scoped, through the one capture helper (#3403), so a
+    /// parallel test's events never land in it.
     fn capture_warns<T>(f: impl FnOnce() -> T) -> (T, String) {
-        let buf = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
+        let buf = roomler_log_capture::Captured::default();
+        let subscriber = roomler_log_capture::fmt(buf.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
-        (out, text)
+        let out = roomler_log_capture::with_default(subscriber, f);
+        (out, buf.text())
     }
 
     /// No live policy names a role: no role list can change the decision, so
