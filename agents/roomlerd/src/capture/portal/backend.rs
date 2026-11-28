@@ -641,8 +641,13 @@ impl ScreenCapture for PortalCapture {
             }
             // No frame inside the window is not an error: a still screen
             // legitimately produces nothing, and `Ok(None)` is the pump's
-            // "nothing this tick".
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            // "nothing this tick". #4570 — it is said after one yield: the
+            // wait above blocks in place, a caller with no frame yet has no
+            // other await, and an abort or a deadline lands where one suspends.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tokio::task::yield_now().await;
+                Ok(None)
+            }
             // FR-93 P6c — why the helper ended is in its exit status, which
             // follows its stdout closing within moments. #3695 — unless the
             // reader refused a frame: then that is why.
@@ -760,7 +765,8 @@ fn stream_end(
 
 /// How long a single `next_frame` waits before reporting "nothing this tick".
 /// Long enough not to spin on a still screen, short enough that the pump stays
-/// responsive to a resize or a teardown.
+/// responsive to a resize or a teardown: with no frame, an abort or a deadline
+/// lands at the yield that follows a timeout (#4570), so within one such wait.
 const FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How long `open` waits for the helper's stream handshake before giving up.
@@ -923,6 +929,84 @@ mod tests {
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "the helper is still in the process table"
+        );
+    }
+
+    /// How long a test lets a wait that should have ended run on before it
+    /// closes the stream: far above one `FRAME_WAIT`, so a slow runner does not
+    /// read as a failure.
+    const STUCK: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A capture on a stream that never sends a frame, and the stream's other
+    /// end. Dropping that end closes the stream, which ends a wait that nothing
+    /// else did: a failure below is a failure and not a hang.
+    fn a_capture_with_no_frame() -> (PortalCapture, std::sync::mpsc::SyncSender<Frame>) {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(1);
+        let capture = PortalCapture {
+            child,
+            rx,
+            width: 4,
+            height: 2,
+            input_route_generation: None,
+            cursor_embedded: false,
+            mutter: false,
+            watch: None,
+            last_frame: None,
+            refused: Default::default(),
+        };
+        (capture, tx)
+    }
+
+    /// #4570 — an abort lands only where a task suspends, and the wait for a
+    /// frame blocks in place. A pump with no frame yet reaches no other await,
+    /// so each "nothing this tick" has to pass one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pump_with_no_frame_yet_ends_at_its_abort() {
+        let (mut capture, tx) = a_capture_with_no_frame();
+        let mut pump = tokio::spawn(async move {
+            // What a pump does with no frame yet: it asks again.
+            while let Ok(None) = capture.next_frame().await {}
+        });
+        // Aborted inside its first wait.
+        tokio::time::sleep(FRAME_WAIT / 5).await;
+        pump.abort();
+        let ended = tokio::time::timeout(STUCK, &mut pump).await;
+        drop(tx);
+        let Ok(ended) = ended else {
+            let _ = pump.await;
+            panic!("the abort did not end a pump that had no frame yet");
+        };
+        assert!(
+            ended.is_err_and(|e| e.is_cancelled()),
+            "the pump ended by itself, not by its abort"
+        );
+    }
+
+    /// #4570 — the same wait under a deadline. A recording waits for its first
+    /// frame with a loop of asks inside a timeout, and a timeout fires only
+    /// where the future it wraps returns to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deadline_around_waits_with_no_frame_fires() {
+        let (mut capture, tx) = a_capture_with_no_frame();
+        let (done, done_rx) = std::sync::mpsc::channel::<()>();
+        let closer = std::thread::spawn(move || {
+            let _ = done_rx.recv_timeout(STUCK);
+            drop(tx);
+        });
+        let first = tokio::time::timeout(FRAME_WAIT / 5, async {
+            // A recording's wait for its first frame: it asks again.
+            while let Ok(None) = capture.next_frame().await {}
+        })
+        .await;
+        drop(done);
+        closer.join().unwrap();
+        assert!(
+            first.is_err(),
+            "the deadline did not end a wait that had no frame"
         );
     }
 }
