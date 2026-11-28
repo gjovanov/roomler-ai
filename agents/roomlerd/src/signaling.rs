@@ -2336,7 +2336,7 @@ async fn connect_once(
                     info!("shutdown signalled; closing ws");
                     peers.end_connection(ConnExit::Shutdown).await;
                     close_side(side, ConnExit::Shutdown.label()).await;
-                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_peers(&mut tunnel_peers, ConnExit::Shutdown).await;
                     // Terminal: a daemon shutdown must tear peers down, never
                     // stash them (the process is going away).
                     close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
@@ -2366,7 +2366,7 @@ async fn connect_once(
                 }
                 peers.end_connection(ConnExit::Sleep).await;
                 close_side(side, ConnExit::Sleep.label()).await;
-                close_all_tunnel_peers(&mut tunnel_peers).await;
+                close_all_tunnel_peers(&mut tunnel_peers, ConnExit::Sleep).await;
                 park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                 let _ = send_frame(&mut ws, Message::Close(None)).await;
                 return Ok(());
@@ -2422,7 +2422,7 @@ async fn connect_once(
                     );
                     peers.end_connection(ConnExit::ResumeFromSuspend).await;
                     close_side(side, ConnExit::ResumeFromSuspend.label()).await;
-                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_peers(&mut tunnel_peers, ConnExit::ResumeFromSuspend).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(AgentDidNotRun(
                         format!(
@@ -2461,7 +2461,8 @@ async fn connect_once(
                     if ConnExit::after_rx_deadline(paused) == ConnExit::ResumeFromSuspend {
                         close_side(side, ConnExit::ResumeFromSuspend.label()).await;
                     }
-                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_peers(&mut tunnel_peers, ConnExit::after_rx_deadline(paused))
+                        .await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     let why = format!("ws rx deadline: no inbound frames for {} s", silent.as_secs());
                     return Err(ConnectError::Transient(match paused {
@@ -2475,10 +2476,13 @@ async fn connect_once(
                 // netstate PR-2 — the net-change probe verdict. Answered =
                 // its pong cleared `outstanding_ping`, or ANY frame arrived
                 // after the probe went out (both prove the socket survived
-                // the transition). Unanswered past the tight deadline =
-                // cycle NOW, single strike — the network moved under the
-                // socket and every second of blind trust stalls the whole
-                // grants/netmap plane behind a dead WS.
+                // the transition). Unanswered for
+                // `WS_NETCHANGE_PROBE_STRIKES` windows of
+                // `WS_NETCHANGE_PROBE_DEADLINE` (2 × 10 s) = cycle: the
+                // network moved under the socket, and every second of blind
+                // trust stalls the whole grants/netmap plane behind a dead
+                // WS. One window is no verdict: a throttled corporate path
+                // answers in 6-15 s (the deadline's own comment).
                 if let Some((probed, misses)) = netchange_probe {
                     if outstanding_ping.is_none() || last_rx.elapsed() < probed.elapsed() {
                         netchange_probe = None;
@@ -2491,7 +2495,8 @@ async fn connect_once(
                                 "control WS unresponsive after a MAJOR network change — cycling now"
                             );
                             peers.end_connection(ConnExit::NetChangeProbe).await;
-                            close_all_tunnel_peers(&mut tunnel_peers).await;
+                            close_all_tunnel_peers(&mut tunnel_peers, ConnExit::NetChangeProbe)
+                                .await;
                             park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                             return Err(ConnectError::Transient(anyhow::anyhow!(
                                 "net-change probe: {} windows of {} s unanswered after a \
@@ -2511,7 +2516,8 @@ async fn connect_once(
                         {
                             warn!(%e, "net-change re-probe ping failed — reconnecting");
                             peers.end_connection(ConnExit::NetChangeReprobe).await;
-                            close_all_tunnel_peers(&mut tunnel_peers).await;
+                            close_all_tunnel_peers(&mut tunnel_peers, ConnExit::NetChangeReprobe)
+                                .await;
                             park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                             return Err(ConnectError::Transient(e.context("net-change re-probe")));
                         }
@@ -2545,7 +2551,11 @@ async fn connect_once(
                                 slow_pongs = 0;
                             } else {
                                 peers.end_connection(ConnExit::KeepaliveUnanswered).await;
-                                close_all_tunnel_peers(&mut tunnel_peers).await;
+                                close_all_tunnel_peers(
+                                    &mut tunnel_peers,
+                                    ConnExit::KeepaliveUnanswered,
+                                )
+                                .await;
                                 park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                                 return Err(ConnectError::Transient(anyhow::anyhow!(
                                     "control WS degraded: keepalive ping unanswered for {} s \
@@ -2566,7 +2576,8 @@ async fn connect_once(
                     {
                         warn!(%e, "keepalive ping failed — will reconnect");
                         peers.end_connection(ConnExit::KeepaliveSendFailed).await;
-                        close_all_tunnel_peers(&mut tunnel_peers).await;
+                        close_all_tunnel_peers(&mut tunnel_peers, ConnExit::KeepaliveSendFailed)
+                            .await;
                         park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                         return Err(ConnectError::Transient(e.context("ws ping")));
                     }
@@ -2593,10 +2604,12 @@ async fn connect_once(
                 // re-earns its hold verdict from scratch.
                 *slowness_cycles = 0;
                 // netstate PR-2 — the network materially moved. Probe the
-                // WS immediately (one ping, 5 s verdict at the pulled-
-                // forward keepalive tick) instead of trusting a socket the
-                // transition may have killed for another 45-90 s. A probe
-                // already in flight rides — its verdict covers this change.
+                // WS immediately (one ping now, its verdict at the pulled-
+                // forward keepalive ticks, two windows of
+                // `WS_NETCHANGE_PROBE_DEADLINE`) instead of trusting a
+                // socket the transition may have killed for another
+                // 45-90 s. A probe already in flight rides — its verdict
+                // covers this change.
                 if netchange_probe.is_none() {
                     info!(change = %summary, "MAJOR network change — probing the control WS now");
                     if let Err(e) =
@@ -2604,7 +2617,8 @@ async fn connect_once(
                     {
                         warn!(%e, "net-change probe ping failed — reconnecting");
                         peers.end_connection(ConnExit::NetChangePingFailed).await;
-                        close_all_tunnel_peers(&mut tunnel_peers).await;
+                        close_all_tunnel_peers(&mut tunnel_peers, ConnExit::NetChangePingFailed)
+                            .await;
                         park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                         return Err(ConnectError::Transient(e.context("net-change probe ping")));
                     }
@@ -2768,7 +2782,7 @@ async fn connect_once(
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
                     peers.end_connection(ConnExit::HeartbeatSendFailed).await;
-                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_peers(&mut tunnel_peers, ConnExit::HeartbeatSendFailed).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(session_ended(
                         "heartbeat send",
@@ -2841,7 +2855,7 @@ async fn connect_once(
                     // teardown as every other fatal arm.
                     warn!(%e, "failed to flush peer-originated message — will reconnect");
                     peers.end_connection(ConnExit::OutboundFlushFailed).await;
-                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_peers(&mut tunnel_peers, ConnExit::OutboundFlushFailed).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(e.context("outbound flush")));
                 }
@@ -3446,7 +3460,7 @@ async fn connect_once(
                     if let Err(e) = send_frame(&mut ws, Message::Pong(data)).await {
                         warn!(%e, "pong reply failed — will reconnect");
                         peers.end_connection(ConnExit::PongReplyFailed).await;
-                        close_all_tunnel_peers(&mut tunnel_peers).await;
+                        close_all_tunnel_peers(&mut tunnel_peers, ConnExit::PongReplyFailed).await;
                         park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                         return Err(ConnectError::Transient(e.context("ws pong")));
                     }
@@ -3456,7 +3470,7 @@ async fn connect_once(
                     let _stage = watchdog::enter(ctx.pump, "ws.close");
                     info!("ws closed by peer");
                     peers.end_connection(ConnExit::ServerClosed).await;
-                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_peers(&mut tunnel_peers, ConnExit::ServerClosed).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Ok(());
                 }
@@ -3465,7 +3479,7 @@ async fn connect_once(
                     let (silent, since_keepalive) = (last_rx.elapsed(), skew_mono.elapsed());
                     let _stage = watchdog::enter(ctx.pump, "ws.error");
                     peers.end_connection(ConnExit::ReadError).await;
-                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_peers(&mut tunnel_peers, ConnExit::ReadError).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(session_ended(
                         "ws read",
@@ -3504,7 +3518,11 @@ async fn connect_once(
                                     slow_pongs = 0;
                                 } else {
                                     peers.end_connection(ConnExit::PongRttDegraded).await;
-                                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                                    close_all_tunnel_peers(
+                                        &mut tunnel_peers,
+                                        ConnExit::PongRttDegraded,
+                                    )
+                                    .await;
                                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                                     return Err(ConnectError::Transient(anyhow::anyhow!(
                                         "control WS degraded: pong rtt {} s ({} consecutive over \
@@ -5170,7 +5188,7 @@ async fn handle_server_msg(
                 );
             }
             peers.end_connection(ConnExit::Goodbye).await;
-            close_all_tunnel_peers(tunnel_peers).await;
+            close_all_tunnel_peers(tunnel_peers, ConnExit::Goodbye).await;
             close_all_tunnel_quic_peers(tunnel_quic_peers).await;
             // Drop pending codec / transport entries too; they're tied
             // to in-flight session_ids that no longer have peers.
@@ -6487,7 +6505,7 @@ async fn handle_server_msg(
                 // would otherwise skip it and leave peers to a 10–30 s
                 // silence-detect instead of a clean close.
                 peers.end_connection(ConnExit::KeyRotated).await;
-                close_all_tunnel_peers(tunnel_peers).await;
+                close_all_tunnel_peers(tunnel_peers, ConnExit::KeyRotated).await;
                 close_all_tunnel_quic_peers(tunnel_quic_peers).await;
                 pending_codecs.clear();
                 pending_transports.clear();
@@ -6627,22 +6645,155 @@ fn undecodable_frame_tag(text: &str) -> Option<String> {
         .and_then(|v| v.get("t")?.as_str().map(str::to_string))
 }
 
-/// T2.10d: tear down every tunnel peer on WS disconnect. Cheap
-/// no-op when the map is empty (normal for agents that never serve
-/// a tunnel).
-async fn close_all_tunnel_peers(
-    tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
+/// What a control connection's end needs of a tunnel peer: its close.
+/// [`crate::tunnel::peer::AgentTunnelPeer`] in the daemon, a counting
+/// stand-in in the tests.
+pub(crate) trait TunnelPeerClose: Send + Sync + 'static {
+    /// Close the peer, and every socket its ICE agent owns with it.
+    fn close(&self) -> impl std::future::Future<Output = ()> + Send + '_;
+}
+
+impl TunnelPeerClose for crate::tunnel::peer::AgentTunnelPeer {
+    fn close(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
+        crate::tunnel::peer::AgentTunnelPeer::close(self)
+    }
+}
+
+/// FR-22 P5-0 — how a control connection's end runs its tunnel peers' closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelSweep {
+    /// Every close at once, and the loop waits for them all.
+    Waited,
+    /// One close at a time, on a task the loop does not wait for.
+    InTurn,
+    /// Every close at once, on tasks the loop does not wait for.
+    Together,
+}
+
+/// FR-22 P5-0 — the sweep each exit gets. No wildcard arm: an exit added later
+/// does not compile until it is placed here.
+///
+/// **The process may end next** (a shutdown, and a goodbye that removes the
+/// primary org's install: `FatalGoodbye`, exit 7): the loop waits. A close
+/// left to a task of its own there would be cut with the runtime, and the
+/// tunnel's client would learn of the end by silence. The wait holds where the
+/// stop waits for this loop: the primary org's, on a stop the daemon decided
+/// itself (an update, a rollback, a requested restart) and before exit 7. A
+/// stop from the operating system (a signal, a service stop) waits 200 ms for
+/// the loops and goes on to end the runtime whatever a loop is still doing
+/// (`app.rs`, the signal arms of the daemon's wait for a stop), and no wait
+/// here extends that. There, every close having started at once is what gets
+/// each the most of that time.
+///
+/// **The computer may suspend next** (the goodbye before a sleep): one close
+/// at a time, as before P5-0, on a task the loop does not wait for. A close
+/// the suspend lands in is cut at its ceiling when the computer wakes,
+/// wherever the monotonic clock counts the sleep (Windows, #3530), and what it
+/// had not reached stays alive ([`crate::peer_close`]). In turn keeps that to
+/// one peer. `run` holds the next dial until the wake either way.
+///
+/// **Every other exit**: the daemon lives on and a dial follows, and a dial
+/// does not wait for a close.
+fn tunnel_sweep_at(exit: ConnExit) -> TunnelSweep {
+    match exit {
+        ConnExit::Shutdown | ConnExit::Goodbye => TunnelSweep::Waited,
+        ConnExit::Sleep => TunnelSweep::InTurn,
+        ConnExit::ResumeFromSuspend
+        | ConnExit::RxDeadline
+        | ConnExit::NetChangeProbe
+        | ConnExit::NetChangeReprobe
+        | ConnExit::KeepaliveUnanswered
+        | ConnExit::KeepaliveSendFailed
+        | ConnExit::NetChangePingFailed
+        | ConnExit::HeartbeatSendFailed
+        | ConnExit::OutboundFlushFailed
+        | ConnExit::PongReplyFailed
+        | ConnExit::ServerClosed
+        | ConnExit::ReadError
+        | ConnExit::PongRttDegraded
+        | ConnExit::KeyRotated => TunnelSweep::Together,
+    }
+}
+
+/// T2.10d: tear down every tunnel peer when the control connection ends by
+/// `exit`. Cheap no-op when the map is empty (normal for agents that never
+/// serve a tunnel).
+///
+/// FR-22 P5-0 — the closes run off the loop, on tasks of their own, each
+/// through [`close_within_budget`] so that an overrun still says so.
+/// [`tunnel_sweep_at`] says how at each exit: all at once or, before a sleep,
+/// in turn, and whether the loop waits for them. Before, the closes ran one
+/// after the other and every exit waited for each, so the dial after a
+/// network change could start N budgets late, with the device unreachable
+/// meanwhile.
+///
+/// ⚠️ A task is what starts a close. `AgentTunnelPeer::close` does nothing
+/// until it is polled, so "not waiting" must never become "dropping the
+/// future". An idle flow ends only when `close` cancels it (#2129): a peer
+/// whose close never started keeps its flows and their sockets, and the `Drop`
+/// net under it is the best case.
+///
+/// The tasks carry the caller's span. On a daemon with several orgs an overrun
+/// and the count name their org, as the loop's own lines do.
+async fn close_all_tunnel_peers<P: TunnelPeerClose>(
+    tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<P>>,
+    exit: ConnExit,
 ) {
     if tunnel_peers.is_empty() {
         return;
     }
     let count = tunnel_peers.len();
-    for (session_id, peer) in tunnel_peers.drain() {
-        // Same bound as the session table's — a webrtc close on a captured
-        // network must not stall the signaling loop into the watchdog.
-        close_within_budget(peer.close(), session_id, "tunnel_ws_disconnect").await;
+    let started = tokio::time::Instant::now();
+    let sweep = tunnel_sweep_at(exit);
+    let span = tracing::Span::current();
+    let closes: Vec<tokio::task::JoinHandle<()>> = match sweep {
+        TunnelSweep::InTurn => {
+            let peers: Vec<(bson::oid::ObjectId, Arc<P>)> = tunnel_peers.drain().collect();
+            let in_turn = async move {
+                for (session_id, peer) in peers {
+                    close_tunnel_peer(session_id, peer).await;
+                }
+            };
+            vec![tokio::spawn(tracing::Instrument::instrument(
+                in_turn,
+                span.clone(),
+            ))]
+        }
+        TunnelSweep::Waited | TunnelSweep::Together => tunnel_peers
+            .drain()
+            .map(|(session_id, peer)| {
+                tokio::spawn(tracing::Instrument::instrument(
+                    close_tunnel_peer(session_id, peer),
+                    span.clone(),
+                ))
+            })
+            .collect(),
+    };
+    let all_closed = async move {
+        for close in closes {
+            // The peer's own close catches its panics (`peer_close`), so this
+            // is the rest of it: a flow's cancel, or the runtime going away.
+            if let Err(e) = close.await {
+                warn!(%e, "a tunnel peer's close did not run to its end");
+            }
+        }
+        info!(
+            count,
+            exit = exit.label(),
+            took_ms = started.elapsed().as_millis() as u64,
+            "torn down agent tunnel peers on ws disconnect"
+        );
+    };
+    if sweep == TunnelSweep::Waited {
+        all_closed.await;
+    } else {
+        tokio::spawn(tracing::Instrument::instrument(all_closed, span));
     }
-    info!(count, "torn down agent tunnel peers on ws disconnect");
+}
+
+/// One tunnel peer's close, within the same bound as the session table's.
+async fn close_tunnel_peer<P: TunnelPeerClose>(session_id: bson::oid::ObjectId, peer: Arc<P>) {
+    close_within_budget(peer.close(), session_id, "tunnel_ws_disconnect").await;
 }
 
 /// #1754 — what the reap arm took out of the session maps for a session
@@ -10551,6 +10702,262 @@ mod tests {
         // Nothing to tell apart: one org asks every question.
         assert_eq!(prompt_org(false, Some("Grox"), true, "primary"), None);
         assert_eq!(prompt_org(false, None, true, "primary"), None);
+    }
+
+    /// FR-22 P5-0 — a tunnel peer whose close takes `takes`, counted at its
+    /// start and at its end.
+    struct SlowTunnelPeer {
+        takes: Duration,
+        closes: Arc<TunnelCloses>,
+    }
+
+    #[derive(Default)]
+    struct TunnelCloses {
+        started: std::sync::atomic::AtomicUsize,
+        ended: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TunnelCloses {
+        fn started(&self) -> usize {
+            self.started.load(Ordering::SeqCst)
+        }
+        fn ended(&self) -> usize {
+            self.ended.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TunnelPeerClose for SlowTunnelPeer {
+        async fn close(&self) {
+            self.closes.started.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.takes).await;
+            self.closes.ended.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// `n` tunnel peers whose close takes `takes`, and what their closes did.
+    fn slow_tunnel_peers(
+        n: usize,
+        takes: Duration,
+    ) -> (
+        HashMap<bson::oid::ObjectId, Arc<SlowTunnelPeer>>,
+        Arc<TunnelCloses>,
+    ) {
+        let closes = Arc::new(TunnelCloses::default());
+        let peers = (0..n)
+            .map(|_| {
+                let peer = SlowTunnelPeer {
+                    takes,
+                    closes: closes.clone(),
+                };
+                (bson::oid::ObjectId::new(), Arc::new(peer))
+            })
+            .collect();
+        (peers, closes)
+    }
+
+    const TUNNELS_TORN_DOWN: &str = "torn down agent tunnel peers on ws disconnect";
+    const CLOSE_OVERRAN: &str = "peer close overran its budget";
+
+    /// A paused clock moves in whole timer ticks: `elapsed` is `want`, give
+    /// or take a few of them.
+    fn took_about(elapsed: Duration, want: Duration) -> bool {
+        elapsed >= want && elapsed < want + Duration::from_millis(20)
+    }
+
+    /// FR-22 P5-0 — an exit a dial follows does not wait for its tunnel
+    /// peers. Three peers on a path that is gone, each close outlasting its
+    /// budget: the caller is not held at all, every close is under way at
+    /// once, each overrun says so, and the one line counts them when the
+    /// budget they share has run out.
+    ///
+    /// Red before P5-0: the closes ran one after the other and the caller
+    /// waited for each, three budgets (15 s) before the dial could start.
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_a_dial_follows_does_not_wait_for_its_tunnel_peers() {
+        let logs = Logged::start();
+        let (mut peers, closes) = slow_tunnel_peers(3, PEER_CLOSE_BUDGET * 4);
+        let before = tokio::time::Instant::now();
+
+        close_all_tunnel_peers(&mut peers, ConnExit::NetChangeProbe).await;
+
+        assert_eq!(
+            before.elapsed(),
+            Duration::ZERO,
+            "the caller waited for a close"
+        );
+        assert!(peers.is_empty(), "the map still holds a peer");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(closes.started(), 3, "every close is under way, together");
+        assert!(
+            logs.lines_with(TUNNELS_TORN_DOWN).is_empty(),
+            "said before they closed"
+        );
+
+        tokio::time::sleep(PEER_CLOSE_BUDGET).await;
+        let overran = logs.lines_with(CLOSE_OVERRAN);
+        assert_eq!(overran.len(), 3, "{overran:?}");
+        let torn_down = logs.lines_with(TUNNELS_TORN_DOWN);
+        assert_eq!(torn_down.len(), 1, "{torn_down:?}");
+        assert!(
+            torn_down[0].contains("count=3") && torn_down[0].contains(r#"exit="netchange_probe""#),
+            "{torn_down:?}"
+        );
+    }
+
+    /// FR-22 P5-0 — "does not wait" is not "does not close". Closes that end
+    /// inside their budget all end, together and in the background, with no
+    /// overrun line.
+    #[tokio::test(start_paused = true)]
+    async fn tunnel_peers_left_behind_by_an_exit_still_close() {
+        let logs = Logged::start();
+        let took = Duration::from_secs(1);
+        let (mut peers, closes) = slow_tunnel_peers(3, took);
+
+        close_all_tunnel_peers(&mut peers, ConnExit::ReadError).await;
+        assert_eq!(closes.ended(), 0, "a close was waited for");
+
+        tokio::time::sleep(took + Duration::from_millis(1)).await;
+        assert_eq!(
+            (closes.started(), closes.ended()),
+            (3, 3),
+            "one close's time, not three"
+        );
+        assert!(logs.lines_with(CLOSE_OVERRAN).is_empty());
+        assert_eq!(logs.lines_with(TUNNELS_TORN_DOWN).len(), 1);
+    }
+
+    /// FR-22 P5-0 — before a sleep the closes take turns, as they did before
+    /// P5-0, and the loop does not wait for them. A close the suspend lands in
+    /// is cut at its ceiling when the computer wakes, where the monotonic
+    /// clock counts the sleep, and what it had not reached stays alive: in
+    /// turn keeps that to one peer.
+    ///
+    /// Red on P5-0's first cut: all three closes were under way at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_sleep_closes_its_tunnel_peers_in_turn_and_does_not_wait() {
+        let logs = Logged::start();
+        let took = Duration::from_secs(1);
+        let (mut peers, closes) = slow_tunnel_peers(3, took);
+        let before = tokio::time::Instant::now();
+
+        close_all_tunnel_peers(&mut peers, ConnExit::Sleep).await;
+
+        assert_eq!(
+            before.elapsed(),
+            Duration::ZERO,
+            "the caller waited for a close"
+        );
+        assert!(peers.is_empty(), "the map still holds a peer");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            (closes.started(), closes.ended()),
+            (1, 0),
+            "one close at a time"
+        );
+        tokio::time::sleep(took).await;
+        assert_eq!(
+            (closes.started(), closes.ended()),
+            (2, 1),
+            "the next starts when one ends"
+        );
+        tokio::time::sleep(took * 2).await;
+        assert_eq!((closes.started(), closes.ended()), (3, 3));
+        let torn_down = logs.lines_with(TUNNELS_TORN_DOWN);
+        assert_eq!(torn_down.len(), 1, "{torn_down:?}");
+        assert!(
+            torn_down[0].contains("count=3") && torn_down[0].contains(r#"exit="sleep""#),
+            "{torn_down:?}"
+        );
+    }
+
+    /// FR-22 P5-0 — the closes' tasks carry their loop's span. On a daemon
+    /// with several orgs an overrun and the count name their org, as they did
+    /// when the loop wrote them itself.
+    ///
+    /// Red on P5-0's first cut: a spawned task starts with no span.
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_closes_lines_name_their_loops_org() {
+        let logs = Logged::start();
+        let (mut peers, _closes) = slow_tunnel_peers(1, PEER_CLOSE_BUDGET * 4);
+        let org = tracing::info_span!("org", label = %"second");
+
+        tracing::Instrument::instrument(
+            close_all_tunnel_peers(&mut peers, ConnExit::ReadError),
+            org,
+        )
+        .await;
+
+        tokio::time::sleep(PEER_CLOSE_BUDGET + Duration::from_millis(1)).await;
+        for line in [CLOSE_OVERRAN, TUNNELS_TORN_DOWN] {
+            let found = logs.lines_with(line);
+            assert_eq!(found.len(), 1, "{line}: {found:?}");
+            assert!(found[0].contains("org{label=second}"), "{line}: {found:?}");
+        }
+    }
+
+    /// FR-22 P5-0 — a shutdown and a goodbye wait, because the process may end
+    /// next, and they wait for all the closes together: one close's time, and
+    /// one budget at most where every close overruns.
+    ///
+    /// Red before P5-0: three closes of 1 s held a shutdown for 3 s, and three
+    /// that overran held it for three budgets.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_waits_for_its_tunnel_peers_together() {
+        for exit in [ConnExit::Shutdown, ConnExit::Goodbye] {
+            let took = Duration::from_secs(1);
+            let (mut peers, closes) = slow_tunnel_peers(3, took);
+            let before = tokio::time::Instant::now();
+            close_all_tunnel_peers(&mut peers, exit).await;
+            let waited = before.elapsed();
+            assert!(took_about(waited, took), "{exit:?}: {waited:?}");
+            assert_eq!(
+                closes.ended(),
+                3,
+                "{exit:?}: closed before the process ends"
+            );
+
+            let (mut gone, closes) = slow_tunnel_peers(3, PEER_CLOSE_BUDGET * 4);
+            let before = tokio::time::Instant::now();
+            close_all_tunnel_peers(&mut gone, exit).await;
+            let waited = before.elapsed();
+            assert!(
+                took_about(waited, PEER_CLOSE_BUDGET),
+                "{exit:?}: {waited:?}"
+            );
+            assert_eq!(closes.started(), 3, "{exit:?}");
+        }
+    }
+
+    /// FR-22 P5-0 — the rule itself, over every exit. Only the two after which
+    /// the process may end are waited for, and only the goodbye before a sleep
+    /// closes in turn. `tunnel_sweep_at` has no wildcard arm, so a new exit
+    /// compiles only once it is placed there, and it is one a dial follows
+    /// unless this test is changed on purpose.
+    #[test]
+    fn each_exit_says_how_its_tunnel_closes_run() {
+        for exit in ConnExit::ALL {
+            let want = match exit {
+                ConnExit::Shutdown | ConnExit::Goodbye => TunnelSweep::Waited,
+                ConnExit::Sleep => TunnelSweep::InTurn,
+                _ => TunnelSweep::Together,
+            };
+            assert_eq!(tunnel_sweep_at(exit), want, "{exit:?}");
+        }
+    }
+
+    /// An agent that serves no tunnel: no work, no line and no wait, at any
+    /// exit.
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_with_no_tunnel_peers_does_nothing() {
+        let logs = Logged::start();
+        let before = tokio::time::Instant::now();
+        for exit in ConnExit::ALL {
+            let (mut peers, _closes) = slow_tunnel_peers(0, Duration::from_secs(1));
+            close_all_tunnel_peers(&mut peers, exit).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(took_about(before.elapsed(), Duration::from_millis(1)));
+        assert!(logs.lines_with(TUNNELS_TORN_DOWN).is_empty());
     }
 }
 

@@ -402,17 +402,17 @@ can name a person.
   refresher is a thread of its own (`health_words::start`,
   `health_words.rs:95`, started by `run_cmd` once enrolled,
   `agents/roomlerd/src/app.rs:5311`), and the hello and the heartbeat read only
-  its cache (`Announced::now`, `agents/roomlerd/src/signaling.rs:7292`).
+  its cache (`Announced::now`, `agents/roomlerd/src/signaling.rs:7443`).
   `start` waits up to 2 s for the first read (`FIRST_READ_WAIT`,
   `health_words.rs:43`), before the loop connects; a hello sent before it
   landed carries neither word, and the first beat after it re-announces.
 - ⚠️ **Stamped in `stub_caps`, as P7's `update_mode` is**
-  (`signaling.rs:7457`, `:7458`). A heartbeat that re-announces replaces the
+  (`signaling.rs:7608`, `:7609`). A heartbeat that re-announces replaces the
   stored caps whole (`AgentDao::update_capabilities`,
   `crates/services/src/dao/agent.rs:607`), so a word stamped in the hello alone
   would be erased at the first re-announce. The same beat gives §3's Windows
   case its re-announce: it compares what it read with what it last announced,
-  `Announced` whole (`if now == last.0`, `signaling.rs:7423`), so the
+  `Announced` whole (`if now == last.0`, `signaling.rs:7574`), so the
   `InProgress` of the first hello after an update is replaced on the first beat
   after the verdict lands: within the refresher's 30 s, or at once, since the
   settle asks for a read (`refresh_soon`, `app.rs:5795`).
