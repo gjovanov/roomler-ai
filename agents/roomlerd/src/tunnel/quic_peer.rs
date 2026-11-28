@@ -17,12 +17,12 @@
 //! 3. Expose [`take_flow`] so [`crate::tunnel::acceptor`] can, after
 //!    dialing the destination + sending `TcpForwardAccept`, grab the
 //!    client-opened QUIC stream for that `flow_id` and drive
-//!    [`tunnel_core::forward::run_flow_quic`].
+//!    [`tunnel_core::forward::run_flow_quic_until`].
 //!
 //! Lifecycle: `ServerMsg::TunnelQuicSetup` → [`setup`] → reply
 //! `ClientMsg::TunnelQuicReady { cert_fingerprint, addrs }` →
 //! `ServerMsg::TcpForwardForward` per flow → acceptor dials + `take_flow`
-//! → `run_flow_quic`. `TunnelTerminate` → [`close`], or [`end`] when it asks
+//! → `run_flow_quic_until`. `TunnelTerminate` → [`close`], or [`end`] when it asks
 //! the exit to close the session's connection (`close_connection`): the
 //! connection closes with [`SESSION_END_CODE`], then the flows stop. Or no terminate at all
 //! (#1754): the accept loop serves exactly ONE connection, so when it ends —

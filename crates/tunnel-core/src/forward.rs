@@ -769,11 +769,11 @@ pub async fn run_flow_quic(
     .await
 }
 
-/// [`run_flow_quic`] that `stop` can end. When `stop` resolves first, both
-/// halves are aborted and awaited, so the flow's TCP socket and stream
-/// halves are dropped before this returns, and the flow reads
-/// `ServerTerminated`. The exit runs its flows under the session's stop
-/// (`agents/roomlerd/src/tunnel/quic_peer.rs`).
+/// [`run_flow_quic`] that `stop` can end. Unlike [`run_flow_quic`], a local read that fails
+/// before the flow's first byte resets the stream. When `stop` resolves first, both halves
+/// are aborted and awaited, so the flow's TCP socket and stream halves are dropped before
+/// this returns, and the flow reads `ServerTerminated`. The exit runs its flows under the
+/// session's stop (`agents/roomlerd/src/tunnel/quic_peer.rs`).
 pub async fn run_flow_quic_until(
     tcp: TcpStream,
     send: SendStream,
