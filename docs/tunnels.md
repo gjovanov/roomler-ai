@@ -927,6 +927,14 @@ land a secondary org's reap in the primary's maps.
 | `pc_closed` | same handler | — | reachable only through a local `close()`; the net under any close that skipped the map |
 | `quic_conn_ended` | the accept task's end, `spawn_accept_loop` (`agents/roomlerd/src/tunnel/quic_peer.rs`) | ms after a close; ≤ 30 s after silence | the ONE connection the peer serves is over — closed by the client, or idle-timed out by quinn once the client's 8 s keepalives stopped |
 
+**One bad stream costs only that stream** (#4501, FR-158 P1). The accept loop awaits only
+`accept_bi` and reads each stream's 4-byte `flow_id` preamble on a task of its own,
+within the forward's 10 s wait for its stream, so a stream reset, finished or stalled
+before its preamble is dropped alone, with one `info!` naming the session and the error,
+and `quic_conn_ended` fires only on the connection's end. On the client, a flow whose
+local side fails before its first byte finishes its stream instead of resetting it, so
+its preamble still reaches the exit.
+
 ⚠️ **Not `Disconnected`.** That is five seconds without a packet — a relay hiccup, a
 laptop's Wi-Fi roam, a CGNAT rebind — and ICE recovers from it on its own. Reaping there
 would tear down healthy tunnels, which is the one thing this pillar must never do. The
@@ -1144,7 +1152,7 @@ sequenceDiagram
 (`agents/roomlerd/src/signaling.rs:5665`) hands the QUIC half to
 `terminate_quic_session` (`:6815`):
 
-- **with the flag**, `AgentQuicPeer::end` (`agents/roomlerd/src/tunnel/quic_peer.rs:590`):
+- **with the flag**, `AgentQuicPeer::end` (`agents/roomlerd/src/tunnel/quic_peer.rs:639`):
   the connection closes with application code `2` (`SESSION_END_CODE`, `:58`, reason
   `session ended`, distinct from a failed auth's `1`); then every flow stops, its two
   halves aborted, which drops its destination socket and its streams. The close goes
@@ -1160,18 +1168,19 @@ sequenceDiagram
 
 A `SessionLink` (`agents/roomlerd/src/tunnel/quic_peer.rs:87`) holds a `Weak` to the
 connection and the stop every flow runs under (`run_flow_quic_until`,
-`crates/tunnel-core/src/forward.rs:763`, for TCP; a `select` for UDP,
+`crates/tunnel-core/src/forward.rs:777`, for TCP; a `select` for UDP,
 `agents/roomlerd/src/tunnel/acceptor.rs:519`), so a kept link holds no socket. A
 forward still waiting for its stream (`take_flow`,
-`agents/roomlerd/src/tunnel/quic_peer.rs:546` and `:559`) returns when the session
+`agents/roomlerd/src/tunnel/quic_peer.rs:595` and `:608`) returns when the session
 ends.
 
 **The reap.** A #1754 reap (`ReapSignal::QuicConnEnded`) goes through `reap_quic_peer`
 (`agents/roomlerd/src/signaling.rs:6847`, from the reap arm at `:3127`) to
-`AgentQuicPeer::reap` (`agents/roomlerd/src/tunnel/quic_peer.rs:602`): when the
+`AgentQuicPeer::reap` (`agents/roomlerd/src/tunnel/quic_peer.rs:651`): when the
 connection itself has ended (`close_reason()` is set), it ends the session as above.
-When the accept loop ended on a connection that is still up, it only closes the peer
-and keeps the session's link. A reap never closes a connection that is up.
+When the connection is still up, it only closes the peer and keeps the session's link.
+Since FR-158 P1 the accept loop ends only with its connection (#4501), so that branch is
+a guard. A reap never closes a connection that is up.
 
 Locked by lib tests: `a_tunnel_terminate_without_close_connection_decodes_unset` and
 `a_tunnel_terminate_that_asks_to_close_decodes_on_an_agent_without_the_field`
