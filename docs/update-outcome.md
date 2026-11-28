@@ -3,15 +3,18 @@
 **Status:** the read half is built (FR-67 P3, #2924) on top of the two fixes
 that made a verdict reach the disk at all on Linux — P1 (#1400, the watcher no
 longer waits on its own parent's pid) and P2 (#1427, the `.deb` path spawns a
-watcher at all). The fleet half (P5: the verdict reported to the server) is
-open; §8 says what it needs. Field, 2026-10-26: three systemd `.deb` hosts and
-one Windows perMachine host (attended), read on 0.4.172 and again on 0.4.174
-and 0.4.177, §7.
+watcher at all). The fleet half is built too (P5, #4534): the daemon stamps
+the verdict into its caps at every announcement, beside the host's crash-loop
+state (#3332), and the devices page marks a device whose last install needs a
+look (§8); its field read is owed. Field, 2026-10-26: three systemd `.deb`
+hosts and one Windows perMachine host (attended), read on 0.4.172 and again on
+0.4.174 and 0.4.177, §7.
 
 Claims about behaviour were checked against the code at `5f126955b` plus
 #2924; anchors say where a check would need repeating. The #4302 parts (§2's
 `watcher` row and the record written whole, §3's per-Machine hop) were checked
-against the code of #4330.
+against the code of #4330, and the P5 parts (§3's last messages, §8) against
+the code of #4534.
 
 ## 1. The problem
 
@@ -90,6 +93,7 @@ sequenceDiagram
     participant W as post-install watcher
     participant F as last-install.json
     participant D as the new daemon
+    participant S as the server
     U->>I: run (Linux: to completion, inline) · spawn (Windows, macOS)
     U->>W: spawn, --expected-version, --installer-already-exited on Linux
     U-->>U: exit (systemd restarts it in 5 s, the MSI starts the new service or task)
@@ -99,7 +103,8 @@ sequenceDiagram
     W->>F: the verdict (SucceededVerified …)
     D->>F: read at startup → one `last install:` log line (P3)
     D->>F: read on every `roomler status` (P3)
-    Note over D: P5 (open): the verdict in the hello, so the server can answer per host
+    D->>F: read every 30 s off the signalling loop, and at once after a settle (P5)
+    D->>S: the caps' `last_install`, in the hello and again on the first heartbeat after it changed (P5, §8)
 ```
 
 > ⚠️ **On Windows the new daemon starts before the verdict exists.** The MSI
@@ -160,7 +165,7 @@ read the watcher's verdict at its start and settled nothing at its clean-run mar
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
-(`crates/localapi/src/lib.rs:490`), a `LastInstallStatus` (`:587`) whose
+(`crates/localapi/src/lib.rs:490`), a `LastInstallStatus` (`:599`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` stdout line spell them so
 one grep finds all three surfaces (locked by
@@ -179,10 +184,10 @@ say:
 | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) | `WATCHER STOPPED — agent-v0.4.172 started 3d ago: <note>` | WARN |
 | `Unreadable` | a file is there and does not parse; `note` carries the error chain | `record UNREADABLE — <error> (<path>)` | WARN |
 
-The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`crates/localapi/src/lib.rs:665`): the
+The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`crates/localapi/src/lib.rs:677`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
-a record older than that (`never_reported`, `:675`).
+a record older than that (`never_reported`, `:687`).
 
 > ⚠️ **Three states must stay apart, and they do by construction.** A daemon
 > that predates the field sends no `last_install` key, and the CLI prints
@@ -317,18 +322,130 @@ $ roomler status
 | 2026-11-23 | the same guest; candidate 0.4.305 updating itself to candidate 0.4.306 (#4302, GREEN) | the same reads | the watcher had a console host of its own, started 7 ms after it; the removal's Restart Manager session shut nothing down, and no event named it. It outlived the old worker and the installer, wrote `SucceededVerified` (exit code 0, `roomlerd 0.4.306`) with its `watcher` field, ran its service check (`verdict=running starts=0`) and exited 0 after 21.3 s. The 0.4.306 daemon settled nothing at its clean-run mark |
 | 2026-11-23 | the same guest; candidate 0.4.306 updating itself to candidate 0.4.307, the service stopped by a task on the installer's success event, MsiInstaller 1033 (#4302, GREEN) | the same reads, the service's states and process creation | the watcher saw the service Running, StopPending and Stopped, logged "the service is STOPPED after the install - starting it" 2.5 s into its check, and the service's new process was created 1 ms later. It saw it Running (`verdict=running starts=1`), wrote the start into the record's note and exited 0 after 24.3 s. The stop task ran one stop, the service manager logged no failure or recovery event, and the 0.4.307 daemon the watcher started read its verdict 1.3 s later |
 | — | the release that carries P3 — none yet: 0.4.198, the newest at this writing, predates #2924, and the three rows above are candidates | `roomler exec <host> -- roomler status`, `journalctl -g "last install"` | **owed**: the `last update` line and the startup line on a fleet host; then a synthetic stale `InProgress` and a deleted record on one host, to read `NEVER REPORTED` and `none recorded` apart in the field |
+| — | the release that carries P5 (#4534) — none yet | the devices page, and `capabilities` in the org's device list | **owed**: a verified install with no marker; on a Windows host, the `updating` marker of the first hello after an update gone a beat after the verdict lands. #3332's cells: a Win11 SystemContext guest whose worker is force-ended three times in 10 min reads `crash loop: <version>` with its presence still online, and a newer release run 5 min clean drops it; a root `.deb` guest killed three times reads `rolled back to <version>` until the promotion clears it (the build it rolls back to must carry P5 too, or nothing reports); a row on the current release with no word shows no marker |
 
-## 8. Not built
+## 8. The fleet answer (P5)
 
-- **P5 — the fleet answer.** No wire message carries the verdict yet; the
-  server still infers success from a changed `agent_version` on the next
-  hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7383`,
-  where `update_mode` is stamped), additive `#[serde(default)]` on
-  `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
-  P7's shape does not cover: on Windows the first hello after an update carries
-  `InProgress` (§3), and caps re-announce only when they change, so the agent
-  has to re-announce once the verdict lands.
+Built 2026-11-27 (#4534), with #3332's crash word beside it. The daemon stamps
+two words into its caps at every announcement, the server stores them with the
+caps, and every device row the org's device list serves carries them, so "did
+this update succeed on each host" needs no SSH:
+
+- `last_install`: this doc's verdict (§4), as the daemon's own reader reads
+  the record (§5).
+- `crash_health`: the crash ladder's state on the host
+  (`docs/remote-control.md` §19.3): crashes inside the current window, and
+  whether it rolled back or could not.
+
+```mermaid
+sequenceDiagram
+    participant R as health-words refresher (a thread of the daemon)
+    participant L as the signalling loop
+    participant S as the server
+    participant UI as the devices page
+    R->>R: every 30 s, and at once after a clean-run promotion or a settle, read last-install.json, the crash ladder in the config and the attention sentinels
+    R->>R: keep two words in a cache, never a path or a note
+    L->>R: current(), a clone of the cache, no file read
+    L->>S: rc:agent.hello, its caps stamped by stub_caps
+    S->>S: update_hello stores the caps
+    loop every heartbeat
+        L->>R: current()
+        alt a word changed since the last announcement
+            L->>S: the heartbeat re-announces the caps
+            S->>S: update_capabilities replaces the stored caps whole
+        end
+    end
+    UI->>S: GET the org's devices
+    S-->>UI: capabilities.last_install and capabilities.crash_health, as stored
+    Note over UI: a marker beside presence, never instead of it
+```
+
+**`last_install`** (`LastInstallWord`, `crates/remote_control/src/models.rs:2144`;
+the field, `:483`):
+
+| Field | What it says | From |
+|---|---|---|
+| `status` | one of §4's eight words, spelled as there (`LastInstallWord::STATUSES`). A word the reader does not know goes out as `Unreadable` | `LastInstallStatus.status` |
+| `never_reported` | `true` for an `InProgress` older than 25 min (§4), absent otherwise | `LastInstallStatus::never_reported` |
+| `expected_version` | the release the install was for (`agent-v0.4.240`) | the record |
+| `new_binary_version` | what the new binary answered, its last word (`0.4.240`) | the record's version probe |
+| `started_unix`, `finished_unix` | unix seconds | the record |
+
+**`crash_health`** (`CrashHealth`, `:2192`; the field, `:493`): `crashes`
+inside the window (0 once the last crash is older), `window_secs` (600),
+`last_crash_unix` while there are crashes in the window, `accused_version` with
+`rollback_failed`, `last_known_good`. Its `state`, the first that holds
+(`crash_health_from`, `agents/roomlerd/src/health_words.rs:234`):
+
+| `state` | When | The device's marker |
+|---|---|---|
+| `rollback_failed` | an attention sentinel `rollback_failed` accuses the running build, by FR-53's rule (`notify::rollback_accuses`, `crates/agent-core/src/notify.rs:222`). Windows raises it whenever the ladder trips, since its installer cannot go back; Linux and macOS when the rollback's install could not run (`docs/remote-control.md` §19.3) | `crash loop: 0.4.240`, red |
+| `rolled_back` | the ladder's `rollback_attempted` is set **and** the running build is its `last_known_good_version` | `rolled back to 0.4.239`, amber |
+| `crashing` | crashes inside the window: the ladder's `crash_count`, while its last crash is at most `CRASH_WINDOW_SECS` (10 min) old | `2 crashes in 10 min`, amber |
+| `ok` | none of these | none |
+
+Every version goes out only if it reads as one (`version_word`,
+`health_words.rs:310`: at most 64 bytes, a digit first once an `agent-v` or a
+`v` is taken off, then letters, digits and `.+_-`), and is left out otherwise.
+A record's `note` and `path` and a sentinel's message never leave the device:
+caps are stored on the server and shown to the org's admins, and a local path
+can name a person.
+
+- ⚠️ **Three states stay apart, as in §4.** No key: an agent older than the
+  words, or one whose first read has not landed, and the row shows nothing new.
+  Nothing to report (`Absent`, `ok`): no marker. Something to report: a marker.
+  A word the page does not know shows nothing, as an unrecognised `update_mode`
+  does, so a newer agent's word never puts a marker on a healthy device
+  (`the_health_words_decode_absent_unknown_and_short` on the wire,
+  `ui/src/__tests__/utils/deviceHealth.spec.ts` on the page).
+- ⚠️ **The signalling loop never reads a record** (#3439's rule). The
+  refresher is a thread of its own (`health_words::start`,
+  `health_words.rs:95`, started by `run_cmd` once enrolled,
+  `agents/roomlerd/src/app.rs:5311`), and the hello and the heartbeat read only
+  its cache (`Announced::now`, `agents/roomlerd/src/signaling.rs:7292`).
+  `start` waits up to 2 s for the first read (`FIRST_READ_WAIT`,
+  `health_words.rs:43`), before the loop connects; a hello sent before it
+  landed carries neither word, and the first beat after it re-announces.
+- ⚠️ **Stamped in `stub_caps`, as P7's `update_mode` is**
+  (`signaling.rs:7457`, `:7458`). A heartbeat that re-announces replaces the
+  stored caps whole (`AgentDao::update_capabilities`,
+  `crates/services/src/dao/agent.rs:607`), so a word stamped in the hello alone
+  would be erased at the first re-announce. The same beat gives §3's Windows
+  case its re-announce: it compares what it read with what it last announced,
+  `Announced` whole (`if now == last.0`, `signaling.rs:7423`), so the
+  `InProgress` of the first hello after an update is replaced on the first beat
+  after the verdict lands: within the refresher's 30 s, or at once, since the
+  settle asks for a read (`refresh_soon`, `app.rs:5795`).
+- ⚠️ **`rolled_back` compares like for like.** `last_known_good_version` is
+  written only by the clean-run promotion (`record_clean_run_at`,
+  `crates/agent-core/src/config.rs:2692`), from the running daemon's own
+  `CARGO_PKG_VERSION`, so the raw stored string, trimmed, is compared with the
+  running version: never a parsed version, never the shown form. The mark
+  alone says nothing, because it is saved before the rollback runs and a
+  daemon still on the accused build holds it too
+  (`rolled_back_needs_the_last_known_good_running_not_the_mark_alone`). Five
+  minutes into a clean run the promotion resets the count and the mark, and
+  asks for a read (`app.rs:5785`), and the word goes back to `ok`.
+- **Host-wide.** One daemon, one updater, one ladder: every org's connection
+  of a multi-org device announces the same two words.
+- **The devices page** (`docs/ui.md`, the "needs a person" chips): the install
+  marker (`installChip`, `ui/src/utils/deviceHealth.ts:136`) for an install at
+  work, one that never reported, or a verdict short of verified; the crash
+  marker (`crashChip`, `:210`), whose tap opens the device's crash reports with
+  the word's meaning at their top (`AgentCrashesDialog.vue`). A verified
+  install shows no marker. Its sentence (`installSentence`, `:93`) is in the
+  version's title and in a card's Details.
+- The server has no code of its own for either word: the hello and the
+  heartbeat store the parsed caps (`update_hello`,
+  `crates/services/src/dao/agent.rs:621`), and the
+  device list serves them as stored (`caps_as_served`,
+  `crates/modules/fleet/src/agent.rs:2966`, which takes out `gui_worker`
+  alone). A word only reaches a row because `AgentCaps` declares it: the parse
+  drops a key the struct does not know
+  (`the_caps_keep_the_install_verdict_and_the_crash_health`).
+
+## 9. Not built
+
 - **P4 — macOS.** `com.roomler.update` sets no `AbandonProcessGroup`, so launchd
   may reap the watcher where the installer genuinely is asynchronous. Open
   question on a real Mac, in the FR.

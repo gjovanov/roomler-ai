@@ -1,6 +1,6 @@
 # FR-67 — An update's outcome is written, and nothing ever reads it
 
-**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** in progress (P1, P2, P7 shipped; P1+P2 field-verified on 0.4.172 and re-read on 0.4.174 and 0.4.177, 2026-10-26; P3 built — its field read is owed on the release that carries it; P7 field-verified on 0.4.146; P5 open) · **Found:** field-testing `agent-v0.4.48`, 2026-09-02 · **Doc:** [`docs/update-outcome.md`](../update-outcome.md)
+**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** in progress (P1, P2, P7 shipped; P1+P2 field-verified on 0.4.172 and re-read on 0.4.174 and 0.4.177, 2026-10-26; P3 built — its field read is owed on the release that carries it; P7 field-verified on 0.4.146; P5 built (#4534) — its field read is owed too) · **Found:** field-testing `agent-v0.4.48`, 2026-09-02 · **Doc:** [`docs/update-outcome.md`](../update-outcome.md)
 
 ## Goal
 
@@ -57,7 +57,7 @@ wait that should not exist.
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
 (`post_install.rs:385`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:7741`)
+(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:8051`)
 was never wired. So even on Windows — where the staged watcher does produce a
 verdict — nothing surfaces it. **P3 wires it** (2026-10-26): the daemon reads
 the record at startup and on every `roomler status`, see the P3 section below.
@@ -92,7 +92,7 @@ It was the first design, and it was refuted:
   file — see 3), and `.output()` with no timeout on the daemon's exit path is a
   genuine fleet-freeze mode.
 - **The config kill switch is inert against that mode**: config changes are
-  `restart_required` (`docs/remote-config.md:477-500`), and the failure being
+  `restart_required` (`docs/remote-config.md:479-502`), and the failure being
   guarded blocks the very exit a restart needs.
 - **It would create a failure mode that cannot exist today**: with the watcher
   surviving, PID reuse on the daemon's freed pid makes `kill(pid,0)` keep
@@ -118,12 +118,12 @@ flowchart LR
     W[post-install watcher] -->|writes| F[last-install.json]
     F -->|read at startup| L["one `last install:` log line<br/>INFO · WARN by verdict"]
     F -->|read on every answer| S["NodeStatus.last_install<br/>→ `roomler status` · `--json`"]
-    F -.->|P5, open| H["the hello's caps<br/>→ the fleet answer"]
+    F -->|"read every 30 s (P5)"| H["AgentCaps.last_install<br/>→ the devices page"]
 ```
 
 | Piece | Where |
 |---|---|
-| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:587`; `NodeStatus.last_install`, `:490` |
+| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:599`; `NodeStatus.last_install`, `:490` |
 | The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:2155`), its pure half `summarize` (`:2174`) |
 | The startup line and its level | `log_at_startup` (`:1829`), `startup_level` (`:1813`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4425`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:1143`) |
@@ -186,10 +186,10 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:471`); `UpdateRefusal` and `update_refusal()` (`:699`, `:1384`) |
-| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5635`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3368`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3339`), else `self` |
-| Stamped at **every** announcement | `stub_caps` (`agents/roomlerd/src/signaling.rs:7383`, `:7399`) |
-| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:2323`): a 409 on one device (`:2377`), a `refused` row with its `refused_code` in a bulk (`:2518`) |
+| The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:471`); `UpdateRefusal` and `update_refusal()` (`:721`, `:1406`) |
+| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5655`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3368`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3339`), else `self` |
+| Stamped at **every** announcement | `stub_caps` (`agents/roomlerd/src/signaling.rs:7435`, `:7451`) |
+| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:2345`): a 409 on one device (`:2399`), a `refused` row with its `refused_code` in a bulk (`:2540`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 
 > [!WARNING]
@@ -207,6 +207,44 @@ sequenceDiagram
 - ⚠️ The codes are a compatibility surface with every dashboard: `primary_org`,
   `auto_update_off`, and FR-2's `pin_downgrade`.
 
+### P5 — the fleet answer
+
+Built 2026-11-27 (#4534), in one PR with #3332's crash word, in P7's shape (the
+decision is under Open decisions). Two additive words ride the caps: the last
+install's verdict (`last_install`) and the host's crash ladder (`crash_health`:
+`ok` · `crashing` · `rolled_back` · `rollback_failed`). The full treatment, with
+each word's fields, the crash states and what never leaves the device, is
+[`docs/update-outcome.md`](../update-outcome.md) §8.
+
+```mermaid
+flowchart LR
+    F["last-install.json · the crash ladder<br/>· the attention sentinels"] -->|"every 30 s, off the loop"| C["health_words cache"]
+    C -->|"stub_caps, at every announcement"| H["AgentCaps.last_install<br/>AgentCaps.crash_health"]
+    H -->|"hello · a heartbeat that re-announces"| S["the stored caps<br/>(replaced whole)"]
+    S -->|"GET the org's devices"| UI["a marker beside presence"]
+```
+
+| Piece | Where |
+|---|---|
+| The two words, additive on `AgentCaps` | `last_install`, `crash_health` (`crates/remote_control/src/models.rs:483`, `:493`); `LastInstallWord` (`:2144`), `CrashHealth` (`:2214`), spellings locked by `the_health_word_spellings_are_locked` |
+| Read off the signalling loop, every 30 s and at once after a promotion or a settle | `health_words::start` (`agents/roomlerd/src/health_words.rs:95`), called by `run_cmd` (`agents/roomlerd/src/app.rs:5311`); the ladder read whole from the config (`config::read_crash_ladder`, `crates/agent-core/src/config.rs:2871`), the sentinels from every attention path (`notify::read_all_attention`, `crates/agent-core/src/notify.rs:213`) |
+| Stamped at every announcement, re-announced when a word changes | `stub_caps` (`agents/roomlerd/src/signaling.rs:7457`, `:7458`); the beat compares `Announced` whole (`:7423`) |
+| Stored with the caps and served as stored | `update_hello`, `update_capabilities` (`crates/services/src/dao/agent.rs:621`, `:607`); `caps_as_served` (`crates/modules/fleet/src/agent.rs:2966`) takes out `gui_worker` alone |
+| Shown beside presence, never instead of it | `ui/src/utils/deviceHealth.ts`; `ui/src/components/admin/AgentsSection.vue` (the table `:306`, `:321`; the cards `:728`, `:739`); the crash marker opens `AgentCrashesDialog.vue` |
+
+- ⚠️ **`rolled_back` compares like for like**: the raw stored
+  `last_known_good_version`, trimmed, against the running
+  `CARGO_PKG_VERSION`, which is what the clean-run promotion stored it from.
+  A version is never parsed here, and the rollback mark alone reads nothing
+  (`rolled_back_needs_the_last_known_good_running_not_the_mark_alone`).
+- ⚠️ **A sentinel accuses by FR-53's rule, in one place**: `notify::rollback_accuses`
+  (`crates/agent-core/src/notify.rs:222`) sits beside the writer in
+  `roomler-node-core`, so another reader of the sentinels (#3373) asks the same
+  question the same way.
+- ⚠️ **Three states, as in P3**: no key (an older agent) shows nothing new,
+  `Absent` and `ok` show no marker, and a word the page does not know is
+  ignored.
+
 ## Phases
 
 | # | Phase | Kill switch | Status |
@@ -215,7 +253,7 @@ sequenceDiagram
 | P2 | Recover a `(deleted)` exe path + refuse a non-existent watcher binary + log the anyhow chain | revert = today's ENOENT | **shipped (#1427)** — ⚠️ NOT the guard it was scoped as: this is the whole reason the `.deb` path had no watcher |
 | P3 | Read the verdict: startup log + `NodeStatus` + `roomler status` | pure addition; revert = today's silence | **built** (#2924, 2026-10-26) — field read owed on the release that carries it |
 | P4 | macOS `AbandonProcessGroup` — **`com.roomler.update.plist`** is the job that matters (`update-helper` is that LaunchDaemon's body and is where `installer -pkg` is spawned) | packaging-only revert | proposed — see the note below |
-| P5 | Fleet answer: report the outcome to the server and show it | render-only; absent field ⇒ today's blank | proposed |
+| P5 | Fleet answer: the last install's verdict and (#3332) the crash ladder's state stamped into the caps at every announcement, stored with them, and a marker on the device's row beside presence | render-only: an agent without the words leaves today's row, and the page shows nothing for a word it does not know | **built** (#4534, 2026-11-27) — field read owed on the release that carries it |
 | P6 | Transient systemd unit — **only if P1 leaves a measurable race** | `update_watcher_escape_cgroup`, default OFF | deferred, evidence-gated |
 | P7 | The dashboard is told which devices will not act on an update ordered from it, and why: `update_mode` in the caps, refused up front with a `refused_code`, marked before the click | revert = today's blind push; an agent without the word is pushed as before | **shipped (#2545)** · field-verified on 0.4.146 + `hosted-20261019-e46da07` |
 
@@ -259,7 +297,10 @@ sequenceDiagram
       and the hypothesis was right.** 21 `post-install watcher spawn failed` in
       seven days against **zero** `post-install watcher started` (P2, #1427)
 - [ ] A fleet query answers "did this update succeed on each host" without SSH
-      (P5, open — the shape is in `docs/update-outcome.md` §8)
+      — **built** (P5, #4534): every row of the org's device list carries
+      `capabilities.last_install`, and the devices page marks each install
+      short of verified (`docs/update-outcome.md` §8); the field read is owed
+      on the release that carries it (§7 there lists the cells)
 - [x] Windows behaviour is byte-for-byte unchanged — the install path, which
       is what this criterion guards: P1 kept the wait (`should_wait_for_installer`
       stays true for a live pid, and Windows passes `already_exited: false`), P3
@@ -280,7 +321,8 @@ sequenceDiagram
       never collapse, who reads it from which process, the three surfaces, the
       field table — with diagrams, linked from `docs/README.md`;
       `docs/remote-control.md` §19.2's "future agent startups read the file" is
-      true now and points there (#2924)
+      true now and points there (#2924). P5's fleet answer is its §8, and the
+      device row's two markers are in `docs/ui.md` (#4534)
 - [x] **P7**: an update ordered from a device's **secondary** org is refused with
       `primary_org` and the way out, and never counted delivered. ⚠️ The "before"
       is recorded: on 2026-10-19 the bulk route counted it delivered (field log)
@@ -302,9 +344,19 @@ sequenceDiagram
 
 ## Open decisions
 
-- **P5 shape**: an additive `#[serde(default)]` field on `ClientMsg::AgentHello`
-  (matching `advertised_routes`) versus a dedicated report message. Hello is
-  simpler; a message reports without waiting for a reconnect.
+- **P5 shape** — **decided 2026-11-27 by the hub**: the words ride the caps in
+  P7's shape, neither a hello-only field nor a report message of their own.
+  The two options this line once weighed (an additive field on
+  `ClientMsg::AgentHello`, or a dedicated message) each lose to the caps: a
+  heartbeat that re-announces changed caps replaces the stored blob
+  (`AgentDao::update_capabilities`, `crates/services/src/dao/agent.rs:607`), so
+  a word the hello alone carries would be erased at a device's first login, and
+  a message of its own would need a reader, a store and a route for what the
+  caps already carry. The caps also give the re-announce a verdict landing
+  after the hello needs, with no new code: the beat compares `Announced` whole
+  (`if now == last.0`, `agents/roomlerd/src/signaling.rs:7423`; `Announced`
+  derives `PartialEq`, `:7176`), and `stub_caps` stamps both words at every
+  announcement (`:7457`, `:7458`).
 - **P6 at all?** Decide from P1's field data, not in the abstract.
 
 ## Field-verification log

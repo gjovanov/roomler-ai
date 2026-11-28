@@ -378,28 +378,18 @@ impl TunnelClientDao {
     /// entry point, or it is a courtesy"). A tombstone matches nothing, so the
     /// setter reports `false` and the removal time it carries stays as it was.
     ///
-    /// The DEVICE-written fields (`mark_status`, `touch_heartbeat`) keep the
-    /// plain by-id filter: their writer is the tunnel WS handler, which only
-    /// runs after the connect-time check admitted a live row and whose poll
-    /// re-reads the row before every heartbeat. `rehydrate` is the one write
-    /// whose JOB is the tombstone (re-enrolment revives it) and keeps its own
-    /// filter too.
+    /// The DEVICE-written field (`touch_heartbeat`) keeps the plain by-id
+    /// filter: its writer is the tunnel WS handler, which only runs after the
+    /// connect-time check admitted a live row and whose poll re-reads the row
+    /// before every heartbeat. `rehydrate` is the one write whose JOB is the
+    /// tombstone (re-enrolment revives it) and keeps its own filter too.
+    ///
+    /// No socket writes `status` (#4553): it is the admin's state, and a
+    /// tunnel client's presence is derived from its live socket
+    /// (`fleet::agent::derive_tunnel_client_presence`), never stored. With two
+    /// pods a disconnect's write could land after the reconnect on the other.
     fn live_row(tenant_id: ObjectId, client_id: ObjectId) -> bson::Document {
         doc! { "_id": client_id, "tenant_id": tenant_id, "deleted_at": null }
-    }
-
-    pub async fn mark_status(&self, client_id: ObjectId, status: AgentStatus) -> DaoResult<bool> {
-        self.base
-            .update_by_id(
-                client_id,
-                doc! {
-                    "$set": {
-                        "status": bson::to_bson(&status).unwrap(),
-                        "last_seen_at": DateTime::now(),
-                    }
-                },
-            )
-            .await
     }
 
     /// Per plan §"What changed from v1" #4 — the WS handler polls

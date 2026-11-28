@@ -23,8 +23,8 @@
 //! `ClientMsg::TunnelQuicReady { cert_fingerprint, addrs }` →
 //! `ServerMsg::TcpForwardForward` per flow → acceptor dials + `take_flow`
 //! → `run_flow_quic`. `TunnelTerminate` → [`close`], or [`end`] when it asks
-//! the exit to close the session's connection (`close_connection`): the flows
-//! stop and the connection closes with [`SESSION_END_CODE`]. Or no terminate at all
+//! the exit to close the session's connection (`close_connection`): the
+//! connection closes with [`SESSION_END_CODE`], then the flows stop. Or no terminate at all
 //! (#1754): the accept loop serves exactly ONE connection, so when it ends —
 //! the client closed, or quinn idle-timed the connection out 30 s after the
 //! client's 8 s keepalives stopped — the session is over, and the loop
@@ -115,18 +115,18 @@ impl SessionLink {
             .upgrade()
     }
 
-    /// End the session: stop every flow, and close the connection with
-    /// [`SESSION_END_CODE`]. Returns whether a connection was there to close.
-    /// Idempotent.
+    /// End the session: close the connection with [`SESSION_END_CODE`], then
+    /// stop every flow. The close goes first: a flow stopped while the
+    /// connection is open drops its send stream, which finishes it, and the
+    /// client could read that clean end before the close. Returns whether a
+    /// connection was there to close. Idempotent.
     pub fn end(&self) -> bool {
-        self.0.stop.cancel();
-        match self.conn() {
-            Some(conn) => {
-                conn.close(SESSION_END_CODE.into(), SESSION_END_REASON);
-                true
-            }
-            None => false,
+        let conn = self.conn();
+        if let Some(conn) = &conn {
+            conn.close(SESSION_END_CODE.into(), SESSION_END_REASON);
         }
+        self.0.stop.cancel();
+        conn.is_some()
     }
 }
 
@@ -581,12 +581,12 @@ impl AgentQuicPeer {
         debug!(session_id = %self.session_id, "agent quic peer closed");
     }
 
-    /// End the session: stop every flow (each aborts both halves, which
-    /// releases its destination socket and its streams), close the
-    /// connection with [`SESSION_END_CODE`], close the endpoint, and stop the
-    /// accept loop. The endpoint's socket, and on the relayed flavours the
-    /// TURN allocation, go when the closed connection drains and the last
-    /// `Arc` of this peer drops. Idempotent.
+    /// End the session: close the connection with [`SESSION_END_CODE`], then
+    /// stop every flow (each aborts both halves, which releases its
+    /// destination socket and its streams), as [`SessionLink::end`] does;
+    /// close the endpoint, and stop the accept loop. The endpoint's socket,
+    /// and on the relayed flavours the TURN allocation, go when the closed
+    /// connection drains and the last `Arc` of this peer drops. Idempotent.
     pub fn end(&self) {
         let had_connection = self.link.end();
         self._peer.close(SESSION_END_CODE, SESSION_END_REASON);
@@ -755,6 +755,108 @@ mod tests {
             "the accept task ends with (just after) its report"
         );
 
+        agent.close();
+    }
+
+    /// Bytes both ways on one flow: client to agent, then agent to client.
+    async fn round_trip(
+        client_send: &mut SendStream,
+        agent_recv: &mut RecvStream,
+        agent_send: &mut SendStream,
+        client_recv: &mut RecvStream,
+        tag: &[u8],
+    ) {
+        client_send.write_all(tag).await.unwrap();
+        let mut got = vec![0u8; tag.len()];
+        tokio::time::timeout(Duration::from_secs(5), agent_recv.read_exact(&mut got))
+            .await
+            .expect("client to agent within 5 s")
+            .expect("client to agent read");
+        assert_eq!(got, tag);
+        agent_send.write_all(tag).await.unwrap();
+        let mut back = vec![0u8; tag.len()];
+        tokio::time::timeout(Duration::from_secs(5), client_recv.read_exact(&mut back))
+            .await
+            .expect("agent to client within 5 s")
+            .expect("agent to client read");
+        assert_eq!(back, tag);
+    }
+
+    /// #4501: one stream that ends before its 4-byte `flow_id` preamble
+    /// arrives costs that stream, never the session. The client resets a
+    /// flow's stream when its local TCP read fails
+    /// (`tunnel_core::forward::run_flow_quic`), and a local app that aborts
+    /// its connection right after the SOCKS reply does that to a brand-new
+    /// flow. The accept loop reads each preamble inline and takes that error
+    /// for the connection's end: it reports `QuicConnEnded`, the signalling
+    /// loop reaps the session and tells the client, and every in-flight flow
+    /// on it is cut. The field measured whole sessions ending this way under
+    /// live traffic, each a few milliseconds after a flow that moved no byte.
+    ///
+    /// The stray stream never carries a whole preamble, so the outcome does
+    /// not depend on which of its frames the agent reads first.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "#4501 RED on master: a stream reset before its preamble ends the accept loop, so the session is reaped"]
+    async fn a_stream_reset_before_its_preamble_costs_only_that_stream() {
+        let session_id = ObjectId::new();
+        let token = "session-token-stray";
+        let (reap_tx, mut reap_rx) = reap_channel();
+        let agent =
+            AgentQuicPeer::setup(session_id, token.to_string(), loopback(), reap_tx).unwrap();
+        let fingerprint = agent.cert_fingerprint().to_string();
+        let addr: SocketAddr = agent.addrs()[0].parse().unwrap();
+        let client = ClientQuicPeer::client(loopback(), &fingerprint).unwrap();
+        let conn = client.connect(addr).await.unwrap();
+        quic::client_authenticate(&conn, token).await.unwrap();
+
+        // Flow 1 is the in-flight connection: served, and moving bytes.
+        let (taken, opened) = tokio::join!(
+            agent.take_flow(1, Duration::from_secs(10)),
+            quic::open_flow(&conn, 1)
+        );
+        let (mut agent_send, mut agent_recv, _hold) =
+            taken.expect("agent must receive flow 1's stream");
+        let (mut client_send, mut client_recv) = opened.expect("client opens flow 1");
+        round_trip(
+            &mut client_send,
+            &mut agent_recv,
+            &mut agent_send,
+            &mut client_recv,
+            b"before",
+        )
+        .await;
+
+        // The stray: half a preamble, then a reset. A flow whose local app
+        // went away before the agent read which flow it is.
+        let (mut stray, _stray_recv) = conn.open_bi().await.unwrap();
+        stray.write_all(&2u32.to_le_bytes()[..2]).await.unwrap();
+        stray.reset(0u32.into()).unwrap();
+
+        // A flow opened after the stray is still served, and nothing is
+        // reaped while the client lives.
+        let (third, opened3) = tokio::join!(
+            agent.take_flow(3, Duration::from_secs(5)),
+            quic::open_flow(&conn, 3)
+        );
+        let _client3 = opened3.expect("client opens flow 3");
+        let reaped = reap_rx.try_recv().ok().map(|r| r.signal);
+        assert!(
+            third.is_ok() && reaped.is_none() && !agent.accept_ended(),
+            "a stream reset before its preamble must cost only that stream: \
+             flow 3 = {:?}, reaped = {reaped:?}, accept loop ended = {}",
+            third.as_ref().map(|_| "served").map_err(|e| e.to_string()),
+            agent.accept_ended()
+        );
+
+        // The in-flight flow still moves bytes both ways.
+        round_trip(
+            &mut client_send,
+            &mut agent_recv,
+            &mut agent_send,
+            &mut client_recv,
+            b"after",
+        )
+        .await;
         agent.close();
     }
 

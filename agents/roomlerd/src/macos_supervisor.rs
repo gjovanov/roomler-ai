@@ -51,6 +51,7 @@
 //! | **the lifeline**: the daemon keeps its end of the worker's stdin open for the worker's life ([`LIFELINE_LINE`]), and the worker stops when it closes | a worker of this release, whatever ended its daemon |
 //! | **the reap**: a daemon with no worker of its own stops every process running exactly `<exe> run --supervised` as a person ([`stale_workers`]), at start and after a worker exits 0 at once | workers from older releases, and any lifeline that leaked |
 
+use roomler_ai_remote_control::models::GuiWorkerBrief;
 use std::time::Duration;
 
 /// How often the supervisor re-reads the world (console user, worker health).
@@ -157,6 +158,105 @@ pub fn decide(i: Inputs) -> Action {
         None if i.consecutive_fast_exits >= MAX_FAST_EXITS => Action::GaveUp,
         None => Action::Spawn(uid),
     }
+}
+
+/// FR-157 P1 — the daemon's switches the screen-worker word reads. Fixed for
+/// its life: set once at its start
+/// ([`DelegateHost::set_word_config`](crate::delegate::DelegateHost::set_word_config)),
+/// from what the supervisor's `run` is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WordConfig {
+    /// The daemon runs as root: only root supervises a worker.
+    pub is_root: bool,
+    /// `macos_supervise_gui_worker`.
+    pub supervise: bool,
+    /// `macos_one_row`.
+    pub one_row: bool,
+}
+
+/// FR-157 P1 — what the screen-worker word is built from: facts the daemon
+/// already holds, as plain data, so the word is tested on every platform as
+/// [`decide`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WordInputs {
+    pub config: WordConfig,
+    /// A worker holds the delegation channel.
+    pub attached: bool,
+    /// The supervisor's last decision, noted at the transition it logs once;
+    /// `None` until its first.
+    pub last: Option<Action>,
+}
+
+/// FR-157 P1 — the screen worker as this daemon says it, on its row
+/// (`AgentCaps.gui_worker`) and in its `Status` (D5), from this one function
+/// so the two never disagree. A claim by the host: nothing decides on it.
+///
+/// `attached` wins over the supervisor's decision: it is the truth about who
+/// would serve a session now. The map from [`Action`] is one `match` with no
+/// catch-all arm, so a new `Action` cannot compile without a word.
+pub fn gui_worker_word(i: WordInputs) -> GuiWorkerBrief {
+    let word = |state: &str, reason: Option<&str>| GuiWorkerBrief {
+        state: state.to_string(),
+        reason: reason.map(str::to_string),
+        one_row: i.config.one_row,
+    };
+    let not_attached = |reason: &str| word(GuiWorkerBrief::NOT_ATTACHED, Some(reason));
+    // No worker is supervised here. A root daemon on one row then serves no
+    // screen at all, the case `run` warns of; any other daemon serves its own.
+    let off = || {
+        if i.config.is_root && i.config.one_row {
+            not_attached(GuiWorkerBrief::SUPERVISOR_OFF)
+        } else {
+            word(GuiWorkerBrief::UNSUPERVISED, None)
+        }
+    };
+    if !(i.config.is_root && i.config.supervise) {
+        return off();
+    }
+    if i.attached {
+        return word(GuiWorkerBrief::ATTACHED, None);
+    }
+    match i.last {
+        // The supervisor is on and has not decided yet: its first tick spawns,
+        // stands down or waits, and each of those is noted at once.
+        None => not_attached(GuiWorkerBrief::STARTING),
+        Some(Action::Disabled) => off(),
+        Some(Action::NoGuiSession) => not_attached(GuiWorkerBrief::NO_CONSOLE_USER),
+        Some(Action::LaunchdOwns) | Some(Action::HandBack(_)) => {
+            not_attached(GuiWorkerBrief::LAUNCHD_OWNS)
+        }
+        Some(Action::Spawn(_)) | Some(Action::Replace(_)) | Some(Action::Healthy) => {
+            not_attached(GuiWorkerBrief::STARTING)
+        }
+        Some(Action::GaveUp) => not_attached(GuiWorkerBrief::GAVE_UP),
+    }
+}
+
+/// FR-157 P1 (D1) — whether this process says the screen-worker word at all.
+/// A Mac's daemon does, on every loop. The worker it supervises
+/// (`run --supervised`, which [`crate::supervision`] records as
+/// [`Supervision::MacosSupervisor`](crate::supervision::Supervision::MacosSupervisor))
+/// is the screen side itself and says none, and neither does any other
+/// platform.
+pub fn says_word(macos: bool, supervision: Option<crate::supervision::Supervision>) -> bool {
+    macos && supervision != Some(crate::supervision::Supervision::MacosSupervisor)
+}
+
+/// FR-157 P1 — what a connection of this process says while it holds no
+/// delegate host: `None` where the process says no word ([`says_word`]), and
+/// on a Mac's daemon `unsupervised`, since that connection never hands a
+/// session to the worker. `one_row` is the config's `macos_one_row`, as in
+/// every word.
+pub fn word_without_host(
+    macos: bool,
+    supervision: Option<crate::supervision::Supervision>,
+    one_row: bool,
+) -> Option<GuiWorkerBrief> {
+    says_word(macos, supervision).then(|| GuiWorkerBrief {
+        state: GuiWorkerBrief::UNSUPERVISED.to_string(),
+        reason: None,
+        one_row,
+    })
 }
 
 /// Grow the respawn backoff. `ran` is how long the worker that just exited
@@ -1738,6 +1838,9 @@ mod imp {
                     error = %e,
                     "macOS supervisor: cannot resolve own exe — not supervising"
                 );
+                // FR-157 P1 — nothing will start a worker for the rest of
+                // this daemon's life, which the row's word says as `gave-up`.
+                delegate.note_supervisor(Action::GaveUp);
                 return;
             }
         };
@@ -1835,6 +1938,10 @@ mod imp {
             // Log transitions, not every tick: this loop runs every 5 s for
             // the daemon's whole life.
             if last_action != Some(action) {
+                // FR-157 P1 — and tell the row's screen-worker word, here and
+                // never on a tick that repeats the state, so a steady
+                // supervisor wakes no connection.
+                delegate.note_supervisor(action);
                 if matches!(action, Action::GaveUp) {
                     let mut not_theirs = uid_now.and_then(person_folder_not_theirs);
                     // #3802 — bounded and off this thread (`administrator_reads`).
@@ -2243,6 +2350,218 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-157 P1 — every `Action` the supervisor can note, one of each.
+    const EVERY_ACTION: [Action; 8] = [
+        Action::Disabled,
+        Action::NoGuiSession,
+        Action::LaunchdOwns,
+        Action::HandBack(501),
+        Action::Spawn(501),
+        Action::Replace(502),
+        Action::GaveUp,
+        Action::Healthy,
+    ];
+
+    /// FR-157 P1 — the supervisor's last decision: none yet, then each.
+    fn every_last() -> impl Iterator<Item = Option<Action>> {
+        std::iter::once(None).chain(EVERY_ACTION.map(Some))
+    }
+
+    /// FR-157 P1 — a word as `(state, reason, one_row)`.
+    fn said(word: &GuiWorkerBrief) -> (&str, Option<&str>, bool) {
+        (word.state.as_str(), word.reason.as_deref(), word.one_row)
+    }
+
+    /// FR-157 P1 (AC3) — on a root daemon with the supervisor on, every
+    /// decision the supervisor can note maps to one `(state, reason)`, as the
+    /// spec's table says, and `attached` wins over each of them. `one_row` is
+    /// the config's in every cell.
+    #[test]
+    fn every_action_maps_to_one_word_and_attached_wins() {
+        use GuiWorkerBrief as W;
+        let not_attached: [(Option<Action>, &str); 8] = [
+            (None, W::STARTING),
+            (Some(Action::NoGuiSession), W::NO_CONSOLE_USER),
+            (Some(Action::LaunchdOwns), W::LAUNCHD_OWNS),
+            (Some(Action::HandBack(501)), W::LAUNCHD_OWNS),
+            (Some(Action::Spawn(501)), W::STARTING),
+            (Some(Action::Replace(502)), W::STARTING),
+            (Some(Action::Healthy), W::STARTING),
+            (Some(Action::GaveUp), W::GAVE_UP),
+        ];
+        for action in EVERY_ACTION {
+            assert!(
+                action == Action::Disabled || not_attached.iter().any(|(l, _)| *l == Some(action)),
+                "{action:?} has a row"
+            );
+        }
+        for one_row in [false, true] {
+            let config = WordConfig {
+                is_root: true,
+                supervise: true,
+                one_row,
+            };
+            for (last, reason) in not_attached {
+                let word = gui_worker_word(WordInputs {
+                    config,
+                    attached: false,
+                    last,
+                });
+                assert_eq!(
+                    said(&word),
+                    (W::NOT_ATTACHED, Some(reason), one_row),
+                    "{last:?} one_row={one_row}"
+                );
+            }
+            // `Disabled` is what the supervisor decides with its switch off or
+            // off root, and here reads as that daemon's word.
+            let disabled = gui_worker_word(WordInputs {
+                config,
+                attached: false,
+                last: Some(Action::Disabled),
+            });
+            let off = if one_row {
+                (W::NOT_ATTACHED, Some(W::SUPERVISOR_OFF), true)
+            } else {
+                (W::UNSUPERVISED, None, false)
+            };
+            assert_eq!(said(&disabled), off, "Disabled one_row={one_row}");
+            for last in every_last() {
+                let word = gui_worker_word(WordInputs {
+                    config,
+                    attached: true,
+                    last,
+                });
+                assert_eq!(
+                    said(&word),
+                    (W::ATTACHED, None, one_row),
+                    "attached wins over {last:?}, one_row={one_row}"
+                );
+            }
+        }
+    }
+
+    /// FR-157 P1 — the switches speak before the channel and the supervisor,
+    /// as the spec's flowchart has it: a daemon that is not root, or runs no
+    /// supervisor, says what it is. Root with `macos_one_row` on and the
+    /// supervisor off has no screen (`run` warns of it at start); every other
+    /// such daemon is `unsupervised`, the healthy two-row Mac's two halves
+    /// among them. Nothing attaches to such a daemon anyway: only the
+    /// supervisor's spawn mints the secret.
+    #[test]
+    fn the_switches_speak_before_the_supervisor() {
+        use GuiWorkerBrief as W;
+        let cells = [
+            // The person's daemon on a two-row Mac, whatever its file says.
+            ((false, false, false), (W::UNSUPERVISED, None)),
+            ((false, false, true), (W::UNSUPERVISED, None)),
+            ((false, true, false), (W::UNSUPERVISED, None)),
+            ((false, true, true), (W::UNSUPERVISED, None)),
+            // The root daemon of a two-row Mac: the default install.
+            ((true, false, false), (W::UNSUPERVISED, None)),
+            // One row with the supervisor off.
+            (
+                (true, false, true),
+                (W::NOT_ATTACHED, Some(W::SUPERVISOR_OFF)),
+            ),
+        ];
+        for ((is_root, supervise, one_row), (state, reason)) in cells {
+            for last in every_last() {
+                for attached in [false, true] {
+                    let word = gui_worker_word(WordInputs {
+                        config: WordConfig {
+                            is_root,
+                            supervise,
+                            one_row,
+                        },
+                        attached,
+                        last,
+                    });
+                    assert_eq!(
+                        said(&word),
+                        (state, reason, one_row),
+                        "root={is_root} supervise={supervise} one_row={one_row} \
+                         attached={attached} {last:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// FR-157 P1 — whatever the facts, the word is a locked spelling
+    /// (`GuiWorkerBrief::STATES`, `::REASONS`), a reason rides `not-attached`
+    /// alone, and `one_row` is the config's.
+    #[test]
+    fn every_word_is_a_locked_spelling() {
+        for is_root in [false, true] {
+            for supervise in [false, true] {
+                for one_row in [false, true] {
+                    for attached in [false, true] {
+                        for last in every_last() {
+                            let word = gui_worker_word(WordInputs {
+                                config: WordConfig {
+                                    is_root,
+                                    supervise,
+                                    one_row,
+                                },
+                                attached,
+                                last,
+                            });
+                            let cell = format!(
+                                "root={is_root} supervise={supervise} one_row={one_row} \
+                                 attached={attached} {last:?}: {word:?}"
+                            );
+                            assert!(
+                                GuiWorkerBrief::STATES.contains(&word.state.as_str()),
+                                "{cell}"
+                            );
+                            assert_eq!(
+                                word.reason.is_some(),
+                                word.state == GuiWorkerBrief::NOT_ATTACHED,
+                                "{cell}"
+                            );
+                            if let Some(reason) = &word.reason {
+                                assert!(
+                                    GuiWorkerBrief::REASONS.contains(&reason.as_str()),
+                                    "{cell}"
+                                );
+                            }
+                            assert_eq!(word.one_row, one_row, "{cell}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// FR-157 P1 (D1) — a Mac's daemon says the word, whatever supervises it,
+    /// and a loop of it that holds no delegate host says `unsupervised`; the
+    /// worker it supervises says none, and no other platform does.
+    #[test]
+    fn a_macs_daemon_says_the_word_and_its_worker_and_other_platforms_do_not() {
+        use crate::supervision::Supervision;
+        let daemons = [None, Some(Supervision::Launchd), Some(Supervision::None)];
+        for supervision in daemons {
+            assert!(says_word(true, supervision), "{supervision:?}");
+            let word = word_without_host(true, supervision, true).expect("a Mac's daemon");
+            assert_eq!(said(&word), (GuiWorkerBrief::UNSUPERVISED, None, true));
+        }
+        let worker = Some(Supervision::MacosSupervisor);
+        assert!(!says_word(true, worker), "the worker is the screen side");
+        assert_eq!(word_without_host(true, worker, true), None);
+        for supervision in [
+            None,
+            Some(Supervision::Launchd),
+            Some(Supervision::MacosSupervisor),
+            Some(Supervision::WindowsScm),
+            Some(Supervision::WindowsTask),
+            Some(Supervision::None),
+        ] {
+            assert!(!says_word(false, supervision), "off macOS: {supervision:?}");
+            assert_eq!(word_without_host(false, supervision, false), None);
+        }
+    }
 
     /// FR-97 / FR-119 — the worker gets the root's value of each forwarded
     /// knob the root has, as a real variable, in the allowlist's order and

@@ -94,6 +94,8 @@ pub mod remote_config;
 pub mod removal;
 /// FR-138 — the platform admin's resume scope and its route.
 pub mod resume_scope;
+/// FR-155 P1e — the work a token rotation's commit starts.
+pub mod rotation_work;
 pub mod setup_diagnostics;
 pub mod setup_release;
 pub mod socket;
@@ -161,6 +163,13 @@ pub struct FleetState {
     /// FR-155 — every decision of `POST /api/agent/self/rotate`, with the
     /// caller's address and the generations.
     pub token_rotation_audit: Arc<TokenRotationAuditDao>,
+    /// FR-155 P1e — the works of rotation commits running on this pod, which
+    /// an answer asked again here waits for (`rotation_work::InFlight`).
+    pub rotations_in_flight: Arc<rotation_work::InFlight>,
+    /// FR-155 P1e — where the integration cells hold the work of a
+    /// rotation's commit (`rotation_work::CommitSeam`). Unheld outside them.
+    #[doc(hidden)]
+    pub rotation_seam: Arc<rotation_work::CommitSeam>,
     /// FR-92 P7 — the permanent keep-busy history: the server's own policy
     /// changes and the devices' reported ons and offs, told apart by
     /// `source`. No TTL (operator, 2026-10-11).
@@ -180,6 +189,12 @@ pub struct FleetState {
     /// sweep so it can compare-DEL each key (an unconditional DEL could erase
     /// a claim an agent already re-made on the surviving pod mid-roll).
     pub agent_presence_tokens: Arc<DashMap<ObjectId, String>>,
+    /// #4553 — this pod's live tunnel-client sockets, the tunnel client's
+    /// counterpart of `rc_hub` for presence. The `network` module's socket
+    /// takes a seat in it; `agent::derive_tunnel_client_presence` reads it.
+    /// Here, beside the agents', because both device lists read presence
+    /// through fleet, and ONE live registry is what every reader must see.
+    pub tunnel_client_sockets: Arc<agent::TunnelClientSockets>,
     /// P4 — per-tenant `device:presence` batching + member-list cache.
     pub presence_fanout: Arc<presence::PresenceFanout>,
     /// PR-1 rehome — owner-side per-agent nudge pacing (cooldown trio).
@@ -356,11 +371,14 @@ impl Module for FleetState {
             external_principals: Arc::new(ExternalPrincipalDao::new(db)),
             config_audit: Arc::new(ConfigAuditDao::new(db)),
             token_rotation_audit: Arc::new(TokenRotationAuditDao::new(db)),
+            rotations_in_flight: Arc::default(),
+            rotation_seam: Arc::default(),
             keep_busy_events: Arc::new(KeepBusyEventDao::new(db)),
             rc_resume_scope: Arc::new(RcResumeScopeDao::new(db)),
             rc_resume_reconcile: Arc::new(tokio::sync::Mutex::new(())),
             rc_hub,
             agent_presence_tokens: Arc::new(DashMap::new()),
+            tunnel_client_sockets: Arc::new(agent::TunnelClientSockets::default()),
             presence_fanout: Arc::new(presence::PresenceFanout::default()),
             agent_nudge_cooldowns: Arc::new(DashMap::new()),
             agent_nudge_throttle: Arc::new(DashMap::new()),

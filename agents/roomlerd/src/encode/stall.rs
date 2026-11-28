@@ -185,8 +185,9 @@ pub struct PassTiming {
     /// Rebuilding the capturer: a relay flip's reopen at the new profile, or
     /// the capture-error arm's backoff and reopen.
     pub recapture_us: u64,
-    /// An empty capture poll's pacing: rc.99's 2 ms sleep, or the yield while
-    /// the display is held.
+    /// An empty capture poll's pacing: rc.99's 2 ms sleep, the 2 ms floor an
+    /// empty that came straight back owes on a session that waits in the
+    /// capture (FR-135 R4a), or the yield while the display is held.
     ///
     /// ⚠️ Counted as WORK, unlike [`Self::pace_us`]. At ~2 ms it can never
     /// reach the bar on its own, so a pass this dominates is one where the pump

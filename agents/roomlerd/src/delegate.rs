@@ -55,7 +55,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use roomler_ai_remote_control::models::{AgentCaps, RecordCap, Unavailable};
+use roomler_ai_remote_control::models::{AgentCaps, GuiWorkerBrief, RecordCap, Unavailable};
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -811,6 +811,13 @@ const RECORD_SESSIONS_KEPT: usize = 1024;
 /// by opening sessions.
 const SESSION_ORGS_KEPT: usize = 1024;
 
+/// #4543 — how many sessions asked while no worker was attached a one-row
+/// Mac's daemon holds the params of ([`Inner::held_params`]). Oldest out: a
+/// session pushed out is served by the root daemon, as every such session was
+/// before #4543. Only a consent wait holds one, so a few are the most a real
+/// Mac ever holds at once.
+const HELD_PARAMS_KEPT: usize = 64;
+
 /// What the worker's signalling loop receives over the delegation channel.
 ///
 /// Two shapes, and the ORDER between them is load-bearing: params must land
@@ -1044,6 +1051,20 @@ fn note_session(
     }
 }
 
+/// #4543 — the params a one-row Mac's daemon resolved for a session while no
+/// worker was attached, held for that session's offer ([`Inner::held_params`]).
+struct HeldParams {
+    /// The session, as hex.
+    session: String,
+    /// The org that asked ([`org_key`]: `None` = the primary).
+    org: Option<String>,
+    /// The account the session was asked under: the one the supervisor had
+    /// started a worker for at the request, else the first it starts after it
+    /// ([`DelegateHost::started_for`]). `None` until then.
+    account: Option<u32>,
+    params: Box<SessionParams>,
+}
+
 /// #1882 — where a [`DelegateHost`] reads the overlay footprint it pushes to an
 /// attached worker: the overlay's v4 blocks as `(network, prefix length)`.
 pub type FootprintSource = fn() -> Vec<(std::net::Ipv4Addr, u8)>;
@@ -1086,7 +1107,8 @@ struct Inner {
     /// FR-43 P3b — which org handed each session to a worker (`None` = the
     /// primary), so its replies go back on that org's WS and no other org can
     /// reach into it. Written where a session's params cross
-    /// ([`DelegateHost::send_params`]). Kept across a transient detach, since
+    /// ([`DelegateHost::send_params`], or with its offer when they were held:
+    /// #4543, [`DelegateHost::send_to_worker`]). Kept across a transient detach, since
     /// the worker re-attaches with its sessions live and a session's org does
     /// not change with the process serving it; forgotten on
     /// [`DelegateHost::revoke`], like [`Inner::record_sessions`], because the
@@ -1150,6 +1172,15 @@ struct Inner {
     /// makes a record for one when its offer crosses. Bounded
     /// ([`SESSION_ORGS_KEPT`]), oldest out.
     keepable: Mutex<std::collections::VecDeque<String>>,
+    /// #4543 — on a one-row Mac's daemon, the params of each session asked
+    /// while no worker was attached ([`DelegateHost::hold`]). They cross at
+    /// the session's offer, first, to a worker of the account it was asked
+    /// under ([`DelegateHost::send_to_worker`]). Dropped when the root serves
+    /// that offer or the session ends ([`DelegateHost::served_here`]), when a
+    /// worker of another account is started ([`DelegateHost::started_for`]),
+    /// and on [`DelegateHost::revoke`]. Bounded ([`HELD_PARAMS_KEPT`]), oldest
+    /// out.
+    held_params: Mutex<std::collections::VecDeque<HeldParams>>,
     /// FR-138 P2b — where a worker's reply about a session the daemon keeps a
     /// record of goes: that record's link, in its org loop's table, which
     /// forwards it while attached and keeps what the server must hear while
@@ -1177,6 +1208,14 @@ struct Inner {
     /// FR-149 P1 — how many times a question moved to the person's app
     /// started the app ([`DelegateHost::start_the_app`]).
     app_starts: std::sync::atomic::AtomicUsize,
+    /// FR-157 P1 — the daemon's switches, which the screen-worker word reads
+    /// ([`DelegateHost::set_word_config`]). Set once at start; the default,
+    /// every switch off, reads `unsupervised`.
+    word_config: Mutex<crate::macos_supervisor::WordConfig>,
+    /// FR-157 P1 — the supervisor's last decision
+    /// ([`DelegateHost::note_supervisor`]). `None` until its first, and on
+    /// every daemon whose supervisor does not run.
+    supervisor_last: Mutex<Option<crate::macos_supervisor::Action>>,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -1268,11 +1307,43 @@ impl DelegateHost {
     #[cfg(unix)]
     pub fn open_for(&self, uid: u32) -> String {
         let secret = self.mint();
-        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
+        self.started_for(uid);
         if let Err(e) = self.listen(uid) {
             tracing::warn!(uid, error = %e, "delegation: could not open the worker socket");
         }
         secret
+    }
+
+    /// The supervisor starts a worker for `uid`: noted as the account its
+    /// relay asks (#3864). #4543 — and a session held for an offer
+    /// ([`Self::hold`]) that was asked before any worker was started is now
+    /// that account's, while one asked under another account is dropped: its
+    /// offer is the root's. Run at every start, because a worker that ended by
+    /// itself is followed by the next one with no revoke between, and the next
+    /// may be another account's.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn started_for(&self, uid: u32) {
+        // Set first, and let go: `hold` reads it under the store's lock, so a
+        // session held at the same moment is bound to `uid` or bound below.
+        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
+        let mut held = self.inner.held_params.lock().expect("held params mutex");
+        held.retain_mut(|h| match h.account {
+            None => {
+                h.account = Some(uid);
+                true
+            }
+            Some(account) if account == uid => true,
+            Some(account) => {
+                tracing::info!(
+                    session = %h.session,
+                    asked_under = account,
+                    started = uid,
+                    "delegation: a worker of another account was started; a session held for its \
+                     offer is the root daemon's (#4543)"
+                );
+                false
+            }
+        });
     }
 
     /// Bind the per-uid socket and serve attaches on it until [`revoke`].
@@ -1671,8 +1742,11 @@ impl DelegateHost {
     /// #3992 — wakes when a word the worker says changes what this device
     /// announces: its caps held ([`DelegateFrame::WorkerCaps`]), the person's
     /// floor kept ([`Self::person_floor`]), or its caps cleared with its
-    /// channel. A connection that holds this host subscribes BEFORE it reads
-    /// the words its hello carries, so a word said in between wakes it, and its
+    /// channel. FR-157 P1 — and when the screen-worker word moves
+    /// ([`Self::gui_worker_word`]): the channel's attach and its end, and each
+    /// new decision of the supervisor ([`Self::note_supervisor`]). A
+    /// connection that holds this host subscribes BEFORE it reads the words
+    /// its hello carries, so a word said in between wakes it, and its
     /// heartbeat announces the word at once rather than within its 30 s.
     pub fn news(&self) -> tokio::sync::watch::Receiver<u64> {
         self.news_sender().subscribe()
@@ -1720,6 +1794,11 @@ impl DelegateHost {
     /// ([`Self::send_params`]): a session crosses on its own org's consent and
     /// no other. The primary off one row keeps P2's rule, where a session no
     /// org has handed over still crosses.
+    ///
+    /// #4543 — on one row, a session asked while no worker was attached
+    /// crosses at its offer: its held params first ([`Self::hold`]), then the
+    /// offer, both or neither, for the org that asked and to a worker of the
+    /// account it was asked under ([`Self::take_held`]).
     pub fn send_to_worker(&self, org: Option<&str>, msg: &ServerMsg) -> bool {
         let tx = self
             .inner
@@ -1742,6 +1821,11 @@ impl DelegateHost {
                 }
                 Some(_) => {}
                 None if org.is_some() || self.one_row() => {
+                    if matches!(msg, ServerMsg::SdpOffer { .. })
+                        && let Some(params) = self.take_held(org, &session)
+                    {
+                        return self.cross_held(held, &tx, org, session, params, msg);
+                    }
                     tracing::debug!(
                         %session,
                         kind = server_msg_kind(msg),
@@ -1870,6 +1954,10 @@ impl DelegateHost {
     /// Must reach the worker BEFORE the `SdpOffer` that consumes them. It does,
     /// because both travel the same ordered channel and the daemon resolves
     /// them while handling `Request`, which the server always sends first.
+    ///
+    /// #4543 — with no worker attached, a one-row Mac's daemon holds them
+    /// instead ([`Self::hold`]), and they cross with the session's offer
+    /// ([`Self::send_to_worker`]). Either way `false` here: nothing crossed yet.
     pub fn send_params(&self, org: Option<&str>, frame: DelegateFrame) -> bool {
         // FR-85 P1e-mac — remembered HERE, where the grant crosses, so the
         // relay's admission of a worker's `RecordingActivity` cannot drift from
@@ -1902,7 +1990,10 @@ impl DelegateHost {
             .lock()
             .expect("to_worker mutex")
             .clone();
-        let Some(tx) = tx else { return false };
+        let Some(tx) = tx else {
+            self.hold(org, frame);
+            return false;
+        };
         // Held across the crossing, so no other org's loop can note the same
         // session between the check and the note.
         let mut held = self.inner.sessions.lock().expect("sessions mutex");
@@ -1921,6 +2012,12 @@ impl DelegateHost {
             return false;
         }
         if let Some(session) = session {
+            // #4543 — handed over now: nothing of it stays held.
+            self.inner
+                .held_params
+                .lock()
+                .expect("held params mutex")
+                .retain(|h| h.session != session);
             note_session(&mut held, session, org);
         }
         drop(held);
@@ -1934,19 +2031,203 @@ impl DelegateHost {
             }
         }
         if let Some(session_id) = recorded {
-            let mut held = self
-                .inner
-                .record_sessions
-                .lock()
-                .expect("record sessions mutex");
-            if !held.iter().any(|s| *s == session_id) {
-                held.push_back(session_id);
-                while held.len() > RECORD_SESSIONS_KEPT {
-                    held.pop_front();
-                }
-            }
+            self.note_recorded(session_id);
         }
         true
+    }
+
+    /// FR-85 P1e-mac — `session` crossed with `RECORD` in its grant: its worker
+    /// may report on its recording ([`Self::records_session_of`]).
+    fn note_recorded(&self, session: String) {
+        let mut held = self
+            .inner
+            .record_sessions
+            .lock()
+            .expect("record sessions mutex");
+        if !held.iter().any(|s| *s == session) {
+            held.push_back(session);
+            while held.len() > RECORD_SESSIONS_KEPT {
+                held.pop_front();
+            }
+        }
+    }
+
+    /// #4543 — `frame`'s params, kept for its session's offer: a one-row Mac's
+    /// daemon with no worker attached at the request (after a reboot before
+    /// anyone signed in, across a log-out and log-in, just after a worker
+    /// ended). They cross with that offer when a worker of the account the
+    /// session was asked under is attached then ([`Self::send_to_worker`]).
+    /// Never `keepable`: the worker that will serve the session said nothing
+    /// at the request, and the daemon claims no such session (FR-138 P2b). A
+    /// session already handed over, or held for another org, is not held. Off
+    /// one row nothing is held, as before.
+    fn hold(&self, org: Option<&str>, frame: DelegateFrame) {
+        if !self.one_row() {
+            return;
+        }
+        let DelegateFrame::SessionParams(mut params) = frame else {
+            return;
+        };
+        params.keepable = false;
+        let session = params.session_id.clone();
+        // Held across, as `send_params` holds it: no other org's loop notes
+        // the session between this check and the hold.
+        let noted = self.inner.sessions.lock().expect("sessions mutex");
+        if let Some(owner) = owner_of(&noted, &session) {
+            if owner.as_deref() != org {
+                tracing::warn!(
+                    %session,
+                    org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                    "delegation: params for a session another org handed over; not held"
+                );
+            }
+            return;
+        }
+        let mut held = self.inner.held_params.lock().expect("held params mutex");
+        if let Some(at) = held.iter().position(|h| h.session == session) {
+            if held[at].org.as_deref() != org {
+                tracing::warn!(
+                    %session,
+                    org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                    "delegation: params for a session another org asked for; not held (#4543)"
+                );
+                return;
+            }
+            // Asked again by the same org: its newest params stand.
+            held.remove(at);
+        }
+        // Read under the store's lock: a worker started at this moment binds
+        // this session after it is held, or is the account read here
+        // ([`Self::started_for`]).
+        let account = *self.inner.worker_uid.lock().expect("worker uid mutex");
+        held.push_back(HeldParams {
+            session: session.clone(),
+            org: org.map(str::to_string),
+            account,
+            params,
+        });
+        while held.len() > HELD_PARAMS_KEPT {
+            if let Some(out) = held.pop_front() {
+                tracing::info!(
+                    session = %out.session,
+                    "delegation: the oldest session held for its offer is let go; its offer is \
+                     the root daemon's (#4543)"
+                );
+            }
+        }
+        drop(held);
+        drop(noted);
+        tracing::info!(
+            %session,
+            org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+            account = ?account,
+            "delegation: no worker attached at the request; the session's params are held for \
+             its offer (#4543)"
+        );
+    }
+
+    /// #4543 — the held params of `session`, taken for its offer: only for the
+    /// org that asked, and only while the worker attached is one of the
+    /// account the session was asked under (a revoke leaves none). Anything
+    /// else leaves them, for [`Self::served_here`] to drop as the root serves
+    /// the offer.
+    fn take_held(&self, org: Option<&str>, session: &str) -> Option<Box<SessionParams>> {
+        let mut held = self.inner.held_params.lock().expect("held params mutex");
+        let at = held.iter().position(|h| h.session == session)?;
+        if held[at].org.as_deref() != org {
+            tracing::warn!(
+                %session,
+                org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                "delegation: an offer for a session another org asked for; not crossing (#4543)"
+            );
+            return None;
+        }
+        let attached = *self.inner.worker_uid.lock().expect("worker uid mutex");
+        if held[at].account.is_none() || held[at].account != attached {
+            tracing::info!(
+                %session,
+                asked_under = ?held[at].account,
+                attached = ?attached,
+                "delegation: the worker attached is not of the account a held session was asked \
+                 under; served here (#4543)"
+            );
+            return None;
+        }
+        held.remove(at).map(|h| h.params)
+    }
+
+    /// #4543 — a held session's params, then its offer, onto the worker's
+    /// queue: two places reserved together, so both cross or neither does,
+    /// and in that order. The session is then noted for `org`, with its
+    /// `RECORD` grant, as one whose params crossed at the request is
+    /// ([`Self::send_params`]), and never as keepable.
+    fn cross_held(
+        &self,
+        mut noted: std::sync::MutexGuard<'_, std::collections::VecDeque<(String, Option<String>)>>,
+        tx: &tokio::sync::mpsc::Sender<DelegateFrame>,
+        org: Option<&str>,
+        session: String,
+        params: Box<SessionParams>,
+        msg: &ServerMsg,
+    ) -> bool {
+        let recorded = params
+            .permissions
+            .contains(roomler_ai_remote_control::permissions::Permissions::RECORD);
+        let Ok(mut places) = tx.try_reserve_many(2) else {
+            tracing::info!(
+                %session,
+                "delegation: the worker's queue has no room for a held session's params and \
+                 offer; served here (#4543)"
+            );
+            return false;
+        };
+        let (Some(first), Some(second)) = (places.next(), places.next()) else {
+            return false;
+        };
+        first.send(DelegateFrame::SessionParams(params));
+        second.send(DelegateFrame::ToWorker {
+            msg: Box::new(msg.clone()),
+        });
+        note_session(&mut noted, session.clone(), org);
+        drop(noted);
+        if recorded {
+            self.note_recorded(session.clone());
+        }
+        tracing::info!(
+            %session,
+            org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+            "delegation: a session asked while no worker was attached crosses at its offer, its \
+             params first (#4543)"
+        );
+        true
+    }
+
+    /// #4543 — the root daemon serves `msg` itself, for `org`: the gate let it
+    /// through to the daemon's own handlers. A held session's offer there, or
+    /// its end, drops its params, so a session whose offer the root took never
+    /// crosses later: moving a live peer is not this channel's job.
+    pub fn served_here(&self, org: Option<&str>, msg: &ServerMsg) {
+        let session = match msg {
+            ServerMsg::SdpOffer { session_id, .. } | ServerMsg::Terminate { session_id, .. } => {
+                session_id.to_hex()
+            }
+            _ => return,
+        };
+        let mut held = self.inner.held_params.lock().expect("held params mutex");
+        let Some(at) = held
+            .iter()
+            .position(|h| h.session == session && h.org.as_deref() == org)
+        else {
+            return;
+        };
+        held.remove(at);
+        drop(held);
+        tracing::info!(
+            %session,
+            kind = server_msg_kind(msg),
+            "delegation: the root daemon serves a held session's offer, or its end; its params \
+             are let go (#4543)"
+        );
     }
 
     /// FR-85 P1e-mac — the `record` caps this DEVICE should advertise, given
@@ -2028,11 +2309,68 @@ impl DelegateHost {
     /// ([`Self::effective_permissions`]), and whether this daemon runs one row.
     /// What `roomlerd one-row` verifies after its restart.
     pub fn worker_status(&self) -> tunnel_core::localapi::GuiWorkerStatus {
+        // FR-157 P1 (D5) — one read of the channel for `attached` and the
+        // word, so the two never disagree within one `Status`.
+        let attached = self.inner.attached.load(Ordering::Acquire);
+        let word = self.word_with(attached);
         tunnel_core::localapi::GuiWorkerStatus {
-            attached: self.inner.attached.load(Ordering::Acquire),
+            attached,
             permissions: self.effective_permissions().map(|(words, _)| words),
             one_row: self.one_row(),
+            state: Some(word.state),
+            reason: word.reason,
         }
+    }
+
+    /// FR-157 P1 — this daemon's switches, which the screen-worker word reads
+    /// ([`Self::gui_worker_word`]). Set once at its start, before any
+    /// connection reads the word. A host nobody sets reads as a daemon with
+    /// every switch off: `unsupervised`.
+    pub fn set_word_config(&self, config: crate::macos_supervisor::WordConfig) {
+        *self.inner.word_config.lock().expect("word config mutex") = config;
+    }
+
+    /// FR-157 P1 — the supervisor's decision, noted at the transition it
+    /// logs once. A new one is news to every connection that holds this host
+    /// ([`Self::news`]); the same one again is none, so a tick that repeats
+    /// it never wakes a connection.
+    pub fn note_supervisor(&self, action: crate::macos_supervisor::Action) {
+        let moved = {
+            let mut last = self
+                .inner
+                .supervisor_last
+                .lock()
+                .expect("supervisor last mutex");
+            last.replace(action) != Some(action)
+        };
+        // Stored first, and the guard dropped, so whoever wakes reads it.
+        if moved {
+            self.words_moved();
+        }
+    }
+
+    /// FR-157 P1 — the screen worker as this daemon says it, on the row of
+    /// every connection that holds this host and in its `Status`
+    /// ([`Self::worker_status`]): one read of the switches, the channel and
+    /// the supervisor's last decision, through
+    /// [`crate::macos_supervisor::gui_worker_word`].
+    pub fn gui_worker_word(&self) -> GuiWorkerBrief {
+        self.word_with(self.inner.attached.load(Ordering::Acquire))
+    }
+
+    /// The word with the channel as `attached` read it.
+    fn word_with(&self, attached: bool) -> GuiWorkerBrief {
+        let config = *self.inner.word_config.lock().expect("word config mutex");
+        let last = *self
+            .inner
+            .supervisor_last
+            .lock()
+            .expect("supervisor last mutex");
+        crate::macos_supervisor::gui_worker_word(crate::macos_supervisor::WordInputs {
+            config,
+            attached,
+            last,
+        })
     }
 
     /// Forget the current secret — the worker it belonged to is gone.
@@ -2061,6 +2399,13 @@ impl DelegateHost {
         // FR-138 P2b — and which sessions the daemon would have claimed: the
         // next worker never got their params.
         self.inner.keepable.lock().expect("keepable mutex").clear();
+        // #4543 — and the sessions held for their offers: asked under the
+        // worker that is gone, or before it, and the next is a new one.
+        self.inner
+            .held_params
+            .lock()
+            .expect("held params mutex")
+            .clear();
         // Unlink the socket too. The accept loop ends when the listener drops
         // with the process, but a path left behind is an endpoint a later
         // worker could dial and sit on forever waiting for a greeting.
@@ -2108,6 +2453,10 @@ impl DelegateHost {
             return;
         }
         tracing::info!("delegation channel attached");
+        // FR-157 P1 — the row's screen-worker word reads `attached` from now,
+        // before the worker's caps arrive, so every connection that holds this
+        // host hears it at once.
+        self.words_moved();
         // ⚠️ `run` clears the sender, the caps and the questions without a
         // check of which channel set them. It requires that no other channel
         // attaches until that clear is done: `attached` is released only after
@@ -2124,6 +2473,11 @@ impl DelegateHost {
         };
         self.records_channel_ended(&cause);
         self.inner.attached.store(false, Ordering::Release);
+        // #3992, FR-157 P1 — the channel's end is news, ONE wake after both
+        // its caps are cleared (`channel_ended`) and the flag is down, so the
+        // woken beat reads the two together: a wake between them would announce
+        // the caps gone with the word still `attached`, and then the word.
+        self.words_moved();
         match result {
             Ok(()) => tracing::info!("delegation channel closed"),
             Err(e) => tracing::warn!(error = %e, "delegation channel ended with an error"),
@@ -2306,18 +2660,11 @@ impl DelegateHost {
         *self.inner.to_worker.lock().expect("to_worker mutex") = None;
         // ⚠️ Clear the caps with the channel. Keeping them would leave the row
         // advertising a capture target that has gone, and the next session
-        // would get the black screen P2b existed to fix.
-        let held = self
-            .inner
-            .worker_caps
-            .lock()
-            .expect("worker caps mutex")
-            .take();
-        // #3992 — and the row hears it now, not at the next beat. A worker that
-        // left without its caps changed nothing the row says.
-        if held.is_some() {
-            self.words_moved();
-        }
+        // would get the black screen P2b existed to fix. #3992 — the row hears
+        // it now, not at the next beat: [`Self::serve`] tells the news once
+        // the flag is down too (FR-157 P1), with or without caps held, since
+        // the screen-worker word moves either way.
+        *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
         // FR-92 — and the questions it will now never answer: dropping each
         // sender ends its caller's wait at once instead of at the timeout.
         self.inner
@@ -2503,6 +2850,8 @@ impl DelegateHost {
     pub(crate) fn end_channel_for_test(&self) {
         self.channel_ended();
         self.records_channel_ended("closed");
+        self.inner.attached.store(false, Ordering::Release);
+        self.words_moved();
     }
 
     /// #4421 — the account a worker is started for, noted as
@@ -2510,7 +2859,7 @@ impl DelegateHost {
     /// Unix's, and binds the worker's socket).
     #[cfg(test)]
     pub(crate) fn started_for_test(&self, uid: u32) {
-        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
+        self.started_for(uid);
     }
 
     /// #3992 — a worker's capabilities held as `serve` holds the ones its frame
@@ -3303,7 +3652,11 @@ pub(crate) mod tests {
         let host = DelegateHost::new();
         let (task, mut lines, mut cwr) = attached_worker(&host).await;
         let news = host.news();
-        assert!(!news.has_changed().unwrap(), "attaching says nothing");
+        // Subscribed after the attach, whose news (FR-157 P1) it has seen.
+        assert!(
+            !news.has_changed().unwrap(),
+            "no caps yet, so nothing since"
+        );
         worker_sends(&mut cwr, &mut lines, &caps_frame()).await;
         assert_eq!(host.effective_permissions(), Some((Vec::new(), false)));
         assert!(news.has_changed().unwrap(), "the caps held are news");
@@ -3353,8 +3706,9 @@ pub(crate) mod tests {
     }
 
     /// #3992 W4 — the channel ends while the worker's caps are held: they are
-    /// cleared, and that is news. A worker that leaves without having sent its
-    /// caps changed nothing the row says, and that is none.
+    /// cleared, and that is news. FR-157 P1 — and a worker that leaves without
+    /// having sent its caps is news too: the row's screen-worker word says it
+    /// has gone. Before P1 that end told nothing.
     #[tokio::test]
     async fn a_channel_that_ends_with_the_caps_held_is_news() {
         let host = DelegateHost::new();
@@ -3374,9 +3728,173 @@ pub(crate) mod tests {
         drop(lines);
         task.await.unwrap();
         assert!(
-            !news.has_changed().unwrap(),
-            "nothing held, nothing cleared"
+            news.has_changed().unwrap(),
+            "nothing held, and the worker's leaving is news"
         );
+    }
+
+    /// FR-157 P1 — a root daemon with the supervisor on, on one row.
+    fn on_one_row() -> crate::macos_supervisor::WordConfig {
+        crate::macos_supervisor::WordConfig {
+            is_root: true,
+            supervise: true,
+            one_row: true,
+        }
+    }
+
+    /// FR-157 P1 — a word as `(state, reason, one_row)`.
+    fn said(word: &GuiWorkerBrief) -> (&str, Option<&str>, bool) {
+        (word.state.as_str(), word.reason.as_deref(), word.one_row)
+    }
+
+    /// FR-157 P1 (AC3) — the attach and the detach of the channel are news,
+    /// so the row hears the word at once: `attached` as soon as a worker holds
+    /// the channel, before its caps, and `not-attached` the moment it leaves.
+    /// Before, the attach told nothing, and the row moved only with the caps
+    /// frame, 0.3 to 2.6 s later in P0's reads.
+    #[tokio::test]
+    async fn the_attach_and_the_detach_wake_the_news() {
+        use crate::macos_supervisor::Action;
+        let host = DelegateHost::new();
+        host.set_word_config(on_one_row());
+        host.note_supervisor(Action::Spawn(501));
+        let mut news = host.news();
+        let (task, lines, cwr) = attached_worker(&host).await;
+        assert!(news.has_changed().unwrap(), "the attach is news");
+        news.borrow_and_update();
+        assert_eq!(
+            said(&host.gui_worker_word()),
+            (GuiWorkerBrief::ATTACHED, None, true),
+            "attached, before any caps"
+        );
+        assert_eq!(
+            host.effective_permissions(),
+            None,
+            "the row's permissions wait for the caps"
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(news.has_changed().unwrap(), "the detach is news");
+        assert_eq!(
+            said(&host.gui_worker_word()),
+            (
+                GuiWorkerBrief::NOT_ATTACHED,
+                Some(GuiWorkerBrief::STARTING),
+                true
+            ),
+            "the supervisor's last decision, once the worker has gone"
+        );
+    }
+
+    /// FR-157 P1 (AC3) — a change of the supervisor's state is news once, and
+    /// the same state noted again, as a tick that repeats it would, is none.
+    #[test]
+    fn a_change_of_the_supervisors_state_is_news_once() {
+        use crate::macos_supervisor::Action;
+        let host = DelegateHost::new();
+        host.set_word_config(on_one_row());
+        let mut news = host.news();
+        host.note_supervisor(Action::NoGuiSession);
+        assert!(news.has_changed().unwrap(), "a new state is news");
+        news.borrow_and_update();
+        assert_eq!(
+            said(&host.gui_worker_word()),
+            (
+                GuiWorkerBrief::NOT_ATTACHED,
+                Some(GuiWorkerBrief::NO_CONSOLE_USER),
+                true
+            )
+        );
+        host.note_supervisor(Action::NoGuiSession);
+        assert!(!news.has_changed().unwrap(), "the same state again is none");
+        host.note_supervisor(Action::Spawn(501));
+        assert!(news.has_changed().unwrap(), "the next state is news");
+        news.borrow_and_update();
+        assert_eq!(
+            said(&host.gui_worker_word()),
+            (
+                GuiWorkerBrief::NOT_ATTACHED,
+                Some(GuiWorkerBrief::STARTING),
+                true
+            )
+        );
+        host.note_supervisor(Action::Spawn(501));
+        assert!(!news.has_changed().unwrap(), "and a repeated tick none");
+    }
+
+    /// FR-157 P1 (D5) — `Status` says the word the row says, from the same
+    /// read, and FR-43's three fields keep their meaning.
+    #[tokio::test]
+    async fn the_status_says_the_word_the_row_says() {
+        use crate::macos_supervisor::{Action, WordConfig};
+        let two_rows_root = WordConfig {
+            is_root: true,
+            ..WordConfig::default()
+        };
+        let one_row_supervisor_off = WordConfig {
+            is_root: true,
+            one_row: true,
+            ..WordConfig::default()
+        };
+        let cells = [
+            (WordConfig::default(), None),
+            (two_rows_root, None),
+            (one_row_supervisor_off, None),
+            (on_one_row(), None),
+            (on_one_row(), Some(Action::NoGuiSession)),
+            (on_one_row(), Some(Action::LaunchdOwns)),
+            (on_one_row(), Some(Action::GaveUp)),
+        ];
+        for (config, last) in cells {
+            let host = DelegateHost::new();
+            host.set_word_config(config);
+            if let Some(action) = last {
+                host.note_supervisor(action);
+            }
+            let word = host.gui_worker_word();
+            let status = host.worker_status();
+            assert_eq!(
+                (status.state.as_deref(), status.reason.as_deref()),
+                (Some(word.state.as_str()), word.reason.as_deref()),
+                "{config:?} {last:?}"
+            );
+            assert!(!status.attached, "{config:?} {last:?}");
+            assert_eq!(status.permissions, None, "{config:?} {last:?}");
+            assert!(!status.one_row, "the host's own flag: {config:?} {last:?}");
+        }
+
+        // And with a worker attached that holds both permissions.
+        let host = DelegateHost::new();
+        host.set_word_config(on_one_row());
+        host.set_one_row();
+        host.note_supervisor(Action::Healthy);
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        let both = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                permissions: Some(vec!["screen-capture".into(), "input".into()]),
+                has_input_permission: true,
+                ..Default::default()
+            }),
+            features: Vec::new(),
+        };
+        let mut line = serde_json::to_vec(&both).unwrap();
+        line.push(b'\n');
+        worker_sends(&mut cwr, &mut lines, &line).await;
+        let status = host.worker_status();
+        assert_eq!(
+            (status.state.as_deref(), status.reason.as_deref()),
+            (Some(GuiWorkerBrief::ATTACHED), None)
+        );
+        assert!(status.attached);
+        assert!(status.one_row);
+        assert_eq!(
+            status.permissions,
+            Some(vec!["screen-capture".to_string(), "input".to_string()])
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
     }
 
     /// #3992 L1 — the four words the device announces of its worker come from
@@ -5810,5 +6328,796 @@ mod secondary_org_tests {
             0,
             "a lib test started a caps-probe child (#3548)"
         );
+    }
+}
+
+/// #4543 — a one-row Mac's session asked while no screen worker was attached,
+/// and offered once one is. The root daemon keeps the request and its
+/// consent. The params it resolved cross at the offer, first, on the same
+/// ordered channel, then the offer and what follows it: for the org that
+/// asked and no other (FR-43 P3b), to a worker of the account it was asked
+/// under, and never for a session whose offer the root took.
+#[cfg(test)]
+mod one_row_attach_tests {
+    use super::*;
+    use bson::oid::ObjectId;
+    use roomler_ai_remote_control::permissions::Permissions;
+
+    /// The person signed in at the Mac, and another account on it.
+    const PERSON: u32 = 501;
+    const OTHER_PERSON: u32 = 502;
+
+    fn one_row_host() -> DelegateHost {
+        let host = DelegateHost::new();
+        host.set_one_row();
+        host
+    }
+
+    /// What `Request` resolves, on the data-channel transport (a worker that
+    /// defaults it shows a black screen with a healthy log), and keepable, as
+    /// a worker that keeps would have it.
+    fn params(session: ObjectId, permissions: Permissions) -> DelegateFrame {
+        DelegateFrame::SessionParams(Box::new(SessionParams {
+            session_id: session.to_hex(),
+            codec: "h264".into(),
+            transport: Some("data-channel-h264".into()),
+            chroma: None,
+            chunk_framing: true,
+            audio: false,
+            permissions,
+            controller_name: "a controller".into(),
+            input_mode: None,
+            asking_org: None,
+            record: None,
+            rc_overlay: None,
+            idle_secs: None,
+            lock_on_end: None,
+            media_legacy: None,
+            keepable: true,
+        }))
+    }
+
+    fn offer(session: ObjectId) -> ServerMsg {
+        ServerMsg::SdpOffer {
+            session_id: session,
+            sdp: String::new(),
+            ice_servers: Vec::new(),
+            extauth_mac: None,
+            peer_auth: None,
+        }
+    }
+
+    fn ice(session: ObjectId) -> ServerMsg {
+        ServerMsg::Ice {
+            session_id: session,
+            candidate: serde_json::Value::Null,
+        }
+    }
+
+    fn reply(session: ObjectId) -> ClientMsg {
+        ClientMsg::Ice {
+            session_id: session,
+            candidate: serde_json::Value::Null,
+        }
+    }
+
+    fn activity(session: ObjectId) -> ClientMsg {
+        ClientMsg::RecordingActivity {
+            session_id: session,
+            kind: roomler_ai_remote_control::models::RecordingActivityKind::Started,
+            name: None,
+            bytes: None,
+            duration_ms: None,
+            reason: None,
+        }
+    }
+
+    /// A worker attached the way `run` attaches one: its queue set, as deep
+    /// as `run`'s.
+    fn attach(host: &DelegateHost) -> tokio::sync::mpsc::Receiver<DelegateFrame> {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        *host.inner.to_worker.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    fn drained(worker: &mut tokio::sync::mpsc::Receiver<DelegateFrame>) -> Vec<DelegateFrame> {
+        std::iter::from_fn(|| worker.try_recv().ok()).collect()
+    }
+
+    fn is_params_of(frame: &DelegateFrame, session: ObjectId) -> bool {
+        matches!(frame, DelegateFrame::SessionParams(p) if p.session_id == session.to_hex())
+    }
+
+    fn is_offer_of(frame: &DelegateFrame, session: ObjectId) -> bool {
+        matches!(
+            frame,
+            DelegateFrame::ToWorker { msg }
+                if matches!(**msg, ServerMsg::SdpOffer { session_id, .. } if session_id == session)
+        )
+    }
+
+    fn is_ice_of(frame: &DelegateFrame, session: ObjectId) -> bool {
+        matches!(
+            frame,
+            DelegateFrame::ToWorker { msg }
+                if matches!(**msg, ServerMsg::Ice { session_id, .. } if session_id == session)
+        )
+    }
+
+    /// (a) #4543, FR-149's C9 first question, at the host: the request is
+    /// handled while no worker is attached, a worker attaches, and the
+    /// session's offer crosses to it, its params first, then what follows,
+    /// for the org that asked. The params keep what `Request` resolved (the
+    /// transport), but never `keepable`: such a session is not kept for the
+    /// daemon's claim (FR-138 P2b), whatever the worker says.
+    #[test]
+    fn a_one_row_session_asked_with_no_worker_crosses_at_its_offer_params_first() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(
+            !host.send_params(
+                None,
+                params(session, Permissions::VIEW | Permissions::RECORD)
+            ),
+            "no worker at the request: nothing crossed then"
+        );
+        assert!(
+            host.owner_of_reply(&reply(session)).is_none(),
+            "nor was the session noted"
+        );
+        assert!(!host.records_session_of(&activity(session)));
+
+        let mut worker = attach(&host);
+        *host.inner.worker_features.lock().unwrap() = vec![KEEP_DELEGATED.to_string()];
+        assert!(
+            host.send_to_worker(None, &offer(session)),
+            "the worker attached before the offer serves the session (#4543)"
+        );
+        let crossed = drained(&mut worker);
+        assert_eq!(crossed.len(), 2, "its params, then its offer: {crossed:?}");
+        let DelegateFrame::SessionParams(p) = &crossed[0] else {
+            panic!("the params first: {crossed:?}");
+        };
+        assert_eq!(p.session_id, session.to_hex());
+        assert_eq!(
+            p.transport.as_deref(),
+            Some("data-channel-h264"),
+            "as the request resolved it"
+        );
+        assert!(!p.keepable, "never kept for the daemon's claim");
+        assert!(
+            is_offer_of(&crossed[1], session),
+            "then the offer: {crossed:?}"
+        );
+        assert!(!host.is_keepable(&session.to_hex()));
+
+        assert!(
+            host.send_to_worker(None, &ice(session)),
+            "and what follows the offer"
+        );
+        let after = drained(&mut worker);
+        assert!(
+            matches!(after.as_slice(), [f] if is_ice_of(f, session)),
+            "{after:?}"
+        );
+        assert_eq!(
+            host.owner_of_reply(&reply(session)),
+            Some(None),
+            "noted for the org that asked"
+        );
+        assert!(
+            host.records_session_of(&activity(session)),
+            "with its RECORD grant"
+        );
+    }
+
+    /// (a) Each org's session, asked before any worker was started: bound to
+    /// the first account started after it, and crossing at its offer for the
+    /// org that asked and no other.
+    #[test]
+    fn a_session_asked_before_any_worker_started_crosses_for_its_own_org() {
+        let host = one_row_host();
+        let (ours, theirs) = (ObjectId::new(), ObjectId::new());
+        assert!(!host.send_params(None, params(ours, Permissions::empty())));
+        assert!(!host.send_params(Some("acme"), params(theirs, Permissions::empty())));
+        host.started_for_test(PERSON);
+        let mut worker = attach(&host);
+        assert!(
+            !host.send_to_worker(None, &offer(theirs)),
+            "acme's session, offered by the primary"
+        );
+        assert!(!host.send_to_worker(Some("other"), &offer(theirs)));
+        assert!(
+            !host.send_to_worker(Some("acme"), &offer(ours)),
+            "the primary's session, offered by acme"
+        );
+        assert!(drained(&mut worker).is_empty(), "nothing crossed");
+
+        assert!(
+            host.send_to_worker(Some("acme"), &offer(theirs)),
+            "acme's own offer crosses (#4543)"
+        );
+        assert!(host.send_to_worker(None, &offer(ours)));
+        let crossed = drained(&mut worker);
+        assert!(
+            crossed.len() == 4
+                && is_params_of(&crossed[0], theirs)
+                && is_offer_of(&crossed[1], theirs)
+                && is_params_of(&crossed[2], ours)
+                && is_offer_of(&crossed[3], ours),
+            "each session's params, then its offer: {crossed:?}"
+        );
+        assert_eq!(
+            host.owner_of_reply(&reply(theirs)),
+            Some(Some("acme".to_string()))
+        );
+        assert_eq!(host.owner_of_reply(&reply(ours)), Some(None));
+    }
+
+    /// (c) FR-43 P3b: a session held for one org never crosses for another,
+    /// by its params, its offer or what follows, and no other org's params
+    /// take its place. Each way round.
+    #[test]
+    fn a_session_held_for_one_org_never_crosses_for_another() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let (theirs, ours) = (ObjectId::new(), ObjectId::new());
+        assert!(!host.send_params(Some("acme"), params(theirs, Permissions::empty())));
+        assert!(
+            !host.send_params(None, params(theirs, Permissions::all())),
+            "the primary's params for acme's session"
+        );
+        assert!(!host.send_params(None, params(ours, Permissions::empty())));
+        assert!(
+            !host.send_params(Some("acme"), params(ours, Permissions::all())),
+            "and the reverse"
+        );
+        let mut worker = attach(&host);
+        assert!(
+            !host.send_to_worker(None, &offer(theirs)),
+            "the primary's offer of acme's session"
+        );
+        assert!(!host.send_to_worker(Some("other"), &offer(theirs)));
+        assert!(!host.send_to_worker(None, &ice(theirs)));
+        assert!(!host.send_to_worker(Some("acme"), &offer(ours)));
+        assert!(!host.send_to_worker(Some("acme"), &ice(ours)));
+        assert!(drained(&mut worker).is_empty(), "nothing crossed");
+        assert!(host.owner_of_reply(&reply(theirs)).is_none());
+        assert!(host.owner_of_reply(&reply(ours)).is_none());
+    }
+
+    /// (e) The account-change edge, decided conservatively: a held session
+    /// crosses only to a worker of the account it was asked under, the one
+    /// the supervisor had started a worker for, else the first started after
+    /// it. A console-user change revokes; a worker that ended by itself is
+    /// followed by the next account's with no revoke; and a revoke after the
+    /// attach (a hand-back, no GUI session) forgets it too. None of them hands
+    /// the session to a worker.
+    #[test]
+    fn a_session_held_for_one_account_never_crosses_to_another_accounts_worker() {
+        // A console-user change: `stop_worker` revokes, then the next starts.
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        host.revoke();
+        host.started_for_test(OTHER_PERSON);
+        let mut worker = attach(&host);
+        assert!(
+            !host.send_to_worker(None, &offer(session)),
+            "after a revoke"
+        );
+        assert!(drained(&mut worker).is_empty());
+
+        // The worker ended by itself; the next account's started, no revoke.
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        host.started_for_test(OTHER_PERSON);
+        let mut worker = attach(&host);
+        assert!(
+            !host.send_to_worker(None, &offer(session)),
+            "another account's worker, with no revoke between"
+        );
+        assert!(drained(&mut worker).is_empty());
+
+        // Asked before any worker started: the first account started is its.
+        let host = one_row_host();
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        host.started_for_test(PERSON);
+        host.started_for_test(OTHER_PERSON);
+        let mut worker = attach(&host);
+        assert!(
+            !host.send_to_worker(None, &offer(session)),
+            "bound to the first account started after the request"
+        );
+        assert!(drained(&mut worker).is_empty());
+
+        // A revoke after the attach, then the same account again.
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        let mut worker = attach(&host);
+        host.revoke();
+        host.started_for_test(PERSON);
+        assert!(
+            !host.send_to_worker(None, &offer(session)),
+            "a revoke forgets what was held"
+        );
+        assert!(drained(&mut worker).is_empty());
+    }
+
+    /// The edge of a worker that attached and ended before the offer,
+    /// decided: the session stays held, and the same account's next worker,
+    /// attached at the offer, serves it. Neither worker is handed anything
+    /// before the offer.
+    #[test]
+    fn a_worker_that_ended_before_the_offer_leaves_the_session_to_the_next() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        let mut first = attach(&host);
+        host.end_channel_for_test();
+        assert!(
+            drained(&mut first).is_empty(),
+            "the first worker was handed nothing"
+        );
+        host.started_for_test(PERSON);
+        let mut next = attach(&host);
+        assert!(
+            drained(&mut next).is_empty(),
+            "nor the next, before the offer"
+        );
+        assert!(
+            host.send_to_worker(None, &offer(session)),
+            "the same person's next worker serves it (#4543)"
+        );
+        let crossed = drained(&mut next);
+        assert!(
+            crossed.len() == 2
+                && is_params_of(&crossed[0], session)
+                && is_offer_of(&crossed[1], session),
+            "{crossed:?}"
+        );
+    }
+
+    /// The store is bounded, oldest out: a session pushed out is served by the
+    /// root, as before #4543, and the rest still cross.
+    #[test]
+    fn the_sessions_held_for_their_offers_are_bounded_oldest_out() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let sessions: Vec<ObjectId> = (0..=HELD_PARAMS_KEPT).map(|_| ObjectId::new()).collect();
+        for session in &sessions {
+            assert!(!host.send_params(None, params(*session, Permissions::empty())));
+        }
+        assert_eq!(
+            host.inner.held_params.lock().unwrap().len(),
+            HELD_PARAMS_KEPT
+        );
+        let mut worker = attach(&host);
+        assert!(
+            !host.send_to_worker(None, &offer(sessions[0])),
+            "the oldest went first"
+        );
+        let newest = sessions[HELD_PARAMS_KEPT];
+        assert!(host.send_to_worker(None, &offer(newest)));
+        let crossed = drained(&mut worker);
+        assert!(
+            crossed.len() == 2 && is_params_of(&crossed[0], newest),
+            "{crossed:?}"
+        );
+    }
+
+    /// The root serving a held session's offer, or the session's end, lets its
+    /// params go, for that org only: a session whose offer the root took never
+    /// crosses later, and another org's word, or an ICE, changes nothing.
+    #[test]
+    fn a_held_session_the_root_served_or_that_ended_is_let_go() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let (served, ended, kept) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        for session in [served, ended, kept] {
+            assert!(!host.send_params(None, params(session, Permissions::empty())));
+        }
+        host.served_here(None, &offer(served));
+        host.served_here(
+            None,
+            &ServerMsg::Terminate {
+                session_id: ended,
+                reason: roomler_ai_remote_control::models::EndReason::AgentHangup,
+                limit: None,
+            },
+        );
+        host.served_here(Some("acme"), &offer(kept));
+        host.served_here(None, &ice(kept));
+        let mut worker = attach(&host);
+        assert!(
+            !host.send_to_worker(None, &offer(served)),
+            "the root took its offer"
+        );
+        assert!(!host.send_to_worker(None, &offer(ended)), "it ended");
+        assert!(
+            host.send_to_worker(None, &offer(kept)),
+            "another org's offer of it, and an ICE, let nothing go"
+        );
+        let crossed = drained(&mut worker);
+        assert!(
+            crossed.len() == 2 && is_params_of(&crossed[0], kept) && is_offer_of(&crossed[1], kept),
+            "{crossed:?}"
+        );
+    }
+
+    /// Off one row nothing is held: the primary keeps P2's rule, where an offer
+    /// crosses with no params, as before #4543.
+    #[test]
+    fn off_one_row_nothing_is_held() {
+        let host = DelegateHost::new();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        assert!(host.inner.held_params.lock().unwrap().is_empty());
+        let mut worker = attach(&host);
+        assert!(host.send_to_worker(None, &offer(session)));
+        let crossed = drained(&mut worker);
+        assert!(
+            matches!(crossed.as_slice(), [f] if is_offer_of(f, session)),
+            "the offer alone: {crossed:?}"
+        );
+    }
+
+    /// The params and the offer cross both or neither: a queue with room for
+    /// one leaves the offer to the root, and nothing of it on the queue.
+    #[test]
+    fn a_held_session_crosses_with_its_offer_or_not_at_all() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        let (tx, mut worker) = tokio::sync::mpsc::channel(2);
+        tx.try_send(DelegateFrame::Ping).unwrap();
+        *host.inner.to_worker.lock().unwrap() = Some(tx);
+        assert!(
+            !host.send_to_worker(None, &offer(session)),
+            "no room for both: served here"
+        );
+        let left = drained(&mut worker);
+        assert!(
+            matches!(left.as_slice(), [DelegateFrame::Ping]),
+            "nothing of it crossed: {left:?}"
+        );
+        assert!(host.owner_of_reply(&reply(session)).is_none());
+    }
+
+    /// A session whose params crossed at a later request, a worker attached
+    /// then, is held no more: the store keeps only sessions not handed over.
+    #[test]
+    fn a_session_handed_over_at_a_later_request_is_held_no_more() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        let _worker = attach(&host);
+        assert!(host.send_params(None, params(session, Permissions::empty())));
+        assert!(host.inner.held_params.lock().unwrap().is_empty());
+    }
+
+    /// #4543, end to end on the daemon's side: a one-row Mac's real org loop
+    /// against a control plane the test drives. The request lands while no
+    /// worker is attached, and the test attaches one, or not, before the
+    /// offer. The offer has a video section and no codec the RTP track can
+    /// send, which the root refuses `no_common_codec` before it builds any
+    /// peer: the root serving a session reads as that refusal, with no
+    /// capture and no encoder. The loop is a secondary org's, as `run_cmd`
+    /// gives one the host on a one-row Mac; the primary's rule is the same
+    /// call, read at the host above.
+    mod real_loop {
+        use super::*;
+        use crate::signaling::{self, OrgCtx};
+        use futures::{SinkExt, StreamExt};
+        use roomler_ai_remote_control::signaling::LIMIT_NO_COMMON_CODEC;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio_tungstenite::tungstenite::Message;
+
+        const PATIENCE: Duration = Duration::from_secs(20);
+        /// Long enough for a loop that read a frame to have answered it.
+        const QUIET: Duration = Duration::from_secs(2);
+
+        /// A video section with no codec the RTP track can send.
+        const NO_CODEC_OFFER: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+                                      m=video 9 UDP/TLS/RTP/SAVPF 96\r\nc=IN IP4 0.0.0.0\r\n\
+                                      a=rtpmap:96 X-NONE/90000\r\n";
+
+        fn request_line(session: ObjectId) -> String {
+            serde_json::json!({
+                "t": "rc:request",
+                "session_id": session.to_hex(),
+                "controller_user_id": ObjectId::new().to_hex(),
+                "controller_name": "a controller",
+                "permissions": serde_json::to_value(Permissions::empty()).unwrap(),
+                "consent_timeout_secs": 30,
+                "tenant_name": "Acme",
+            })
+            .to_string()
+        }
+
+        fn offer_line(session: ObjectId) -> String {
+            serde_json::to_string(&ServerMsg::SdpOffer {
+                session_id: session,
+                sdp: NO_CODEC_OFFER.to_string(),
+                ice_servers: Vec::new(),
+                extauth_mac: None,
+                peer_auth: None,
+            })
+            .unwrap()
+        }
+
+        fn ice_line(session: ObjectId) -> String {
+            serde_json::to_string(&ice(session)).unwrap()
+        }
+
+        /// The control plane: each line put on `to_device` goes to the
+        /// device, and each text frame the device sends comes back on `said`.
+        struct Plane {
+            to_device: mpsc::Sender<String>,
+            said: mpsc::Receiver<String>,
+        }
+
+        impl Plane {
+            async fn send(&self, line: String) {
+                self.to_device.send(line).await.expect("the plane is up");
+            }
+
+            /// Whether the device says, within `patience`, a line holding
+            /// every one of `needles`.
+            async fn says(&mut self, needles: &[&str], patience: Duration) -> bool {
+                tokio::time::timeout(patience, async {
+                    while let Some(line) = self.said.recv().await {
+                        if needles.iter().all(|n| line.contains(n)) {
+                            return true;
+                        }
+                    }
+                    false
+                })
+                .await
+                .unwrap_or(false)
+            }
+
+            /// The root's own answer to an offer of `session`: its refusal.
+            async fn root_served(&mut self, session: ObjectId, patience: Duration) -> bool {
+                let hex = session.to_hex();
+                self.says(
+                    &["rc:terminate", hex.as_str(), LIMIT_NO_COMMON_CODEC],
+                    patience,
+                )
+                .await
+            }
+        }
+
+        async fn driven_plane() -> (String, String, Plane) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (to_device, mut outgoing) = mpsc::channel::<String>(16);
+            let (said_tx, said) = mpsc::channel(256);
+            tokio::spawn(async move {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let (mut sink, mut frames) = ws.split();
+                loop {
+                    tokio::select! {
+                        line = outgoing.recv() => {
+                            let Some(line) = line else { return };
+                            if sink.send(Message::Text(line.into())).await.is_err() {
+                                return;
+                            }
+                        }
+                        frame = frames.next() => {
+                            let Some(Ok(frame)) = frame else { return };
+                            if let Message::Text(text) = frame {
+                                let _ = said_tx.send(text.to_string()).await;
+                            }
+                        }
+                    }
+                }
+            });
+            (
+                format!("http://127.0.0.1:{port}"),
+                format!("ws://127.0.0.1:{port}/ws"),
+                Plane { to_device, said },
+            )
+        }
+
+        /// The org `acme`'s real loop with `host`, as `run_cmd` gives it on a
+        /// one-row Mac's daemon.
+        struct AcmeLoop {
+            stopping: tokio::sync::watch::Sender<bool>,
+            task: tokio::task::JoinHandle<anyhow::Result<()>>,
+            _view: tokio::sync::watch::Receiver<tunnel_core::localapi::OverlayView>,
+            _dir: tempfile::TempDir,
+        }
+
+        impl AcmeLoop {
+            async fn start(host: &DelegateHost) -> (Self, Plane) {
+                let dir = tempfile::tempdir().unwrap();
+                let (server, ws, plane) = driven_plane().await;
+                let mut cfg = crate::config::test_fixture();
+                cfg.server_url = server;
+                cfg.ws_url = Some(ws);
+                cfg.agent_token = "tok".into();
+                let (stopping, stop_rx) = tokio::sync::watch::channel(false);
+                let (view_tx, view) =
+                    tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
+                let broker = crate::consent::ConsentBroker::new(
+                    crate::consent::Mode::AutoGrant,
+                    dir.path().join("consent"),
+                )
+                .unwrap();
+                let remote_cfg = crate::remote_config::RemoteConfigServices::new(
+                    dir.path().join("config.toml"),
+                    Arc::new(tokio::sync::Mutex::new(())),
+                    false,
+                    false,
+                );
+                let task = tokio::spawn(signaling::run(
+                    OrgCtx::secondary("acme", crate::token_slot::TokenSlot::new("tok")),
+                    Delegation::for_secondary(Some(host)),
+                    cfg,
+                    crate::encode::EncoderPreference::Software,
+                    stop_rx,
+                    Arc::new(AtomicBool::new(false)),
+                    view_tx,
+                    Default::default(),
+                    broker,
+                    crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+                    remote_cfg,
+                    crate::rc_sessions::RcSessionRegistry::new(),
+                ));
+                let started = Self {
+                    stopping,
+                    task,
+                    _view: view,
+                    _dir: dir,
+                };
+                (started, plane)
+            }
+
+            async fn end(self) {
+                let _ = self.stopping.send(true);
+                let _ = tokio::time::timeout(PATIENCE, self.task).await;
+            }
+        }
+
+        /// The request, and the device's answer to it, with no worker
+        /// attached.
+        async fn asked_with_no_worker(host: &DelegateHost) -> (AcmeLoop, Plane, ObjectId) {
+            let (acme, mut plane) = AcmeLoop::start(host).await;
+            let session = ObjectId::new();
+            plane.send(request_line(session)).await;
+            assert!(
+                plane.says(&["rc:consent"], PATIENCE).await,
+                "the device answered the ask"
+            );
+            (acme, plane, session)
+        }
+
+        fn no_probe_child() {
+            assert_eq!(
+                crate::encode::caps::caps_probe_spawns(),
+                0,
+                "a lib test started a caps-probe child (#3548)"
+            );
+        }
+
+        /// (a) #4543 in the real loop: the request is handled while no worker
+        /// is attached, a worker attaches, and the offer crosses to it, its
+        /// params first. Before the fix the root served it: a connected
+        /// session with no picture.
+        #[test]
+        fn a_one_row_session_asked_with_no_worker_is_served_by_the_worker_at_its_offer() {
+            let probe = crate::encode::caps::loop_fixture();
+            probe.block_on(async {
+                let host = one_row_host();
+                host.started_for_test(PERSON);
+                let (acme, mut plane, session) = asked_with_no_worker(&host).await;
+                let mut worker = attach(&host);
+                plane.send(offer_line(session)).await;
+                let first = tokio::select! {
+                    frame = tokio::time::timeout(PATIENCE, worker.recv()) => {
+                        frame.expect("a frame within PATIENCE").expect("a frame")
+                    }
+                    true = plane.root_served(session, PATIENCE) => {
+                        panic!(
+                            "the root served the offer: a connected session with no picture \
+                             (#4543)"
+                        )
+                    }
+                };
+                let DelegateFrame::SessionParams(p) = &first else {
+                    panic!("the params first, got {first:?}");
+                };
+                assert_eq!(p.session_id, session.to_hex());
+                assert_eq!(
+                    p.asking_org.as_deref(),
+                    Some("Acme"),
+                    "what the request resolved"
+                );
+                assert!(!p.keepable);
+                let next = tokio::time::timeout(PATIENCE, worker.recv())
+                    .await
+                    .expect("the offer within PATIENCE")
+                    .expect("a frame");
+                assert!(is_offer_of(&next, session), "then the offer: {next:?}");
+                assert!(
+                    !plane.root_served(session, QUIET).await,
+                    "and the root did not serve it too"
+                );
+                acme.end().await;
+            });
+            no_probe_child();
+        }
+
+        /// (b) An offer that comes while no worker is attached is served by
+        /// the root, as it always was.
+        #[test]
+        fn a_one_row_offer_with_no_worker_attached_is_served_by_the_root() {
+            let probe = crate::encode::caps::loop_fixture();
+            probe.block_on(async {
+                let host = one_row_host();
+                host.started_for_test(PERSON);
+                let (acme, mut plane, session) = asked_with_no_worker(&host).await;
+                plane.send(offer_line(session)).await;
+                assert!(
+                    plane.root_served(session, PATIENCE).await,
+                    "no worker at the offer: the root serves it"
+                );
+                acme.end().await;
+            });
+            no_probe_child();
+        }
+
+        /// (d) A session whose offer the root took stays there: a worker that
+        /// attaches after it is handed nothing of it, neither what follows
+        /// nor a second offer, which the root answers again. Moving a live
+        /// peer is out of scope.
+        #[test]
+        fn a_one_row_session_whose_offer_the_root_took_never_crosses_after() {
+            let probe = crate::encode::caps::loop_fixture();
+            probe.block_on(async {
+                let host = one_row_host();
+                host.started_for_test(PERSON);
+                let (acme, mut plane, session) = asked_with_no_worker(&host).await;
+                plane.send(offer_line(session)).await;
+                assert!(
+                    plane.root_served(session, PATIENCE).await,
+                    "the first offer: the root's"
+                );
+                let mut worker = attach(&host);
+                // In the loop's order: the ICE is handled before the second
+                // offer's refusal is said.
+                plane.send(ice_line(session)).await;
+                plane.send(offer_line(session)).await;
+                assert!(
+                    plane.root_served(session, PATIENCE).await,
+                    "the second offer: the root's too"
+                );
+                let crossed = drained(&mut worker);
+                assert!(crossed.is_empty(), "nothing of it crossed: {crossed:?}");
+                acme.end().await;
+            });
+            no_probe_child();
+        }
     }
 }

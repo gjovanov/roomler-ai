@@ -464,6 +464,10 @@ mod tombstone_tests;
 mod touch_preset_tests;
 #[cfg(test)]
 mod transfer_activity_tests;
+/// #4553 — a tunnel client's presence comes from its live socket, on either
+/// pod, and from the heartbeat trail only when there is no directory to ask.
+#[cfg(test)]
+mod tunnel_client_presence_tests;
 /// #3328 — a tunnel enrollment token enrolls once, and re-enrolling a machine
 /// id that already has a tunnel client revives it only for its owner or a
 /// holder of `MANAGE_AGENTS`.
@@ -478,6 +482,10 @@ mod tunnel_policy_permission_tests;
 /// hold that role in the policy's org, read on every forward request.
 #[cfg(test)]
 mod tunnel_role_subject_tests;
+/// #4501 — an in-flight tunnel connection across a pod roll and across its
+/// exit's control socket cycling, on two pods.
+#[cfg(test)]
+mod tunnel_survival_tests;
 #[cfg(test)]
 mod tunnel_tests;
 /// FR-115 P4b — coturn's per-allocation totals into `turn_bytes`, for the
