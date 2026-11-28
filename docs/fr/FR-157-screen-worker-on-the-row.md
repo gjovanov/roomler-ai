@@ -47,7 +47,7 @@ host to learn it.
   ([`encode/caps.rs:4453-4459`](../../agents/roomlerd/src/encode/caps.rs#L4453-L4459)). Once an attached worker has
   sent its caps, the row advertises the worker's permission pair instead
   ([`delegate.rs:2015-2018`](../../agents/roomlerd/src/delegate.rs#L2015-L2018), announced at
-  [`signaling.rs:7177`](../../agents/roomlerd/src/signaling.rs#L7177)). No word says one row. The four Macs of the lab
+  [`signaling.rs:7263`](../../agents/roomlerd/src/signaling.rs#L7263)). No word says one row. The four Macs of the lab
   cells below therefore collapse into two readings:
 
   | Mac | what its row carries today |
@@ -167,7 +167,7 @@ failure is noted as `GaveUp`
 ### Who sends it
 
 - **A Mac's daemon, on every loop.** On a loop that holds the delegate host (the primary, and every org on a one-row
-  Mac, [`signaling.rs:7166-7171`](../../agents/roomlerd/src/signaling.rs#L7166-L7171)) the word is the host's. On a
+  Mac, [`signaling.rs:7252-7257`](../../agents/roomlerd/src/signaling.rs#L7252-L7257)) the word is the host's. On a
   loop that holds none, it is `unsupervised`, because that loop never hands a session to the worker.
 - **Never the worker** (`--supervised`). It is the screen side itself, as `Status` already says of it
   ([`crates/localapi/src/lib.rs:491-496`](../../crates/localapi/src/lib.rs#L491-L496)).
@@ -185,10 +185,10 @@ tell: any loop of the worker but its primary holds no host, as a daemon's second
 ### When it moves
 
 The word is read with the others in `Announcer::now`
-([`signaling.rs:7171`](../../agents/roomlerd/src/signaling.rs#L7171)) and compared as part of `Announced`
-([`signaling.rs:7082`](../../agents/roomlerd/src/signaling.rs#L7082)). So the hello carries it
-([`hello_with`, `signaling.rs:7285-7303`](../../agents/roomlerd/src/signaling.rs#L7285-L7303)), and so does every beat
-on which it changed ([`beat`, `signaling.rs:7308-7320`](../../agents/roomlerd/src/signaling.rs#L7308-L7320); the
+([`signaling.rs:7257`](../../agents/roomlerd/src/signaling.rs#L7257)) and compared as part of `Announced`
+([`signaling.rs:7168`](../../agents/roomlerd/src/signaling.rs#L7168)). So the hello carries it
+([`hello_with`, `signaling.rs:7371-7389`](../../agents/roomlerd/src/signaling.rs#L7371-L7389)), and so does every beat
+on which it changed ([`beat`, `signaling.rs:7394-7406`](../../agents/roomlerd/src/signaling.rs#L7394-L7406); the
 caps go out at [`signaling.rs:2729-2744`](../../agents/roomlerd/src/signaling.rs#L2729-L2744)).
 
 What P1 adds is the news. Before P1 the host woke the heartbeat for three things only: the worker's caps held, the
@@ -209,9 +209,9 @@ so the steady state costs nothing. It must also come back down when the worker l
 ([`crates/remote_control/src/signaling.rs:652-654`](../../crates/remote_control/src/signaling.rs#L652-L654)).
 
 P1 built it so. `Announcer::now` reads the word
-([`signaling.rs:7210-7215`](../../agents/roomlerd/src/signaling.rs#L7210-L7215)) into `Announced`
-([`:7135-7140`](../../agents/roomlerd/src/signaling.rs#L7135-L7140)), and `stub_caps` writes it into the caps
-([`:7400`](../../agents/roomlerd/src/signaling.rs#L7400)). The attach wakes the news as soon as the channel is held
+([`signaling.rs:7296-7301`](../../agents/roomlerd/src/signaling.rs#L7296-L7301)) into `Announced`
+([`:7221-7226`](../../agents/roomlerd/src/signaling.rs#L7221-L7226)), and `stub_caps` writes it into the caps
+([`:7486`](../../agents/roomlerd/src/signaling.rs#L7486)). The attach wakes the news as soon as the channel is held
 ([`delegate.rs:2178-2182`](../../agents/roomlerd/src/delegate.rs#L2178-L2182)). The end wakes it once, after both the
 caps are cleared and the flag is down ([`delegate.rs:2197-2203`](../../agents/roomlerd/src/delegate.rs#L2197-L2203)),
 so no beat reads the caps gone with the word still `attached`. That one wake replaces the end's old one, which came only

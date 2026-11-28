@@ -1077,8 +1077,8 @@ sequenceDiagram
 ```
 
 **What the exit does.** The `ServerMsg::TunnelTerminate` arm
-(`agents/roomlerd/src/signaling.rs:5627`) hands the QUIC half to
-`terminate_quic_session` (`:6715`):
+(`agents/roomlerd/src/signaling.rs:5638`) hands the QUIC half to
+`terminate_quic_session` (`:6726`):
 
 - **with the flag**, `AgentQuicPeer::end` (`agents/roomlerd/src/tunnel/quic_peer.rs:590`):
   every flow stops, its two halves aborted, which drops its destination socket and
@@ -1088,7 +1088,7 @@ sequenceDiagram
   flavours the TURN allocation, go once the closed connection drains. A peer R3
   parked and reclaimed is ended the same way;
 - **without it**, `AgentQuicPeer::close`, and the session's `SessionLink` is kept in
-  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6689`) for 60 s
+  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6700`) for 60 s
   (`ENDED_SESSION_TTL`, at most 64 sessions a tenant, the oldest first out). A
   terminate with the flag that arrives after one without still reaches the session
   through it and ends it.
@@ -1102,7 +1102,7 @@ forward still waiting for its stream (`take_flow`,
 ends.
 
 **The reap.** A #1754 reap (`ReapSignal::QuicConnEnded`) goes through `reap_quic_peer`
-(`agents/roomlerd/src/signaling.rs:6747`, from the reap arm at `:3100`) to
+(`agents/roomlerd/src/signaling.rs:6758`, from the reap arm at `:3111`) to
 `AgentQuicPeer::reap` (`agents/roomlerd/src/tunnel/quic_peer.rs:602`): when the
 connection itself has ended (`close_reason()` is set), it ends the session as above.
 When the accept loop ended on a connection that is still up, it only closes the peer

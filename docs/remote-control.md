@@ -1104,11 +1104,11 @@ sequenceDiagram
 ```
 
 **When it moves.** `Announcer::now` reads the word with the other words
-([`signaling.rs:7210-7215`](../agents/roomlerd/src/signaling.rs#L7210-L7215)),
+([`signaling.rs:7296-7301`](../agents/roomlerd/src/signaling.rs#L7296-L7301)),
 and `Announced` compares it with them
-([`:7135-7140`](../agents/roomlerd/src/signaling.rs#L7135-L7140)). So the hello
+([`:7221-7226`](../agents/roomlerd/src/signaling.rs#L7221-L7226)). So the hello
 carries it, and so does every beat on which it changed
-([`stub_caps`, `:7400`](../agents/roomlerd/src/signaling.rs#L7400)). A beat on
+([`stub_caps`, `:7486`](../agents/roomlerd/src/signaling.rs#L7486)). A beat on
 which it did not change sends no caps for it. Three things wake the loops that
 hold the host, so the heartbeat announces the word at once:
 
