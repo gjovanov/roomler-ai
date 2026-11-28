@@ -21,9 +21,10 @@ either agent-reachable or operator-only.**
 
 - **agent** — a measurement, a test, a fleet read via `roomler exec`, a `vmtest` /
   `profiletest` / `tunnel-fleet-test` cell, a Chrome-driven RC session, a doc.
-- **operator** — a human's perception or a human's decision. FR-77 is open *only for the
-  operator's Notepad++ scroll*. FR-74's remainder is *the operator's cap call*. FR-1 was
-  verified by *"WINHOST-J works nicely"*. No agent reaches those, ever.
+- **operator** — a human's perception or a human's decision. FR-77 stayed open *only for
+  the operator's Notepad++ scroll*, which is now FR-135's AC22. FR-74's remainder is *the
+  operator's cap call*. FR-1 was verified by *"WINHOST-J works nicely"*. No agent reaches
+  those, ever.
 
 A card is **Ready to close** when every *agent* criterion is ticked with linked evidence.
 The board's top section then answers the question that exists nowhere else today:

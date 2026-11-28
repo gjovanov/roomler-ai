@@ -78,6 +78,9 @@ pub mod diagnostics;
 pub mod enroll_key;
 pub mod exec_service;
 pub mod external_access;
+/// FR-155 P1c — every pod's check of the entries it holds against their
+/// rows' generations.
+pub mod generation_check;
 pub mod hub;
 pub mod install_trace;
 pub mod keep_busy;
@@ -256,6 +259,11 @@ impl Module for FleetState {
             Some(consent_tx),
             core.relay_load.clone(),
         ));
+        // FR-155 P1c — the token rotation, on only while both switches are:
+        // a rotation commits only then.
+        rc_hub.set_token_rotation(
+            settings.rc.agent_token_rotation && settings.rc.token_generation_check,
+        );
         // FR-115 P3b — the hub keeps its sessions' slots: renews this pod's
         // leases every round, and gives a slot back when its session ends.
         // Empty until `rc.session_slots` has a caller claim one.
@@ -420,6 +428,10 @@ impl Module for FleetState {
         // scope is read again on the same cadence, so a change whose event
         // was lost still reaches this pod's devices. Not spawned at window 0.
         resume_scope::spawn_reconciler(state.clone());
+        // FR-155 P1c — on the same cadence, every pod ends an entry below its
+        // row's generation, also a pod that the rotation's control event does
+        // not reach. Not spawned while the rotation is off.
+        generation_check::spawn(state.clone());
         // C-2/PR-1 — the owner-side idle-agent nudge handler (P7b, from the
         // host): cycles an agent's socket iff every holder reads it idle.
         nudge::register_bus_handler(&state);
