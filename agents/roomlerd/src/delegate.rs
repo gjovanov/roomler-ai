@@ -55,7 +55,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use roomler_ai_remote_control::models::{AgentCaps, RecordCap, Unavailable};
+use roomler_ai_remote_control::models::{AgentCaps, GuiWorkerBrief, RecordCap, Unavailable};
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -1177,6 +1177,14 @@ struct Inner {
     /// FR-149 P1 — how many times a question moved to the person's app
     /// started the app ([`DelegateHost::start_the_app`]).
     app_starts: std::sync::atomic::AtomicUsize,
+    /// FR-157 P1 — the daemon's switches, which the screen-worker word reads
+    /// ([`DelegateHost::set_word_config`]). Set once at start; the default,
+    /// every switch off, reads `unsupervised`.
+    word_config: Mutex<crate::macos_supervisor::WordConfig>,
+    /// FR-157 P1 — the supervisor's last decision
+    /// ([`DelegateHost::note_supervisor`]). `None` until its first, and on
+    /// every daemon whose supervisor does not run.
+    supervisor_last: Mutex<Option<crate::macos_supervisor::Action>>,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -1671,8 +1679,11 @@ impl DelegateHost {
     /// #3992 — wakes when a word the worker says changes what this device
     /// announces: its caps held ([`DelegateFrame::WorkerCaps`]), the person's
     /// floor kept ([`Self::person_floor`]), or its caps cleared with its
-    /// channel. A connection that holds this host subscribes BEFORE it reads
-    /// the words its hello carries, so a word said in between wakes it, and its
+    /// channel. FR-157 P1 — and when the screen-worker word moves
+    /// ([`Self::gui_worker_word`]): the channel's attach and its end, and each
+    /// new decision of the supervisor ([`Self::note_supervisor`]). A
+    /// connection that holds this host subscribes BEFORE it reads the words
+    /// its hello carries, so a word said in between wakes it, and its
     /// heartbeat announces the word at once rather than within its 30 s.
     pub fn news(&self) -> tokio::sync::watch::Receiver<u64> {
         self.news_sender().subscribe()
@@ -2028,11 +2039,68 @@ impl DelegateHost {
     /// ([`Self::effective_permissions`]), and whether this daemon runs one row.
     /// What `roomlerd one-row` verifies after its restart.
     pub fn worker_status(&self) -> tunnel_core::localapi::GuiWorkerStatus {
+        // FR-157 P1 (D5) — one read of the channel for `attached` and the
+        // word, so the two never disagree within one `Status`.
+        let attached = self.inner.attached.load(Ordering::Acquire);
+        let word = self.word_with(attached);
         tunnel_core::localapi::GuiWorkerStatus {
-            attached: self.inner.attached.load(Ordering::Acquire),
+            attached,
             permissions: self.effective_permissions().map(|(words, _)| words),
             one_row: self.one_row(),
+            state: Some(word.state),
+            reason: word.reason,
         }
+    }
+
+    /// FR-157 P1 — this daemon's switches, which the screen-worker word reads
+    /// ([`Self::gui_worker_word`]). Set once at its start, before any
+    /// connection reads the word. A host nobody sets reads as a daemon with
+    /// every switch off: `unsupervised`.
+    pub fn set_word_config(&self, config: crate::macos_supervisor::WordConfig) {
+        *self.inner.word_config.lock().expect("word config mutex") = config;
+    }
+
+    /// FR-157 P1 — the supervisor's decision, noted at the transition it
+    /// logs once. A new one is news to every connection that holds this host
+    /// ([`Self::news`]); the same one again is none, so a tick that repeats
+    /// it never wakes a connection.
+    pub fn note_supervisor(&self, action: crate::macos_supervisor::Action) {
+        let moved = {
+            let mut last = self
+                .inner
+                .supervisor_last
+                .lock()
+                .expect("supervisor last mutex");
+            last.replace(action) != Some(action)
+        };
+        // Stored first, and the guard dropped, so whoever wakes reads it.
+        if moved {
+            self.words_moved();
+        }
+    }
+
+    /// FR-157 P1 — the screen worker as this daemon says it, on the row of
+    /// every connection that holds this host and in its `Status`
+    /// ([`Self::worker_status`]): one read of the switches, the channel and
+    /// the supervisor's last decision, through
+    /// [`crate::macos_supervisor::gui_worker_word`].
+    pub fn gui_worker_word(&self) -> GuiWorkerBrief {
+        self.word_with(self.inner.attached.load(Ordering::Acquire))
+    }
+
+    /// The word with the channel as `attached` read it.
+    fn word_with(&self, attached: bool) -> GuiWorkerBrief {
+        let config = *self.inner.word_config.lock().expect("word config mutex");
+        let last = *self
+            .inner
+            .supervisor_last
+            .lock()
+            .expect("supervisor last mutex");
+        crate::macos_supervisor::gui_worker_word(crate::macos_supervisor::WordInputs {
+            config,
+            attached,
+            last,
+        })
     }
 
     /// Forget the current secret — the worker it belonged to is gone.
@@ -2108,6 +2176,10 @@ impl DelegateHost {
             return;
         }
         tracing::info!("delegation channel attached");
+        // FR-157 P1 — the row's screen-worker word reads `attached` from now,
+        // before the worker's caps arrive, so every connection that holds this
+        // host hears it at once.
+        self.words_moved();
         // ⚠️ `run` clears the sender, the caps and the questions without a
         // check of which channel set them. It requires that no other channel
         // attaches until that clear is done: `attached` is released only after
@@ -2124,6 +2196,11 @@ impl DelegateHost {
         };
         self.records_channel_ended(&cause);
         self.inner.attached.store(false, Ordering::Release);
+        // #3992, FR-157 P1 — the channel's end is news, ONE wake after both
+        // its caps are cleared (`channel_ended`) and the flag is down, so the
+        // woken beat reads the two together: a wake between them would announce
+        // the caps gone with the word still `attached`, and then the word.
+        self.words_moved();
         match result {
             Ok(()) => tracing::info!("delegation channel closed"),
             Err(e) => tracing::warn!(error = %e, "delegation channel ended with an error"),
@@ -2306,18 +2383,11 @@ impl DelegateHost {
         *self.inner.to_worker.lock().expect("to_worker mutex") = None;
         // ⚠️ Clear the caps with the channel. Keeping them would leave the row
         // advertising a capture target that has gone, and the next session
-        // would get the black screen P2b existed to fix.
-        let held = self
-            .inner
-            .worker_caps
-            .lock()
-            .expect("worker caps mutex")
-            .take();
-        // #3992 — and the row hears it now, not at the next beat. A worker that
-        // left without its caps changed nothing the row says.
-        if held.is_some() {
-            self.words_moved();
-        }
+        // would get the black screen P2b existed to fix. #3992 — the row hears
+        // it now, not at the next beat: [`Self::serve`] tells the news once
+        // the flag is down too (FR-157 P1), with or without caps held, since
+        // the screen-worker word moves either way.
+        *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
         // FR-92 — and the questions it will now never answer: dropping each
         // sender ends its caller's wait at once instead of at the timeout.
         self.inner
@@ -2503,6 +2573,8 @@ impl DelegateHost {
     pub(crate) fn end_channel_for_test(&self) {
         self.channel_ended();
         self.records_channel_ended("closed");
+        self.inner.attached.store(false, Ordering::Release);
+        self.words_moved();
     }
 
     /// #4421 — the account a worker is started for, noted as
@@ -3303,7 +3375,11 @@ pub(crate) mod tests {
         let host = DelegateHost::new();
         let (task, mut lines, mut cwr) = attached_worker(&host).await;
         let news = host.news();
-        assert!(!news.has_changed().unwrap(), "attaching says nothing");
+        // Subscribed after the attach, whose news (FR-157 P1) it has seen.
+        assert!(
+            !news.has_changed().unwrap(),
+            "no caps yet, so nothing since"
+        );
         worker_sends(&mut cwr, &mut lines, &caps_frame()).await;
         assert_eq!(host.effective_permissions(), Some((Vec::new(), false)));
         assert!(news.has_changed().unwrap(), "the caps held are news");
@@ -3353,8 +3429,9 @@ pub(crate) mod tests {
     }
 
     /// #3992 W4 — the channel ends while the worker's caps are held: they are
-    /// cleared, and that is news. A worker that leaves without having sent its
-    /// caps changed nothing the row says, and that is none.
+    /// cleared, and that is news. FR-157 P1 — and a worker that leaves without
+    /// having sent its caps is news too: the row's screen-worker word says it
+    /// has gone. Before P1 that end told nothing.
     #[tokio::test]
     async fn a_channel_that_ends_with_the_caps_held_is_news() {
         let host = DelegateHost::new();
@@ -3374,9 +3451,173 @@ pub(crate) mod tests {
         drop(lines);
         task.await.unwrap();
         assert!(
-            !news.has_changed().unwrap(),
-            "nothing held, nothing cleared"
+            news.has_changed().unwrap(),
+            "nothing held, and the worker's leaving is news"
         );
+    }
+
+    /// FR-157 P1 — a root daemon with the supervisor on, on one row.
+    fn on_one_row() -> crate::macos_supervisor::WordConfig {
+        crate::macos_supervisor::WordConfig {
+            is_root: true,
+            supervise: true,
+            one_row: true,
+        }
+    }
+
+    /// FR-157 P1 — a word as `(state, reason, one_row)`.
+    fn said(word: &GuiWorkerBrief) -> (&str, Option<&str>, bool) {
+        (word.state.as_str(), word.reason.as_deref(), word.one_row)
+    }
+
+    /// FR-157 P1 (AC3) — the attach and the detach of the channel are news,
+    /// so the row hears the word at once: `attached` as soon as a worker holds
+    /// the channel, before its caps, and `not-attached` the moment it leaves.
+    /// Before, the attach told nothing, and the row moved only with the caps
+    /// frame, 0.3 to 2.6 s later in P0's reads.
+    #[tokio::test]
+    async fn the_attach_and_the_detach_wake_the_news() {
+        use crate::macos_supervisor::Action;
+        let host = DelegateHost::new();
+        host.set_word_config(on_one_row());
+        host.note_supervisor(Action::Spawn(501));
+        let mut news = host.news();
+        let (task, lines, cwr) = attached_worker(&host).await;
+        assert!(news.has_changed().unwrap(), "the attach is news");
+        news.borrow_and_update();
+        assert_eq!(
+            said(&host.gui_worker_word()),
+            (GuiWorkerBrief::ATTACHED, None, true),
+            "attached, before any caps"
+        );
+        assert_eq!(
+            host.effective_permissions(),
+            None,
+            "the row's permissions wait for the caps"
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(news.has_changed().unwrap(), "the detach is news");
+        assert_eq!(
+            said(&host.gui_worker_word()),
+            (
+                GuiWorkerBrief::NOT_ATTACHED,
+                Some(GuiWorkerBrief::STARTING),
+                true
+            ),
+            "the supervisor's last decision, once the worker has gone"
+        );
+    }
+
+    /// FR-157 P1 (AC3) — a change of the supervisor's state is news once, and
+    /// the same state noted again, as a tick that repeats it would, is none.
+    #[test]
+    fn a_change_of_the_supervisors_state_is_news_once() {
+        use crate::macos_supervisor::Action;
+        let host = DelegateHost::new();
+        host.set_word_config(on_one_row());
+        let mut news = host.news();
+        host.note_supervisor(Action::NoGuiSession);
+        assert!(news.has_changed().unwrap(), "a new state is news");
+        news.borrow_and_update();
+        assert_eq!(
+            said(&host.gui_worker_word()),
+            (
+                GuiWorkerBrief::NOT_ATTACHED,
+                Some(GuiWorkerBrief::NO_CONSOLE_USER),
+                true
+            )
+        );
+        host.note_supervisor(Action::NoGuiSession);
+        assert!(!news.has_changed().unwrap(), "the same state again is none");
+        host.note_supervisor(Action::Spawn(501));
+        assert!(news.has_changed().unwrap(), "the next state is news");
+        news.borrow_and_update();
+        assert_eq!(
+            said(&host.gui_worker_word()),
+            (
+                GuiWorkerBrief::NOT_ATTACHED,
+                Some(GuiWorkerBrief::STARTING),
+                true
+            )
+        );
+        host.note_supervisor(Action::Spawn(501));
+        assert!(!news.has_changed().unwrap(), "and a repeated tick none");
+    }
+
+    /// FR-157 P1 (D5) — `Status` says the word the row says, from the same
+    /// read, and FR-43's three fields keep their meaning.
+    #[tokio::test]
+    async fn the_status_says_the_word_the_row_says() {
+        use crate::macos_supervisor::{Action, WordConfig};
+        let two_rows_root = WordConfig {
+            is_root: true,
+            ..WordConfig::default()
+        };
+        let one_row_supervisor_off = WordConfig {
+            is_root: true,
+            one_row: true,
+            ..WordConfig::default()
+        };
+        let cells = [
+            (WordConfig::default(), None),
+            (two_rows_root, None),
+            (one_row_supervisor_off, None),
+            (on_one_row(), None),
+            (on_one_row(), Some(Action::NoGuiSession)),
+            (on_one_row(), Some(Action::LaunchdOwns)),
+            (on_one_row(), Some(Action::GaveUp)),
+        ];
+        for (config, last) in cells {
+            let host = DelegateHost::new();
+            host.set_word_config(config);
+            if let Some(action) = last {
+                host.note_supervisor(action);
+            }
+            let word = host.gui_worker_word();
+            let status = host.worker_status();
+            assert_eq!(
+                (status.state.as_deref(), status.reason.as_deref()),
+                (Some(word.state.as_str()), word.reason.as_deref()),
+                "{config:?} {last:?}"
+            );
+            assert!(!status.attached, "{config:?} {last:?}");
+            assert_eq!(status.permissions, None, "{config:?} {last:?}");
+            assert!(!status.one_row, "the host's own flag: {config:?} {last:?}");
+        }
+
+        // And with a worker attached that holds both permissions.
+        let host = DelegateHost::new();
+        host.set_word_config(on_one_row());
+        host.set_one_row();
+        host.note_supervisor(Action::Healthy);
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        let both = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                permissions: Some(vec!["screen-capture".into(), "input".into()]),
+                has_input_permission: true,
+                ..Default::default()
+            }),
+            features: Vec::new(),
+        };
+        let mut line = serde_json::to_vec(&both).unwrap();
+        line.push(b'\n');
+        worker_sends(&mut cwr, &mut lines, &line).await;
+        let status = host.worker_status();
+        assert_eq!(
+            (status.state.as_deref(), status.reason.as_deref()),
+            (Some(GuiWorkerBrief::ATTACHED), None)
+        );
+        assert!(status.attached);
+        assert!(status.one_row);
+        assert_eq!(
+            status.permissions,
+            Some(vec!["screen-capture".to_string(), "input".to_string()])
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
     }
 
     /// #3992 L1 — the four words the device announces of its worker come from
