@@ -1662,9 +1662,9 @@ async fn spawn_with_relay(
 /// T31 (FR-155 P1e): the commit pushes the device's floor to every regional
 /// relay before the route answers. A stand-in relay, polled once a minute,
 /// holds, when the answer arrives, a set that verifies with the ticket key's
-/// public half and names the device's key at G+1, until past every ticket
-/// minted before the commit. A ticket minted to the device's control socket
-/// at G+1 carries G+1.
+/// public half and names the device's key at G+1, until at least the
+/// request's time plus `DERP_TICKET_TTL` and `DERP_TICKET_LEEWAY_SECS`. A
+/// ticket minted to the device's control socket at G+1 carries G+1.
 #[tokio::test]
 async fn the_commit_pushes_the_floor_to_every_relay_before_it_answers() {
     use base64::Engine as _;
@@ -1726,7 +1726,7 @@ async fn the_commit_pushes_the_floor_to_every_relay_before_it_answers() {
     assert_eq!(floor.generation, next, "the floor is the new generation");
     assert!(
         floor.until >= started + DERP_TICKET_TTL.as_secs() + DERP_TICKET_LEEWAY_SECS,
-        "the floor lasts past every ticket minted before the commit"
+        "the floor lasts at least as long as a ticket lives"
     );
 
     let mut ws = crate::agent_presence_tests::connect_agent(&app, &new).await;
