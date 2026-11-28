@@ -255,8 +255,8 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
-> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`agents/roomlerd/src/signaling.rs:3958`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, then the moment the daemon's footprint grows, ahead of any frame queued for the worker after it grew, and behind a `Pong` should the set have grown unannounced (`delegate.rs:2243`, `delegate.rs:2273`, `delegate.rs:2286`, `delegate.rs:2310`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:5056`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`agents/roomlerd/src/signaling.rs:3963`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:753`).
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, then the moment the daemon's footprint grows, ahead of any frame queued for the worker after it grew, and behind a `Pong` should the set have grown unannounced (`delegate.rs:2520`, `delegate.rs:2550`, `delegate.rs:2563`, `delegate.rs:2587`; the worker side is `delegate_worker.rs:524`, wired at `app.rs:5056`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > **Both kinds filter by the worker's footprint as it stands (#3359)**, unioned with what the session carried, so a delegated session handed an empty copy keeps the overlay out from the moment the daemon's push lands. The worker does not wait for a first push before it gathers: the daemon records the blocks before it creates the adapter and pushes them at once, and it writes the push ahead of any frame it queues for the worker afterwards, so an offer never reaches the worker ahead of a block the daemon already had. What is left is the push's own transit: a host candidate the worker gathers after the daemon's adapter has its address but before the push lands. That needs the push (a local socket, read by a worker loop that may be busy with another frame) to take longer than the adapter's creation and its address. The remote-side window above applies to the worker too.
 >
@@ -306,7 +306,7 @@ flowchart TD
 | the rule | `auto_allows` (`rc_overlay.rs:538`) |
 
 Notes on the implementation:
-- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:224`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4721`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
+- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:224`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4728`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
 - **A viewer device on a worse link stays off** (`exclude`, `rc_overlay.rs:70`). One computer can run several agents, each with its own relay: Windows and WSL, where the Windows agent is direct to its peers and the WSL one rides DERP (FR-121 P3b). A session that rides the mesh through the best one keeps every other one out of its ICE servers, its remote candidates and the offer's SDP. Otherwise ICE, which ranks relays by the order of their TURN servers, could pick the relay behind DERP.
 - **It logs one line:** `rc ICE: overlay auto (FR-128) — the session may ride the mesh` (or `stays off`), with `viewers`, `carriers`, `far_turn` (the server's hint), `own_far_turn` (D8), `allow` and `exclude`.
 - **Kill switch:** `ROOMLERD_RC_OVERLAY_AUTO=0` (`rc_overlay.rs:93`) makes `auto` behave as `off`. The device then stops advertising `rc-overlay-auto`, so the Hub reads its policy as `off` too.
@@ -732,7 +732,7 @@ sequenceDiagram
 | `code` | Means | What the operator does |
 |---|---|---|
 | `permission` | The OS can capture; this process may not. macOS Screen Recording (TCC), a denied portal grant | Grant it on the host and reconnect. ⚠️ A macOS grant is bound to the binary's **code signature** — a signing-identity change invalidates it silently (2026-09-08: the Developer ID move did exactly that fleet-wide) |
-| `no_display` | Nothing to capture — headless, no desktop session | Nothing. Shell and tunnels are unaffected. Files are too, except on a system install: a Linux one refuses reads with nobody at its screen (#3688), and a Mac's root daemon, which has no desktop session and says this code, declines file transfer (#3757, [desktop-companion.md §9.6](desktop-companion.md#96-a-macs-system-install-transfers-files-only-in-the-persons-session-3757)) |
+| `no_display` | Nothing to capture — headless, no desktop session | Nothing. Shell and tunnels are unaffected. Files are too, except on a system install: a Linux one refuses reads with nobody at its screen (#3688), and a Mac's root daemon, which has no desktop session and says this code, declines file transfer (#3757, [desktop-companion.md §9.6](desktop-companion.md#96-a-macs-system-install-transfers-files-only-in-the-persons-session-3757)). On a one-row Mac, reconnect once someone is signed in at the Mac: its root daemon serves only a session whose offer no screen worker took, and its `hint` names no row to go to (#4543, below) |
 | `not_built` | A signalling-only agent build, no capture backend compiled in | Install a full agent build |
 | `backend_error` | The backend failed and the agent did not attribute it | Read `detail` (the backend's own words) and the agent log |
 | `wayland_not_enabled` | FR-93: a Wayland desktop is showing, and every arm that could capture it is off on this device. Before FR-93 a per-user daemon streamed **black** here, and a system one said "headless" | Switch on the arm the `hint` names for this install: `drm_capture` + `uinput` on a system install, `portal_capture` (+ `mutter_capture` on GNOME) on a per-user one. See [`linux-capture.md` §1.1](linux-capture.md#11-a-wayland-desktop-with-nothing-switched-on-fr-93-p1) |
@@ -833,7 +833,7 @@ supervisor reads who to tell on its own thread and sends one
 (`sessions_told_via`, `virtual_desktop.rs:513`), so it never waits on a
 channel. Only where the device's plan is the virtual desktop
 (`capture::sessions_capture_the_virtual_desktop`,
-`agents/roomlerd/src/capture/mod.rs:1646`); under an explicit `drm_capture` or
+`agents/roomlerd/src/capture/mod.rs:1668`); under an explicit `drm_capture` or
 `portal_capture` arm, and with `ROOMLERD_VIRTUAL_DESKTOP_TELL_SESSIONS=0`,
 nobody is told. **The viewer keeps that notice until the person connects
 again, even if frames reach the session later** (a follower promoted, a
@@ -902,7 +902,7 @@ here.
 outside every login session, the root LaunchDaemon in session 0, has no window
 server and never will, so it can never capture. The classifier always named
 that case `no_display` (`classify_capture_failure`,
-`agents/roomlerd/src/capture/mod.rs:2733`), but it asked only after the open had
+`agents/roomlerd/src/capture/mod.rs:2755`), but it asked only after the open had
 failed, and there the open took 30 s to fail. Read on the released 0.4.200 on a
 supervised lab Mac in FR-43's black-row layout (one root enrollment, no
 per-user config), with one viewer on the daemon's row:
@@ -916,8 +916,8 @@ per-user config), with one viewer on the daemon's row:
 Every re-created session waited the same 30 s, so each notice reached a session
 already gone, and the page blamed the network
 ([FR-43](fr/FR-43-macos-single-enrollment.md), the black rows). `scrap_open`
-(`agents/roomlerd/src/capture/mod.rs:5048`) now asks `tcc::has_gui_session`
-first, through `open_in_session` (`agents/roomlerd/src/capture/mod.rs:5064`).
+(`agents/roomlerd/src/capture/mod.rs:5099`) now asks `tcc::has_gui_session`
+first, through `open_in_session` (`agents/roomlerd/src/capture/mod.rs:5115`).
 Where it answers no, nothing runs that waits on a window server: TCC's
 preflight and request (`agents/roomlerd/src/capture/scrap_backend.rs:112`), the
 display wake (`agents/roomlerd/src/capture/scrap_backend.rs:162`) and
@@ -925,6 +925,68 @@ display wake (`agents/roomlerd/src/capture/scrap_backend.rs:162`) and
 and the notice above are unchanged, and its warn line carries what the question
 itself cost (`checked_in_us`). A supervised Mac's delegated sessions never reach
 this open: its GUI worker captures, as before.
+
+⚠️ **On a one-row Mac, a session asked while no screen worker was attached is
+the worker's if one has attached by its offer** (#4543). The root daemon
+resolves a session's parameters (`SessionParams`: the transport, the codec, the
+grant, the record context) while it handles the session's request, and hands
+them to the screen worker ahead of the offer that consumes them. On a one-row
+Mac a session crosses only once its parameters did (FR-43 P3b). A request that
+came while no worker was attached (after a reboot before anyone signed in,
+across a log-out and log-in, just after a worker ended) left them behind. Its
+offer then fell through to the root daemon even when the person had signed in
+and a worker had attached during the consent wait: a connected session with no
+picture, and its files channel declined
+([desktop-companion.md §9.6](desktop-companion.md#96-a-macs-system-install-transfers-files-only-in-the-persons-session-3757)).
+Since #4543 the root daemon holds them, and they cross with the offer:
+
+```mermaid
+sequenceDiagram
+    participant S as server
+    participant D as roomlerd (root, one row)
+    participant W as screen worker
+    S->>D: rc:request, no worker attached
+    D->>D: consent as ever, the params resolved and held, keepable false
+    Note over W: the person signs in, the supervisor starts a worker<br/>for their account, and it attaches
+    S->>D: rc:sdp.offer
+    D->>W: SessionParams, then the offer, both or neither
+    W->>W: builds the peer, as the person at the screen
+    S->>D: rc:ice, rc:terminate
+    D->>W: cross for the org that asked, as for any session handed over
+```
+
+| Rule | Where (`agents/roomlerd/src/delegate.rs`) |
+|---|---|
+| **Held** only by a one-row Mac's root daemon, and only when no worker is attached at the request: the params, the org that asked, and the account the session was asked under (the one the supervisor had started a worker for, else the first it starts after the request). `keepable` is forced false. A session already handed over, or held for another org, is not held. At most 64 are held, oldest out: a session pushed out is the root's, as before. Off one row nothing is held | `hold`, `agents/roomlerd/src/delegate.rs:2064`, from `send_params` (`:1994`); `HELD_PARAMS_KEPT`, `:819` |
+| **Crosses at the offer**, with a worker attached: the held params first and the offer right behind them, on two places of the worker's queue reserved together, so both cross or neither does. The session is then noted for its org, with its `RECORD` grant, as one whose params crossed at the request is, and what follows the offer crosses as for any session handed over | the arm in `send_to_worker`, `agents/roomlerd/src/delegate.rs:1823`; `cross_held`, `:2164` |
+| **Only for the org that asked** (FR-43 P3b), and only to a worker of the account the session was asked under. A worker started for another account lets the session go. That covers a worker that ended by itself followed by the next person's, with no revoke between. A revoke (a console-user change, a GUI session's end, a hand-back to launchd, the daemon's stop) lets every held session go | `take_held`, `agents/roomlerd/src/delegate.rs:2134`; `started_for`, `:1325`; `revoke`, `:2381` |
+| **The root keeps what it serves.** An offer the root serves itself (no worker attached at it, a worker of another account, no room for both on the queue) lets the session go, and so does the session's end. A session whose offer the root took never crosses later | `served_here`, `agents/roomlerd/src/delegate.rs:2209`, called where the gate falls through (`agents/roomlerd/src/signaling.rs:3908`) |
+| **A worker that attached and ended before the offer** leaves the session held. If the same account's next worker is attached at the offer it serves the session, and if none is, the root does | `started_for`, `agents/roomlerd/src/delegate.rs:1325` |
+| **Never kept for the daemon's claim** (FR-138 P2b): the attach generation is read before the offer crosses, as before (`agents/roomlerd/src/signaling.rs:3881`), `served_by_daemon` is unchanged, and `cross_offer` makes no record of a session that is not keepable | `cross_offer`, `agents/roomlerd/src/session_table.rs:732` |
+
+A one-row Mac's root daemon that serves a session itself, so with no screen
+worker in it, names no row in its `no_display` sentence
+(`mac_no_display_hint`, `agents/roomlerd/src/capture/mod.rs:932`): "This
+roomlerd runs as a system daemon, which has no desktop session and therefore
+no screen to capture. On this Mac the screen is captured by the screen worker
+of the person signed in at it, and none served this session. Reconnect once
+someone is signed in at the Mac. Remote shell works here." Before #4543 it sent
+the viewer to the Mac's user-session roomlerd, a row a one-row Mac does not
+have. A two-row Mac's `-daemon` row keeps that sentence: there the person's
+own row serves the screen.
+
+**Tested** in `delegate::one_row_attach_tests`
+(`agents/roomlerd/src/delegate.rs:6341`), in the lib tests of the
+`rust-agent`, `windows-agent-sessions` and `ffmpeg-encoder-check` lanes. On the
+host: the params first at the offer, for the org that asked and the account it
+was asked under; a worker that ended before the offer; the bound; both or
+neither; nothing held off one row. In `real_loop` (`:6819`), a secondary org's
+real signalling loop on a one-row host, against a control plane the test
+drives: the offer is the worker's when one attached during the consent wait,
+the root's when none did, and a session whose offer the root took never crosses
+after. The sentence:
+`capture::wayland_reason_tests::a_one_row_macs_no_display_hint_sends_the_viewer_to_no_row`
+(`agents/roomlerd/src/capture/mod.rs:4384`).
 
 ⚠️ **A sleeping macOS display streams nothing, and fails nothing either.** The
 stream opens, `capture: backend=scrap` logs, and then no frame ever arrives:
@@ -989,7 +1051,7 @@ is tested on every OS.
 
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
-| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:4016`](../agents/roomlerd/src/signaling.rs#L4016)); `no-backend` | the receive-audio toggle is off, with the device's reason |
+| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:4021`](../agents/roomlerd/src/signaling.rs#L4021)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:2963`](../agents/roomlerd/src/encode/caps.rs#L2963)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
@@ -1069,8 +1131,8 @@ supervisor's last `Action`. It is pure, so it is tested on every OS. The map
 from `Action` is one `match` with no catch-all arm, so a new `Action` cannot
 compile without a word. The row and `roomler status` both read it through the
 delegate host (`DelegateHost::gui_worker_word` and `worker_status`,
-[`delegate.rs:2087-2104`](../agents/roomlerd/src/delegate.rs#L2087-L2104),
-[`:2041-2053`](../agents/roomlerd/src/delegate.rs#L2041-L2053)), so the two
+[`delegate.rs:2357-2374`](../agents/roomlerd/src/delegate.rs#L2357-L2374),
+[`:2311-2323`](../agents/roomlerd/src/delegate.rs#L2311-L2323)), so the two
 never disagree.
 
 | process | loop | the word |
@@ -1104,11 +1166,11 @@ sequenceDiagram
 ```
 
 **When it moves.** `Announcer::now` reads the word with the other words
-([`signaling.rs:7310-7315`](../agents/roomlerd/src/signaling.rs#L7310-L7315)),
+([`signaling.rs:7317-7322`](../agents/roomlerd/src/signaling.rs#L7317-L7322)),
 and `Announced` compares it with them
-([`:7223-7228`](../agents/roomlerd/src/signaling.rs#L7223-L7228)). So the hello
+([`:7230-7235`](../agents/roomlerd/src/signaling.rs#L7230-L7235)). So the hello
 carries it, and so does every beat on which it changed
-([`stub_caps`, `:7509`](../agents/roomlerd/src/signaling.rs#L7509)). A beat on
+([`stub_caps`, `:7516`](../agents/roomlerd/src/signaling.rs#L7516)). A beat on
 which it did not change sends no caps for it. Three things wake the loops that
 hold the host, so the heartbeat announces the word at once:
 
@@ -1117,13 +1179,13 @@ hold the host, so the heartbeat announces the word at once:
   ([`macos_supervisor.rs:1940-1944`](../agents/roomlerd/src/macos_supervisor.rs#L1940-L1944)),
   never on its 5 s tick. The host wakes the loops only when the decision
   differs from the last one
-  ([`note_supervisor`, `delegate.rs:2067-2080`](../agents/roomlerd/src/delegate.rs#L2067-L2080)).
+  ([`note_supervisor`, `delegate.rs:2337-2350`](../agents/roomlerd/src/delegate.rs#L2337-L2350)).
 - **The attach.** The host wakes the loops as soon as a worker holds the
   channel, before its caps arrive
-  ([`delegate.rs:2178-2182`](../agents/roomlerd/src/delegate.rs#L2178-L2182)).
+  ([`delegate.rs:2455-2459`](../agents/roomlerd/src/delegate.rs#L2455-L2459)).
 - **The channel's end.** The host wakes the loops once, after the caps are
   cleared and the flag is down
-  ([`delegate.rs:2197-2203`](../agents/roomlerd/src/delegate.rs#L2197-L2203)).
+  ([`delegate.rs:2474-2480`](../agents/roomlerd/src/delegate.rs#L2474-L2480)).
   So no beat announces the caps gone while the word still says `attached`.
   Before P1 the end woke the loops only when the worker had sent its caps.
 
@@ -1360,7 +1422,7 @@ sequenceDiagram
 - **The decision is one pure function**
   ([`sas.rs:120`](../agents/roomlerd/src/input/sas.rs#L120)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
-  announcement ([`signaling.rs:7293`](../agents/roomlerd/src/signaling.rs#L7293)),
+  announcement ([`signaling.rs:7300`](../agents/roomlerd/src/signaling.rs#L7300)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
   GPO refresh changes reaches the server within a beat. Where it says no, the
   `keys-only` entry stays and its reason names the half that is missing.
@@ -3171,12 +3233,12 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    causes, `NoSurface`, [`:1079`](../agents/roomlerd/src/consent.rs#L1079)), and tests pin every
    sentence, SSH's and exec's. An exec command waits on the broker alone: its companion and
    notification go up on a task of their own (`exec_surfaces_up`,
-   [`signaling.rs:8149`](../agents/roomlerd/src/signaling.rs#L8149), handed off at
-   [`:6023`](../agents/roomlerd/src/signaling.rs#L6023)), and its answer reads what they came to when
+   [`signaling.rs:8156`](../agents/roomlerd/src/signaling.rs#L8156), handed off at
+   [`:6030`](../agents/roomlerd/src/signaling.rs#L6030)), and its answer reads what they came to when
    the window ends, never waiting for it (`shown_by_now`,
-   [`:8195`](../agents/roomlerd/src/signaling.rs#L8195), read at
-   [`:6060`](../agents/roomlerd/src/signaling.rs#L6060); `exec_refusal`,
-   [`:8235`](../agents/roomlerd/src/signaling.rs#L8235)). A verdict not known by then keeps the
+   [`:8202`](../agents/roomlerd/src/signaling.rs#L8202), read at
+   [`:6067`](../agents/roomlerd/src/signaling.rs#L6067); `exec_refusal`,
+   [`:8242`](../agents/roomlerd/src/signaling.rs#L8242)). A verdict not known by then keeps the
    right-hand words. Until #3982 every unanswered exec question read "did not approve the command
    (Timeout)", whether anything showed it or not.
 
@@ -3220,7 +3282,7 @@ panel connects to its display once, when the daemon starts, and keeps that conne
 
    Busy wins over the app's cause (`Prompted::why_not_shown`,
    [`:470`](../agents/roomlerd/src/indicator/session_panel.rs#L470), read by exec at
-   [`signaling.rs:8172`](../agents/roomlerd/src/signaling.rs#L8172) and by SSH at
+   [`signaling.rs:8179`](../agents/roomlerd/src/signaling.rs#L8179) and by SSH at
    [`ssh.rs:2716`](../agents/roomlerd/src/ssh.rs#L2716)): the panel took no question because it
    showed another, and that is what kept this one from the person. Its sentence
    (`NoSurface::PanelBusy`, [`consent.rs:1093`](../agents/roomlerd/src/consent.rs#L1093)) says that
@@ -3232,16 +3294,16 @@ panel connects to its display once, when the daemon starts, and keeps that conne
 
 **The window runs from the request (#4000).** A remote-control question's window now runs from the
 request, as an exec question's does. Its surfaces go up beside it on a task of their own
-(`rc_consent_task`, [`signaling.rs:8069`](../agents/roomlerd/src/signaling.rs#L8069), spawned at
-[`:4589`](../agents/roomlerd/src/signaling.rs#L4589); `rc_surfaces_verdict`,
-[`:8032`](../agents/roomlerd/src/signaling.rs#L8032)). When the question ends, the task reads what
-they came to without waiting (`rc_shown_by_now`, [`:8207`](../agents/roomlerd/src/signaling.rs#L8207)).
+(`rc_consent_task`, [`signaling.rs:8076`](../agents/roomlerd/src/signaling.rs#L8076), spawned at
+[`:4596`](../agents/roomlerd/src/signaling.rs#L4596); `rc_surfaces_verdict`,
+[`:8039`](../agents/roomlerd/src/signaling.rs#L8039)). When the question ends, the task reads what
+they came to without waiting (`rc_shown_by_now`, [`:8214`](../agents/roomlerd/src/signaling.rs#L8214)).
 Not known yet counts as shown (`timeout`), as for exec, and one INFO line says the surfaces were
 still going up. Since #4016 only a question that asked a surface logs it: an auto-grant asks none
-(`surfaces_asked`, read at the call, [`:4581`](../agents/roomlerd/src/signaling.rs#L4581)), and its
+(`surfaces_asked`, read at the call, [`:4588`](../agents/roomlerd/src/signaling.rs#L4588)), and its
 answer is ready before the surfaces' task has run. A verdict that comes after its question ended
 logs `consent prompt surface, after its question had ended`, never the line of a live question
-(`rc_surfaces_up`, [`:7921`](../agents/roomlerd/src/signaling.rs#L7921)). Until #4000 the task
+(`rc_surfaces_up`, [`:7928`](../agents/roomlerd/src/signaling.rs#L7928)). Until #4000 the task
 waited for the surfaces before its first look at the prompt started the window (#3888). That wait,
 worst case:
 
@@ -3265,12 +3327,12 @@ it: there is no hub timer for SSH, and the Windows worker relay waits the window
 
 | Test | Shows |
 |---|---|
-| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:9679`](../agents/roomlerd/src/signaling.rs#L9679)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
-| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:9750`](../agents/roomlerd/src/signaling.rs#L9750)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
-| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:9792`](../agents/roomlerd/src/signaling.rs#L9792)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
-| `an_auto_grant_logs_no_surfaces_going_up_and_is_granted_as_before` ([`:9840`](../agents/roomlerd/src/signaling.rs#L9840)) | #4016: a question that asked no surface logs no "still going up" line, and is granted as before |
-| `only_a_question_decided_while_its_surfaces_go_up_logs_that_they_were` ([`:9890`](../agents/roomlerd/src/signaling.rs#L9890)) | #4016: the line, once, for a question decided while its surfaces go up; none, and the verdict kept, when the verdict came first |
-| `a_question_that_ended_before_its_surfaces_says_so_in_their_line` ([`:9964`](../agents/roomlerd/src/signaling.rs#L9964)) | #4016: a verdict that comes after its question was answered says the question had ended; one that comes while it stands logs the plain line |
+| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:9686`](../agents/roomlerd/src/signaling.rs#L9686)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
+| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:9757`](../agents/roomlerd/src/signaling.rs#L9757)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
+| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:9799`](../agents/roomlerd/src/signaling.rs#L9799)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
+| `an_auto_grant_logs_no_surfaces_going_up_and_is_granted_as_before` ([`:9847`](../agents/roomlerd/src/signaling.rs#L9847)) | #4016: a question that asked no surface logs no "still going up" line, and is granted as before |
+| `only_a_question_decided_while_its_surfaces_go_up_logs_that_they_were` ([`:9897`](../agents/roomlerd/src/signaling.rs#L9897)) | #4016: the line, once, for a question decided while its surfaces go up; none, and the verdict kept, when the verdict came first |
+| `a_question_that_ended_before_its_surfaces_says_so_in_their_line` ([`:9971`](../agents/roomlerd/src/signaling.rs#L9971)) | #4016: a verdict that comes after its question was answered says the question had ended; one that comes while it stands logs the plain line |
 | `a_marker_is_rewritten_only_while_its_question_stands` ([`consent.rs:1253`](../agents/roomlerd/src/consent.rs#L1253)) | the notification's marker rewrite writes nothing for a question that ended |
 
 ⚠️ **A click on a notification's body is not an answer** (FR-93 P6f). GNOME 50
@@ -3561,7 +3623,7 @@ session goes without it, with a reason:
 
 - ⚠️ **The device enforces the floor itself.** The hub's strip is so the viewer can say why before
   the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:147`](../agents/roomlerd/src/session_policy.rs#L147),
-  applied at [`signaling.rs:4222`](../agents/roomlerd/src/signaling.rs#L4222)) the moment the consent
+  applied at [`signaling.rs:4227`](../agents/roomlerd/src/signaling.rs#L4227)) the moment the consent
   mode resolves, before anything reads it. A request carrying `FILES` with no policy at all, as from a
   bypassed hub, is masked to no `FILES` when the floor says `off`
   (`the_device_floor_holds_when_the_server_sends_no_policy`). Field-verified on 0.4.136, with the red
@@ -3776,7 +3838,7 @@ Each order on that channel names what asked (`rc_sessions::Via`,
 [`rc_sessions.rs:347`](../agents/roomlerd/src/rc_sessions.rs#L347), #4001), and the arm logs
 `the person at the device ended the session` with it as `via`
 ([`signaling.rs:2990`](../agents/roomlerd/src/signaling.rs#L2990) → `log_device_end`,
-[`:7788`](../agents/roomlerd/src/signaling.rs#L7788) →
+[`:7795`](../agents/roomlerd/src/signaling.rs#L7795) →
 [`rc_sessions.rs:382`](../agents/roomlerd/src/rc_sessions.rs#L382)):
 
 | `via` | what asked |
@@ -3795,9 +3857,9 @@ quote that old line as it read then. A pump with no encoder (#3245) asks on the 
 
 Every road that ends a session at the device logs that line, or the idle limit's, once and before
 it ends anything, through `log_device_end` (#4010): this arm, a session of a GUI worker's delegated
-table (`end_delegated_by_device`, [`signaling.rs:7804`](../agents/roomlerd/src/signaling.rs#L7804),
+table (`end_delegated_by_device`, [`signaling.rs:7811`](../agents/roomlerd/src/signaling.rs#L7811),
 §11.16.1), and an end while no connection is up (`end_in_gap`,
-[`:7838`](../agents/roomlerd/src/signaling.rs#L7838), §11.16). Until #4010 the person's end of a
+[`:7845`](../agents/roomlerd/src/signaling.rs#L7845), §11.16). Until #4010 the person's end of a
 delegated or kept session logged none. `a_device_end_is_logged_once_through_one_function`,
 `a_delegated_session_the_device_ends_logs_its_end_once` and `an_end_at_the_device_in_a_gap_logs_once`
 pin it.
@@ -4001,7 +4063,7 @@ sequenceDiagram
 | | |
 |---|---|
 | Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14666`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14644`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4735`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14675`) |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4742`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14675`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:110`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:710`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:351`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:942`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:481`, #2326) |
@@ -4150,7 +4212,7 @@ hears the terminate and `merge_live_stats` matches nothing. So a session with no
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
 P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:955`)
 and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2875`), by the
-same road the tick uses: the shared `send_one_session_stats` (`agents/roomlerd/src/signaling.rs:7007`) queues the sample on
+same road the tick uses: the shared `send_one_session_stats` (`agents/roomlerd/src/signaling.rs:7014`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:295`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
@@ -4830,11 +4892,11 @@ and the worker keeps the peer (§11.16.1).
 |---|---|
 | ⚠️ Nothing leaves the table except through `close_within_budget`. `AgentPeer`'s `Drop` does not close its `RTCPeerConnection`, so a kept peer that is dropped is the ephemeral-port leak. A table dropped while it holds peers still closes them, with a WARN | `Drop for SessionTable`, `agents/roomlerd/src/session_table.rs:2046` |
 | The deadline is set once, at the detach, to the window. A reconnect does not move it, and a claim answered after it is a claim refused: the device closes the session and answers `rc:terminate agent_disconnect` | `end_connection`, `agents/roomlerd/src/session_table.rs:1622`; `resume`, `:1566` |
-| The deadlines are served wherever the loop waits: the backoff, the dial, the hello's send and the overlay's start (up to 15 s, and unbounded, between a connection's start and its loop: P2a-2, L8), and the connection's own loop until the claim is answered | `serving_kept`, `agents/roomlerd/src/signaling.rs:7612`; the hello, `:2017`; the overlay, `:2121` |
+| The deadlines are served wherever the loop waits: the backoff, the dial, the hello's send and the overlay's start (up to 15 s, and unbounded, between a connection's start and its loop: P2a-2, L8), and the connection's own loop until the claim is answered | `serving_kept`, `agents/roomlerd/src/signaling.rs:7619`; the hello, `:2017`; the overlay, `:2121` |
 | Every sender a session holds is one link: the peer's ICE-candidate handler, the state handler that sends `Terminate` on `Failed`, the watchdog, the `record` context and the `privacy` reporter. The table points it at each new connection. While the session is kept the link never waits and drops what it is given, except what the server must hear anyway: the session's own `Terminate`, which closes the peer and queues the end, and its recording's and curtain's activity, which waits for a connection as an end does, for the audit (P2a-2, L9) | `SessionLink`, `agents/roomlerd/src/session_table.rs:414`; `forward`, `:478`; `heard_while_kept`, `:466` |
 | ⚠️ The consent prompt keeps the connection's own sender: `await_prompt_or_socket_end` reads its close to withdraw a prompt (#2416) | `agents/roomlerd/src/signaling.rs:413` |
-| The person at the device ends a kept session at once: it stops serving, says `rc:ended {reason}` on its control channel, closes after the grace, and its `rc:terminate` goes out on the current connection, or on the next one, after its hello. A pump with no encoder asks through the same channel, and a kept one's end is `no_video` too, never the person's `host_disconnect` (P2a-2, L10). The end is logged once, before it, as on every road (#4010) | `end_kept_by_device`, `agents/roomlerd/src/session_table.rs:1794`; `end_in_gap`, `agents/roomlerd/src/signaling.rs:7838`; `log_device_end`, `:7788`; `no_video`, `agents/roomlerd/src/session_table.rs:1443` |
-| The server's end of a session the table holds, attached or kept (a kick, the maximum length, a refused claim): control stops at once, `rc:ended {reason, limit}` goes on its control channel, and the peer closes after the grace, on a task of its own. Its viewer may not have rejoined since a resume, and to a viewer a bare close reads as a drop, which it redials: on an owner's or an auto-consent device that undid the kick. The viewer reads `rc:ended` as it reads `rc:terminate`, and the first of the two wins (§11.17). Off, or with no window open on this connection, the switch on included, the end closes the peer at once and says nothing, as before (P2a-2, C1; P4-0). A session kept under an earlier connection's window is no exception: with no window its claim is refused `agent_disconnect` at the hello, which its viewer redials after anyway. A GUI worker's delegated table always says it, since it holds only what the daemon offered `keepable` under its window | `close_terminated`, `agents/roomlerd/src/session_table.rs:1469`; its call in the `Terminate` arm, `agents/roomlerd/src/signaling.rs:5096`; `p4_0_a_kept_sessions_end_on_a_connection_with_no_window_closes_at_once`, `agents/roomlerd/src/session_table.rs:4673` |
+| The person at the device ends a kept session at once: it stops serving, says `rc:ended {reason}` on its control channel, closes after the grace, and its `rc:terminate` goes out on the current connection, or on the next one, after its hello. A pump with no encoder asks through the same channel, and a kept one's end is `no_video` too, never the person's `host_disconnect` (P2a-2, L10). The end is logged once, before it, as on every road (#4010) | `end_kept_by_device`, `agents/roomlerd/src/session_table.rs:1794`; `end_in_gap`, `agents/roomlerd/src/signaling.rs:7845`; `log_device_end`, `:7795`; `no_video`, `agents/roomlerd/src/session_table.rs:1443` |
+| The server's end of a session the table holds, attached or kept (a kick, the maximum length, a refused claim): control stops at once, `rc:ended {reason, limit}` goes on its control channel, and the peer closes after the grace, on a task of its own. Its viewer may not have rejoined since a resume, and to a viewer a bare close reads as a drop, which it redials: on an owner's or an auto-consent device that undid the kick. The viewer reads `rc:ended` as it reads `rc:terminate`, and the first of the two wins (§11.17). Off, or with no window open on this connection, the switch on included, the end closes the peer at once and says nothing, as before (P2a-2, C1; P4-0). A session kept under an earlier connection's window is no exception: with no window its claim is refused `agent_disconnect` at the hello, which its viewer redials after anyway. A GUI worker's delegated table always says it, since it holds only what the daemon offered `keepable` under its window | `close_terminated`, `agents/roomlerd/src/session_table.rs:1469`; its call in the `Terminate` arm, `agents/roomlerd/src/signaling.rs:5103`; `p4_0_a_kept_sessions_end_on_a_connection_with_no_window_closes_at_once`, `agents/roomlerd/src/session_table.rs:4673` |
 | A dead peer, `Failed` or `Closed`, is never kept and never resumed. Its state handler says `Terminate` once, on `Failed`, and the watchdog stops watching there, so one that died while its socket was dying told only that socket. A transient exit closes it and says its end, `error`, on the next connection; a claim answered after it died is refused the same way (P2a-2, M1) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622`; `resume`, `:1566`; `AgentPeer::is_dead`, `agents/roomlerd/src/peer.rs:14204` |
 | A connection that ends before its server announced a window (the window comes after the hello) closes what it built, as before. What the last connection kept keeps its own deadline, and the next hello claims it (P2a-2, M3) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622` |
 | What the server must hear is never lost to a full queue: an end at the device, a kept session's own end and reports, the answer to a claim the device can no longer honour, a request refused as busy. It waits, in order, for room on this connection's queue, and the loop's table arm sends it the moment there is room; with no connection, the next one's hello is followed by it. Nothing waits on it (P2a-2, L7) | `queue_end`, `agents/roomlerd/src/session_table.rs:1832`; `next_event`, `:1876` |
@@ -4857,7 +4919,7 @@ daemon will claim is split between them, and each half keeps what it owns:
 
 | | Owned by | Where |
 |---|---|---|
-| The peer, its sockets and its close | the GUI worker, on a second session table beside its own, driven by the daemon's orders | `SessionTable::for_worker`, `agents/roomlerd/src/session_table.rs:699`; `DelegatedSide`, `agents/roomlerd/src/signaling.rs:7644` |
+| The peer, its sockets and its close | the GUI worker, on a second session table beside its own, driven by the daemon's orders | `SessionTable::for_worker`, `agents/roomlerd/src/session_table.rs:699`; `DelegatedSide`, `agents/roomlerd/src/signaling.rs:7651` |
 | The claim, the window, the verb, what the server must hear | the daemon, in a record with no peer | `Record`, `agents/roomlerd/src/session_table.rs:602` |
 | The deadline | both, from one number: the daemon sets it at the detach and sends it as `keep_ms`, and the worker closes its peer on its own copy, capped at 120 s. The daemon's is never later, so "the daemon refused" always means "the worker closes". The worker's own close says `agent_disconnect` up the channel, so a record whose `Resumed` was lost to a full queue does not stay live with no peer behind it | `detach_records`, `agents/roomlerd/src/session_table.rs:1208`; `detach_named`, `:829`; `close_due`, `:1981` |
 
@@ -4899,21 +4961,21 @@ sequenceDiagram
 | Rule | Where |
 |---|---|
 | A1 — while the daemon's table keeps, a message about a session the daemon's own table holds is served by the daemon and never crosses to a worker that attached since. It keeps while a window is open on this connection, or while a session is still kept from an earlier one, whose peer is the daemon's to close. Otherwise, the switch on alone included, the gate is today's (P4-0) | `served_by_daemon`, `agents/roomlerd/src/delegate.rs:424`; `keeping`, `agents/roomlerd/src/session_table.rs:1379`; the gate, `agents/roomlerd/src/signaling.rs:3888` |
-| A2 — `SessionParams.keepable` says the daemon will claim the session: the switch on and a window open on this connection (P4-0: the switch alone is not enough), an attached worker that said `keep-delegated` (matched by equality), never an external session. Of a worker's feature words the daemon keeps only those it knows, each once, as it keeps only the capability words it knows (`worker_words`) | `session_keepable`, `agents/roomlerd/src/delegate.rs:432`; `worker_feature_words`, `:293`; `worker_words`, `:630`; `worker_keeps`, `:2463`; the params, `agents/roomlerd/src/signaling.rs:4319` |
-| A3 — a keepable session's crossed offer gets a record while the window is still open (P4-0), under the attach generation the gate read before the offer crossed, so a channel that ends in between leaves a record of a gone worker. A window withdrawn between the params and the offer leaves the worker a session the daemon orders nothing about, which still closes on its own end (B6), its `Terminate` or the channel's end. The worker's replies about it go into the record's link: to the connection while attached, and while kept what the server must hear goes to the table and the rest is dropped. Nothing waits | `cross_offer`, `agents/roomlerd/src/session_table.rs:732`; the read, `agents/roomlerd/src/signaling.rs:3881`; `relay_upstream`, `agents/roomlerd/src/delegate.rs:2609` |
+| A2 — `SessionParams.keepable` says the daemon will claim the session: the switch on and a window open on this connection (P4-0: the switch alone is not enough), an attached worker that said `keep-delegated` (matched by equality), never an external session, and never a session a one-row Mac's daemon held for its offer, asked while no worker was attached (#4543, §5.1a). Of a worker's feature words the daemon keeps only those it knows, each once, as it keeps only the capability words it knows (`worker_words`) | `session_keepable`, `agents/roomlerd/src/delegate.rs:432`; `worker_feature_words`, `:293`; `worker_words`, `:630`; `worker_keeps`, `:2740`; the params, `agents/roomlerd/src/signaling.rs:4324`; the held session's, `hold`, `agents/roomlerd/src/delegate.rs:2064` |
+| A3 — a keepable session's crossed offer gets a record while the window is still open (P4-0), under the attach generation the gate read before the offer crossed, so a channel that ends in between leaves a record of a gone worker. A window withdrawn between the params and the offer leaves the worker a session the daemon orders nothing about, which still closes on its own end (B6), its `Terminate` or the channel's end. The worker's replies about it go into the record's link: to the connection while attached, and while kept what the server must hear goes to the table and the rest is dropped. Nothing waits | `cross_offer`, `agents/roomlerd/src/session_table.rs:732`; the read, `agents/roomlerd/src/signaling.rs:3881`; `relay_upstream`, `agents/roomlerd/src/delegate.rs:2886` |
 | A4 — a transient exit with a window keeps the record and sends one `Detached` per exit; a terminal exit, no window (M3: one the scope's reconcile withdrew since the record was made), a record past the capacity, the switch off at the next connection or the daemon's deadline closes it and sends `Close` | `detach_records`, `agents/roomlerd/src/session_table.rs:1208`; `close_record`, `:1165` |
 | A5, A6 — the hello claims the kept records. `rc:session.resumed` before the daemon's deadline, with the same worker attached, re-attaches one and sends `Resumed`; otherwise the record goes, the worker is told to close, and the server hears `agent_disconnect` | `kept_ids`, `agents/roomlerd/src/session_table.rs:1525`; `resume_record`, `:1278` |
 | A7 — the server's end (a kick, the maximum length, a refused claim, the viewer's hang-up) drops the record and is ordered to its worker as `Ended {session_id, reason, limit}`, on the lane the worker serves wherever its loop waits, its own socket's dial, hello and backoffs included; the `Terminate` still crosses as before, on the inbound lane, which waits for that socket. The worker ends the session as the `Terminate` would: the recording's end and the banner, the final stats up the channel through the queue that never waits, `rc:ended` on its control channel, the close after the grace (C1). The first of the two it reads ends it, and the other finds nothing. Only the worker whose record it is gets the order, so an older worker never does. A bare `Close` it is not: one could overtake the end and close the peer before the end is said | `drop_record`, `agents/roomlerd/src/session_table.rs:785`; its call, `agents/roomlerd/src/signaling.rs:3875`; the worker's end, `end_ordered`, `agents/roomlerd/src/session_table.rs:1008` |
-| A9, D6 — the host bumps an attach generation each time a channel ends, however it ends, an I/O error included (a worker gone mid-write is EPIPE), before the next worker can attach: a record of an older one is never claimed, counted or resumed. Each bound record hears its session end as `error`, which the server hears on this connection, or after the next hello, and the worker's `keep-delegated` goes with the channel. The queue, the caps and keep busy's questions are cleared by `run` however the channel ends, outside the switch, a line over the read limit included | `records_channel_ended`, `agents/roomlerd/src/delegate.rs:2417`; `channel_ended`, `:2382`; `prune_records`, `agents/roomlerd/src/session_table.rs:1189` |
+| A9, D6 — the host bumps an attach generation each time a channel ends, however it ends, an I/O error included (a worker gone mid-write is EPIPE), before the next worker can attach: a record of an older one is never claimed, counted or resumed. Each bound record hears its session end as `error`, which the server hears on this connection, or after the next hello, and the worker's `keep-delegated` goes with the channel. The queue, the caps and keep busy's questions are cleared by `run` however the channel ends, outside the switch, a line over the read limit included | `records_channel_ended`, `agents/roomlerd/src/delegate.rs:2694`; `channel_ended`, `:2659`; `prune_records`, `agents/roomlerd/src/session_table.rs:1189` |
 | A10 — kept records count against `rc_max_sessions` | `len`, `agents/roomlerd/src/session_table.rs:1506` |
 | A11 — a loop that holds the host says `rc-resume` with the switch on, as every loop does. The verb asks for a window, and nothing else changes before one (P4-0) | `connection_keeps`, `agents/roomlerd/src/session_table.rs:115` |
 | P4-0 — one device, one switch: the root's `rc_sessions_survive_reattach`, set in its environment or its config, binds the GUI worker, whose own table and hello would otherwise follow the person's config | `WORKER_ENV_FORWARD`, `agents/roomlerd/src/macos_supervisor.rs:453`; `the_roots_resume_switch_binds_the_worker`, `:2627` |
 | B2 — the worker serves a message about a session whose params said `keepable`, or that its delegated table holds, on that table; anything else as before | `agents/roomlerd/src/signaling.rs:3269` |
-| B3, B6 — such a session's peer is built on a link to the delegation channel, and its own end closes it at once, attached or kept, with its real end: after a roll no server echoes it | `agents/roomlerd/src/signaling.rs:4775`; `forward`, `agents/roomlerd/src/session_table.rs:478`; `serve`, `:1910` |
-| B4 — the orders (`Detached`, `Resumed`, `Close`, `Ended`, and the channel's own `Paused` and `Attached`) travel a lane of their own, served by the delegated table wherever the worker's loop waits, its own connection down included | `worker_lane`, `agents/roomlerd/src/delegate.rs:382`; `obey`, `agents/roomlerd/src/session_table.rs:1058`; `next_side`, `agents/roomlerd/src/signaling.rs:7716`; `serving_delegated`, `:7751` |
+| B3, B6 — such a session's peer is built on a link to the delegation channel, and its own end closes it at once, attached or kept, with its real end: after a roll no server echoes it | `agents/roomlerd/src/signaling.rs:4782`; `forward`, `agents/roomlerd/src/session_table.rs:478`; `serve`, `:1910` |
+| B4 — the orders (`Detached`, `Resumed`, `Close`, `Ended`, and the channel's own `Paused` and `Attached`) travel a lane of their own, served by the delegated table wherever the worker's loop waits, its own connection down included | `worker_lane`, `agents/roomlerd/src/delegate.rs:382`; `obey`, `agents/roomlerd/src/session_table.rs:1058`; `next_side`, `agents/roomlerd/src/signaling.rs:7723`; `serving_delegated`, `:7758` |
 | B5 — `Detached` keeps only the sessions it names (one worker serves every org's on a one-row Mac). A dead one closes and says `error` up the channel (M1), and one it cannot keep says its end too, so the daemon does not claim it | `detach_named`, `agents/roomlerd/src/session_table.rs:829`; `close_session`, `:918` |
-| B7 — the person's Disconnect and the idle limit end such a session through that table, whose queue never waits. A kept one says `rc:ended`; an attached one stops at once and says nothing on its control channel, since the server tells its viewer. Both roads that end one, the device-end arm and the gap's, go through one function that logs the end first, once, as a direct session's is (#4010) | `end_by_device`, `agents/roomlerd/src/session_table.rs:1110`; the device-end arm, `agents/roomlerd/src/signaling.rs:2943`; `end_delegated_by_device`, `:7804` |
-| B8 — the worker's own connection ends none of them, but for the machine's own exits: a stop, a sleep, a resume from suspend | `close_side`, `agents/roomlerd/src/signaling.rs:7768` |
+| B7 — the person's Disconnect and the idle limit end such a session through that table, whose queue never waits. A kept one says `rc:ended`; an attached one stops at once and says nothing on its control channel, since the server tells its viewer. Both roads that end one, the device-end arm and the gap's, go through one function that logs the end first, once, as a direct session's is (#4010) | `end_by_device`, `agents/roomlerd/src/session_table.rs:1110`; the device-end arm, `agents/roomlerd/src/signaling.rs:2943`; `end_delegated_by_device`, `:7811` |
+| B8 — the worker's own connection ends none of them, but for the machine's own exits: a stop, a sleep, a resume from suspend | `close_side`, `agents/roomlerd/src/signaling.rs:7775` |
 | B9, D5 — the channel's end with both processes alive (`Paused`, said once per greeted attach however it ends, with its cause) closes every one of them, attached and kept, through the budget and with its real end: the daemon ended each as `error` at that end (D6), and the peer of an ended session must close. Their links stop waiting first. Each then says it is gone up the channel, `agent_disconnect`, through the queue that never waits: a `Paused` served late, after the next attach built a session, closes that one too, and the daemon drops the record it made for it; for a session of the attach that ended it repeats the daemon's `error`, harmlessly. A line names each session and the cause, and one counts them, so a read can count the blips that ended sessions. Surviving a blip, re-bound at the next attach, would be a design change | `close_at_channel_end`, `agents/roomlerd/src/session_table.rs:962`; `pause`, `:939`; `OrdersLane`, `agents/roomlerd/src/delegate_worker.rs:289` |
 
 Both ends must speak P2b for a delegated session to be kept. The worker says a word in its caps, and the daemon says
@@ -5524,7 +5586,7 @@ with an agent release. Every pairing behaves as before FR-138, or ends the sessi
 | The device is outside the scope, or taken out of it | As window 0, for that device. Taking it out tells its live connection 0, so its next loss ends its sessions, and a session it had already kept is refused at its claim, or closes at its own deadline. With its switch on it then behaves as with its switch off (P4-0): every exit closes as before, the server's end closes the peer at once, and a supervised Mac makes no record of a delegated session. A scope the server cannot read at the hello announces no window either | `a_device_outside_the_scope_ends_its_session_as_today_and_its_claim_is_refused` (`crates/tests/src/rc_resume_claim_tests.rs:664`); `a_window_withdrawn_keeps_nothing_at_the_next_exit` (`agents/roomlerd/src/session_table.rs:2503`); `a_scope_change_reaches_a_device_on_the_other_pod` (`crates/tests/src/rc_resume_sweep_tests.rs:303`); `p4_0_with_no_window_every_arm_ends_as_with_the_switch_off` (`agents/roomlerd/src/session_table.rs:4564`); `p4_0_with_no_window_the_servers_end_closes_at_once_as_off` (`:4636`); `p4_0_with_no_window_the_delegation_host_is_the_switch_off` (`:4792`); `a_scope_that_cannot_be_read_at_the_hello_announces_no_window` (`crates/tests/src/rc_resume_claim_tests.rs:1373`) |
 | The page predates P1c | It ignores `resume_secs` and `rc:session.detached` and never rejoins. The device's claim resumes the session, which waits the window for a viewer and then ends `controller_hangup`, marked `limit: hold_expired`. The page's own socket loss holds the session the same way, and its next request, which names nothing in `replaces`, reaps the held one as the same person's | `a_resume_its_viewer_never_rejoins_ends_marked_hold_expired` (`crates/tests/src/rc_resume_ends_tests.rs:617`); `a_held_session_never_costs_its_own_viewer_the_slot` (`crates/tests/src/rc_resume_rejoin_tests.rs:407`), its second half |
 | The page predates D5 = A | It hangs up before it redials a session the server called detached, so the row reads `controller_hangup` (§11.18) | `a_controllers_end_during_the_gap_is_enforced_at_the_claim` (`crates/tests/src/rc_resume_rejoin_tests.rs:572`) |
-| A supervised Mac's GUI worker or daemon predates P2b | The delegated session takes the path it took before (§11.16.1's version table). A P2b daemon with an older worker claims nothing for it, and the server ends it at the hello | `p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions` (`agents/roomlerd/src/delegate.rs:3953`); `p2b_the_orders_and_both_fields_keep_a_stable_wire_and_older_frames_parse` (`:5775`) |
+| A supervised Mac's GUI worker or daemon predates P2b | The delegated session takes the path it took before (§11.16.1's version table). A P2b daemon with an older worker claims nothing for it, and the server ends it at the hello | `p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions` (`agents/roomlerd/src/delegate.rs:4230`); `p2b_the_orders_and_both_fields_keep_a_stable_wire_and_older_frames_parse` (`:6052`) |
 | The server is rolled back during a gap, to an image at or above the floor below | The session's audit listing still reads, a kind the image does not know as `unknown`. Whether a kept session resumes is that image's claim to decide; an image that never answers the claim leaves the device to close the peer at its own deadline, so the session ends at the window | `an_audit_listing_holding_the_new_kinds_and_an_unknown_one_still_reads` (`crates/tests/src/rc_resume_tests.rs:257`); `an_audit_page_holding_an_unknown_kind_still_reads` (`crates/remote_control/src/models.rs:12074`); `a_reconnect_does_not_move_the_deadline` (`agents/roomlerd/src/session_table.rs:2572`) |
 
 The integration tests run on every master push that touches the server or the agent (`integration-tests.yml`), the
@@ -5542,7 +5604,7 @@ session not yet live, and an external one, end as before FR-138.
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1180`) |
 | each row above | each arm is the loop's one call into the table, and nothing else closes the connection's peers | `every_arm_of_the_connection_ends_through_the_table` (`agents/roomlerd/src/session_table.rs:2438`) |
-| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:976`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:9595`) |
+| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:976`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:9602`) |
 | an external session (FR-52, D3) | built with no link, so it closes at every exit. The server ends it at the drop and refuses a claim of it | `an_external_session_is_built_without_a_link` (`agents/roomlerd/src/session_table.rs:3351`); `a_delegated_or_external_session_closes_at_a_transient_exit` (`:2513`); `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:976`); `a_claim_of_an_external_session_is_refused` (`crates/tests/src/rc_resume_pd_tests.rs:379`) |
 
 ⚠️ **The rollback floor.** Production has written `session_detached` and `session_resumed` since P3 turned the window
@@ -7428,7 +7490,7 @@ is silent while it waits.
   Only the loop waiting for its next event reads `select`.
 - A `ws.text` arm is refined to the message it is handling, read
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
-  `agents/roomlerd/src/signaling.rs:6604`). The dispatch awaits per
+  `agents/roomlerd/src/signaling.rs:6611`). The dispatch awaits per
   message, so that is where a stall inside it shows.
 - The `StageGuard` (`watchdog.rs:524`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that

@@ -300,7 +300,7 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
 `AgentCaps` behind a `OnceLock`, the process's `ProbeState::first`
 (`agents/roomlerd/src/encode/caps.rs:49`, filled at `:165`); both the hello
-and the FR-43 heartbeat re-announce (`agents/roomlerd/src/signaling.rs:1981`, `:2730`, through one builder, `:7327`)
+and the FR-43 heartbeat re-announce (`agents/roomlerd/src/signaling.rs:1981`, `:2730`, through one builder, `:7334`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
@@ -415,7 +415,7 @@ rule are [`linux-capture.md`](linux-capture.md) §4.
 
 **Switching it on takes two keys.** `window_capture` only says what to ask the
 portal for. The portal arm itself is `portal_capture`
-(`agents/roomlerd/src/capture/mod.rs:3546`), and DRM is tried before it, so a
+(`agents/roomlerd/src/capture/mod.rs:3568`), and DRM is tried before it, so a
 host with `drm_capture = true` never gets there. Set `portal_capture = true` and
 `window_capture = true`, leave `drm_capture` unset or false, then
 `roomler restart`.

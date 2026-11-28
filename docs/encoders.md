@@ -297,7 +297,7 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:4037`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:4042`), and the viewer ignores
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:10448`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
@@ -966,18 +966,18 @@ in.
 
 **How it reaches the server and the viewer.** The hello and the heartbeat announce one snapshot
 (#3992). One function reads every word a connection announces, the answer's generation first
-([`Announcer::now`](../agents/roomlerd/src/signaling.rs#L7268)), and one builds the caps from it
-([`Announcer::caps`](../agents/roomlerd/src/signaling.rs#L7327)). The hello carries the first
+([`Announcer::now`](../agents/roomlerd/src/signaling.rs#L7275)), and one builds the caps from it
+([`Announcer::caps`](../agents/roomlerd/src/signaling.rs#L7334)). The hello carries the first
 snapshot, and that is what the connection has announced until a beat reads one that differs
-([`Announcer::beat`](../agents/roomlerd/src/signaling.rs#L7410)) and re-announces (FR-43 P2c);
+([`Announcer::beat`](../agents/roomlerd/src/signaling.rs#L7417)) and re-announces (FR-43 P2c);
 the server replaces the row's blob. Only the hello makes that first value, so the comparison
 starts from nothing else. The generation is part of that comparison, per connection, with no
 wire change, and since #3439 a watch on it wakes every connection, so every organization's row
 gets it at once rather than within a beat. A supervised Mac's screen worker wakes the connections
 that hold its delegation host the same way: its caps, the person's floor or its leaving, once
-stored, move a second watch ([`DelegateHost::news`](../agents/roomlerd/src/delegate.rs#L1688)).
+stored, move a second watch ([`DelegateHost::news`](../agents/roomlerd/src/delegate.rs#L1751)).
 The hello subscribes to it before it reads its words
-([`Announcer::hello_with`](../agents/roomlerd/src/signaling.rs#L7387)), so a word said in between
+([`Announcer::hello_with`](../agents/roomlerd/src/signaling.rs#L7394)), so a word said in between
 is in the hello or wakes the loop. The beat still decides what is sent, and a word that changes
 nothing the row says costs no caps. A reconnect's hello reads the answer in force. A
 viewer sees the new matrix at its next page load or 5-minute status read. A session

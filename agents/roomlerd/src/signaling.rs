@@ -3902,6 +3902,11 @@ async fn handle_server_msg(
         }
         return Ok(());
     }
+    // #4543 — the daemon serves it here: a session held for its offer whose
+    // offer this is, or that ended, is let go, so it never crosses later.
+    if let Some(delegate) = delegate {
+        delegate.served_here(crate::delegate::org_key(ctx.is_primary, &ctx.label), &msg);
+    }
 
     match msg {
         ServerMsg::Request {
@@ -4327,7 +4332,9 @@ async fn handle_server_msg(
                 if !sent {
                     // No worker, or its queue is full. Not fatal — the daemon
                     // still serves the session itself, which on macOS means a
-                    // blank screen but a working, terminable session.
+                    // blank screen but a working, terminable session. #4543 —
+                    // with no worker, a one-row Mac's daemon holds them: they
+                    // cross with the offer if one has attached by then.
                     tracing::debug!(%session_id, "no worker to hand session params to");
                 }
             }

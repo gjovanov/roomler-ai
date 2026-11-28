@@ -57,7 +57,7 @@ wait that should not exist.
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
 (`post_install.rs:385`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:7861`)
+(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:7923`)
 was never wired. So even on Windows — where the staged watcher does produce a
 verdict — nothing surfaces it. **P3 wires it** (2026-10-26): the daemon reads
 the record at startup and on every `roomler status`, see the P3 section below.
@@ -187,8 +187,8 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:471`); `UpdateRefusal` and `update_refusal()` (`:721`, `:1406`) |
-| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5648`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3368`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3339`), else `self` |
-| Stamped at **every** announcement | `stub_caps` (`agents/roomlerd/src/signaling.rs:7428`, `:7444`) |
+| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5655`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3368`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3339`), else `self` |
+| Stamped at **every** announcement | `stub_caps` (`agents/roomlerd/src/signaling.rs:7435`, `:7451`) |
 | Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:2354`): a 409 on one device (`:2408`), a `refused` row with its `refused_code` in a bulk (`:2549`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 
@@ -228,7 +228,7 @@ flowchart LR
 |---|---|
 | The two words, additive on `AgentCaps` | `last_install`, `crash_health` (`crates/remote_control/src/models.rs:483`, `:493`); `LastInstallWord` (`:2144`), `CrashHealth` (`:2214`), spellings locked by `the_health_word_spellings_are_locked` |
 | Read off the signalling loop, every 30 s and at once after a promotion or a settle | `health_words::start` (`agents/roomlerd/src/health_words.rs:95`), called by `run_cmd` (`agents/roomlerd/src/app.rs:5311`); the ladder read whole from the config (`config::read_crash_ladder`, `crates/agent-core/src/config.rs:2871`), the sentinels from every attention path (`notify::read_all_attention`, `crates/agent-core/src/notify.rs:213`) |
-| Stamped at every announcement, re-announced when a word changes | `stub_caps` (`agents/roomlerd/src/signaling.rs:7450`, `:7451`); the beat compares `Announced` whole (`:7416`) |
+| Stamped at every announcement, re-announced when a word changes | `stub_caps` (`agents/roomlerd/src/signaling.rs:7457`, `:7458`); the beat compares `Announced` whole (`:7423`) |
 | Stored with the caps and served as stored | `update_hello`, `update_capabilities` (`crates/services/src/dao/agent.rs:621`, `:607`); `caps_as_served` (`crates/modules/fleet/src/agent.rs:2751`) takes out `gui_worker` alone |
 | Shown beside presence, never instead of it | `ui/src/utils/deviceHealth.ts`; `ui/src/components/admin/AgentsSection.vue` (the table `:306`, `:321`; the cards `:728`, `:739`); the crash marker opens `AgentCrashesDialog.vue` |
 
@@ -354,9 +354,9 @@ flowchart LR
   a message of its own would need a reader, a store and a route for what the
   caps already carry. The caps also give the re-announce a verdict landing
   after the hello needs, with no new code: the beat compares `Announced` whole
-  (`if now == last.0`, `agents/roomlerd/src/signaling.rs:7416`; `Announced`
-  derives `PartialEq`, `:7169`), and `stub_caps` stamps both words at every
-  announcement (`:7450`, `:7451`).
+  (`if now == last.0`, `agents/roomlerd/src/signaling.rs:7423`; `Announced`
+  derives `PartialEq`, `:7176`), and `stub_caps` stamps both words at every
+  announcement (`:7457`, `:7458`).
 - **P6 at all?** Decide from P1's field data, not in the abstract.
 
 ## Field-verification log

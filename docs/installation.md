@@ -3006,13 +3006,13 @@ the stricter of the person's and its own.
 Each org's row says what the worker has told the daemon from the connection's first
 message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
 permissions, what it can record, its Remote Apps words and its audio, and the stricter
-`rc_*` floor ([`signaling.rs:7268`](../agents/roomlerd/src/signaling.rs#L7268)), built
-into the caps by one function ([`:7327`](../agents/roomlerd/src/signaling.rs#L7327)).
+`rc_*` floor ([`signaling.rs:7275`](../agents/roomlerd/src/signaling.rs#L7275)), built
+into the caps by one function ([`:7334`](../agents/roomlerd/src/signaling.rs#L7334)).
 So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
 restarts of the daemon measured in #3992, is on the row at once, rather than the root's
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
 the hello, or changes later, wakes the heartbeat of each org's connection at once
-([`delegate.rs:1688`](../agents/roomlerd/src/delegate.rs#L1688)): its caps, the person's
+([`delegate.rs:1751`](../agents/roomlerd/src/delegate.rs#L1751)): its caps, the person's
 floor and its leaving reach the row then, not up to 30 s later at the next one. Since
 FR-157 P1 every org's row also carries the host's screen-worker word, `attached` or
 `not-attached` with why. The worker's attach, its channel's end and each new decision of
