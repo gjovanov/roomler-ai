@@ -1,7 +1,7 @@
 # FR-148: The path is measured, and the plan follows it
 
 **Issue:** [#3953](https://github.com/gjovanov/roomler-ai/issues/3953) · **Status:** P0 runs since 2026-11-16 and its lab cell ran a first slice on 2026-11-17; its open-time train's core is built and run by no session (4a, with one cell red: D43), and its integration is not. P1's memory stores the model in shadow, and its opener is built behind the same switch, whose default is `shadow` and which is `on` on no device; P2's QSV step and P4's rank are merged behind switches that are off by default, and so is D46's in-flight budget: its first two steps (B1, B2) and its stall classifier, computed in shadow; its third (B3, `on` for relay sessions) merged on 2026-11-20 (#4139). Two were read in the field on 2026-11-20 (§15): P2's QSV step meets AC13 on CORPLAP-1, and P4's rank fails AC22 on CORPLAP-2, because it lowers only the agent's own candidates while a pair's route is decided by both ends. On 2026-11-23 the rank by the pair's route (D49), set on CORPLAP-2, meets AC22 there. The others are not read in the field yet (§6). From `0.4.230` P0 names the cause of every move of the live target (#4161). The plan and decisions D1 to D5 are the operator's, taken on 2026-11-16 · **Owner:** the agent's rate path, its path memory and its ICE policy, and the viewer's video channels
-**Supersedes:** [FR-63](FR-63-one-delay-based-rate-controller.md) (#1243), [FR-79](FR-79-one-validity-gate.md) (#1524), [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), [FR-59](FR-59-slow-link-latency-priority.md) (#1163), [FR-71](FR-71-transport-stall-classification.md) (#1362), [FR-74](FR-74-text-clarity-on-direct-paths.md) (#1442), [FR-17](FR-17-partial-reliability-video.md) (#799), [FR-18](FR-18-carrier-queue-discipline.md) (#801), [FR-64](FR-64-remote-desktop-never-rides-the-overlay.md) (#1244), and since 2026-11-28 [FR-14](FR-14-direct-link-jitter-episodes.md) (#792). §12 says what moved where
+**Supersedes:** [FR-63](FR-63-one-delay-based-rate-controller.md) (#1243), [FR-79](FR-79-one-validity-gate.md) (#1524), [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), [FR-59](FR-59-slow-link-latency-priority.md) (#1163), [FR-71](FR-71-transport-stall-classification.md) (#1362), [FR-74](FR-74-text-clarity-on-direct-paths.md) (#1442), [FR-17](FR-17-partial-reliability-video.md) (#799), [FR-18](FR-18-carrier-queue-discipline.md) (#801), [FR-64](FR-64-remote-desktop-never-rides-the-overlay.md) (#1244), and since 2026-11-28 [FR-14](FR-14-direct-link-jitter-episodes.md) (#792) and [FR-15](FR-15-relay-age-feedback.md) (#795). §12 says what moved where
 **Works beside:** [FR-135](FR-135-one-rc-media-pipeline.md) (#3293), which owns the pipeline's shape (§13)
 
 §2 is evidence, read on master's `df905bbc1`, and its anchors stay on that commit when the code moves: §2 names the
@@ -743,7 +743,7 @@ it shows what the laptop can look like and not what TURN over UDP carries under 
 
 ## 12. What this FR supersedes, and where each open criterion went
 
-Each FR below closed as not planned on 2026-11-16, except FR-14, which closed as not planned on 2026-11-28. What it shipped stays in the tree until P5 deletes or keeps it.
+Each FR below closed as not planned on 2026-11-16, except FR-14 and FR-15, which closed as not planned on 2026-11-28. What it shipped stays in the tree until P5 deletes or keeps it.
 
 | FR | Shipped, and stays | Moved here |
 |---|---|---|
@@ -757,8 +757,9 @@ Each FR below closed as not planned on 2026-11-16, except FR-14, which closed as
 | FR-18 (#801) | the age bound, the send-buffer cap, the counters | its field reads, joined to FR-17's channel (P4) |
 | FR-64 (#1244) | the own-adapter filter, which is what `off` means; the multi-org route fix | "never" becomes the carrier rule (D3) |
 | FR-14 (#792) | nothing: designs A, B and C were not built, and FR-74's P1 and P1b replaced the direct gate they would have tuned | the floor crash under churn (AC9, AC28) and the queue and the drag under churn (AC29) |
+| FR-15 (#795) | the age loop (#796) and its floor's bound (P2, #804), with the heartbeat's age fields. Under `inflight_budget = on` the loop acts only on a lag past the budget's envelope (D51) | the relay age reads (AC21, AC23, AC29). Its switch, `RELAY_AGE_FEEDBACK`, retires with FR-63's B3a, which is P5 here |
 
-All 33 open criteria, one by one:
+All 36 open criteria, one by one:
 
 | From | Criterion | State at the close | Here |
 |---|---|---|---|
@@ -766,6 +767,9 @@ All 33 open criteria, one by one:
 | FR-14 | AC2, `bytes_inflight` p99 under 80 KB on that pair | open | AC29, restated: no window with a standing queue, the queue bounded in time by D46's budget. The fixed 80 KB bar reads a measure FR-74's P1b dropped on purpose |
 | FR-14 | AC3, a drag on CORPLAP-1 during VPN churn shows no lumps of several hundred ms | open | AC29, whose CORPLAP-1 read includes that drag |
 | FR-14 | AC4, relay and constrained behaviour byte-identical | open | AC21, restated: healthy relays within noise of the P0 baseline. This FR changes constrained paths on purpose (AC17, AC18, AC32), and FR-14 built nothing to compare |
+| FR-15 | AC1, on an 85 ms relay pair the age plateaus at about 90 ms through a sustained drag, where it climbed to 120 | open | AC29: an age that climbs through a drag is a standing queue, and AC29 holds that no window has one. AC21 reads a healthy relay's age against the P0 baseline |
+| FR-15 | AC2, on a relay pair of two corporate-VPN laptops: no age excursion over 1 s, sustained age within about twice the pair's floor, and the target stepping down during the viewer's age spikes | open | AC23 for a relayed session's age and `send_wait`, AC29's field read, and AC9 where the excursion is a transit stall. The step down is the age loop's own action, which D51 keeps under `on` only past the envelope |
+| FR-15 | AC3, a viewer that sends no age leaves relay behaviour byte-identical to 0.4.7 | open | AC21, restated as for FR-14's AC4: this FR changes constrained paths on purpose. A viewer that sends no age leaves the loop off (`absent_age_report_leaves_the_loop_off`, `agents/roomlerd/src/encode/governor.rs:4624`) |
 | FR-17 | the relay pair under fast motion: `send_wait` p99 under 250 ms, age p99 under 300 ms | open | AC23 |
 | FR-17 | no IDR-storm regression | open | AC24 |
 | FR-17 | direct transports unchanged | open | AC21 |
