@@ -23,8 +23,8 @@
 //! `ClientMsg::TunnelQuicReady { cert_fingerprint, addrs }` →
 //! `ServerMsg::TcpForwardForward` per flow → acceptor dials + `take_flow`
 //! → `run_flow_quic`. `TunnelTerminate` → [`close`], or [`end`] when it asks
-//! the exit to close the session's connection (`close_connection`): the flows
-//! stop and the connection closes with [`SESSION_END_CODE`]. Or no terminate at all
+//! the exit to close the session's connection (`close_connection`): the
+//! connection closes with [`SESSION_END_CODE`], then the flows stop. Or no terminate at all
 //! (#1754): the accept loop serves exactly ONE connection, so when it ends —
 //! the client closed, or quinn idle-timed the connection out 30 s after the
 //! client's 8 s keepalives stopped — the session is over, and the loop
@@ -115,18 +115,18 @@ impl SessionLink {
             .upgrade()
     }
 
-    /// End the session: stop every flow, and close the connection with
-    /// [`SESSION_END_CODE`]. Returns whether a connection was there to close.
-    /// Idempotent.
+    /// End the session: close the connection with [`SESSION_END_CODE`], then
+    /// stop every flow. The close goes first: a flow stopped while the
+    /// connection is open drops its send stream, which finishes it, and the
+    /// client could read that clean end before the close. Returns whether a
+    /// connection was there to close. Idempotent.
     pub fn end(&self) -> bool {
-        self.0.stop.cancel();
-        match self.conn() {
-            Some(conn) => {
-                conn.close(SESSION_END_CODE.into(), SESSION_END_REASON);
-                true
-            }
-            None => false,
+        let conn = self.conn();
+        if let Some(conn) = &conn {
+            conn.close(SESSION_END_CODE.into(), SESSION_END_REASON);
         }
+        self.0.stop.cancel();
+        conn.is_some()
     }
 }
 
@@ -630,12 +630,12 @@ impl AgentQuicPeer {
         debug!(session_id = %self.session_id, "agent quic peer closed");
     }
 
-    /// End the session: stop every flow (each aborts both halves, which
-    /// releases its destination socket and its streams), close the
-    /// connection with [`SESSION_END_CODE`], close the endpoint, and stop the
-    /// accept loop. The endpoint's socket, and on the relayed flavours the
-    /// TURN allocation, go when the closed connection drains and the last
-    /// `Arc` of this peer drops. Idempotent.
+    /// End the session: close the connection with [`SESSION_END_CODE`], then
+    /// stop every flow (each aborts both halves, which releases its
+    /// destination socket and its streams), as [`SessionLink::end`] does;
+    /// close the endpoint, and stop the accept loop. The endpoint's socket,
+    /// and on the relayed flavours the TURN allocation, go when the closed
+    /// connection drains and the last `Arc` of this peer drops. Idempotent.
     pub fn end(&self) {
         let had_connection = self.link.end();
         self._peer.close(SESSION_END_CODE, SESSION_END_REASON);
