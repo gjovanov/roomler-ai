@@ -202,7 +202,7 @@ async fn reconcile_host(host: &mut Option<LocalTurnHost>, want_ip: Option<IpAddr
         info!("loopback-TURN: overlay IP cleared; local TURN host stopped");
         return;
     };
-    match LocalTurnHost::start((Ipv4Addr::UNSPECIFIED, 0).into(), ip, secret.to_vec()).await {
+    match LocalTurnHost::start((crate::test_net::any_v4(), 0).into(), ip, secret.to_vec()).await {
         Ok(h) => {
             info!(
                 port = h.local_addr().port(),

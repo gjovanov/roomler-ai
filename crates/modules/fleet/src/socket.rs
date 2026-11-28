@@ -49,6 +49,9 @@ pub async fn handle_agent_socket(
     // pre-S6 agent build); direction input when THIS agent originates
     // tunnel opens toward a foreign-homed target.
     dialed_tid: Option<String>,
+    // FR-155 P1b — the token generation the upgrade admitted this
+    // connection under (its `gen` claim).
+    generation: u32,
 ) {
     info!(%agent_id, %tenant_id, "remote-control agent WS connected");
     let conn_established_ms = bson::DateTime::now().timestamp_millis();
@@ -115,6 +118,32 @@ pub async fn handle_agent_socket(
         supports_relay_regions,
         (ssh_host_pubkey, peer_auth_key, kept_sessions),
     ) = hello;
+    // FR-155 P1c — a registration admits only the device's current
+    // generation. While the rotation is on, the row is read on the primary
+    // after the hello, before anything is written, and the connection's
+    // generation is judged against its `token_gen` by the upgrade's rule and
+    // in the upgrade's order. A refusal registers and writes nothing. From
+    // this read to the admit, the pod's floor refuses a registration below a
+    // rotation the pod has applied (`hub::rotation`).
+    if state.rc_hub.token_rotation() {
+        match registration_generation(&state, tenant_id, agent_id, generation).await {
+            RegistrationGeneration::Admit => {}
+            RegistrationGeneration::RowGone => {
+                info!(
+                    %agent_id, %tenant_id, at = "registration",
+                    "refusing agent WS: row gone (a reaped ephemeral device?)"
+                );
+                return;
+            }
+            RegistrationGeneration::Other { reason, row_gen } => {
+                info!(
+                    %agent_id, generation, reason, row_gen, at = "registration",
+                    "refusing agent WS: token of another generation"
+                );
+                return;
+            }
+        }
+    }
     // FR-100 P1a — likewise a device key: stored only in its one canonical
     // shape, so a browser's first pin never starts from a key no browser can
     // import. A hint either way (the browser pins what signed), so this
@@ -208,7 +237,7 @@ pub async fn handle_agent_socket(
         refused: refused_claims,
         reaped: reaped_at_registration,
         registered_at,
-    } = state.rc_hub.register_agent_resuming(
+    } = match state.rc_hub.register_agent_resuming(
         agent_id,
         tenant_id,
         owner_user_id,
@@ -216,8 +245,25 @@ pub async fn handle_agent_socket(
         max_sessions,
         input_arbiter,
         supports_exec,
+        generation,
         resume,
-    );
+    ) {
+        Ok(registration) => registration,
+        // FR-155 P1b — the connection is below the lowest generation this pod
+        // admits for the device: a rotation's floor, or (P1c, while the
+        // rotation is on) the entry it would replace. Nothing was registered.
+        // The hello's write is left for the next hello or the presence sweep
+        // to replace: a guarded Offline write here could land after the new
+        // generation's hello, which this one may have followed, and mark a
+        // connected device off.
+        Err(refused) => {
+            info!(
+                %agent_id, generation, floor = refused.floor,
+                "refusing agent WS: below the generation this pod admits for the device"
+            );
+            return;
+        }
+    };
     // FR-138 — the window goes out before anything answers a claim, and a
     // claim refused at once (no window, or past the device's capacity) is
     // answered now.
@@ -463,6 +509,7 @@ pub async fn handle_agent_socket(
             registered_at: resume_window.map(|_| registered_at),
             reaped: reaped_at_registration,
         },
+        server_ended: cancel.server_ended(),
     };
     let lifecycles = state.agent_socket.lifecycles();
     for (_, lc) in &lifecycles {
@@ -1290,6 +1337,66 @@ pub fn prefs_from_rtt(results: &[RelayRegionRtt]) -> Vec<String> {
     measured.into_iter().map(|(_, r)| r.to_string()).collect()
 }
 
+/// FR-155 P1c — what the registration's read of the row says about the
+/// connection's generation ([`handle_agent_socket`]).
+enum RegistrationGeneration {
+    /// Admitted as before: the row is at the connection's generation, or is
+    /// removed or quarantined (left to the removal's own paths), or the read
+    /// failed (the upgrade's check stands, and the pod's check,
+    /// `crate::generation_check`, ends an entry below its row's generation).
+    Admit,
+    /// No row: refused, as the upgrade refuses it.
+    RowGone,
+    /// A live row of another generation: refused, as the upgrade refuses it,
+    /// with FR-103's reason.
+    Other { reason: &'static str, row_gen: u32 },
+}
+
+/// FR-155 P1c — the upgrade's generation check, run again at the
+/// registration on the row as the primary holds it: `refusal_reason` first,
+/// so a removed or quarantined row is the removal's to answer, then
+/// `generation_refusal`. `NotFound` only is a row gone; any other error
+/// admits, as the upgrade's read does.
+async fn registration_generation(
+    state: &FleetState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    generation: u32,
+) -> RegistrationGeneration {
+    let row = match state
+        .agents
+        .find_any_in_tenant_on_the_primary(tenant_id, agent_id)
+        .await
+    {
+        Ok(row) => row,
+        Err(roomler_ai_services::dao::base::DaoError::NotFound) => {
+            return RegistrationGeneration::RowGone;
+        }
+        Err(e) => {
+            warn!(
+                %agent_id, %e,
+                "agent row unreadable at the registration: admitted under the upgrade's check"
+            );
+            return RegistrationGeneration::Admit;
+        }
+    };
+    if crate::auth_agent::refusal_reason(&row).is_some() {
+        return RegistrationGeneration::Admit;
+    }
+    match crate::auth_agent::generation_refusal(
+        generation,
+        row.token_gen,
+        crate::auth_agent::generation_from_rotation(&row),
+        state.settings.rc.token_generation_check,
+    ) {
+        Some(reason) => RegistrationGeneration::Other {
+            reason,
+            row_gen: row.token_gen,
+        },
+        None => RegistrationGeneration::Admit,
+    }
+}
+
 /// Parse the next inbound WS text frame as [`ClientMsg`]. Skips non-text frames.
 /// #3517 — a socket that ends first says how, as the read loop's ends do.
 async fn read_next_rc(
@@ -1514,6 +1621,8 @@ pub async fn ws_upgrade_agent(
             .unwrap();
     }
     let token_exp = claims.exp;
+    // FR-155 P1b — what the hub keeps for the rotation's sweep and floor.
+    let generation = claims.generation;
 
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
@@ -1575,6 +1684,7 @@ pub async fn ws_upgrade_agent(
                 tenant_id,
                 agent.owner_user_id,
                 tid,
+                generation,
             )
             .await;
         })

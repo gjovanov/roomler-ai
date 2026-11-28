@@ -1365,6 +1365,10 @@ mod tests {
 
     /// What `f` logs, as the daemon's log file writes it (`roomler_node_core::
     /// logging::init`'s file layer: time, level, message, fields; no target).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn logged(f: impl FnOnce()) -> String {
         use std::sync::{Arc, Mutex};
         #[derive(Clone, Default)]
@@ -1484,7 +1488,7 @@ mod tests {
             ice_transport_policy: RTCIceTransportPolicy::Relay,
             ..Default::default()
         };
-        let api = webrtc::api::APIBuilder::new().build();
+        let api = crate::test_net::api();
         std::sync::Arc::new(api.new_peer_connection(config).await.unwrap())
     }
 
@@ -1519,6 +1523,10 @@ mod tests {
     /// the agent's own TURN allocation over UDP reads `udp`, from the pair
     /// the carrier line reads.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(
+        windows,
+        ignore = "its TURN client socket, which webrtc-ice binds on 0.0.0.0, raises a firewall prompt on Windows (#4500)"
+    )]
     async fn a_pair_on_the_agents_udp_relay_names_its_transport() {
         use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
         let (server, port) = loopback_turn().await;
@@ -1566,14 +1574,9 @@ mod tests {
     /// A peer that gathers host candidates on loopback alone and asks no
     /// server: the agent's end of a pair whose far end is relayed.
     async fn host_peer() -> std::sync::Arc<RTCPeerConnection> {
-        use webrtc::api::setting_engine::SettingEngine;
-        use webrtc::ice::mdns::MulticastDnsMode;
         use webrtc::ice::network_type::NetworkType;
-        let mut setting = SettingEngine::default();
-        setting.set_include_loopback_candidate(true);
-        setting.set_ip_filter(Box::new(|ip: std::net::IpAddr| ip.is_loopback()));
+        let mut setting = crate::test_net::setting_engine();
         setting.set_network_types(vec![NetworkType::Udp4]);
-        setting.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
         let api = webrtc::api::APIBuilder::new()
             .with_setting_engine(setting)
             .build();
@@ -1728,6 +1731,10 @@ mod tests {
     /// Before the candidate came nothing showed a relay, and the same pair
     /// read `direct`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(
+        windows,
+        ignore = "its TURN client socket, which webrtc-ice binds on 0.0.0.0, raises a firewall prompt on Windows (#4500)"
+    )]
     async fn a_relay_learnt_as_prflx_before_its_candidate_reads_as_the_relay() {
         use crate::media_deadline::{CarrierClass, class_of};
         use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;

@@ -190,7 +190,7 @@ Notes on the calls:
 | a folder another account owns | moved aside by handle (`FileRenameInformation`, `RootDirectory` = the parent's handle) as `<name>.moved-<unix>`, and a sealed one made. Nothing in it is deleted or changes owner. One WARN names it | a `<name>.moved-<unix>` entry beside the new folder, its content still that account's |
 | a link (a junction or a symbolic link) | the link entry itself moved aside by handle, never followed, and a sealed folder made. One WARN | a `<name>.moved-<unix>` entry; whatever the link led to is untouched |
 | anything else that is not a folder: a plain file, a file link, a hard link (as built in P1, accepted 2026-11-12) | the entry moved aside by its own handle (opened with `FILE_OPEN_REPARSE_POINT` and `DELETE`), and a sealed folder made: a file link moves as itself, a hard link moves only that name. One WARN | a `<name>.moved-<unix>` entry, its content unchanged |
-| above the leaf: a link, or a folder that cannot be opened or whose final path is elsewhere | refused (`Why::Link`, `Why::Elsewhere`), with one throttled WARN, and the site does without: a crash record is not written; the logs take the fallback they take today when `service-logs` cannot be used (`logging.rs:235-258`, `fallback_log_dir` `:357-363`). The machine folder itself is FR-94's to repair, not a log writer's | the WARN line, which names the path |
+| above the leaf: a link, or a folder that cannot be opened or whose final path is elsewhere | refused (`Why::Link`, `Why::Elsewhere`), with one throttled WARN, and the site does without: a crash record is not written; the logs take the fallback they take today when `service-logs` cannot be used (`logging.rs:235-258`, `fallback_log_dir` `:361-367`). The machine folder itself is FR-94's to repair, not a log writer's | the WARN line, which names the path |
 
 ### P1: crash records
 
@@ -251,7 +251,7 @@ is by handle too. #3743's elevated tests already cover both.
 
 ### P2: service logs
 
-`open_log_appender` (`logging.rs:376`) gets, for a process with a `ServiceLogRole` on Windows (`logging.rs:101-122`:
+`open_log_appender` (`logging.rs:380`) gets, for a process with a `ServiceLogRole` on Windows (`logging.rs:101-122`:
 the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a `HeldRollingWriter` in place of
 `tracing_appender`'s `RollingFileAppender` (D3):
 
@@ -260,14 +260,14 @@ the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a
   reuse;
 - `impl std::io::Write`: when the UTC date has changed since the last write, it opens `<basename>.<YYYY-MM-DD>`
   with `append_file(.., Seal::Readable)`. Those are `tracing_appender`'s daily names, so `rolling_basenames`, the
-  prune and the log tail read them unchanged (`logging.rs:1155-1157`);
+  prune and the log tail read them unchanged (`logging.rs:1159-1161`);
 - wrapped in `tracing_appender::non_blocking`, as today (`logging.rs:266`);
 - a refusal takes today's fallback for an unusable `service-logs`, the reason logged first (#3073,
   `logging.rs:235-258`).
 
 | Site | Today | After |
 |---|---|---|
-| the prune (`logging.rs:1197-1212`) | `read_dir`, `remove_file(entry.path())` | `entries()`, the same name and age rule, `remove_file(name)` |
+| the prune (`logging.rs:1201-1216`) | `read_dir`, `remove_file(entry.path())` | `entries()`, the same name and age rule, `remove_file(name)` |
 | the panic file (`:1119-1140`) | `fs::write` | the hook keeps the `Arc<HeldPath>`: `write_file("panic-<pid>-<ts>.log", ..)` |
 | the stderr file (`:810-816`) | `OpenOptions`, create and append | `append_file(name, Seal::Readable)` |
 | the encoder caps cache (`agents/roomlerd/src/encode/caps_cache.rs:337-354`, its path `:183-187`) | `create_dir_all`, `fs::write(tmp)`, `fs::rename` | `write_file(FILE_NAME, ..)`; its readers read with `read_file` |

@@ -94,7 +94,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
    (`crates/tunnel-core/src/overlay/netcheck.rs:207`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:4072` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:4076` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -198,9 +198,9 @@ two bound `addr:port`s selected by VNI.
 
 **This is the one change that can break the fleet silently. It ships first, alone, as P0.**
 
-`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3885`) documents itself as safe
+`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3889`) documents itself as safe
 to extend — *"an unknown/absent value ⇒ the client falls back to its local computation, so
-adding a variant later is forward-compatible"* (`:3762-3764`). **The comment is wrong about
+adding a variant later is forward-compatible"* (`:3766-3768`). **The comment is wrong about
 the "unknown" half and the code does not implement it.** The enum is a plain
 `#[derive(Deserialize)]` with `#[serde(rename_all = "kebab-case")]`, **no `#[serde(other)]`**
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2163`) handles a
@@ -221,7 +221,7 @@ Four requirements, all in P0:
    documented behaviour real. **This is a bug fix worth landing even if FR-19 never ships.**
 3. The variant stays a **unit variant**. The session is pushed **out-of-band** as its own
    `rc:overlay.relay_session` message keyed by node id. ⚠️ `RelayStrategyWire` derives
-   **`Copy`** (`crates/remote_control/src/signaling.rs:3883`); a `session` payload would break that derive and ripple through
+   **`Copy`** (`crates/remote_control/src/signaling.rs:3887`); a `session` payload would break that derive and ripple through
    `netmap.rs:92`, `relay_link.rs:1312-1315` and three by-value returns at
    `crates/modules/network/src/overlay.rs:2820/2953/3025` — and would also change the JSON from a string tag to a map.
 4. A test decoding `"org-relay"` against a **pre-FR-19 `NetmapPeer` shape**.
@@ -372,7 +372,7 @@ Verdict machinery to extend, verified against master:
 | Server verdict entry point | `crates/modules/network/src/overlay.rs:2820` `server_relay_verdict` |
 | …delegating to the pure decision | `crates/modules/network/src/overlay.rs:3025` `relay_verdict_core` |
 | Measured caps supersede presence | `crates/modules/network/src/overlay.rs:2970-2981` (in `verdict_from_nodes`, `:2953`) |
-| Wire verdict enum | `crates/remote_control/src/signaling.rs:3464` `RelayStrategyWire` |
+| Wire verdict enum | `crates/remote_control/src/signaling.rs:3468` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1289` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
@@ -527,7 +527,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `crates/remote_control/src/signaling.rs:4073` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `crates/remote_control/src/signaling.rs:4077` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".
@@ -705,7 +705,7 @@ the count `stale_drops()` reads (`transport/derp.rs:461`) as `dropped_stale` whe
 
 ⚠️ A pair that is not on `relay:org` is not evidence of "no relay available": the node may
 never have measured, and an unmeasured capability is `None`, never `false` (`CapVectorWire`,
-`crates/remote_control/src/signaling.rs:3533-3537`).
+`crates/remote_control/src/signaling.rs:3537-3541`).
 ⚠️ `relay_server` must resolve from **the requesting tenant's own node row**. A multi-org
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:144-146`.
@@ -727,7 +727,7 @@ Verified against `origin/master`, 2026-08-28.
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
 | Netmap shaping | `overlay.rs:2087` `shape_peer` |
-| Wire model | `crates/remote_control/src/signaling.rs:3484` `NetmapPeer`; `:3462` `RelayStrategyWire` |
+| Wire model | `crates/remote_control/src/signaling.rs:3488` `NetmapPeer`; `:3466` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
 | Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:315` `sweep_carrier_health` |
 | Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2895`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
@@ -941,8 +941,8 @@ kill switch. That is what makes E2E-3 executable before P2.
 
 New module `crates/tests/src/peer_relay_tests.rs`. Model on
 `crates/tests/src/relay_region_tests.rs:49` (40 lines; `TestApp::spawn_with_settings`,
-`fixtures/test_app.rs:207`, with both a REST and an in-process `app.state` assertion). For a
-two-pod topology copy `cluster_tests.rs:1485` via `spawn_pair` (`test_app.rs:179`).
+`fixtures/test_app.rs:211`, with both a REST and an in-process `app.state` assertion). For a
+two-pod topology copy `cluster_tests.rs:1485` via `spawn_pair` (`test_app.rs:183`).
 
 Server-decision tests — all implementable as described: `mint_refused_when_mode_off`,
 `mint_refused_without_relay_grant`, `mint_refused_cross_tenant` (404-shaped: leaks neither
@@ -970,7 +970,7 @@ every P2/P4 PR would skip this lane entirely. The workflow's own comment says to
 this: *"If a new crate becomes part of what these tests drive, add it here."* Add both paths
 in the same PR as `peer_relay_tests.rs`.
 ⚠️ Set `RUST_LOG` — the harness installs a subscriber only when it is set
-(`fixtures/test_app.rs:67`) — and use `--nocapture`.
+(`fixtures/test_app.rs:71`) — and use `--nocapture`.
 
 ### 10c. E2E on the real fleet — mars, zeus, jupiter
 

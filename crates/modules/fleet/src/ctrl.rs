@@ -274,6 +274,32 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 info!(agent = %aid, revision, "rc ctrl: desired config pushed from another pod");
             }
         }
+        // FR-155 P1b — a device's token rotated on another pod: this pod ends
+        // the device's connection admitted below the new generation, and keeps
+        // the floor that refuses a late one (`hub::rotation`). The generation
+        // keeps a late envelope from ending a connection admitted at it, the
+        // tenant is checked as well, and a key lost on the way ends nothing.
+        // Applied whatever this pod's `rc.agent_token_rotation` says: the
+        // rotation is made, as its lost answer is given again either way.
+        Some("end_below_generation") => {
+            let oid = |key: &str| {
+                ctrl.get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok())
+            };
+            let (Some(aid), Some(tid), Some(generation)) = (
+                oid("agent_id"),
+                oid("tenant_id"),
+                ctrl.get("generation")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|g| u32::try_from(g).ok()),
+            ) else {
+                return;
+            };
+            if hub.end_below_generation(aid, tid, generation) {
+                info!(agent = %aid, generation, "rc ctrl: a rotation's end applied from another pod");
+            }
+        }
         // FR-138 P1b-2 — `resume_scope` is read from the store, which the hub
         // does not reach: [`apply_rc_ctrl_on`] takes it.
         _ => {}

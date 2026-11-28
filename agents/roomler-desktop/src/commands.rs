@@ -5564,6 +5564,10 @@ mod tests {
 
     /// This thread's log lines while the guard lives. The tests below are
     /// `#[tokio::test]`s, on the current thread, so a click's lines land here.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's own log capture, never a console (root clippy.toml, #3938)"
+    )]
     fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
         let out = Captured::default();
         let subscriber = tracing_subscriber::fmt()

@@ -81,7 +81,7 @@ async fn remove(app: &TestApp, seeded: &crate::fixtures::seed::SeededTenant, age
     assert_eq!(resp.status(), 200, "remove the device");
 }
 
-async fn renew(app: &TestApp, token: &str) -> reqwest::Response {
+pub(crate) async fn renew(app: &TestApp, token: &str) -> reqwest::Response {
     app.auth_post("/api/agent/self/renew", token)
         .send()
         .await
@@ -100,7 +100,7 @@ pub(crate) async fn self_devices(app: &TestApp, token: &str) -> u16 {
 
 /// The status an upgrade to `path` answers with this token: 101 when the
 /// socket is accepted, the HTTP status when it is refused.
-async fn upgrade_status(app: &TestApp, path: &str, token: &str) -> u16 {
+pub(crate) async fn upgrade_status(app: &TestApp, path: &str, token: &str) -> u16 {
     let url = format!(
         "ws://{}{path}?token={}&role=agent",
         app.addr,

@@ -117,7 +117,7 @@ sequenceDiagram
    response older than the newest it applied, and patches rows in place keyed by route id /
    flow id (`routeRows`, `:55`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
-   one rolled generation).
+   one rolled generation; its stderr is coloured only on a terminal: [installation.md](installation.md#console-lines-colour-only-on-a-terminal-3938)).
 2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4722`)
    binds the first instance (retrying while another process holds the name), then runs a
    pool of accept tasks (`accept_pipe`, `:4836`), each owning one listening instance and
@@ -932,7 +932,7 @@ flowchart TD
 #3669 made each step a read takes run as the person. What a read touched outside such a step, or
 with no bound, and what its refusal said, is gathered in `agents/roomlerd/src/files/reads.rs`, with
 its tests in `files::drawer_edges` (`agents/roomlerd/src/files/drawer_edges.rs`) and
-`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:18080`).
+`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:18084`).
 
 ```mermaid
 sequenceDiagram
@@ -1112,7 +1112,7 @@ sequenceDiagram
   channel.
 - **No bound on the copy.** A large file legitimately copies for long, so only a bound on progress
   would be sound, and none is set.
-- The tests are `peer::upload_end_tests` (`agents/roomlerd/src/peer.rs:18536`). A test holds a
+- The tests are `peer::upload_end_tests` (`agents/roomlerd/src/peer.rs:18540`). A test holds a
   placement where its copy runs (`files::drawer_edges::seams::hold_placing`), a download before
   its first chunk (`hold_sending`), and a begin between its two makes (`before_the_id`).
 
@@ -1500,7 +1500,7 @@ What a viewer notices:
   ends "Remote shell works here.", where it said file transfer worked there too.
 - Windows, Linux, a per-user Mac and every session a GUI worker serves are unchanged.
 
-**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17246`), on every lane's lib
+**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17250`), on every lane's lib
 tests: the decision and its reason's words; each request's answer (`declined_reply`); and through
 the router over an in-process peer pair, both peers closed after each test, a declined channel that
 answers each request with the reason, leaves the folder asked about as it was and stays up
@@ -1701,8 +1701,8 @@ sequenceDiagram
 
 | Piece | Where | What |
 |---|---|---|
-| the start | `notification_for_rc`, [`signaling.rs:7849`](../agents/roomlerd/src/signaling.rs#L7849); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:295`](../agents/roomlerd/src/indicator/mod.rs#L295) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
-| the consent task | `rc_surfaces_up`, [`signaling.rs:7780`](../agents/roomlerd/src/signaling.rs#L7780); `notification_shown`, [`:7864`](../agents/roomlerd/src/signaling.rs#L7864) | waits for the show's verdict. Since #4000 it does so on a task of its own beside the prompt's window, which runs from the request (#3888 had the window start after the show, see §10.5). Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
+| the start | `notification_for_rc`, [`signaling.rs:7935`](../agents/roomlerd/src/signaling.rs#L7935); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:295`](../agents/roomlerd/src/indicator/mod.rs#L295) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
+| the consent task | `rc_surfaces_up`, [`signaling.rs:7866`](../agents/roomlerd/src/signaling.rs#L7866); `notification_shown`, [`:7950`](../agents/roomlerd/src/signaling.rs#L7950) | waits for the show's verdict. Since #4000 it does so on a task of its own beside the prompt's window, which runs from the request (#3888 had the window start after the show, see §10.5). Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
 | the session walk | `graphical_session_within`, [`companion.rs:9224`](../agents/roomlerd/src/companion.rs#L9224); `SESSION_WALKS`, [`:9252`](../agents/roomlerd/src/companion.rs#L9252) | one walk in flight per kind of ask (the uid asked for, and whether only a person's session will do), on a thread named `session-walk`. Each caller waits `SESSION_WALK_WAIT`, 1.5 s ([`:9208`](../agents/roomlerd/src/companion.rs#L9208)), the seat and account lookups' wait. No answer in time is "not known" with its reason (`walked_in_time`, [`:9265`](../agents/roomlerd/src/companion.rs#L9265)), never "nobody at the screen" |
 | a question that ends on the way | `Prompts::coming`, [`indicator/notify.rs:358`](../agents/roomlerd/src/indicator/notify.rs#L358); `launch`, [`:505`](../agents/roomlerd/src/indicator/notify.rs#L505) | the question is on the books as coming before its show starts. `hide_prompt` (a `Terminate`, an answer from another surface, the closed socket the consent task watches) takes it off, and the show then starts no helper, or drops the one it started, whose helper closes the notification and exits. Its verdict is `its question ended while the notification was being put up`, once |
 
@@ -2022,8 +2022,8 @@ window runs from the request").
 
 | Piece | Where | What |
 |---|---|---|
-| the loop's side | `start_for_prompt`, [`companion.rs:1393`](../agents/roomlerd/src/companion.rs#L1393); the hand-off, [`signaling.rs:4496`](../agents/roomlerd/src/signaling.rs#L4496) | starts `ensure_running` on a task of its own, 3 s at most, and returns its handle (`Starting`, [`companion.rs:1411`](../agents/roomlerd/src/companion.rs#L1411)) at once. The loop hands it to the consent task with the question, in `RcSurfaces` ([`signaling.rs:7750`](../agents/roomlerd/src/signaling.rs#L7750)) |
-| the consent task's side | `rc_surfaces_up`, [`signaling.rs:7780`](../agents/roomlerd/src/signaling.rs#L7780), called at [`:7901`](../agents/roomlerd/src/signaling.rs#L7901) on the task `rc_consent_task` spawns ([`:7940`](../agents/roomlerd/src/signaling.rs#L7940)) | waits for the start's verdict, then for the notification where the tray cannot show the question. Since #4000 that is beside the prompt's window, and `rc_shown_by_now` ([`:8066`](../agents/roomlerd/src/signaling.rs#L8066)) reads it when the question ends; #3888 had it before the first look at the prompt started the window. `have_surface` is the native panel, or the marker with the tray up, or a notification that came up, so a start that failed or ran out of time is still `no_prompt_surface`, never a timeout |
+| the loop's side | `start_for_prompt`, [`companion.rs:1393`](../agents/roomlerd/src/companion.rs#L1393); the hand-off, [`signaling.rs:4496`](../agents/roomlerd/src/signaling.rs#L4496) | starts `ensure_running` on a task of its own, 3 s at most, and returns its handle (`Starting`, [`companion.rs:1411`](../agents/roomlerd/src/companion.rs#L1411)) at once. The loop hands it to the consent task with the question, in `RcSurfaces` ([`signaling.rs:7836`](../agents/roomlerd/src/signaling.rs#L7836)) |
+| the consent task's side | `rc_surfaces_up`, [`signaling.rs:7866`](../agents/roomlerd/src/signaling.rs#L7866), called at [`:7987`](../agents/roomlerd/src/signaling.rs#L7987) on the task `rc_consent_task` spawns ([`:8026`](../agents/roomlerd/src/signaling.rs#L8026)) | waits for the start's verdict, then for the notification where the tray cannot show the question. Since #4000 that is beside the prompt's window, and `rc_shown_by_now` ([`:8152`](../agents/roomlerd/src/signaling.rs#L8152)) reads it when the question ends; #3888 had it before the first look at the prompt started the window. `have_surface` is the native panel, or the marker with the tray up, or a notification that came up, so a start that failed or ran out of time is still `no_prompt_surface`, never a timeout |
 | a question that ends while the start runs | `ConsentBroker::is_asking`, [`consent.rs:853`](../agents/roomlerd/src/consent.rs#L853) | a `Terminate` the loop reads meanwhile takes the question off the broker's books and finds no notification to take down. The consent task starts none for a question off the books, or whose socket closed, and takes down one started just as it was withdrawn |
 
 - **The bound is as before:** the start's 2.5 s and the 3 s budget, on the start's own task and
@@ -2107,7 +2107,7 @@ flowchart TD
   package update stopped (`companion/package_sync.rs`).
 - **Every caller of the start is a question or a banner:** the remote-control prompt
   (`start_for_prompt`, `companion.rs:1393`, from `agents/roomlerd/src/signaling.rs:4496`), the exec prompt
-  (`exec_surfaces_up`, `agents/roomlerd/src/signaling.rs:8015`), a recording's and an SSH session's question
+  (`exec_surfaces_up`, `agents/roomlerd/src/signaling.rs:8101`), a recording's and an SSH session's question
   (`Companion::verdict`, `companion.rs:1462`, which a recording reads through `Companion::up`),
   and Linux's being-viewed banner (`indicator/notify.rs:747`). The other callers are
   `tray_start_tests`' own.
@@ -3900,7 +3900,7 @@ flowchart TD
 | the schedule | `next_refresh_wait`, `companion.rs:491`; `FAST_REFRESH_WAITS`, `:122`; `RefreshSchedule::next`, `:463` | keyed on the version marker. While it reads too old the waits are 2, 5, 10 and 15 minutes, then 15 to the end of the first hour, so the tries land 2, 7, 17, 32, 47 and 62 minutes after the loop starts; after that the updater's 4 h. A marker that reads current starts them over. While a tray the refresh stopped is not running again, the waits are 1, 5 and 15 minutes when those are shorter (§13.3) |
 | the loop | `retry_refresh`, `companion.rs:513` | one plan per wait, so one line per wait while the tray is too old: `desktop companion is too old to connect to this daemon; its refresh is retried`, with `installed`, `needs` and `next_try_in_min`. It runs in the one refresher per install (#1686): on a machine-wide install the service host, whose log is `roomler logs --source service`. The version it plans from is read off the async worker (`sibling_version`, §13.4) |
 | what status is told | `too_old_to_connect`, `companion.rs:570`; `too_old_here`, `:663`; `too_old_beside`, `:694` | `NodeStatus.companion_too_old` (`crates/localapi/src/lib.rs:510`), read fresh on every answer, because the service host, another process, may have just refreshed the tray. The tray's version is the one the refresh goes by (§13.4, #3908): the marker when it names the daemon's, else the EXE's own. Absent means fine or not applicable, never unknown: a tray whose version neither names is reported without one, and a token or a file the daemon cannot read counts as reportable |
-| the log the hint names | `newest_service_log`, `crates/agent-core/src/logging.rs:1089` | `--source service` reads the service host's `roomlerd-service.log` alone, the newest of its daily files (#3814). It used to take whichever was newer of that and the SystemContext worker's `roomlerd.log` in the same `service-logs` folder. The busier worker's nearly always was, so the hint's own command showed none of the warn lines. The worker's log is `--source daemon`, since the worker answers the verb |
+| the log the hint names | `newest_service_log`, `crates/agent-core/src/logging.rs:1093` | `--source service` reads the service host's `roomlerd-service.log` alone, the newest of its daily files (#3814). It used to take whichever was newer of that and the SystemContext worker's `roomlerd.log` in the same `service-logs` folder. The busier worker's nearly always was, so the hint's own command showed none of the warn lines. The worker's log is `--source daemon`, since the worker answers the verb |
 | whether the retry is off | `retry_off_where_it_runs`, `companion.rs:600`; `sync_enabled_in`, `:623`; `service_sync_enabled`, `:641` | `companion_too_old.retry_off` (#3814): `ROOMLERD_COMPANION_SYNC=0` is set where the retry runs. A daemon that runs the retry itself reads its own environment. So does the SystemContext worker: the service host starts it with the host's own environment. A worker the host starts as the person gets the person's environment, which leaves the service's `Environment` value out, so it reads that value: once a process, because a restart of the service starts a new worker. A value it cannot read, or one that does not name the switch, leaves the retry on |
 | what status says | `tray_lines`, `agents/roomler-cli/src/localclient.rs:2518` | the lines below |
 
