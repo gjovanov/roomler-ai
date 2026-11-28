@@ -12,17 +12,17 @@
 //!    so it can pin — there's no CA).
 //! 2. Run an **accept loop** that authenticates the one client
 //!    connection by the server-minted token, then reads each inbound
-//!    flow stream's `flow_id` preamble and hands the stream to whichever
-//!    forward is waiting for it.
+//!    flow stream's `flow_id` preamble on a task of its own (#4501) and
+//!    hands the stream to whichever forward is waiting for it.
 //! 3. Expose [`take_flow`] so [`crate::tunnel::acceptor`] can, after
 //!    dialing the destination + sending `TcpForwardAccept`, grab the
 //!    client-opened QUIC stream for that `flow_id` and drive
-//!    [`tunnel_core::forward::run_flow_quic`].
+//!    [`tunnel_core::forward::run_flow_quic_until`].
 //!
 //! Lifecycle: `ServerMsg::TunnelQuicSetup` → [`setup`] → reply
 //! `ClientMsg::TunnelQuicReady { cert_fingerprint, addrs }` →
 //! `ServerMsg::TcpForwardForward` per flow → acceptor dials + `take_flow`
-//! → `run_flow_quic`. `TunnelTerminate` → [`close`], or [`end`] when it asks
+//! → `run_flow_quic_until`. `TunnelTerminate` → [`close`], or [`end`] when it asks
 //! the exit to close the session's connection (`close_connection`): the
 //! connection closes with [`SESSION_END_CODE`], then the flows stop. Or no terminate at all
 //! (#1754): the accept loop serves exactly ONE connection, so when it ends —
@@ -249,8 +249,9 @@ pub struct AgentQuicPeer {
 /// the client closed, quinn idle-timed the connection out (30 s, with the
 /// client's 8 s keepalives gone), the client failed auth, or the endpoint
 /// closed under it. An idle but live client never ends it — quinn's
-/// keepalive is below its idle timeout by design. Our own `close()` ABORTS
-/// the task, so it never reports a close the loop already did.
+/// keepalive is below its idle timeout by design, and one stream's failure
+/// never does (#4501). Our own `close()` ABORTS the task, so it never
+/// reports a close the loop already did.
 fn spawn_accept_loop(
     peer: Arc<QuicPeer>,
     session_id: ObjectId,
@@ -307,26 +308,74 @@ async fn serve_one_connection(
     info!(%session_id, "agent quic: client authenticated; serving flow streams");
     let conn = Arc::new(conn);
     link.attach(&conn);
-    loop {
-        match quic::accept_flow(&conn).await {
-            Ok((flow_id, send, recv)) => {
-                let streams = (send, recv, link.hold(&conn));
-                let mut rdv = rendezvous.lock().await;
-                if let Some(tx) = rdv.waiters.remove(&flow_id) {
-                    // A forward is already waiting — hand it over.
-                    if tx.send(streams).is_err() {
-                        debug!(%session_id, flow_id, "agent quic: forward dropped before stream");
-                    }
-                } else {
-                    // Stream beat the forward — stash it.
-                    rdv.ready.insert(flow_id, streams);
-                }
+    // #4501: each stream's preamble is read on a task of its own, so a stream
+    // that fails or stalls before its `flow_id` costs that stream alone. The
+    // loop awaits only `accept_bi`, whose error is the connection's end, and
+    // the reads still running end with the loop: the set aborts them on drop.
+    let mut preambles = tokio::task::JoinSet::new();
+    let ended = loop {
+        match conn.accept_bi().await {
+            Ok((send, recv)) => {
+                preambles.spawn(hand_over(
+                    session_id,
+                    send,
+                    recv,
+                    link.hold(&conn),
+                    Arc::clone(&rendezvous),
+                ));
+                // Collect the reads that are done, without waiting on any.
+                while preambles.try_join_next().is_some() {}
             }
-            Err(e) => {
-                debug!(%session_id, %e, "agent quic: accept_flow loop ended");
-                break;
-            }
+            Err(e) => break e,
         }
+    };
+    info!(%session_id, error = %ended, "agent quic: the connection ended; the accept loop stops");
+}
+
+/// How long a stream the accept loop took has to deliver its 4-byte
+/// `flow_id` preamble before it is dropped (#4501): the forward's own wait
+/// for its stream ([`super::acceptor::FLOW_RENDEZVOUS_WAIT`]).
+const PREAMBLE_WAIT: Duration = super::acceptor::FLOW_RENDEZVOUS_WAIT;
+
+/// One stream the accept loop took: read its `flow_id` preamble within
+/// [`PREAMBLE_WAIT`], then hand it to the forward waiting for it, or stash it
+/// for the forward still to come. A stream that fails or stalls before its
+/// preamble is dropped with one line that names the session and why, and
+/// the session goes on (#4501).
+async fn hand_over(
+    session_id: ObjectId,
+    send: SendStream,
+    mut recv: RecvStream,
+    hold: FlowHold,
+    rendezvous: Arc<Mutex<Rendezvous>>,
+) {
+    let flow_id = match tokio::time::timeout(PREAMBLE_WAIT, quic::read_flow_id(&mut recv)).await {
+        Ok(Ok(flow_id)) => flow_id,
+        Ok(Err(e)) => {
+            info!(
+                %session_id, stream = %recv.id(), error = %format!("{e:#}"),
+                "agent quic: a stream ended before its flow id; dropped it, the session goes on"
+            );
+            return;
+        }
+        Err(_) => {
+            info!(
+                %session_id, stream = %recv.id(), wait = ?PREAMBLE_WAIT,
+                "agent quic: a stream sent no flow id in time; dropped it, the session goes on"
+            );
+            return;
+        }
+    };
+    let streams = (send, recv, hold);
+    let mut rdv = rendezvous.lock().await;
+    if let Some(tx) = rdv.waiters.remove(&flow_id) {
+        // A forward is already waiting — hand it over.
+        if tx.send(streams).is_err() {
+            debug!(%session_id, flow_id, "agent quic: forward dropped before stream");
+        }
+    } else {
+        // Stream beat the forward — stash it.
+        rdv.ready.insert(flow_id, streams);
     }
 }
 
@@ -782,22 +831,70 @@ mod tests {
         assert_eq!(back, tag);
     }
 
-    /// #4501: one stream that ends before its 4-byte `flow_id` preamble
-    /// arrives costs that stream, never the session. The client resets a
-    /// flow's stream when its local TCP read fails
-    /// (`tunnel_core::forward::run_flow_quic`), and a local app that aborts
-    /// its connection right after the SOCKS reply does that to a brand-new
-    /// flow. The accept loop reads each preamble inline and takes that error
-    /// for the connection's end: it reports `QuicConnEnded`, the signalling
-    /// loop reaps the session and tells the client, and every in-flight flow
-    /// on it is cut. The field measured whole sessions ending this way under
-    /// live traffic, each a few milliseconds after a flow that moved no byte.
+    /// What a stray stream does after the first half of its 4-byte `flow_id`
+    /// preamble.
+    #[derive(Clone, Copy, Debug)]
+    enum Stray {
+        /// Resets the stream.
+        Reset,
+        /// Finishes the stream.
+        Finish,
+        /// Sends nothing more.
+        Stall,
+    }
+
+    impl Stray {
+        fn label(self) -> &'static str {
+            match self {
+                Stray::Reset => "reset",
+                Stray::Finish => "finished",
+                Stray::Stall => "stalled",
+            }
+        }
+    }
+
+    /// Flow 1's four halves, client and agent, and the hold the agent's
+    /// forward keeps.
+    struct InFlight {
+        client_send: SendStream,
+        client_recv: RecvStream,
+        agent_send: SendStream,
+        agent_recv: RecvStream,
+        _hold: FlowHold,
+    }
+
+    impl InFlight {
+        async fn round_trip(&mut self, tag: &[u8]) {
+            round_trip(
+                &mut self.client_send,
+                &mut self.agent_recv,
+                &mut self.agent_send,
+                &mut self.client_recv,
+                tag,
+            )
+            .await;
+        }
+    }
+
+    /// What [`a_stray_costs_only_its_stream`] leaves open, for a cell's own
+    /// checks after it.
+    struct AfterStray {
+        agent: AgentQuicPeer,
+        reap_rx: mpsc::Receiver<TunnelReap>,
+        stray: SendStream,
+        flow1: InFlight,
+        _client: (ClientQuicPeer, QuicConnection, RecvStream),
+    }
+
+    /// #4501: the scenario of every stray-stream cell. A session serves
+    /// flow 1, which moves bytes; then a stray stream sends half of its
+    /// preamble and does `stray`; then flow 3 opens. The stray must cost that
+    /// stream alone: flow 3 is served, nothing is reaped while the client
+    /// lives, and flow 1 still moves bytes both ways.
     ///
-    /// The stray stream never carries a whole preamble, so the outcome does
-    /// not depend on which of its frames the agent reads first.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "#4501 RED on master: a stream reset before its preamble ends the accept loop, so the session is reaped"]
-    async fn a_stream_reset_before_its_preamble_costs_only_that_stream() {
+    /// The stray never carries a whole preamble, so the outcome does not
+    /// depend on which of its frames the agent reads first.
+    async fn a_stray_costs_only_its_stream(stray: Stray) -> AfterStray {
         let session_id = ObjectId::new();
         let token = "session-token-stray";
         let (reap_tx, mut reap_rx) = reap_channel();
@@ -814,23 +911,30 @@ mod tests {
             agent.take_flow(1, Duration::from_secs(10)),
             quic::open_flow(&conn, 1)
         );
-        let (mut agent_send, mut agent_recv, _hold) =
-            taken.expect("agent must receive flow 1's stream");
-        let (mut client_send, mut client_recv) = opened.expect("client opens flow 1");
-        round_trip(
-            &mut client_send,
-            &mut agent_recv,
-            &mut agent_send,
-            &mut client_recv,
-            b"before",
-        )
-        .await;
+        let (agent_send, agent_recv, hold) = taken.expect("agent must receive flow 1's stream");
+        let (client_send, client_recv) = opened.expect("client opens flow 1");
+        let mut flow1 = InFlight {
+            client_send,
+            client_recv,
+            agent_send,
+            agent_recv,
+            _hold: hold,
+        };
+        flow1.round_trip(b"before").await;
 
-        // The stray: half a preamble, then a reset. A flow whose local app
-        // went away before the agent read which flow it is.
-        let (mut stray, _stray_recv) = conn.open_bi().await.unwrap();
-        stray.write_all(&2u32.to_le_bytes()[..2]).await.unwrap();
-        stray.reset(0u32.into()).unwrap();
+        // The stray: half a preamble, then `stray`. A reset is what a flow
+        // whose local app went away before the agent read which flow it is
+        // sends.
+        let (mut stray_send, stray_recv) = conn.open_bi().await.unwrap();
+        stray_send
+            .write_all(&2u32.to_le_bytes()[..2])
+            .await
+            .unwrap();
+        match stray {
+            Stray::Reset => stray_send.reset(0u32.into()).unwrap(),
+            Stray::Finish => stray_send.finish().unwrap(),
+            Stray::Stall => {}
+        }
 
         // A flow opened after the stray is still served, and nothing is
         // reaped while the client lives.
@@ -842,22 +946,90 @@ mod tests {
         let reaped = reap_rx.try_recv().ok().map(|r| r.signal);
         assert!(
             third.is_ok() && reaped.is_none() && !agent.accept_ended(),
-            "a stream reset before its preamble must cost only that stream: \
+            "a stream {} before its preamble must cost only that stream: \
              flow 3 = {:?}, reaped = {reaped:?}, accept loop ended = {}",
+            stray.label(),
             third.as_ref().map(|_| "served").map_err(|e| e.to_string()),
             agent.accept_ended()
         );
 
         // The in-flight flow still moves bytes both ways.
-        round_trip(
-            &mut client_send,
-            &mut agent_recv,
-            &mut agent_send,
-            &mut client_recv,
-            b"after",
+        flow1.round_trip(b"after").await;
+        AfterStray {
+            agent,
+            reap_rx,
+            stray: stray_send,
+            flow1,
+            _client: (client, conn, stray_recv),
+        }
+    }
+
+    /// #4501: one stream that ends before its 4-byte `flow_id` preamble
+    /// arrives costs that stream, never the session. A client on an older
+    /// release resets a flow's stream whenever its local TCP read fails
+    /// (`tunnel_core::forward::run_flow_quic`); a local app that aborts its
+    /// connection right after the SOCKS reply does that to a brand-new flow.
+    /// The accept loop read each preamble inline and took that error for the
+    /// connection's end: it reported `QuicConnEnded`, the signalling loop
+    /// reaped the session and told the client, and every in-flight flow on it
+    /// was cut. The field measured whole sessions ending this way under live
+    /// traffic, each a few milliseconds after a flow that moved no byte.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_stream_reset_before_its_preamble_costs_only_that_stream() {
+        let after = a_stray_costs_only_its_stream(Stray::Reset).await;
+        after.agent.close();
+    }
+
+    /// #4501: a stream finished before its whole preamble arrived costs that
+    /// stream alone too. Its preamble read ends early where a reset one's
+    /// fails, and the accept loop took either for the connection's end.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_stream_finished_before_its_preamble_costs_only_that_stream() {
+        let after = a_stray_costs_only_its_stream(Stray::Finish).await;
+        after.agent.close();
+    }
+
+    /// #4501: a stream that stops sending partway through its preamble
+    /// delays no stream opened after it, and the agent drops it once the
+    /// preamble wait (10 s) is over, while the session goes on serving.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_stream_stalled_before_its_preamble_costs_only_that_stream() {
+        let mut after = a_stray_costs_only_its_stream(Stray::Stall).await;
+
+        // The agent drops the stalled stream: its send half is stopped.
+        let stopped = tokio::time::timeout(
+            PREAMBLE_WAIT + Duration::from_secs(5),
+            after.stray.stopped(),
         )
         .await;
-        agent.close();
+        assert!(
+            matches!(stopped, Ok(Ok(Some(_)))),
+            "a stream stalled before its preamble is dropped once the preamble wait is over: {stopped:?}"
+        );
+
+        // The drop costs that stream alone.
+        after.flow1.round_trip(b"after the drop").await;
+        assert!(
+            matches!(after.reap_rx.try_recv(), Err(TryRecvError::Empty)),
+            "nothing is reaped while the client lives"
+        );
+        assert!(
+            !after.agent.accept_ended(),
+            "the accept loop still serves the session"
+        );
+        after.agent.close();
     }
 
     /// A client presenting the WRONG token must NOT get its flow served:
