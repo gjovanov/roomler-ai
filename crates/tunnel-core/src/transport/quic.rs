@@ -1084,6 +1084,77 @@ mod tests {
         assert_eq!(got, payload, "A→B payload corrupted through QUIC");
     }
 
+    /// #4501: a flow whose local side fails before its first byte finishes
+    /// its stream instead of resetting it, so the exit still reads the
+    /// stream's `flow_id` preamble. A reset discards what the exit has not
+    /// read yet, the preamble with it, and an exit on an older release takes
+    /// a stream that fails before its preamble for the end of the session.
+    /// The local app here resets its connection before it sends a byte, as
+    /// one that aborts right after the SOCKS reply does.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "#4501 fails on the base: a flow whose local side fails before its first byte resets its stream"]
+    async fn a_flow_whose_local_side_fails_before_its_first_byte_finishes_its_stream() {
+        use crate::forward::{FlowStats, run_flow_quic};
+        use roomler_ai_remote_control::signaling::CloseReason;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let (server, fp) = QuicPeer::server(loopback()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = QuicPeer::client(loopback(), &fp).unwrap();
+        let exit_accept = tokio::spawn(async move { server.accept().await.unwrap().unwrap() });
+        let client_conn = client.connect(server_addr).await.unwrap();
+        let exit_conn = exit_accept.await.unwrap();
+
+        // The local app's connection, reset by the app before its first byte.
+        let listener = TcpListener::bind(loopback()).await.unwrap();
+        let app = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (into_tunnel, _) = listener.accept().await.unwrap();
+        socket2::SockRef::from(&app)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(app);
+
+        let (send, recv) = open_flow(&client_conn, 4).await.unwrap();
+        let flow = tokio::spawn(run_flow_quic(
+            into_tunnel,
+            send,
+            recv,
+            4,
+            Arc::new(FlowStats::default()),
+        ));
+
+        // The exit reads the whole stream: the preamble, then a finish.
+        let (exit_send, mut exit_recv) =
+            tokio::time::timeout(Duration::from_secs(5), exit_conn.accept_bi())
+                .await
+                .expect("the flow's stream reaches the exit within 5 s")
+                .expect("accept_bi");
+        let read = tokio::time::timeout(Duration::from_secs(5), exit_recv.read_to_end(64))
+            .await
+            .expect("the flow's stream ends within 5 s");
+        assert_eq!(
+            read.as_deref().map_err(|e| e.to_string()),
+            Ok(&4u32.to_le_bytes()[..]),
+            "a flow whose local side fails before its first byte must finish its stream \
+             after its preamble, not reset it"
+        );
+
+        // The exit's half ends too, and the flow reads its local failure.
+        drop((exit_send, exit_recv));
+        let reason = tokio::time::timeout(Duration::from_secs(5), flow)
+            .await
+            .expect("the flow ends within 5 s")
+            .expect("the flow's task");
+        assert!(
+            matches!(reason, CloseReason::IoError),
+            "the flow ends on its local side's failure: {reason:?}"
+        );
+    }
+
     /// End-to-end UDP ASSOCIATE pump over QUIC: the agent side runs
     /// [`crate::forward::run_flow_udp_quic`] against a loopback UDP echo
     /// target; the "client" writes a length-prefixed datagram on the
