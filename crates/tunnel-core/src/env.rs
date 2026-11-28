@@ -322,9 +322,17 @@ pub const LIVE_WORK_SWITCHES: &[&str] = &["LIVE_WORK_PROOF"];
 /// The current spelling is the first arm of the child's own chain, so a value
 /// the child already has under an older spelling cannot outrank it.
 pub fn worker_switches(read: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
-    // The seam: nothing is handed on yet.
-    let _ = read;
-    Vec::new()
+    LIVE_WORK_SWITCHES
+        .iter()
+        .filter_map(|suffix| {
+            let value = PREFIXES
+                .iter()
+                .find_map(|p| read(&format!("{p}{suffix}")))?;
+            let on = flag_value(Some(&value), true);
+            let handed = if on { "1" } else { "0" };
+            Some((format!("{}{suffix}", PREFIXES[0]), handed.to_string()))
+        })
+        .collect()
 }
 
 /// OsString twin of [`node_env`] for reads that must tolerate non-Unicode
