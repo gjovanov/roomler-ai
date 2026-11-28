@@ -240,7 +240,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 | How the overlay gets in | Filter (off) | Where |
 |---|---|---|
 | A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:496` |
-| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:538`, `crates/modules/fleet/src/hub.rs:2448` |
+| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:538`, `crates/modules/fleet/src/hub.rs:2459` |
 | A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1901`, `peer.rs:1940`, `peer.rs:1866` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, in the footprint registry `crates/tunnel-core/src/overlay_footprint.rs`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
@@ -332,8 +332,8 @@ flowchart LR
   - The gate waits at most 500 ms, then sends no hint. A slow read costs the hint, never the session.
 - **Which devices are the browser's** follows the Hub's own precedence (`viewer_devices_of`, `controller.rs:696`). Probed descriptors win over named devices, and every one the Hub hands out counts, through the Hub's own `bounded_relays` and `named_devices` (`crates/modules/fleet/src/hub.rs:105`, `:126`). The browser sends them all: the first as `local_relay`, the rest as `local_relay_also` (`ui/src/composables/useRemoteControl.ts:4396`).
 - **The target folds in its own netcheck** at the offer (D8): one LocalAPI `status` call beside the `peers` call (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:768`). If that netcheck found no UDP out, the far TURN is dead whatever the server saw (`with_own_reach`, `:787`). This is what measures a Mac: its RC target is the GUI worker's row, and that row has no overlay node for the hook to find (`find_live_by_agent`, `crates/services/src/dao/overlay_node.rs:501`). The per-user half answers `status` itself, so it lends the root daemon's netcheck along with the rest of the machine's network fields (`with_machine_network`, `agents/roomlerd/src/person_socket.rs:305`).
-- **The Hub** reads `auto` as `off` for an agent that does not advertise `rc-overlay-auto` (`effective_rc_overlay`, `crates/modules/fleet/src/hub.rs:3005`). It decides this once per request, for the relay and the session alike.
-- **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3163`; `forward_offer`, `:2448`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
+- **The Hub** reads `auto` as `off` for an agent that does not advertise `rc-overlay-auto` (`effective_rc_overlay`, `crates/modules/fleet/src/hub.rs:3016`). It decides this once per request, for the relay and the session alike.
+- **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3174`; `forward_offer`, `:2459`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
 - **Across pods** the relay envelope carries `rc_overlay_auto` and `rc_overlay_far_turn` beside the bool (`rc_overlay_to_relay`, `crates/modules/remote/src/relay.rs:591`; `rc_overlay_from_relay`, `:604`). An older pod reads only the bool, so `auto` reaches it as `off`.
 - **Status:** live since 2026-10-29, on agents from 0.4.185 and server images from `hosted-20261029-2ae4ffd`. P2b (the hint reads `stun_udp` alone) and P2c's server half (D8: the browser's best device) are live since `hosted-20261030-ff00741`; P2c's agent half (the target's own netcheck) since agent 0.4.189. The field record is FR-128 §8.
 
@@ -626,8 +626,8 @@ Chrome gates only the second. A public page's WebRTC reaches a TURN server on 12
 same organization whose `rc_overlay` is on, or `auto` on an agent that decides it (FR-128), and otherwise answers
 `local_relay_refused`: `not_your_device`,
 `other_network`, `device_offline`, `rc_overlay_off` or `same_device` (`resolve_local_relay`,
-`crates/modules/fleet/src/hub.rs:3163`). The report lives in the Hub's memory with the agent's connection
-(`set_agent_local_relay`, `crates/modules/fleet/src/hub.rs:3143`) and is never stored. ⚠️ It carries a live
+`crates/modules/fleet/src/hub.rs:3174`). The report lives in the Hub's memory with the agent's connection
+(`set_agent_local_relay`, `crates/modules/fleet/src/hub.rs:3154`) and is never stored. ⚠️ It carries a live
 credential, minted by the device and re-minted every 30 minutes, so nothing logs it.
 
 > ⚠️ **On Chrome 156, a TURN server on 127.0.0.1 is no path from roomler.ai** (measured on neo16, 2026-10-29). There
@@ -641,8 +641,8 @@ loopback, each agent with its own relay on its own probe port, and their overlay
 completely: on neo16 the Windows agent is direct to every peer while the WSL one rides DERP, and a relay reached over
 DERP carries no media. So the viewer takes every answer, not the first: it names every own device, the Hub resolves
 each on its own (`named_devices`, `crates/modules/fleet/src/hub.rs:126`) and hands the target every `turn:` with the
-offer (`crates/modules/fleet/src/hub.rs:2447`), at most `LOCAL_RELAYS_MAX` (4), and ICE checks a pair through each. A
-target whose `rc_overlay` is off is refused that first (`crates/modules/fleet/src/hub.rs:3569`). Otherwise a refusal
+offer (`crates/modules/fleet/src/hub.rs:2458`), at most `LOCAL_RELAYS_MAX` (4), and ICE checks a pair through each. A
+target whose `rc_overlay` is off is refused that first (`crates/modules/fleet/src/hub.rs:3580`). Otherwise a refusal
 is told only when no named device got a relay, and then it is the first one's.
 
 > ⚠️ Chrome ranks its relay candidates by the order of its TURN servers, so among relays that all work, the first in
@@ -2744,8 +2744,8 @@ live viewer to the consent page, and the device hung its session up.
 
 The mapping is `ConsentMode::asks`
 ([`models.rs:1493`](../crates/remote_control/src/models.rs#L1493)), sent at
-[`hub.rs:2076`](../crates/modules/fleet/src/hub.rs#L2076). A duplicate request
-coalesced onto a live session gets the same value (`:1796`).
+[`hub.rs:2087`](../crates/modules/fleet/src/hub.rs#L2087). A duplicate request
+coalesced onto a live session gets the same value (`:1807`).
 
 The viewer words two things for the person actually asked:
 - its wait (`awaitingConsentLabel`,
@@ -3552,7 +3552,7 @@ machine is a new identity until a person says otherwise.
 **The other direction: the device judges the browser (P1c).** The daemon judges the browser behind every in-org
 offer as it notes it ([`judge_offer`, `peer_auth.rs:231`](../agents/roomlerd/src/peer_auth.rs#L231)),
 and the hub records the verdict on the session's `session_started` audit row
-([`forward_answer`, `hub.rs:2496`](../crates/modules/fleet/src/hub.rs#L2496)). Nothing is refused
+([`forward_answer`, `hub.rs:2507`](../crates/modules/fleet/src/hub.rs#L2507)). Nothing is refused
 before FR-100 P3; the record is what the fleet's audit week is counted over.
 
 | Verdict | Means | The device |
@@ -3885,7 +3885,7 @@ sequenceDiagram
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:110`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:710`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:351`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:942`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:481`, #2326) |
-| Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4587`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
+| Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4598`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
 
 ⚠️ **The consent prompt has already been answered** by the time the offer
 arrives, so the person at the device approved a session that then cannot start.
@@ -4960,7 +4960,7 @@ default.
 
 A device that advertises `rc-resume` and is in the scope is told `rc:agent.resume_window {secs}` right after its hello,
 and the viewer of every session created on it is told `resume_secs` on `rc:session.created` (`create_session_full`,
-`crates/modules/fleet/src/hub.rs:2027`). An external session (FR-52) is never told it: D3.
+`crates/modules/fleet/src/hub.rs:2038`). An external session (FR-52) is never told it: D3.
 
 ```mermaid
 sequenceDiagram
@@ -5113,7 +5113,7 @@ slot first (claimed before the hub's own dispatch), the pod that holds the devic
 claims one (`before_request`, `crates/modules/remote/src/row_end.rs:203`; `Hub::end_replaced`,
 `crates/modules/fleet/src/hub/hold.rs:284`; `Hub::reap_held_for`, `:323`). The hub's own orphan reap spares a held
 session against another person's request and never takes a session with no controller for an orphan
-(`crates/modules/fleet/src/hub.rs:1683`). When no pod holds the session the redial names, because its device's
+(`crates/modules/fleet/src/hub.rs:1694`). When no pod holds the session the redial names, because its device's
 socket went (the row is detached), it ends at its row instead, as `agent_disconnect`, inferred, and its slot is given
 back there, still before the gate (D5 = A; the end table below). A redial sends `replaces` again on every attempt until it is
 answered, so it may name a session that has already ended: that ends nothing and refuses nothing, and the request
@@ -5166,7 +5166,7 @@ design accepts:
 
 **The `external` marker** (review 1, L6). An external session (FR-52) requested while its device's connection holds a
 window is marked `external: true` on its row: the hub writes the marker into the `session_requested` audit event
-(`crates/modules/fleet/src/hub.rs:2113`), which projects it onto the row (`crates/remote_control/src/audit.rs:188`),
+(`crates/modules/fleet/src/hub.rs:2124`), which projects it onto the row (`crates/remote_control/src/audit.rs:188`),
 and a claim of a marked row is refused `agent_disconnect` and ended at the number read, whatever the gate says
 (`crates/modules/remote/src/resume.rs:241`; D3). It is written only under a window, so with none the event and the
 row are what they always were. One gap remains: an external session requested before its device was announced a
@@ -5279,7 +5279,7 @@ detached session's redial's or the one-time close's) was written because the ses
 already ended (a half-open socket kept it), whose reason and `now` would rewrite the row's end and leave the mark on
 it. An asked end still replaces an earlier SEEN end, as every end did before FR-138, and at window 0 that is
 load-bearing: FR-27 audits a device with no prompt surface as `consent_timeout` and then ends it `no_prompt_surface`
-on the same row (`crates/modules/fleet/src/hub.rs:2299`), and the growth digest's `by_end_reason` reads the second
+on the same row (`crates/modules/fleet/src/hub.rs:2310`), and the growth digest's `by_end_reason` reads the second
 (`crates/api/src/growth/digest.rs:2362`). A filter of `ended_at: null` (first end wins) would turn every such row into
 `consent_timeout`.
 
@@ -5803,7 +5803,7 @@ flowchart LR
 | `session_created` | **one server hop**: the request reached a live hub | `rc:session.created` | `remote_audit` `consent_prompted` | ✅ |
 | `ready` | a human, on a Prompt-mode device | `rc:ready` | `remote_audit` `consent_granted` | ✅ |
 | `offer_sent` | the browser building its offer | after `setLocalDescription` | — | ✅ |
-| `answer` | the agent receiving the offer and answering | `rc:sdp.answer` | `remote_audit` `session_started` (`crates/modules/fleet/src/hub.rs:2553`, `crates/remote_control/src/audit.rs:204`) | ✅ |
+| `answer` | the agent receiving the offer and answering | `rc:sdp.answer` | `remote_audit` `session_started` (`crates/modules/fleet/src/hub.rs:2564`, `crates/remote_control/src/audit.rs:204`) | ✅ |
 | `pc_connected` | ICE + DTLS | `RTCPeerConnection` `connected` | — | ✅ |
 | `dc_open` | SCTP — the `video-bytes` DataChannel | DC `open` | — | ✅ |
 | `first_frame` | the decode worker's first output frame | worker `first-frame` | — | ✅ |
@@ -5859,7 +5859,7 @@ sequenceDiagram
     participant R as Redis presence
     participant O as Owner pod
     V->>P: rc:session.request
-    P->>P: Hub::create_session (hub.rs:1535)
+    P->>P: Hub::create_session (hub.rs:1546)
     alt the agent is registered on this pod
         P-->>V: rc:session.created
     else AgentOffline here
@@ -5917,7 +5917,7 @@ the pod-log (~1 day) and `agent_logs` (7 d) windows, a stall in `requesting`
 leaves **no server row at all** (the request never reached a hub), and
 `agent_logs` held **zero** browser-source rows — `POST /api/log/browser`
 (`crates/modules/fleet/src/agent_log.rs:207`, mounted at
-`crates/modules/fleet/src/lib.rs:549`) had existed since rc.58 without a caller.
+`crates/modules/fleet/src/lib.rs:561`) had existed since rc.58 without a caller.
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
@@ -5991,7 +5991,7 @@ route by `browser_connect_timing_record_parses` (`agent_log.rs:494`), because a
 
 **Mining it** (`roomler2`, through `scripts/prod-mongo-read.sh`, whose client runs outside
 `mongodb-0` and never prints a credential: [production-mongo-reads.md](production-mongo-reads.md)). Retention is the collection's **7 d
-TTL** (`crates/modules/fleet/src/lib.rs:896`, `crates/db/src/models/agent_log.rs:115`) — the same window
+TTL** (`crates/modules/fleet/src/lib.rs:908`, `crates/db/src/models/agent_log.rs:115`) — the same window
 as the agent's own logs, and the pod log is shorter still — so a stall must be
 mined within the week; `remote_audit` keeps its three marks for 90 d.
 

@@ -1,0 +1,83 @@
+name: Test binds
+
+# #4500 — tests bind loopback only. On Windows the first UDP bind or TCP
+# listen a program makes on any other address asks the person at the machine
+# whether to allow it, and cargo names each test binary after a hash, so every
+# new target dir is a new program and a new prompt (docs/testing.md, "How
+# tests bind"). The roomlerd lib suite runs under the bind audit in ci.yml's
+# windows-agent-sessions job, which already builds and runs it on Windows.
+# This workflow holds what ci.yml has no lane for:
+#   * the vendored webrtc crate's own tests on Windows, under the bind audit.
+#     On Linux they run in full in ci.yml's vendored-tests matrix (its webrtc
+#     entry, #4503), the three that bind off loopback on purpose (a STUN
+#     server on the internet, mDNS) too, since they are ignored on Windows
+#     only. That matrix holds one entry per fork, so this run is a job here;
+#   * the audit report's own cases, on made-up events.
+#
+# Its own workflow, path-filtered to the webrtc forks and the audit's scripts:
+# a job in ci.yml runs on every PR that is not docs-only.
+on:
+  pull_request:
+    paths:
+      - 'crates/vendored/webrtc/**'
+      - 'crates/vendored/webrtc-ice/**'
+      - 'crates/vendored/webrtc-sctp/**'
+      - 'crates/vendored/rtp/**'
+      - 'scripts/test-binds-*'
+      - 'scripts/vendored-webrtc-test.sh'
+      - '.github/workflows/test-binds.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'crates/vendored/webrtc/**'
+      - 'crates/vendored/webrtc-ice/**'
+      - 'crates/vendored/webrtc-sctp/**'
+      - 'crates/vendored/rtp/**'
+      - 'scripts/test-binds-*'
+      - 'scripts/vendored-webrtc-test.sh'
+      - '.github/workflows/test-binds.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: test-binds-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  report-cases:
+    name: The bind audit's report on made-up events
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every case of the report (scripts/test-binds-audit-test.ps1)
+        shell: pwsh
+        run: ./scripts/test-binds-audit-test.ps1
+
+  vendored-webrtc-windows:
+    name: Vendored webrtc tests on Windows, every bind on loopback
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: The report's cases, on Windows's pwsh too
+        shell: pwsh
+        run: ./scripts/test-binds-audit-test.ps1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      # Built first, outside the audit: the audit then covers the run alone.
+      - name: Build the fork's tests
+        run: bash scripts/vendored-webrtc-test.sh --no-run
+      # GNU `timeout`, by path (Windows has a timeout.exe that only waits):
+      # upstream's mDNS tests have hung for minutes on Windows (why ci.yml's
+      # vendored-tests matrix skips four in its webrtc-ice entry), and the
+      # report must still run after one.
+      - name: Run them under the bind audit
+        run: bash scripts/test-binds-run.sh 'webrtc-*.exe' /usr/bin/timeout 1200 bash scripts/vendored-webrtc-test.sh

@@ -1011,7 +1011,7 @@ Where it fires:
 
 | End | Trigger | Where |
 |---|---|---|
-| exit | `AgentTunnelPeer::close` — the one method every real teardown reaches: the `rc:tunnel.terminate` arm, the #1754 reap, and the WS-disconnect sweep (`close_all_tunnel_peers`) | [`peer.rs:351`](../agents/roomlerd/src/tunnel/peer.rs), the handle passed to the flow at [`acceptor.rs:186`](../agents/roomlerd/src/tunnel/acceptor.rs) |
+| exit | `AgentTunnelPeer::close` — the one method every real teardown reaches: the `rc:tunnel.terminate` arm, the #1754 reap, and the WS-disconnect sweep (`close_all_tunnel_peers`) | [`peer.rs:348`](../agents/roomlerd/src/tunnel/peer.rs), the handle passed to the flow at [`acceptor.rs:186`](../agents/roomlerd/src/tunnel/acceptor.rs) |
 | client | the DC carrier being dropped (`kill_flow`, the session dying, a re-upgrade drain reaching zero, the standalone CLI's session end) — a `CancelOnDrop` in `Plane::Dc` fires it from `Drop` | [`driver.rs:486`](../crates/tunnel-core/src/driver.rs) · installed at `driver.rs:1269` |
 
 ⚠️ **The exclusion is `close`, not the loop exit.** The cancel is tied to
@@ -1057,7 +1057,7 @@ it ends itself, and no other:
 |---|---|---|
 | a tunnel-client connection the server ends: the connection loop tells the exit at once, and the client is told after it | `true` | `exit_end` (`crates/modules/network/src/tunnel.rs:1655`), from the end-signal arm of `handle_tunnel_client_socket` (`:181`); `signal_end` (`:1669`) sets the flag first and waits for that arm at most 5 s (`END_TOLD_WITHIN`, `:71`) |
 | that client's ack, relayed, and the connection's teardown | `true` | `Originator::exit_terminate` (`crates/modules/network/src/tunnel.rs:524`), which reads `Originator::server_ended` |
-| an agent connection the server ends itself: `Hub::kick_removed_agent` sets the connection's `ServerEnded` (`crates/modules/fleet/src/hub.rs:1320`), which `AgentCtx::server_ended` shares (`crates/core/src/agent_socket.rs:72`); the agent's relays from then on, and its teardown | `true` | `relay_tunnel_client_msg_from_agent` (`crates/modules/network/src/tunnel.rs:1772`), `teardown_agent_originated_sessions` (`:2000`) |
+| an agent connection the server ends itself: `Hub::kick_removed_agent` sets the connection's `ServerEnded` (`crates/modules/fleet/src/hub.rs:1331`), which `AgentCtx::server_ended` shares (`crates/core/src/agent_socket.rs:72`); the agent's relays from then on, and its teardown | `true` | `relay_tunnel_client_msg_from_agent` (`crates/modules/network/src/tunnel.rs:1772`), `teardown_agent_originated_sessions` (`:2000`) |
 | every other relay and teardown: a socket that drops, a roll, a replacement | `false` | the same sites |
 | a push to a client (`terminate_agent_sessions_now`, the relays in `agent_arms.rs`) | `false` | `crates/modules/network/src/tunnel.rs:2098`, `crates/modules/network/src/agent_arms.rs` |
 

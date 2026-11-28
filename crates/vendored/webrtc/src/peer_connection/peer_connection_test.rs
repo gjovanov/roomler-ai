@@ -384,6 +384,7 @@ async fn test_get_stats() -> Result<()> {
 }
 
 #[tokio::test]
+#[cfg_attr(windows, ignore = "binds 0.0.0.0 for a STUN server on the internet: a firewall prompt on Windows (Roomler #4500)")]
 async fn test_peer_connection_close_is_send() -> Result<()> {
     let handle = tokio::spawn(async move { peer().await });
     tokio::join!(handle).0.unwrap()

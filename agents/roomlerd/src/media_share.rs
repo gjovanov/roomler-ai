@@ -1382,12 +1382,12 @@ mod tests {
         Arc<RTCDataChannel>,
         tokio::sync::mpsc::UnboundedReceiver<String>,
     ) {
-        use webrtc::api::APIBuilder;
+        // #4500 — the viewer and the device gather on loopback only
+        // (crate::test_net).
         use webrtc::peer_connection::configuration::RTCConfiguration;
         let pc = || async {
             Arc::new(
-                APIBuilder::new()
-                    .build()
+                crate::test_net::api()
                     .new_peer_connection(RTCConfiguration::default())
                     .await
                     .expect("a peer connection"),
