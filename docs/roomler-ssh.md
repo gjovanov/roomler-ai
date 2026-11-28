@@ -1309,7 +1309,7 @@ Now the window is the TTL from **arrival**, on the device's monotonic clock:
 | side | where | what it does |
 |---|---|---|
 | the device | `record_grant` ([`ssh.rs:3293`](../agents/roomlerd/src/ssh.rs#L3293)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3325-3334`), so a skewed clock stays visible |
-| the server | `decide` ([`agent_ssh.rs:445`](../crates/modules/network/src/routes/agent_ssh.rs#L445)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2764`](../crates/remote_control/src/models.rs#L2764)), on `rc:ssh.grant` (`agent_ssh.rs:465`) and in the FR-105 `ssh_pending` row the service claims (`:491`). The caller's copy stays mint + 60 s |
+| the server | `decide` ([`agent_ssh.rs:445`](../crates/modules/network/src/routes/agent_ssh.rs#L445)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2786`](../crates/remote_control/src/models.rs#L2786)), on `rc:ssh.grant` (`agent_ssh.rs:465`) and in the FR-105 `ssh_pending` row the service claims (`:491`). The caller's copy stays mint + 60 s |
 
 The slack is for agents released before #3511, which still take
 `min(expires_at_ms − now, 60 s)`. From the server release that carries it they
@@ -1327,7 +1327,7 @@ server's. These bounds hold whatever the device's clock says:
 
 1. **FR-83.** The caller is told where to dial only once the target's
    `rc:ssh.grant_ack` is back, within `GRANT_ACK_TIMEOUT_SECS` (10 s,
-   `models.rs:2776`). Later than that the answer is `grant_unconfirmed`
+   `models.rs:2798`). Later than that the answer is `grant_unconfirmed`
    (`agent_ssh.rs:599`), never an address.
 2. **FR-105.** The SYSTEM service can claim a via-service grant only before
    `claim_by`, mint + 10 s on the server's clock (`agent_ssh.rs:496`; the claim
@@ -1338,7 +1338,7 @@ server's. These bounds hold whatever the device's clock says:
 4. **A queued grant dies with its connection.** It waits on the connection's
    own queue (`crates/modules/fleet/src/hub.rs:3343`), so a reconnect drops it,
    and a connection that hears nothing for 80 s (`WS_RX_DEADLINE`,
-   `agents/roomlerd/src/signaling.rs:66`, checked at `:2427`) reconnects. On a
+   `agents/roomlerd/src/signaling.rs:66`, checked at `:2434`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
    (`agents/roomlerd/src/ssh.rs:3227`), and no window longer than 60 s from
@@ -1352,7 +1352,7 @@ One case is left: a caller of the HTTP route who keeps a reusable key after a
 could then be redeemed up to about 165 s after mint, instead of 60 s. That
 matters only if the caller's authorization was revoked in between, and a
 redeemed session already outlives a revocation for its `session_secs` (12 h at
-most, `MAX_SESSION_SECS`, `models.rs:2780`). #3511 records that decision.
+most, `MAX_SESSION_SECS`, `models.rs:2802`). #3511 records that decision.
 
 | | server before #3511 | server with #3511 |
 |---|---|---|
@@ -1422,7 +1422,7 @@ as `grant_refused`. The wire gets no new value, so every server release reads
 it. It is not `other`, a reason this build would not know, and not `expired`,
 which #3511 retired. The worker logs it as it logs any refusal of
 `record_grant`, `rc:ssh.grant rejected` with the grant id
-([`signaling.rs:6238`](../agents/roomlerd/src/signaling.rs#L6238)), and the
+([`signaling.rs:6249`](../agents/roomlerd/src/signaling.rs#L6249)), and the
 error names the case: "a grant id is honoured at most once, and its first copy
 was redeemed" (or is still pending, expired unredeemed, or was dropped from a
 full table).
@@ -1432,8 +1432,8 @@ differently so that it does:
 
 | Path | A copy is | Why the first copy's answer stands |
 |---|---|---|
-| the worker's own table | refused, `invalid` | One loop records and acknowledges each grant in order (`handle_server_msg`, [`signaling.rs:3360`](../agents/roomlerd/src/signaling.rs#L3360)), and its answers leave on one queue ([`signaling.rs:2794`](../agents/roomlerd/src/signaling.rs#L2794)). The server reads one socket's frames in order ([`socket.rs:607-629`](../crates/modules/fleet/src/socket.rs#L607)), and the first answer removes the caller's wait ([`ssh_grant_acks.rs:108-120`](../crates/modules/network/src/ssh_grant_acks.rs#L108)). The copy's refusal finds no wait, and the server logs `ssh: grant ack with no waiter` at debug ([`agent_socket.rs:141-155`](../crates/modules/network/src/agent_socket.rs#L141)) |
-| the SYSTEM service (FR-105) | dropped by the worker: no second ring and no acknowledgement, only a warning, `rc:ssh.grant already handed to the SYSTEM service (or refused); this copy is dropped, no ack` ([`signaling.rs:6138-6147`](../agents/roomlerd/src/signaling.rs#L6138)) | Here a refusal could undo the first copy. The service's claim is single use ([`ssh_pending.rs:44-68`](../crates/services/src/dao/ssh_pending.rs#L44)), so a copy's ring ends in a 404 ([`agent_ssh.rs:1263-1290`](../crates/modules/network/src/routes/agent_ssh.rs#L1263)), which the worker would answer as a refusal. The first copy's claim can land on a server instance other than the one holding the caller's wait. That wait reads the claim from the shared row every 400 ms, and until then it still takes a worker's refusal ([`ssh_grant_acks.rs:115`](../crates/modules/network/src/ssh_grant_acks.rs#L115)): its refusal arm would deny the caller ([`agent_ssh.rs:545-566`](../crates/modules/network/src/routes/agent_ssh.rs#L545)) while the service holds the grant. So the worker remembers each via-service id at first sight, before any outcome (`first_sight_via_service`, [`ssh.rs:3559`](../agents/roomlerd/src/ssh.rs#L3559)), in a memory of its own with the same horizon and bound, never the table's. A grant the worker refused is as dead as one the service took, and its first refusal already answered |
+| the worker's own table | refused, `invalid` | One loop records and acknowledges each grant in order (`handle_server_msg`, [`signaling.rs:3371`](../agents/roomlerd/src/signaling.rs#L3371)), and its answers leave on one queue ([`signaling.rs:2805`](../agents/roomlerd/src/signaling.rs#L2805)). The server reads one socket's frames in order ([`socket.rs:607-629`](../crates/modules/fleet/src/socket.rs#L607)), and the first answer removes the caller's wait ([`ssh_grant_acks.rs:108-120`](../crates/modules/network/src/ssh_grant_acks.rs#L108)). The copy's refusal finds no wait, and the server logs `ssh: grant ack with no waiter` at debug ([`agent_socket.rs:141-155`](../crates/modules/network/src/agent_socket.rs#L141)) |
+| the SYSTEM service (FR-105) | dropped by the worker: no second ring and no acknowledgement, only a warning, `rc:ssh.grant already handed to the SYSTEM service (or refused); this copy is dropped, no ack` ([`signaling.rs:6149-6158`](../agents/roomlerd/src/signaling.rs#L6149)) | Here a refusal could undo the first copy. The service's claim is single use ([`ssh_pending.rs:44-68`](../crates/services/src/dao/ssh_pending.rs#L44)), so a copy's ring ends in a 404 ([`agent_ssh.rs:1263-1290`](../crates/modules/network/src/routes/agent_ssh.rs#L1263)), which the worker would answer as a refusal. The first copy's claim can land on a server instance other than the one holding the caller's wait. That wait reads the claim from the shared row every 400 ms, and until then it still takes a worker's refusal ([`ssh_grant_acks.rs:115`](../crates/modules/network/src/ssh_grant_acks.rs#L115)): its refusal arm would deny the caller ([`agent_ssh.rs:545-566`](../crates/modules/network/src/routes/agent_ssh.rs#L545)) while the service holds the grant. So the worker remembers each via-service id at first sight, before any outcome (`first_sight_via_service`, [`ssh.rs:3559`](../agents/roomlerd/src/ssh.rs#L3559)), in a memory of its own with the same horizon and bound, never the table's. A grant the worker refused is as dead as one the service took, and its first refusal already answered |
 
 Left as they are:
 
@@ -1519,7 +1519,7 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4370`](../agents/roomlerd/src/signaling.rs#L4370), [`:5932`](../agents/roomlerd/src/signaling.rs#L5932)), as the recording question does
+first the same way ([`signaling.rs:4381`](../agents/roomlerd/src/signaling.rs#L4381), [`:5943`](../agents/roomlerd/src/signaling.rs#L5943)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
@@ -2024,7 +2024,7 @@ stay, each for a reason that outlives it:
 |---|---|---|---|
 | `ssh_ticket` on `ClientMsg::SshRequest`, parse-only, sent by no build | a 0.4.199 agent still sends it, and `ClientMsg` ignores a field it does not know: dropped from the wire, a ticketed request would parse as the device owner's own | `crates/remote_control/src/signaling.rs:858` | no agent at 0.4.199 or older is left (FR-137 D8) |
 | a request that carries one is refused `TicketRefused` and audited, never served as the owner's | the same | bound to a refused caller at `crates/modules/network/src/agent_arms.rs:193`, refused at `crates/modules/network/src/routes/agent_ssh.rs:348`, and recorded by `dispatch` like any refusal | with the field |
-| `SshDenyReason::{TicketRefused, SessionNotAllowed, TargetTooOld}` (`ticket_refused`, `session_not_allowed`, `target_too_old`) | `ssh_audit` keeps its rows for 90 days and the enum is strict, with no `#[serde(other)]`: one unknown word fails a whole listing. No build writes the last two now | `crates/remote_control/src/models.rs:5362-5372` | 90 days after P1's roll of 2026-11-04, so 2027-02-02 at the earliest (FR-137 D7); `ticket_refused` goes with the field |
+| `SshDenyReason::{TicketRefused, SessionNotAllowed, TargetTooOld}` (`ticket_refused`, `session_not_allowed`, `target_too_old`) | `ssh_audit` keeps its rows for 90 days and the enum is strict, with no `#[serde(other)]`: one unknown word fails a whole listing. No build writes the last two now | `crates/remote_control/src/models.rs:5384-5394` | 90 days after P1's roll of 2026-11-04, so 2027-02-02 at the earliest (FR-137 D7); `ticket_refused` goes with the field |
 
 A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `claim_service_grant` reads no query, so the word is ignored
@@ -2034,7 +2034,7 @@ A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `a_ticketed_ssh_request_is_refused_and_audited`
 (`crates/tests/src/parked_wire_tests.rs:43`), `ssh_audit_rows_written_before_p2_list`
 (`:118`) and `ssh_audit_rows_written_before_p2_still_load`
-(`crates/remote_control/src/models.rs:9324`) lock it. The other surfaces FR-90
+(`crates/remote_control/src/models.rs:9346`) lock it. The other surfaces FR-90
 left reserved are listed in
 [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 

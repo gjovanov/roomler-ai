@@ -4354,6 +4354,9 @@ mod tests {
             attached,
             permissions: words.map(|w| w.iter().map(|s| s.to_string()).collect()),
             one_row,
+            // FR-157 P1 — the verify reads the three above and never these.
+            state: None,
+            reason: None,
         }
     }
 
