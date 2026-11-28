@@ -215,12 +215,13 @@ mod tests {
         let built = wire.clone();
         let factory: TunFactory = Box::new(move |_, _, _| Ok(built.clone()));
         let factory = crate::ssh::maybe_intercept(factory, cfg, services(dir));
-        let device = factory(
-            Ipv4Addr::new(100, 64, 0, 7),
-            Ipv4Addr::new(255, 192, 0, 0),
-            1280,
-        )
-        .expect("the overlay's device");
+        // The overlay's address is loopback here. An installed interception
+        // first probes `<overlay ip>:<ssh_port>` for an OS listener with a
+        // bind and a listen (`warn_if_os_listener`), and a made-up overlay
+        // address can be the one the host running the tests holds, where that
+        // listen raises a firewall prompt on Windows (#4500).
+        let device = factory(Ipv4Addr::LOCALHOST, Ipv4Addr::new(255, 192, 0, 0), 1280)
+            .expect("the overlay's device");
         !Arc::ptr_eq(&device, &wire)
     }
 

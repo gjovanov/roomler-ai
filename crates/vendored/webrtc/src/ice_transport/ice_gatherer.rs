@@ -104,7 +104,16 @@ impl RTCIceGatherer {
             _ => CandidateType::Unspecified,
         };
 
-        let mdns_mode = self.setting_engine.candidates.multicast_dns_mode;
+        // Roomler patch (#4500): this crate's own tests gather on loopback;
+        // see `confined_for_tests`. Any other build takes the engine's values.
+        #[cfg(test)]
+        let (ip_filter, include_loopback, mdns_mode) = confined_for_tests(&self.setting_engine);
+        #[cfg(not(test))]
+        let (ip_filter, include_loopback, mdns_mode) = (
+            self.setting_engine.candidates.ip_filter.clone(),
+            self.setting_engine.candidates.include_loopback_candidate,
+            self.setting_engine.candidates.multicast_dns_mode,
+        );
 
         let mut config = ice::agent::agent_config::AgentConfig {
             udp_network: self.setting_engine.udp_network.clone(),
@@ -119,12 +128,12 @@ impl RTCIceGatherer {
             prflx_acceptance_min_wait: self.setting_engine.timeout.ice_prflx_acceptance_min_wait,
             relay_acceptance_min_wait: self.setting_engine.timeout.ice_relay_acceptance_min_wait,
             interface_filter: self.setting_engine.candidates.interface_filter.clone(),
-            ip_filter: self.setting_engine.candidates.ip_filter.clone(),
+            ip_filter,
             // Roomler patch (FR-148 P4).
             carrier_rank: self.setting_engine.candidates.carrier_rank.clone(),
             nat_1to1_ips: self.setting_engine.candidates.nat_1to1_ips.clone(),
             nat_1to1_ip_candidate_type: nat_1to1_cand_type,
-            include_loopback: self.setting_engine.candidates.include_loopback_candidate,
+            include_loopback,
             net: self.setting_engine.vnet.clone(),
             multicast_dns_mode: mdns_mode,
             multicast_dns_host_name: self
@@ -319,6 +328,46 @@ impl RTCIceGatherer {
     }
 }
 
+/// Roomler patch (#4500): what a gatherer gathers on in this crate's own
+/// tests. On Windows, the first UDP bind a program makes on an address other
+/// than loopback asks the person at the machine whether to allow it, and cargo
+/// names each test binary after a hash, so every new target dir is a new
+/// prompt. So the mDNS socket that the default `QueryOnly` mode opens on the
+/// multicast port stays closed, and unless a test chose its own filter or
+/// runs on a vnet (whose addresses are virtual), host candidates come from
+/// loopback alone. A test that asks for mDNS candidates (`QueryAndGather`)
+/// keeps the network it asked for and is kept off Windows instead, like the
+/// tests that bind a socket for a STUN server on the internet. `cfg(test)` is
+/// this crate's own test build: no dependent compiles this.
+#[cfg(test)]
+fn confined_for_tests(
+    setting_engine: &SettingEngine,
+) -> (
+    Arc<Option<ice::agent::agent_config::IpFilterFn>>,
+    bool,
+    ice::mdns::MulticastDnsMode,
+) {
+    use ice::mdns::MulticastDnsMode;
+    let c = &setting_engine.candidates;
+    if c.multicast_dns_mode == MulticastDnsMode::QueryAndGather {
+        return (
+            c.ip_filter.clone(),
+            c.include_loopback_candidate,
+            c.multicast_dns_mode,
+        );
+    }
+    let chosen = c.ip_filter.is_some() || c.interface_filter.is_some();
+    if chosen || setting_engine.vnet.is_some() {
+        return (
+            c.ip_filter.clone(),
+            c.include_loopback_candidate,
+            MulticastDnsMode::Disabled,
+        );
+    }
+    let loopback: ice::agent::agent_config::IpFilterFn = Box::new(|ip| ip.is_loopback());
+    (Arc::new(Some(loopback)), true, MulticastDnsMode::Disabled)
+}
+
 #[cfg(test)]
 mod test {
     use tokio::sync::mpsc;
@@ -329,6 +378,7 @@ mod test {
     use crate::ice_transport::ice_server::RTCIceServer;
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "binds 0.0.0.0 for a STUN server on the internet: a firewall prompt on Windows (Roomler #4500)")]
     async fn test_new_ice_gatherer_success() -> Result<()> {
         let opts = RTCIceGatherOptions {
             ice_servers: vec![RTCIceServer {
@@ -379,6 +429,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "binds the mDNS multicast port: a firewall prompt on Windows (Roomler #4500)")]
     async fn test_ice_gather_mdns_candidate_gathering() -> Result<()> {
         let mut s = SettingEngine::default();
         s.set_ice_multicast_dns_mode(ice::mdns::MulticastDnsMode::QueryAndGather);

@@ -67,6 +67,10 @@ async fn settle_to(baseline: usize) -> usize {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "its subject is mDNS, whose socket on port 5353 raises a firewall prompt on Windows (#4500)"
+)]
 fn an_unanswered_mdns_resolution_ends_with_the_agent() {
     runtime().block_on(async {
         let baseline = alive();
@@ -115,6 +119,10 @@ fn an_unanswered_mdns_resolution_ends_with_the_agent() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "webrtc-ice binds the socket it asks a STUN server from on 0.0.0.0, which raises a firewall prompt on Windows (#4500)"
+)]
 fn a_candidate_gathered_after_close_does_not_outlive_the_agent() {
     runtime().block_on(async {
         // A STUN server that answers only when told to: after the close.
