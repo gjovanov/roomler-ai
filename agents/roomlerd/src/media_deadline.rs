@@ -2463,8 +2463,8 @@ mod tests {
     /// re-check, is `unknown`.
     #[tokio::test]
     async fn with_no_pair_selected_the_class_is_unknown() {
-        let pc = webrtc::api::APIBuilder::new()
-            .build()
+        // #4500 — a peer on loopback only.
+        let pc = crate::test_net::api()
             .new_peer_connection(Default::default())
             .await
             .expect("a peer connection");
@@ -2717,8 +2717,8 @@ mod tests {
     /// one: the class is `unknown` and the end `none`, whatever the report.
     #[tokio::test]
     async fn with_no_pair_selected_the_report_waits_for_one() {
-        let pc = webrtc::api::APIBuilder::new()
-            .build()
+        // #4500 — a peer on loopback only.
+        let pc = crate::test_net::api()
             .new_peer_connection(Default::default())
             .await
             .expect("a peer connection");
@@ -2801,8 +2801,8 @@ mod tests {
     /// every write goes as under `off`: no drain, no mark, no ask.
     #[tokio::test]
     async fn off_keeps_nothing_and_shadow_shows_the_switch_the_report_causes() {
-        let pc = webrtc::api::APIBuilder::new()
-            .build()
+        // #4500 — a peer on loopback only.
+        let pc = crate::test_net::api()
             .new_peer_connection(Default::default())
             .await
             .expect("a peer connection");
@@ -3917,21 +3917,20 @@ mod tests {
     impl Ends {
         async fn open(daemon_server: bool) -> Self {
             use webrtc::api::APIBuilder;
-            use webrtc::api::setting_engine::SettingEngine;
             use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
             use webrtc::dtls_transport::dtls_role::DTLSRole;
 
             let session_id = ObjectId::new();
             let session = Session::register(session_id, Arc::new(AtomicBool::new(false)));
-            let mut daemon_setting = SettingEngine::default();
+            // Both ends gather on loopback, with no mDNS socket (#4500).
+            let mut daemon_setting = crate::test_net::setting_engine();
             if daemon_server {
                 daemon_setting
                     .set_answering_dtls_role(DTLSRole::Server)
                     .expect("a DTLS role");
             }
             let viewer_pc = Arc::new(
-                APIBuilder::new()
-                    .build()
+                crate::test_net::api()
                     .new_peer_connection(Default::default())
                     .await
                     .expect("the viewer's peer"),
@@ -4387,8 +4386,8 @@ mod tests {
         assert_eq!(kf_rate(Some(0), Some(1_600_000)), Some(1_600_000));
         assert_eq!(kf_rate(None, Some(0)), None);
         assert_eq!(kf_rate(None, None), None);
-        let pc = webrtc::api::APIBuilder::new()
-            .build()
+        // #4500 — a peer on loopback only.
+        let pc = crate::test_net::api()
             .new_peer_connection(Default::default())
             .await
             .expect("a peer connection");
@@ -5007,9 +5006,9 @@ mod tests {
     /// under every value; and a send task can own it.
     #[tokio::test]
     async fn the_lane_holds_video_bytes_stash_through_the_send() {
+        // #4500 — a peer on loopback only.
         let pc = Arc::new(
-            webrtc::api::APIBuilder::new()
-                .build()
+            crate::test_net::api()
                 .new_peer_connection(Default::default())
                 .await
                 .expect("a peer connection"),

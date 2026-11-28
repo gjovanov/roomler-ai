@@ -2144,8 +2144,8 @@ jobs:
       - name: Agent unit tests on Windows (the whole --lib suite)
         env:
           ROOMLERD_TEST_REQUIRE_ELEVATED: "1"
-        run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast
+        # #4500 — under the bind audit: every bind on loopback, or the step fails.
+        run: bash scripts/test-binds-run.sh 'roomlerd-*.exe' cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast
 
       # #3813 — the real clipboard on Windows, where a developer's own native
       # `cargo test` once replaced what they had copied. Each test that writes

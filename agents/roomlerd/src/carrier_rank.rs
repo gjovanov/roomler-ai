@@ -1030,7 +1030,6 @@ mod tests {
     /// the rank `mode` hands ICE with the mesh link relayed (`mesh_last`) or
     /// direct. What the agent's opening reads of the pair it selected.
     async fn opening_on_loopback_turn(mode: RankMode, mesh_last: bool) -> Opening {
-        use webrtc::api::setting_engine::SettingEngine;
         use webrtc::ice_transport::ice_server::RTCIceServer;
         use webrtc::peer_connection::configuration::RTCConfiguration;
         use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -1066,13 +1065,12 @@ mod tests {
             ..Default::default()
         };
         let viewer = Arc::new(
-            webrtc::api::APIBuilder::new()
-                .build()
+            crate::test_net::api()
                 .new_peer_connection(config())
                 .await
                 .unwrap(),
         );
-        let mut setting = SettingEngine::default();
+        let mut setting = crate::test_net::setting_engine();
         crate::rc_overlay::RcOverlay {
             allow: true,
             carrier_rank: mode,
@@ -1144,6 +1142,10 @@ mod tests {
     /// TURN pair was selected. Under `prio` the agent reads no route, and the
     /// opening is the one built before.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(
+        windows,
+        ignore = "its TURN client socket, which webrtc-ice binds on 0.0.0.0, raises a firewall prompt on Windows (#4500)"
+    )]
     async fn the_opening_reads_the_agents_route_at_once_under_route_only() {
         let prio = opening_on_loopback_turn(RankMode::Prio, true).await;
         assert_eq!(
