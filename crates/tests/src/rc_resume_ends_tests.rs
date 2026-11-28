@@ -112,6 +112,7 @@ pub(crate) fn claiming_connection(
             registered_at: Some(reg.registered_at),
             reaped: reg.reaped.clone(),
         },
+        server_ended: reg.cancel.server_ended(),
     };
     (ctx, reg.rx)
 }

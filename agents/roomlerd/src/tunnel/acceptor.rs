@@ -257,7 +257,7 @@ pub async fn handle_forward_request_quic(
     // Grab the client-opened flow stream from the rendezvous. Times
     // out if the client never opens it (died right after Accept, QUIC
     // path stalled) so the dialed dst socket doesn't leak.
-    let (send, recv) = match quic_peer.take_flow(flow_id, FLOW_RENDEZVOUS_WAIT).await {
+    let (send, recv, hold) = match quic_peer.take_flow(flow_id, FLOW_RENDEZVOUS_WAIT).await {
         Ok(streams) => streams,
         Err(e) => {
             warn!(%session_id, %flow_id, %e, "QUIC flow stream never opened — closing dst");
@@ -278,8 +278,16 @@ pub async fn handle_forward_request_quic(
 
     let stats = Arc::new(tunnel_core::forward::FlowStats::default());
     let stats_for_audit = Arc::clone(&stats);
-    let close_reason =
-        tunnel_core::forward::run_flow_quic(stream, send, recv, flow_id, stats).await;
+    // Under the session's stop: a session that ends stops this flow too.
+    let close_reason = tunnel_core::forward::run_flow_quic_until(
+        stream,
+        send,
+        recv,
+        flow_id,
+        stats,
+        hold.stopped(),
+    )
+    .await;
     info!(%session_id, %flow_id, ?close_reason, "agent QUIC flow ended");
     let (tcp_read, _dc_send, _dc_recv, tcp_write, _depth) = stats_for_audit.snapshot();
     let _ = outbound
@@ -481,7 +489,7 @@ pub async fn handle_udp_forward_request_quic(
         return;
     }
 
-    let (send, recv) = match quic_peer.take_flow(flow_id, FLOW_RENDEZVOUS_WAIT).await {
+    let (send, recv, hold) = match quic_peer.take_flow(flow_id, FLOW_RENDEZVOUS_WAIT).await {
         Ok(streams) => streams,
         Err(e) => {
             warn!(%session_id, %flow_id, %e, "QUIC UDP flow stream never opened — closing socket");
@@ -497,15 +505,19 @@ pub async fn handle_udp_forward_request_quic(
     };
 
     let stats = Arc::new(tunnel_core::forward::FlowStats::default());
-    let close_reason = tunnel_core::forward::run_flow_udp_quic(
-        udp,
-        send,
-        recv,
-        flow_id,
-        tunnel_core::forward::UDP_FLOW_IDLE_TIMEOUT,
-        stats,
-    )
-    .await;
+    // Under the session's stop: the pump runs on this task, so dropping it
+    // drops the target socket and the stream halves.
+    let close_reason = tokio::select! {
+        reason = tunnel_core::forward::run_flow_udp_quic(
+            udp,
+            send,
+            recv,
+            flow_id,
+            tunnel_core::forward::UDP_FLOW_IDLE_TIMEOUT,
+            stats,
+        ) => reason,
+        () = hold.stopped() => CloseReason::ServerTerminated,
+    };
     info!(%session_id, %flow_id, ?close_reason, "agent QUIC UDP flow ended");
     let _ = outbound
         .send(ClientMsg::UdpClosed {

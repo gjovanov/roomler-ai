@@ -222,9 +222,18 @@ impl CancelReason {
 pub struct AgentCancel {
     notify: Notify,
     reason: AtomicU8,
+    /// Set by [`Hub::kick_removed_agent`]; the connection's
+    /// [`roomler_core::AgentCtx::server_ended`].
+    server_ended: roomler_core::ServerEnded,
 }
 
 impl AgentCancel {
+    /// Whether the server ended this connection itself, shared with every
+    /// arm of its socket.
+    pub fn server_ended(&self) -> roomler_core::ServerEnded {
+        self.server_ended.clone()
+    }
+
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
@@ -1317,6 +1326,9 @@ impl Hub {
             return KickOutcome::NotRegistered;
         };
         info!("agent {} offline (removed)", agent_id);
+        // Before anything else reaches the connection: what its arms send
+        // from here on, and its teardown, carry an end the server decided.
+        entry.cancel.server_ended.set();
         self.end_agent_sessions(agent_id);
         if !goodbye {
             return KickOutcome::NotTold;
@@ -7728,6 +7740,80 @@ mod tests {
             hub.kick_removed_agent(agent_id, true),
             KickOutcome::NotRegistered,
             "a second kick, or another pod's, finds nothing"
+        );
+    }
+
+    // ─── #4542: the connection a removal's kick ends reads server-ended ──
+
+    #[tokio::test]
+    async fn a_removal_kick_marks_the_connection_it_ends_as_ended_by_the_server() {
+        for goodbye in [true, false] {
+            let hub = test_hub().await;
+            let agent_id = ObjectId::new();
+            let (_tx, cancel, _rx) = hub.register_agent(
+                agent_id,
+                ObjectId::new(),
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                false,
+            );
+            let ended = cancel.server_ended();
+            assert!(!ended.get(), "a registered connection starts unset");
+
+            hub.kick_removed_agent(agent_id, goodbye);
+
+            assert!(
+                ended.get(),
+                "the kick (goodbye: {goodbye}) marks the connection it ended"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_other_end_the_hub_decides_leaves_the_connection_unmarked() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant_id = ObjectId::new();
+        let register = || {
+            hub.register_agent(
+                agent_id,
+                tenant_id,
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                false,
+            )
+        };
+
+        let (_tx1, first, _rx1) = register();
+        let (tx2, second, _rx2) = register();
+        assert_eq!(first.reason(), Some(CancelReason::Replaced));
+        assert!(
+            !first.server_ended().get(),
+            "a connection a newer one displaced stays unmarked"
+        );
+
+        assert_eq!(
+            hub.nudge_agent_if_idle(agent_id, false),
+            NudgeOutcome::Nudged
+        );
+        assert!(hub.cycle_agent_ws(agent_id));
+        assert_eq!(hub.cancel_all_agents(), vec![agent_id]);
+        assert!(hub.unregister_agent(agent_id, Some(&tx2)));
+        assert!(
+            !second.server_ended().get(),
+            "the idle nudge, the renumber, the shutdown and the socket's own unregistration leave it unmarked"
+        );
+
+        // Last: a rotation's floor refuses a later registration below it.
+        let (_tx3, third, _rx3) = register();
+        assert!(hub.end_below_generation(agent_id, tenant_id, 1));
+        assert!(
+            !third.server_ended().get(),
+            "a connection a rotation ended stays unmarked"
         );
     }
 

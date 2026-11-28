@@ -447,7 +447,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | kill switch · epoch | `crates/agent-core/src/config.rs:1096-1101`, `:1894-1899`, `:2024-2026`; `config_surface.rs:1266-1273` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2113-2214`; `ui/src/stores/agents.ts:1344-1358` |
 | P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3408`, `:3426`, `:4158`, `:3396`, `:11013`, `:11295`; the node and network fields `:7275`, `:7522` |
-| P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7434` |
+| P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7498` |
 | P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:381-423`, `:444-475`, `:813`, `:834`, `:883` |
 | P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:383`; nest `crates/modules/network/src/lib.rs:556`, `:614` |
 | P2 DERP | `crates/modules/network/src/derp.rs:442`, `:514-550` |
