@@ -1,9 +1,17 @@
 # FR-14: Direct-link jitter episodes — the AIMD sawtooth on VPN-churning links
 
-Status: **design** (evidence collected 2026-08-27). Tracking issue: `FR-14` in
-gjovanov/roomler-ai/issues. Child of FR-1 (same program: RustDesk-parity drag
-smoothness); split out because it is direct-path-specific where FR-10 was
-relay-specific.
+Status: **closed not planned 2026-11-28**: superseded by
+[FR-148](FR-148-path-measured-plan-follows.md)
+([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). Nothing was built under
+this number: designs A, B and C below were not built, and FR-74's P1 and P1b replaced the
+direct gate they would have tuned. AC1 is FR-148's AC9 and AC28, AC2 and AC3 its AC29, and
+AC4 its AC21; FR-148 §12 maps each one. At the close: **design** (evidence collected
+2026-08-27). Tracking issue:
+[#792](https://github.com/gjovanov/roomler-ai/issues/792). Child of FR-1 (same program:
+RustDesk-parity drag smoothness); split out because it is direct-path-specific where FR-10
+was relay-specific.
+
+**Anchors:** master `bf6c21d1f` (closed 2026-11-28): this spec is the record of the work, and its line anchors read at that commit.
 
 ## Problem
 
@@ -79,3 +87,4 @@ the lump), and they compose.
 |---|---|---|
 | 2026-08-27 | 0.4.5 | Baseline evidence above; FR filed. |
 | 2026-11-03 | 0.4.177 to 0.4.197, natural traffic | **AC1 `[~]`.** `agent_logs`, the week, every `constrained=false` window with `target_bps` at or under the 1.5 M area floor, beside the *overlay: network change* lines that fall inside those sessions. CORPLAP-1: 10 direct sessions, 1 052 windows, none at the floor, lowest target 6.72 M, 44 lines in 5 of the sessions, longest session 31 min. CORPLAP-3: 53 sessions, 6 588 windows, none at the floor, lowest 3.63 M, 562 lines in 46 of the sessions, longest 49 min. CORPLAP-2: 11 sessions, 215 windows, none at the floor, lowest 12.3 M, 20 lines in 8 of the sessions. So the crash this FR was filed for didn't show on the three hosts it describes, in a week of network churn. A drag isn't logged, so this doesn't show a 30-minute drag. Other hosts still reach the floor on direct: 158 windows in 3 sessions on 2 hosts. Nothing was built under this FR (`episode_ceiling` isn't in the tree); FR-74 P1 and P1b replaced the direct gate. |
+| 2026-11-28 | — | **Closed not planned: superseded by [FR-148](FR-148-path-measured-plan-follows.md) (#3953).** Nothing was built under this number. The four criteria above stay as they were read, and each has a home in FR-148 (its §12): AC1 is its AC9 and AC28, AC2 and AC3 its AC29, which now names the 30-minute drag on CORPLAP-1 during VPN churn, and AC4 its AC21. The 2026-11-03 read stays as this FR's record |

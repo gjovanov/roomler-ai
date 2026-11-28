@@ -184,7 +184,8 @@ uploads the pump does not have yet. Nothing about how a session is chosen change
       other cell intact). Ladder: **IDR on every rate change** for `hevc_d3d12va` and
       `hevc_vulkan` (20/20, the rebuild class). 4:4:4: **no cell of these backends opens
       one**, measured on both vendors with a positive control in the same run — so there
-      is no 4:4:4 scroll to judge here. (FR-77's NVENC 4:4:4 cells still owe #1470 theirs.)
+      is no 4:4:4 scroll to judge here. (FR-77's NVENC 4:4:4 cells still owe theirs:
+      that scroll is FR-135's AC22 since FR-77 closed on 2026-11-28.)
 - [x] **Docs** updated with the new backends in the tables and diagrams, linked
       from `docs/README.md` (`docs/encoders.md` §Hardware frames + the cascade and
       fleet tables, #1506 / #1508 / #1512; the README row names VAAPI · D3D12 · Vulkan).
