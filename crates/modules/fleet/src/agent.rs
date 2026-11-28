@@ -2637,6 +2637,20 @@ pub fn derive_agent_presence(
     (presence, is_online)
 }
 
+/// #4553 — a tunnel client's three-state presence from its three inputs:
+/// a socket of it live on this pod, what the presence directory said
+/// (`Some(true)` a pod claims one, `Some(false)` none does, `None` it could
+/// not answer), and its heartbeat trail. STUB: master's reading, every
+/// tunnel client offline.
+pub fn tunnel_client_presence(
+    _local_socket: bool,
+    _claimed: Option<bool>,
+    _last_seen_at: bson::DateTime,
+    _now: bson::DateTime,
+) -> (AgentPresence, bool) {
+    (AgentPresence::Offline, false)
+}
+
 fn to_agent_response(
     state: &FleetState,
     a: roomler_ai_remote_control::models::Agent,
@@ -3343,5 +3357,69 @@ mod pin_downgrade_words_tests {
              would DOWNGRADE this device; pass force=true to do it deliberately"
         );
         assert!(!reason.to_ascii_lowercase().contains("agent"), "{reason}");
+    }
+}
+
+/// #4553 — a tunnel client's presence table (`tunnel_client_presence`, the
+/// twin of `derive_agent_presence`).
+#[cfg(test)]
+mod tunnel_client_presence_tests {
+    use super::{AgentPresence, tunnel_client_presence};
+    use bson::DateTime;
+
+    const NOW_MS: i64 = 1_800_000_000_000;
+    /// 3 × the tunnel socket's 60 s check, the record's TTL.
+    const TRAIL_MS: i64 = 180_000;
+
+    fn now() -> DateTime {
+        DateTime::from_millis(NOW_MS)
+    }
+
+    fn seen(ms_ago: i64) -> DateTime {
+        DateTime::from_millis(NOW_MS - ms_ago)
+    }
+
+    /// Every input to one presence. A socket on this pod, or a record another
+    /// pod holds, is online whatever the trail says. The trail speaks only
+    /// when the directory could not answer: a client the directory says
+    /// nobody holds is offline, even seconds after it closed.
+    #[test]
+    fn every_input_reads_one_presence() {
+        use AgentPresence::{Offline, Online, Stale};
+        let (fresh, old) = (seen(30_000), seen(10 * 60_000));
+        let table = [
+            // (socket on this pod, directory, trail, presence)
+            (true, Some(true), fresh, Online),
+            (true, Some(false), old, Online),
+            (true, None, old, Online),
+            (false, Some(true), fresh, Online),
+            (false, Some(true), old, Online),
+            (false, Some(false), fresh, Offline),
+            (false, Some(false), old, Offline),
+            (false, None, fresh, Stale),
+            (false, None, old, Offline),
+        ];
+        for (local, claimed, last_seen, want) in table {
+            let (presence, is_online) = tunnel_client_presence(local, claimed, last_seen, now());
+            assert_eq!(
+                presence, want,
+                "local={local} claimed={claimed:?} last_seen={last_seen}"
+            );
+            assert_eq!(
+                is_online,
+                want == Online,
+                "is_online is the online state only: local={local} claimed={claimed:?}"
+            );
+        }
+    }
+
+    /// The trail is fresh for the record's TTL and no longer; a trail ahead
+    /// of this pod's clock (another pod's skew) is fresh.
+    #[test]
+    fn the_trail_is_fresh_for_three_checks() {
+        let p = |ms_ago| tunnel_client_presence(false, None, seen(ms_ago), now()).0;
+        assert_eq!(p(TRAIL_MS - 1), AgentPresence::Stale);
+        assert_eq!(p(TRAIL_MS), AgentPresence::Offline);
+        assert_eq!(p(-5_000), AgentPresence::Stale);
     }
 }
