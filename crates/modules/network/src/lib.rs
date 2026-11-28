@@ -52,9 +52,11 @@ use tokio::sync::mpsc;
 
 pub mod agent_arms;
 pub mod agent_socket;
+pub mod credential_rotation;
 pub mod derp;
 pub mod derp_acl;
 pub mod derp_cluster;
+pub mod derp_rotation;
 pub mod derp_types;
 pub mod ephemeral;
 pub mod hooks;
@@ -117,6 +119,10 @@ pub struct NetworkState {
     pub derp_acl: derp_acl::DerpAclCache,
     /// C-5 — per-connection rehome-close signals (cluster convergence).
     pub derp_cancels: derp_types::DerpCancelRegistry,
+    /// FR-155 P1d — this pod's DERP connections with the generation each
+    /// was admitted under, and the floors a token rotation keeps
+    /// ([`derp_rotation`]).
+    pub derp_generations: Arc<derp_rotation::DerpGenerations>,
     /// P7 — per-pair TURN-relay churn state for the forced-DERP escalation,
     /// keyed by the symmetric `pair_key`. Manual TTL (checked on access) +
     /// a size-capped retain sweep — see [`overlay::PairChurn`].
@@ -303,6 +309,7 @@ impl Module for NetworkState {
             derp_registry: Arc::new(DashMap::new()),
             derp_acl: Arc::new(DashMap::new()),
             derp_cancels: Arc::new(DashMap::new()),
+            derp_generations: Arc::new(derp_rotation::DerpGenerations::new()),
             relay_pair_churn: Arc::new(DashMap::new()),
             derp_unservable: Arc::new(DashMap::new()),
             org_relay: Arc::new(org_relay::OrgRelayState::new()),
@@ -341,6 +348,11 @@ impl Module for NetworkState {
         derp_cluster::wire_derp_cluster(&state);
         // Split-brain observability: the per-pod DERP registry census.
         derp::spawn_registry_census(&state);
+        // FR-155 P1d — while the token rotation is on, every pod ends a DERP
+        // registration below its row's generation on the cadence of fleet's
+        // check, also a pod that the rotation's control event does not
+        // reach. Not spawned while the rotation is off.
+        derp_rotation::spawn_check(state.clone());
         // FR-51 — the ephemeral-node reaper (cluster-singleton per cycle via
         // the DB-name-scoped claim pattern). Spawns NOTHING unless
         // `rc.ephemeral_reaper_enabled` — the P1 kill switch, default off.

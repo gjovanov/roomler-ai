@@ -1149,6 +1149,37 @@ pub async fn self_rotate(
         )
         .await;
         audit.record("first", None, Some(next_gen)).await;
+        // FR-155 P1d — what the commit changes outside fleet: the overlay node
+        // goes offline, the DERP registrations below the new generation end,
+        // and the device is ordered a new overlay key
+        // (`FleetLifecycle::agent_credentials_rotated`). Once, here, before
+        // the answer: the device connects at the new generation only once it
+        // has the token. A failure is logged, counted and audited, and the
+        // token is answered all the same.
+        let failed = state
+            .hooks
+            .agent_credentials_rotated(caller.tenant_id, caller.agent_id, next_gen)
+            .await;
+        if !failed.is_empty() {
+            roomler_core::cluster::metrics::bump(
+                &roomler_core::cluster::metrics::CREDENTIAL_ROTATION_HOOK_FAILED_TOTAL,
+            );
+            for (module, e) in &failed {
+                tracing::warn!(
+                    tenant_id = %caller.tenant_id, agent_id = %caller.agent_id,
+                    generation = next_gen, module, error = %e,
+                    "fr-155: a module could not apply the token rotation; the new token is answered"
+                );
+            }
+            let modules = failed
+                .iter()
+                .map(|(module, _)| *module)
+                .collect::<Vec<_>>()
+                .join(",");
+            audit
+                .record("hook_failed", Some(modules.as_str()), Some(next_gen))
+                .await;
+        }
         let agent_token = state
             .auth
             .renew_agent_token(caller.agent_id, caller.tenant_id, next_gen, Some(ttl))

@@ -115,8 +115,8 @@ pub enum OrderedBy {
     /// An operator, through the route (which checked `MANAGE_AGENTS`).
     Operator(ObjectId),
     /// FR-40 P2 — the server itself, for the reason named: the order's
-    /// `trigger`, today only `key_retired`. No user asked, so the order and
-    /// its audit row carry the zero id.
+    /// `trigger`, `key_retired` or (FR-155 P1d) `credential_rotation`. No
+    /// user asked, so the order and its audit row carry the zero id.
     Server(&'static str),
 }
 

@@ -92,14 +92,15 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328), and comes back as that holder's: its new token acts for them.
 
 - **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1389`; tunnel clients `crates/services/src/dao/tunnel_client.rs:483`). From then on only tokens minted after the removal are accepted.
-- **Where it is checked**, at all five sites, each of which already loads the row, and at a sixth while the token rotation is on (FR-155 P1c):
+- **Where it is checked**, at all five sites, each of which already loads the row, and at two more while the token rotation is on (the agent socket's registration, FR-155 P1c, and DERP's, P1d):
 
 | Site | Where |
 |---|---|
 | `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:103` |
 | the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1532` |
 | the agent socket's registration, after the hello, while the token rotation is on: a refusal registers and writes nothing, and a removed or quarantined row is the removal's to answer | `registration_generation`, on its own read of the row on the primary, `crates/modules/fleet/src/socket.rs:1360` |
-| DERP | `crates/modules/network/src/derp.rs:401` |
+| DERP, decided before the upgrade (answers 401) | `crates/modules/network/src/derp.rs:410` |
+| DERP's registration, after the registration frame, while the token rotation is on: a refusal writes nothing, and the row is judged in the upgrade's order (removed or quarantined first, then the generation), so a row that cannot be read refuses, as at the upgrade | `registration_generation`, on its own read of the row on the primary, `crates/modules/network/src/derp.rs:505` |
 | the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2236` |
 | the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:575` |
 

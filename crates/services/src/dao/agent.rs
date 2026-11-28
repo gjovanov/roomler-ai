@@ -560,8 +560,8 @@ impl AgentDao {
     /// admission decides on the row's generation and last rotation as read,
     /// its update compares against the primary's row ([`Self::rotate_token`]),
     /// and after an update that matched nothing it reads the row again to say
-    /// why, and the agent socket's registration (P1c) reads its row here. Each
-    /// read must see what the primary has applied, which a secondary may not.
+    /// why. The agent socket's (P1c) and DERP's (P1d) registrations read it here.
+    /// Each read must see what the primary has applied, which a secondary may not.
     #[expect(
         clippy::disallowed_methods,
         reason = "the token rotation tells a removed device that it was removed, as the revocation checks do"
