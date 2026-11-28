@@ -487,8 +487,9 @@ async fn retired_key_at_derp(
 /// time from the read to the admit to stay inside the floor.
 const REGISTRATION_READ_SECS: u64 = 10;
 
-/// FR-155 P1d — what the registration's read of the row found.
-enum RegistrationGeneration {
+/// FR-155 P1d — what the registration's read of the row found. P1e: the DERP
+/// ticket arm reads it too (`crate::agent_arms::handle_derp_ticket_request`).
+pub(crate) enum RegistrationGeneration {
     /// The upgrade's checks pass on the row as the primary holds it.
     Admit,
     /// Removed, quarantined, or of another generation: refused, with the
@@ -502,7 +503,7 @@ enum RegistrationGeneration {
 /// row as the primary holds it, in the upgrade's order: `refusal_reason`,
 /// then `generation_refusal`. Fails closed, as the upgrade does: a row that
 /// cannot be read within [`REGISTRATION_READ_SECS`] refuses.
-async fn registration_generation(
+pub(crate) async fn registration_generation(
     state: &NetworkState,
     tenant_id: ObjectId,
     agent_id: ObjectId,

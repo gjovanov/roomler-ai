@@ -97,10 +97,10 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | Site | Where |
 |---|---|
 | `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:103` |
-| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1532` |
-| the agent socket's registration, after the hello, while the token rotation is on: a refusal registers and writes nothing, and a removed or quarantined row is the removal's to answer | `registration_generation`, on its own read of the row on the primary, `crates/modules/fleet/src/socket.rs:1360` |
+| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1533` |
+| the agent socket's registration, after the hello, while the token rotation is on: a refusal registers and writes nothing, and a removed or quarantined row is the removal's to answer | `registration_generation`, on its own read of the row on the primary, `crates/modules/fleet/src/socket.rs:1361` |
 | DERP, decided before the upgrade (answers 401) | `crates/modules/network/src/derp.rs:410` |
-| DERP's registration, after the registration frame, while the token rotation is on: a refusal writes nothing, and the row is judged in the upgrade's order (removed or quarantined first, then the generation), so a row that cannot be read refuses, as at the upgrade | `registration_generation`, on its own read of the row on the primary, `crates/modules/network/src/derp.rs:505` |
+| DERP's registration, after the registration frame, while the token rotation is on: a refusal writes nothing, and the row is judged in the upgrade's order (removed or quarantined first, then the generation), so a row that cannot be read refuses, as at the upgrade | `registration_generation`, on its own read of the row on the primary, `crates/modules/network/src/derp.rs:506` |
 | the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2360` |
 | the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:578` |
 

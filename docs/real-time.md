@@ -1056,14 +1056,14 @@ A registration that a rotation ended closes with
 ### How an agent socket ended (#3517)
 
 Every end of a registered agent socket leaves one line on the pod that held it, at the
-end of its teardown (`crates/modules/fleet/src/socket.rs:1130-1142`), and its `cause`
+end of its teardown (`crates/modules/fleet/src/socket.rs:1131-1143`), and its `cause`
 says how the socket ended:
 
 ```
 INFO roomler_ai_mod_fleet::socket: remote-control agent WS disconnected agent_id=… cause=error kind=eof error="…"
 ```
 
-Each exit of the read loop (`socket.rs:581`) breaks with a `SocketEnd`
+Each exit of the read loop (`socket.rs:582`) breaks with a `SocketEnd`
 (`crates/modules/fleet/src/socket_end.rs:25`), so an exit added later does not compile
 until it names its cause. `cause` is always on the line. Every other field appears only
 with the cause it belongs to, so the line never carries a field that means nothing for
@@ -1088,7 +1088,7 @@ flowchart LR
 | `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
 | `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2343`) |
 | `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
-| `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:603`). The check runs on a tick, so `elapsed_s` reads past the deadline |
+| `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:604`). The check runs on a tick, so `elapsed_s` reads past the deadline |
 | `cancelled` | `by` | the Hub cancelled the loop; `by` below |
 | `sleep` | — | the device said it is going to sleep (FR-55 P4). Its daemon sends a close frame next, which the loop never reads |
 | `stream_end` | — | the stream ended with neither a frame nor an error. tokio-tungstenite ends it that way only after a close or an error, and the loop leaves on both first, so this is not expected |
@@ -1130,7 +1130,7 @@ pins. If axum moves to another one, every error reads `other`, and the loopback 
 `socket::tests::a_dropped_tcp_leg_reads_eof` fails first.
 
 **Before the hello.** A socket that ends before its `rc:agent.hello` registered nothing,
-so it gets no disconnect line. The hello wait (`read_next_rc`, `socket.rs:1402`) says
+so it gets no disconnect line. The hello wait (`read_next_rc`, `socket.rs:1403`) says
 how it ended on its own warn line, `agent opened WS without rc:agent.hello — closing`,
 with the same `cause`, `code`, `reason`, `kind` and `error`. Before #3517 that line read
 `other=None` for every end.
@@ -1140,7 +1140,7 @@ either, and gets no disconnect line; its own line says why. `refusing agent WS: 
 generation this pod admits for the device`, with `floor`, is the Hub's refusal
 (`socket.rs:259`): a rotation's floor (P1b) or, while the rotation is on, the entry of a
 higher generation, which stays (P1c). While the rotation is on, the registration first
-reads the row after the hello (`registration_generation`, `socket.rs:1360`), and its
+reads the row after the hello (`registration_generation`, `socket.rs:1361`), and its
 refusals carry `at=registration`: `refusing agent WS: token of another generation`, with
 the upgrade's `reason` and `row_gen`, and `refusing agent WS: row gone (a reaped ephemeral
 device?)`.

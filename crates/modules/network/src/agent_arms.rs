@@ -260,9 +260,21 @@ pub async fn handle_agent_ssh_request(
 /// overlay `(network_id, wg_public_key)` — exactly the invariants the central
 /// `/derp` enforces from Mongo, so a PoP relay can enforce them with the
 /// PUBLIC key alone.
+///
+/// FR-155 P1e: it carries `generation`, the generation of the control socket
+/// that asked (its Hub entry's), never the row's. While the token rotation is
+/// on, a ticket is minted only to a socket the row admits, read on the
+/// primary within the DERP registration's bound
+/// (`crate::derp::registration_generation`), and nothing is awaited from that
+/// read to the mint. So every ticket below the row's generation was minted
+/// before its rotation's commit or within that read just after it, and the
+/// floor the commit pushes to the regional relays lasts at least as long as
+/// that ticket does (`roomler_core::relay_floors`).
 pub async fn handle_derp_ticket_request(
     state: &NetworkState,
     agent_id: ObjectId,
+    tenant_id: ObjectId,
+    generation: u32,
     tx: &tokio::sync::mpsc::Sender<ServerMsg>,
 ) {
     let Some(signer) = &state.derp_ticket else {
@@ -275,7 +287,22 @@ pub async fn handle_derp_ticket_request(
         debug!(%agent_id, "derp ticket requested but agent has no overlay node");
         return;
     };
-    match signer.mint(&node.network_id.to_hex(), &node.wg_public_key) {
+    // The row's read is the last await before the mint, so the ticket is
+    // minted within the read's bound of the read's start.
+    if state.fleet.rc_hub.token_rotation() {
+        match crate::derp::registration_generation(state, tenant_id, agent_id, generation).await {
+            crate::derp::RegistrationGeneration::Admit => {}
+            crate::derp::RegistrationGeneration::Refused { reason, row_gen } => {
+                info!(%agent_id, generation, row_gen, reason, "derp ticket not minted: the socket is not at the row's generation");
+                return;
+            }
+            crate::derp::RegistrationGeneration::Unavailable(e) => {
+                warn!(%agent_id, generation, %e, "derp ticket not minted: the row could not be read");
+                return;
+            }
+        }
+    }
+    match signer.mint_at(&node.network_id.to_hex(), &node.wg_public_key, generation) {
         Ok((ticket, exp)) => {
             let _ = tx.try_send(ServerMsg::DerpTicket { ticket, exp });
         }

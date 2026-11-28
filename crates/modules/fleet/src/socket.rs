@@ -502,6 +502,7 @@ pub async fn handle_agent_socket(
         os,
         dialed_tid,
         conn_established_ms,
+        generation,
         tx: registered_tx.clone(),
         resume: roomler_core::AgentResume {
             window_secs: resume_window.unwrap_or(0),

@@ -329,6 +329,72 @@ impl RedisPubSub {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
+    /// FR-155 P1e — raise one generation floor in the hash `key` that every
+    /// pod shares (`crate::relay_floors`). The field `field` holds
+    /// `gen|until`, merged by the higher generation and the later until, so a
+    /// write never lowers a floor or ends one sooner. Fields past their until
+    /// are removed, and the hash lives as long as its farthest floor.
+    pub async fn floor_raise(
+        &self,
+        key: &str,
+        field: &str,
+        generation: u32,
+        until: u64,
+        now: u64,
+    ) -> Result<(), redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        let _: i64 = redis::Script::new(Self::FLOOR_RAISE)
+            .key(key)
+            .arg(field)
+            .arg(generation)
+            .arg(until)
+            .arg(now)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// FR-155 P1e — every field of the hash `key` (empty when it is absent).
+    pub async fn hash_all(
+        &self,
+        key: &str,
+    ) -> Result<std::collections::HashMap<String, String>, redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        redis::cmd("HGETALL").arg(key).query_async(&mut conn).await
+    }
+
+    /// `KEYS[1]` the hash, `ARGV` field, generation, until, now. Lua numbers
+    /// are doubles, exact for a generation and a unix second.
+    const FLOOR_RAISE: &'static str = r#"
+local now = tonumber(ARGV[4])
+local all = redis.call('HGETALL', KEYS[1])
+for i = 1, #all, 2 do
+  local sep = string.find(all[i + 1], '|', 1, true)
+  local u = sep and tonumber(string.sub(all[i + 1], sep + 1))
+  if not u or u < now then
+    redis.call('HDEL', KEYS[1], all[i])
+  end
+end
+local gen = tonumber(ARGV[2])
+local untl = tonumber(ARGV[3])
+local cur = redis.call('HGET', KEYS[1], ARGV[1])
+if cur then
+  local sep = string.find(cur, '|', 1, true)
+  if sep then
+    local g = tonumber(string.sub(cur, 1, sep - 1))
+    local u = tonumber(string.sub(cur, sep + 1))
+    if g and g > gen then gen = g end
+    if u and u > untl then untl = u end
+  end
+end
+redis.call('HSET', KEYS[1], ARGV[1], string.format('%d|%d', gen, untl))
+local left = untl - now
+if left > 0 and redis.call('TTL', KEYS[1]) < left then
+  redis.call('EXPIRE', KEYS[1], left)
+end
+return 1
+"#;
+
     /// `KEYS[1]` the baseline, `ARGV` boot, value, ttl. Returns the bytes to
     /// book. Lua numbers are doubles, exact to 2^53 bytes (9 PB). A stored
     /// value that does not parse starts a new baseline, like another boot.

@@ -47,10 +47,16 @@ services:
       # FR-76 P3 — no DERP_NETWORKS here: a regional PoP serves every network.
       # Never add it as ${DERP_NETWORKS:-}. An empty value refuses to start,
       # so that line would stop every PoP that leaves it unset (README.md).
+      # FR-155 P1e — where the relay keeps its generation floors across a
+      # restart, written on every change (the state volume below).
+      DERP_FLOORS_FILE: /var/lib/derp-relay/floors.json
     volumes:
       # Linux x86_64 binary built by CI / the build host:
       #   cargo build -p derp-relay --release
       - /opt/relay-pop/bin/derp-relay:/opt/derp-relay:ro
+      # FR-155 P1e — the floors file's directory, kept across a container's
+      # re-creation. Docker creates the host directory on first start.
+      - /opt/relay-pop/state:/var/lib/derp-relay
 
   nginx:
     image: nginx:stable

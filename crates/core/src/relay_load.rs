@@ -559,6 +559,7 @@ async fn book_network_bytes(
 
 /// Spawn the poller. No-op (never spawns) when regions are disabled or none
 /// exposes a `/stats` endpoint, or when `relay.stats_poll_secs` is 0.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_poller(
     turn_map: Arc<TurnMap>,
     load: RelayLoadMap,
@@ -573,6 +574,9 @@ pub fn spawn_poller(
     allowance_push: Option<AllowancePush>,
     // FR-115 P4b-2 — `None` ⇒ the PoPs' TURN bytes are not attributed.
     turn_pull: Option<TurnUsagePull>,
+    // FR-155 P1e — `None` ⇒ the token rotation is off: no relay is told a
+    // floor, and none holds a live set.
+    relay_floors: Option<Arc<crate::relay_floors::RelayFloors>>,
 ) {
     let poll_secs = settings.stats_poll_secs;
     let busy_load = settings.busy_load;
@@ -617,6 +621,9 @@ pub fn spawn_poller(
         // `turn_usage`, and the cursor (boot, last seq) this pod holds for each.
         let mut turn_keepers: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut turn_cursors: HashMap<String, (String, u64)> = HashMap::new();
+        // FR-155 P1e — the endpoints whose last answered `GET` reported
+        // `floors`: the only ones the floors are pushed to.
+        let mut floor_takers: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut tick = tokio::time::interval(Duration::from_secs(poll_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -659,6 +666,11 @@ pub fn spawn_poller(
                         turn_keepers.insert(url.clone());
                     } else {
                         turn_keepers.remove(url);
+                    }
+                    if crate::relay_floors::takes_floor_push(&body) {
+                        floor_takers.insert(url.clone());
+                    } else {
+                        floor_takers.remove(url);
                     }
                     // FR-20 B, booked per endpoint and once across pods (#2763).
                     if let (Some(st), Some(pop)) = (&stats, &pop_bytes) {
@@ -737,6 +749,19 @@ pub fn spawn_poller(
                 if !to.is_empty() {
                     push.push(&client, &to, poll_secs.saturating_mul(3)).await;
                 }
+            }
+            // FR-155 P1e — every live generation floor, every poll, also when
+            // there is none: a relay counts the set live three polls,
+            // and a relay a commit's push did not reach has the floor now.
+            if let Some(floors) = &relay_floors {
+                floors.set_takers(
+                    endpoints_in(&targets, &floor_takers)
+                        .into_iter()
+                        .flat_map(|(_, urls)| urls)
+                        .map(|url| crate::relay_floors::floors_url(&url))
+                        .collect(),
+                );
+                floors.push().await;
             }
             // FR-115 P4b-2 — pull every PoP that keeps coturn's totals, all at
             // once, so one dead PoP does not stretch the tick.

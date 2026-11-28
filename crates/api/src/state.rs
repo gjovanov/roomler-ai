@@ -219,6 +219,16 @@ impl AppState {
         // one carries a derp_url (the stats host). The stats sink makes each
         // poll tick durable (`stats_relay` buckets) when stats are enabled.
         let relay_load: roomler_ai_remote_control::turn_creds::RelayLoadMap = Default::default();
+        // FR-155 P1e — the generation floors the regional relays hold for a
+        // rotated device: built only while the token rotation is on and a
+        // ticket key is configured. Without Redis, a pod pushes what it
+        // committed itself.
+        let relay_floors = roomler_core::relay_floors::RelayFloors::new(
+            &settings,
+            redis_pubsub.clone(),
+            db.name(),
+        )
+        .map(Arc::new);
         crate::relay_load::spawn_poller(
             turn_map.clone(),
             relay_load.clone(),
@@ -268,6 +278,8 @@ impl AppState {
                         db.name(),
                     )
                 }),
+            // FR-155 P1e — the live floors, pushed on the same poll.
+            relay_floors.clone(),
         );
 
         // C-1 — the directory heartbeat: every 30 s, re-assert this pod's
@@ -320,6 +332,7 @@ impl AppState {
             cluster_bus: cluster_bus.clone(),
             turn_map: turn_map.clone(),
             relay_load: relay_load.clone(),
+            relay_floors: relay_floors.clone(),
             hooks: roomler_core::HookRegistry::default(),
             agent_socket: roomler_core::AgentSocketRegistry::default(),
             // FR-115 — plans bind only where they are sold (`saas` compiled

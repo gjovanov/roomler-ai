@@ -1,8 +1,8 @@
 # FR-155: A one-row conversion gives each enrollment it moves new credentials
 
 **Issue:** [#4467](https://github.com/gjovanov/roomler-ai/issues/4467) · **Status:** claimed 2026-11-25; P1a merged
-(#4470), P1b merged (#4517), P1c merged (#4530), P1d merged (#4557), P1e in review (P1e-1 #4565, the work a commit
-starts; P1e-2, the regional relays, next), P1f (the switch on, D5) after it. D1–D3, D5 and D6 were decided on 2026-11-25, with two requirements added (Q1, Q2); D4 is open, for P4.
+(#4470), P1b merged (#4517), P1c merged (#4530), P1d merged (#4557), P1e-1 merged (#4565, the work a commit
+starts), P1e-2 in review (#4568, the regional relays), P1f (the switch on, D5) after it. D1–D3, D5 and D6 were decided on 2026-11-25, with two requirements added (Q1, Q2); D4 is open, for P4.
 **Builds on:** [FR-43](FR-43-macos-single-enrollment.md) P3c (`sudo roomlerd one-row`),
 [FR-147](FR-147-root-out-of-homes-macos.md) (root's records, the person's child),
 [FR-103](FR-103-device-credentials-renew-themselves.md) (the token generation),
@@ -52,6 +52,7 @@ sequenceDiagram
     participant D as root's daemon
     participant S as server (fleet)
     participant N as network module
+    participant R as regional DERP relays
     C->>C: rekey.json, one pending entry per moved label, before root's file
     C->>D: restart, verify each moved label connected
     D->>D: one-row lock free, no live session on the entry
@@ -60,7 +61,9 @@ sequenceDiagram
     S->>S: conditional update token_gen G to G+1
     S->>S: end the agent's connections below G+1 on every pod
     S->>N: hook agent_credentials_rotated
-    N->>N: node offline, DERP below G+1 ended, key order queued
+    N->>N: node offline, DERP below G+1 ended
+    N->>R: a floor at G+1 for the node's keys (P1e)
+    N->>N: key order queued
     S->>S: mark the work's end on the row (P1e)
     S-->>D: 200 token at G+1
     D->>D: save the token, entry done
@@ -159,6 +162,10 @@ The commit then ends the agent's connections admitted below G+1:
   composition baseline stays as it is. A second envelope would be a second message for every pod to apply in step
   with the first, for the same agent and generation. The pod that commits skips its own envelope (the Redis
   forwarder's self-echo guard), so there the DERP end is step 2 of the hook.
+- **Every regional relay (P1e).** The hook commits a floor at G+1 for the node's keys, and every regional DERP relay
+  the API reaches holds it: the relay admits a registration of those keys only at G+1 or above, and a floor that
+  arrives ends each connection below it. The commit pushes the floor to every relay that takes floors before the
+  route answers, and every poll pushes it again (below).
 
 The commit takes the agent's entry out of this pod's Hub before the hook runs. FR-40's order then reads the device
 as offline (`overlay_key.rs:165`) and is queued for the next connection (`:217-221`): it is never pushed to a
@@ -234,6 +241,66 @@ The read, the rule of the higher generation and the check run only while `rc.age
 at the registration, no check, and last-writer-wins as before. The
 end and its floor run when a rotation commits, and none commits while the switch is off. T22 shows it.
 
+### Every regional relay holds A and B for the device's generation (P1e)
+
+*Read on master `590f7e9ba` (2026-11-28).* P1e-2 makes P1d's two properties hold at every regional DERP relay
+(`crates/derp-relay`), whatever the timing, while the switch is on:
+
+- **A. A regional relay admits a registration only at the device's current generation.**
+- **B. Every regional relay the API reaches ends a registration below the device's current generation within N.** N
+  is one period of `relay.stats_poll_secs` (30 s by default) plus the time of that poll's reads of the relays'
+  `/stats` and the push's bound (4 s). A relay holds a floor from when it arrives: before the route answers at every
+  relay the commit's push reaches, and within N at every other relay the API reaches.
+
+A relay holds no database and learns no new identifier. It reads the generation from the ticket, and the API tells it
+the floors, keyed by the registry's own key, the overlay network and the WireGuard key, never by the agent.
+
+| Part | Where | What it does |
+|---|---|---|
+| **The ticket's generation** | the claim `gen` (`DerpTicketClaims::generation`, `crates/remote_control/src/derp_ticket.rs`), minted by `DerpTicketSigner::mint_at` in the ticket arm (`handle_derp_ticket_request`, `crates/modules/network/src/agent_arms.rs`) | a ticket carries the generation of the control socket that asked for it (`AgentCtx::generation`, its Hub entry's), never the row's. While the switch is on, the arm mints only to a socket the row admits, read on the primary as the DERP registration reads it (`registration_generation`, within 10 s), and that read is the last await before the mint. A relay before P1e ignores the claim, as serde ignores a field it does not know |
+| **The floors** (B) | the hook's step 3 (`hold_relays_below`, `crates/modules/network/src/credential_rotation.rs`) and `RelayFloors::commit` (`crates/core/src/relay_floors.rs`) | at the commit, a floor at G+1 for each key a ticket below G+1 can name: the node's key, and each key it retired within `DERP_TICKET_TTL`, `DERP_TICKET_LEEWAY_SECS` and `FLOOR_MARGIN_SECS` (`floors_for`; the margin covers here what it covers at the floor's end, below). Each lasts until `floor_until` (below). It is stored in a Redis hash that every pod reads (`roomler:relay_floors:<db>`, merged by a script by the higher generation and the later `until`), and in the pod's own map, so a pod without Redis pushes what it committed. A floor the store refuses is the hook's error |
+| **The push at the commit** (B) | `RelayFloors::push`, from the commit | signs the live floors as one set (`FloorSetClaims`, audience `derp-floors`, with the ticket key) and posts it to `/stats/floors` on every relay that takes floors, all at once: 3 s each (`FLOOR_PUSH_SECS`), 4 s for all. It runs in the hook, before the route answers. A relay the push does not reach has the floor on the next poll |
+| **Every poll** (B) | `spawn_poller` (`crates/core/src/relay_load.rs`) | after each poll's reads of the relays' `/stats`, pushes every live floor again, as one set, to every relay whose last answered `GET /stats` reports `floors` (`takes_floor_push`), also when there is none. A relay counts a set live for its `ttl`, three polls |
+| **The relay's floors** (A) | `Floors`, `derp_upgrade` and `admit` (`crates/derp-relay/src/main.rs`) | merges each set that verifies entry by entry, by the higher generation and the later `until`, so an older, repeated or partial set lowers no floor and ends none sooner. A ticket below its key's floor is refused at the upgrade, with the 401 of a ticket that does not verify, and at the registration, under the key's registry entry; a refusal writes nothing, and the registration in place stays and keeps relaying. A floor holds while `now <= until` on the relay's clock. A ticket without the generation ranks below every generation |
+| **The registration of the higher generation stays** (A) | `admit` | while a set is live (one arrived within its `ttl`), a registration below the generation of the one in place for its key is refused, and the one in place stays and keeps relaying. An equal or a higher one replaces it, as a reconnect always has. With no live set, a re-registration is last-writer-wins, as before |
+| **A floor that arrives ends each connection below it** (B) | `floors_push` and `end_below` | each connection is listed from before its admission reads the floors until it closes, also one whose registration a newer one replaced. A set that raises a floor ends each listed connection below it through the socket's own close, so the removal that only the registered sender makes never removes a newer registration |
+| **A restart** (A) | `DERP_FLOORS_FILE`, `/var/lib/derp-relay/floors.json` on the volume `/opt/relay-pop/state` (`scripts/relay-pop/docker-compose.pop.yml`) | every change is written to a temporary file that is renamed over it, and the file is read at the start, so a relay that restarts holds its floors before any push. A file that cannot be read or parsed is logged, and the relay holds none until the API's next push. With the variable unset the floors are kept in memory only, which the start logs |
+| **What a relay reports** | `GET /stats`, `floors` | `held`, `newest_iat`, `set_live`, `kept` (`file` or `memory`), `refused_total` and `ended_total`: counts and a time, never a key. Its presence is how the API knows a relay takes floors |
+
+**Why a floor lasts until `floor_until`.** A relay verifies a ticket while `now <= exp + DERP_TICKET_LEEWAY_SECS`
+(`derp_ticket::verify`). A ticket below G+1 is minted before the commit, or on a read of the row that began before it
+and returned within 10 s, with nothing awaited from that read to the mint, so its `exp` is at most the commit's time
+plus 10 s plus `DERP_TICKET_TTL`. A floor's `until` is the hook's time, after the commit, plus `DERP_TICKET_TTL`,
+`DERP_TICKET_LEEWAY_SECS` and `FLOOR_MARGIN_SECS` (3600 s), so it is at least 3590 s past `exp +
+DERP_TICKET_LEEWAY_SECS` of every ticket below G+1: a relay keeps each floor at least as long as a ticket below it
+lives. The relay judges `exp` and `until` on its one clock, so its own skew cancels, and at `now == until` the floor
+still holds. The margin covers the 10 s and the pods' clocks differing. `a_floor_outlasts_every_ticket_minted_below_it`
+(`relay_floors.rs`) pins the sum.
+
+**Why the list and the registry entry admit nothing below a floor.** A connection is listed before its admission
+reads the floors, and the admission reads them under the key's registry entry, where it writes. A floor merged before
+that read refuses the registration, which writes nothing. A floor merged after it is followed by the end, which finds
+the connection in the list and closes it. Floors only rise, so a floor once read is never lower at a later read. Two
+registrations of one key are ordered by the entry: the later one is refused while it is below the one in place and a
+set is live, and replaces it otherwise.
+
+**Why a file keeps the floors across a restart.** The other way, admitting only tickets minted after the relay started
+until its first push, would refuse nearly every node until the API's next push, and for as long as the API stayed out
+of reach: a node keeps one ticket for its process (`agents/roomlerd/src/signaling.rs:1131-1137`) and asks for the next
+on its own timer (`:5254-5273`). A relay that cannot hear the API never fails closed for everyone: it admits every
+ticket at or above its key's floor, and every ticket for a key with none.
+
+**The roll.** Every regional relay rolls first, then the pods (`scripts/relay-pop/README.md`). A relay before P1e
+verifies a ticket that carries the generation (T30), and a P1e relay admits a ticket without it for a key with no floor
+(T26), so pods and relays of either release work together while the switch is off. Before P1f, every regional relay
+runs P1e's relay (Phases).
+
+With the switch off, `Core::relay_floors` is `None`: it is built only while `rc.agent_token_rotation` and
+`rc.token_generation_check` are both on and a ticket key is configured. No floor is stored or pushed, so no relay holds
+a live set: no relay is told a floor, and a re-registration is last-writer-wins, as before. A ticket carries its
+generation either way, and the ticket arm reads the row only while the switch is on. A floor a relay already holds
+lasts to its `until`. T32 shows it.
+
 ### The hook `agent_credentials_rotated` (P1d)
 
 A new `FleetLifecycle` hook in `crates/core/src/hooks.rs`, beside `agent_removed` (`:98`), with a default no-op:
@@ -250,7 +317,11 @@ runs every module's hook, also after one fails, and names each that failed. The 
    (`agent_socket.rs:269-278`), so the hook runs it.
 2. **Its DERP registrations admitted below the new generation end** on this pod
    (`DerpGenerations::end_below_generation`, above); every other pod ends its own when it applies the control event.
-3. **An FR-40 order** with the trigger `credential_rotation`, a new constant beside `key_retired`
+3. **Every regional relay holds a floor at G+1** for the node's keys (P1e, `hold_relays_below`; "Every regional relay
+   holds A and B for the device's generation", above): stored where every pod reads it, and pushed to every relay
+   that takes floors before the route answers. A relay the push does not reach has it on the next poll. A floor the
+   store refuses is the hook's error, after the order ran.
+4. **An FR-40 order** with the trigger `credential_rotation`, a new constant beside `key_retired`
    (`crates/remote_control/src/models.rs:3345`; `KEY_ROTATION_TRIGGER_CREDENTIAL_ROTATION`): `place_order(..,
    OrderedBy::Server(..), public_key_before = the node's key, else the key of the row's `overlay_identity`)`
    (`overlay_key.rs:156-249`). It is queued, and the connect-time reconcile delivers it when the device
@@ -471,7 +542,7 @@ A Mac whose root records are all gone does not read as converted (`converted_roo
 
 | Phase | Switch | Off means |
 |---|---|---|
-| P1 | `rc.agent_token_rotation` (`ROOMLER__RC__AGENT_TOKEN_ROTATION`); the route also answers 404 while `rc.token_generation_check` is off | 404 for a first call: devices keep their credentials, keep working and show `rekey_pending`; a replay is answered. Nothing of P1c runs: no read at the registration, no check. Nothing of P1d's DERP half runs: no read at a DERP registration, no DERP check, and last-writer-wins as before; with no commit, the hook never runs. Nothing of P1e runs: no work starts, and a replay is answered at once, as before. Off by default until P1f; from then on the fleet-wide switch (D5) |
+| P1 | `rc.agent_token_rotation` (`ROOMLER__RC__AGENT_TOKEN_ROTATION`); the route also answers 404 while `rc.token_generation_check` is off | 404 for a first call: devices keep their credentials, keep working and show `rekey_pending`; a replay is answered. Nothing of P1c runs: no read at the registration, no check. Nothing of P1d's DERP half runs: no read at a DERP registration, no DERP check, and last-writer-wins as before; with no commit, the hook never runs. Nothing of P1e runs: no work starts, and a replay is answered at once, as before; no floor is stored or pushed, so no regional relay holds a live set, and a re-registration there is last-writer-wins, as before (a floor a relay already holds lasts to its `until`). Off by default until P1f; from then on the fleet-wide switch (D5) |
 | P2 | `ROOMLERD_ONE_ROW_SPLICE=0` | a revert refuses a person whose credentials differ, and never puts the kept ones back (fails closed) |
 | P3 | `ROOMLERD_CREDENTIAL_ROTATION=0` | no first request; the entries stay recorded and visible, and a `requested` one is asked again with its key |
 | P4 | `ROOMLERD_ONE_ROW_REKEY_EXISTING=0` | nothing recorded at start |
@@ -479,7 +550,7 @@ A Mac whose root records are all gone does not read as converted (`converted_roo
 ### Tests
 
 Each cell fails on master before its PR and passes on it, except M6 and M16, which pass on master too: they pin
-what the design rests on. T1's P1b half, T14, T18 and T22 pass on master too. FR-103's check already answers 401 to a
+what the design rests on. T1's P1b half, T14, T18, T22 and T32 pass on master too. FR-103's check already answers 401 to a
 token of G once the row is at G+1 (run [46001191285](https://github.com/gjovanov/roomler-ai/actions/runs/46001191285),
 at P1b's cells), and T14 and T18 pin that with the switch off nothing changes. T15, T16 and T17 fail on P1b's code,
 before P1c's change (runs [46069840160](https://github.com/gjovanov/roomler-ai/actions/runs/46069840160) and
@@ -489,13 +560,18 @@ T19 and T21 fail on P1c's code, before P1d's change (run
 and T23 (run [46099851946](https://github.com/gjovanov/roomler-ai/actions/runs/46099851946)); T22 passes there, and
 pins that with the switch off nothing of P1d's DERP half runs. T24 and T25 fail on P1d's code, before P1e-1's change
 (run [46121321620](https://github.com/gjovanov/roomler-ai/actions/runs/46121321620), at P1e-1's cells), and T6's
-P1e part pins that with the switch off an answer asked again is given at once. The names state the property.
+P1e part pins that with the switch off an answer asked again is given at once. T26 to T29 fail on the relay's code,
+before P1e-2 changes it (run [46134786508](https://github.com/gjovanov/roomler-ai/actions/runs/46134786508), at
+P1e-2's first commit, the ticket's claim), and so do T30 (run
+[46126563806](https://github.com/gjovanov/roomler-ai/actions/runs/46126563806)) and T31 (run
+[46126563740](https://github.com/gjovanov/roomler-ai/actions/runs/46126563740)), at P1e-2's cells; T32 passes there,
+and pins that with the switch off no relay is told a floor. The names state the property.
 
 **Server (P1).** The integration cells run in `.github/workflows/integration-tests.yml`, job `integration`, step
 "Run the suite" (`:288`). A PR fires that lane only through its path filter (`:44-59`), which lists
 `crates/tests/**` and neither `crates/modules/**` nor `crates/core/**`, so each P1 PR carries its cells in
 `crates/tests`. Each cell starts its servers with the switch on, except a server that shows the switch off (T6,
-T14, T18, T22).
+T14, T18, T22, T32).
 
 | # | Cell | Phase | Asserts |
 |---|---|---|---|
@@ -517,16 +593,23 @@ T14, T18, T22).
 | T22 | `a_pod_switched_off_ends_and_refuses_no_derp_registration` | P1d | T18 for DERP: on a pod with `rc.agent_token_rotation=false`, beside rotations committed on a pod with it on, nothing of P1d's DERP half runs. In T19's setup the pod refuses no registration, and last-writer-wins as before; in T21's setup the pod ends no registration through two periods |
 | T24 | `the_work_a_commit_starts_runs_to_its_end_when_the_request_drops` | P1e | two servers; the device's socket and its overlay join on the second (on the first without Redis). The seam (`rotation_work::CommitSeam`) holds the work right after the commit, the client closes its connection, and the seam lets the work go on: the `first` row, the node Offline, the `credential_rotation` order queued, and the device's socket on the second server ended by the control event |
 | T25 | `an_answer_asked_again_waits_for_the_work_of_its_commit` | P1e | with the work held at the seam, an answer asked again with the same token and key waits, on the pod that committed and on another server, and is given at G+1 once the work has run, after the `first` row. With the work held past `REPLAY_WAIT_SECS`, an answer asked again on either pod is given at G+1 within the bound |
+| T31 | `the_commit_pushes_the_floor_to_every_relay_before_it_answers` | P1e | a stand-in regional relay whose `/stats` reports `floors`, polled once a minute: when the route's answer arrives, the relay has been pushed a set that verifies with the ticket key's public half and names the device's key at G+1, until at least the request's time plus `DERP_TICKET_TTL` and `DERP_TICKET_LEEWAY_SECS`. A ticket minted to the device's control socket at G+1 carries G+1 |
+| T32 | `with_the_switch_off_no_relay_is_told_a_floor` | P1e | the control: a server with `rc.agent_token_rotation=false` and a ticket key, and a stand-in relay whose `/stats` reports `floors`, polled every second: the relay is pushed no floor set through three polls |
 
 | # | Cell | Phase | Asserts | Lane, step |
 |---|---|---|---|---|
 | T9 | `rotation_admission` | P1a | the admission's truth table: the claim's generation against the row's, the last rotation's generation and key hash, and `exp` | `ci.yml` job `rust-unit`, "Run fleet module unit tests" (`:542-543`) |
-| T10 | `credential_rotation_hook_runs_leave_then_order` | P1d | the hook's effects in order, against a stand-in state: the node offline, the DERP end at the new generation, the order; a rate-limited order is placed once more later and is not the hook's error; an order that cannot be written is, after the other two ran | `rust-unit`, "Run the remaining crates' unit tests" (`:568-577`, `-p roomler-ai-mod-network`) |
+| T10 | `credential_rotation_hook_runs_leave_then_order` | P1d, P1e | the hook's effects in order, against a stand-in state: the node offline, the DERP end at the new generation, the regional relays' floor at it (P1e), the order; a rate-limited order is placed once more later and is not the hook's error; an order that cannot be written is, after the other effects ran | `rust-unit`, "Run the remaining crates' unit tests" (`:568-577`, `-p roomler-ai-mod-network`) |
 | T20 | `the_derp_registry_keeps_the_registration_of_the_higher_generation` | P1d | T16 for DERP (`DerpGenerations::admit`): with the rotation on, a registration below the one in place for its key is refused (`BelowGeneration`) and the one in place stays, its cancel unfired; an equal and a higher generation replace it; two registrations of two generations at once leave the higher one in place, 500 times; with the rotation off, last-writer-wins as before | "Run the remaining crates' unit tests" |
 | T23 | `the_derp_registry_admits_nothing_below_an_ended_generation` | P1d | T12 for DERP: after an end, a registration below its generation is refused and writes nothing; before it, the end closes it by its cancel, also once a newer registration took its key; a registration at the end's generation is admitted either way and the end leaves it alone; the end is the agent's and the tenant's | "Run the remaining crates' unit tests" |
 | T11 | `a_rotated_generation_is_refused_with_its_own_reason` | P1a | `generation_refusal`: below a generation a rotation made, the rotation's text; below one a removal made, the removal's; equal, none; the switch off, none | "Run fleet module unit tests" |
 | T12 | `the_hub_admits_no_connection_below_a_rotated_generation` | P1b | a registration below the pod's floor is refused, and the sweep ends the entries below the floor and keeps one at it, in either order of sweep and registration | "Run fleet module unit tests" |
 | T16 | `the_hub_keeps_the_entry_of_the_higher_generation` | P1c | with the rotation on, a registration below the entry it would replace is refused (`BelowFloor`) and the entry stays, its cancel unfired; a higher generation replaces a lower one; a registration of each of two generations at once leaves the higher one's entry, 500 times; with the rotation off, a registration is admitted as before P1c | "Run fleet module unit tests" |
+| T26 | `a_relay_refuses_a_ticket_below_its_floor` | P1e | a ticket below its key's floor is refused and writes nothing: the registration in place stays and keeps relaying. A ticket at or above the floor is admitted. A ticket without the generation is admitted for a key with no floor, and refused for a key with one | `rust-unit`, "Run the PoP relay's tests" (`:598-599`, `-p derp-relay --bins`) |
+| T27 | `a_relay_ends_a_registration_below_a_floor_that_arrives` | P1e | a floor that arrives ends each live connection below it through the socket's own close: the registration in place, and a connection whose registration a newer one replaced; the ended registration leaves the registry. The registration at the floor stays and relays, and a new one at the floor is admitted | "Run the PoP relay's tests" |
+| T28 | `a_relay_keeps_the_registration_of_the_higher_generation` | P1e | T20 for a regional relay: while it holds a floor set, two registrations of one key at two generations at once leave the higher one in place, 500 times; once it hears a probe, every later probe reaches it and none reaches the lower one | "Run the PoP relay's tests" |
+| T29 | `a_relays_floors_only_rise_and_last_until_their_tickets_end` | P1e | an older set with a lower floor, the same set again and a set without the key lower no floor; a floor holds to its `until` and is dropped past it; a relay that restarts holds its floors from `DERP_FLOORS_FILE` before any push, and admits a ticket at the floor | "Run the PoP relay's tests" |
+| T30 | `a_ticket_carries_its_generation_and_an_old_relay_still_verifies_it` | P1e | a ticket minted at a generation carries it as the claim `gen`, and it round-trips; the claims as a relay before P1e decodes them, without the field, decode such a ticket; a ticket minted without the generation decodes with none | "Run the remaining crates' unit tests" (`-p roomler-ai-remote-control`) |
 
 **Device (P2 to P4).** These cells use the conversion's `Host` trait and its fake (`one_row.rs:1695-1756`, the fake
 at `:4465`) and record the order of the effects. They compile on every platform, and they hand in keys rather than
@@ -585,7 +668,7 @@ ledger's key digests.
 | F7 | a conversion where one of the person's orgs is already root's (the "retired" fate), beside a moved one | root's own row in that org keeps its generation; the moved row's is +1 |
 | F8 | F5, with a remote-control session and an SSH connection on a moved row opened within the clean-run threshold and held past it | `Status` reads `rekey_pending` while either is live, neither is cut, and the re-key completes after both end |
 
-P1 changes nothing on a device: no release calls the route before P3. Its cells are T1 to T25, and its effects are
+P1 changes nothing on a device: no release calls the route before P3. Its cells are T1 to T32, and its effects are
 read in the field with P3's cells.
 
 ## Phases
@@ -602,16 +685,27 @@ phase, which is now P1f: P1e-1 makes the work a commit starts run to its end and
 and P1e-2 makes every regional DERP relay hold A and B for the device's generation. D5's text below stands as
 decided; the PR it names, the one that completes P1 and turns the switch on, is P1f's.
 
+P1f's precondition, decided with P1e-2: every app pod runs P1e, and has for longer than `DERP_TICKET_TTL` plus
+`DERP_TICKET_LEEWAY_SECS` (24 h 5 min), so every ticket that verifies carries its generation; and every regional relay
+runs P1e's relay. From then on no relay admits a ticket without the generation while the switch is on: none verifies
+any more (the wait), and for a key with a floor a relay ranks such a ticket below every generation (its rule). That
+strands no node. A node does not ask for another ticket when a relay refuses one: it asks on its own timer, at 90 % of
+the ticket's `exp` (`agents/roomlerd/src/signaling.rs:5254-5273`, master `590f7e9ba`). After the wait, though, every
+ticket that verifies carries its generation, so turning the switch on refuses no node's ticket for lacking one.
+
+Before any agent rotates (P3), a daemon's first connection at its new generation holds a ticket of that generation
+(#4569).
+
 | Phase | What | Kill switch, or back-out | Status |
 |---|---|---|---|
 | P1a | Server: the route, its admission and replay, the conditional update with its once-an-hour ceiling (429, T13), `token_rotation` on the row, the audit with the caller's IP and its index set, the refusal reason for a generation a rotation retired (Q2), the composition baseline; the route in `docs/api.md` | `rc.agent_token_rotation`, off by default | MERGED (#4470) |
 | P1b | Server: each control socket records its generation; the commit ends the agent's sockets below the new generation on every pod (`end_below_generation`), and each pod keeps a floor at registration; T1's second half (the agent socket's upgrade and a DERP dial admit G+1 and refuse G, and a renewal with the token of G after the commit is refused) | the same switch, off by default | MERGED (#4517) |
 | P1c | Server: only the device's current generation holds its Hub entry, on every pod. The registration reads the row after the hello and judges the generation by FR-103's rule; the entry of a higher generation stays; every pod's check ends an entry below its row's generation within N, one period of `rc.presence_sweep_secs`; T15 to T18 | the same switch, off by default: with it off, nothing of P1c runs | MERGED (#4530) |
 | P1d | Server: the core hook `agent_credentials_rotated`, called once after a commit; the network module takes the node offline, ends its DERP registrations below the new generation and queues an FR-40 order (`credential_rotation`, placed once more after a rate-limit refusal); a failure logged, counted (`credential_rotation_hook_failed_total`) and audited (`hook_failed`). Only the device's current generation holds its DERP registration, on every pod: the end through P1b's event and the sync hook `end_below_generation`, the floor, the read at the registration, the registration of a higher generation stays, every pod's check; T4's DERP half, T5, T10, T19 to T23 | the same switch, off by default: with it off, nothing of P1d's DERP half runs, and no commit calls the hook | MERGED (#4557) |
-| P1e | Server, in two PRs. **P1e-1:** the work a commit starts runs in a task of its own to its end, and the route answers after it; an answer asked again waits for that work on every pod, by the task's end or the row's mark (`token_rotation.settled_at`), at most 10 s (`credential_rotation_replay_unsettled_total` past it); T24, T25. **P1e-2:** every regional DERP relay admits a registration only at the device's current generation, and ends one below it within one poll; T26 to T32 | the same switch, off by default: with it off, no work starts and a replay is answered at once | in review (P1e-1 #4565; P1e-2 next) |
-| P1f | Server: **the switch on by default** (D5), `rc.agent_token_rotation` | `rc.agent_token_rotation` off: 404, fleet-wide | — |
+| P1e | Server, in two PRs. **P1e-1:** the work a commit starts runs in a task of its own to its end, and the route answers after it; an answer asked again waits for that work on every pod, by the task's end or the row's mark (`token_rotation.settled_at`), at most 10 s (`credential_rotation_replay_unsettled_total` past it); T24, T25. **P1e-2:** a DERP ticket carries the generation of the control socket it was minted to; every regional DERP relay admits a registration only at the device's current generation, and ends one below it within one poll plus the push's bound: the commit stores a floor per key where every pod reads it and pushes it to every relay that takes floors before the route answers, every poll pushes the live floors again, a relay merges them by the higher generation and keeps them in a file across a restart, and while a set is live the registration of the higher generation stays; T26 to T32 | the same switch, off by default: with it off, no work starts and a replay is answered at once, and no floor is stored or pushed | P1e-1 MERGED (#4565); P1e-2 in review (#4568) |
+| P1f | Server: **the switch on by default** (D5), `rc.agent_token_rotation`. Before it: every app pod runs P1e, and has for longer than `DERP_TICKET_TTL` plus `DERP_TICKET_LEEWAY_SECS`, and every regional relay runs P1e's relay (the note above) | `rc.agent_token_rotation` off: 404, fleet-wide | — |
 | P2 | Device: `splice_current` in the undo and `--revert`; the child verb `refresh-legacy` | `ROOMLERD_ONE_ROW_SPLICE=0`, which fails closed | — |
-| P3 | Device: `rekey.json`, the one-row lock, the re-key in each moved enrollment's loop (Q1), `Status`'s `credentials`, the conversion's bounded wait and its report; the release notes' line on `--revert` | `ROOMLERD_CREDENTIAL_ROTATION=0` | — |
+| P3 | Device: `rekey.json`, the one-row lock, the re-key in each moved enrollment's loop (Q1), `Status`'s `credentials`, the conversion's bounded wait and its report; the release notes' line on `--revert`. Before any agent rotates, a daemon's first connection at its new generation holds a ticket of that generation (#4569) | `ROOMLERD_CREDENTIAL_ROTATION=0` | — |
 | P3b | Device: every root-daemon config write takes the one-row lock (D2) | its own PR names it | — |
 | P4 | Device: Macs converted by an earlier release, at start; D4's count | `ROOMLERD_ONE_ROW_REKEY_EXISTING=0` | — |
 | P5 | Docs: `docs/device-credentials.md` (a rotation section, the commit's sequence as a mermaid diagram), `docs/installation.md` (the one-row Mac: what a conversion does to credentials, and `--revert`), `docs/README.md`'s rows | none | — |
@@ -642,9 +736,9 @@ decided; the PR it names, the one that completes P1 and turns the switch on, is 
 - [ ] **AC9** (Q2, P1a, T11): a token of a generation a rotation retired is refused with its own reason, distinct
   from a removal's.
 - [ ] **AC10**: each phase's switch is proven both ways: P1's by T6 (P1c's parts by T15 to T17 on, and T18 off;
-  P1d's DERP half by T19 to T21 on, and T22 off; P1e-1 by T24 and T25 on, and T6's replay off), P2's by M5, P3's by
-  F6, P4's by M21.
-- [ ] **AC11**: the test cells above, M6, M16, T14, T18, T22 and T1's P1b half aside, fail on master before their PR,
+  P1d's DERP half by T19 to T21 on, and T22 off; P1e-1 by T24 and T25 on, and T6's replay off; P1e-2 by T26 to T31
+  on, and T32 off), P2's by M5, P3's by F6, P4's by M21.
+- [ ] **AC11**: the test cells above, M6, M16, T14, T18, T22, T32 and T1's P1b half aside, fail on master before their PR,
   and every cell passes in the lane named.
 - [ ] **AC12** — Docs updated in house style (tables, the commit's sequence as a mermaid diagram, `file:line`
   anchors): `docs/device-credentials.md`'s rotation section, `docs/installation.md`'s one-row Mac (what a
@@ -665,6 +759,17 @@ decided; the PR it names, the one that completes P1 and turns the switch on, is 
   registration below its row's current `token_gen` within N, one period of `rc.presence_sweep_secs` (30 s by
   default) plus one read, also a pod that the commit's control event does not reach; the pod that commits, and a
   pod the event reaches, end it within 5 s. With the switch off, no check runs.
+- [ ] **AC17** (P1e-2, A at the relays, T26, T28, T29, T30, T32): while the switch is on, a regional relay admits a
+  registration only at the device's current generation, whatever the timing: a ticket below its key's floor is
+  refused at the upgrade and at the registration and writes nothing, so the registration in place stays and keeps
+  relaying; while the relay holds a live set, a registration below the one in place for its key is refused; and a
+  relay that restarts holds its floors before any push. A relay before P1e verifies a ticket that carries the
+  generation. With the switch off, no relay is told a floor.
+- [ ] **AC18** (P1e-2, B at the relays, T27, T31, T32): while the switch is on, every regional relay the API reaches
+  ends a registration below the device's current generation within N, one period of `relay.stats_poll_secs` (30 s
+  by default) plus the poll's reads of the relays' `/stats` and the push's bound (4 s); a relay the commit's push
+  reaches holds the floor before the route answers. A relay keeps each floor at least as long as a ticket below it
+  lives. With the switch off, no relay is told a floor.
 - [ ] **AC19** (P1e-1, T24, T25): while the switch is on, the work a rotation's commit starts runs to its end, also
   when the request that committed drops: the `first` row, the node Offline, the `credential_rotation` order queued
   and the control event's end on every other pod. An answer asked again, on the pod that committed or on any other,

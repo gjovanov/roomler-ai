@@ -69,6 +69,7 @@ pub mod notify;
 pub mod origin;
 pub mod quota;
 pub mod rate_limit;
+pub mod relay_floors;
 pub mod relay_load;
 pub mod state;
 pub mod storage;

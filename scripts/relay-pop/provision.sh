@@ -49,6 +49,10 @@ iptables -C INPUT -p tcp --dport 9641 ! -i lo -j DROP 2>/dev/null || \
 iptables -A INPUT -p tcp --dport 9641 ! -i lo -j DROP
 netfilter-persistent save >/dev/null
 
+# FR-155 P1e — the derp-relay's generation floors file lives here
+# (DERP_FLOORS_FILE in docker-compose.pop.yml), kept across re-creation.
+mkdir -p "$POP/state"
+
 # ── TLS: acme.sh HTTP-01 standalone on :80, one cert covering both names ────
 mkdir -p "$POP/certs"
 if [ ! -d "$HOME/.acme.sh" ]; then

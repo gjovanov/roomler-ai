@@ -183,6 +183,77 @@ old workers until they close. A new `derp-relay` binary takes effect with
 `docker compose -f docker-compose.pop.yml restart derp-relay`, which drops the
 PoP's DERP sockets; the nodes reconnect at once.
 
+## Generation floors (FR-155 P1e)
+
+Since FR-155 P1e a node's ticket carries the token generation of the control
+socket it was minted to (`gen`), and the API tells every PoP that takes them the
+generation floors of the devices whose token rotated
+([the spec](../../docs/fr/FR-155-one-row-new-credentials.md#every-regional-relay-holds-a-and-b-for-the-devices-generation-p1e)).
+While the token rotation is on (`rc.agent_token_rotation` and
+`rc.token_generation_check` on the API), a PoP:
+
+- admits a registration only at the device's current generation;
+- ends a registration below it before the rotation's route answers when the
+  commit's push reaches it, and otherwise at the API's next poll (every 30 s);
+- keeps, for each key, the registration of the higher generation, while the
+  API's last set is live.
+
+A floor is keyed by what the registry already keys by, the overlay network and
+the WG public key, so a PoP learns no new identifier and logs no agent id.
+
+| Part | Where | What it does |
+|---|---|---|
+| The push | `POST /stats/floors`, under the prefix nginx already proxies (`floors_push`, `crates/derp-relay/src/main.rs:996`) | the API's live floors as one EdDSA JWT signed with the ticket key (audience `derp-floors`), with the set's `ttl`, three polls. `204` when merged, `401` when it does not verify, `400` when the body is not text. A refused set changes nothing |
+| The merge | `Floors::merge` (`crates/derp-relay/src/main.rs:367`) | entry by entry, by the higher generation and the later `until`, so an older, repeated or partial set lowers no floor and ends none sooner. A floor holds while `now <= until` on the PoP's clock; the API sets `until` past every ticket below the floor |
+| The refusal | the upgrade (`crates/derp-relay/src/main.rs:1243-1253`) and the registration (`admit`, `:509`) | a ticket below its key's floor, or one without `gen` for a key with a floor, is answered `401` at the upgrade, as a ticket that does not verify is, and refused at the registration, under the key's registry entry. A refusal writes nothing, and the registration in place stays and keeps relaying |
+| The end | `end_below` (`crates/derp-relay/src/main.rs:537`) | a set that raises a floor ends each live connection below it, through the socket's own close |
+| The higher generation | `admit` (`crates/derp-relay/src/main.rs:509`) | while a set is live (one arrived within its `ttl`), a registration below the generation of the one in place for its key is refused. An equal or a higher one replaces it. With no live set, a re-registration is last-writer-wins, as before P1e |
+| A restart | `DERP_FLOORS_FILE` (`crates/derp-relay/src/main.rs:955-965`): `/var/lib/derp-relay/floors.json` in the container, `/opt/relay-pop/state/floors.json` on the host | every change is written to `floors.json.tmp` and renamed over the file, which the start reads, so a PoP holds its floors before the API's first push |
+
+A PoP that hears no API keeps admitting every ticket at or above its key's floor,
+and every ticket for a key with none. With the switch off the API pushes no set,
+so a PoP holds no live set and refuses no ticket for its generation; a floor it
+already holds lasts to its `until`.
+
+`GET /stats` reports `floors`, counts and a time, never a key. Its presence is
+how the API knows the PoP takes floors: a PoP whose `/stats` has no `floors`
+runs a relay from before P1e, and the API pushes it nothing.
+
+| Field | What |
+|---|---|
+| `held` | the floors held whose `until` has not passed |
+| `newest_iat` | the `iat` of the newest set merged (unix seconds), `null` before the first |
+| `set_live` | whether a set arrived within its `ttl` |
+| `kept` | `file` with `DERP_FLOORS_FILE` set, `memory` without |
+| `refused_total` | tickets refused at the upgrade and registrations refused, since the process started |
+| `ended_total` | connections ended by a floor that arrived, since the process started |
+
+| Event | Level | Message | Fields |
+|---|---|---|---|
+| the start read the file | INFO | `derp-relay: holding the generation floors its file keeps` | `held`, `path` |
+| the file cannot be read, or does not parse | WARN | `derp-relay: the floors file is unreadable; holding none until the API's next push`, or `… does not parse; …` | `path`, `e` |
+| `DERP_FLOORS_FILE` is unset | WARN | `DERP_FLOORS_FILE is unset: the generation floors are kept in memory only, and a restart holds none until the API's next push` | |
+| a write failed | WARN | `derp-relay: the floors file could not be written` | `path`, `e` |
+| a set raised floors | INFO | `derp-relay: generation floors rose` | `raised` |
+| a set ended connections | INFO | `derp-relay: connections below a generation floor that arrived end` | `ended` |
+| each connection it ends | INFO | `derp-relay: a registration below its key's generation floor ends` | `network` |
+| a registration refused | INFO | `derp-relay: registration refused` | `network`, `reason` (`below its key's generation floor`, or `below the generation of the registration in place`) |
+| a ticket refused at the upgrade | DEBUG | `derp-relay: a ticket below its key's generation floor` | `network` |
+| a set that does not verify | DEBUG | `derp-relay: refused a floor set` | `e` |
+
+**The roll: every PoP first, then the API's pods.** On each PoP, stage the kit
+and the binary as in step 2 of the bring-up, then re-run
+`bash /opt/relay-pop/provision.sh`. It creates `/opt/relay-pop/state`, and its
+`docker compose up -d` re-creates `derp-relay` with the variable and the volume,
+which drops the PoP's DERP sockets once; the nodes reconnect at once. A
+`restart` alone keeps the container's old environment, without the file. Then
+read the PoP's `GET https://derp-{region}.roomler.ai/stats`: `floors` with
+`"kept": "file"`. A relay from before P1e verifies a ticket that carries `gen`,
+and a P1e relay admits a ticket without it for a key with no floor, so pods and
+PoPs of either release work together while the switch is off. Going back to an
+older binary needs nothing else. P1f, the switch on, comes after every regional
+PoP runs this relay.
+
 ## The drop lines (FR-148 D52)
 
 `derp-relay` drops a frame it cannot pass on, as the central relay does, and
@@ -200,8 +271,8 @@ looked for here ([every drop on the relay path](../../docs/overlay-communication
 so a line here matches the nodes' lines and the central relay's. A total counts
 every drop of its cause since the process started, logged or not; a line
 between two others says how many fell between. The two forward drops are
-counted and paced in `ForwardDrops` (`crates/derp-relay/src/main.rs:996`,
-pacing `drop_log_due`, `:1043`); each cause keeps the last line's time for at
+counted and paced in `ForwardDrops` (`crates/derp-relay/src/main.rs:1417`,
+pacing `drop_log_due`, `:1464`); each cause keeps the last line's time for at
 most 4,096 network and destination pairs, and a pair past that waits for a
 sweep, at most one a window. A frame shorter than 32 bytes or longer than
 2,048 is still dropped without a count.
