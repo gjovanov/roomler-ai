@@ -72,10 +72,16 @@ fn setup() -> &'static Setup {
         // #3443 — with `RUST_LOG` set, the device side's own lines (the
         // handler, the grace, the recorder supervisor) go to stderr, so a
         // failed run keeps how its recording ended. Without it the binary
-        // has no subscriber: what it checks is the wire.
+        // has no subscriber: what it checks is the wire. The lines are plain:
+        // stderr here is a test's output, never coloured (#3938).
         if std::env::var_os("RUST_LOG").is_some() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test's own stderr under RUST_LOG, never coloured (root clippy.toml, #3938)"
+            )]
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_ansi(false)
                 .with_writer(std::io::stderr)
                 .try_init();
         }
