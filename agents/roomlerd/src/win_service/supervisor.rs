@@ -2087,13 +2087,33 @@ pub fn run(
                         spawn_args.extend(pin_args.iter().map(String::as_str));
                         spawn_args.extend(end_args.iter().map(String::as_str));
                         spawn_args.extend(wait_args.iter().map(String::as_str));
+                        // FR-156 P1c — a live-work switch this service reads
+                        // from a value set in its own environment goes to the
+                        // worker too, which runs in the person's environment.
+                        // None set, every host today: today's spawn.
+                        let env = worker_env(|name| std::env::var(name).ok());
+                        for (name, value) in &env {
+                            tracing::info!(
+                                name = %name.to_string_lossy(),
+                                value = %value.to_string_lossy(),
+                                "supervisor: FR-156 P1c — the worker is handed this service's live-work switch"
+                            );
+                        }
                         // SAFETY: `spawn_handle` is a live primary/user
                         // token — either the WTSQueryUserToken result or
                         // its duplicated elevated linked token; both
                         // OwnedHandles outlive this call. CreateProcessAsUserW
-                        // duplicates any handles it needs.
+                        // duplicates any handles it needs. The same holds for
+                        // both spawns below.
                         crash_sweep::before_start(crash_sweep.as_ref()); // #3799
-                        match unsafe { spawn_in_session(spawn_handle, &worker_exe, &spawn_args) } {
+                        let spawned = if env.is_empty() {
+                            unsafe { spawn_in_session(spawn_handle, &worker_exe, &spawn_args) }
+                        } else {
+                            unsafe {
+                                spawn_in_session_env(spawn_handle, &worker_exe, &spawn_args, &env)
+                            }
+                        };
+                        match spawned {
                             Ok(p) => {
                                 tracing::info!(
                                     pid = p.pid,
@@ -3058,6 +3078,108 @@ pub unsafe fn spawn_into_job(
         stderr: err_r,
         stdin: parent_in,
     })
+}
+
+/// FR-156 P1c — the variables laid over the person's own block for the worker
+/// this service starts as the person: each live-work switch the service reads
+/// from a value set in its own environment (its `Environment`, or the machine
+/// environment it was started with), under the current spelling, with the value
+/// the service's own read gives it ([`tunnel_core::env::worker_switches`]).
+///
+/// The person's block ([`EnvBlock::for_token`]) holds none of the service's
+/// environment. Without this, `set-service-env-var` turning a switch off would
+/// reach the service and not its worker. For `ROOMLERD_LIVE_WORK_PROOF` that is
+/// the service's SSH server (port 2223) sending no keepalives while the worker
+/// still counts only a connection heard from within its window: an idle SYSTEM
+/// session through 2223 stops counting, and an update cuts it. A value set only
+/// where the worker reads it and the service does not (the machine environment
+/// after boot, the person's own) still reaches the worker alone, which leaves
+/// the keepalives on and the counting off, the safe way round.
+///
+/// Empty when the service sets none of them, and the worker's spawn is then
+/// today's ([`spawn_in_session`]).
+fn worker_env(read: impl Fn(&str) -> Option<String>) -> Vec<(OsString, OsString)> {
+    tunnel_core::env::worker_switches(read)
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect()
+}
+
+/// FR-156 P1c — [`spawn_in_session`] with `env` laid over the person's own
+/// block: the worker this service starts as the person, handed the live-work
+/// switches the service reads ([`worker_env`]). It is the same call but for the
+/// block, `CreateEnvironmentBlock`'s with `env` merged in by
+/// [`merge_env_block`], as [`spawn_into_job`] builds it. Keep the two in step.
+/// `spawn_in_session` itself is left as it was, so a service that hands nothing
+/// on starts its worker exactly as before.
+///
+/// # Safety
+/// As [`spawn_in_session`]: `token` must be a valid Win32 user token, alive
+/// across the call.
+pub(crate) unsafe fn spawn_in_session_env(
+    token: HANDLE,
+    exe: &Path,
+    args: &[&str],
+    env: &[(OsString, OsString)],
+) -> Result<OwnedProcess> {
+    // The person's block is copied out and freed at the end of this statement
+    // (`EnvBlock`'s Drop); the merged copy lives until the process is created.
+    let block = merge_env_block(
+        EnvBlock::for_token(token)
+            .context("CreateEnvironmentBlock")?
+            .entries(),
+        env,
+    )?;
+
+    // The command line as `spawn_in_session` builds it.
+    let mut cmdline = String::with_capacity(exe.as_os_str().len() + 32);
+    cmdline.push('"');
+    cmdline.push_str(&exe.to_string_lossy());
+    cmdline.push('"');
+    for a in args {
+        cmdline.push(' ');
+        cmdline.push_str(a);
+    }
+    let mut cmdline_w = encode_wide(OsStr::new(&cmdline));
+
+    let exe_w = encode_wide(exe.as_os_str());
+
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    // The interactive desktop (`spawn_in_session` says why).
+    let mut desktop_w = encode_wide(OsStr::new("winsta0\\default"));
+    si.lpDesktop = desktop_w.as_mut_ptr();
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    // SAFETY: all buffers, `block` among them (a well-formed block, from
+    // `merge_env_block`), are alive for the duration of the call; out-params
+    // are valid mutable pointers; the flags are `spawn_in_session`'s.
+    let ok = unsafe {
+        CreateProcessAsUserW(
+            token,
+            exe_w.as_ptr(),
+            cmdline_w.as_mut_ptr(),
+            std::ptr::null_mut(), // process security attributes
+            std::ptr::null_mut(), // thread security attributes
+            FALSE,                // inherit handles
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            block.as_ptr() as *const c_void,
+            std::ptr::null(), // current directory — let the user's profile decide
+            &si,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        // SAFETY: GetLastError is a thread-local read.
+        let err = unsafe { GetLastError() };
+        bail!("CreateProcessAsUserW({}) failed (err {err})", exe.display());
+    }
+    Ok(OwnedProcess::from_raw_parts(
+        pi.hProcess,
+        pi.hThread,
+        pi.dwProcessId,
+    ))
 }
 
 /// A `STARTUPINFOEXW` whose handle list bounds inheritance to the handles
@@ -4103,6 +4225,24 @@ mod tests {
                 "{name:?}={value:?} must be refused"
             );
         }
+    }
+
+    /// FR-156 P1c-5 — the live-work switch the service hands on replaces the
+    /// person's own of that name however it is cased, as Windows compares names,
+    /// so the worker's block holds one entry of it: the service's.
+    #[test]
+    fn the_services_live_work_switch_replaces_the_persons_own() {
+        let env = worker_env(|name| (name == "ROOMLERD_LIVE_WORK_PROOF").then(|| "0".to_string()));
+        let base = vec![wide(r"Path=C:\Windows"), wide("roomlerd_live_work_proof=1")];
+        let block = merge_env_block(base, &env).unwrap();
+        let named: Vec<String> = entries_of(&block)
+            .into_iter()
+            .filter(|e| {
+                e.to_ascii_uppercase()
+                    .starts_with("ROOMLERD_LIVE_WORK_PROOF=")
+            })
+            .collect();
+        assert_eq!(named, ["ROOMLERD_LIVE_WORK_PROOF=0"]);
     }
 
     /// FR-90 P1i — the process is in its job, and sees the session's variable

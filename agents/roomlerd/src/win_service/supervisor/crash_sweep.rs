@@ -442,12 +442,14 @@ mod tests {
 
     /// Every worker start in the supervisor waits for the sweep first: both
     /// arms, the person's and the SystemContext one, ask for it before they
-    /// spawn.
+    /// spawn. The person's arm spawns one of two ways, today's or with the
+    /// service's live-work switches handed on (FR-156 P1c), and both count.
     #[test]
     fn every_worker_start_asks_for_the_sweep_first() {
         let source = include_str!("../supervisor.rs");
         let spawns = [
             "unsafe { spawn_in_session(spawn_handle,",
+            "spawn_in_session_env(spawn_handle,",
             "winlogon_token::spawn_system_in_session(&token,",
         ];
         for spawn in spawns {
