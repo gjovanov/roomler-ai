@@ -747,10 +747,26 @@ fn spawn_flow_logger(flow_id: u32, stats: Arc<FlowStats>) -> tokio::task::JoinHa
 /// are awaited so half-close survives a duplex flow.
 pub async fn run_flow_quic(
     tcp: TcpStream,
+    send: SendStream,
+    recv: RecvStream,
+    flow_id: u32,
+    stats: Arc<FlowStats>,
+) -> CloseReason {
+    run_flow_quic_until(tcp, send, recv, flow_id, stats, std::future::pending()).await
+}
+
+/// [`run_flow_quic`] that `stop` can end. When `stop` resolves first, both
+/// halves are aborted and awaited, so the flow's TCP socket and stream
+/// halves are dropped before this returns, and the flow reads
+/// `ServerTerminated`. The exit runs its flows under the session's stop
+/// (`agents/roomlerd/src/tunnel/quic_peer.rs`).
+pub async fn run_flow_quic_until(
+    tcp: TcpStream,
     mut send: SendStream,
     mut recv: RecvStream,
     flow_id: u32,
     stats: Arc<FlowStats>,
+    stop: impl std::future::Future<Output = ()>,
 ) -> CloseReason {
     // P3b-3: hold an `active_flows` gauge for this flow's pump lifetime
     // (no-op when not session-tracked). Drops on return AND on abort.
@@ -829,8 +845,31 @@ pub async fn run_flow_quic(
         }
     });
 
-    let r1 = tcp_to_quic.await.unwrap_or(CloseReason::IoError);
-    let r2 = quic_to_tcp.await.unwrap_or(CloseReason::IoError);
+    let halves = [tcp_to_quic.abort_handle(), quic_to_tcp.abort_handle()];
+    let both = async move {
+        let r1 = tcp_to_quic.await.unwrap_or(CloseReason::IoError);
+        let r2 = quic_to_tcp.await.unwrap_or(CloseReason::IoError);
+        (r1, r2)
+    };
+    tokio::pin!(both);
+    tokio::pin!(stop);
+    let ended = tokio::select! {
+        pair = &mut both => Some(pair),
+        () = &mut stop => None,
+    };
+    let reason = match ended {
+        Some((CloseReason::Eof, CloseReason::Eof)) => CloseReason::Eof,
+        Some(_) => CloseReason::IoError,
+        None => {
+            for half in &halves {
+                half.abort();
+            }
+            // An aborted task's handle resolves once its future is dropped,
+            // so the socket and stream halves are gone when this returns.
+            let _ = both.await;
+            CloseReason::ServerTerminated
+        }
+    };
 
     let (read_total, send_total, recv_total, write_total, _mb) = stats.snapshot();
     info!(
@@ -842,12 +881,7 @@ pub async fn run_flow_quic(
         "tunnel flow closed (quic) — final throughput totals"
     );
     logger_handle.abort();
-
-    if matches!(r1, CloseReason::Eof) && matches!(r2, CloseReason::Eof) {
-        CloseReason::Eof
-    } else {
-        CloseReason::IoError
-    }
+    reason
 }
 
 // ────────────────────────────────────────────────────────────────────────────

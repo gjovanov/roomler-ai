@@ -3198,6 +3198,10 @@ pub enum ServerMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         reason: CloseReason,
+        /// Asks the exit to close this session's connection. Absent reads
+        /// `false`; a peer without the field ignores it.
+        #[serde(default)]
+        close_connection: bool,
     },
 
     /// Server → client: status changed mid-session (admin set
@@ -7143,6 +7147,66 @@ mod tests {
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""reason":"client_shutdown""#));
+    }
+
+    /// `close_connection` is additive: a terminate that does not carry it
+    /// decodes with it unset.
+    #[test]
+    fn a_tunnel_terminate_without_close_connection_decodes_unset() {
+        let sid = ObjectId::new();
+        let frame = format!(
+            r#"{{"t":"rc:tunnel.terminate","session_id":"{}","reason":"server_terminated"}}"#,
+            sid.to_hex()
+        );
+        let decoded: ServerMsg = serde_json::from_str(&frame).expect("the frame decodes");
+        let wire = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(wire["session_id"], serde_json::json!(sid.to_hex()));
+        assert_eq!(wire["reason"], serde_json::json!("server_terminated"));
+        assert_eq!(
+            wire["close_connection"],
+            serde_json::json!(false),
+            "a terminate without close_connection decodes unset"
+        );
+    }
+
+    /// A terminate that asks the exit to close the connection, as this build
+    /// writes it, decodes on an agent whose decoder has no `close_connection`
+    /// (the frozen copy below), with its session and reason intact. serde
+    /// ignores an unknown field, and `ServerMsg` has no `deny_unknown_fields`.
+    #[test]
+    fn a_tunnel_terminate_that_asks_to_close_decodes_on_an_agent_without_the_field() {
+        // Spelled `rename(deserialize = …)`: the composition baseline counts
+        // every plain serde rename in this file as a wire name, and this copy
+        // is not one.
+        #[derive(Deserialize)]
+        #[serde(tag = "t")]
+        enum PinnedServerMsg {
+            #[serde(rename(deserialize = "rc:tunnel.terminate"))]
+            TunnelTerminate {
+                #[serde(with = "oid_hex")]
+                session_id: ObjectId,
+                reason: CloseReason,
+            },
+        }
+
+        let sid = ObjectId::new();
+        let frame = format!(
+            r#"{{"t":"rc:tunnel.terminate","session_id":"{}","reason":"server_terminated","close_connection":true}}"#,
+            sid.to_hex()
+        );
+        let decoded: ServerMsg = serde_json::from_str(&frame).expect("the frame decodes");
+        let wire = serde_json::to_string(&decoded).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            v["close_connection"],
+            serde_json::json!(true),
+            "this build writes close_connection back as it read it"
+        );
+
+        let PinnedServerMsg::TunnelTerminate { session_id, reason } =
+            serde_json::from_str(&wire).expect("an agent without the field decodes the frame");
+        assert_eq!(session_id, sid);
+        assert_eq!(reason, CloseReason::ServerTerminated);
     }
 
     #[test]

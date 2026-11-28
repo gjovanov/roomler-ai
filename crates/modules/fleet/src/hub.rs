@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -222,9 +222,18 @@ impl CancelReason {
 pub struct AgentCancel {
     notify: Notify,
     reason: AtomicU8,
+    /// Set by [`Hub::kick_removed_agent`]; the connection's
+    /// [`roomler_core::AgentCtx::server_ended`].
+    server_ended: roomler_core::ServerEnded,
 }
 
 impl AgentCancel {
+    /// Whether the server ended this connection itself, shared with every
+    /// arm of its socket.
+    pub fn server_ended(&self) -> roomler_core::ServerEnded {
+        self.server_ended.clone()
+    }
+
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
@@ -853,6 +862,11 @@ pub struct HubInner {
     /// FR-155 P1b — per (tenant, agent), the generation a rotation named and
     /// how long this pod refuses a registration below it (`hub::rotation`).
     floors: DashMap<(ObjectId, ObjectId), rotation::Floor>,
+    /// FR-155 P1c — whether this pod runs the token rotation, set once at
+    /// startup ([`Hub::set_token_rotation`]). While it is on, the entry of a
+    /// higher generation stays when one of a lower generation registers
+    /// (`hub::rotation`).
+    token_rotation: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -886,6 +900,7 @@ impl Hub {
                 session_slots: std::sync::OnceLock::new(),
                 slotted: DashMap::new(),
                 floors: DashMap::new(),
+                token_rotation: AtomicBool::new(false),
             }),
         }
     }
@@ -958,7 +973,8 @@ impl Hub {
         supports_exec: bool,
     ) -> (ClientTx, Arc<AgentCancel>, mpsc::Receiver<ServerMsg>) {
         // FR-155 P1b — at generation 0, which only a floor someone set for
-        // this agent refuses; the agent socket registers through
+        // this agent refuses (or, P1c, an entry above it while the rotation
+        // is on); the agent socket registers through
         // `register_agent_resuming` with the generation it checked.
         let reg = self
             .register_agent_resuming(
@@ -972,7 +988,7 @@ impl Hub {
                 0,
                 ResumeHello::default(),
             )
-            .expect("no rotation floor for a registration at generation 0");
+            .expect("nothing above generation 0 for this device on this pod");
         (reg.tx, reg.cancel, reg.rx)
     }
 
@@ -987,6 +1003,8 @@ impl Hub {
     /// FR-155 P1b — `generation` is the token generation the connection was
     /// admitted under. Below a rotation's floor on this pod the registration
     /// is refused ([`BelowFloor`]) and changes nothing (`hub::rotation`).
+    /// P1c — and so is one below the entry it would replace, while the
+    /// rotation is on ([`Hub::set_token_rotation`]).
     #[allow(clippy::too_many_arguments)]
     pub fn register_agent_resuming(
         &self,
@@ -1078,8 +1096,10 @@ impl Hub {
         // FR-138 — a row created before this instant belongs to an earlier
         // connection: the registration read's line.
         let registered_at = bson::DateTime::now();
-        // FR-155 P1b — the insert, unless a rotation's floor refuses it: the
-        // two are one step under the entry's lock (`rotation`).
+        // FR-155 P1b — the insert, unless a rotation's floor refuses it (or,
+        // P1c, the entry it would replace is of a higher generation): the
+        // checks and the insert are one step under the entry's lock
+        // (`rotation`).
         if let Some(prev) = self.admit_agent(entry)? {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
             // read-loop polling `socket_rx.next()` for up to one 25 s
@@ -1306,6 +1326,9 @@ impl Hub {
             return KickOutcome::NotRegistered;
         };
         info!("agent {} offline (removed)", agent_id);
+        // Before anything else reaches the connection: what its arms send
+        // from here on, and its teardown, carry an end the server decided.
+        entry.cancel.server_ended.set();
         self.end_agent_sessions(agent_id);
         if !goodbye {
             return KickOutcome::NotTold;
@@ -7720,6 +7743,80 @@ mod tests {
         );
     }
 
+    // ─── #4542: the connection a removal's kick ends reads server-ended ──
+
+    #[tokio::test]
+    async fn a_removal_kick_marks_the_connection_it_ends_as_ended_by_the_server() {
+        for goodbye in [true, false] {
+            let hub = test_hub().await;
+            let agent_id = ObjectId::new();
+            let (_tx, cancel, _rx) = hub.register_agent(
+                agent_id,
+                ObjectId::new(),
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                false,
+            );
+            let ended = cancel.server_ended();
+            assert!(!ended.get(), "a registered connection starts unset");
+
+            hub.kick_removed_agent(agent_id, goodbye);
+
+            assert!(
+                ended.get(),
+                "the kick (goodbye: {goodbye}) marks the connection it ended"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_other_end_the_hub_decides_leaves_the_connection_unmarked() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant_id = ObjectId::new();
+        let register = || {
+            hub.register_agent(
+                agent_id,
+                tenant_id,
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                false,
+            )
+        };
+
+        let (_tx1, first, _rx1) = register();
+        let (tx2, second, _rx2) = register();
+        assert_eq!(first.reason(), Some(CancelReason::Replaced));
+        assert!(
+            !first.server_ended().get(),
+            "a connection a newer one displaced stays unmarked"
+        );
+
+        assert_eq!(
+            hub.nudge_agent_if_idle(agent_id, false),
+            NudgeOutcome::Nudged
+        );
+        assert!(hub.cycle_agent_ws(agent_id));
+        assert_eq!(hub.cancel_all_agents(), vec![agent_id]);
+        assert!(hub.unregister_agent(agent_id, Some(&tx2)));
+        assert!(
+            !second.server_ended().get(),
+            "the idle nudge, the renumber, the shutdown and the socket's own unregistration leave it unmarked"
+        );
+
+        // Last: a rotation's floor refuses a later registration below it.
+        let (_tx3, third, _rx3) = register();
+        assert!(hub.end_below_generation(agent_id, tenant_id, 1));
+        assert!(
+            !third.server_ended().get(),
+            "a connection a rotation ended stays unmarked"
+        );
+    }
+
     #[tokio::test]
     async fn the_kick_control_event_tells_the_device_only_when_it_says_so() {
         // The pod holding the socket applies the removing pod's decision. An
@@ -8359,6 +8456,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// FR-155 P1c, T16 — while the rotation is on, the entry of a higher
+    /// generation stays when one of a lower generation registers: that
+    /// registration is refused as one below the floor is, with the entry's
+    /// generation, and the entry, its cancel and its queue are untouched. At
+    /// the entry's generation or above, a registration replaces the entry as
+    /// before, and two at once leave the entry of the higher generation.
+    /// With the rotation off, the hub admits as before.
+    #[tokio::test]
+    async fn the_hub_keeps_the_entry_of_the_higher_generation() {
+        let hub = test_hub().await;
+        hub.set_token_rotation(true);
+        assert!(hub.token_rotation());
+        let tenant = ObjectId::new();
+        let register = |hub: &Hub, agent: ObjectId, generation: u32| {
+            hub.register_agent_resuming(
+                agent,
+                tenant,
+                ObjectId::new(),
+                OsKind::Linux,
+                2,
+                true,
+                false,
+                generation,
+                ResumeHello::default(),
+            )
+        };
+
+        let agent = ObjectId::new();
+        let mut kept = register(&hub, agent, 2).expect("no floor and no entry");
+        match register(&hub, agent, 1) {
+            Err(BelowFloor { floor }) => {
+                assert_eq!(floor, 2, "refused with the entry's generation")
+            }
+            Ok(_) => panic!(
+                "the entry of the higher generation stays, and a registration below it is refused"
+            ),
+        }
+        assert!(hub.is_agent_online(agent), "the entry stays");
+        assert_eq!(kept.cancel.reason(), None, "its cancel never fired");
+        assert!(kept.rx.try_recv().is_err(), "and it was sent nothing");
+
+        // At the entry's generation, and above it, a registration replaces
+        // the entry as before.
+        let same = register(&hub, agent, 2).expect("the entry's generation registers");
+        assert_eq!(kept.cancel.reason(), Some(CancelReason::Replaced));
+        let _above = register(&hub, agent, 3).expect("a higher generation registers");
+        assert_eq!(same.cancel.reason(), Some(CancelReason::Replaced));
+
+        // Two at once, many times: whichever runs first, the entry left is
+        // the higher generation's.
+        for _ in 0..500 {
+            let agent = ObjectId::new();
+            let gate = std::sync::Barrier::new(2);
+            let (lower, higher) = std::thread::scope(|s| {
+                let lower = s.spawn(|| {
+                    gate.wait();
+                    register(&hub, agent, 1)
+                });
+                let higher = s.spawn(|| {
+                    gate.wait();
+                    register(&hub, agent, 2)
+                });
+                (lower.join().unwrap(), higher.join().unwrap())
+            });
+            let higher = higher.expect("the higher generation registers in either order");
+            assert_eq!(
+                higher.cancel.reason(),
+                None,
+                "the entry left is the higher generation's"
+            );
+            match lower {
+                Ok(lower) => assert_eq!(lower.cancel.reason(), Some(CancelReason::Replaced)),
+                Err(BelowFloor { floor }) => assert_eq!(floor, 2),
+            }
+        }
+
+        // With the rotation off, the hub admits as before.
+        let off = test_hub().await;
+        assert!(!off.token_rotation(), "off until it is set");
+        let agent = ObjectId::new();
+        let first = register(&off, agent, 2).expect("no floor and no entry");
+        let _next =
+            register(&off, agent, 1).expect("with the rotation off, the hub admits as before");
+        assert_eq!(first.cancel.reason(), Some(CancelReason::Replaced));
     }
 
     /// FR-155 P1b — the control event a rotation on another pod sends: an

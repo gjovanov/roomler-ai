@@ -94,7 +94,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
    (`crates/tunnel-core/src/overlay/netcheck.rs:207`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:4072` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:4076` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -198,15 +198,15 @@ two bound `addr:port`s selected by VNI.
 
 **This is the one change that can break the fleet silently. It ships first, alone, as P0.**
 
-`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3885`) documents itself as safe
+`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3889`) documents itself as safe
 to extend — *"an unknown/absent value ⇒ the client falls back to its local computation, so
-adding a variant later is forward-compatible"* (`:3762-3764`). **The comment is wrong about
+adding a variant later is forward-compatible"* (`:3766-3768`). **The comment is wrong about
 the "unknown" half and the code does not implement it.** The enum is a plain
 `#[derive(Deserialize)]` with `#[serde(rename_all = "kebab-case")]`, **no `#[serde(other)]`**
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2163`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:3417`).
+(`agents/roomlerd/src/signaling.rs:3428`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -221,7 +221,7 @@ Four requirements, all in P0:
    documented behaviour real. **This is a bug fix worth landing even if FR-19 never ships.**
 3. The variant stays a **unit variant**. The session is pushed **out-of-band** as its own
    `rc:overlay.relay_session` message keyed by node id. ⚠️ `RelayStrategyWire` derives
-   **`Copy`** (`crates/remote_control/src/signaling.rs:3883`); a `session` payload would break that derive and ripple through
+   **`Copy`** (`crates/remote_control/src/signaling.rs:3887`); a `session` payload would break that derive and ripple through
    `netmap.rs:92`, `relay_link.rs:1312-1315` and three by-value returns at
    `crates/modules/network/src/overlay.rs:2820/2953/3025` — and would also change the JSON from a string tag to a map.
 4. A test decoding `"org-relay"` against a **pre-FR-19 `NetmapPeer` shape**.
@@ -372,7 +372,7 @@ Verdict machinery to extend, verified against master:
 | Server verdict entry point | `crates/modules/network/src/overlay.rs:2820` `server_relay_verdict` |
 | …delegating to the pure decision | `crates/modules/network/src/overlay.rs:3025` `relay_verdict_core` |
 | Measured caps supersede presence | `crates/modules/network/src/overlay.rs:2970-2981` (in `verdict_from_nodes`, `:2953`) |
-| Wire verdict enum | `crates/remote_control/src/signaling.rs:3464` `RelayStrategyWire` |
+| Wire verdict enum | `crates/remote_control/src/signaling.rs:3468` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1289` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
@@ -527,7 +527,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `crates/remote_control/src/signaling.rs:4073` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `crates/remote_control/src/signaling.rs:4077` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".
@@ -696,7 +696,7 @@ the count `stale_drops()` reads (`transport/derp.rs:461`) as `dropped_stale` whe
 | surface | addition |
 |---|---|
 | `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`agents/roomler-cli/src/localclient.rs:2251`) |
-| `roomler peers --json` | `relay_kind: "org"`, `relay_transport: "udp"` and `relay_server`, the relay node's name (`PeerInfo`, `crates/localapi/src/lib.rs:930`; `OrgRelayConn::relay_server`, `crates/tunnel-core/src/overlay/orgrelay/client.rs:347-349`) |
+| `roomler peers --json` | `relay_kind: "org"`, `relay_transport: "udp"` and `relay_server`, the relay node's name (`PeerInfo`, `crates/localapi/src/lib.rs:942`; `OrgRelayConn::relay_server`, `crates/tunnel-core/src/overlay/orgrelay/client.rs:347-349`) |
 | `roomler why <peer>` | the relay row names the kind; the tier ladder is unchanged (§6) |
 | `roomler status` | relay node: an `org relay` line with the bound `ip:port` and `reachable (probes answered)`, or `bound — NOT yet proven reachable` until a probe is answered, then `answered=… refused: shape=… not-probe=… rate=…` (`print_status`, `agents/roomler-cli/src/localclient.rs:2858-2872`). `roomler netcheck` prints no org-relay line |
 | relay node | **one counter per refusal reason** in `RelayStats` (`crates/tunnel-core/src/overlay/orgrelay/server.rs:44-69`): unknown VNI, unbound source, not yet bound, session expired or idle, past the bind deadline, at the session cap, rate-limited, not relay-shaped, unknown control, and `drop_bad_tag1` / `drop_bad_cookie` / `drop_bad_tag2`, beside `forwarded`, `bound` and the session counts. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood. Two readers: `roomler status` (the probe responder's counters, above) and a daemon log line, `org-relay server counters`, every 300 s when they have changed (`report_loop`, `agents/roomlerd/src/relay_server.rs:143`). ⚠️ That line carries 13 counters. The session cap, `refused_not_shaped`, `refused_unknown_control` and the not-yet-bound, expired, idle and bind-deadline drops have no reader (`relay_stats()`, `:66`, has no caller). There are no per-session packet or byte counts, and no wrong-tenant reason |
@@ -705,7 +705,7 @@ the count `stale_drops()` reads (`transport/derp.rs:461`) as `dropped_stale` whe
 
 ⚠️ A pair that is not on `relay:org` is not evidence of "no relay available": the node may
 never have measured, and an unmeasured capability is `None`, never `false` (`CapVectorWire`,
-`crates/remote_control/src/signaling.rs:3533-3537`).
+`crates/remote_control/src/signaling.rs:3537-3541`).
 ⚠️ `relay_server` must resolve from **the requesting tenant's own node row**. A multi-org
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:144-146`.
@@ -727,7 +727,7 @@ Verified against `origin/master`, 2026-08-28.
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
 | Netmap shaping | `overlay.rs:2087` `shape_peer` |
-| Wire model | `crates/remote_control/src/signaling.rs:3484` `NetmapPeer`; `:3462` `RelayStrategyWire` |
+| Wire model | `crates/remote_control/src/signaling.rs:3488` `NetmapPeer`; `:3466` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
 | Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:315` `sweep_carrier_health` |
 | Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2895`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |

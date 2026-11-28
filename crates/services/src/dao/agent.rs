@@ -560,8 +560,8 @@ impl AgentDao {
     /// admission decides on the row's generation and last rotation as read,
     /// its update compares against the primary's row ([`Self::rotate_token`]),
     /// and after an update that matched nothing it reads the row again to say
-    /// why. Each read must see what the primary has applied, which a
-    /// secondary may not have yet.
+    /// why, and the agent socket's registration (P1c) reads its row here. Each
+    /// read must see what the primary has applied, which a secondary may not.
     #[expect(
         clippy::disallowed_methods,
         reason = "the token rotation tells a removed device that it was removed, as the revocation checks do"
@@ -1552,6 +1552,52 @@ impl AgentDao {
                 doc! { "$set": { "owner_user_id": owner_user_id } },
             )
             .await
+    }
+
+    /// FR-155 P1c — `(agent, tenant, token_gen)` of each row among
+    /// `agent_ids` that is live and not quarantined, read on the primary in
+    /// one query with a projection: a pod's check of the entries it holds
+    /// (`generation_check` in the fleet module). A row from before FR-103 has
+    /// no `token_gen`, which reads as 0. A removed or quarantined row is left
+    /// out, as `refusal_reason` comes before the generation everywhere.
+    pub async fn live_generations_on_the_primary(
+        &self,
+        agent_ids: &[ObjectId],
+    ) -> DaoResult<Vec<(ObjectId, ObjectId, u32)>> {
+        use futures::TryStreamExt;
+        if agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let coll = self
+            .on_the_primary
+            .collection()
+            .clone_with_type::<Document>();
+        let mut cursor = coll
+            .find(doc! {
+                "_id": { "$in": agent_ids },
+                "deleted_at": null,
+                "status": { "$ne": "quarantined" },
+            })
+            .projection(doc! { "_id": 1, "tenant_id": 1, "token_gen": 1 })
+            .await?;
+        let mut out = Vec::with_capacity(agent_ids.len());
+        while let Some(d) = cursor.try_next().await? {
+            let (Ok(agent_id), Ok(tenant_id)) =
+                (d.get_object_id("_id"), d.get_object_id("tenant_id"))
+            else {
+                continue;
+            };
+            let generation = match d.get("token_gen") {
+                None | Some(bson::Bson::Null) => Some(0),
+                Some(bson::Bson::Int32(n)) => u32::try_from(*n).ok(),
+                Some(bson::Bson::Int64(n)) => u32::try_from(*n).ok(),
+                Some(_) => None,
+            };
+            if let Some(generation) = generation {
+                out.push((agent_id, tenant_id, generation));
+            }
+        }
+        Ok(out)
     }
 }
 

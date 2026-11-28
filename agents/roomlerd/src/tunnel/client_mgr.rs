@@ -2293,12 +2293,14 @@ mod tests {
         let ours = ServerMsg::TunnelTerminate {
             session_id: sid,
             reason: CloseReason::ServerTerminated,
+            close_connection: false,
         };
         assert!(hub.intercept(ours).is_none());
         // Someone else's → passes through to the target-side handler.
         let target = ServerMsg::TunnelTerminate {
             session_id: oid(4),
             reason: CloseReason::ServerTerminated,
+            close_connection: true,
         };
         assert!(hub.intercept(target).is_some());
     }

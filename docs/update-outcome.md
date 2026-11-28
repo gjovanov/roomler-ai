@@ -160,7 +160,7 @@ read the watcher's verdict at its start and settled nothing at its clean-run mar
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
-(`crates/localapi/src/lib.rs:490`), a `LastInstallStatus` (`:587`) whose
+(`crates/localapi/src/lib.rs:490`), a `LastInstallStatus` (`:599`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` stdout line spell them so
 one grep finds all three surfaces (locked by
@@ -179,10 +179,10 @@ say:
 | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) | `WATCHER STOPPED — agent-v0.4.172 started 3d ago: <note>` | WARN |
 | `Unreadable` | a file is there and does not parse; `note` carries the error chain | `record UNREADABLE — <error> (<path>)` | WARN |
 
-The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`crates/localapi/src/lib.rs:665`): the
+The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`crates/localapi/src/lib.rs:677`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
-a record older than that (`never_reported`, `:675`).
+a record older than that (`never_reported`, `:687`).
 
 > ⚠️ **Three states must stay apart, and they do by construction.** A daemon
 > that predates the field sends no `last_install` key, and the CLI prints
@@ -323,7 +323,7 @@ $ roomler status
 - **P5 — the fleet answer.** No wire message carries the verdict yet; the
   server still infers success from a changed `agent_version` on the next
   hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7297`,
+  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7412`,
   where `update_mode` is stamped), additive `#[serde(default)]` on
   `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
   P7's shape does not cover: on Windows the first hello after an update carries
