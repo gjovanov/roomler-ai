@@ -2,16 +2,16 @@
 // Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR-BEGIN
 // This whole module IS the env-prefix fallback chain. Every occurrence of a
-// retired name in it is a prefix the chain must keep honouring
-// (`ROOMLER_AGENT_`, `ROOMLER_NODE_`), its documentation, or a test that sets one
-// to prove the field keeps working.
+// retired name in it is a prefix the chain reads or still looks for
+// (`ROOMLER_NODE_` read, `ROOMLER_AGENT_` looked for since FR-46 P2b), its docs,
+// or a test that sets one to prove the field keeps working.
 // INVARIANT: if you add a retired name here that is NOT part of that chain, that
 // is a bug, not a new exemption. docs/fr/FR-21
 //! Roomler node env-var reads with legacy-prefix fallback.
 //!
 //! The daemon was renamed `roomler-agent` → `roomlerd`, and operators set its
-//! tuning vars where no package upgrade rewrites them: a Windows service's
-//! Environment block, the registry, a systemd drop-in. Silently dropping a
+//! tuning vars by name: in a Windows service's Environment block, or in a
+//! systemd drop-in that no package upgrade rewrites. Silently dropping a
 //! spelling they use is the MajorUpgrade-drops-env-vars class of bug that
 //! already bit the fleet: the daemon starts fine and ignores what it was told.
 //! So every node env read goes through [`node_env`] with a bare SUFFIX, and a
@@ -167,12 +167,12 @@ pub mod test_env {
     }
 }
 
-// RETIRED-NAME-ANCHOR(4): arms 2 and 3 are the reason a rename here costs
-// nothing in the field. Both spellings are set on real hosts today — mars,
-// jupiter and zeus each carry four `ROOMLER_AGENT_*` entries in an
+// RETIRED-NAME-ANCHOR(4): arm 2 is the reason a rename here costs nothing in
+// the field. Arm 3, the original `ROOMLER_AGENT_*`, went in FR-46 P2b, loudly:
+// mars, jupiter and zeus each carried four such entries in an
 // operator-authored `/etc/systemd/system/roomlerd.service.d/` drop-in, which a
-// package upgrade never rewrites. Dropping either arm silently un-configures
-// those hosts: the daemon starts fine and simply ignores what it was told.
+// package upgrade never rewrites. A host that still sets one is told, because
+// a dropped arm otherwise un-configures it with no sign: the daemon starts fine.
 /// Read a Roomler node env var by suffix. Precedence, highest first:
 ///
 ///   1. `ROOMLERD_<suffix>`      — the current spelling (FR-21 P3, decision D1)
@@ -302,7 +302,7 @@ pub fn flag_value(value: Option<&str>, default: bool) -> bool {
 /// same: two readers of one knob that disagree about which prefix wins is a
 /// bug nobody would think to look for.
 ///
-// RETIRED-NAME-ANCHOR(5): the legacy arms, as in [`node_env`]. See docs/fr/FR-21.
+// RETIRED-NAME-ANCHOR(5): the legacy arm, as in [`node_env`]. See docs/fr/FR-21.
 pub fn node_env_os(suffix: &str) -> Option<std::ffi::OsString> {
     PREFIXES
         .iter()
