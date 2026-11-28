@@ -167,26 +167,6 @@ pub mod test_env {
     }
 }
 
-// RETIRED-NAME-ANCHOR(4): arm 2 is the reason a rename here costs nothing in
-// the field. Arm 3, the original `ROOMLER_AGENT_*`, went in FR-46 P2b, loudly:
-// mars, jupiter and zeus each carried four such entries in an
-// operator-authored `/etc/systemd/system/roomlerd.service.d/` drop-in, which a
-// package upgrade never rewrites. A host that still sets one is told, because
-// a dropped arm otherwise un-configures it with no sign: the daemon starts fine.
-/// Read a Roomler node env var by suffix. Precedence, highest first:
-///
-///   1. `ROOMLERD_<suffix>`      — the current spelling (FR-21 P3, decision D1)
-///   2. `ROOMLER_NODE_<suffix>`  — the previous "new" spelling, still honoured
-///   3. a registered config-backed fallback (S2)
-///
-/// The original `ROOMLER_AGENT_<suffix>` is never read (FR-46 P2b): the chain
-/// ends above it, and [`retired_env_present`] only reports it. Returns `None`
-/// if none is set (or the env value isn't valid Unicode).
-///
-/// Every knob in the daemon reads through here and passes a SUFFIX, never a
-/// full name, so adding a preferred prefix is one arm in this chain rather than
-/// an edit at every call site. See docs/fr/FR-21 and docs/fr/FR-46.
-///
 /// The env-var prefixes [`node_env`] READS, most current first.
 ///
 /// One list, because three things must agree about it: both readers below and
@@ -251,6 +231,26 @@ pub fn warn_on_retired_env() {
     }
 }
 
+// RETIRED-NAME-ANCHOR(4): arm 2 is the reason a rename here costs nothing in
+// the field. Arm 3, the original `ROOMLER_AGENT_*`, went in FR-46 P2b, loudly:
+// mars, jupiter and zeus each carried four such entries in an
+// operator-authored `/etc/systemd/system/roomlerd.service.d/` drop-in, which a
+// package upgrade never rewrites. A host that still sets one is told, because
+// a dropped arm otherwise un-configures it with no sign: the daemon starts fine.
+/// Read a Roomler node env var by suffix. Precedence, highest first:
+///
+///   1. `ROOMLERD_<suffix>`      — the current spelling (FR-21 P3, decision D1)
+///   2. `ROOMLER_NODE_<suffix>`  — the previous "new" spelling, still honoured
+///   3. a registered config-backed fallback (S2)
+///
+/// Arms 1 and 2 are [`PREFIXES`], in its order. The original
+/// `ROOMLER_AGENT_<suffix>` is never read (FR-46 P2b): the chain ends above
+/// it, and [`retired_env_present`] only reports it. Returns `None` if none is
+/// set (or the env value isn't valid Unicode).
+///
+/// Every knob in the daemon reads through here and passes a SUFFIX, never a
+/// full name, so adding a preferred prefix is one arm in this chain rather than
+/// an edit at every call site. See docs/fr/FR-21 and docs/fr/FR-46.
 pub fn node_env(suffix: &str) -> Option<String> {
     PREFIXES
         .iter()

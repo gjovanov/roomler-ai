@@ -1626,7 +1626,7 @@ The merge rule (`agents/roomler-msi-ca/src/carry.rs:190`, `merge`): a carried
 entry replaces an entry of the same name, compared without regard to case as
 Windows compares environment names, and is added where there is none. The
 exceptions are `ROOMLERD_ENABLE_SYSTEM_SWAP` and `ROOMLER_NODE_ENABLE_SYSTEM_SWAP`,
-both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
+both spellings the daemon reads (`crates/tunnel-core/src/env.rs:177`,
 `carry.rs:37`). The installer decides the switch: the updater passes
 `ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:2246`;
 it reads the service's environment for a per-Machine install only, so a per-user
