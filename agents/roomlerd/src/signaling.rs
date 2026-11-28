@@ -6659,32 +6659,82 @@ impl TunnelPeerClose for crate::tunnel::peer::AgentTunnelPeer {
     }
 }
 
-/// FR-22 P5-0 — whether the loop waits for its tunnel peers' closes at this
-/// exit: only where the process may end next. A shutdown ends it, and so does
-/// a goodbye that removes the primary org's install (`FatalGoodbye`, exit 7).
-/// A close left to a task of its own there would be cut with the runtime, and
-/// the tunnel's client would learn of the end by silence. After every other
-/// exit the daemon lives on and a dial follows, and a dial does not wait for
-/// a close.
-fn waits_for_tunnel_closes(exit: ConnExit) -> bool {
-    matches!(exit, ConnExit::Shutdown | ConnExit::Goodbye)
+/// FR-22 P5-0 — how a control connection's end runs its tunnel peers' closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelSweep {
+    /// Every close at once, and the loop waits for them all.
+    Waited,
+    /// One close at a time, on a task the loop does not wait for.
+    InTurn,
+    /// Every close at once, on tasks the loop does not wait for.
+    Together,
+}
+
+/// FR-22 P5-0 — the sweep each exit gets. No wildcard arm: an exit added later
+/// does not compile until it is placed here.
+///
+/// **The process may end next** (a shutdown, and a goodbye that removes the
+/// primary org's install: `FatalGoodbye`, exit 7): the loop waits. A close
+/// left to a task of its own there would be cut with the runtime, and the
+/// tunnel's client would learn of the end by silence. The wait holds where the
+/// stop waits for this loop: the primary org's, on a stop the daemon decided
+/// itself (an update, a rollback, a requested restart) and before exit 7. A
+/// stop from the operating system (a signal, a service stop) waits 200 ms for
+/// the loops and goes on to end the runtime whatever a loop is still doing
+/// (`app.rs`, the signal arms of the daemon's wait for a stop), and no wait
+/// here extends that. There, every close having started at once is what gets
+/// each the most of that time.
+///
+/// **The computer may suspend next** (the goodbye before a sleep): one close
+/// at a time, as before P5-0, on a task the loop does not wait for. A close
+/// the suspend lands in is cut at its ceiling when the computer wakes,
+/// wherever the monotonic clock counts the sleep (Windows, #3530), and what it
+/// had not reached stays alive ([`crate::peer_close`]). In turn keeps that to
+/// one peer. `run` holds the next dial until the wake either way.
+///
+/// **Every other exit**: the daemon lives on and a dial follows, and a dial
+/// does not wait for a close.
+fn tunnel_sweep_at(exit: ConnExit) -> TunnelSweep {
+    match exit {
+        ConnExit::Shutdown | ConnExit::Goodbye => TunnelSweep::Waited,
+        ConnExit::Sleep => TunnelSweep::InTurn,
+        ConnExit::ResumeFromSuspend
+        | ConnExit::RxDeadline
+        | ConnExit::NetChangeProbe
+        | ConnExit::NetChangeReprobe
+        | ConnExit::KeepaliveUnanswered
+        | ConnExit::KeepaliveSendFailed
+        | ConnExit::NetChangePingFailed
+        | ConnExit::HeartbeatSendFailed
+        | ConnExit::OutboundFlushFailed
+        | ConnExit::PongReplyFailed
+        | ConnExit::ServerClosed
+        | ConnExit::ReadError
+        | ConnExit::PongRttDegraded
+        | ConnExit::KeyRotated => TunnelSweep::Together,
+    }
 }
 
 /// T2.10d: tear down every tunnel peer when the control connection ends by
 /// `exit`. Cheap no-op when the map is empty (normal for agents that never
 /// serve a tunnel).
 ///
-/// FR-22 P5-0 — every close starts at once, on a task of its own, through
-/// [`close_within_budget`]: no peer waits for the one before it, and an
-/// overrun still says so. The caller waits for them only where
-/// [`waits_for_tunnel_closes`] says the process may end next. Before, the
-/// closes ran one after the other and every exit waited for each, so the
-/// dial after a network change could start N budgets late, with the device
-/// unreachable meanwhile.
+/// FR-22 P5-0 — the closes run off the loop, on tasks of their own, each
+/// through [`close_within_budget`] so that an overrun still says so.
+/// [`tunnel_sweep_at`] says how at each exit: all at once or, before a sleep,
+/// in turn, and whether the loop waits for them. Before, the closes ran one
+/// after the other and every exit waited for each, so the dial after a
+/// network change could start N budgets late, with the device unreachable
+/// meanwhile.
 ///
 /// ⚠️ A task is what starts a close. `AgentTunnelPeer::close` does nothing
 /// until it is polled, so "not waiting" must never become "dropping the
-/// future": that would leave the close to the `Drop` net under it.
+/// future". An idle flow ends only when `close` cancels it (#2129): a peer
+/// whose close never started keeps its flows and their sockets, and the `Drop`
+/// net under it is the best case.
+///
+/// The tasks carry the caller's span. On a daemon with several orgs an overrun
+/// and the count name their org, as the loop's own lines do.
 async fn close_all_tunnel_peers<P: TunnelPeerClose>(
     tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<P>>,
     exit: ConnExit,
@@ -6694,15 +6744,31 @@ async fn close_all_tunnel_peers<P: TunnelPeerClose>(
     }
     let count = tunnel_peers.len();
     let started = tokio::time::Instant::now();
-    let closes: Vec<tokio::task::JoinHandle<()>> = tunnel_peers
-        .drain()
-        .map(|(session_id, peer)| {
-            tokio::spawn(async move {
-                // Same bound as the session table's.
-                close_within_budget(peer.close(), session_id, "tunnel_ws_disconnect").await;
+    let sweep = tunnel_sweep_at(exit);
+    let span = tracing::Span::current();
+    let closes: Vec<tokio::task::JoinHandle<()>> = match sweep {
+        TunnelSweep::InTurn => {
+            let peers: Vec<(bson::oid::ObjectId, Arc<P>)> = tunnel_peers.drain().collect();
+            let in_turn = async move {
+                for (session_id, peer) in peers {
+                    close_tunnel_peer(session_id, peer).await;
+                }
+            };
+            vec![tokio::spawn(tracing::Instrument::instrument(
+                in_turn,
+                span.clone(),
+            ))]
+        }
+        TunnelSweep::Waited | TunnelSweep::Together => tunnel_peers
+            .drain()
+            .map(|(session_id, peer)| {
+                tokio::spawn(tracing::Instrument::instrument(
+                    close_tunnel_peer(session_id, peer),
+                    span.clone(),
+                ))
             })
-        })
-        .collect();
+            .collect(),
+    };
     let all_closed = async move {
         for close in closes {
             // The peer's own close catches its panics (`peer_close`), so this
@@ -6718,11 +6784,16 @@ async fn close_all_tunnel_peers<P: TunnelPeerClose>(
             "torn down agent tunnel peers on ws disconnect"
         );
     };
-    if waits_for_tunnel_closes(exit) {
+    if sweep == TunnelSweep::Waited {
         all_closed.await;
     } else {
-        tokio::spawn(all_closed);
+        tokio::spawn(tracing::Instrument::instrument(all_closed, span));
     }
+}
+
+/// One tunnel peer's close, within the same bound as the session table's.
+async fn close_tunnel_peer<P: TunnelPeerClose>(session_id: bson::oid::ObjectId, peer: Arc<P>) {
+    close_within_budget(peer.close(), session_id, "tunnel_ws_disconnect").await;
 }
 
 /// #1754 — what the reap arm took out of the session maps for a session
@@ -10857,16 +10928,21 @@ mod tests {
         }
     }
 
-    /// FR-22 P5-0 — the rule itself, over every exit: only the two after which
-    /// the process may end wait for a tunnel peer's close. A new exit is one a
-    /// dial follows, unless it is added here on purpose.
+    /// FR-22 P5-0 — the rule itself, over every exit. Only the two after which
+    /// the process may end are waited for, and only the goodbye before a sleep
+    /// closes in turn. `tunnel_sweep_at` has no wildcard arm, so a new exit
+    /// compiles only once it is placed there, and it is one a dial follows
+    /// unless this test is changed on purpose.
     #[test]
-    fn only_a_shutdown_and_a_goodbye_wait_for_tunnel_closes() {
-        let waits: Vec<ConnExit> = ConnExit::ALL
-            .into_iter()
-            .filter(|exit| waits_for_tunnel_closes(*exit))
-            .collect();
-        assert_eq!(waits, [ConnExit::Shutdown, ConnExit::Goodbye]);
+    fn each_exit_says_how_its_tunnel_closes_run() {
+        for exit in ConnExit::ALL {
+            let want = match exit {
+                ConnExit::Shutdown | ConnExit::Goodbye => TunnelSweep::Waited,
+                ConnExit::Sleep => TunnelSweep::InTurn,
+                _ => TunnelSweep::Together,
+            };
+            assert_eq!(tunnel_sweep_at(exit), want, "{exit:?}");
+        }
     }
 
     /// An agent that serves no tunnel: no work, no line and no wait, at any

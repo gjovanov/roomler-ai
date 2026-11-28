@@ -983,12 +983,12 @@ bound — and must be reported as `pc_failed` no earlier than 20 s in),
 `the_reclaim_drops_a_parked_quic_peer_whose_connection_ended`
 (`agents/roomlerd/src/signaling.rs`).
 
-### A control connection's end closes its tunnel peers together, and waits only where the process may end (FR-22 P5-0)
+### A control connection's end closes its tunnel peers off the loop, and waits only where the process may end (FR-22 P5-0)
 
 A WebRTC tunnel peer is welded to the control connection it was offered on: its flows
 signal over that socket. So when the connection ends, by any of its seventeen exits, the
 sweep closes every one of them (`close_all_tunnel_peers`,
-`agents/roomlerd/src/signaling.rs:6688`). A QUIC peer is not part of this: its close is
+`agents/roomlerd/src/signaling.rs:6738`). A QUIC peer is not part of this: its close is
 synchronous, and it may be parked instead.
 
 Before FR-22 P5-0 the sweep closed the peers **in turn**, and the loop waited for each,
@@ -997,34 +997,68 @@ that follows the exit could not start meanwhile. With N peers on a path that was
 the device stayed unreachable for up to N × 5 s more than its network required: for a
 remote-desktop viewer as for everything else that reaches it through its control socket.
 
+Since P5-0 the closes run on tasks of their own, and each exit gets one of three sweeps
+(`TunnelSweep`, `agents/roomlerd/src/signaling.rs:6664`; the rule is `tunnel_sweep_at`,
+`:6697`, a match with no wildcard arm, so an exit added later does not compile until it
+is placed):
+
+| Sweep | Exits | The closes | The loop |
+|---|---|---|---|
+| `Waited` | `Shutdown`, `Goodbye` | all at once, each on a task of its own | waits for all of them together: one budget at most |
+| `InTurn` | `Sleep` | one after the other, on one task | does not wait |
+| `Together` | the other fourteen | all at once, each on a task of its own | does not wait: the dial starts |
+
 | | Before P5-0 | Since P5-0 |
 |---|---|---|
-| The closes | one after the other | all at once, each on a task of its own |
-| The loop waits | for each, at every exit | at `Shutdown` and `Goodbye` only, for all of them together: one budget at most |
+| The loop waits | for each close, at every exit | at `Shutdown` and `Goodbye` only |
 | A close that overruns its budget | one WARN, then the next peer starts | one WARN each, as before (`close_within_budget`, `agents/roomlerd/src/signaling.rs:314`); the close goes on in the background (#3716) |
 | The sweep's line | `torn down agent tunnel peers on ws disconnect count=N` | the same text, with `exit=` and `took_ms=`, written when the last close ended |
+| The org on those lines | the loop's span | the same: the tasks carry the loop's span, so a daemon with several orgs still reads which org's peers closed |
 
 ```mermaid
 flowchart LR
-    E["a control connection ends<br/>(one of 17 exits)"] --> S["every tunnel peer leaves the map,<br/>each close on a task of its own"]
-    S --> Q{"may the process end next?<br/>Shutdown, Goodbye"}
-    Q -- yes --> W["wait for all of them together:<br/>one budget at most"]
-    Q -- no --> D["return at once:<br/>the dial starts"]
-    S -.-> L["the sweep's line, when the last close ended:<br/>count, exit, took_ms"]
+    E["a control connection ends<br/>(one of 17 exits)"] --> S["every tunnel peer leaves the map"]
+    S --> Q{"what may happen next?"}
+    Q -- "the process may end:<br/>Shutdown, Goodbye" --> W["all closes at once,<br/>the loop waits: one budget at most"]
+    Q -- "the computer may suspend:<br/>Sleep" --> T["one close at a time on one task,<br/>the loop returns at once"]
+    Q -- "a dial follows:<br/>the other 14" --> D["all closes at once,<br/>the loop returns at once: the dial starts"]
+    W -.-> L["the sweep's line, when the last close ended:<br/>count, exit, took_ms"]
+    T -.-> L
+    D -.-> L
 ```
 
-**Why two exits still wait.** A shutdown ends the process, and so does a goodbye that
-removes the primary org's install (exit 7). A close left to a task there would be cut
-with the runtime, and the tunnel's client would learn of the end by silence.
-`waits_for_tunnel_closes` (`agents/roomlerd/src/signaling.rs:6669`) is that rule. After
-every other exit the daemon lives on and a dial follows.
+**Why two exits still wait, and where that wait holds.** A shutdown ends the process,
+and so does a goodbye that removes the primary org's install (exit 7). A close left to a
+task there would be cut with the runtime, and the tunnel's client would learn of the end
+by silence. The wait holds where the stop waits for the loop: the primary org's loop, on
+a stop the daemon decided itself (an update, a rollback, a requested restart) and before
+exit 7. ⚠️ A stop from the operating system (a signal, a service stop) waits 200 ms for
+the loops and then goes on to end the runtime, whatever a loop is still doing
+(`agents/roomlerd/src/app.rs:5901` and `:5912`). No wait in the loop extends that. What
+P5-0 changes there: once the sweep is reached every close starts at once, where before
+each stood behind the one before it.
+
+**Why a sleep closes in turn.** Before a sleep the loop reports its goodbye as sent
+before it closes anything (`agents/roomlerd/src/signaling.rs:2363`), and that report is
+what the sleep was being held for (`say_goodbye`,
+`agents/roomlerd/src/sleep_notice.rs:262`). The closes come after it, so the suspend
+can land inside one. Where the
+monotonic clock counts the sleep (Windows, #3530), such a close is past its ceiling
+(`PEER_CLOSE_CEILING`, 60 s, `agents/roomlerd/src/peer_close.rs:26`) when the computer
+wakes: it is cut there, and what it had not reached stays alive. Before P5-0 that could
+be one peer at most, and one close at a time keeps it so (#4593 is about the ceiling
+itself). The loop still does not wait:
+the next dial is held until the wake either way (`agents/roomlerd/src/signaling.rs:1264`),
+and after it the dial does not stand behind the closes that are left.
 
 ⚠️ **A task is what starts a close.** `AgentTunnelPeer::close`
 (`agents/roomlerd/src/tunnel/peer.rs:340`) does nothing until it is polled: it cancels
 the flows and spawns the peer connection's close at its first poll
 (`agents/roomlerd/src/peer_close.rs:37`). "Not waiting" must never be written as
-"dropping the future". That leaves the close to the `Drop` net, later and without its
-lines.
+"dropping the future". An idle flow ends only when `close` cancels it (#2129), so a peer
+whose close never started keeps its flows and their sockets, and the `Drop` net under it
+is the best case. One way out of the loop still drops the map with no sweep at all, a
+failed send of a remote-control answer (#4592).
 
 ⚠️ **A peer's own "closed" report can reach the next connection's loop, and is dropped
 there.** The reap channel of #1754 is one per org loop
@@ -1038,14 +1072,16 @@ fact: a tunnel client offers a session id once (`crates/tunnel-core/src/driver.r
 connection's end still closes inside the loop, within the same budget. That is FR-138's
 order, in `docs/remote-control.md`.
 
-Locked by lib tests (`cargo test -p roomlerd --lib -- tunnel_peers tunnel_closes`), three
-of them shown red on the code before:
+Locked by lib tests (`cargo test -p roomlerd --lib -- tunnel_peers tunnel_closes`), five
+of them shown red on the code before them:
 `an_exit_a_dial_follows_does_not_wait_for_its_tunnel_peers`
 (the caller waited 15 s for three closes that overran; now 0),
 `tunnel_peers_left_behind_by_an_exit_still_close`,
 `a_shutdown_waits_for_its_tunnel_peers_together` (3 s; now 1 s),
-`only_a_shutdown_and_a_goodbye_wait_for_tunnel_closes` (the rule, over every
-`ConnExit`) and `an_exit_with_no_tunnel_peers_does_nothing`.
+`a_sleep_closes_its_tunnel_peers_in_turn_and_does_not_wait`,
+`a_tunnel_closes_lines_name_their_loops_org`,
+`each_exit_says_how_its_tunnel_closes_run` (the rule, over every `ConnExit`) and
+`an_exit_with_no_tunnel_peers_does_nothing`.
 
 ### ⚠️ A session that ends with a live flow ends that flow, both halves (#2129)
 
@@ -1150,7 +1186,7 @@ sequenceDiagram
 
 **What the exit does.** The `ServerMsg::TunnelTerminate` arm
 (`agents/roomlerd/src/signaling.rs:5665`) hands the QUIC half to
-`terminate_quic_session` (`:6815`):
+`terminate_quic_session` (`:6886`):
 
 - **with the flag**, `AgentQuicPeer::end` (`agents/roomlerd/src/tunnel/quic_peer.rs:639`):
   the connection closes with application code `2` (`SESSION_END_CODE`, `:58`, reason
@@ -1161,7 +1197,7 @@ sequenceDiagram
   The endpoint's UDP socket, and on the relayed flavours the TURN allocation, go once
   the closed connection drains. A peer R3 parked and reclaimed is ended the same way;
 - **without it**, `AgentQuicPeer::close`, and the session's `SessionLink` is kept in
-  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6789`) for 60 s
+  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6860`) for 60 s
   (`ENDED_SESSION_TTL`, at most 64 sessions a tenant, the oldest first out). A
   terminate with the flag that arrives after one without still reaches the session
   through it and ends it.
@@ -1175,7 +1211,7 @@ forward still waiting for its stream (`take_flow`,
 ends.
 
 **The reap.** A #1754 reap (`ReapSignal::QuicConnEnded`) goes through `reap_quic_peer`
-(`agents/roomlerd/src/signaling.rs:6847`, from the reap arm at `:3127`) to
+(`agents/roomlerd/src/signaling.rs:6918`, from the reap arm at `:3127`) to
 `AgentQuicPeer::reap` (`agents/roomlerd/src/tunnel/quic_peer.rs:651`): when the
 connection itself has ended (`close_reason()` is set), it ends the session as above.
 When the connection is still up, it only closes the peer and keeps the session's link.
