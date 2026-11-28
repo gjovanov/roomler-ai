@@ -4559,7 +4559,7 @@ nothing (`agents/roomler-setup/src/front/app.js:1802`, written with `textContent
 keeps them in memory only. The scripts that strip the codes with `sed`
 (`scripts/e2e-nightly.sh:258`, `scripts/fr139-restart-cell.sh:126`,
 `scripts/aws-testbox/guest-roomlerd.sh:31`) change nothing on plain text, and the PoP
-README's grep of the relay's log (`scripts/relay-pop/README.md:212`) matches message
+README's grep of the relay's log (`scripts/relay-pop/README.md:283`) matches message
 text, which was never coloured. `scripts/install-sh-output-check.sh` counts every
 control byte but newline and tab in the script's output
 (`scripts/install-sh-output-check.sh:475`) against a stand-in daemon (`:315`), so it
