@@ -1,9 +1,20 @@
 # FR-15: Relay age feedback — close the rate loop with the viewer's own clock
 
-Status: **shipped** in 0.4.9 (#796), P2 in 0.4.11 (#804); AC4 met 2026-11-03, the other
-criteria open (evidence collected 2026-08-27, first field session of the FR-1 P7
-age pill). Tracking issue: `FR-15` in gjovanov/roomler-ai/issues. Child of FR-1; the
-successor to FR-10's open decision ("relay drainage needs a signal SCTP doesn't give us").
+Status: **closed not planned 2026-11-28**: superseded by
+[FR-148](FR-148-path-measured-plan-follows.md)
+([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). What it shipped stays in
+the tree until FR-148's P5 deletes or keeps it: the age loop (#796) and its floor's bound
+(P2, #804). Under `inflight_budget = on` the loop acts only on a lag past the budget's
+envelope (FR-148's D51), and its switch `RELAY_AGE_FEEDBACK` retires with FR-63's B3a,
+which is FR-148's P5 (`docs/rate-control.md`, the switch registry). AC1 is FR-148's AC29
+and AC21, AC2 its AC23, AC29 and AC9, and AC3 its AC21; FR-148 §12 maps each one. At the
+close: **shipped** in 0.4.9 (#796), P2 in 0.4.11 (#804); AC4 met 2026-11-03, the other
+criteria open (evidence collected 2026-08-27, first field session of the FR-1 P7 age
+pill). Tracking issue: [#795](https://github.com/gjovanov/roomler-ai/issues/795). Child of
+FR-1; the successor to FR-10's open decision ("relay drainage needs a signal SCTP doesn't
+give us").
+
+**Anchors:** master `0d17f9a0e` (closed 2026-11-28): this spec is the record of the work, and its line anchors read at that commit.
 
 ## Problem
 
