@@ -1805,7 +1805,7 @@ live client nor its trail.
   had no caller, is gone.
 - **Presence is a fact the server observes.** No authorization decision reads it.
 
-Known gaps, none of them new with presence:
+Known gaps:
 
 - **A pod that crashes** releases nothing, so its clients' records live out their TTL:
   a dead client reads `online` on the other pod for up to 180 s (an agent's record has
@@ -1813,6 +1813,9 @@ Known gaps, none of them new with presence:
 - **Two sockets of one client on two pods:** when the one whose pod holds the record
   closes, the other pod's next refresh claims it again, so for up to 60 s the closing
   socket's pod reads the client `offline` while its other socket is open.
+- **A deployment with no Redis at all** has no directory to ask, so it reads every
+  client without a socket on this pod by its trail: one that closed, or enrolled, in
+  the last 180 s reads `stale`, never `offline`, even on a single pod.
 - **A half-open socket** keeps its seat and its record, and so reads `online`, until a
   write to it fails: the tunnel socket has no receive deadline (`socket_rx.next()`,
   `tunnel.rs:197`), and the 60 s check writes to the database and Redis, never to the
