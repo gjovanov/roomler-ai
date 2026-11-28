@@ -2,9 +2,10 @@
 
 **Issue:** [#4494](https://github.com/gjovanov/roomler-ai/issues/4494) · **Status:** claimed 2026-11-27, from
 [#3882](https://github.com/gjovanov/roomler-ai/issues/3882). P0, the lab's RED read, is done. P2, the server read, is
-built behind its switch, which is off, and P1, the agent's word, is built in
-[#4552](https://github.com/gjovanov/roomler-ai/pull/4552); nothing else is. D1–D5 were ruled on #4494 on 2026-11-27,
-as recommended; D6 is open, and is P3's.
+in production behind its switch, which is off. P1, the agent's word, is merged
+([#4552](https://github.com/gjovanov/roomler-ai/pull/4552), 2026-11-28) and reaches the field with the next agent
+release. AC1 to AC4 and AC6 are met; nothing else is. D1–D5 were ruled on #4494 on 2026-11-27, as recommended; D6 is
+open, and is P3's.
 **Builds on:** [FR-43](FR-43-macos-single-enrollment.md) (the one-row Mac: the supervisor, the delegation channel,
 `Status.gui_worker`), [FR-93](FR-93-wayland-out-of-the-box.md) P2b (the `desktop` brief: a claim on the row that the
 server counts)
@@ -347,8 +348,8 @@ docs; P5 checks that they are whole.
 | phase | what | kill switch | status |
 |---|---|---|---|
 | P0 | the RED read of C1–C4 and the lag's split (C5), on the current release and the current server; no code | none: it reads and changes nothing | done: C1–C4 read RED (AC1) and C5's split (AC2) on 2026-11-27 (the field log); no layer comes near one beat, so P1 goes ahead (D2) |
-| P1 | the agent: `AgentCaps.gui_worker` in `crates/remote_control`, filled by a Mac's daemon, in the hello and at once on each attach, detach and change of the supervisor's state; `Status.gui_worker` takes the same `state` and `reason` (D5) | inert while `ROOMLER__RC__GUI_WORKER_READ` is off, and dropped by an older server | built, [#4552](https://github.com/gjovanov/roomler-ai/pull/4552): its tests read RED on a stub, then GREEN, in CI; it reaches the field with the next agent release, and P4 reads it there |
-| P2 | the server: the counts in both overviews, the device list's filter, and the word left out of every device response while the switch is off | `ROOMLER__RC__GUI_WORKER_READ`, default off | built, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516); in production since 2026-11-27 with its switch off (the field log) |
+| P1 | the agent: `AgentCaps.gui_worker` in `crates/remote_control`, filled by a Mac's daemon, in the hello and at once on each attach, detach and change of the supervisor's state; `Status.gui_worker` takes the same `state` and `reason` (D5) | inert while `ROOMLER__RC__GUI_WORKER_READ` is off, and dropped by an older server | merged 2026-11-28, [#4552](https://github.com/gjovanov/roomler-ai/pull/4552): its tests read RED on a stub, then GREEN, in CI (AC3, AC4); it reaches the field with the next agent release, and P4 reads it there |
+| P2 | the server: the counts in both overviews, the device list's filter, and the word left out of every device response while the switch is off | `ROOMLER__RC__GUI_WORKER_READ`, default off | built, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516): its integration test read RED, then GREEN, in CI (AC6); in production since 2026-11-27 with its switch off (the field log) |
 | P3 | the devices list: the chip, in the table and the cards (D6) | the same switch: off, the rows carry no word, so there is no chip | not started |
 | P4 | the field read of C1–C5 on the release with P1 and the server with P2 and P3, with the switch turned on in production (the operator's step); a wrong reading turns it off again, and the default turns on once every cell reads green | the switch | not started |
 | P5 | the docs: the field and its wire name, the chip and its page, the macOS row table, the server read, and the `docs/README.md` rows | none: docs | not started |
@@ -360,15 +361,15 @@ docs; P5 checks that they are whole.
   No row carries a word for one row or for the worker, so the server cannot tell the cells apart.
 - [x] **AC2** (P0, C5): the lag on the current release, five sign-ins stamped at the attach line, the worker's caps
   line, the beat's caps line and the row's change. The split names the layer that holds anything over one beat (D2).
-- [ ] **AC3** (P1): the unit tests above, each shown RED on master first: the attach, the detach and each change of
+- [x] **AC3** (P1): the unit tests above, each shown RED on master first: the attach, the detach and each change of
   the supervisor's state wake the host's news; a beat that changes only the word announces caps; every `Action` maps
   to one `(state, reason)` through a `match` with no catch-all arm; the worker and other platforms announce no word.
-- [ ] **AC4** (P1, old and new together): caps without the word serialise without the key and parse to `None`, so an
+- [x] **AC4** (P1, old and new together): caps without the word serialise without the key and parse to `None`, so an
   older agent's row reads `unknown`; a word with an unknown key inside it parses; `permissions` is unchanged in every
   cell.
 - [ ] **AC5** (P1, by D5): `roomler status` on a Mac shows the same `state` and `reason` as its row, so a healthy
   two-row Mac no longer shows only `attached: false`.
-- [ ] **AC6** (P2): an integration test: with the switch on, both overviews count Mac rows by `state`, `reason` and
+- [x] **AC6** (P2): an integration test: with the switch on, both overviews count Mac rows by `state`, `reason` and
   `one_row`, online and in total, with the rows that sent no word as `unknown`, and the device list's filter returns
   exactly the org's online rows in the state asked for. With the switch off, the overviews carry no `gui_workers`, the
   list's rows carry no word, and the filter is refused.
