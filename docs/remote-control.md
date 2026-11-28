@@ -973,7 +973,13 @@ of the person signed in at it, and none served this session. Reconnect once
 someone is signed in at the Mac. Remote shell works here." Before #4543 it sent
 the viewer to the Mac's user-session roomlerd, a row a one-row Mac does not
 have. A two-row Mac's `-daemon` row keeps that sentence: there the person's
-own row serves the screen.
+own row serves the screen. Since #4566 the reason that daemon gives for
+declining the session's `files` channel names no row either
+(`FILES_ON_A_ONE_ROW_MAC`, `agents/roomlerd/src/peer.rs:12892`): "File transfer
+on this Mac runs as the person signed in at its screen, in their screen worker,
+and none served this session. Reconnect once someone is signed in at the Mac."
+A two-row Mac keeps its own
+([desktop-companion.md §9.6](desktop-companion.md#96-a-macs-system-install-transfers-files-only-in-the-persons-session-3757)).
 
 **Tested** in `delegate::one_row_attach_tests`
 (`agents/roomlerd/src/delegate.rs:6341`), in the lib tests of the
@@ -986,7 +992,9 @@ drives: the offer is the worker's when one attached during the consent wait,
 the root's when none did, and a session whose offer the root took never crosses
 after. The sentence:
 `capture::wayland_reason_tests::a_one_row_macs_no_display_hint_sends_the_viewer_to_no_row`
-(`agents/roomlerd/src/capture/mod.rs:4384`).
+(`agents/roomlerd/src/capture/mod.rs:4384`), and the files channel's:
+`peer::files_channel_tests::a_one_row_macs_declined_files_channel_names_no_row`
+(`agents/roomlerd/src/peer.rs:17341`).
 
 ⚠️ **A sleeping macOS display streams nothing, and fails nothing either.** The
 stream opens, `capture: backend=scrap` logs, and then no frame ever arrives:
@@ -1311,7 +1319,7 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:14411`](../agents/roomlerd/src/peer.rs#L14411)) sends it
+The pump ([`peer.rs:14435`](../agents/roomlerd/src/peer.rs#L14435)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5769`](../agents/roomlerd/src/peer.rs#L5769); the viewer parses it
@@ -4062,8 +4070,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14666`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14644`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4742`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14675`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14690`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14668`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4742`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14699`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:110`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:710`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:351`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:942`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:481`, #2326) |
@@ -4897,7 +4905,7 @@ and the worker keeps the peer (§11.16.1).
 | ⚠️ The consent prompt keeps the connection's own sender: `await_prompt_or_socket_end` reads its close to withdraw a prompt (#2416) | `agents/roomlerd/src/signaling.rs:413` |
 | The person at the device ends a kept session at once: it stops serving, says `rc:ended {reason}` on its control channel, closes after the grace, and its `rc:terminate` goes out on the current connection, or on the next one, after its hello. A pump with no encoder asks through the same channel, and a kept one's end is `no_video` too, never the person's `host_disconnect` (P2a-2, L10). The end is logged once, before it, as on every road (#4010) | `end_kept_by_device`, `agents/roomlerd/src/session_table.rs:1794`; `end_in_gap`, `agents/roomlerd/src/signaling.rs:7845`; `log_device_end`, `:7795`; `no_video`, `agents/roomlerd/src/session_table.rs:1443` |
 | The server's end of a session the table holds, attached or kept (a kick, the maximum length, a refused claim): control stops at once, `rc:ended {reason, limit}` goes on its control channel, and the peer closes after the grace, on a task of its own. Its viewer may not have rejoined since a resume, and to a viewer a bare close reads as a drop, which it redials: on an owner's or an auto-consent device that undid the kick. The viewer reads `rc:ended` as it reads `rc:terminate`, and the first of the two wins (§11.17). Off, or with no window open on this connection, the switch on included, the end closes the peer at once and says nothing, as before (P2a-2, C1; P4-0). A session kept under an earlier connection's window is no exception: with no window its claim is refused `agent_disconnect` at the hello, which its viewer redials after anyway. A GUI worker's delegated table always says it, since it holds only what the daemon offered `keepable` under its window | `close_terminated`, `agents/roomlerd/src/session_table.rs:1469`; its call in the `Terminate` arm, `agents/roomlerd/src/signaling.rs:5103`; `p4_0_a_kept_sessions_end_on_a_connection_with_no_window_closes_at_once`, `agents/roomlerd/src/session_table.rs:4673` |
-| A dead peer, `Failed` or `Closed`, is never kept and never resumed. Its state handler says `Terminate` once, on `Failed`, and the watchdog stops watching there, so one that died while its socket was dying told only that socket. A transient exit closes it and says its end, `error`, on the next connection; a claim answered after it died is refused the same way (P2a-2, M1) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622`; `resume`, `:1566`; `AgentPeer::is_dead`, `agents/roomlerd/src/peer.rs:14204` |
+| A dead peer, `Failed` or `Closed`, is never kept and never resumed. Its state handler says `Terminate` once, on `Failed`, and the watchdog stops watching there, so one that died while its socket was dying told only that socket. A transient exit closes it and says its end, `error`, on the next connection; a claim answered after it died is refused the same way (P2a-2, M1) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622`; `resume`, `:1566`; `AgentPeer::is_dead`, `agents/roomlerd/src/peer.rs:14228` |
 | A connection that ends before its server announced a window (the window comes after the hello) closes what it built, as before. What the last connection kept keeps its own deadline, and the next hello claims it (P2a-2, M3) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622` |
 | What the server must hear is never lost to a full queue: an end at the device, a kept session's own end and reports, the answer to a claim the device can no longer honour, a request refused as busy. It waits, in order, for room on this connection's queue, and the loop's table arm sends it the moment there is room; with no connection, the next one's hello is followed by it. Nothing waits on it (P2a-2, L7) | `queue_end`, `agents/roomlerd/src/session_table.rs:1832`; `next_event`, `:1876` |
 | Kept sessions count against `rc_max_sessions`: a request that would put one beside a kept peer past it is refused as busy (`rc:terminate agent_hangup`), and the table never keeps more than the capacity | `full_beside_kept`, `agents/roomlerd/src/session_table.rs:1539` |
@@ -6099,7 +6107,7 @@ the pod-log (~1 day) and `agent_logs` (7 d) windows, a stall in `requesting`
 leaves **no server row at all** (the request never reached a hub), and
 `agent_logs` held **zero** browser-source rows — `POST /api/log/browser`
 (`crates/modules/fleet/src/agent_log.rs:207`, mounted at
-`crates/modules/fleet/src/lib.rs:561`) had existed since rc.58 without a caller.
+`crates/modules/fleet/src/lib.rs:568`) had existed since rc.58 without a caller.
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
@@ -6173,7 +6181,7 @@ route by `browser_connect_timing_record_parses` (`agent_log.rs:494`), because a
 
 **Mining it** (`roomler2`, through `scripts/prod-mongo-read.sh`, whose client runs outside
 `mongodb-0` and never prints a credential: [production-mongo-reads.md](production-mongo-reads.md)). Retention is the collection's **7 d
-TTL** (`crates/modules/fleet/src/lib.rs:908`, `crates/db/src/models/agent_log.rs:115`) — the same window
+TTL** (`crates/modules/fleet/src/lib.rs:915`, `crates/db/src/models/agent_log.rs:115`) — the same window
 as the agent's own logs, and the pod log is shorter still — so a stall must be
 mined within the week; `remote_audit` keeps its three marks for 90 d.
 
@@ -6869,12 +6877,12 @@ to-activate, so the browser never sees a bait-and-switch.
   A folder whose path alone leaves a page no room is refused, named by its
   last part, shortened to fit if need be (`refusal`, `dir_pages.rs:148`).
   The listing's task sends the frames in order (`send_listing_frames`,
-  [`peer.rs:13574`](../agents/roomlerd/src/peer.rs#L13574)), each waiting
+  [`peer.rs:13598`](../agents/roomlerd/src/peer.rs#L13598)), each waiting
   while the channel holds more than the download pumps' 4 MiB high-water
   mark, and stops at the channel's end, the session's, or the first send
   that fails. A send that fails is a WARN, `files: answer not sent`, with
   the frame's kind, size, id and error, never an entry's name
-  (`send_files_frame`, `peer.rs:14027`); `files: dir listed` gains
+  (`send_files_frame`, `peer.rs:14051`); `files: dir listed` gains
   `capped`, `bytes` and `pages`. The viewer
   ([`remoteDirListing.ts`](../ui/src/composables/remoteDirListing.ts),
   moved out of `useRemoteControl.ts` by #4121) asks with `paged: true`,
@@ -6925,14 +6933,14 @@ to-activate, so the browser never sees a bait-and-switch.
   upload left open before the refused one, which a viewer's Cancel leaves
   open on the device. The end of an upload whose begin the channel refused
   gets no answer either (`refused_at_begin`, `files.rs:3264`, asked in the
-  End arm at `agents/roomlerd/src/peer.rs:13332`). The channel remembers its
+  End arm at `agents/roomlerd/src/peer.rs:13356`). The channel remembers its
   last 64 refused ids, the oldest forgotten first, and only ids that are one
   plain name. A begin with a refused id is a retry and runs as a fresh
   begin, and once accepted its id is off the list. A resume, whatever its
   answer, ends the dropping, and an accepted one takes its id off the list. A
   chunk or an end for an upload never begun is answered as before, and so is
   everything on the declined (#3757) and FILES-denied channels. Tests:
-  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17693`), over
+  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17798`), over
   a real channel through the production router, and
   `files::refused_begin_tests` (`files.rs:14126`).
   **A refused folder is said, not hidden** (#2930). The agent falls back to
