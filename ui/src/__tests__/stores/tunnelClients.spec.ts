@@ -63,6 +63,26 @@ describe('useTunnelClientStore', () => {
     expect(store.error).toBe('boom')
   })
 
+  // #4553 — nothing writes `online` to a tunnel client's stored status, so a
+  // count of that field read 0 with every client connected.
+  it('counts the clients online by their presence, never by their stored status', async () => {
+    mockApi.get.mockResolvedValueOnce({
+      items: [
+        mkClient({ id: 'c1', status: 'offline', presence: 'online', is_online: true }),
+        mkClient({ id: 'c2', status: 'offline', presence: 'online', is_online: true }),
+        mkClient({ id: 'c3', status: 'offline', presence: 'stale', is_online: false }),
+        mkClient({ id: 'c4', status: 'online', presence: 'offline', is_online: false }),
+      ],
+      total: 4,
+      page: 1,
+      per_page: 100,
+      total_pages: 1,
+    })
+    const store = useTunnelClientStore()
+    await store.fetchTunnelClients(TENANT_ID)
+    expect(store.onlineCount).toBe(2)
+  })
+
   it('issueEnrollmentToken POSTs the enroll-token path', async () => {
     mockApi.post.mockResolvedValueOnce({
       enrollment_token: 'tok',
