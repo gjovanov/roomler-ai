@@ -348,6 +348,25 @@ async fn an_in_flight_tunnel_connection_survives_a_rolled_pod() {
     );
 }
 
+/// FR-158 P1b, cell A's fresh half: after the roll the forward serves a new
+/// connection within 15 s, through a session opened on the client's new
+/// control socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_rolled_pod_the_forward_serves_a_new_connection() {
+    let mut rig = live_quic_forward("p1b-roll").await;
+
+    rig.client_front.point_at(rig.pod2.addr);
+    rig.exit_front.point_at(rig.pod2.addr);
+    roomler_ai_api::state::shutdown_cleanup(&rig.pod1.state).await;
+
+    let outcome = after_the_event(&mut rig).await;
+    rig.stop().await;
+    assert!(
+        outcome.fresh.is_ok(),
+        "after a roll the forward must serve a new connection: {outcome:?}"
+    );
+}
+
 /// Cell B, the exit's control socket cycles: its path to the server drops
 /// with no close and it redials the same pod, while it and the QUIC path stay
 /// up. Field: the server ended every session aimed at that exit at once.
