@@ -69,6 +69,10 @@ mod room_access_tests;
 /// from its creation on, and the repair of the counts stored wrong.
 #[cfg(test)]
 mod room_member_count_tests;
+/// #4448 — a room's message count is the number of its live messages: a post
+/// counts one, a delete takes its one away, on every room route.
+#[cfg(test)]
+mod room_message_count_tests;
 /// A reply's thread and quote are live messages of its own room, a thread
 /// lists its own room's replies, and a mention reaches the room's members.
 #[cfg(test)]
