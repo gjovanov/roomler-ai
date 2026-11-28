@@ -4476,6 +4476,443 @@ mod session_job {
     }
 }
 
+/// #3361 — what a Roomler SSH one-shot leaves when it ends, on Linux. The
+/// session's container is its process group: the engine makes the shell lead
+/// one (`process_group(0)` in `spawn_and_wait`), and what the shell starts in
+/// the background stays in it unless it leaves (`setsid`).
+///
+/// Signal safety: every group these tests signal is one the engine made for
+/// the test's own command. Its id is the shell's pid, which the shell wrote
+/// itself; it is never the test process's own group, nor 0 or 1; and it is
+/// signalled only while a process the test watches is still in it, so the id
+/// cannot have been handed to anyone else (a group's id stays reserved while
+/// it has a member).
+#[cfg(all(test, target_os = "linux"))]
+mod session_group_tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// How long a command may take to start and say who it is, on a busy
+    /// runner.
+    const STARTS_WITHIN: Duration = Duration::from_secs(30);
+    /// How long the engine is given to see its shell's exit before the
+    /// client goes: the run is then in its final wait, on the pipes.
+    const SETTLE: Duration = Duration::from_secs(2);
+    /// AC1: how long the test waits for a run that should end at once. A run
+    /// still waiting this long after its client left is the bug.
+    const STILL_WAITING_AFTER: Duration = Duration::from_secs(10);
+    /// AC2: how soon after its client left the run ends.
+    const ENDS_WITHIN: Duration = Duration::from_secs(1);
+    /// How long a process that must survive is watched for (the Windows
+    /// tests' bar).
+    const STILL_THERE_FOR: Duration = Duration::from_secs(3);
+
+    /// Roomler SSH's request (`ssh.rs`): the host's own shell, in a session.
+    fn session(command: String, request_id: &str) -> ExecRequest {
+        ExecRequest {
+            request_id: request_id.into(),
+            shell: String::new(),
+            command,
+            timeout_ms: 300_000,
+            max_output_bytes: 0,
+            cwd: None,
+            caller: "test".into(),
+            run_as: RunAs::Daemon,
+            start_in_home: false,
+            session_owned: true,
+        }
+    }
+
+    fn folder() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "roomlerd-3361-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A one-shot that starts `start` in the background, writes "<its own
+    /// pid> <the background pid>" to `pids`, and exits at once.
+    fn leaves(dir: &Path, start: &str) -> String {
+        let tmp = dir.join("pids.tmp");
+        format!(
+            "{start} & echo \"$$ $!\" > '{tmp}' && mv '{tmp}' '{pids}'",
+            tmp = tmp.display(),
+            pids = dir.join("pids").display()
+        )
+    }
+
+    /// A process, by its pid and its start time, so a recycled pid is never
+    /// taken for it.
+    #[derive(Debug, Clone, Copy)]
+    struct Proc {
+        pid: i32,
+        start: u64,
+    }
+
+    /// The state letter and the start time in `/proc/<pid>/stat`.
+    fn stat(pid: i32) -> Option<(char, u64)> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Past the command's name, which may hold anything but ends at the
+        // last ')': the state is field 3, the start time field 22.
+        let rest: Vec<&str> = text.rsplit_once(')')?.1.split_whitespace().collect();
+        let state = rest.first()?.chars().next()?;
+        let start = rest.get(19)?.parse().ok()?;
+        Some((state, start))
+    }
+
+    impl Proc {
+        fn of(pid: i32) -> Self {
+            Self::seen(pid).unwrap_or_else(|| panic!("process {pid} is gone before it was watched"))
+        }
+
+        /// `None` once it has been collected: a shell that exits at once may
+        /// be, before the test first looks.
+        fn seen(pid: i32) -> Option<Self> {
+            stat(pid).map(|(_, start)| Self { pid, start })
+        }
+
+        /// Here, the same process, and not a zombie: a zombie has exited and
+        /// waits only to be collected.
+        fn running(&self) -> bool {
+            matches!(stat(self.pid), Some((state, start))
+                if start == self.start && !matches!(state, 'Z' | 'X'))
+        }
+
+        async fn gone_within(&self, within: Duration) -> bool {
+            let deadline = Instant::now() + within;
+            loop {
+                if !self.running() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    fn pgid_of(pid: i32) -> Option<i32> {
+        // SAFETY: `getpgid(2)` only reads; a pid that is gone answers -1.
+        let g = unsafe { libc::getpgid(pid) };
+        (g > 0).then_some(g)
+    }
+
+    fn own_group() -> i32 {
+        // SAFETY: `getpgrp(2)` cannot fail.
+        unsafe { libc::getpgrp() }
+    }
+
+    /// The group the engine made the test's shell lead, and a process of the
+    /// test's in it. Whatever the verdict, what is left in it ends with the
+    /// test.
+    struct Group {
+        leader: i32,
+        member: Proc,
+    }
+
+    impl Group {
+        fn new(leader: i32, member: Proc) -> Self {
+            let own = own_group();
+            assert!(
+                leader > 1 && leader != own,
+                "the shell {leader} must lead a group of its own (the test's is {own})"
+            );
+            assert_eq!(
+                pgid_of(member.pid),
+                Some(leader),
+                "process {} is not in the group its shell {leader} leads",
+                member.pid
+            );
+            Self { leader, member }
+        }
+    }
+
+    impl Drop for Group {
+        fn drop(&mut self) {
+            // While the member is in it, the group's id is still this group's.
+            if self.member.running() && pgid_of(self.member.pid) == Some(self.leader) {
+                // SAFETY: `killpg(2)` on the group the engine made for this
+                // test's command, checked above.
+                unsafe {
+                    libc::killpg(self.leader, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// A process that left the session's group: `setsid` made it lead a
+    /// session and a group of its own. It is ended by its own pid, and only
+    /// while it is still that process.
+    struct Lone(Proc);
+
+    impl Lone {
+        fn new(p: Proc) -> Self {
+            // SAFETY: `getsid(2)` only reads.
+            let sid = unsafe { libc::getsid(p.pid) };
+            assert!(
+                p.pid > 1 && sid == p.pid && pgid_of(p.pid) == Some(p.pid) && p.pid != own_group(),
+                "process {} should lead a session and a group of its own (sid {sid})",
+                p.pid
+            );
+            Self(p)
+        }
+    }
+
+    impl Drop for Lone {
+        fn drop(&mut self) {
+            if self.0.running() {
+                // SAFETY: `kill(2)` on one process the test started, checked
+                // by its start time to still be that process.
+                unsafe {
+                    libc::kill(self.0.pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// The numbers the shell wrote to `file`, once it has.
+    async fn said<T>(file: &Path, n: usize, run: &tokio::task::JoinHandle<T>) -> Vec<i32> {
+        let deadline = Instant::now() + STARTS_WITHIN;
+        loop {
+            // Read the run's state first: a shell writes before it exits.
+            let finished = run.is_finished();
+            if let Ok(text) = std::fs::read_to_string(file) {
+                let got: Vec<i32> = text
+                    .split_whitespace()
+                    .filter_map(|w| w.parse().ok())
+                    .collect();
+                if got.len() == n {
+                    return got;
+                }
+            }
+            assert!(
+                !finished,
+                "the run ended before its shell wrote {}",
+                file.display()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "nothing in {} within {STARTS_WITHIN:?}",
+                file.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait for the shell to have exited, then let the engine see it.
+    async fn exited<T>(shell: i32, run: &tokio::task::JoinHandle<T>) {
+        if let Some(shell) = Proc::seen(shell) {
+            assert!(
+                shell.gone_within(STARTS_WITHIN).await,
+                "the shell {} did not exit within {STARTS_WITHIN:?}",
+                shell.pid
+            );
+        }
+        tokio::time::sleep(SETTLE).await;
+        assert!(
+            !run.is_finished(),
+            "the run ended with its shell, so nothing held its pipes: the test proves nothing"
+        );
+    }
+
+    /// The run, which its client has just left: how long it took to end, and
+    /// what it said.
+    async fn ends<T>(run: &mut tokio::task::JoinHandle<T>) -> (Duration, T) {
+        let left = Instant::now();
+        match tokio::time::timeout(STILL_WAITING_AFTER, run).await {
+            Ok(outcome) => (left.elapsed(), outcome.unwrap()),
+            Err(_) => panic!(
+                "the run was still waiting {STILL_WAITING_AFTER:?} after its client left, on a \
+                 background process that holds its pipes (#3361)"
+            ),
+        }
+    }
+
+    /// AC1 and AC2 — `ssh node 'sleep 1000 & exit'`: the shell has exited,
+    /// and what it started holds its output pipes, so the run waits on them.
+    /// A client gone ends that wait, and the session's process group with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_gone_after_the_command_exited_ends_its_group() {
+        let dir = folder();
+        let (sink, mut chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
+        tokio::spawn(async move { while chunks.recv().await.is_some() {} });
+        let abort = tokio_util::sync::CancellationToken::new();
+        let mut run = {
+            let req = session(leaves(&dir, "sleep 1000"), "t3361-streamed");
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                ExecEngine::new()
+                    .run_streamed(req, &Redactor::default(), None, sink, abort)
+                    .await
+            })
+        };
+        let pids = said(&dir.join("pids"), 2, &run).await;
+        let (shell, left) = (pids[0], Proc::of(pids[1]));
+        let _group = Group::new(shell, left);
+        exited(shell, &run).await;
+
+        abort.cancel();
+        let (took, outcome) = ends(&mut run).await;
+        assert!(
+            took < ENDS_WITHIN,
+            "the run ended {took:?} after its client left, past {ENDS_WITHIN:?}"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cancelled"),
+            "{outcome:?}"
+        );
+        assert!(
+            left.gone_within(ENDS_WITHIN).await,
+            "the background process outlived the client"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same one-shot on the buffered path (`ssh_exec_streaming = false`,
+    /// `run_fed`): its final wait hears the run's cancel too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancel_after_the_command_exited_ends_its_group_on_the_buffered_path() {
+        let dir = folder();
+        let eng = Arc::new(ExecEngine::new());
+        let mut run = {
+            let req = session(leaves(&dir, "sleep 1000"), "t3361-buffered");
+            let eng = eng.clone();
+            tokio::spawn(async move { eng.run_fed(req, &Redactor::default(), None).await })
+        };
+        let pids = said(&dir.join("pids"), 2, &run).await;
+        let (shell, left) = (pids[0], Proc::of(pids[1]));
+        let _group = Group::new(shell, left);
+        exited(shell, &run).await;
+
+        assert!(
+            eng.cancel("t3361-buffered").await,
+            "the run is not in flight"
+        );
+        let (took, outcome) = ends(&mut run).await;
+        assert!(
+            took < ENDS_WITHIN,
+            "the run ended {took:?} after its cancel, past {ENDS_WITHIN:?}"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cancelled"),
+            "{outcome:?}"
+        );
+        assert!(
+            left.gone_within(ENDS_WITHIN).await,
+            "the background process outlived the cancel"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process that left the session's group (`setsid`) is out of the
+    /// session's reach, as a process another service started is out of a
+    /// job's on Windows. It holds the pipes, and still does not hold the run
+    /// past its client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_process_that_left_the_group_does_not_hold_the_run_past_its_client() {
+        let dir = folder();
+        let (tmp, away) = (dir.join("away.tmp"), dir.join("away"));
+        let start = format!(
+            "setsid sh -c 'echo $$ > {tmp} && mv {tmp} {away}; exec sleep 1000'",
+            tmp = tmp.display(),
+            away = away.display()
+        );
+        let (sink, mut chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
+        tokio::spawn(async move { while chunks.recv().await.is_some() {} });
+        let abort = tokio_util::sync::CancellationToken::new();
+        let mut run = {
+            let req = session(leaves(&dir, &start), "t3361-setsid");
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                ExecEngine::new()
+                    .run_streamed(req, &Redactor::default(), None, sink, abort)
+                    .await
+            })
+        };
+        let shell = said(&dir.join("pids"), 2, &run).await[0];
+        let away = Proc::of(said(&away, 1, &run).await[0]);
+        let _away = Lone::new(away);
+        exited(shell, &run).await;
+
+        abort.cancel();
+        let (took, outcome) = ends(&mut run).await;
+        assert!(
+            took < ENDS_WITHIN,
+            "the run ended {took:?} after its client left, past {ENDS_WITHIN:?}"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cancelled"),
+            "{outcome:?}"
+        );
+        // What a session cannot promise (`docs/roomler-ssh.md`).
+        assert!(
+            away.running(),
+            "a process outside the session's group ended with it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AC3 — a one-shot that ENDS by itself lost nothing: what it started in
+    /// the background stays, through the command's end and a client that
+    /// leaves after it. The counterpart of the Windows
+    /// `what_a_command_left_running_when_it_ended_stays`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn what_a_command_left_running_when_it_ended_stays() {
+        let dir = folder();
+        let (sink, mut chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
+        tokio::spawn(async move { while chunks.recv().await.is_some() {} });
+        let abort = tokio_util::sync::CancellationToken::new();
+        let mut run = {
+            let req = session(leaves(&dir, "sleep 1000 > /dev/null 2>&1"), "t3361-ended");
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                ExecEngine::new()
+                    .run_streamed(req, &Redactor::default(), None, sink, abort)
+                    .await
+            })
+        };
+        let pids = said(&dir.join("pids"), 2, &run).await;
+        let left = Proc::of(pids[1]);
+        let _group = Group::new(pids[0], left);
+        let outcome = tokio::time::timeout(STARTS_WITHIN, &mut run)
+            .await
+            .expect(
+                "a command whose background process holds none of its pipes ends with its shell",
+            )
+            .unwrap();
+        assert_eq!(outcome.error, None, "{outcome:?}");
+        assert_eq!(outcome.exit_code, Some(0), "{outcome:?}");
+        assert!(
+            !left.gone_within(STILL_THERE_FOR).await,
+            "it ended with the command"
+        );
+        abort.cancel();
+        assert!(
+            !left.gone_within(STILL_THERE_FOR).await,
+            "it ended with a client that left after the command had ended"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// #3303 — nothing outlives a Roomler SSH session, on Windows. A daemon that
 /// leaves runs none of its destructors for certain (a crash, the service host's
 /// terminate, the watchdog's `exit(2)`), so these tests leave the way those do:
