@@ -432,7 +432,7 @@ flowchart TD
 - **What never leaves the server:** machine ids, owner ids, WireGuard keys and key epochs,
   consent settings, codecs. Those fields are blanked *before* search runs, so `q` cannot be
   used to probe them. Search, sort and paging are the web grid's own
-  (`parse_query` / `apply_query`, `crates/api/src/routes/device.rs:295`, `:337`), so the two
+  (`parse_query` / `apply_query`, `crates/api/src/routes/device.rs:310`, `:352`), so the two
   grids cannot drift.
 - Proven by a negative control: with visibility taken from every live node instead of the
   shaped netmap, the enforce test leaks a withheld peer and fails
@@ -932,7 +932,7 @@ flowchart TD
 #3669 made each step a read takes run as the person. What a read touched outside such a step, or
 with no bound, and what its refusal said, is gathered in `agents/roomlerd/src/files/reads.rs`, with
 its tests in `files::drawer_edges` (`agents/roomlerd/src/files/drawer_edges.rs`) and
-`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:18084`).
+`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:18271`).
 
 ```mermaid
 sequenceDiagram
@@ -963,17 +963,17 @@ sequenceDiagram
 ```
 
 - **The read loop never awaits a listing.** The files channel's message handler hands `files:dir`
-  to a task of its own (`spawn_dir_listing`, `agents/roomlerd/src/peer.rs:13506`, from the arm at
-  `:13435`) and goes on reading, so a download's `files:cancel`, the next listing or an upload's
+  to a task of its own (`spawn_dir_listing`, `agents/roomlerd/src/peer.rs:13612`, from the arm at
+  `:13541`) and goes on reading, so a download's `files:cancel`, the next listing or an upload's
   chunks never wait behind a share: the channel's worst-case hold for a listing is none. It used to
   be awaited inline, and webrtc-rs reads a channel's next message only once the handler of the last
   one returns. A later listing's answer can now come before an earlier one's; the viewer matches
   each by its `req_id` (`onFilesMessage`, `ui/src/composables/remoteDirListing.ts:215`), so no wire changed. Once the
   channel closes or its session ends, a listing still running drops its answer and sends nothing
   (`FilesHandler::channel_closed`, `agents/roomlerd/src/files/reads.rs:323`, from the channel's
-  `on_close`, `agents/roomlerd/src/peer.rs:13101`; `end_session`). An answer already being sent
-  races that end too (`answer_dir_listing`, `agents/roomlerd/src/peer.rs:13525`, through
-  `or_stopped`, `:14096`): after a network drop a send can park for good on a channel that still
+  `on_close`, `agents/roomlerd/src/peer.rs:13207`; `end_session`). An answer already being sent
+  races that end too (`answer_dir_listing`, `agents/roomlerd/src/peer.rs:13631`, through
+  `or_stopped`, `:14202`): after a network drop a send can park for good on a channel that still
   reads open (#1730), and the task kept the channel and its handler for as long as the agent ran.
 - **One listing step at a time per channel** (the folder lane, `reads::Lane`). A step on a blocking thread
   cannot be cancelled, so a share that stops answering keeps its thread, and a timeout frees the
@@ -1013,7 +1013,7 @@ sequenceDiagram
   request said `paged`, and as one `files:dir-error` naming the folder, its count and the
   listing's size to a viewer that did not, which every viewer shows. The task sends the pages in
   order behind the same end as a whole answer (`send_listing_frames`,
-  `agents/roomlerd/src/peer.rs:13574`, through `or_stopped`), so a channel that closes mid-listing
+  `agents/roomlerd/src/peer.rs:13680`, through `or_stopped`), so a channel that closes mid-listing
   stops them, and the viewer waits 5 s again at each page. A send that fails is a WARN,
   `files: answer not sent`, with its error. A folder over 10 000 entries is listed to that limit
   and says so (`capped`). The answers by viewer and agent, the limit and the budget:
@@ -1079,9 +1079,9 @@ sequenceDiagram
 |---|---|---|
 | The end's first half, on the loop | `FilesHandler::begin_end` (`files.rs:2927`) | quick: under the channel's `incoming` lock it takes the upload out of the slot and marks it as ending (`ENDING`, `files.rs:1539`, read by `upload_ending`, `:1542`) before the lock goes, so whatever is read next finds the slot free and the upload ending. Its refusals keep their words ("no active transfer to end", "files:end id=… but active transfer is …"), and the read loop answers them, as before |
 | The placement | `Ending::place` (`files.rs:2974`) | the end's body from the flush on, unchanged: the short-transfer check, the rename, the copy across volumes or the copy across to the person, then the staging and its registry entry removed. It keeps the upload's busy mark for the updater (`ActiveTransferGuard`) until the file is durable, and its ending mark until it returns, however it ends. It holds neither the handler nor the channel |
-| The lane | `spawn_placement_lane` (`peer.rs:13186`), made by `attach_files_handler` (`:13107`) | one per channel: the placements run one at a time, each in a task of its own, in the order their ends came, so their answers keep that order. It holds the channel only weakly, and its end by the token a listing drops its answer on (`listings_closed`). Its sender lives in the channel's message callback, which `on_session_end` (`:13154`) lets go, and the lane ends once the placements queued by then are done |
-| The answer | `answer_upload_end` (`peer.rs:13213`) | one per upload, `files:complete` or the end's `files:error`, with the fields and the words the read loop sent; logged ("files: complete", "files: end failed") and noted for the session's audit as before. Sent only while the channel lives, the send racing the channel's end (`or_stopped`, `:14096`) |
-| The End arm | `handle_files_control` (`peer.rs:13332`, `:13337`, `:13346`) | the end of an upload refused at its begin is dropped (#3785), and so is a second end of an upload being placed, so it is answered once. Any other end takes `begin_end`, and the loop never waits for its placement |
+| The lane | `spawn_placement_lane` (`peer.rs:13292`), made by `attach_files_handler` (`:13213`) | one per channel: the placements run one at a time, each in a task of its own, in the order their ends came, so their answers keep that order. It holds the channel only weakly, and its end by the token a listing drops its answer on (`listings_closed`). Its sender lives in the channel's message callback, which `on_session_end` (`:13260`) lets go, and the lane ends once the placements queued by then are done |
+| The answer | `answer_upload_end` (`peer.rs:13319`) | one per upload, `files:complete` or the end's `files:error`, with the fields and the words the read loop sent; logged ("files: complete", "files: end failed") and noted for the session's audit as before. Sent only while the channel lives, the send racing the channel's end (`or_stopped`, `:14202`) |
+| The End arm | `handle_files_control` (`peer.rs:13438`, `:13443`, `:13452`) | the end of an upload refused at its begin is dropped (#3785), and so is a second end of an upload being placed, so it is answered once. Any other end takes `begin_end`, and the loop never waits for its placement |
 
 - **A cancel of the upload being placed does nothing to it** (`cancel_incoming`,
   `agents/roomlerd/src/files.rs:3276`): the copy is one step that cannot stop, and its staging is
@@ -1112,7 +1112,7 @@ sequenceDiagram
   channel.
 - **No bound on the copy.** A large file legitimately copies for long, so only a bound on progress
   would be sound, and none is set.
-- The tests are `peer::upload_end_tests` (`agents/roomlerd/src/peer.rs:18540`). A test holds a
+- The tests are `peer::upload_end_tests` (`agents/roomlerd/src/peer.rs:18727`). A test holds a
   placement where its copy runs (`files::drawer_edges::seams::hold_placing`), a download before
   its first chunk (`hold_sending`), and a begin between its two makes (`before_the_id`).
 
@@ -1486,10 +1486,10 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/peer.rs`) | Why |
 |---|---|---|
-| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12913`), asked as the channel opens (`files_channel_here`, `:12922`, from the `"files"` arm, `:1338`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3890`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1278`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`agents/roomlerd/src/signaling.rs:4786`) |
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:13010`), asked as the channel opens (`files_channel_here`, `:13024`, from the `"files"` arm, `:1338`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3892`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1278`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`agents/roomlerd/src/signaling.rs:4788`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches after the offer moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. On a one-row Mac, one that attaches between the session's request and its offer serves the session since #4543: the parameters the root daemon held cross with the offer (`hold`, `agents/roomlerd/src/delegate.rs:2064`; `cross_held`, `:2164`), and a session whose offer the root daemon answered stays there (`served_here`, `:2209`). A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
-| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12948`), `attach_files_declined` (`:12971`), `declined_reply` (`:13002`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
-| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12881`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session roomlerd." |
+| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:13054`), `attach_files_declined` (`:13077`), `declined_reply` (`:13108`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
+| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12964`) on a Mac with two rows; since #4566, `FILES_ON_A_ONE_ROW_MAC` (`:12974`) on a one-row Mac's root daemon (`consent_relay::one_row`, the read the no-screen sentence uses) | Two rows: "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session roomlerd." One row, where that daemon is the Mac's only row and there is no user-session roomlerd: "File transfer on this Mac runs as the person signed in at its screen, in their screen worker, and none served this session. Reconnect once someone is signed in at the Mac." |
 | What stays | the device's caps (`agents/roomlerd/src/encode/caps.rs:4481`) | the row still offers file transfer: on a one-row Mac it is the row the worker serves whenever someone is signed in, and the hub puts FILES in a grant, which consent names, from these words when a session is asked. Consent, the session request and every other channel are unchanged |
 
 What a viewer notices:
@@ -1500,10 +1500,13 @@ What a viewer notices:
   person signed in is the worker's already, if the worker had attached by its offer (#4543).
 - **On a two-row Mac's `-daemon` row** the same, whoever is signed in: the person's own row serves
   the screen and files.
+- **On a one-row Mac** the reason names no row since #4566, as the no-screen sentence below does:
+  that Mac has no user-session roomlerd to connect to. A two-row Mac's `-daemon` row keeps its
+  sentence.
 - **A session whose offer the root daemon answered before the person signed in** keeps its declined
   channel until it ends.
 - **The no-screen sentence** that daemon sends (`no_display`, `mac_no_display_hint`,
-  `agents/roomlerd/src/capture/mod.rs:932`) ends "Remote shell works here.", where it said file
+  `agents/roomlerd/src/capture/mod.rs:933`) ends "Remote shell works here.", where it said file
   transfer worked there too. On a one-row Mac it names no row since #4543: "This roomlerd runs as a
   system daemon, which has no desktop session and therefore no screen to capture. On this Mac the
   screen is captured by the screen worker of the person signed in at it, and none served this
@@ -1511,8 +1514,11 @@ What a viewer notices:
   `-daemon` row still sends the viewer to the person's own row.
 - Windows, Linux, a per-user Mac and every session a GUI worker serves are unchanged.
 
-**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17250`), on every lane's lib
-tests: the decision and its reason's words; each request's answer (`declined_reply`); and through
+**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17356`), on every lane's lib
+tests: the decision and its reason's words; since #4566, one row's reason, which names no row
+(`a_one_row_macs_declined_files_channel_names_no_row`), two rows' byte for byte
+(`a_two_row_macs_declined_files_channel_keeps_its_reason`), and each whole in an answer
+(`every_reason_reaches_the_viewer_whole`); each request's answer (`declined_reply`); and through
 the router over an in-process peer pair, both peers closed after each test, a declined channel that
 answers each request with the reason, leaves the folder asked about as it was and stays up
 (`a_declined_channel_answers_each_request_with_the_reason_and_stays_up`), a served one that lists the
@@ -1712,8 +1718,8 @@ sequenceDiagram
 
 | Piece | Where | What |
 |---|---|---|
-| the start | `notification_for_rc`, [`signaling.rs:7974`](../agents/roomlerd/src/signaling.rs#L7974); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:295`](../agents/roomlerd/src/indicator/mod.rs#L295) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
-| the consent task | `rc_surfaces_up`, [`signaling.rs:7905`](../agents/roomlerd/src/signaling.rs#L7905); `notification_shown`, [`:7989`](../agents/roomlerd/src/signaling.rs#L7989) | waits for the show's verdict. Since #4000 it does so on a task of its own beside the prompt's window, which runs from the request (#3888 had the window start after the show, see §10.5). Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
+| the start | `notification_for_rc`, [`signaling.rs:7997`](../agents/roomlerd/src/signaling.rs#L7997); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:295`](../agents/roomlerd/src/indicator/mod.rs#L295) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
+| the consent task | `rc_surfaces_up`, [`signaling.rs:7928`](../agents/roomlerd/src/signaling.rs#L7928); `notification_shown`, [`:8012`](../agents/roomlerd/src/signaling.rs#L8012) | waits for the show's verdict. Since #4000 it does so on a task of its own beside the prompt's window, which runs from the request (#3888 had the window start after the show, see §10.5). Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
 | the session walk | `graphical_session_within`, [`companion.rs:9224`](../agents/roomlerd/src/companion.rs#L9224); `SESSION_WALKS`, [`:9252`](../agents/roomlerd/src/companion.rs#L9252) | one walk in flight per kind of ask (the uid asked for, and whether only a person's session will do), on a thread named `session-walk`. Each caller waits `SESSION_WALK_WAIT`, 1.5 s ([`:9208`](../agents/roomlerd/src/companion.rs#L9208)), the seat and account lookups' wait. No answer in time is "not known" with its reason (`walked_in_time`, [`:9265`](../agents/roomlerd/src/companion.rs#L9265)), never "nobody at the screen" |
 | a question that ends on the way | `Prompts::coming`, [`indicator/notify.rs:358`](../agents/roomlerd/src/indicator/notify.rs#L358); `launch`, [`:505`](../agents/roomlerd/src/indicator/notify.rs#L505) | the question is on the books as coming before its show starts. `hide_prompt` (a `Terminate`, an answer from another surface, the closed socket the consent task watches) takes it off, and the show then starts no helper, or drops the one it started, whose helper closes the notification and exits. Its verdict is `its question ended while the notification was being put up`, once |
 
@@ -2033,8 +2039,8 @@ window runs from the request").
 
 | Piece | Where | What |
 |---|---|---|
-| the loop's side | `start_for_prompt`, [`companion.rs:1393`](../agents/roomlerd/src/companion.rs#L1393); the hand-off, [`signaling.rs:4514`](../agents/roomlerd/src/signaling.rs#L4514) | starts `ensure_running` on a task of its own, 3 s at most, and returns its handle (`Starting`, [`companion.rs:1411`](../agents/roomlerd/src/companion.rs#L1411)) at once. The loop hands it to the consent task with the question, in `RcSurfaces` ([`signaling.rs:7875`](../agents/roomlerd/src/signaling.rs#L7875)) |
-| the consent task's side | `rc_surfaces_up`, [`signaling.rs:7905`](../agents/roomlerd/src/signaling.rs#L7905), called at [`:8026`](../agents/roomlerd/src/signaling.rs#L8026) on the task `rc_consent_task` spawns ([`:8065`](../agents/roomlerd/src/signaling.rs#L8065)) | waits for the start's verdict, then for the notification where the tray cannot show the question. Since #4000 that is beside the prompt's window, and `rc_shown_by_now` ([`:8191`](../agents/roomlerd/src/signaling.rs#L8191)) reads it when the question ends; #3888 had it before the first look at the prompt started the window. `have_surface` is the native panel, or the marker with the tray up, or a notification that came up, so a start that failed or ran out of time is still `no_prompt_surface`, never a timeout |
+| the loop's side | `start_for_prompt`, [`companion.rs:1393`](../agents/roomlerd/src/companion.rs#L1393); the hand-off, [`signaling.rs:4516`](../agents/roomlerd/src/signaling.rs#L4516) | starts `ensure_running` on a task of its own, 3 s at most, and returns its handle (`Starting`, [`companion.rs:1411`](../agents/roomlerd/src/companion.rs#L1411)) at once. The loop hands it to the consent task with the question, in `RcSurfaces` ([`signaling.rs:7898`](../agents/roomlerd/src/signaling.rs#L7898)) |
+| the consent task's side | `rc_surfaces_up`, [`signaling.rs:7928`](../agents/roomlerd/src/signaling.rs#L7928), called at [`:8049`](../agents/roomlerd/src/signaling.rs#L8049) on the task `rc_consent_task` spawns ([`:8088`](../agents/roomlerd/src/signaling.rs#L8088)) | waits for the start's verdict, then for the notification where the tray cannot show the question. Since #4000 that is beside the prompt's window, and `rc_shown_by_now` ([`:8214`](../agents/roomlerd/src/signaling.rs#L8214)) reads it when the question ends; #3888 had it before the first look at the prompt started the window. `have_surface` is the native panel, or the marker with the tray up, or a notification that came up, so a start that failed or ran out of time is still `no_prompt_surface`, never a timeout |
 | a question that ends while the start runs | `ConsentBroker::is_asking`, [`consent.rs:853`](../agents/roomlerd/src/consent.rs#L853) | a `Terminate` the loop reads meanwhile takes the question off the broker's books and finds no notification to take down. The consent task starts none for a question off the books, or whose socket closed, and takes down one started just as it was withdrawn |
 
 - **The bound is as before:** the start's 2.5 s and the 3 s budget, on the start's own task and
@@ -2117,8 +2123,8 @@ flowchart TD
   the `--autostart` restart of a tray the refresh lost, and the restart of a companion a Linux
   package update stopped (`companion/package_sync.rs`).
 - **Every caller of the start is a question or a banner:** the remote-control prompt
-  (`start_for_prompt`, `companion.rs:1393`, from `agents/roomlerd/src/signaling.rs:4514`), the exec prompt
-  (`exec_surfaces_up`, `agents/roomlerd/src/signaling.rs:8140`), a recording's and an SSH session's question
+  (`start_for_prompt`, `companion.rs:1393`, from `agents/roomlerd/src/signaling.rs:4516`), the exec prompt
+  (`exec_surfaces_up`, `agents/roomlerd/src/signaling.rs:8163`), a recording's and an SSH session's question
   (`Companion::verdict`, `companion.rs:1462`, which a recording reads through `Companion::up`),
   and Linux's being-viewed banner (`indicator/notify.rs:747`). The other callers are
   `tray_start_tests`' own.
@@ -2644,7 +2650,7 @@ hosts the panel in FR-149 P2.
 | the word and the frames | the worker says `consent-panel` in its caps frames, beside `relay-consent`, only with no enrollment, in a build with the macOS panel, and with the switch on. The daemon keeps the word by equality, and it goes with the channel. `PanelAsk { id, question }` carries the question's 24-hex id, the panel's text and the time left in milliseconds; `PanelTold { id, state }` says `shown`, `busy` or `not_up` with a reason, and, unasked, `not_up` says the panel no longer shows a question it showed (the click's row); `PanelHide { id }` takes it down. A reader skips a frame it does not know (a debug line), so they are additive both ways | `hosts_the_panel`, [`session_panel.rs:831`](../agents/roomlerd/src/indicator/session_panel.rs#L831); `worker_features`, [`delegate.rs:269`](../agents/roomlerd/src/delegate.rs#L269); the frames, [`:231`](../agents/roomlerd/src/delegate.rs#L231), [`:245`](../agents/roomlerd/src/delegate.rs#L245), [`:251`](../agents/roomlerd/src/delegate.rs#L251); `ask_panel`, [`:1491`](../agents/roomlerd/src/delegate.rs#L1491); `panel_told`, [`:1542`](../agents/roomlerd/src/delegate.rs#L1542) |
 | the worker's gate and its panel | `/dev/console`'s owner is the worker's own account (the root's read, made again), its panel shows no other question, the id is 24 hex, and time is left. Then ONE main-thread job puts the panel up and reads its window number: above 0 is `shown`; 0 or less takes it down and is `not_up`. The job is answered within 400 ms (`SHOW_WITHIN`): one not begun by then never runs, and one running then takes its panel down again at its end. The window is built with no lock held, and the slot is read before and filled after it, so a window server that stalls the build stalls the main thread alone. The question sits in the one slot every question shares | `worker_gate`, [`session_panel.rs:564`](../agents/roomlerd/src/indicator/session_panel.rs#L564); `show_root_question`, [`indicator/mac.rs:304`](../agents/roomlerd/src/indicator/mac.rs#L304); `put_up`, [`:335`](../agents/roomlerd/src/indicator/mac.rs#L335); `put_up_within`, [`:400`](../agents/roomlerd/src/indicator/mac.rs#L400) |
 | the worker's frame loop (review F5) | the loop never waits for the panel's main thread. Its desk shows a `PanelAsk` on a task of its own, and the loop writes the answer as it writes a delegated session's replies; a `PanelHide` is one take-down that waits for nothing. While a show waits for a stalled main thread, the delegated sessions' frames, the liveness ping and the next `PanelHide` pass. A `shown` the root daemon no longer waits for gets a `PanelHide`, and a show that ends after its attach finds nobody to hear it and takes itself down, so a late show never stays on the panel | `Desk`, [`session_panel.rs:724`](../agents/roomlerd/src/indicator/session_panel.rs#L724); `Desk::ask`, [`:762`](../agents/roomlerd/src/indicator/session_panel.rs#L762); the panel it drives, `ThePanel`, [`:661`](../agents/roomlerd/src/indicator/session_panel.rs#L661); the desk in the loop, [`delegate_worker.rs:440`](../agents/roomlerd/src/delegate_worker.rs#L440), its arms [`:560`](../agents/roomlerd/src/delegate_worker.rs#L560) and [`:608`](../agents/roomlerd/src/delegate_worker.rs#L608) |
-| the click | a click on a question the worker's own broker is not asking takes the app's road: `consent_decide_view` on the worker's LocalAPI state, to the root half over the root's person socket, which asks the seat again before its broker takes it, 5 s at most (`DECIDE_WITHIN`). On a task, so the worker's signalling loop reads on. The panel cleared its slot at the click, so a click the root half did not take leaves the question on no panel: the worker says so, unasked (`PanelTold` with `not_up`, `why=the_answer_was_not_taken`), and the root daemon moves the question to the app as at a channel's end, only while its broker asks it and it is on the panel's books; anything else it drops with a debug line. The question is never put back on the panel: the refusal may mean it ended, was answered elsewhere or the seat moved, which the root half knows (review F1) | `panel_road`, [`consent_relay.rs:494`](../agents/roomlerd/src/consent_relay.rs#L494); `panel_clicked`, [`:511`](../agents/roomlerd/src/consent_relay.rs#L511); `panel_answered`, [`:545`](../agents/roomlerd/src/consent_relay.rs#L545); registered by `register_panel_road`, [`:487`](../agents/roomlerd/src/consent_relay.rs#L487); the consent arm, [`signaling.rs:2887`](../agents/roomlerd/src/signaling.rs#L2887); `tell_the_root`, [`session_panel.rs:701`](../agents/roomlerd/src/indicator/session_panel.rs#L701); `panel_let_go`, [`delegate.rs:1588`](../agents/roomlerd/src/delegate.rs#L1588) |
+| the click | a click on a question the worker's own broker is not asking takes the app's road: `consent_decide_view` on the worker's LocalAPI state, to the root half over the root's person socket, which asks the seat again before its broker takes it, 5 s at most (`DECIDE_WITHIN`). On a task, so the worker's signalling loop reads on. The panel cleared its slot at the click, so a click the root half did not take leaves the question on no panel: the worker says so, unasked (`PanelTold` with `not_up`, `why=the_answer_was_not_taken`), and the root daemon moves the question to the app as at a channel's end, only while its broker asks it and it is on the panel's books; anything else it drops with a debug line. The question is never put back on the panel: the refusal may mean it ended, was answered elsewhere or the seat moved, which the root half knows (review F1) | `panel_road`, [`consent_relay.rs:494`](../agents/roomlerd/src/consent_relay.rs#L494); `panel_clicked`, [`:511`](../agents/roomlerd/src/consent_relay.rs#L511); `panel_answered`, [`:545`](../agents/roomlerd/src/consent_relay.rs#L545); registered by `register_panel_road`, [`:487`](../agents/roomlerd/src/consent_relay.rs#L487); the consent arm, [`signaling.rs:2889`](../agents/roomlerd/src/signaling.rs#L2889); `tell_the_root`, [`session_panel.rs:701`](../agents/roomlerd/src/indicator/session_panel.rs#L701); `panel_let_go`, [`delegate.rs:1588`](../agents/roomlerd/src/delegate.rs#L1588) |
 | the take-down | the root's `hide_prompt` sends `PanelHide` for a question on the session panel. The worker's pump takes a root question down at its time's end, and the worker's desk takes it down when its channel ends. A `shown` after its wait gets a `PanelHide` | `hide_prompt`, [`indicator/mod.rs:344`](../agents/roomlerd/src/indicator/mod.rs#L344); `hide_panel`, [`delegate.rs:1677`](../agents/roomlerd/src/delegate.rs#L1677); the time's end, [`indicator/mac.rs:726`](../agents/roomlerd/src/indicator/mac.rs#L726); the desk's end, [`session_panel.rs:807`](../agents/roomlerd/src/indicator/session_panel.rs#L807) |
 | the channel's end (D4), and every move to the app | a question the worker said `shown` for, whose channel then ends (the worker crashed, the person logged out, the seat moved), is marked for the app for the rest of its window: its marker says `companion` with the deadline it had, rewritten while the broker asks it, as #4000 rewrites one for a notification. Each move, this one and the click's, also starts the app, by the start a question whose surface is the app makes from the outset (`companion::start_for_prompt`), detached, best-effort and with no lock held (review F2); a marker that is the app's already is not moved again, so a question starts it once. A channel that ends between `shown` and the caller's first write of the marker finds no marker to rewrite; that write reads the panel's books after it and moves the question then, so the question ends with the app in either order (review F3). Every caller writes its marker that way | `panel_channel_ended`, [`delegate.rs:1710`](../agents/roomlerd/src/delegate.rs#L1710); `to_the_app`, [`:1615`](../agents/roomlerd/src/delegate.rs#L1615); `start_the_app`, [`:1636`](../agents/roomlerd/src/delegate.rs#L1636); `to_the_companion_while_asking`, [`consent.rs:1165`](../agents/roomlerd/src/consent.rs#L1165); `write_marker`, [`session_panel.rs:296`](../agents/roomlerd/src/indicator/session_panel.rs#L296) |
 | the main loop's promise (P0's C2) | `main` promises the AppKit loop before it starts the daemon's thread, so a panel built before the loop pumps is kept; the loop's first pass opens it to questions. A worker whose loop started late had no panel for its life on 0.4.228 | `promise_main_loop`, [`indicator/mac.rs:190`](../agents/roomlerd/src/indicator/mac.rs#L190), called at [`app.rs:1316`](../agents/roomlerd/src/app.rs#L1316); `MainLoop`, [`panel_gate.rs:473`](../agents/roomlerd/src/indicator/panel_gate.rs#L473); the first pass, [`indicator/mac.rs:677`](../agents/roomlerd/src/indicator/mac.rs#L677) |
@@ -3256,7 +3262,7 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5860`, `AskingMark`
+dialog is the wait (`agents/roomlerd/src/peer.rs:5899`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1475`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:539`). The mark goes

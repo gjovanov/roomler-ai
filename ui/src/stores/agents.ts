@@ -8,6 +8,7 @@ import { canManageOrgSettings, canReadDeviceDiagnostics } from '@/utils/permissi
 import { isKeepBusyPattern, type KeepBusyPattern } from '@/composables/keepBusy'
 import type { AgentReleaseBrief } from '@/utils/updateStall'
 import type { PowerBrief, SleepView } from '@/utils/devicePresence'
+import type { CrashHealth, LastInstallWord } from '@/utils/deviceHealth'
 import type { ExternalAuditEntry, ExternalPrincipal } from '@/utils/externalAudit'
 
 /**
@@ -225,6 +226,11 @@ export interface AgentCapabilities {
    *  only the machine's primary drives its updater), 'off' (auto-update off
    *  on the device). Absent on older agents. See utils/updateRefusal.ts. */
   update_mode?: string
+  /** FR-67 P5 — the last install's verdict, as the device's post-install
+   *  watcher recorded it. Absent on older agents. See utils/deviceHealth.ts. */
+  last_install?: LastInstallWord
+  /** #3332 — the crash ladder's state on the host. Absent on older agents. */
+  crash_health?: CrashHealth
   /** mime-style codec names: 'h264', 'h265', 'av1'. */
   codecs: string[]
   /** Descriptive backend labels: 'openh264-sw', 'mf-h264-hw', 'mf-h265-hw',

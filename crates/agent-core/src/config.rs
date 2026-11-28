@@ -2826,6 +2826,67 @@ pub fn run_state_moved(before: &str, after: &str) -> Option<Vec<&'static str>> {
     (before == after).then_some(moved)
 }
 
+/// #3332 — the crash ladder's four keys, the first four of
+/// [`RUN_STATE_KEYS`], as a reader that only SHOWS them takes them from the
+/// file ([`read_crash_ladder`]): the caps' crash word (`roomlerd`'s
+/// `health_words`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct CrashLadder {
+    /// [`AgentConfig::last_known_good_version`], as stored: the bare package
+    /// version [`record_clean_run_at`] promoted.
+    #[serde(default)]
+    pub last_known_good_version: Option<String>,
+    /// [`AgentConfig::crash_count`].
+    #[serde(default)]
+    pub crash_count: u32,
+    /// [`AgentConfig::last_crash_unix`].
+    #[serde(default)]
+    pub last_crash_unix: u64,
+    /// [`AgentConfig::rollback_attempted`].
+    #[serde(default)]
+    pub rollback_attempted: bool,
+}
+
+impl CrashLadder {
+    /// The ladder as `cfg` holds it.
+    pub fn of(cfg: &AgentConfig) -> Self {
+        Self {
+            last_known_good_version: cfg.last_known_good_version.clone(),
+            crash_count: cfg.crash_count,
+            last_crash_unix: cfg.last_crash_unix,
+            rollback_attempted: cfg.rollback_attempted,
+        }
+    }
+}
+
+/// #3332 — the crash ladder of the config at `path`, read from the file as it
+/// is now. It runs every half minute for a word the daemon only shows, so it is
+/// quiet where [`load`] speaks: only the four keys are parsed (nothing else the
+/// file holds is read into a value, and a key this build does not know cannot
+/// fail it), no line is logged (a [`load`] says each plaintext URL it promoted
+/// and each unknown key), no `.prev` is read or repaired and nothing is
+/// written. An empty file or one of NUL bytes is an error, never a ladder of
+/// defaults: an unclean shutdown leaves those, and the ladder is then unknown,
+/// not clean. The error names no value the file holds ([`parse_failure`]).
+pub fn read_crash_ladder(path: &std::path::Path) -> Result<CrashLadder> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config at {}", path.display()))?;
+    if raw.trim().is_empty() || raw.bytes().all(|b| b == 0) {
+        anyhow::bail!(
+            "config at {} is {} bytes and holds nothing",
+            path.display(),
+            raw.len()
+        );
+    }
+    toml::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "parsing config at {}: {}",
+            path.display(),
+            parse_failure(&raw, &e)
+        )
+    })
+}
+
 /// TOML-friendly mirror of `encode::EncoderPreference`. Kept separate so
 /// the `encode` module stays CLI-independent and the config file survives
 /// feature gating without needing the `mf-encoder` feature enabled to
@@ -7643,6 +7704,54 @@ tenant_id = "tid2"
                 "{key} is not a top-level key of:\n{text}"
             );
         }
+    }
+
+    /// #3332 — the quiet read of the ladder takes from a file `save` wrote
+    /// exactly what the config holds, so a renamed field cannot leave the crash
+    /// word reading defaults; its four keys are run-state keys; and a file that
+    /// holds nothing is an error, never a clean ladder.
+    #[test]
+    fn the_crash_ladder_reads_back_what_the_config_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = with_run_state();
+        cfg.last_known_good_version = Some("0.4.239".into());
+        save(&path, &cfg).unwrap();
+        let ladder = read_crash_ladder(&path).unwrap();
+        assert_eq!(ladder, CrashLadder::of(&cfg));
+        assert_eq!(
+            ladder,
+            CrashLadder {
+                last_known_good_version: Some("0.4.239".into()),
+                crash_count: 2,
+                last_crash_unix: 1_000_000,
+                rollback_attempted: true,
+            }
+        );
+        for key in [
+            "last_known_good_version",
+            "crash_count",
+            "last_crash_unix",
+            "rollback_attempted",
+        ] {
+            assert!(RUN_STATE_KEYS.contains(&key), "{key}");
+        }
+
+        record_clean_run_at(&mut cfg, "0.4.240");
+        save(&path, &cfg).unwrap();
+        assert_eq!(read_crash_ladder(&path).unwrap(), CrashLadder::of(&cfg));
+
+        std::fs::write(&path, "").unwrap();
+        assert!(read_crash_ladder(&path).is_err(), "an empty file");
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        assert!(read_crash_ladder(&path).is_err(), "a file of NUL bytes");
+        std::fs::write(&path, "crash_count = \"tok-secret\"\n").unwrap();
+        let said = format!("{:#}", read_crash_ladder(&path).unwrap_err());
+        assert!(!said.contains("tok-secret"), "{said}");
+        assert!(
+            read_crash_ladder(&dir.path().join("missing.toml")).is_err(),
+            "no file"
+        );
     }
 
     /// #4097 — each step of the run bookkeeping moves something, and nothing

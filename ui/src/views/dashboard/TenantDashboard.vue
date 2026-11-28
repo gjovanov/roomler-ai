@@ -270,13 +270,10 @@ const devicesOnlineLabel = computed(() => {
   if (m) return `${m.online}/${m.total}`
   return String(onlineDevices.value)
 })
-/** Enrolled tunnel clients, online-by-stored-status/total. No liveness
- *  probe exists for tunnel clients (the tunnel.rs "T2" gap) — the tile's
- *  tooltip says so instead of pretending. */
-const tunnelsLabel = computed(() => {
-  const online = tunnelClientStore.clients.filter((c) => c.status === 'online').length
-  return `${online}/${tunnelClientStore.total}`
-})
+/** Enrolled tunnel clients, connected/total: the store counts the presence
+ *  the server derives from each client's socket (#4553), page-capped like
+ *  the agents fallback above. */
+const tunnelsLabel = computed(() => `${tunnelClientStore.onlineCount}/${tunnelClientStore.total}`)
 const showFleet = computed(
   () => caps.has('fleet') && canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner),
 )

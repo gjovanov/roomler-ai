@@ -407,6 +407,26 @@ mod tests {
         );
     }
 
+    /// FR-135 R4a (#3275) — a DataChannel pump on the waiting path opens its
+    /// capture paced, so FR-119's grants reach the SYSTEM-context GDI arm's
+    /// bucket for the first time. A granted 120 or 144 holds nothing back
+    /// there: a BitBlt and an encode take longer than the granted period, and a
+    /// source slower than its target always finds a frame of credit.
+    #[test]
+    fn a_granted_rate_above_sixty_never_holds_a_source_slower_than_it() {
+        // GDI as a field session ran it: 10 ms a BitBlt and a 6 ms encode.
+        let work = 16 * MS;
+        for fps in [120, 144] {
+            let mut gate = SlotFirst::new(fps);
+            let mut now = Instant::now();
+            for frame in 0..500 {
+                assert_eq!(gate.wait(now), Duration::ZERO, "{fps} fps, frame {frame}");
+                gate.took(now);
+                now += work;
+            }
+        }
+    }
+
     #[test]
     fn after_an_idle_spell_at_most_two_frames_go_back_to_back() {
         let t0 = Instant::now();

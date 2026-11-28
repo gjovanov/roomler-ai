@@ -152,8 +152,13 @@ impl Rules {
     /// default. `stats` is instruments and nothing else (FR-135 §7.1: R0's
     /// fields only add to what the reads parse), so it is on from its first
     /// release, with `rc_media_legacy=stats` as its switch.
+    ///
+    /// R4a's capture wait has new code too, and runs the old by default: the
+    /// first of §7.1's three steps for a change to what an agent does. A device
+    /// turns it on with `rc_media_canary=capture_wait`, and its flip is a
+    /// release of its own (#3275).
     pub const THIS_BUILD: Rules = Rules {
-        built: Stats.bit() | MediaPlan.bit(),
+        built: Stats.bit() | MediaPlan.bit() | CaptureWait.bit(),
         new_by_default: Stats.bit() | MediaPlan.bit(),
     };
 }
@@ -549,10 +554,33 @@ mod tests {
         assert_eq!(s.refused_wire(), vec!["encode_stage:not_built"]);
     }
 
+    /// FR-135 R4a (#3275) — this build has `capture_wait`'s new code and runs
+    /// the old by default. The device's canary key turns it on, a pushed legacy
+    /// entry sends the session back and wins, and nothing that stands on it has
+    /// code yet.
+    #[test]
+    fn capture_wait_is_built_and_off_until_a_device_s_canary_asks() {
+        assert!(CaptureWait.built());
+        assert!(!MediaPaths::default().is_new(CaptureWait));
+
+        let s = resolve(&Entries::default(), &entries(&[CaptureWait]));
+        assert!(s.is_new(CaptureWait));
+        assert_eq!(s.canary, vec![CaptureWait]);
+        assert!(s.refused_wire().is_empty() && s.any_key());
+
+        let s = resolve(&entries(&[CaptureWait]), &entries(&[CaptureWait]));
+        assert!(!s.is_new(CaptureWait));
+        assert_eq!(s.refused_wire(), vec!["capture_wait:legacy"]);
+
+        for p in [CaptureStage, EncodeStage, HighRefresh] {
+            assert!(!p.built(), "{p}");
+        }
+    }
+
     /// On a build where a path has new code but a path under it is still old
     /// by default, its canary entry is refused for that requirement, and a
     /// default stands on its requirements: neither branch can fire in this
-    /// build, where only `media_plan` has new code and it stands on nothing.
+    /// build, where no path with new code stands on another.
     #[test]
     fn a_requirement_on_the_old_path_holds_a_canary_and_a_default_back() {
         let built_all = Rules {

@@ -6,5 +6,5 @@
 agent_env_reads=182 # p4:DEADLINE-1: retires with FR-148 P5, when the deadline channel's switch is deleted
 viewer_knobs=32 # r0:CLOCK-1: retires after a week of field reads with the calibration on
 pump_lines_rtp=1312
-pump_lines_vp9_dc=1500 # p2:BUDGET-6: retires with FR-148 P5, when the one controller owns the budget's hold, the encoder's charge and the send path's measure, or AC32 rejects the budget
-pump_lines_ffmpeg_dc=3852 # p2:BUDGET-3: retires with FR-148 P5, when the one controller owns the budget or it is deleted
+pump_lines_vp9_dc=1539 # r4a:WAIT-1: retires with #3275's delete, when the sleeping arm and the switch's conditional go
+pump_lines_ffmpeg_dc=3895 # r4a:WAIT-1: retires with #3275's delete, when the sleeping arm and the switch's conditional go
