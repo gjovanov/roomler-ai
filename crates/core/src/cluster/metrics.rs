@@ -81,6 +81,10 @@ pub static RC_SLOT_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// `agent_credentials_rotated` hook answered an error. The new token was
 /// answered, and the decision's audit row says `hook_failed`.
 pub static CREDENTIAL_ROTATION_HOOK_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// FR-155 P1e — answers asked again that were given at their bound
+/// (`REPLAY_WAIT_SECS` in the fleet module's `rotation_work`), before the
+/// work of their commit marked its end.
+pub static CREDENTIAL_ROTATION_REPLAY_UNSETTLED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// #3952 — each Redis subscriber's probe of its own connection
 /// (`crate::ws::sub_probe`): probes sent, heard, missed and unknown, and the
 /// deaf verdicts, each one a new subscription. On a Redis that answers,

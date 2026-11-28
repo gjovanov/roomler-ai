@@ -938,16 +938,17 @@ impl axum::response::IntoResponse for RotateError {
 }
 
 /// One rotation decision's audit row: who asked, from where, with which
-/// generation. Every outcome of the route goes through [`Self::record`].
-struct RotationAudit<'a> {
-    state: &'a FleetState,
-    caller: crate::auth_agent::RotationCaller,
-    client_ip: Option<String>,
+/// generation. Every outcome of the route goes through [`Self::record`], also
+/// the work of a commit (`crate::rotation_work::run`).
+pub(crate) struct RotationAudit<'a> {
+    pub(crate) state: &'a FleetState,
+    pub(crate) caller: crate::auth_agent::RotationCaller,
+    pub(crate) client_ip: Option<String>,
 }
 
 impl RotationAudit<'_> {
     /// Best-effort: a failed write is logged and never changes the answer.
-    async fn record(&self, decision: &str, reason: Option<&str>, gen_to: Option<u32>) {
+    pub(crate) async fn record(&self, decision: &str, reason: Option<&str>, gen_to: Option<u32>) {
         let event = roomler_ai_remote_control::models::TokenRotationAuditEvent {
             id: None,
             tenant_id: self.caller.tenant_id,
@@ -981,7 +982,9 @@ impl RotationAudit<'_> {
 /// first rotation an hour per device (429 above it). A token one generation
 /// below, with the rotation key of the rotation that made the row's
 /// generation, asks again for an answer that was lost: it is minted at the
-/// row's generation, nothing else changes, and the hour does not apply.
+/// row's generation, nothing else changes, and the hour does not apply. The
+/// work a commit starts runs in a task of its own to its end, and both
+/// answers come after it (FR-155 P1e, `crate::rotation_work`).
 ///
 /// 404 to a first call while `rc.agent_token_rotation` is off (a call asking
 /// again is answered either way, so switching it off never leaves a device
@@ -1116,6 +1119,7 @@ pub async fn self_rotate(
         generation: next_gen,
         key_sha256,
         at: DateTime::from_millis(now.timestamp_millis()),
+        settled_at: None,
     };
     let last_rotation_before = DateTime::from_millis(now.timestamp_millis() - ROTATION_INTERVAL_MS);
     let committed = state
@@ -1131,54 +1135,27 @@ pub async fn self_rotate(
         .await
         .map_err(|e| ApiError::Internal(format!("token rotation: {e}")))?;
     if committed {
-        // FR-155 P1b — what the commit ends: the device's connections admitted
-        // below the new generation, on this pod and, through the control
-        // channel, on every other, each pod keeping a floor that refuses a
-        // late registration below it (`hub::rotation`).
-        state
-            .rc_hub
-            .end_below_generation(caller.agent_id, caller.tenant_id, next_gen);
-        crate::ctrl::publish_rc_ctrl(
-            &state.core,
-            "end_below_generation",
-            serde_json::json!({
-                "agent_id": caller.agent_id.to_hex(),
-                "tenant_id": caller.tenant_id.to_hex(),
-                "generation": next_gen,
-            }),
-        )
-        .await;
-        audit.record("first", None, Some(next_gen)).await;
-        // FR-155 P1d — what the commit changes outside fleet: the overlay node
-        // goes offline, the DERP registrations below the new generation end,
-        // and the device is ordered a new overlay key
-        // (`FleetLifecycle::agent_credentials_rotated`). Once, here, before
-        // the answer: the device connects at the new generation only once it
-        // has the token. A failure is logged, counted and audited, and the
-        // token is answered all the same.
-        let failed = state
-            .hooks
-            .agent_credentials_rotated(caller.tenant_id, caller.agent_id, next_gen)
-            .await;
-        if !failed.is_empty() {
-            roomler_core::cluster::metrics::bump(
-                &roomler_core::cluster::metrics::CREDENTIAL_ROTATION_HOOK_FAILED_TOTAL,
+        // FR-155 P1e — the work the commit starts (the sweep, the control
+        // event, the `first` row, the hook, the row's mark) runs in a task of
+        // its own, to its end, and the answer is minted once it has ended
+        // (`rotation_work`). This pod's answers asked again wait for it from
+        // here on.
+        let running = state
+            .rotations_in_flight
+            .start(caller.tenant_id, caller.agent_id, next_gen);
+        let work = tokio::spawn(crate::rotation_work::run(
+            state.clone(),
+            caller,
+            audit.client_ip.clone(),
+            rotation.key_sha256.clone(),
+            running,
+        ));
+        if let Err(e) = work.await {
+            tracing::error!(
+                tenant_id = %caller.tenant_id, agent_id = %caller.agent_id,
+                generation = next_gen, error = %e,
+                "fr-155: the work of a rotation's commit ended in an error; the new token is answered"
             );
-            for (module, e) in &failed {
-                tracing::warn!(
-                    tenant_id = %caller.tenant_id, agent_id = %caller.agent_id,
-                    generation = next_gen, module, error = %e,
-                    "fr-155: a module could not apply the token rotation; the new token is answered"
-                );
-            }
-            let modules = failed
-                .iter()
-                .map(|(module, _)| *module)
-                .collect::<Vec<_>>()
-                .join(",");
-            audit
-                .record("hook_failed", Some(modules.as_str()), Some(next_gen))
-                .await;
         }
         let agent_token = state
             .auth
@@ -1264,12 +1241,23 @@ pub async fn self_rotate(
 }
 
 /// The answer to the row's last rotation, asked again: minted at the row's
-/// generation, and the row is not written.
+/// generation, and the row is not written. While the rotation is on, it is
+/// given once the work of that rotation's commit has ended, waited for at
+/// most `rotation_work::REPLAY_WAIT_SECS` (FR-155 P1e, `rotation_work`).
 async fn answer_again(
     state: &FleetState,
     audit: &RotationAudit<'_>,
     row: &Agent,
 ) -> Result<Json<RenewedAgentToken>, RotateError> {
+    if state.rc_hub.token_rotation() {
+        crate::rotation_work::wait_for_the_work(
+            state,
+            audit.caller.tenant_id,
+            audit.caller.agent_id,
+            row,
+        )
+        .await;
+    }
     let ttl = state.settings.rc.agent_token_ttl_secs;
     let agent_token = state
         .auth

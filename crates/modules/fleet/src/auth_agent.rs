@@ -624,6 +624,7 @@ mod tests {
             generation,
             key_sha256: key_sha256.to_string(),
             at: bson::DateTime::from_millis(0),
+            settled_at: None,
         }
     }
 

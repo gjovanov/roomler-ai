@@ -1799,8 +1799,8 @@ the admin's state: `online` and `offline` both mean active, and `quarantined` en
 the socket at its next 60 s check. Whether the client is connected is derived on
 every read from its live tunnel socket, the way an agent's presence is derived from
 its hub registration (Phase A-1). ONE function does it,
-`derive_tunnel_client_presence` (`crates/modules/fleet/src/agent.rs:2850`), beside
-`derive_agent_presence` (`:2648`), and every list that shows a tunnel client calls
+`derive_tunnel_client_presence` (`crates/modules/fleet/src/agent.rs:2838`), beside
+`derive_agent_presence` (`:2636`), and every list that shows a tunnel client calls
 it: the unified device list and a device's own listing
 (`crates/api/src/routes/device.rs:226`, `crates/api/src/routes/agent_self.rs`), and
 `GET …/tunnel-client` with the PUT's answer
@@ -1821,8 +1821,8 @@ flowchart TD
 
 | What the read finds | `presence` | `is_online` |
 |---|---|---|
-| a socket of the client is live on this pod (`TunnelClientSockets`, `agent.rs:2688`) | `online` | `true` |
-| else, a fresh record of it from any pod (`tunnel_client_presence_batch`, `agent.rs:2816`) | `online` | `true` |
+| a socket of the client is live on this pod (`TunnelClientSockets`, `agent.rs:2676`) | `online` | `true` |
+| else, a fresh record of it from any pod (`tunnel_client_presence_batch`, `agent.rs:2804`) | `online` | `true` |
 | else, the directory answered | `offline` | `false` |
 | else (no Redis, an error, or the 200 ms budget spent), and `last_seen_at` is fresh | `stale` | `false` |
 | else | `offline` | `false` |
@@ -1836,7 +1836,7 @@ after a clean close, so read on its own it would show every client that just clo
 or just enrolled, as `stale`. A directory that answered knows the sockets; the trail
 stands in only for one that did not, and then it is never green: with Redis down, a
 pod reads a client connected to the other pod as `stale` (`tunnel_client_presence`,
-`agent.rs:2880`, and its table test).
+`agent.rs:2868`, and its table test).
 
 ### The record its sockets write
 
@@ -1855,12 +1855,12 @@ live client nor its trail.
 | pod shutdown | every token this pod holds is taken, so no refresh writes it back, then released | `NetworkState::shutdown` (`crates/modules/network/src/lib.rs:994`) |
 
 - ⚠️ **The client's sockets on one pod share one token**, as an agent's hub slot holds
-  one (`TunnelClientSockets::sit`, `agent.rs:2706`). Two `roomler` processes on one
+  one (`TunnelClientSockets::sit`, `agent.rs:2694`). Two `roomler` processes on one
   machine hold two sockets, and the newer one often closes first (a short `roomler
   ssh` beside a long-lived forward). With a token per socket, that close would delete
   the record the other socket stands behind, and every other pod would read the client
   offline until the next refresh, up to 60 s. Shared, the first close releases nothing;
-  the last one releases the record (`leave`, `:2766`).
+  the last one releases the record (`leave`, `:2754`).
 - ⚠️ **The release waits for the check.** `refresh_if_mine` writes a missing key back:
   that is how a record lost to a Redis blip heals within one check. A refresh still in
   flight after the release would bring the record back for its whole TTL, so the
