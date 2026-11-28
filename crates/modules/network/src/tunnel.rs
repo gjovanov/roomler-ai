@@ -24,6 +24,8 @@
 //!    - Other variants land in T2.6+ (data-plane relays).
 //! 3. Periodic revocation re-check (60 s) — re-reads `tunnel_clients.
 //!    status`, sends `TunnelRevoked` if the row turns bad mid-session.
+//! 4. Keepalive (#4571) — a Ping every 30 s from the write side; a socket
+//!    that delivers no frame for 90 s ends as a lost link does.
 //!
 //! Audit context: every `tunnel forward` invocation gets one
 //! `tunnel_session_id` (assigned by the server on `TunnelOpen`).
@@ -71,6 +73,30 @@ const OUTBOUND_CAP: usize = 256;
 /// the period is the directory's, which sets the record's TTL from it.
 const REVOCATION_CHECK_INTERVAL: Duration = Duration::from_secs(TUNNEL_CLIENT_CHECK_SECS);
 
+/// #4571 — the server's keepalive on a tunnel client's socket: a Ping every
+/// period, sent from the write side ([`spawn_keepalive`]). 30 s is the
+/// client's own keepalive (`roomler`'s `WS_KEEPALIVE`) and the DERP socket's
+/// (`DERP_KEEPALIVE`, whose note records the 300 s idle timeout of the proxy
+/// in front of the pods): ten periods inside it.
+const TUNNEL_PING_EVERY: Duration = Duration::from_secs(30);
+
+/// #4571 — how many keepalive periods with no frame from the client end its
+/// socket: 90 s, the client's own receive deadline (`roomler`'s
+/// `WS_RX_DEADLINE`), so each side gives a dead link up in the same window.
+/// A healthy client delivers a frame every period (it answers each Ping while
+/// it reads, and pings on its own since tunnel-v0.3.0-rc.148), so a late or
+/// lost frame never ends it, and one that vanished reads offline 90 s after
+/// its last frame.
+const TUNNEL_SILENT_PERIODS: u32 = 3;
+
+/// The keepalive period and the receive deadline a tunnel client's socket
+/// runs: [`TUNNEL_PING_EVERY`] and [`TUNNEL_SILENT_PERIODS`] of it, or a
+/// test's period (`rc.tunnel_ping_every`, which no deployment can set).
+fn keepalive(rc: &roomler_ai_config::RcSettings) -> (Duration, Duration) {
+    let every = rc.tunnel_ping_every.unwrap_or(TUNNEL_PING_EVERY);
+    (every, every * TUNNEL_SILENT_PERIODS)
+}
+
 /// How long the check waits for the connection loop to have told the
 /// session's exit that the connection ends, before it tells the client
 /// either way ([`signal_end`]).
@@ -113,6 +139,11 @@ pub async fn handle_tunnel_client_socket(
     // back to this client.
     let (outbound_tx, outbound_rx) = mpsc::channel::<ServerMsg>(OUTBOUND_CAP);
     let pump = tokio::spawn(pump_server_messages(outbound_rx, socket_tx.clone()));
+    // #4571 — the server's keepalive, beside the pump on the write side. The
+    // read loop below ends the socket once the client has been silent for
+    // `rx_deadline`.
+    let (ping_every, rx_deadline) = keepalive(&state.settings.rc);
+    let pinger = spawn_keepalive(socket_tx.clone(), ping_every);
 
     // Register this connection in the overlay registry (keyed by
     // tunnel_client_id) so the overlay broker can fan netmaps/deltas to
@@ -191,10 +222,18 @@ pub async fn handle_tunnel_client_socket(
         presence.clone(),
     );
 
-    // Main read loop.
+    // Main read loop. #4571 — it ends a socket that has delivered no frame
+    // for `rx_deadline` as it ends one whose read failed: a client that went
+    // without closing (a laptop that slept, a NAT that dropped its mapping)
+    // otherwise kept its seat and its presence record until a write failed.
+    let silence = tokio::time::sleep(rx_deadline);
+    tokio::pin!(silence);
     loop {
         let msg = tokio::select! {
-            msg = socket_rx.next() => msg,
+            // The end signal first, which comes once; the deadline last, as a
+            // frame that has arrived proves the client however late the loop
+            // reads it.
+            biased;
             Some(told) = end_rx.recv() => {
                 if let Some((agent_id, msg)) = exit_end(&orig, session.as_ref()) {
                     info!(%tunnel_client_id, exit = %agent_id, "tunnel-client connection ends; the session's exit closes its connection");
@@ -202,6 +241,24 @@ pub async fn handle_tunnel_client_socket(
                 }
                 let _ = told.send(());
                 continue;
+            }
+            msg = socket_rx.next() => {
+                // Every frame resets the deadline before it is matched: a
+                // message, the client's own Ping, its Pong to ours.
+                silence
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + rx_deadline);
+                msg
+            }
+            () = &mut silence => {
+                info!(
+                    %tunnel_client_id, silent_s = rx_deadline.as_secs(),
+                    "tunnel-client WS delivered no frame within its receive deadline; ending it as a lost link"
+                );
+                // A lost link: the read error's path below, and its teardown.
+                Some(Err(axum::Error::new(std::io::Error::from(
+                    std::io::ErrorKind::TimedOut,
+                ))))
             }
         };
         let Some(msg) = msg else { break };
@@ -444,6 +501,8 @@ pub async fn handle_tunnel_client_socket(
         }
     }
 
+    // The socket has ended: no more keepalive.
+    pinger.abort();
     revocation_handle.abort();
     // #4553 — waited out before the seat leaves: a refresh still in flight
     // would set the record again after the release deleted it
@@ -1703,6 +1762,32 @@ async fn signal_end(
     matches!(tokio::time::timeout(within, told).await, Ok(Some(())))
 }
 
+/// #4571 — the server's keepalive Ping on a tunnel client's socket, from the
+/// write side as the DERP socket's write task sends its own (`derp.rs`):
+/// through the socket's one sink, which the pump and the 60 s check also write
+/// through. A Ping that cannot be written, to a client that has gone silent,
+/// holds this task and the sink but never the read loop, whose deadline then
+/// ends the socket. A client answers each Ping while it reads (tungstenite
+/// does it), so every released `roomler` stays inside that deadline.
+fn spawn_keepalive(
+    socket_tx: Arc<Mutex<SplitSink<WebSocket, Message>>>,
+    every: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is now: the first Ping goes one period in.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let mut sink = socket_tx.lock().await;
+            if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_revocation_check(
     state: NetworkState,
@@ -2552,6 +2637,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ─── #4571: the keepalive and the receive deadline ──
+
+    /// A deployment pings every 30 s and ends a socket silent for 90 s, the
+    /// client's own keepalive and deadline. Only a test's period replaces
+    /// them, and the deadline stays three of its periods.
+    #[test]
+    fn a_deployment_pings_every_30_s_and_ends_a_socket_silent_for_90_s() {
+        let mut rc = roomler_ai_config::RcSettings::default();
+        assert_eq!(
+            keepalive(&rc),
+            (Duration::from_secs(30), Duration::from_secs(90))
+        );
+        rc.tunnel_ping_every = Some(Duration::from_millis(400));
+        assert_eq!(
+            keepalive(&rc),
+            (Duration::from_millis(400), Duration::from_millis(1200))
+        );
     }
 
     /// A policy granting `127.0.0.1:port` on every device to `subjects`.

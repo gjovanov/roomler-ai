@@ -1063,11 +1063,11 @@ it ends itself, and no other:
 
 | Path | `close_connection` | Where |
 |---|---|---|
-| a tunnel-client connection the server ends: the connection loop tells the exit at once, and the client is told after it | `true` | `exit_end` (`crates/modules/network/src/tunnel.rs:1678`), from the end-signal arm of `handle_tunnel_client_socket` (`:198`); `signal_end` (`:1692`) sets the flag first and waits for that arm at most 5 s (`END_TOLD_WITHIN`, `:77`) |
-| that client's ack, relayed, and the connection's teardown | `true` | `Originator::exit_terminate` (`crates/modules/network/src/tunnel.rs:547`), which reads `Originator::server_ended` |
-| an agent connection the server ends itself: `Hub::kick_removed_agent` sets the connection's `ServerEnded` (`crates/modules/fleet/src/hub.rs:1331`), which `AgentCtx::server_ended` shares (`crates/core/src/agent_socket.rs:72`); the agent's relays from then on, and its teardown | `true` | `relay_tunnel_client_msg_from_agent` (`crates/modules/network/src/tunnel.rs:1896`), `teardown_agent_originated_sessions` (`:2124`) |
+| a tunnel-client connection the server ends: the connection loop tells the exit at once, and the client is told after it | `true` | `exit_end` (`crates/modules/network/src/tunnel.rs:1737`), from the end-signal arm of `handle_tunnel_client_socket` (`:237`); `signal_end` (`:1751`) sets the flag first and waits for that arm at most 5 s (`END_TOLD_WITHIN`, `:103`) |
+| that client's ack, relayed, and the connection's teardown | `true` | `Originator::exit_terminate` (`crates/modules/network/src/tunnel.rs:606`), which reads `Originator::server_ended` |
+| an agent connection the server ends itself: `Hub::kick_removed_agent` sets the connection's `ServerEnded` (`crates/modules/fleet/src/hub.rs:1331`), which `AgentCtx::server_ended` shares (`crates/core/src/agent_socket.rs:72`); the agent's relays from then on, and its teardown | `true` | `relay_tunnel_client_msg_from_agent` (`crates/modules/network/src/tunnel.rs:1981`), `teardown_agent_originated_sessions` (`:2209`) |
 | every other relay and teardown: a socket that drops, a roll, a replacement | `false` | the same sites |
-| a push to a client (`terminate_agent_sessions_now`, the relays in `agent_arms.rs`) | `false` | `crates/modules/network/src/tunnel.rs:2222`, `crates/modules/network/src/agent_arms.rs` |
+| a push to a client (`terminate_agent_sessions_now`, the relays in `agent_arms.rs`) | `false` | `crates/modules/network/src/tunnel.rs:2307`, `crates/modules/network/src/agent_arms.rs` |
 
 ```mermaid
 sequenceDiagram
@@ -1459,7 +1459,7 @@ Locked by lib tests, each shown red with a one-line negative control:
    ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
    The forward itself reads no permission bit: the policy is the grant, made to let
    people who hold no management bit reach what a holder named them for
-   (`crates/modules/network/src/tunnel.rs:1172`). Every decision lands in
+   (`crates/modules/network/src/tunnel.rs:1231`). Every decision lands in
    `tunnel_audit` (90 d). A device the org
    removed is refused as a target while it is removed; if its machine enrolls
    again, the device is taken out of every live policy's subjects and targets
@@ -1471,7 +1471,7 @@ Locked by lib tests, each shown red with a one-line negative control:
 ### Who a forward is matched as (#3635)
 
 A forward is matched in the org whose policies decide it, the target device's
-(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1166`); a forward from
+(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1225`); a forward from
 another org is refused `cross_tenant` whatever those policies say. In that org the
 originator is matched as the person it acts for, its `owner_user_id`:
 
@@ -1480,7 +1480,7 @@ originator is matched as the person it acts for, its `owner_user_id`:
 | A tunnel client: `roomler` on its own socket, with its tunnel-client credential | the person who enrolled it; for a paired client, whoever approved the pairing | a role that person holds in the org | `TunnelClientId` = this client; an `AgentId` never matches it | yes |
 | A device opening forwards over its own device socket: `forward --daemon`, a declared route, a supervised SOCKS5 listener ([tunnel-install.md](tunnel-install.md#declared-routes-daemon-supervised--p6)) | the device's owner, as read when the device's socket connected | a role the device's owner holds in the org | `AgentId` = this device; a `TunnelClientId` never matches it | yes |
 
-The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1058`),
+The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1117`),
 through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:757`),
 the same read every gate that matches a role makes
 ([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)):
@@ -1525,7 +1525,7 @@ flowchart TD
 | `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:398`) | a device forwards on its owner's role, and is refused once the owner left the org |
 | `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:455`) | a role of another org, and a role the org deleted, grant nothing here; the rule naming the other org's role is a stored one, because a policy write takes only the org's roles |
 | `…::the_other_subject_kinds_forward_as_before` (`:539`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
-| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2380`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
+| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2465`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
 
 ### A retired agent-session grant is refused (FR-137)
 
@@ -1538,8 +1538,8 @@ reach whatever the device may reach. So:
 - `net_grant` stays on `ClientMsg::TunnelOpen`, parse-only
   (`crates/remote_control/src/signaling.rs:1363`), and no build sends it;
 - the server refuses any open that carries one, at step 3c
-  (`crates/modules/network/src/tunnel.rs:755`), before a tunnel session exists
-  (step 4, `:839`), with `rc:error {code: net_grant_refused}`
+  (`crates/modules/network/src/tunnel.rs:814`), before a tunnel session exists
+  (step 4, `:898`), with `rc:error {code: net_grant_refused}`
   (`NET_GRANT_REFUSED`, `signaling.rs:102`). An old device reads that code as the
   end of its grant, never as a reason to retry.
 
@@ -1680,7 +1680,7 @@ Today's clients ignore fields they do not know.
 
 | switch | default | off means |
 |---|---|---|
-| `rc.tunnel_instance_id` (`ROOMLER__RC__TUNNEL_INSTANCE_ID`, `crates/config/src/settings.rs:1139`) | on | every request is looked up as an older client's, by `machine_id` alone; no `instance_id` is written and none is refused 400; a request that carried one is answered `keyed_by: machine_id`. A row keyed by an instance id is then not found by the legacy hash, so its client gets a new row at its next enrollment: the switch is for a fault, not a setting to leave off |
+| `rc.tunnel_instance_id` (`ROOMLER__RC__TUNNEL_INSTANCE_ID`, `crates/config/src/settings.rs:1149`) | on | every request is looked up as an older client's, by `machine_id` alone; no `instance_id` is written and none is refused 400; a request that carried one is answered `keyed_by: machine_id`. A row keyed by an instance id is then not found by the legacy hash, so its client gets a new row at its next enrollment: the switch is for a fault, not a setting to leave off |
 
 The tests: the decision's table in `tunnel_enrollment.rs`, and the integration tests from
 `two_installs_with_one_legacy_hash_get_two_rows` on in
@@ -1794,9 +1794,9 @@ live client nor its trail.
 
 | When | What | Where |
 |---|---|---|
-| connect | `last_seen_at` is touched (the check's first run is a full period away); the socket takes a seat on this pod; a client new to this pod gets its token there; the record is claimed with `claim_if_newer`, newest wins by the time each pod minted its token | `handle_tunnel_client_socket` (`crates/modules/network/src/tunnel.rs:99-102`), `PresenceRecord::open` (`:1805`) |
-| every 60 s | the check that re-reads the row, and closes the socket of a quarantined or removed client, touches `last_seen_at` and refreshes the record with `refresh_if_mine`, the token read live: ours or gone is set again, another pod's is left alone | `spawn_revocation_check` (`:1707`), its refresh at `:1739` and, when the row could not be read, `:1765` |
-| close | the check is aborted and awaited, then the seat leaves; the client's LAST socket on this pod releases the record, compare-and-delete, so an old pod's late close never takes a newer socket's record | `:447-453`, `PresenceRecord::close` (`:1856`) |
+| connect | `last_seen_at` is touched (the check's first run is a full period away); the socket takes a seat on this pod; a client new to this pod gets its token there; the record is claimed with `claim_if_newer`, newest wins by the time each pod minted its token | `handle_tunnel_client_socket` (`crates/modules/network/src/tunnel.rs:125-128`), `PresenceRecord::open` (`:1890`) |
+| every 60 s | the check that re-reads the row, and closes the socket of a quarantined or removed client, touches `last_seen_at` and refreshes the record with `refresh_if_mine`, the token read live: ours or gone is set again, another pod's is left alone | `spawn_revocation_check` (`:1792`), its refresh at `:1824` and, when the row could not be read, `:1850` |
+| close, or 90 s with no frame ([below](#a-socket-that-goes-silent-is-ended-4571)) | the check is aborted and awaited, then the seat leaves; the client's LAST socket on this pod releases the record, compare-and-delete, so an old pod's late close never takes a newer socket's record | `:506-512`, `PresenceRecord::close` (`:1941`) |
 | pod shutdown | every token this pod holds is taken, so no refresh writes it back, then released | `NetworkState::shutdown` (`crates/modules/network/src/lib.rs:994`) |
 
 - ⚠️ **The client's sockets on one pod share one token**, as an agent's hub slot holds
@@ -1825,10 +1825,50 @@ Known gaps:
 - **A deployment with no Redis at all** has no directory to ask, so it reads every
   client without a socket on this pod by its trail: one that closed, or enrolled, in
   the last 180 s reads `stale`, never `offline`, even on a single pod.
-- **A half-open socket** keeps its seat and its record, and so reads `online`, until a
-  write to it fails: the tunnel socket has no receive deadline (`socket_rx.next()`,
-  `tunnel.rs:197`), and the 60 s check writes to the database and Redis, never to the
-  socket.
+
+### A socket that goes silent is ended (#4571)
+
+A client can go without closing its socket: a laptop that slept, a NAT that dropped
+its mapping, a network that changed. Until #4571 such a socket kept its seat and its
+record, and so read `online`, until something closed it from outside or a write to it
+failed: up to 300 s behind the hosted deployment's proxy, which closes an idle link,
+and for hours on a path with no such proxy. The read loop had no receive deadline, and
+the 60 s check writes to the database and Redis, never to the socket. Now the server
+pings every tunnel client's socket and ends one that has gone silent.
+
+| What | How | Where |
+|---|---|---|
+| The keepalive | a WebSocket Ping every 30 s, from the write side: a task beside the pump that writes through the socket's one sink, as the pump and the 60 s check do. The first goes one period after the connect | `spawn_keepalive` (`crates/modules/network/src/tunnel.rs:1772`), `TUNNEL_PING_EVERY` (`:81`) |
+| The deadline | the read loop ends a socket that has delivered no frame for 3 periods, 90 s. Any frame resets it before it is matched: a message, the client's own Ping, its Pong to the server's | the read loop's `select!` (`:229-263`), `TUNNEL_SILENT_PERIODS` (`:90`) |
+| The end | a lost link: it leaves the loop as a read error does (`:267`), so the socket's normal teardown runs, the seat leaves, the record is released and both lists read the client `offline`. The exit is told what a lost link tells it, and nothing new is audited: whatever a lost link does to the client's tunnel sessions, a silent socket does the same. One INFO line names the client: `tunnel-client WS delivered no frame within its receive deadline; ending it as a lost link` | `:253-262` |
+
+Why these numbers: 30 s is the client's own keepalive (`WS_KEEPALIVE`,
+`agents/roomler-cli/src/forward.rs:67`) and the DERP socket's (`DERP_KEEPALIVE`,
+`crates/modules/network/src/derp.rs:92`), ten periods inside the 300 s idle timeout of
+the proxy in front of the pods that `DERP_KEEPALIVE`'s note records. 3 periods is the
+client's own receive deadline (`WS_RX_DEADLINE`, `forward.rs:77`), so each side gives a
+dead link up in the same 90 s, and a client that vanished reads `offline` 90 s after
+its last frame, whatever is in front of the pods.
+
+Every released `roomler` stays inside the deadline while it is healthy. It reads its
+socket for the socket's whole life (the driver's dispatcher,
+`crates/tunnel-core/src/driver.rs:1437` and `:1994`, back to the oldest release), and
+tungstenite answers each Ping as it reads it; since tunnel-v0.3.0-rc.148 it also sends a
+Ping of its own every 30 s from its writer, whatever its reader is doing.
+
+- ⚠️ **The deadline never waits on a write.** A client that has gone silent stops
+  acknowledging, so the send buffer can fill, and a write, the Ping's included, then
+  waits while it holds the sink, until TCP gives the link up minutes later. The
+  deadline is the read loop's, which takes no lock, so a write stuck on a silent
+  client never keeps its socket alive. A Ping sent from the read loop would wait on
+  that lock: that trap is why the agent socket's server sends no Ping at all
+  (`crates/modules/fleet/src/socket.rs:552-561`). Here the Ping has its own task, on
+  the write side.
+- ⚠️ **A frame that has arrived wins.** The `select!` is `biased` with the deadline
+  last, so a client whose frames waited while a handler ran is not ended for the wait.
+- The integration tests run the keepalive at 1 s through `rc.tunnel_ping_every`, a
+  `serde(skip)` field (`crates/config/src/settings.rs:983`): no environment variable or
+  file can set it, so a deployment always runs 30 s and 90 s.
 
 ## LocalAPI
 
