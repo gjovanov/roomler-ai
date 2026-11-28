@@ -546,6 +546,16 @@ pub struct GuiWorkerStatus {
     /// The daemon runs with `macos_one_row`: its worker holds no enrollment.
     #[serde(default)]
     pub one_row: bool,
+    /// FR-157 P1 (D5) — the screen worker's state as the device's row says
+    /// it (`AgentCaps.gui_worker.state`): `unsupervised` · `attached` ·
+    /// `not-attached`. Built by the function that builds the row's word, so
+    /// the host and the server never disagree. `None` from a daemon older
+    /// than P1, and an older CLI ignores it.
+    pub state: Option<String>,
+    /// FR-157 P1 (D5) — with `not-attached`, why: `no-console-user` ·
+    /// `launchd-owns` · `starting` · `gave-up` · `supervisor-off`. The row's
+    /// `reason`, from the same function.
+    pub reason: Option<String>,
 }
 
 /// #3164 — what [`NodeStatus::macos_grants`] reports.
@@ -9031,6 +9041,89 @@ mod tests {
         }
         let older: OlderReader = serde_json::from_str(&wire).unwrap();
         assert_eq!((older.name.as_str(), older.connected), ("h", true));
+    }
+
+    /// FR-157 P1 (D5) — the worker's `state` and `reason` are additive both
+    /// ways. A daemon older than P1 sends neither, and a new CLI reads `None`
+    /// for each; a daemon that cannot say leaves both keys out, so its status
+    /// is what such a daemon sends; and a CLI from before P1 parses a status
+    /// that carries them, with FR-43's three fields as they were.
+    #[test]
+    fn gui_worker_state_and_reason_are_additive_both_ways() {
+        // As 0.4.239's root daemon sends it on a healthy two-row Mac.
+        let before = r#"{"attached":false,"one_row":false}"#;
+        let read: GuiWorkerStatus = serde_json::from_str(before).unwrap();
+        assert_eq!(
+            (read.state.as_deref(), read.reason.as_deref()),
+            (None, None)
+        );
+        assert_eq!(serde_json::to_string(&read).unwrap(), before);
+
+        let gave_up = GuiWorkerStatus {
+            attached: false,
+            permissions: None,
+            one_row: true,
+            state: Some("not-attached".into()),
+            reason: Some("gave-up".into()),
+        };
+        let wire = serde_json::to_string(&gave_up).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"attached":false,"one_row":true,"state":"not-attached","reason":"gave-up"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GuiWorkerStatus>(&wire).unwrap(),
+            gave_up
+        );
+        let unsupervised = GuiWorkerStatus {
+            state: Some("unsupervised".into()),
+            reason: None,
+            ..read.clone()
+        };
+        assert_eq!(
+            serde_json::to_string(&unsupervised).unwrap(),
+            r#"{"attached":false,"one_row":false,"state":"unsupervised"}"#,
+            "no reason, no key"
+        );
+
+        /// `GuiWorkerStatus` as a CLI from before P1 reads it: FR-43's verify
+        /// reads these three.
+        #[derive(Deserialize)]
+        struct OlderWorker {
+            attached: bool,
+            #[serde(default)]
+            permissions: Option<Vec<String>>,
+            #[serde(default)]
+            one_row: bool,
+        }
+        /// And `NodeStatus` as that CLI reads it.
+        #[derive(Deserialize)]
+        struct OlderStatus {
+            name: String,
+            #[serde(default)]
+            gui_worker: Option<OlderWorker>,
+        }
+        let old_node: NodeStatus = serde_json::from_str(
+            r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#,
+        )
+        .unwrap();
+        let status = NodeStatus {
+            gui_worker: Some(GuiWorkerStatus {
+                permissions: Some(vec!["screen-capture".into(), "input".into()]),
+                ..gave_up.clone()
+            }),
+            ..old_node
+        };
+        let older: OlderStatus = serde_json::from_str(&serde_json::to_string(&status).unwrap())
+            .expect("an older CLI parses the new status");
+        assert_eq!(older.name, "h");
+        let worker = older.gui_worker.expect("and the worker in it");
+        assert!(!worker.attached);
+        assert!(worker.one_row);
+        assert_eq!(
+            worker.permissions,
+            Some(vec!["screen-capture".to_string(), "input".to_string()])
+        );
     }
 
     /// #3814 — `retry_off` is additive both ways. `false` is left out, so a
