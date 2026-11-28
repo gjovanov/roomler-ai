@@ -198,10 +198,10 @@ impl MessageDao {
     /// message deleted). A count never goes below 0: the field is a `u64`, so
     /// a stored -1 would fail every read of the room, the org's room list
     /// included. A row stored before the count had a writer reads 0 over its
-    /// messages until chat's startup job `room-message-count` sets it to them,
-    /// so its first deletes find 0 and leave it. The message is already
-    /// written when this runs, so a failure here does not fail it: the count
-    /// stays one off until the repair's next pass reaches the room.
+    /// messages until the repair's sweep sets it to them, so its first deletes
+    /// find 0 and leave it. The message is already written when this runs, so
+    /// a failure here does not fail it: the count stays one off until the
+    /// repair's next sweep reaches the room (within a day, boots or not).
     async fn move_room_count(&self, tenant_id: ObjectId, room_id: ObjectId, by: i64) {
         let mut room = doc! { "_id": room_id, "tenant_id": tenant_id };
         if by < 0 {
@@ -216,7 +216,7 @@ impl MessageDao {
                 error = %e,
                 room = %room_id,
                 by,
-                "a room's message_count did not move; the repair sets it at a later boot"
+                "a room's message_count did not move; the repair's next sweep sets it"
             );
         }
     }

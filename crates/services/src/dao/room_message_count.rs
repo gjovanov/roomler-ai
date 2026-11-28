@@ -160,13 +160,15 @@ impl MessageCountRepair {
     /// Where the sweep stands.
     pub async fn sweep(&self) -> DaoResult<Sweep> {
         let held = self.locks.find_one(doc! { "_id": CURSOR }).await?;
-        Ok(match held.as_ref().and_then(|d| d.get("after")) {
-            Some(Bson::ObjectId(id)) => Sweep::At(Some(*id)),
+        let after = held.as_ref().and_then(|d| d.get("after")).cloned();
+        let swept_at = held
+            .as_ref()
+            .and_then(|d| d.get_datetime("swept_at").ok().copied());
+        Ok(match after {
+            Some(Bson::ObjectId(id)) => Sweep::At(Some(id)),
             // Null, or anything else a hand could leave there: begin again.
             Some(_) => Sweep::At(None),
-            None => Sweep::Idle {
-                swept_at: held.and_then(|d| d.get_datetime("swept_at").ok().copied()),
-            },
+            None => Sweep::Idle { swept_at },
         })
     }
 

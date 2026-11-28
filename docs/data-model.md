@@ -170,18 +170,18 @@ flowchart LR
   with no count beside it. It is not leader-gated, on the member count's grounds above.
 - On every pod, the periodic job `room-message-count-sweep` (`crates/modules/chat/src/lib.rs:218`,
   `crates/modules/chat/src/message_count.rs:48`) asks every 10 minutes whether a pass is due
-  (`due`, `crates/services/src/dao/room_message_count.rs:187`). So a sweep a pass's budget
+  (`due`, `crates/services/src/dao/room_message_count.rs:189`). So a sweep a pass's budget
   stopped finishes without waiting for a deploy, and a count a lost `$inc` left wrong is set
   right within a day, boots or not. The host runs it on `PeriodicJobs`
   ([modular-monolith.md](modular-monolith.md)).
 
 | What a pass holds | How |
 |---|---|
-| Reads are bounded, on the primary | rooms in `_id` order, 100 at a time, with a projection of `_id` and `message_count`; one `$group` per batch over the batch's live messages (`live_pipeline`, `crates/services/src/dao/room_message_count.rs:95`), hinted on the index `room_id_1_deleted_at_1` (`:91`, `:332`; declared in chat's `index_plan`, `crates/modules/chat/src/lib.rs:274`). A missing `deleted_at` and a null one are both keyed null, so it examines one index key per live message of the batch's rooms and none of a deleted message, whatever the size of `messages`. Every read goes to the primary, as the member count's do |
-| A post or a delete is never lost | the live messages are counted **after** the batch's counts are read, and each write is filtered on `message_count` still the count read (`set_if`, `:312`): a count that moved fails the compare and waits for the next pass (`skipped`) |
+| Reads are bounded, on the primary | rooms in `_id` order, 100 at a time, with a projection of `_id` and `message_count`; one `$group` per batch over the batch's live messages (`live_pipeline`, `crates/services/src/dao/room_message_count.rs:95`), hinted on the index `room_id_1_deleted_at_1` (`:91`, `:334`; declared in chat's `index_plan`, `crates/modules/chat/src/lib.rs:274`). A missing `deleted_at` and a null one are both keyed null, so it examines one index key per live message of the batch's rooms and none of a deleted message, whatever the size of `messages`. Every read goes to the primary, as the member count's do |
+| A post or a delete is never lost | the live messages are counted **after** the batch's counts are read, and each write is filtered on `message_count` still the count read (`set_if`, `:314`): a count that moved fails the compare and waits for the next pass (`skipped`) |
 | It writes nothing else | only `message_count`, only where it differs from the live messages |
 | A pass is bounded | at most 20,000 rooms, and no new batch after 5 s (`:78-82`) |
-| The cursor never goes back, and no room is skipped | a pass moves `locks` `room_message_count` only on a compare with where the sweep stood when it began (`move_sweep`, `:345`). Two passes that began at the same place may repeat a batch, but only the first moves the cursor, and a boot's new sweep is never undone by a pass already under way |
+| The cursor never goes back, and no room is skipped | a pass moves `locks` `room_message_count` only on a compare with where the sweep stood when it began (`move_sweep`, `:347`). Two passes that began at the same place may repeat a batch, but only the first moves the cursor, and a boot's new sweep is never undone by a pass already under way |
 | One line a pass | `room message counts: a pass` at info with `job`, `rooms_read`, `changed`, `skipped`, `more`, `cursor_moved`, `ms`; a pass that set any count logs `… corrected stored counts (a writer missed messages)` at **warn**, with `changed` (rooms), `raised` and `lowered` (by how much, summed) (`crates/modules/chat/src/message_count.rs:61`). In steady state `changed` is 0: a warn after the first sweep means a writer was missed, or a post raced the pass's write |
 
 What a pass cannot see is a post or a delete half done at the moment of its write: the
