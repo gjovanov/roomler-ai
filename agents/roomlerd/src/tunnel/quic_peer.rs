@@ -439,6 +439,10 @@ mod tests {
     /// `take_flow` rendezvous yields the stream and the bytes arrive.
     /// Covers BOTH rendezvous orderings via the stash + waiter paths.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
     async fn agent_quic_rendezvous_delivers_authed_flow() {
         let session_id = ObjectId::new();
         let token = "session-token-xyz";
@@ -480,6 +484,10 @@ mod tests {
     /// and all. Nothing is reported while the client lives, and
     /// `accept_ended` flips with the report.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
     async fn a_client_that_drops_its_connection_is_reaped() {
         let session_id = ObjectId::new();
         let token = "session-token-gone";
@@ -540,6 +548,10 @@ mod tests {
     /// the accept loop closes the connection after auth fails, so
     /// `take_flow` times out (no stream is ever rendezvoused).
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
     async fn agent_quic_rejects_bad_token_so_no_flow() {
         let session_id = ObjectId::new();
         let (reap_tx, _reap_rx) = reap_channel();
