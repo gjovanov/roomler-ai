@@ -39,7 +39,7 @@ erDiagram
 | `tenant_members` | Membership + role assignment. Unique `(tenant_id, user_id)` |
 | `roles` | Permission bitfield (`u64`; 35 bits defined, of which 32–34 are reserved and never reused: parked FR-90's `HIVE_RUN`, `KNOWHOW_VIEW` and `KNOWHOW_EDIT`, still set in stored masks — [permissions.md](permissions.md#reserved-bits-32-34-fr-137)). Unique `(tenant_id, name)`, ordered by `position` |
 | `rooms` | Hierarchical tree (text + voice/video): `parent_id`, unique `(tenant_id, path)`, sparse-unique `meeting_code`; text index on `name`+`purpose`+`tags`. Optional `binding {module, ref}` — another module owns what the room *means*; chat stores it and never interprets it. No module sets it now: the rooms parked FR-90 bound (`secret`, path `hive-<session id>`) still carry it and open as plain Secret rooms (FR-137). `member_count` is the number of its `room_members` rows, moved by the code that writes a row ([below](#a-rooms-member_count-is-its-member-rows-4409)). `message_count` is the number of its live messages, moved by `MessageDao`, the one writer of `messages`, and kept right by a sweep ([below](#a-rooms-message_count-is-its-live-messages-4448)) |
-| `room_members` | Per-room membership: one row per member, unique `(room_id, user_id)` (`crates/modules/chat/src/lib.rs:240`). A leave deletes the row, so the rows with a room's `room_id` are its members: what the member route lists and counts as its `total`, and what `rooms.member_count` counts |
+| `room_members` | Per-room membership: one row per member, unique `(room_id, user_id)` (`crates/modules/chat/src/lib.rs:259`). A leave deletes the row, so the rows with a room's `room_id` are its members: what the member route lists and counts as its `total`, and what `rooms.member_count` counts |
 | `messages` | Chat. Thread via `thread_id`, pins, embeds; text index on `content`. `author_type` `user` (default) · `bot` · `webhook` · `system`; a non-user author carries its own `author_display`, which is read **only** when `author_type` is not `user` — a person cannot rename themselves through it. Optional `binding`, set by no module now (parked FR-90's turn stubs still carry both fields). `MessageDao` is its only writer (#4448), and `(room_id, deleted_at)` is the index the room's `message_count` is counted through ([below](#a-rooms-message_count-is-its-live-messages-4448)) |
 | `reactions` | Unicode + custom-emoji reactions, keyed by `message_id` |
 | `recordings` | Call-recording rows, metadata only: nothing records a call (#4163). A row's file names a storage provider (`S3`/`MinIO`/`Local`) and holds no media. `created_by`: who started it (absent on older rows) |
@@ -94,10 +94,10 @@ writes a row moves the count in the same call, and nothing else writes it:
 Until #4409 the constructor stored 1 and the creator's join added another, so every room
 made before the fix read one member ahead of its rows.
 
-**The repair.** Chat's startup job `room-member-count` (`crates/modules/chat/src/lib.rs:198`)
+**The repair.** Chat's startup job `room-member-count` (`crates/modules/chat/src/lib.rs:205`)
 runs one pass of `MemberCountRepair` (`crates/services/src/dao/room_member_count.rs:117`) at
 every boot of every pod, on the boot path before the listener binds
-(`crates/api/src/main.rs:263`, `:347`). Once the stored counts are right a pass reads and
+(`crates/api/src/main.rs:263`, `:350`). Once the stored counts are right a pass reads and
 changes nothing.
 
 | What a pass holds | How |
@@ -113,7 +113,7 @@ Measured on 20,000 rooms in a local MongoDB 7.0, over three runs: rooms one ahea
 pair and so one write a room, 0.9 to 1.3 ms a room, so the 10 s bound stops a pass after
 8,000 to 11,000 rooms.
 
-It is **not leader-gated** (`crates/core/src/job.rs:30-36`). Every write compares the
+It is **not leader-gated** (`crates/core/src/job.rs:38-46`). Every write compares the
 count it read, so a pass is right beside a live pod's joins and leaves and beside a second
 pass. And in a roll the first pod to boot holds the 120 s lease while the other pod still
 runs the old code and makes rooms one ahead; the second pod boots inside that lease, so a

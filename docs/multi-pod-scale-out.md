@@ -507,7 +507,7 @@ Why a Redis that answers, however slowly, does not trip it:
 3. It takes two misses in a row: one late arrival, or one stall of the pod's own runtime, costs at
    most one.
 4. While the command connection is down every probe is unknown, and readiness already fails on its
-   PING (`crates/api/src/lib.rs:495`).
+   PING (`crates/api/src/lib.rs:497`).
 
 | Subscriber | A subscribe that gets no answer | A subscription gone deaf |
 |---|---|---|
@@ -540,7 +540,7 @@ connected 3 times in 10 s, and the relay's gave up after 3.0 s.
   and every post, ping and total arrives once.
 - **TURN usage.** Totals published in the gap are not booked; the per-leg dedupe books none twice.
 - **Readiness.** `/health/ready` answers 503 with `redis_subscriber: false`
-  (`crates/api/src/lib.rs:501-503`, `:522`) only from the verdict to the new subscription, about
+  (`crates/api/src/lib.rs:503-505`, `:524`) only from the verdict to the new subscription, about
   1 s, usually shorter than the readiness probe's failure threshold; before the verdict it reads
   true. Liveness is `/health`, so a deaf subscriber never restarts a pod.
 
