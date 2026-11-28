@@ -2852,8 +2852,81 @@ was confirmed, each claim was refuted or lifted, and the budget stopped the trai
 to 1.04 of the link at 8 Mbit/s and on its floor at 0.19 to 0.22 at 50, as 4a-3c's rule's
 clean pass did (1.04 to 1.06; 0.18 to 0.21). In a pass of 4a-3c's rule that a build
 reached, the claim at 50 Mbit/s under seed 4 was confirmed and the train stopped on a
-plateau at 0.03 (P-a), as in its own settling run. The settling run's verdict waits for a
-second run.
+plateau at 0.03 (P-a), as in its own settling run.
+
+A second run settled it, under a gate that measures the host instead of naming its
+programs. The first run's rule, no `cargo` or `rustc` on the host, names two programs, and
+it is wrong both ways: a format check runs `rustfmt` for seconds and loads nothing, while a
+video encode or a model run loads the host with no build at all. What the cells feel is the
+host's scheduling, since their emulated link and the daemon's pacer wait on timers. So each
+pass ran a canary from the start of its wait to the end of its test: one thread at normal
+priority, under the cells' own 1 ms timer resolution, that asks for 1 ms sleeps and records
+when each one wakes. A pass counted when, over its test, the canary woke 470 times a second
+or more, overshot a sleep by 303 ms at most and never went 304 ms without a wake, overshot
+by more than 3 ms on 0.015 % of its wakes at most and by more than 2.1 ms on 1 % at most,
+and stalled past 50 ms nine times at most, and when no 5-s read found the host 85 % busy or
+the WSL VM above six CPUs. Its wait held the same canary limits over its last two minutes,
+with the host under 60 % busy and the VM at four CPUs or less, and a pass stopped early once
+a read found it loaded. The limits come from a formula fixed before any was computed, over
+the 16 windows of a test's length in 55 minutes of calibration that the old rule called
+quiet, with no gap in the host's own record: the 1 % share is counted past 1.2 times their
+median p99, the share over 3 ms, the largest overshoot and the count of stalls may reach
+three times their medians, and the rate of wakes must reach 0.8 times its median. The host
+stalls for about 100 ms every minute or two whatever it runs. Every canary sees such a
+stall in the same second, at normal priority too, and the cells' timers wait it out with
+them: the calibration's windows held three at the median, so a pass may hold nine. A build
+or a format check now decides nothing; each one is recorded, with the session that ran it.
+
+Three rounds counted, in fifteen attempts over about eight hours of a night when other work
+kept the host busy. The gate called twelve passes loaded: six for the WSL VM above six
+CPUs, one for the host at 93 %, and five for the canary's share over 3 ms, 0.02 to 0.03 % at
+their ends. Ten passes it called clean counted for nothing, since a later pass of their
+round was loaded. The nine that counted ran at 22 to 33 % of the host's CPU on average, and
+in none of them did the canary stall past 50 ms. The old rule would have counted none of
+the three rounds: `cargo` or `rustc` ran in the test, or in the two minutes before it, in
+six of the nine passes. In their 360 runs a rule, this rule broke two, 4a-3c's rule one and
+4a-3b's rule fourteen (the table below gives a P-a break's stop as a share of the link and
+a P-e break's peak queue). By the verdict fixed before the run that is neither a pass nor
+a red: this rule broke one run more than 4a-3c's, which a pass forbids, and no run in two
+passes that 4a-3c's rule held in all, which is what a red would need. The verdict leaves
+that case to a ruling.
+
+| Rule | Round 1 (this rule first) | Round 2 (4a-3c's rule first) | Round 3 (4a-3b's rule first) | In all | Clean passes whose round did not count |
+|---|---|---|---|---|---|
+| **This rule** | P-e at 2 Mbit/s, 20 ms, path I, seed 4 (59.8 ms); P-a at 0.4 Mbit/s, 80 ms, path C, seed 5 (0.78) | none | none | **2** | three passes, two runs: P-e at 2 Mbit/s, 80 ms, path I, seed 5 (80.1 ms); P-e at 2 Mbit/s, 20 ms, path I, seed 3 (50.5 ms) |
+| 4a-3c's rule | none | P-e at 8 Mbit/s, 80 ms, path I, seed 2 (88.1 ms) | none | **1** | three passes, five runs: P-e at 2 Mbit/s, 20 ms, path I, seed 4 (66.1 ms); P-a at 8 Mbit/s, 20 ms, path I, seed 4 (1.20); P-e at 0.4 Mbit/s, 20 ms, path C, seed 3 (60.3 ms); P-e at 8 Mbit/s, 80 ms, path I, seed 3 (85.2 ms); P-a at 8 Mbit/s, 20 ms, path C, seed 4 (0.14) |
+| 4a-3b's rule | P-a at 2 Mbit/s, 80 ms, path C, seed 1 (0.28); P-e at 2 Mbit/s, 20 ms, path I, seed 2 (51.8 ms); P-e at 0.4 Mbit/s, 80 ms, path C, seed 3 (110.3 ms); P-a at 50 Mbit/s, 20 ms, path C, seed 4 (0.01); P-a at 50 Mbit/s, 250 ms, path I, seed 5 (0.00) | P-e at 2 Mbit/s, 80 ms, path I, seed 2 (80.4 ms); P-e at 2 Mbit/s, 20 ms, path I, seed 3 (50.3 ms); P-a at 8 Mbit/s, 80 ms, path C, seed 3 (0.06); P-a at 8 Mbit/s, 20 ms, path C, seed 4 (0.09); P-a at 50 Mbit/s, 250 ms, path I, seed 5 (0.00) | P-e at 0.4 Mbit/s, 80 ms, path C, seed 3 (86.2 ms); P-a at 8 Mbit/s, 80 ms, path C, seed 3 (0.06); P-a at 50 Mbit/s, 20 ms, path C, seed 4 (0.01); P-a at 2 Mbit/s, 80 ms, path C, seed 5 (0.11) | **14** | four passes, fifteen runs |
+
+Each of the three breaks in the counted rounds is a run in which the two rules take the
+same path, and each held in every other pass of the rule that broke it. At 2 Mbit/s and
+20 ms on path I under seed 4 both rules make the pair's claim, which stood in seventeen of
+their eighteen passes, and stop on their delay at 1.01 to 1.09 of the link, with 33.2 to
+59.8 ms of queue on this rule and 38.7 to 66.1 on 4a-3c's: the 59.8 broke P-e's 50 ms in a
+counted pass of this rule, the 66.1 in a clean pass of 4a-3c's whose round did not count,
+and 4a-3b's rule broke it too, at 58.0 ms. At 0.4 Mbit/s and 80 ms on path C under seed 5
+no claim is made, so this rule runs 4a-3c's code: the train was capped about 1,275 ms in, a
+trial was confirmed, and the train stopped on a plateau, at 0.78 in one pass of this rule
+and at 0.85 to 0.88 in its six other plateaus, and at 0.85 to 0.89 in all eight of
+4a-3c's. At 8 Mbit/s and 80 ms on path I under seed 2 no claim is made either: in 4a-3c's
+counted pass the trial lifted, a second engaged, and the train wrote its 512 KiB at 0.93
+of the link with 88.1 ms of queue, over the 80 ms P-e allows. The same path on this rule
+wrote them with 50.3 to 55.7 ms in three passes, and in the other passes of either rule the
+queue read 43.1 to 65.9 ms.
+
+The P-a class of 4a-3c's settling run, at 8 and 50 Mbit/s and 20 ms on path C under seeds
+4 and 5, held in all of this rule's passes, counted and not: the budget stopped the train
+at 0.95 to 1.07 of the link at 8 Mbit/s and on its floor at 0.18 to 0.21 at 50, and no
+trial was confirmed in a counted pass. In a loaded pass one was, at 8 Mbit/s under seed 4,
+and the budget still stopped the train, at 0.95. 4a-3c's rule held the class in its
+counted passes (0.99 to 1.07; 0.18 to 0.22) and broke it once outside them, at 8 Mbit/s
+under seed 4, where a confirmed trial stopped the train on a plateau at 0.14. 4a-3b's rule
+broke it in every counted round, at 50 Mbit/s under seed 4 in rounds 1 and 3 (plateaus at
+0.01) and at 8 Mbit/s under seed 4 in round 2 (0.09), and in all five of its other passes
+that reached it. The run this rule broke in the first run, P-e at 8 Mbit/s and 80 ms on
+path I under seed 5, held in all nine of its passes that reached it: the delay stopped the
+train at 0.97 to 1.05 of the link with 53.8 to 59.7 ms of queue in six, and the budget at
+0.89 to 0.95 with 45.5 to 65.3 ms in three. 4a-3b's rule broke it in a clean pass whose
+round did not count (82.4 ms).
 
 **Found, and standing.**
 
