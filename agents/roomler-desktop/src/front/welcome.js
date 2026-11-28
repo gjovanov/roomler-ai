@@ -251,10 +251,10 @@
   }
 
   function paintConsent() {
-    const box = el('wl-consent-ask');
+    const box = el('wl-consent-trust');
     if (box && !box.matches(':focus')) {
-      // auto_grant_session = false ⇔ "ask me".
-      box.checked = entryValue('auto_grant_session') === 'false';
+      // auto_grant_session = true ⇔ ticked, as the setup wizard's box (#3782).
+      box.checked = entryValue('auto_grant_session') !== 'false';
     }
   }
 
@@ -350,8 +350,8 @@
     setText(
       'wl-sum-consent',
       entryValue('auto_grant_session') === 'false'
-        ? 'You are asked before someone connects'
-        : 'People in your organisation can connect without asking',
+        ? 'Every session is asked at this screen'
+        : "The organization's consent policy decides, with no extra prompt on this machine",
     );
     const loginBox = el('wl-login-toggle');
     setText(
@@ -506,10 +506,10 @@
 
   /* ── consent ─────────────────────────────────────────────────────── */
 
-  async function setConsent(ask) {
+  async function setConsent(trust) {
     try {
-      const entry = await setKey('auto_grant_session', ask ? 'false' : 'true');
-      outcome.consent = ask ? 'ask' : 'auto';
+      const entry = await setKey('auto_grant_session', trust ? 'true' : 'false');
+      outcome.consent = trust ? 'auto' : 'ask';
       say(
         'wl-consent-result',
         entry.restart_required
@@ -670,7 +670,7 @@
     el('wl-btn-skip').addEventListener('click', () => void finish());
     el('wl-btn-enroll').addEventListener('click', () => navigate('onboarding'));
     el('wl-btn-net-enable').addEventListener('click', () => void enableNetwork());
-    el('wl-consent-ask').addEventListener('change', (ev) => void setConsent(ev.target.checked));
+    el('wl-consent-trust').addEventListener('change', (ev) => void setConsent(ev.target.checked));
     el('wl-btn-apply').addEventListener('click', () => void applyPending());
     el('wl-login-toggle').addEventListener('change', (ev) =>
       void setAutostart(ev.target.checked, 'wl-login-result', 'wl-login-toggle', 'wl-login-note', 'wl-login-label'),

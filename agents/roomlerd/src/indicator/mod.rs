@@ -157,13 +157,13 @@ pub struct ViewerIndicator {
 }
 
 impl ViewerIndicator {
-    /// Spin up the worker. On Windows with the `viewer-indicator`
-    /// feature this creates a background thread that owns a layered,
-    /// click-through overlay window (a thin always-on border) plus a
-    /// reveal-on-hover badge carrying the viewer's initials + a
-    /// "Disconnect" control that fires through `kill_tx`. Everywhere
-    /// else this is a no-op constructor — the returned handle accepts
-    /// `show_session` / `hide_session` calls and drops them.
+    /// Spin up the worker. Only the overlay is Windows-only (`indicator::win`,
+    /// with the `viewer-indicator` feature): the border, the badge with the
+    /// viewer's initials and a Disconnect through `kill_tx`, the recording
+    /// mark, the privacy curtain and the consent panel. On every platform the
+    /// handle keeps the session registry the companion's banner and Disconnect
+    /// read. Elsewhere it holds the native consent panel where the build has
+    /// one (`x11`, `mac`), and on Linux the desktop's notifications (`notify`).
     pub fn new(
         kill_tx: KillSender,
         registry: crate::rc_sessions::RcSessionRegistry,
@@ -179,16 +179,16 @@ impl ViewerIndicator {
         })
     }
 
-    /// Explicitly-disabled handle. Callers that can't bring the overlay
-    /// up (init failed, headless CI, etc.) can use this so the rest of
-    /// the code stays oblivious. Equivalent to `new()` on non-Windows.
+    /// Explicitly-disabled handle, for a caller that can't bring the overlay
+    /// up (init failed, headless CI). Unlike any `new()`: no panel, no `notify`,
+    /// no kill channel, and a private registry until [`Self::with_registry`].
     pub fn disabled() -> Self {
         Self {
             inner: Inner::disabled(),
-            // A disabled OVERLAY is not a disabled session list. Everything
-            // outside Windows lands here today, and those are exactly the
-            // hosts whose only banner is the companion's — reading an empty
-            // registry there would be the bug, not the safe default.
+            // A disabled OVERLAY is not a disabled session list. A Windows host
+            // whose overlay failed to start lands here, and its only banner is
+            // then the companion's: reading an empty registry there would be
+            // the bug, not the safe default (signalling attaches the real one).
             registry: crate::rc_sessions::RcSessionRegistry::new(),
             kill_tx: None,
             recordings: Default::default(),
@@ -563,9 +563,9 @@ impl Slot for Option<PromptView> {
 }
 
 // ---------------------------------------------------------------------------
-// Platform-specific inner. The stub is used on non-Windows and when the
-// `viewer-indicator` feature is disabled; the real impl is in
-// `indicator::win`.
+// Platform-specific inner: the overlay (`indicator::win`) on Windows with the
+// `viewer-indicator` feature, else the stub below, which holds the native consent
+// panel where the build has one. The registry and `notify` are the handle's own.
 
 #[cfg(all(target_os = "windows", feature = "viewer-indicator"))]
 mod win;

@@ -1544,7 +1544,7 @@ who may view this screen · files you receive · start at login · done:
 ```mermaid
 flowchart LR
     A["This device<br/>(enrolled as … on …)"] --> B["Private network<br/>what it is · what it changes · Enable"]
-    B --> C["Who may view this screen<br/>ask me before someone connects"]
+    B --> C["Who may view this screen<br/>trust the organization's consent policy"]
     C --> D["Files you receive<br/>§9"]
     D --> E["Start at login"]
     E --> F["Done → Overview"]

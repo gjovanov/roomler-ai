@@ -185,8 +185,8 @@
         <p id="adv-existing-note" class="muted" hidden>This machine already has an
         enrollment: the daemon keeps its current settings, and only the options you
         change here are written over them.</p>
-        <!-- #3714: auto_grant_session is this device's own floor under the
-             organization's consent policy, not a blanket approval. -->
+        <!-- #3714: auto_grant_session is this device's own floor under the organization's
+             consent policy. #3782: config_surface.rs describes it in these words, and a test holds both. -->
         <label class="field checkline">
           <input id="adv-auto-grant" type="checkbox" checked>
           <span>Trust the organization's consent policy (no extra prompt on this machine)</span>
@@ -203,8 +203,8 @@
           <small class="muted">Comma-separated CIDRs this node offers to route
           for overlay peers. Leave empty unless this is a subnet router.</small>
         </label>
-        <!-- #3714: advertise_local_subnets only suggests routes to the tunnel
-             mesh, so it sits beside the tunnel field it adds to. -->
+        <!-- #3714: advertise_local_subnets only suggests routes to the tunnel mesh, so it sits
+             beside the tunnel field it adds to. #3782: config_surface.rs describes it in these words too. -->
         <label class="field checkline">
           <input id="adv-local-subnets" type="checkbox" checked>
           <span>Suggest this machine's local networks as tunnel routes</span>

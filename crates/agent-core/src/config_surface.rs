@@ -354,7 +354,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Standard,
         live: false,
         kind: "bool",
-        description: "Auto-detect and advertise directly-connected IPv4 subnets (untrusted until admin-approved). Default: on.",
+        description: "Suggest this machine's local networks as tunnel routes. An administrator sees them under the device's Tunnel mesh routes. Nothing on those networks can be reached through this machine until an administrator approves a route. Default: on.",
     },
     KeyMeta {
         key: "auto_grant_session",
@@ -362,7 +362,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Essential,
         live: false,
         kind: "bool",
-        description: "Auto-approve incoming remote-control session requests without an operator prompt. Default: on.",
+        description: "Trust the organization's consent policy (no extra prompt on this machine). Sessions the policy lets in without asking start without asking here: the owner's own (whoever approves this device), an administrator's Force control, and every session once this device is set to Auto-grant. Everyone else is asked at this screen. Whoever is here sees a notice with Disconnect while someone is viewing. Default: on.",
     },
     KeyMeta {
         key: "enable_remote_browse",
@@ -6002,5 +6002,191 @@ mod description_words_tests {
             }
         }
         assert!(said.is_empty(), "these descriptions say agent: {said:?}");
+    }
+}
+
+#[cfg(test)]
+mod one_description_tests {
+    use super::*;
+
+    /// A checkbox on a page that sets a key of this registry.
+    struct Checkbox {
+        /// The page and its script, as a failure names them.
+        page: &'static str,
+        html: &'static str,
+        key: &'static str,
+        /// The box is the first `<input` from the first match of this.
+        from: &'static str,
+        /// The box's id, which its script reads.
+        id: &'static str,
+        script: &'static str,
+        /// The lines of the script that make a tick mean `true`.
+        tick_is_true: &'static [&'static str],
+    }
+
+    const WIZARD_HTML: &str = include_str!("../../../agents/roomler-setup/src/front/index.html");
+    const WIZARD_JS: &str = include_str!("../../../agents/roomler-setup/src/front/app.js");
+    const COMPANION_HTML: &str =
+        include_str!("../../../agents/roomler-desktop/src/front/index.html");
+    const WELCOME_JS: &str = include_str!("../../../agents/roomler-desktop/src/front/welcome.js");
+
+    const WIZARD: &str =
+        "the setup wizard's Advanced options (agents/roomler-setup/src/front/index.html, app.js)";
+    const WELCOME: &str =
+        "the companion's Welcome (agents/roomler-desktop/src/front/index.html, welcome.js)";
+
+    /// The boxes for `auto_grant_session` and `advertise_local_subnets`
+    /// outside the companion's Settings page.
+    const CHECKBOXES: &[Checkbox] = &[
+        Checkbox {
+            page: WIZARD,
+            html: WIZARD_HTML,
+            key: "auto_grant_session",
+            from: "<input id=\"adv-auto-grant\"",
+            id: "adv-auto-grant",
+            script: WIZARD_JS,
+            tick_is_true: &[
+                "autoGrantSession: document.getElementById(\"adv-auto-grant\").checked,",
+            ],
+        },
+        Checkbox {
+            page: WIZARD,
+            html: WIZARD_HTML,
+            key: "advertise_local_subnets",
+            from: "<input id=\"adv-local-subnets\"",
+            id: "adv-local-subnets",
+            script: WIZARD_JS,
+            tick_is_true: &[
+                "advertiseLocalSubnets: document.getElementById(\"adv-local-subnets\").checked,",
+            ],
+        },
+        // Found by its step, not by its id, so whatever box the step holds is
+        // the one read.
+        Checkbox {
+            page: WELCOME,
+            html: COMPANION_HTML,
+            key: "auto_grant_session",
+            from: "data-step=\"consent\"",
+            id: "wl-consent-trust",
+            script: WELCOME_JS,
+            tick_is_true: &[
+                "const box = el('wl-consent-trust');",
+                "box.checked = entryValue('auto_grant_session') !== 'false';",
+                "el('wl-consent-trust').addEventListener('change', (ev) => void setConsent(ev.target.checked));",
+                "await setKey('auto_grant_session', trust ? 'true' : 'false');",
+            ],
+        },
+    ];
+
+    /// #3782 — a setting has one description, and every surface that shows
+    /// the setting says it. The companion's Settings page shows this
+    /// registry's description (`settings.js` renders `entry.description`). A
+    /// box for the key on another page, the setup wizard's or the companion
+    /// Welcome's, says it as the box's label and the line under it: the
+    /// description is `"{label}. {hint} Default: on."`, or `off` where the
+    /// key's built-in default is off. Those words say what a ticked box does,
+    /// so a tick means `true` on every box, and each page's script is held to
+    /// that too.
+    #[test]
+    fn every_box_for_a_key_says_its_description() {
+        let mut wrong = Vec::new();
+        for b in CHECKBOXES {
+            let description = KEYS
+                .iter()
+                .find(|m| m.key == b.key)
+                .map(|m| m.description)
+                .expect("a key of this registry");
+            let default = match builtin_default(b.key).as_deref() {
+                Some("true") => "on",
+                Some("false") => "off",
+                other => panic!("{} is a bool, and its default is {other:?}", b.key),
+            };
+            match box_words(b.html, b.from) {
+                Ok((tag, label, hint)) => {
+                    let said = format!("{label}. {hint} Default: {default}.");
+                    if said != description {
+                        wrong.push(format!(
+                            "{}: {}'s box says {said:?}, and this registry's description, \
+                             which the companion's Settings page shows, is {description:?}",
+                            b.page, b.key
+                        ));
+                    }
+                    if !tag.contains(&format!("id=\"{}\"", b.id)) {
+                        wrong.push(format!(
+                            "{}: {}'s box is not the {:?} its script reads: {tag}>",
+                            b.page, b.key, b.id
+                        ));
+                    }
+                }
+                Err(why) => wrong.push(format!("{}: {}'s box: {why}", b.page, b.key)),
+            }
+            let script = one_line(b.script);
+            let lacks: Vec<&str> = b
+                .tick_is_true
+                .iter()
+                .copied()
+                .filter(|line| !script.contains(line))
+                .collect();
+            if !lacks.is_empty() {
+                wrong.push(format!(
+                    "{}: a tick on {}'s box must mean true, and its script lacks {lacks:?}",
+                    b.page, b.key
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The first checkbox from `from` in `html`: its `<input …>` tag, its
+    /// label (the text from the tag to `</label>`) and the line under it (the
+    /// `<p>` right after the label), each label and line on one line as a
+    /// person reads it.
+    fn box_words<'a>(html: &'a str, from: &str) -> Result<(&'a str, String, String), String> {
+        let at = html
+            .find(from)
+            .ok_or_else(|| format!("the page has no {from:?}"))?;
+        let input = at + html[at..].find("<input").ok_or("no <input after it")?;
+        let (tag, rest) = html[input..]
+            .split_once('>')
+            .ok_or("an <input with no end")?;
+        let (label, rest) = rest
+            .split_once("</label>")
+            .ok_or("no </label> after the box")?;
+        let rest = rest
+            .trim_start()
+            .strip_prefix("<p")
+            .filter(|r| r.starts_with(|c: char| c == '>' || c.is_whitespace()))
+            .ok_or("no <p> right after the box's label")?;
+        let (_, rest) = rest.split_once('>').ok_or("a <p with no end")?;
+        let (hint, _) = rest.split_once("</p>").ok_or("a <p> with no </p>")?;
+        Ok((
+            tag,
+            one_line(&visible_text(label)),
+            one_line(&visible_text(hint)),
+        ))
+    }
+
+    /// `text` with every run of whitespace, line breaks included, as one space.
+    fn one_line(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The text of `html` a person sees: markup and comments dropped.
+    fn visible_text(html: &str) -> String {
+        let mut text = String::new();
+        let mut rest = html;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("<!--") {
+                rest = after.split_once("-->").map_or("", |(_, r)| r);
+            } else if rest.starts_with('<') {
+                rest = rest.split_once('>').map_or("", |(_, r)| r);
+                text.push(' ');
+            } else {
+                let next = rest.find('<').unwrap_or(rest.len());
+                text.push_str(&rest[..next]);
+                rest = &rest[next..];
+            }
+        }
+        text
     }
 }

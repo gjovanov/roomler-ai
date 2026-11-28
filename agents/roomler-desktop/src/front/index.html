@@ -1042,20 +1042,33 @@
             <p id="wl-net-result" class="small" hidden></p>
           </div>
 
-          <!-- 3. Who may view this screen -->
+          <!-- 3. Who may view this screen. #3782: the box is auto_grant_session,
+               ticked when it is on. Its label and the line under it say the key's
+               description (crates/agent-core/src/config_surface.rs), as the setup
+               wizard's box does, and a test there holds them to it. -->
           <div class="wl-step" data-step="consent" hidden>
             <h3>Who may view this screen</h3>
             <p>
-              When someone in your organisation asks to view or control this
-              computer, Roomler can let them in straight away, or ask you first.
+              When someone in your organization asks to view or control this
+              computer, the organization's consent policy decides whether anyone
+              is asked first, and who.
             </p>
             <label class="wl-check">
-              <input type="checkbox" id="wl-consent-ask" />
-              Ask me before someone connects
+              <input type="checkbox" id="wl-consent-trust" checked />
+              Trust the organization's consent policy (no extra prompt on this machine)
             </label>
             <p class="muted small">
-              Leave this off on a computer nobody sits at: a request that nobody
-              answers is refused.
+              Sessions the policy lets in without asking start without asking
+              here: the owner's own (whoever approves this device), an
+              administrator's Force control, and every session once this device
+              is set to Auto-grant. Everyone else is asked at this screen.
+              Whoever is here sees a notice with Disconnect while someone is
+              viewing.
+            </p>
+            <p class="muted small">
+              Leave it ticked on a computer nobody sits at: unticked, every
+              session is asked at this screen, and a request that nobody answers
+              is refused.
             </p>
             <p id="wl-consent-result" class="small" hidden></p>
           </div>
