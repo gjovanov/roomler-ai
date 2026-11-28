@@ -207,24 +207,58 @@ fn test_pacer_and_windows_answer_none_before_the_association() {
 
 /// roomler patch (FR-148 P0): while the association's slot is held, as
 /// `stop()` holds it across the association's close, both answer `None`, at
-/// once.
+/// once: five times each, and the fastest of each five in under a
+/// millisecond. Five, because a loaded runner can deschedule one call for a
+/// time slice mid-call: a call that waits or spins for the slot is slow all
+/// five times, and one preemption slows one.
 #[tokio::test]
 async fn test_pacer_and_windows_answer_none_while_stop_holds_the_slot() -> Result<()> {
     let (transport, client, server) = transport_over_a_pipe().await?;
     let free = (transport.pacer().is_some(), transport.windows().is_some());
-    let (pacer, windows, took) = {
+    let (pacers, windows) = {
         let _held = transport.sctp_association.lock().await;
-        let t = std::time::Instant::now();
-        let pacer = transport.pacer();
-        let windows = transport.windows();
-        (pacer.is_none(), windows.is_none(), t.elapsed())
+        let mut pacers = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let pacer = transport.pacer();
+            pacers.push((pacer.is_none(), t.elapsed()));
+        }
+        let mut windows = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let handle = transport.windows();
+            windows.push((handle.is_none(), t.elapsed()));
+        }
+        (pacers, windows)
     };
     client.close().await?;
     server.close().await?;
+    let pacer_took: Vec<Duration> = pacers.iter().map(|&(_, took)| took).collect();
+    let windows_took: Vec<Duration> = windows.iter().map(|&(_, took)| took).collect();
+    println!(
+        "FR-148 P0: with the slot held, five pacer() calls took {pacer_took:?}, five windows() \
+         calls {windows_took:?}"
+    );
     assert_eq!(free, (true, true), "a free slot reaches the association");
-    assert!(pacer, "a held slot answered with a pacer");
-    assert!(windows, "a held slot answered with windows");
-    assert!(took < Duration::from_millis(1), "answered in {took:?}");
+    assert!(
+        pacers.iter().all(|&(none, _)| none),
+        "a held slot answered with a pacer"
+    );
+    assert!(
+        windows.iter().all(|&(none, _)| none),
+        "a held slot answered with windows"
+    );
+    let fastest = |took: &[Duration]| *took.iter().min().expect("five calls");
+    assert!(
+        fastest(&pacer_took) < Duration::from_millis(1),
+        "the fastest of five pacer() calls took {:?}: {pacer_took:?}",
+        fastest(&pacer_took)
+    );
+    assert!(
+        fastest(&windows_took) < Duration::from_millis(1),
+        "the fastest of five windows() calls took {:?}: {windows_took:?}",
+        fastest(&windows_took)
+    );
     Ok(())
 }
 

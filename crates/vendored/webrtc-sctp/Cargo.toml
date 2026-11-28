@@ -217,7 +217,12 @@
 #     it never raises the window, never touches the other two, never waits
 #     for the lock, and writes nothing in fast recovery. Both writes store
 #     the gauges, as every window write does, and a refusal says why
-#     (`RestoreRefusal`, one word each for a log line). The agent's open-time
+#     (`RestoreRefusal`, one word each for a log line). Neither write leaves
+#     the window below one MTU, the floor a T3-rtx expiry keeps, because slow
+#     start grows a window by `min(acked, cwnd)` and one of 0 would never
+#     grow back; the association never writes a window below it, so for its
+#     own snapshots the floor changes nothing. `Windows` has no `Default`,
+#     because zeros are not a snapshot. The agent's open-time
 #     train paces a session's first flight, and in shadow it hands the
 #     association back as it found it: its first write takes the snapshot,
 #     and the restore writes it back once the flight has drained. The
@@ -237,8 +242,12 @@
 #     the lock, a gone association, the first flight after a restore, a
 #     handle that keeps nothing alive, the lowering's bound, a window it
 #     never raises, the two values it leaves, its refusal in fast recovery,
-#     nothing released at once after it, the gauges both writes store), and
-#     association_internal_test.rs's
+#     nothing released at once after it, the gauges both writes store, and
+#     the floor under each write in
+#     `test_windows_a_lowering_never_leaves_the_window_below_one_mtu` and
+#     `test_windows_a_restore_never_leaves_the_window_below_one_mtu`),
+#     `windows_has_no_default` stops their build if `Windows` derives
+#     `Default` again, and association_internal_test.rs's
 #     `test_windows_a_window_handle_changes_no_packet` runs the scripted
 #     exchange with a handle's snapshot after every packet and without,
 #     compared packet by packet. Its twin now holds the agent's side behind

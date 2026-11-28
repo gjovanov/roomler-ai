@@ -3973,32 +3973,53 @@ async fn test_windows_a_restore_refuses_when_the_gate_says_no() -> Result<()> {
 }
 
 /// roomler (FR-148 P0, D35): with the association's lock held, the restore and
-/// the lowering both answer `Busy`, each in under a millisecond: neither ever
-/// waits for the lock.
+/// the lowering both answer `Busy`, five times each, and the fastest of each
+/// five takes under a millisecond: neither ever waits for the lock. Five,
+/// because a loaded runner can deschedule one call for a time slice mid-call:
+/// a call that waits or spins for the lock is slow all five times, and one
+/// preemption slows one.
 #[tokio::test]
 async fn test_windows_a_held_lock_is_busy_and_never_waited_for() -> Result<()> {
     let (br, a0, a1, _s0) = windows_pair().await?;
     let handle = a0.windows();
     let snapshot = handle.snapshot().await.expect("the association is there");
-    let (restore, restore_took, lower, lower_took) = {
+    let (restores, lowers) = {
         let _held = a0.association_internal.lock().await;
-        let t = std::time::Instant::now();
-        let restore = handle.try_restore(&snapshot, || true);
-        let restore_took = t.elapsed();
-        let t = std::time::Instant::now();
-        let lower = handle.try_lower(&snapshot);
-        (restore, restore_took, lower, t.elapsed())
+        let mut restores = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let answer = handle.try_restore(&snapshot, || true);
+            restores.push((answer, t.elapsed()));
+        }
+        let mut lowers = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let answer = handle.try_lower(&snapshot);
+            lowers.push((answer, t.elapsed()));
+        }
+        (restores, lowers)
     };
     close_association_pair(&br, a0, a1).await;
-    assert_eq!(restore, Err(RestoreRefusal::Busy));
-    assert_eq!(lower, Err(RestoreRefusal::Busy));
+    let restore_took: Vec<Duration> = restores.iter().map(|&(_, took)| took).collect();
+    let lower_took: Vec<Duration> = lowers.iter().map(|&(_, took)| took).collect();
+    println!(
+        "FR-148 D35: with the lock held, five restores took {restore_took:?}, five lowerings \
+         {lower_took:?}"
+    );
+    let restore_answers: Vec<_> = restores.iter().map(|&(answer, _)| answer).collect();
+    let lower_answers: Vec<_> = lowers.iter().map(|&(answer, _)| answer).collect();
+    assert_eq!(restore_answers, [Err(RestoreRefusal::Busy); 5]);
+    assert_eq!(lower_answers, [Err(RestoreRefusal::Busy); 5]);
+    let fastest = |took: &[Duration]| *took.iter().min().expect("five calls");
     assert!(
-        restore_took < Duration::from_millis(1),
-        "the restore took {restore_took:?}"
+        fastest(&restore_took) < Duration::from_millis(1),
+        "the fastest of five restores took {:?}: {restore_took:?}",
+        fastest(&restore_took)
     );
     assert!(
-        lower_took < Duration::from_millis(1),
-        "the lowering took {lower_took:?}"
+        fastest(&lower_took) < Duration::from_millis(1),
+        "the fastest of five lowerings took {:?}: {lower_took:?}",
+        fastest(&lower_took)
     );
     Ok(())
 }
@@ -4481,4 +4502,89 @@ async fn test_windows_both_writes_store_the_gauges() -> Result<()> {
         (5_000, SET.ssthresh)
     );
     Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a lowering never leaves the window below one
+/// MTU, the association's own floor, the one a T3-rtx expiry keeps: slow
+/// start grows a window by `min(acked, cwnd)`, so a window of 0 would never
+/// grow back. With a window of 64,000 and nothing in flight, a lowering toward
+/// a window of 0 leaves one MTU.
+#[tokio::test]
+async fn test_windows_a_lowering_never_leaves_the_window_below_one_mtu() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(
+        &a0,
+        Windows {
+            cwnd: 64_000,
+            ..SET
+        },
+    )
+    .await;
+    let lowered = past_busy(|| handle.try_lower(&Windows { cwnd: 0, ..SET })).await;
+    let (now, mtu, in_flight) = {
+        let ai = a0.association_internal.lock().await;
+        (ai.cwnd, ai.mtu, ai.inflight_bytes())
+    };
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(in_flight, 0, "a chunk was in flight");
+    assert_eq!(
+        lowered,
+        Ok(Lowered {
+            before: 64_000,
+            after: mtu
+        })
+    );
+    assert_eq!(now, mtu, "the lowering left the window below one MTU");
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): a restore never leaves the window below one MTU
+/// either. A restore of a window of 0, with nothing pending or in flight,
+/// writes one MTU, and the slow start threshold and `partial_bytes_acked` as
+/// given. The three start at `SET`, so each of them moves.
+#[tokio::test]
+async fn test_windows_a_restore_never_leaves_the_window_below_one_mtu() -> Result<()> {
+    let (br, a0, a1, _s0) = windows_pair().await?;
+    let handle = a0.windows();
+    set_windows(&a0, SET).await;
+    let zero = Windows {
+        cwnd: 0,
+        ssthresh: 9_000,
+        partial_bytes_acked: 0,
+    };
+    let restored = past_busy(|| handle.try_restore(&zero, || true)).await;
+    let now = windows_of(&a0).await;
+    let mtu = a0.association_internal.lock().await.mtu;
+    close_association_pair(&br, a0, a1).await;
+    assert_eq!(restored, Ok(()));
+    assert_eq!(
+        now,
+        Windows {
+            cwnd: mtu,
+            ssthresh: 9_000,
+            partial_bytes_acked: 0
+        },
+        "the restore left the window below one MTU"
+    );
+    Ok(())
+}
+
+/// roomler (FR-148 P0, D35): `Windows` has no `Default`, so zeros never pass
+/// for a snapshot. Checked when the tests build, with the ambiguity that
+/// `static_assertions::assert_not_impl_any!` uses: every type takes
+/// `AmbiguousIfDefault<()>`, and a type with `Default` takes
+/// `AmbiguousIfDefault<HasDefault>` too. Without `Default` the `_` below has
+/// one answer; with it, two, and the build stops (E0283). The body runs
+/// nothing.
+#[test]
+fn windows_has_no_default() {
+    trait AmbiguousIfDefault<A> {
+        fn some_item() {}
+    }
+    impl<T> AmbiguousIfDefault<()> for T {}
+    #[allow(dead_code)]
+    struct HasDefault;
+    impl<T: Default> AmbiguousIfDefault<HasDefault> for T {}
+    let _ = <Windows as AmbiguousIfDefault<_>>::some_item;
 }

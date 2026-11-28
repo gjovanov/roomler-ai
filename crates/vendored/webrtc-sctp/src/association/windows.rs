@@ -35,8 +35,10 @@ use tokio::sync::Mutex;
 
 use super::association_internal::AssociationInternal;
 
-/// The three values a snapshot takes and a restore writes back.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// The three values a snapshot takes and a restore writes back. It has no
+/// `Default`, because zeros are not a snapshot: the association never writes a
+/// window below one MTU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Windows {
     /// The congestion window, in bytes.
     pub cwnd: u32,
@@ -127,6 +129,14 @@ impl WindowHandle {
     /// gathered chunk: one written after the check leaves at the next send,
     /// under the window restored. With nothing pending, the write loop has
     /// nothing to wake for, and the next write wakes it.
+    ///
+    /// It never leaves the window below one MTU: the window it writes is
+    /// `max(to.cwnd, MTU)`, and the other two are written as given. The floor
+    /// is the association's own, the one a T3-rtx expiry keeps
+    /// (`cwnd <- MTU`), so for any snapshot the association took it changes
+    /// nothing. A window of 0 could never grow back: slow start grows the
+    /// window by `min(acked, cwnd)`, and the send path would let out one chunk
+    /// at a time, and only with nothing in flight.
     pub fn try_restore(
         &self,
         to: &Windows,
@@ -146,16 +156,23 @@ impl WindowHandle {
         if !may() {
             return Err(RestoreRefusal::Gate);
         }
-        ai.write_windows(to);
+        let cwnd = to.cwnd.max(ai.mtu);
+        ai.write_windows(&Windows { cwnd, ..*to });
         Ok(())
     }
 
     /// Lowers the congestion window to `to`'s, or to the bytes in flight where
-    /// that is more, and never raises it: `cwnd = min(cwnd, max(to.cwnd, in
-    /// flight))`. The slow start threshold and `partial_bytes_acked` are left
-    /// alone, and the gauges are stored. It never waits for the lock (`Busy`),
-    /// and writes nothing in fast recovery (`FastRecovery`), whose loss
-    /// response owns the window, which does not grow until it ends.
+    /// that is more, never below one MTU, and never raises it: `cwnd =
+    /// min(cwnd, max(to.cwnd, in flight, MTU))`. The slow start threshold and
+    /// `partial_bytes_acked` are left alone, and the gauges are stored. It
+    /// never waits for the lock (`Busy`), and writes nothing in fast recovery
+    /// (`FastRecovery`), whose loss response owns the window, which does not
+    /// grow until it ends.
+    ///
+    /// The floor is the association's own, the one a T3-rtx expiry keeps, as
+    /// in `try_restore`: for any snapshot the association took it changes
+    /// nothing. As the lowering never raises the window, a window already
+    /// under one MTU, which the association never writes, stays where it is.
     ///
     /// It may run with bytes in flight because it never raises the window, as
     /// SCTP's own loss response writes it with bytes out (fast recovery's
@@ -171,7 +188,7 @@ impl WindowHandle {
         }
         let before = ai.cwnd;
         let in_flight = u32::try_from(ai.inflight_bytes()).unwrap_or(u32::MAX);
-        let after = before.min(to.cwnd.max(in_flight));
+        let after = before.min(to.cwnd.max(in_flight).max(ai.mtu));
         ai.write_cwnd(after);
         Ok(Lowered { before, after })
     }
