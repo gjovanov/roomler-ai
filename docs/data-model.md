@@ -38,9 +38,9 @@ erDiagram
 | `users` | Accounts. Unique `email`, `username`; text index on `display_name`+`username`. ⚠️ Unique `email` is a **reservation**, so it holds only an address the account has *proven* (activation, or a provider that verified it) — an unproven claim goes to the non-indexed `unverified_email` and the row takes a `.invalid` placeholder |
 | `tenant_members` | Membership + role assignment. Unique `(tenant_id, user_id)` |
 | `roles` | Permission bitfield (`u64`; 35 bits defined, of which 32–34 are reserved and never reused: parked FR-90's `HIVE_RUN`, `KNOWHOW_VIEW` and `KNOWHOW_EDIT`, still set in stored masks — [permissions.md](permissions.md#reserved-bits-32-34-fr-137)). Unique `(tenant_id, name)`, ordered by `position` |
-| `rooms` | Hierarchical tree (text + voice/video): `parent_id`, unique `(tenant_id, path)`, sparse-unique `meeting_code`; text index on `name`+`purpose`+`tags`. Optional `binding {module, ref}` — another module owns what the room *means*; chat stores it and never interprets it. No module sets it now: the rooms parked FR-90 bound (`secret`, path `hive-<session id>`) still carry it and open as plain Secret rooms (FR-137). `member_count` is the number of its `room_members` rows, moved by the code that writes a row ([below](#a-rooms-member_count-is-its-member-rows-4409)) |
+| `rooms` | Hierarchical tree (text + voice/video): `parent_id`, unique `(tenant_id, path)`, sparse-unique `meeting_code`; text index on `name`+`purpose`+`tags`. Optional `binding {module, ref}` — another module owns what the room *means*; chat stores it and never interprets it. No module sets it now: the rooms parked FR-90 bound (`secret`, path `hive-<session id>`) still carry it and open as plain Secret rooms (FR-137). `member_count` is the number of its `room_members` rows, moved by the code that writes a row ([below](#a-rooms-member_count-is-its-member-rows-4409)). `message_count` is the number of its live messages, moved by `MessageDao`, the one writer of `messages`, and kept right by a sweep ([below](#a-rooms-message_count-is-its-live-messages-4448)) |
 | `room_members` | Per-room membership: one row per member, unique `(room_id, user_id)` (`crates/modules/chat/src/lib.rs:240`). A leave deletes the row, so the rows with a room's `room_id` are its members: what the member route lists and counts as its `total`, and what `rooms.member_count` counts |
-| `messages` | Chat. Thread via `thread_id`, pins, embeds; text index on `content`. `author_type` `user` (default) · `bot` · `webhook` · `system`; a non-user author carries its own `author_display`, which is read **only** when `author_type` is not `user` — a person cannot rename themselves through it. Optional `binding`, set by no module now (parked FR-90's turn stubs still carry both fields) |
+| `messages` | Chat. Thread via `thread_id`, pins, embeds; text index on `content`. `author_type` `user` (default) · `bot` · `webhook` · `system`; a non-user author carries its own `author_display`, which is read **only** when `author_type` is not `user` — a person cannot rename themselves through it. Optional `binding`, set by no module now (parked FR-90's turn stubs still carry both fields). `MessageDao` is its only writer (#4448), and `(room_id, deleted_at)` is the index the room's `message_count` is counted through ([below](#a-rooms-message_count-is-its-live-messages-4448)) |
 | `reactions` | Unicode + custom-emoji reactions, keyed by `message_id` |
 | `recordings` | Call-recording rows, metadata only: nothing records a call (#4163). A row's file names a storage provider (`S3`/`MinIO`/`Local`) and holds no media. `created_by`: who started it (absent on older rows) |
 | `call_sessions` | Call lifecycle rows (**730 d** TTL on `started_at` — the conference module's index set, not 90 d) |
@@ -51,7 +51,7 @@ erDiagram
 | `notifications` | @mention & system notifications; `is_read`. ⚠️ A `notification_type` a build does not know reads as `other` — one new kind must not fail a user's whole list on an older pod mid-roll. Parked FR-90's stored `approval_request` rows read so too (`crates/db/src/models/notification.rs:42`) |
 | `push_subscriptions` | Web-push endpoints (VAPID) |
 | `background_tasks` | Export/processing pipeline; TTL-expired |
-| `locks` | Server-wide coordination documents, one per `_id`; no index beyond `_id`, no TTL. `startup_maintenance`: the 120 s startup lease (`expires_at`) that one pod wins at boot and the leader-gated startup jobs run under (`crates/api/src/main.rs:235-252`). `room_member_count`: where the last member-count pass that stopped early stopped — `after` (the last room `_id` of the last batch it finished) and `at`; absent once a pass reaches the last room ([below](#a-rooms-member_count-is-its-member-rows-4409)) |
+| `locks` | Server-wide coordination documents, one per `_id`; no index beyond `_id`, no TTL. `startup_maintenance`: the 120 s startup lease (`expires_at`) that one pod wins at boot and the leader-gated startup jobs run under (`crates/api/src/main.rs:235-252`). `room_member_count`: where the last member-count pass that stopped early stopped — `after` (the last room `_id` of the last batch it finished) and `at`; absent once a pass reaches the last room ([below](#a-rooms-member_count-is-its-member-rows-4409)). `room_message_count`: where the message-count sweep stands — `after` (the last room of the last batch a pass finished; null when a sweep begins at the first room; absent when no sweep is under way), `swept_at` (when the last sweep finished), `begun_at`, `at` ([below](#a-rooms-message_count-is-its-live-messages-4448)) |
 | `activation_codes` | Email activation. One row per account, replaced by every new link; TTL on `valid_to`. ⚠️ So nothing that must outlive the link can live here: the resend cooldown's stamp is `users.activation_resent_at` (#3199) |
 | `stripe_events` | Stripe webhook dedupe/audit. **FR-102 P4**: an event whose processing failed is un-marked, so Stripe's retry is processed rather than skipped |
 | `billing_events` | FR-102 P4 (`saas`): what Stripe billed — one row per webhook event of the six billing kinds (`subscription_created` · `subscription_updated` · `subscription_deleted` · `invoice_paid` · `invoice_payment_failed` · `trial_will_end`) and one per paid invoice the operator's backfill read: `tenant_id`, `kind`, `plan`, `seats`, `amount_cents` (invoices: what was billed, after coupons, before tax; `null` on a subscription event, never 0), `recurring_cents` (the non-proration subscription lines — the basis of billed MRR), `interval_months`, `currency`, `period_start` / `period_end`, `stripe_id` (`in_…` / `sub_…`), `subscription_id`, `status`, `reason`, `cancel_at_period_end`, `event_id` (absent on a backfilled row), `source` (`webhook` · `backfill`), `ts`, `recorded_at`. **Never a card, an address or a name.** Indexes: sparse-unique `event_id`; unique `(kind, stripe_id)` partial on `kind: invoice_paid` (the webhook and the backfill meet on it); `(tenant_id, ts)`; `(kind, ts)`. No TTL — **kept with the org**: `roomler_core::growth::purge_tenant` takes them; the monthly totals frozen into `growth_daily` carry no org and stay ([growth-observability.md](growth-observability.md#revenue-what-stripe-billed-p4)) |
@@ -119,6 +119,81 @@ pass. And in a roll the first pod to boot holds the 120 s lease while the other 
 runs the old code and makes rooms one ahead; the second pod boots inside that lease, so a
 gated job would skip there and leave those rooms until some later boot. Ungated, the last
 pod to boot passes after the old code is gone.
+
+### A room's `message_count` is its live messages (#4448)
+
+`rooms.message_count` is the number of the room's live messages: the `messages` documents
+with its `room_id` that match `deleted_at: null`, the predicate every reader of `messages`
+uses (null, or no such field: a message stored before the field existed is live). A post,
+a quote and a thread reply each count one. The org dashboard sums the field over the org's
+room list, and Explore shows it as "N messages". Until #4448 nothing wrote it, so every room
+read 0.
+
+**One writer.** `MessageDao` is the only code that writes `messages`
+(`crates/services/src/dao/message.rs:18`), and it moves the count in the same call:
+
+| Writer | The message | The count |
+|---|---|---|
+| `new_room`, the constructor (`crates/services/src/dao/room.rs:108`) | none yet | stored **0** |
+| `MessageDao::create_with_attachments` (`crates/services/src/dao/message.rs:79`, `:136`), which `create` and the post route call | inserted | +1 |
+| `MessageDao::soft_delete_in_room` (`:173`, `:192`), the delete route's | `deleted_at` set, if it matched a live message of that room | −1, only when it matched, and never below 0 (`:205`): the field is a `u64`, and a stored −1 would fail every read of the org's room list |
+| `RoomDao::cascade_delete` (`crates/services/src/dao/room.rs:348-353`) | all deleted | the room is deleted with them |
+
+A second delete of the same message matches nothing, answers 404 and moves nothing. A
+failed `$inc` is logged at warn and does not fail the post: the message is written, and the
+next sweep sets the count. `MessageDao`'s collection handle is private, and the api
+crate's unit test `message_writer_guard` (`crates/api/src/message_writer_guard.rs:30`, run in
+every PR's unit lane) fails on any file under `crates/` or `agents/` that names the
+collection outside the readers it lists, each with its reason, so the next writer cannot
+skip the count by accident.
+
+**The sweep.** `MessageCountRepair` (`crates/services/src/dao/room_message_count.rs`) sets
+each room's count back to its live messages, in sweeps over every room, each made of
+bounded passes. Chat drives it on two clocks:
+
+```mermaid
+flowchart LR
+    B["a pod boots<br/>room-message-count (startup, ungated)"] --> N["begin a sweep at the first room"]
+    N --> P["one pass"]
+    T["every 10 min, every pod<br/>room-message-count-sweep (periodic, ungated)"] --> D{"due?<br/>a sweep under way, or the last<br/>one finished 24 h ago or more"}
+    D -- no --> X["nothing"]
+    D -- yes --> P
+    P --> M{"stopped at its cap<br/>or its budget?"}
+    M -- yes --> C["locks.room_message_count.after = last room finished"]
+    M -- no --> F["after removed, swept_at = now"]
+```
+
+- At every boot of every pod, the startup job `room-message-count`
+  (`crates/modules/chat/src/lib.rs:214`, `crates/modules/chat/src/message_count.rs:38`)
+  begins a new sweep and runs one pass. A roll's last pod to boot begins a sweep after the
+  last process of the old code is gone, so it also counts what a pod of the old code wrote
+  with no count beside it. It is not leader-gated, on the member count's grounds above.
+- On every pod, the periodic job `room-message-count-sweep` (`crates/modules/chat/src/lib.rs:218`,
+  `crates/modules/chat/src/message_count.rs:48`) asks every 10 minutes whether a pass is due
+  (`due`, `crates/services/src/dao/room_message_count.rs:187`). So a sweep a pass's budget
+  stopped finishes without waiting for a deploy, and a count a lost `$inc` left wrong is set
+  right within a day, boots or not. The host runs it on `PeriodicJobs`
+  ([modular-monolith.md](modular-monolith.md)).
+
+| What a pass holds | How |
+|---|---|
+| Reads are bounded, on the primary | rooms in `_id` order, 100 at a time, with a projection of `_id` and `message_count`; one `$group` per batch over the batch's live messages (`live_pipeline`, `crates/services/src/dao/room_message_count.rs:95`), hinted on the index `room_id_1_deleted_at_1` (`:91`, `:332`; declared in chat's `index_plan`, `crates/modules/chat/src/lib.rs:274`). A missing `deleted_at` and a null one are both keyed null, so it examines one index key per live message of the batch's rooms and none of a deleted message, whatever the size of `messages`. Every read goes to the primary, as the member count's do |
+| A post or a delete is never lost | the live messages are counted **after** the batch's counts are read, and each write is filtered on `message_count` still the count read (`set_if`, `:312`): a count that moved fails the compare and waits for the next pass (`skipped`) |
+| It writes nothing else | only `message_count`, only where it differs from the live messages |
+| A pass is bounded | at most 20,000 rooms, and no new batch after 5 s (`:78-82`) |
+| The cursor never goes back, and no room is skipped | a pass moves `locks` `room_message_count` only on a compare with where the sweep stood when it began (`move_sweep`, `:345`). Two passes that began at the same place may repeat a batch, but only the first moves the cursor, and a boot's new sweep is never undone by a pass already under way |
+| One line a pass | `room message counts: a pass` at info with `job`, `rooms_read`, `changed`, `skipped`, `more`, `cursor_moved`, `ms`; a pass that set any count logs `… corrected stored counts (a writer missed messages)` at **warn**, with `changed` (rooms), `raised` and `lowered` (by how much, summed) (`crates/modules/chat/src/message_count.rs:61`). In steady state `changed` is 0: a warn after the first sweep means a writer was missed, or a post raced the pass's write |
+
+What a pass cannot see is a post or a delete half done at the moment of its write: the
+message written or deleted and counted, its count not yet moved. That room ends one off, and
+the next sweep sets it right (that is the one warn a healthy deployment can show).
+
+**The index, on a roll.** The new index is built by the boot's index ensure, which the pod
+awaits before it serves (`crates/api/src/main.rs:226`); a failed build stops the boot. On a
+deployment with a large `messages` collection, the first pod of the roll serves only once the
+build has scanned the collection (MongoDB's hybrid build takes no lasting collection lock, so
+the other pod keeps serving); the second pod finds it built. Each message write maintains one
+more key.
 
 ## Fleet: agents, remote desktop, tunnels, overlay
 

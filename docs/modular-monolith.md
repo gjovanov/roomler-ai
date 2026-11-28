@@ -106,8 +106,13 @@ What the host drives, and in which order — each of these is a rule paid for in
   its own cleanup and before it logs the disconnect; a module holding per-connection state
   (conference: transports + the call session) releases it there — never by watching the registry.
 - **`Module::jobs`** are declared; the host runs the `AtStartup` ones under the SAME Mongo lease
-  that gates its own maintenance, logs a failure instead of refusing to boot, and warns on an
-  `Every` cadence because nothing schedules those yet.
+  that gates its own maintenance, and logs a failure instead of refusing to boot. Since #4448 it
+  runs the `Every` ones that are not leader-gated on `PeriodicJobs` (`crates/core/src/job.rs:108`,
+  started at `crates/api/src/main.rs:266`): on every pod, a first run between half a period and
+  one and a half after boot, each next run one period after the last one ended (never
+  overlapping), a failed run logged, all stopped first thing at shutdown (`:375`). A
+  leader-gated `Every` job is logged and not run: the startup lease lapses 120 s after boot,
+  and the host holds no lease a periodic job could renew.
 - **`Module::shutdown`** runs in reverse composition order at the top of `shutdown_cleanup`.
 - **A module that is not mounted answers 503, never a boot refusal**: the agent socket and the
   tunnel-client socket go through `Modules::agent_upgrade` / `tunnel_client_upgrade`; the gauges
