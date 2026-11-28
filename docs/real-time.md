@@ -1050,6 +1050,12 @@ A registration that a rotation ended closes with
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially
   alive.
+- Tunnel clients (`roomler`) keep one WSS control socket per session, with a WS ping
+  every 30 s and a 90 s receive deadline of their own. The server pings that socket
+  every 30 s as well and ends one that has delivered no frame for 90 s, as a lost
+  link (#4571, [tunnels.md](tunnels.md#a-socket-that-goes-silent-is-ended-4571)). The
+  agent socket's server sends no ping and reaps a socket silent past
+  `rc.ws_rx_deadline_secs` ([below](#how-an-agent-socket-ended-3517)).
 - `rc:goodbye` close reasons distinguish *replaced by newer connection* (benign
   restart) from *deleted / policy-rejected* (stop retrying).
 

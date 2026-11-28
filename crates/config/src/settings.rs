@@ -965,18 +965,20 @@ impl Default for ReleasesSettings {
 /// waits. Env: `ROOMLER__RC__WS_RX_DEADLINE_SECS` etc.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RcSettings {
-    /// Reap an agent/tunnel WS after this many seconds without ANY
-    /// inbound frame (the agent pings every 25 s and heartbeats every
-    /// 30 s, so a healthy leg is never silent this long).
+    /// Reap an agent WS after this many seconds without ANY inbound frame
+    /// (the agent pings every 25 s and heartbeats every 30 s, so a healthy
+    /// leg is never silent this long). A tunnel client's socket has its own
+    /// deadline, below.
     pub ws_rx_deadline_secs: u64,
     /// How often the read loop checks the deadline.
     pub ws_liveness_tick_secs: u64,
     /// #4571 — a test's period for the server's keepalive Ping on a tunnel
     /// client's socket, which then ends after three periods with no frame
     /// from the client. `None` everywhere else: a deployment runs the
-    /// network module's own 30 s (so 90 s), and `serde(skip)` keeps this out
-    /// of the environment and every config file, so no deployment can set it.
-    /// The two-pod integration tests set it short.
+    /// network module's own 30 s, so 90 s (`TUNNEL_PING_EVERY`,
+    /// `crates/modules/network/src/tunnel.rs`), and `serde(skip)` keeps this
+    /// out of the environment and every config file, so no deployment can
+    /// set it. The two-pod integration tests set it short.
     #[serde(skip)]
     pub tunnel_ping_every: Option<std::time::Duration>,
     /// P4 — per-tenant coalescing window for `device:presence` fan-out.
