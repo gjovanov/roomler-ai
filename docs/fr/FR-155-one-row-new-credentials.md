@@ -1,8 +1,8 @@
 # FR-155: A one-row conversion gives each enrollment it moves new credentials
 
 **Issue:** [#4467](https://github.com/gjovanov/roomler-ai/issues/4467) · **Status:** claimed 2026-11-25; P1a merged
-(#4470), P1b merged (#4517), P1c merged (#4530), P1d merged (#4557), P1e in review (P1e-1 #4565, the work a commit
-starts; P1e-2 #4568, the regional relays), P1f (the switch on, D5) after it. D1–D3, D5 and D6 were decided on 2026-11-25, with two requirements added (Q1, Q2); D4 is open, for P4.
+(#4470), P1b merged (#4517), P1c merged (#4530), P1d merged (#4557), P1e-1 merged (#4565, the work a commit
+starts), P1e-2 in review (#4568, the regional relays), P1f (the switch on, D5) after it. D1–D3, D5 and D6 were decided on 2026-11-25, with two requirements added (Q1, Q2); D4 is open, for P4.
 **Builds on:** [FR-43](FR-43-macos-single-enrollment.md) P3c (`sudo roomlerd one-row`),
 [FR-147](FR-147-root-out-of-homes-macos.md) (root's records, the person's child),
 [FR-103](FR-103-device-credentials-renew-themselves.md) (the token generation),
@@ -306,7 +306,8 @@ lasts to its `until`. T32 shows it.
 A new `FleetLifecycle` hook in `crates/core/src/hooks.rs`, beside `agent_removed` (`:98`), with a default no-op:
 fleet cannot call network, and a hook is the inverse edge. It carries the tenant, the agent and the new generation.
 Fleet calls it once, on the pod that commits, after the sweep, the control event and the `first` audit row, and
-before it mints the answer (`self_rotate`, `crates/modules/fleet/src/agent.rs`): the device connects at G+1 only
+before it mints the answer: since P1e in the work the commit starts (`rotation_work::run`,
+`crates/modules/fleet/src/rotation_work.rs`), which `self_rotate` awaits (below). The device connects at G+1 only
 once it has the token, so the hook's effects come before any connection at G+1. `HookRegistry::agent_credentials_rotated`
 runs every module's hook, also after one fails, and names each that failed. The network module implements it
 (`crates/modules/network/src/credential_rotation.rs`, `run`, over an `Effects` trait that T10's stand-in replaces):
@@ -339,6 +340,38 @@ never withholds the new token: the answer carries the row's only working credent
 limit refuses (`overlay_key.rs:94-110`) is placed again once, after the limiter's window (61 s,
 `ORDER_AGAIN_AFTER_SECS`). A second refusal is audited in `key_rotation_audit` and logged, and the device keeps its
 overlay key until an operator orders a rotation (`POST …/agent/{aid}/overlay-key/rotate`, `docs/api.md`).
+
+### The work a commit starts runs to its end, and an answer asked again waits for it (P1e)
+
+*Read on master `fa16d895a` (2026-11-28).* P1e makes two properties hold while the switch is on:
+
+- **The work a rotation's commit starts runs to its end**, whatever becomes of the request that committed.
+- **An answer asked again waits for that work**, on the pod that committed and on any other, at most 10 s.
+
+| Part | Where | What it does |
+|---|---|---|
+| **The work, in a task of its own** | `self_rotate` (`crates/modules/fleet/src/agent.rs`) and `rotation_work::run` (`crates/modules/fleet/src/rotation_work.rs`) | once `AgentDao::rotate_token` commits G+1, the route records the work on this pod (`InFlight::start`), spawns it, and awaits its handle before it mints the answer. The work is P1b's sweep, the control event `end_below_generation`, the `first` row and the hook with its failure path, in that order, and last the row's mark. A spawned task runs to its end whatever becomes of the request, and the route answers only after it. A work that ends in an error is logged (`fr-155: the work of a rotation's commit ended in an error; the new token is answered`), and the token is answered |
+| **The mark** | `AgentDao::mark_rotation_settled` (`crates/services/src/dao/agent.rs`) | writes `token_rotation.settled_at` only while the row's rotation is the work's: its generation and its key's hash. `rotate_token` writes each rotation's record anew, without it |
+| **An answer asked again waits** | `answer_again` (`agent.rs`) and `rotation_work::wait_for_the_work` | a rotation that carries the mark is answered at once. Otherwise, on the pod that runs the work, the answer waits for the task's end; on any other, it reads the row on the primary every 250 ms (`REPLAY_POLL_MS`, `marked_by`) until the mark appears or the row records another rotation. Both waits end at `REPLAY_WAIT_SECS`, 10 s |
+| **The bound** | `wait_for_the_work` | past 10 s the answer is given, with the warning `fr-155: an answer asked again is given before the work of its commit marked its end, after the bound` and `credential_rotation_replay_unsettled_total` in `GET /api/cluster/status`. 10 s is under the agent's request timeout (20 s, `agents/roomlerd/src/token_renewal.rs:65`), so the device reads the answer of the request that waited |
+
+**Why an answer asked again waits on every pod (the choice for another pod).** Two of the work's effects are not
+judged by generation: the overlay node's Offline mark with its fan-out (`handle_overlay_leave`), and the key order's
+push, which reaches only a connection on the pod that places the order (`overlay_key.rs:165`). Each comes before the
+device's first connection at G+1 only if every answer that carries G+1 comes after the work. The route's own answer
+does. An answer asked again does too: on the pod that committed by the task's end, and on any other pod by the mark,
+which the work writes last. The other choice, making those two effects safe by the generation, would give the overlay
+node the generation it joined under and a conditional leave: network code and a schema field, in a phase that is
+fleet's. The work's other effects are judged by generation already: an end at G+1 leaves a connection at G+1 alone,
+on every pod.
+
+**Why each wait is bounded.** Once the row is at G+1, the token an answer carries is the device's only credential the
+server admits, so no wait keeps it from the device for long. A pod built before P1e writes no mark, so an answer asked
+again for its rotation waits the bound once. Whatever the timing, every pod's own check ends a connection below its
+row's generation within N (P1c, P1d).
+
+With the rotation off (`Hub::token_rotation`), nothing of this runs: no rotation commits, so no work starts, and an
+answer asked again reads nothing new and is given at once, as before. T24 and T25 show the two properties.
 
 ### The device: root's daemon carries the re-key (P3)
 
@@ -547,7 +580,7 @@ T14, T18, T22, T32).
 | T3 | `one_rotation_per_generation` | P1a | one rotation per generation: the conditional update commits once at G, and the row ends at G+1 |
 | T4 | `a_rotation_ends_the_connections_of_earlier_generations`, and its DERP half `a_rotation_ends_the_derp_registrations_of_earlier_generations` | P1b, P1d | an agent socket (P1b) and a DERP registration (P1d) open at G, then rotate: each ends within 5 s. With two servers, a socket or a registration on B ends when A rotates. A socket or a registration opened at G+1 survives a late event |
 | T5 | `a_rotation_takes_the_node_offline_and_orders_a_key` | P1d | a joined node, then rotate: the node is Offline, a peer's netmap marks it unreachable, and the row carries the server's `credential_rotation` order (the zero `requested_by`), naming the key the device held, queued (no `delivered_at`), and handed to the device's connection at G+1 with its `request_id` |
-| T6 | `rotation_is_unsupported_while_switched_off` | P1a | `rc.agent_token_rotation=false`: a first call is answered 404 and the audit row says `unsupported`, while a replay of a rotation made before is answered 200; `rc.token_generation_check=false`: 404 |
+| T6 | `rotation_is_unsupported_while_switched_off` | P1a | `rc.agent_token_rotation=false`: a first call is answered 404 and the audit row says `unsupported`, while a replay of a rotation made before is answered 200, at once also when its record carries no mark of its work's end (P1e); `rc.token_generation_check=false`: 404 |
 | T7 | `a_removed_or_quarantined_row_does_not_rotate` | P1a | a tombstoned row: 401; a quarantined row: 401; the generation unchanged |
 | T8 | `the_composition_includes_the_rotate_route` | P1a | the composition gate (`crates/tests/fixtures/composition.baseline.json`) |
 | T13 | `a_second_rotation_within_the_hour_waits` | P1a | rotate, then a first call with the new token within the hour: 429, the audit row says `rate_limited`, and the generation is unchanged; a replay of the first rotation is answered 200; with the row's `token_rotation.at` set back by more than an hour, the second rotation commits |
@@ -669,7 +702,7 @@ Before any agent rotates (P3), a daemon's first connection at its new generation
 | P1b | Server: each control socket records its generation; the commit ends the agent's sockets below the new generation on every pod (`end_below_generation`), and each pod keeps a floor at registration; T1's second half (the agent socket's upgrade and a DERP dial admit G+1 and refuse G, and a renewal with the token of G after the commit is refused) | the same switch, off by default | MERGED (#4517) |
 | P1c | Server: only the device's current generation holds its Hub entry, on every pod. The registration reads the row after the hello and judges the generation by FR-103's rule; the entry of a higher generation stays; every pod's check ends an entry below its row's generation within N, one period of `rc.presence_sweep_secs`; T15 to T18 | the same switch, off by default: with it off, nothing of P1c runs | MERGED (#4530) |
 | P1d | Server: the core hook `agent_credentials_rotated`, called once after a commit; the network module takes the node offline, ends its DERP registrations below the new generation and queues an FR-40 order (`credential_rotation`, placed once more after a rate-limit refusal); a failure logged, counted (`credential_rotation_hook_failed_total`) and audited (`hook_failed`). Only the device's current generation holds its DERP registration, on every pod: the end through P1b's event and the sync hook `end_below_generation`, the floor, the read at the registration, the registration of a higher generation stays, every pod's check; T4's DERP half, T5, T10, T19 to T23 | the same switch, off by default: with it off, nothing of P1d's DERP half runs, and no commit calls the hook | MERGED (#4557) |
-| P1e | Server, in two PRs. **P1e-1:** the work a commit starts runs in a task of its own to its end, and the route answers after it; an answer asked again waits for that work on every pod, by the task's end or the row's mark (`token_rotation.settled_at`), at most 10 s (`credential_rotation_replay_unsettled_total` past it); T24, T25. **P1e-2:** a DERP ticket carries the generation of the control socket it was minted to; every regional DERP relay admits a registration only at the device's current generation, and ends one below it within one poll plus the push's bound: the commit stores a floor per key where every pod reads it and pushes it to every relay that takes floors before the route answers, every poll pushes the live floors again, a relay merges them by the higher generation and keeps them in a file across a restart, and while a set is live the registration of the higher generation stays; T26 to T32 | the same switch, off by default: with it off, no work starts and a replay is answered at once, and no floor is stored or pushed | in review (P1e-1 #4565; P1e-2 #4568) |
+| P1e | Server, in two PRs. **P1e-1:** the work a commit starts runs in a task of its own to its end, and the route answers after it; an answer asked again waits for that work on every pod, by the task's end or the row's mark (`token_rotation.settled_at`), at most 10 s (`credential_rotation_replay_unsettled_total` past it); T24, T25. **P1e-2:** a DERP ticket carries the generation of the control socket it was minted to; every regional DERP relay admits a registration only at the device's current generation, and ends one below it within one poll plus the push's bound: the commit stores a floor per key where every pod reads it and pushes it to every relay that takes floors before the route answers, every poll pushes the live floors again, a relay merges them by the higher generation and keeps them in a file across a restart, and while a set is live the registration of the higher generation stays; T26 to T32 | the same switch, off by default: with it off, no work starts and a replay is answered at once, and no floor is stored or pushed | P1e-1 MERGED (#4565); P1e-2 in review (#4568) |
 | P1f | Server: **the switch on by default** (D5), `rc.agent_token_rotation`. Before it: every app pod runs P1e, and has for longer than `DERP_TICKET_TTL` plus `DERP_TICKET_LEEWAY_SECS`, and every regional relay runs P1e's relay (the note above) | `rc.agent_token_rotation` off: 404, fleet-wide | — |
 | P2 | Device: `splice_current` in the undo and `--revert`; the child verb `refresh-legacy` | `ROOMLERD_ONE_ROW_SPLICE=0`, which fails closed | — |
 | P3 | Device: `rekey.json`, the one-row lock, the re-key in each moved enrollment's loop (Q1), `Status`'s `credentials`, the conversion's bounded wait and its report; the release notes' line on `--revert`. Before any agent rotates, a daemon's first connection at its new generation holds a ticket of that generation (#4569) | `ROOMLERD_CREDENTIAL_ROTATION=0` | — |

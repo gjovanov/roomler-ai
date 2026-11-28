@@ -16,6 +16,10 @@
 //! every pod, and a registration admits only the device's current
 //! generation. P1d: the same holds for its DERP registrations, and the
 //! rotation takes its overlay node offline and orders a new overlay key.
+//! P1e: the work a commit starts runs to its end, and an answer asked again
+//! waits for it; when the commit answers, every regional relay that takes
+//! floors has been pushed the device's, and with the switch off no relay is
+//! told a floor.
 //!
 //! Every server here starts with `rc.agent_token_rotation` on (its default is
 //! off until the phase that completes the server's half), except where a
@@ -28,6 +32,7 @@ use crate::retired_key_tests::{self as rk, Ws};
 use crate::token_renewal_tests::{enroll, forge_agent_token, renew, self_devices, upgrade_status};
 use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use futures::{SinkExt, StreamExt};
+use roomler_ai_mod_fleet::rotation_work::REPLAY_WAIT_SECS;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
@@ -331,7 +336,8 @@ async fn one_rotation_per_generation() {
 
 /// T6: `rc.agent_token_rotation` off answers 404 to a first call, with an
 /// `unsupported` audit row, and answers a call asking again for a rotation
-/// made before. `rc.token_generation_check` off answers 404 to every call.
+/// made before at once, also when its record carries no mark of its work's
+/// end (P1e). `rc.token_generation_check` off answers 404 to every call.
 /// Three servers over one database: the switch on, the switch off, and the
 /// generation check off.
 #[tokio::test]
@@ -356,7 +362,21 @@ async fn rotation_is_unsupported_while_switched_off() {
         404,
         "a first call"
     );
+    off.db
+        .collection::<Document>("agents")
+        .update_one(
+            doc! { "_id": oid(&agent_id) },
+            doc! { "$unset": { "token_rotation.settled_at": "" } },
+        )
+        .await
+        .unwrap();
+    let asked = tokio::time::Instant::now();
     let again = answered_token(rotate(&off, &g0, &key).await).await;
+    assert!(
+        tokio::time::Instant::now().duration_since(asked)
+            < Duration::from_secs(REPLAY_WAIT_SECS / 2),
+        "with the switch off, an answer asked again is given at once"
+    );
     assert_eq!(token_generation(&again), 1, "the rotation made before");
     assert_eq!(row_generation(&agent_row(&off, &agent_id).await), 1);
     let (fresh_id, fresh) = enroll(&off, &seeded, "m-fr155-off-fresh").await;
@@ -1567,6 +1587,255 @@ async fn a_pod_switched_off_ends_and_refuses_no_derp_registration() {
         "with the switch off, the pod ends no DERP registration"
     );
     assert!(derp_registered(&off, network, kept_key));
+}
+
+/// How long T24 and T25 give each effect of a commit's work, once the seam
+/// lets the work go on.
+const WORK_WAIT: Duration = Duration::from_secs(10);
+
+/// A pair of servers over one database for T24 and T25, with the rotation
+/// on. No pod's own check runs within a cell (`rc.presence_sweep_secs`), so
+/// only a commit's work ends a connection.
+async fn spawn_pair_on() -> (TestApp, TestApp) {
+    TestApp::spawn_pair(|s| {
+        s.rc.agent_token_rotation = true;
+        s.rc.presence_sweep_secs = 3600;
+    })
+    .await
+}
+
+/// Until `works` works of a commit wait at `app`'s seam, at most 10 s.
+async fn wait_at_the_seam(app: &TestApp, works: usize) {
+    let seam = &app.state.fleet().rotation_seam;
+    for _ in 0..200 {
+        if seam.waiting() >= works {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the rotation commits, and the work of its commit reaches the seam");
+}
+
+/// A rotation sent over a connection of its own, returned once the work of
+/// its commit waits at `app`'s seam. The request is complete: the route
+/// reads its body before it commits.
+async fn rotate_to_the_seam(app: &TestApp, token: &str, key: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let body = json!({ "rotation_key": key }).to_string();
+    let request = format!(
+        "POST {ROTATE} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        app.addr,
+        body.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect(app.addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    wait_at_the_seam(app, 1).await;
+    stream
+}
+
+/// A rotation on `app` in a task of its own, so the cell can watch it.
+fn spawn_rotate(
+    app: &TestApp,
+    token: &str,
+    key: &str,
+) -> tokio::task::JoinHandle<reqwest::Response> {
+    let request = app
+        .auth_post(ROTATE, token)
+        .json(&json!({ "rotation_key": key }));
+    tokio::spawn(async move { request.send().await.unwrap() })
+}
+
+/// Poll `what` every 100 ms until it holds, at most [`WORK_WAIT`].
+async fn within_the_work<F, Fut>(mut what: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + WORK_WAIT;
+    loop {
+        if what().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// T24 (P1e): the work a rotation's commit starts runs to its end, also when
+/// the request that committed drops. The seam holds the work right after the
+/// commit, the client closes its connection, and the seam then lets the work
+/// go on: the decision is recorded (`first`), the overlay node goes offline,
+/// the `credential_rotation` order is queued, and a second server applies the
+/// control event's end to the device's socket there.
+#[tokio::test]
+async fn the_work_a_commit_starts_runs_to_its_end_when_the_request_drops() {
+    let (a, b) = spawn_pair_on().await;
+    let seeded = a.seed_tenant("fr155work").await;
+    let (agent_id, old) = enroll(&a, &seeded, "m-fr155-work").await;
+    // The device's socket, and its overlay join, are on the second server
+    // when Redis carries the control event there.
+    let (socket_pod, place) = if a.state.redis_pubsub.is_some() {
+        (&b, "on the second server, by the control event")
+    } else {
+        eprintln!("no Redis available: the device's socket is on the pod that commits");
+        (&a, "on the pod that commits")
+    };
+    let mut device = rk::connect(socket_pod, &old, &["key-rotate"]).await;
+    rk::join_admitted(&mut device, 91).await;
+    let node = rk::node_row(&a, &seeded, "m-fr155-work").await;
+    assert_eq!(node.get_str("status").ok(), Some("online"), "{node}");
+
+    let seam = a.state.fleet().rotation_seam.hold();
+    let connection = rotate_to_the_seam(&a, &old, &rotation_key(241)).await;
+    assert_eq!(
+        row_generation(&agent_row(&a, &agent_id).await),
+        1,
+        "the rotation committed"
+    );
+    drop(connection);
+    // Up to 2 s for the server to see the connection close.
+    for _ in 0..40 {
+        if a.state.fleet().rotation_seam.waiting() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    seam.release();
+
+    let (app, id, tenant) = (&a, agent_id.as_str(), &seeded);
+    let recorded = within_the_work(|| async move {
+        decisions(&audit_rows(app, id).await).contains(&decision("first", None))
+    })
+    .await;
+    let rows = decisions(&audit_rows(app, id).await);
+    assert!(
+        recorded,
+        "the work a commit starts runs to its end when the request drops: the decision is \
+         recorded; rows {rows:?}"
+    );
+    let offline = within_the_work(|| async move {
+        rk::node_row(app, tenant, "m-fr155-work")
+            .await
+            .get_str("status")
+            .ok()
+            == Some("offline")
+    })
+    .await;
+    assert!(
+        offline,
+        "the work a commit starts runs to its end when the request drops: the overlay node \
+         goes offline"
+    );
+    let queued = within_the_work(|| async move {
+        agent_row(app, id)
+            .await
+            .get_document("key_rotation")
+            .is_ok_and(|order| {
+                order.get_str("trigger").ok() == Some("credential_rotation")
+                    && !order.contains_key("delivered_at")
+            })
+    })
+    .await;
+    let row = agent_row(app, id).await;
+    assert!(
+        queued,
+        "the work a commit starts runs to its end when the request drops: the \
+         `credential_rotation` order is queued; row {row}"
+    );
+    assert_ended(listen(&mut device, Duration::from_secs(5)).await, place);
+}
+
+/// T25 (P1e): an answer asked again waits for the work of its commit, on the
+/// pod that committed and on another server. The seam holds the work, and the
+/// answer asked again with the same token and key is given once the work has
+/// run, after the commit's `first` row. Each wait is bounded: with the work
+/// held past [`REPLAY_WAIT_SECS`], the answer asked again is given all the
+/// same, on either pod.
+#[tokio::test]
+async fn an_answer_asked_again_waits_for_the_work_of_its_commit() {
+    let (a, b) = spawn_pair_on().await;
+    let seeded = a.seed_tenant("fr155wait").await;
+
+    for (place, asked, machine, seed) in [
+        ("on the pod that committed", &a, "m-fr155-wait-here", 251_u8),
+        ("on another server", &b, "m-fr155-wait-there", 252_u8),
+    ] {
+        let (agent_id, old) = enroll(&a, &seeded, machine).await;
+        let key = rotation_key(seed);
+        let seam = a.state.fleet().rotation_seam.hold();
+        let first = spawn_rotate(&a, &old, &key);
+        wait_at_the_seam(&a, 1).await;
+        let mut again = spawn_rotate(asked, &old, &key);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), &mut again)
+                .await
+                .is_err(),
+            "{place}: an answer asked again waits while the work of its commit runs"
+        );
+        seam.release();
+        let again = tokio::time::timeout(WORK_WAIT, again)
+            .await
+            .unwrap_or_else(|_| panic!("{place}: the answer asked again, once the work ran"))
+            .unwrap();
+        assert_eq!(token_generation(&answered_token(again).await), 1, "{place}");
+        let first = tokio::time::timeout(WORK_WAIT, first)
+            .await
+            .unwrap_or_else(|_| panic!("{place}: the commit's own answer"))
+            .unwrap();
+        assert_eq!(token_generation(&answered_token(first).await), 1, "{place}");
+        assert_eq!(
+            decisions(&audit_rows(&a, &agent_id).await),
+            vec![decision("first", None), decision("replay", None)],
+            "{place}: the answer asked again comes after the work of its commit"
+        );
+    }
+
+    // The bound, on both pods at once: the work of two commits held past it.
+    let (_, here) = enroll(&a, &seeded, "m-fr155-wait-bound-here").await;
+    let (_, there) = enroll(&a, &seeded, "m-fr155-wait-bound-there").await;
+    let (here_key, there_key) = (rotation_key(253), rotation_key(254));
+    let seam = a.state.fleet().rotation_seam.hold();
+    let firsts = [
+        spawn_rotate(&a, &here, &here_key),
+        spawn_rotate(&a, &there, &there_key),
+    ];
+    wait_at_the_seam(&a, 2).await;
+    let started = tokio::time::Instant::now();
+    let agains = [
+        (
+            "on the pod that committed",
+            spawn_rotate(&a, &here, &here_key),
+        ),
+        ("on another server", spawn_rotate(&b, &there, &there_key)),
+    ];
+    for (place, again) in agains {
+        let again = tokio::time::timeout(Duration::from_secs(REPLAY_WAIT_SECS + 5), again)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{place}: an answer asked again is given within its bound, also while \
+                     the work of its commit is held"
+                )
+            })
+            .unwrap();
+        assert_eq!(token_generation(&answered_token(again).await), 1, "{place}");
+    }
+    assert!(
+        tokio::time::Instant::now().duration_since(started)
+            >= Duration::from_secs(REPLAY_WAIT_SECS - 1),
+        "each answer asked again waited for the work of its commit up to its bound"
+    );
+    seam.release();
+    for first in firsts {
+        let first = tokio::time::timeout(WORK_WAIT, first)
+            .await
+            .expect("the commit's own answer, once the work ran")
+            .unwrap();
+        assert_eq!(token_generation(&answered_token(first).await), 1);
+    }
 }
 
 /// FR-155 P1e — a stand-in regional relay: its `GET /stats` reports the

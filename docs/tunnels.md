@@ -672,7 +672,7 @@ sequenceDiagram
 ```
 
 The agent drops send futures on purpose. On the control channel, `send_control_notice`
-(`agents/roomlerd/src/peer.rs:6231`) bounds each attempt with a timeout and retries, and the
+(`agents/roomlerd/src/peer.rs:6270`) bounds each attempt with a timeout and retries, and the
 idle warning (`agents/roomlerd/src/session_idle.rs:465`) and the session's `rc:ended`
 (`agents/roomlerd/src/session_table.rs:362`) each have a 2 s budget. Other sends race the
 session's end in a `select!` or die with an aborted pump. A tunnel flow's cancel cuts its
@@ -779,7 +779,7 @@ writer busy. The rule was written before the counted runs, and it and every run 
 | 0.4.222, three runs | 6.4 s | 661,403 to 666,457 B | 4.6 to 4.9 s after the lock, 0.5 to 0.9 s after the cut's end | every later lock and unlock shows within 2 s, on one stream from start to end |
 
 **What a person saw on 0.4.221 was a reconnect, not a chip that stays wrong.** The lock
-notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10715`) was lost, and nothing the agent
+notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10797`) was lost, and nothing the agent
 sent on the control channel after it was read. On this guest a locked session sends no video.
 The viewer's media watchdog spares only an agent that said it cannot capture or that it waits
 (`ui/src/composables/useRemoteControl.ts:5844`), and no such word could arrive. So it asked
@@ -791,9 +791,9 @@ never shows it:
 
 | Condition | Why | Anchor |
 |---|---|---|
-| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4277`, `:5241`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2621` |
-| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7279`, `:2207`, `agents/roomlerd/src/peer.rs:11346`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
-| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1534`, `:6231`, `agents/roomlerd/src/lock_state.rs:333` |
+| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4287`, `:5275`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2621` |
+| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7279`, `:2207`, `agents/roomlerd/src/peer.rs:11428`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
+| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1534`, `:6270`, `agents/roomlerd/src/lock_state.rs:333` |
 
 A real path failure cuts both directions. The second row is read from the source: two runs on
 0.4.221 with only the agent's outgoing packets cut, and a waiting writer, delivered every
@@ -1735,8 +1735,8 @@ the admin's state: `online` and `offline` both mean active, and `quarantined` en
 the socket at its next 60 s check. Whether the client is connected is derived on
 every read from its live tunnel socket, the way an agent's presence is derived from
 its hub registration (Phase A-1). ONE function does it,
-`derive_tunnel_client_presence` (`crates/modules/fleet/src/agent.rs:2850`), beside
-`derive_agent_presence` (`:2648`), and every list that shows a tunnel client calls
+`derive_tunnel_client_presence` (`crates/modules/fleet/src/agent.rs:2838`), beside
+`derive_agent_presence` (`:2636`), and every list that shows a tunnel client calls
 it: the unified device list and a device's own listing
 (`crates/api/src/routes/device.rs:226`, `crates/api/src/routes/agent_self.rs`), and
 `GET …/tunnel-client` with the PUT's answer
@@ -1757,8 +1757,8 @@ flowchart TD
 
 | What the read finds | `presence` | `is_online` |
 |---|---|---|
-| a socket of the client is live on this pod (`TunnelClientSockets`, `agent.rs:2688`) | `online` | `true` |
-| else, a fresh record of it from any pod (`tunnel_client_presence_batch`, `agent.rs:2816`) | `online` | `true` |
+| a socket of the client is live on this pod (`TunnelClientSockets`, `agent.rs:2676`) | `online` | `true` |
+| else, a fresh record of it from any pod (`tunnel_client_presence_batch`, `agent.rs:2804`) | `online` | `true` |
 | else, the directory answered | `offline` | `false` |
 | else (no Redis, an error, or the 200 ms budget spent), and `last_seen_at` is fresh | `stale` | `false` |
 | else | `offline` | `false` |
@@ -1772,7 +1772,7 @@ after a clean close, so read on its own it would show every client that just clo
 or just enrolled, as `stale`. A directory that answered knows the sockets; the trail
 stands in only for one that did not, and then it is never green: with Redis down, a
 pod reads a client connected to the other pod as `stale` (`tunnel_client_presence`,
-`agent.rs:2880`, and its table test).
+`agent.rs:2868`, and its table test).
 
 ### The record its sockets write
 
@@ -1791,12 +1791,12 @@ live client nor its trail.
 | pod shutdown | every token this pod holds is taken, so no refresh writes it back, then released | `NetworkState::shutdown` (`crates/modules/network/src/lib.rs:994`) |
 
 - ⚠️ **The client's sockets on one pod share one token**, as an agent's hub slot holds
-  one (`TunnelClientSockets::sit`, `agent.rs:2706`). Two `roomler` processes on one
+  one (`TunnelClientSockets::sit`, `agent.rs:2694`). Two `roomler` processes on one
   machine hold two sockets, and the newer one often closes first (a short `roomler
   ssh` beside a long-lived forward). With a token per socket, that close would delete
   the record the other socket stands behind, and every other pod would read the client
   offline until the next refresh, up to 60 s. Shared, the first close releases nothing;
-  the last one releases the record (`leave`, `:2766`).
+  the last one releases the record (`leave`, `:2754`).
 - ⚠️ **The release waits for the check.** `refresh_if_mine` writes a missing key back:
   that is how a record lost to a Redis blip heals within one check. A refresh still in
   flight after the release would bring the record back for its whole TTL, so the
