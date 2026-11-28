@@ -1197,8 +1197,10 @@ impl DxgiCapture for DxgiDirectBackend {
         // from 1 µs to 22 ms, and a readback from 6 ms to 67 ms), and an encoder
         // reads a GPU frame back on this device from another thread. Polling
         // instead is no way out: the 2 ms poll cost 11 ms of L4 on a still screen,
-        // on a guest with no real GPU. The only pump that waits is the RTP one,
-        // and its H.264 encoders read every frame back anyway.
+        // on a guest with no real GPU. The RTP pump waits, and its H.264 encoders
+        // read every frame back anyway. A DataChannel pump waits only on a
+        // session whose capture hands out no GPU frame to begin with (FR-135
+        // R4a, `capture::pace::dc_capture_wait`).
         let gpu_frames = wait_ms == 0;
         // SAFETY: out-params are valid; duplication is live.
         unsafe {

@@ -560,8 +560,8 @@ impl AgentDao {
     /// admission decides on the row's generation and last rotation as read,
     /// its update compares against the primary's row ([`Self::rotate_token`]),
     /// and after an update that matched nothing it reads the row again to say
-    /// why. The agent socket's (P1c) and DERP's (P1d) registrations read it here.
-    /// Each read must see what the primary has applied, which a secondary may not.
+    /// why. The agent socket's (P1c) and DERP's (P1d) registrations read it here, as
+    /// does an answer asked again (P1e). Each read must see what the primary has applied.
     #[expect(
         clippy::disallowed_methods,
         reason = "the token rotation tells a removed device that it was removed, as the revocation checks do"
@@ -1461,6 +1461,32 @@ impl AgentDao {
                         "token_exp": DateTime::from_millis(token_exp_unix.saturating_mul(1000)),
                     },
                 },
+            )
+            .await
+    }
+
+    /// FR-155 P1e — mark the end of the work a rotation's commit started
+    /// (`token_rotation.settled_at`), only while the row's rotation is the
+    /// one that work ran for: its `generation` and its key's hash. `false`
+    /// when the row records another rotation, or none, so an earlier work
+    /// never marks a later rotation's record. [`Self::rotate_token`] writes
+    /// each rotation's record anew, without the mark.
+    pub async fn mark_rotation_settled(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        generation: u32,
+        key_sha256: &str,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": agent_id,
+                    "tenant_id": tenant_id,
+                    "token_rotation.gen": i64::from(generation),
+                    "token_rotation.key_sha256": key_sha256,
+                },
+                doc! { "$set": { "token_rotation.settled_at": DateTime::now() } },
             )
             .await
     }

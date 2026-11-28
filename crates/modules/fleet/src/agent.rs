@@ -938,16 +938,17 @@ impl axum::response::IntoResponse for RotateError {
 }
 
 /// One rotation decision's audit row: who asked, from where, with which
-/// generation. Every outcome of the route goes through [`Self::record`].
-struct RotationAudit<'a> {
-    state: &'a FleetState,
-    caller: crate::auth_agent::RotationCaller,
-    client_ip: Option<String>,
+/// generation. Every outcome of the route goes through [`Self::record`], also
+/// the work of a commit (`crate::rotation_work::run`).
+pub(crate) struct RotationAudit<'a> {
+    pub(crate) state: &'a FleetState,
+    pub(crate) caller: crate::auth_agent::RotationCaller,
+    pub(crate) client_ip: Option<String>,
 }
 
 impl RotationAudit<'_> {
     /// Best-effort: a failed write is logged and never changes the answer.
-    async fn record(&self, decision: &str, reason: Option<&str>, gen_to: Option<u32>) {
+    pub(crate) async fn record(&self, decision: &str, reason: Option<&str>, gen_to: Option<u32>) {
         let event = roomler_ai_remote_control::models::TokenRotationAuditEvent {
             id: None,
             tenant_id: self.caller.tenant_id,
@@ -981,7 +982,9 @@ impl RotationAudit<'_> {
 /// first rotation an hour per device (429 above it). A token one generation
 /// below, with the rotation key of the rotation that made the row's
 /// generation, asks again for an answer that was lost: it is minted at the
-/// row's generation, nothing else changes, and the hour does not apply.
+/// row's generation, nothing else changes, and the hour does not apply. The
+/// work a commit starts runs in a task of its own to its end, and both
+/// answers come after it (FR-155 P1e, `crate::rotation_work`).
 ///
 /// 404 to a first call while `rc.agent_token_rotation` is off (a call asking
 /// again is answered either way, so switching it off never leaves a device
@@ -1116,6 +1119,7 @@ pub async fn self_rotate(
         generation: next_gen,
         key_sha256,
         at: DateTime::from_millis(now.timestamp_millis()),
+        settled_at: None,
     };
     let last_rotation_before = DateTime::from_millis(now.timestamp_millis() - ROTATION_INTERVAL_MS);
     let committed = state
@@ -1131,54 +1135,27 @@ pub async fn self_rotate(
         .await
         .map_err(|e| ApiError::Internal(format!("token rotation: {e}")))?;
     if committed {
-        // FR-155 P1b — what the commit ends: the device's connections admitted
-        // below the new generation, on this pod and, through the control
-        // channel, on every other, each pod keeping a floor that refuses a
-        // late registration below it (`hub::rotation`).
-        state
-            .rc_hub
-            .end_below_generation(caller.agent_id, caller.tenant_id, next_gen);
-        crate::ctrl::publish_rc_ctrl(
-            &state.core,
-            "end_below_generation",
-            serde_json::json!({
-                "agent_id": caller.agent_id.to_hex(),
-                "tenant_id": caller.tenant_id.to_hex(),
-                "generation": next_gen,
-            }),
-        )
-        .await;
-        audit.record("first", None, Some(next_gen)).await;
-        // FR-155 P1d — what the commit changes outside fleet: the overlay node
-        // goes offline, the DERP registrations below the new generation end,
-        // and the device is ordered a new overlay key
-        // (`FleetLifecycle::agent_credentials_rotated`). Once, here, before
-        // the answer: the device connects at the new generation only once it
-        // has the token. A failure is logged, counted and audited, and the
-        // token is answered all the same.
-        let failed = state
-            .hooks
-            .agent_credentials_rotated(caller.tenant_id, caller.agent_id, next_gen)
-            .await;
-        if !failed.is_empty() {
-            roomler_core::cluster::metrics::bump(
-                &roomler_core::cluster::metrics::CREDENTIAL_ROTATION_HOOK_FAILED_TOTAL,
+        // FR-155 P1e — the work the commit starts (the sweep, the control
+        // event, the `first` row, the hook, the row's mark) runs in a task of
+        // its own, to its end, and the answer is minted once it has ended
+        // (`rotation_work`). This pod's answers asked again wait for it from
+        // here on.
+        let running = state
+            .rotations_in_flight
+            .start(caller.tenant_id, caller.agent_id, next_gen);
+        let work = tokio::spawn(crate::rotation_work::run(
+            state.clone(),
+            caller,
+            audit.client_ip.clone(),
+            rotation.key_sha256.clone(),
+            running,
+        ));
+        if let Err(e) = work.await {
+            tracing::error!(
+                tenant_id = %caller.tenant_id, agent_id = %caller.agent_id,
+                generation = next_gen, error = %e,
+                "fr-155: the work of a rotation's commit ended in an error; the new token is answered"
             );
-            for (module, e) in &failed {
-                tracing::warn!(
-                    tenant_id = %caller.tenant_id, agent_id = %caller.agent_id,
-                    generation = next_gen, module, error = %e,
-                    "fr-155: a module could not apply the token rotation; the new token is answered"
-                );
-            }
-            let modules = failed
-                .iter()
-                .map(|(module, _)| *module)
-                .collect::<Vec<_>>()
-                .join(",");
-            audit
-                .record("hook_failed", Some(modules.as_str()), Some(next_gen))
-                .await;
         }
         let agent_token = state
             .auth
@@ -1264,12 +1241,23 @@ pub async fn self_rotate(
 }
 
 /// The answer to the row's last rotation, asked again: minted at the row's
-/// generation, and the row is not written.
+/// generation, and the row is not written. While the rotation is on, it is
+/// given once the work of that rotation's commit has ended, waited for at
+/// most `rotation_work::REPLAY_WAIT_SECS` (FR-155 P1e, `rotation_work`).
 async fn answer_again(
     state: &FleetState,
     audit: &RotationAudit<'_>,
     row: &Agent,
 ) -> Result<Json<RenewedAgentToken>, RotateError> {
+    if state.rc_hub.token_rotation() {
+        crate::rotation_work::wait_for_the_work(
+            state,
+            audit.caller.tenant_id,
+            audit.caller.agent_id,
+            row,
+        )
+        .await;
+    }
     let ttl = state.settings.rc.agent_token_ttl_secs;
     let agent_token = state
         .auth
@@ -1357,13 +1345,16 @@ pub async fn self_unenroll(
 // Agent CRUD
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Phase A-1 three-state presence (see `to_agent_response`).
+/// Phase A-1 three-state presence (see `to_agent_response`); a tunnel
+/// client's reads the same three words (#4553, `tunnel_client_presence`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentPresence {
-    /// An rc socket is registered on some pod — Connect will work.
+    /// An rc socket is registered on some pod — Connect will work. For a
+    /// tunnel client: its tunnel socket is.
     Online,
-    /// Heartbeat trail fresh but no pod claims the socket — amber.
+    /// Heartbeat trail fresh but no pod claims the socket — amber. For a
+    /// tunnel client only while the directory cannot answer.
     Stale,
     Offline,
 }
@@ -2668,6 +2659,230 @@ pub fn derive_agent_presence(
     (presence, is_online)
 }
 
+/// #4553 — this pod's live tunnel-client sockets, read by
+/// [`derive_tunnel_client_presence`] as the hub is read for an agent, and the
+/// token of each client's presence record on this pod.
+///
+/// A client may hold several sockets at once (two `roomler` processes on one
+/// machine, or a reconnect whose old socket has not closed yet), so each
+/// socket takes a SEAT, and the client is live here while any seat is taken.
+/// The token is ONE per client on this pod, as `agent_presence_tokens` holds
+/// one per agent: every socket of the client here refreshes it, and only the
+/// last one to close releases it. With a token per socket, the first of two
+/// sockets to close would delete the record the other still stands behind,
+/// and every other pod would read the client offline until the next refresh.
+/// Written only by the tunnel-client socket (`network::tunnel`).
+#[derive(Default)]
+pub struct TunnelClientSockets {
+    clients: dashmap::DashMap<ObjectId, ClientSeats>,
+    next_seat: std::sync::atomic::AtomicU64,
+}
+
+/// One client's sockets on this pod, and its record's token: `None` on a pod
+/// with no directory, and once the shutdown release took it.
+#[derive(Default)]
+struct ClientSeats {
+    seats: std::collections::HashSet<u64>,
+    token: Option<String>,
+}
+
+impl TunnelClientSockets {
+    /// Take a seat for one socket of `client`. A client new to this pod gets
+    /// its record's token from `mint` (`None` on a pod with no directory); a
+    /// client with a socket here already keeps the token it has. Returns the
+    /// seat, and the token the socket claims the record with.
+    pub fn sit(
+        self: &std::sync::Arc<Self>,
+        client: ObjectId,
+        mint: impl FnOnce() -> Option<String>,
+    ) -> (TunnelClientSeat, Option<String>) {
+        let seat = self
+            .next_seat
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let token = {
+            let mut entry = self.clients.entry(client).or_default();
+            if entry.seats.is_empty() {
+                entry.token = mint();
+            }
+            entry.seats.insert(seat);
+            entry.token.clone()
+        };
+        let seat = TunnelClientSeat {
+            sockets: std::sync::Arc::clone(self),
+            client,
+            seat,
+            left: false,
+        };
+        (seat, token)
+    }
+
+    /// Whether a socket of `client` is live on this pod.
+    pub fn is_live(&self, client: ObjectId) -> bool {
+        self.clients
+            .get(&client)
+            .is_some_and(|c| !c.seats.is_empty())
+    }
+
+    /// The token of `client`'s record on this pod, read live for a refresh,
+    /// as the agent heartbeat reads its token right before its
+    /// `refresh_if_mine`: that call re-sets a missing key, so a refresh with a
+    /// token already released would bring its record back.
+    pub fn token(&self, client: ObjectId) -> Option<String> {
+        self.clients.get(&client).and_then(|c| c.token.clone())
+    }
+
+    /// Take every token this pod holds, for the shutdown release, as the
+    /// agent sweep takes `agent_presence_tokens`: a token taken is refreshed
+    /// no more ([`Self::token`]), so the release is not written back. The keys
+    /// are read first and each entry on its own, so no shard guard outlives
+    /// this call (the caller awaits Redis per token: the root `clippy.toml`).
+    pub fn take_tokens(&self) -> Vec<(ObjectId, String)> {
+        let clients: Vec<ObjectId> = self.clients.iter().map(|e| *e.key()).collect();
+        clients
+            .into_iter()
+            .filter_map(|client| {
+                let token = self.clients.get_mut(&client)?.token.take()?;
+                Some((client, token))
+            })
+            .collect()
+    }
+
+    /// The seat leaves. If it was the client's last socket on this pod, the
+    /// client leaves too, and its token comes back for the release. Asked
+    /// again under the shard's lock: a socket seated since keeps the client
+    /// here, and the record with it.
+    fn leave(&self, client: ObjectId, seat: u64) -> Option<String> {
+        let last = match self.clients.get_mut(&client) {
+            Some(mut c) => {
+                c.seats.remove(&seat);
+                c.seats.is_empty()
+            }
+            None => false,
+        };
+        if !last {
+            return None;
+        }
+        self.clients
+            .remove_if(&client, |_, c| c.seats.is_empty())
+            .and_then(|(_, c)| c.token)
+    }
+}
+
+/// One socket's seat in [`TunnelClientSockets`]. A socket that ends leaves
+/// with [`Self::leave`], which hands back the token for the release. A seat
+/// dropped any other way (a panic) leaves too, and its record ends with its
+/// TTL.
+pub struct TunnelClientSeat {
+    sockets: std::sync::Arc<TunnelClientSockets>,
+    client: ObjectId,
+    seat: u64,
+    left: bool,
+}
+
+impl TunnelClientSeat {
+    /// Leave this pod's registry. `Some(token)`: this was the client's last
+    /// socket here, so its record is the caller's to release.
+    pub fn leave(mut self) -> Option<String> {
+        self.left = true;
+        self.sockets.leave(self.client, self.seat)
+    }
+}
+
+impl Drop for TunnelClientSeat {
+    fn drop(&mut self) {
+        if !self.left {
+            let _ = self.sockets.leave(self.client, self.seat);
+        }
+    }
+}
+
+/// #4553 — the tunnel-client twin of [`agent_presence_batch`]: one MGET of
+/// the clients' presence records under the same 200 ms budget. `Some` = the
+/// directory answered, holding the clients some pod has a socket of; `None`
+/// = it could not (no Redis on this pod, an error, or past the budget), and
+/// [`derive_tunnel_client_presence`] reads the heartbeat trail instead.
+pub async fn tunnel_client_presence_batch(
+    state: &FleetState,
+    clients: &[roomler_ai_remote_control::models::TunnelClient],
+) -> Option<std::collections::HashSet<ObjectId>> {
+    let dir = state.cluster_directory.as_ref()?;
+    let ids: Vec<ObjectId> = clients.iter().filter_map(|c| c.id).collect();
+    let keys: Vec<String> = ids
+        .iter()
+        .map(|i| roomler_core::cluster::directory::tunnel_client_key(&i.to_hex()))
+        .collect();
+    match tokio::time::timeout(std::time::Duration::from_millis(200), dir.get_many(&keys)).await {
+        Ok(Ok(vals)) => Some(
+            ids.into_iter()
+                .zip(vals)
+                .filter_map(|(id, v)| v.map(|_| id))
+                .collect(),
+        ),
+        Ok(Err(e)) => {
+            tracing::debug!(%e, "tunnel-client presence MGET failed; reading the heartbeat trail");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("tunnel-client presence MGET timed out; reading the heartbeat trail");
+            None
+        }
+    }
+}
+
+/// #4553 — a tunnel client's three-state presence, the twin of
+/// [`derive_agent_presence`], shared by every list that shows a tunnel client
+/// (the unified device list and a device's own listing in `crates/api`, and
+/// network's `GET …/tunnel-client`) so they cannot drift. `directory` is
+/// [`tunnel_client_presence_batch`]'s answer. Presence is a fact the server
+/// observes; no authorization reads it.
+pub fn derive_tunnel_client_presence(
+    state: &FleetState,
+    c: &roomler_ai_remote_control::models::TunnelClient,
+    directory: Option<&std::collections::HashSet<ObjectId>>,
+) -> (AgentPresence, bool) {
+    let local = c.id.is_some_and(|i| state.tunnel_client_sockets.is_live(i));
+    let claimed = directory.map(|d| c.id.is_some_and(|i| d.contains(&i)));
+    tunnel_client_presence(local, claimed, c.last_seen_at, DateTime::now())
+}
+
+/// How long a tunnel client's `last_seen_at` counts as fresh: the record's
+/// TTL, 3 × the socket's check (`TUNNEL_CLIENT_TTL_SECS`).
+const TUNNEL_CLIENT_TRAIL_MS: i64 =
+    (roomler_core::cluster::directory::TUNNEL_CLIENT_TTL_SECS * 1000) as i64;
+
+/// The table behind [`derive_tunnel_client_presence`], pure so a test reads
+/// every input to one answer. "online" = a socket of the client is live on
+/// this pod, or the directory holds a fresh record of one on any pod
+/// (`claimed: Some(true)`). "stale" = the directory could not answer
+/// (`claimed: None`) and the trail is fresh: the client may be live on a pod
+/// this one cannot see, so amber, never a green lie. "offline" = neither.
+///
+/// ⚠️ Unlike an agent's, the trail is read ONLY when the directory is
+/// silent. An agent's `stale` is gated on the `Online` status its socket
+/// writes and its clean teardown clears. A tunnel client's `status` is the
+/// admin's and no socket writes it (with two pods, a disconnect write could
+/// land after a reconnect on the other pod), and its trail stays fresh for
+/// minutes after a clean close. Read alone, the trail would show every client
+/// that just closed, or just enrolled, as stale. A directory that answered is
+/// the truth about sockets; the trail stands in only for one that did not.
+pub fn tunnel_client_presence(
+    local_socket: bool,
+    claimed: Option<bool>,
+    last_seen_at: DateTime,
+    now: DateTime,
+) -> (AgentPresence, bool) {
+    let trail_fresh =
+        now.timestamp_millis() - last_seen_at.timestamp_millis() < TUNNEL_CLIENT_TRAIL_MS;
+    let presence = if local_socket || claimed == Some(true) {
+        AgentPresence::Online
+    } else if claimed.is_none() && trail_fresh {
+        AgentPresence::Stale
+    } else {
+        AgentPresence::Offline
+    };
+    (presence, matches!(presence, AgentPresence::Online))
+}
+
 fn to_agent_response(
     state: &FleetState,
     a: roomler_ai_remote_control::models::Agent,
@@ -3374,5 +3589,130 @@ mod pin_downgrade_words_tests {
              would DOWNGRADE this device; pass force=true to do it deliberately"
         );
         assert!(!reason.to_ascii_lowercase().contains("agent"), "{reason}");
+    }
+}
+
+/// #4553 — a tunnel client's presence table (`tunnel_client_presence`, the
+/// twin of `derive_agent_presence`).
+#[cfg(test)]
+mod tunnel_client_presence_tests {
+    use super::{AgentPresence, tunnel_client_presence};
+    use bson::DateTime;
+
+    const NOW_MS: i64 = 1_800_000_000_000;
+    /// 3 × the tunnel socket's 60 s check, the record's TTL.
+    const TRAIL_MS: i64 = 180_000;
+
+    fn now() -> DateTime {
+        DateTime::from_millis(NOW_MS)
+    }
+
+    fn seen(ms_ago: i64) -> DateTime {
+        DateTime::from_millis(NOW_MS - ms_ago)
+    }
+
+    /// Every input to one presence. A socket on this pod, or a record another
+    /// pod holds, is online whatever the trail says. The trail speaks only
+    /// when the directory could not answer: a client the directory says
+    /// nobody holds is offline, even seconds after it closed.
+    #[test]
+    fn every_input_reads_one_presence() {
+        use AgentPresence::{Offline, Online, Stale};
+        let (fresh, old) = (seen(30_000), seen(10 * 60_000));
+        let table = [
+            // (socket on this pod, directory, trail, presence)
+            (true, Some(true), fresh, Online),
+            (true, Some(false), old, Online),
+            (true, None, old, Online),
+            (false, Some(true), fresh, Online),
+            (false, Some(true), old, Online),
+            (false, Some(false), fresh, Offline),
+            (false, Some(false), old, Offline),
+            (false, None, fresh, Stale),
+            (false, None, old, Offline),
+        ];
+        for (local, claimed, last_seen, want) in table {
+            let (presence, is_online) = tunnel_client_presence(local, claimed, last_seen, now());
+            assert_eq!(
+                presence, want,
+                "local={local} claimed={claimed:?} last_seen={last_seen}"
+            );
+            assert_eq!(
+                is_online,
+                want == Online,
+                "is_online is the online state only: local={local} claimed={claimed:?}"
+            );
+        }
+    }
+
+    /// The trail is fresh for the record's TTL and no longer; a trail ahead
+    /// of this pod's clock (another pod's skew) is fresh.
+    #[test]
+    fn the_trail_is_fresh_for_three_checks() {
+        let p = |ms_ago| tunnel_client_presence(false, None, seen(ms_ago), now()).0;
+        assert_eq!(p(TRAIL_MS - 1), AgentPresence::Stale);
+        assert_eq!(p(TRAIL_MS), AgentPresence::Offline);
+        assert_eq!(p(-5_000), AgentPresence::Stale);
+    }
+
+    /// A client is live on this pod while any socket of it sits, and its
+    /// sockets share ONE record token: a second socket keeps the token the
+    /// first one minted, a socket closing while another sits releases
+    /// nothing, and only the last one out hands the token back. A client new
+    /// to the pod mints its own. The shutdown release takes each token once,
+    /// and a token it took is refreshed no more.
+    #[test]
+    fn a_client_is_live_here_while_any_socket_of_it_sits() {
+        use super::TunnelClientSockets;
+        use bson::oid::ObjectId;
+        use std::sync::Arc;
+
+        let sockets = Arc::new(TunnelClientSockets::default());
+        let (a, b) = (ObjectId::new(), ObjectId::new());
+        assert!(!sockets.is_live(a));
+
+        let (first, t1) = sockets.sit(a, || Some("t1".into()));
+        let (second, t2) = sockets.sit(a, || unreachable!("a client here keeps its token"));
+        assert_eq!(t1.as_deref(), Some("t1"));
+        assert_eq!(
+            t2.as_deref(),
+            Some("t1"),
+            "the second socket claims with it"
+        );
+        let (other, none) = sockets.sit(b, || None);
+        assert_eq!(none, None, "a pod with no directory holds no token");
+        assert!(sockets.is_live(a) && sockets.is_live(b));
+        assert_eq!(sockets.token(a).as_deref(), Some("t1"));
+
+        // The newer socket closes first: the record stays with the older one.
+        assert_eq!(second.leave(), None, "another socket of the client sits");
+        assert!(sockets.is_live(a));
+        assert_eq!(sockets.token(a).as_deref(), Some("t1"));
+        assert_eq!(
+            first.leave().as_deref(),
+            Some("t1"),
+            "the last one releases"
+        );
+        assert!(!sockets.is_live(a));
+        assert_eq!(sockets.token(a), None);
+
+        // Back on this pod, with a new token; the shutdown release takes it.
+        let (again, t3) = sockets.sit(a, || Some("t3".into()));
+        assert_eq!(t3.as_deref(), Some("t3"));
+        assert_eq!(sockets.take_tokens(), vec![(a, "t3".to_string())]);
+        assert_eq!(sockets.token(a), None, "a taken token is refreshed no more");
+        assert!(sockets.take_tokens().is_empty(), "each token is taken once");
+        assert!(sockets.is_live(a), "taking the token leaves the socket");
+        assert_eq!(again.leave(), None, "its token was released already");
+
+        drop(other);
+        assert!(
+            !sockets.is_live(b),
+            "a seat dropped without leave() leaves too"
+        );
+        assert!(
+            sockets.clients.is_empty(),
+            "the last socket out removes its client's entry"
+        );
     }
 }

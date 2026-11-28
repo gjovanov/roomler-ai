@@ -468,6 +468,10 @@ mod tombstone_tests;
 mod touch_preset_tests;
 #[cfg(test)]
 mod transfer_activity_tests;
+/// #4553 — a tunnel client's presence comes from its live socket, on either
+/// pod, and from the heartbeat trail only when there is no directory to ask.
+#[cfg(test)]
+mod tunnel_client_presence_tests;
 /// #3328 — a tunnel enrollment token enrolls once, and re-enrolling a machine
 /// id that already has a tunnel client revives it only for its owner or a
 /// holder of `MANAGE_AGENTS`.

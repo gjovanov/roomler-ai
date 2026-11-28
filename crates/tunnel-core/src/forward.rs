@@ -745,6 +745,11 @@ fn spawn_flow_logger(flow_id: u32, stats: Arc<FlowStats>) -> tokio::task::JoinHa
 /// are populated (tcp_read/dc_send outbound, dc_recv/tcp_write inbound)
 /// so the 2 s logger reads identically across transports. Both halves
 /// are awaited so half-close survives a duplex flow.
+///
+/// A local read that fails before the flow's first byte finishes the
+/// stream instead of resetting it (`BeforeFirstByte::Finish`), so the
+/// `flow_id` preamble still reaches the exit (#4501), while the exit's
+/// flows ([`run_flow_quic_until`]) reset theirs.
 pub async fn run_flow_quic(
     tcp: TcpStream,
     send: SendStream,
@@ -752,21 +757,67 @@ pub async fn run_flow_quic(
     flow_id: u32,
     stats: Arc<FlowStats>,
 ) -> CloseReason {
-    run_flow_quic_until(tcp, send, recv, flow_id, stats, std::future::pending()).await
+    pump_flow_quic(
+        tcp,
+        send,
+        recv,
+        flow_id,
+        stats,
+        std::future::pending(),
+        BeforeFirstByte::Finish,
+    )
+    .await
 }
 
-/// [`run_flow_quic`] that `stop` can end. When `stop` resolves first, both
-/// halves are aborted and awaited, so the flow's TCP socket and stream
-/// halves are dropped before this returns, and the flow reads
-/// `ServerTerminated`. The exit runs its flows under the session's stop
-/// (`agents/roomlerd/src/tunnel/quic_peer.rs`).
+/// [`run_flow_quic`] that `stop` can end. Unlike [`run_flow_quic`], a local read that fails
+/// before the flow's first byte resets the stream. When `stop` resolves first, both halves
+/// are aborted and awaited, so the flow's TCP socket and stream halves are dropped before
+/// this returns, and the flow reads `ServerTerminated`. The exit runs its flows under the
+/// session's stop (`agents/roomlerd/src/tunnel/quic_peer.rs`).
 pub async fn run_flow_quic_until(
+    tcp: TcpStream,
+    send: SendStream,
+    recv: RecvStream,
+    flow_id: u32,
+    stats: Arc<FlowStats>,
+    stop: impl std::future::Future<Output = ()>,
+) -> CloseReason {
+    pump_flow_quic(
+        tcp,
+        send,
+        recv,
+        flow_id,
+        stats,
+        stop,
+        BeforeFirstByte::Reset,
+    )
+    .await
+}
+
+/// How a flow's TCP → QUIC half ends its stream when the local side fails
+/// before the flow's first byte (#4501).
+#[derive(Clone, Copy)]
+enum BeforeFirstByte {
+    /// Finish it: the client's flows ([`run_flow_quic`]). A reset discards
+    /// what the exit has not read yet, the `flow_id` preamble
+    /// [`crate::transport::quic::open_flow`] wrote with it, and an exit on an
+    /// older release takes a stream that fails before its preamble for the
+    /// end of the session.
+    Finish,
+    /// Reset it, as after the first byte: the exit's flows
+    /// ([`run_flow_quic_until`]).
+    Reset,
+}
+
+/// The two halves of [`run_flow_quic`] and [`run_flow_quic_until`].
+async fn pump_flow_quic(
     tcp: TcpStream,
     mut send: SendStream,
     mut recv: RecvStream,
     flow_id: u32,
     stats: Arc<FlowStats>,
     stop: impl std::future::Future<Output = ()>,
+    before_first_byte: BeforeFirstByte,
 ) -> CloseReason {
     // P3b-3: hold an `active_flows` gauge for this flow's pump lifetime
     // (no-op when not session-tracked). Drops on return AND on abort.
@@ -778,6 +829,7 @@ pub async fn run_flow_quic_until(
     let stats_send = Arc::clone(&stats);
     let tcp_to_quic = tokio::spawn(async move {
         let mut buf = vec![0u8; CHUNK_BYTES];
+        let mut first_byte_read = false;
         loop {
             match read_half.read(&mut buf).await {
                 Ok(0) => {
@@ -786,6 +838,7 @@ pub async fn run_flow_quic_until(
                     return CloseReason::Eof;
                 }
                 Ok(n) => {
+                    first_byte_read = true;
                     stats_send
                         .tcp_read_bytes
                         .fetch_add(n as u64, Ordering::Relaxed);
@@ -803,7 +856,14 @@ pub async fn run_flow_quic_until(
                 }
                 Err(e) => {
                     debug!(flow_id, %e, "quic pump: TCP read error");
-                    let _ = send.reset(0u32.into());
+                    match before_first_byte {
+                        BeforeFirstByte::Finish if !first_byte_read => {
+                            let _ = send.finish();
+                        }
+                        _ => {
+                            let _ = send.reset(0u32.into());
+                        }
+                    }
                     return CloseReason::IoError;
                 }
             }
