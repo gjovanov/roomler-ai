@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-use bson::{DateTime, doc, oid::ObjectId};
-use mongodb::Database;
+use bson::{DateTime, Document, doc, oid::ObjectId};
+use mongodb::{Collection, Database};
 use roomler_ai_db::models::{
     AuthorType, ContentType, Mentions, Message, MessageAttachment, MessageType, ReactionSummary,
+    Room,
 };
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
 pub struct MessageDao {
     pub base: BaseDao<Message>,
+    /// The rooms, for the one field this DAO writes there: a room's
+    /// `message_count` moves with each message it writes or deletes (#4448).
+    rooms: Collection<Document>,
 }
 
 impl MessageDao {
     pub fn new(db: &Database) -> Self {
         Self {
             base: BaseDao::new(db, Message::COLLECTION),
+            rooms: db.collection(Room::COLLECTION),
         }
     }
 
@@ -102,6 +107,8 @@ impl MessageDao {
         };
 
         let id = self.base.insert_one(&message).await?;
+        // #4448 — the room counts its live messages, and this is one more.
+        self.move_room_count(tenant_id, room_id, 1).await;
 
         // Update thread metadata on parent message when a thread reply is created
         if let Some(parent_id) = thread_id {
@@ -131,6 +138,62 @@ impl MessageDao {
             })
             .await?
             .ok_or(DaoError::NotFound)
+    }
+
+    /// Delete the live message `id` of `room_id` in `tenant_id`: a soft
+    /// delete, which leaves the tombstone. `false` when no live message
+    /// matched (another room's or tenant's, a deleted one, or one a second
+    /// delete reached first), and then the room's count does not move. When it
+    /// matched, the room counts one live message fewer (#4448).
+    pub async fn soft_delete_in_room(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        id: ObjectId,
+    ) -> DaoResult<bool> {
+        let deleted = self
+            .base
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "tenant_id": tenant_id,
+                    "room_id": room_id,
+                    "deleted_at": null,
+                },
+                doc! { "$set": { "deleted_at": DateTime::now() } },
+            )
+            .await?;
+        if deleted {
+            self.move_room_count(tenant_id, room_id, -1).await;
+        }
+        Ok(deleted)
+    }
+
+    /// Move the room's `message_count` by `by` (+1 a message written, -1 a
+    /// message deleted). A count never goes below 0: the field is a `u64`, so
+    /// a stored -1 would fail every read of the room, the org's room list
+    /// included. A row stored before the count had a writer reads 0 over its
+    /// messages until chat's startup job `room-message-count` sets it to them,
+    /// so its first deletes find 0 and leave it. The message is already
+    /// written when this runs, so a failure here does not fail it: the count
+    /// stays one off until the repair's next pass reaches the room.
+    async fn move_room_count(&self, tenant_id: ObjectId, room_id: ObjectId, by: i64) {
+        let mut room = doc! { "_id": room_id, "tenant_id": tenant_id };
+        if by < 0 {
+            room.insert("message_count", doc! { "$gte": -by });
+        }
+        if let Err(e) = self
+            .rooms
+            .update_one(room, doc! { "$inc": { "message_count": by } })
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                room = %room_id,
+                by,
+                "a room's message_count did not move; the repair sets it at a later boot"
+            );
+        }
     }
 
     /// FR-32 — live messages in the tenant, for **reporting only**.

@@ -254,7 +254,7 @@ impl MemberCountRepair {
 /// `db`'s collection `name`, reading the primary whatever the connection
 /// string prefers: a `readPreference` in it moves `db`'s default, and the
 /// collection would inherit it. Its write and read concerns stay `db`'s.
-fn on_the_primary(db: &Database, name: &str) -> Collection<Document> {
+pub(super) fn on_the_primary(db: &Database, name: &str) -> Collection<Document> {
     db.collection_with_options(
         name,
         CollectionOptions::builder()
@@ -266,7 +266,7 @@ fn on_the_primary(db: &Database, name: &str) -> Collection<Document> {
 /// A stored count as a whole number: an integer, or a double with no fraction.
 /// Anything else (missing, a fraction, a string) is no count, so it differs
 /// from every number of rows and a pass sets it.
-fn count_of(v: Option<&Bson>) -> Option<i64> {
+pub(super) fn count_of(v: Option<&Bson>) -> Option<i64> {
     match v? {
         Bson::Int32(n) => Some(i64::from(*n)),
         Bson::Int64(n) => Some(*n),

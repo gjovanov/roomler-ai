@@ -410,8 +410,9 @@ pub async fn delete(
     // The soft delete matches a live message only, so a second delete that
     // passed the guard before the first one landed finds nothing: it answers
     // as a missing message does, keeps the first removal time and sends
-    // nothing.
-    if !state.messages.base.soft_delete_in_tenant(tid, mid).await? {
+    // nothing. The delete that matched takes its one from the room's
+    // `message_count` (#4448).
+    if !state.messages.soft_delete_in_room(tid, rid, mid).await? {
         return Err(ApiError::NotFound("Resource not found".to_string()));
     }
 

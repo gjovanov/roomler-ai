@@ -45,6 +45,7 @@ pub mod media_type;
 pub mod member_count;
 pub mod membership;
 pub mod message;
+pub mod message_count;
 pub mod reaction;
 pub mod room;
 pub mod search;
@@ -194,13 +195,21 @@ impl Module for ChatState {
     /// ([`member_count`]). Not leader-gated: every write compares the count
     /// it read, so a pass is right beside a live pod's joins and leaves and
     /// beside another pass, and a roll's last pod to boot passes after the
-    /// old code is gone.
+    /// old code is gone. #4448: the same for a room's message count, set to
+    /// its live messages ([`message_count`]), on the same grounds.
     fn jobs(&self) -> Vec<Job> {
-        let state = self.clone();
-        vec![Job::at_startup(member_count::JOB, false, move || {
-            let state = state.clone();
-            async move { member_count::repair(&state).await }
-        })]
+        let members = self.clone();
+        let messages = self.clone();
+        vec![
+            Job::at_startup(member_count::JOB, false, move || {
+                let state = members.clone();
+                async move { member_count::repair(&state).await }
+            }),
+            Job::at_startup(message_count::JOB, false, move || {
+                let state = messages.clone();
+                async move { message_count::repair(&state).await }
+            }),
+        ]
     }
 
     /// `typing:start` / `typing:stop` on the user socket.
