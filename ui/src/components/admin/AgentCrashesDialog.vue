@@ -28,6 +28,20 @@
       </v-card-title>
 
       <v-card-text style="max-height: 70vh">
+        <!-- #3332 — what the device's crash marker says, in words: the row's
+             marker opens this dialog, and a tap on a touch screen shows no
+             title. The device's own claim, shown whether or not the reports
+             below may be read. -->
+        <v-alert
+          v-if="health"
+          type="warning"
+          variant="tonal"
+          density="compact"
+          class="mb-3"
+          data-testid="agent-crashes-health"
+        >
+          {{ health }}
+        </v-alert>
         <!-- A refusal is an answer, not an error (FR-82): reading a device's
              crash reports needs MANAGE_AGENTS, and the dialog says so. -->
         <v-alert
@@ -136,6 +150,9 @@ const props = defineProps<{
   tenantId: string
   agentId: string
   agentName: string
+  /** #3332 — the device's crash word as a sentence (`crashSentence`), or ''
+   *  when it reports nothing. */
+  health?: string
 }>()
 
 const emit = defineEmits<{
