@@ -931,7 +931,9 @@ land a secondary org's reap in the primary's maps.
 `accept_bi` and reads each stream's 4-byte `flow_id` preamble on a task of its own,
 within the forward's 10 s wait for its stream, so a stream reset, finished or stalled
 before its preamble is dropped alone, with one `info!` naming the session and the error,
-and `quic_conn_ended` fires only on the connection's end.
+and `quic_conn_ended` fires only on the connection's end. On the client, a flow whose
+local side fails before its first byte finishes its stream instead of resetting it, so
+its preamble still reaches the exit.
 
 ⚠️ **Not `Disconnected`.** That is five seconds without a packet — a relay hiccup, a
 laptop's Wi-Fi roam, a CGNAT rebind — and ICE recovers from it on its own. Reaping there
@@ -1101,7 +1103,7 @@ sequenceDiagram
 
 A `SessionLink` (`agents/roomlerd/src/tunnel/quic_peer.rs:87`) holds a `Weak` to the
 connection and the stop every flow runs under (`run_flow_quic_until`,
-`crates/tunnel-core/src/forward.rs:763`, for TCP; a `select` for UDP,
+`crates/tunnel-core/src/forward.rs:777`, for TCP; a `select` for UDP,
 `agents/roomlerd/src/tunnel/acceptor.rs:519`), so a kept link holds no socket. A
 forward still waiting for its stream (`take_flow`,
 `agents/roomlerd/src/tunnel/quic_peer.rs:595` and `:608`) returns when the session
