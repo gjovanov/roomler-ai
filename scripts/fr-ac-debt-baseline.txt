@@ -74,6 +74,7 @@ FR-64=1   # E.7 #1244 closed 2026-11-16 not planned: superseded by FR-148 #3953,
 FR-71=4   # E.8 #1362 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC3 and AC6 are FR-148's AC9, AC4 its AC21, AC5 its AC9 and AC30.
 FR-74=2   # E.9 #1442 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC2 and AC4 are FR-148's AC15; P5 is its P3.
 FR-79=2   # E.10 #1524 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC8 is FR-148's AC6 and AC7, AC9 its AC9 and AC16. V5b (PR #3374) is the first step of its P1.
+FR-14=4   # E.11 #792 closed 2026-11-28 not planned: superseded by FR-148 #3953, in the consolidation the operator asked for on 2026-11-27. Nothing was built under this number. AC1 is FR-148's AC9 and AC28, AC2 and AC3 its AC29, AC4 its AC21.
 
 # ── nodocs: bound by the docs-before-close rule, and no docs criterion ───────
 #
@@ -103,3 +104,4 @@ FR-79=2   # E.10 #1524 closed 2026-11-16 not planned: superseded by FR-148 #3953
 
 nodocs FR-31  # #897 closed 2026-11-08 not planned: nothing shipped under it to document (draft PR #900 closed unmerged); FR-35 #922 carries the work.
 nodocs FR-17  # #799 closed 2026-11-16 not planned: stages A and B are inert behind an opt-in and no reader-facing page describes them. The docs of the deadline-limited channel are FR-148's AC31.
+nodocs FR-14  # #792 closed 2026-11-28 not planned: nothing shipped under it to document (designs A, B and C were not built). The docs of the path model are FR-148's AC31.

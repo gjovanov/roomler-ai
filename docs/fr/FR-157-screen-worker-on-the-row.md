@@ -299,19 +299,19 @@ docs; P5 checks that they are whole.
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P0 | the RED read of C1–C4 and the lag's split (C5), on the current release and the current server; no code | none: it reads and changes nothing | not started |
+| P0 | the RED read of C1–C4 and the lag's split (C5), on the current release and the current server; no code | none: it reads and changes nothing | done: C1–C4 read RED (AC1) and C5's split (AC2) on 2026-11-27 (the field log); no layer comes near one beat, so P1 goes ahead (D2) |
 | P1 | the agent: `AgentCaps.gui_worker` in `crates/remote_control`, filled by a Mac's daemon, in the hello and at once on each attach, detach and change of the supervisor's state; `Status.gui_worker` takes the same `state` and `reason` (D5) | inert while `ROOMLER__RC__GUI_WORKER_READ` is off, and dropped by an older server | not started |
-| P2 | the server: the counts in both overviews, the device list's filter, and the word left out of every device response while the switch is off | `ROOMLER__RC__GUI_WORKER_READ`, default off | built, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516) |
+| P2 | the server: the counts in both overviews, the device list's filter, and the word left out of every device response while the switch is off | `ROOMLER__RC__GUI_WORKER_READ`, default off | built, [#4516](https://github.com/gjovanov/roomler-ai/pull/4516); in production since 2026-11-27 with its switch off (the field log) |
 | P3 | the devices list: the chip, in the table and the cards (D6) | the same switch: off, the rows carry no word, so there is no chip | not started |
 | P4 | the field read of C1–C5 on the release with P1 and the server with P2 and P3, with the switch turned on in production (the operator's step); a wrong reading turns it off again, and the default turns on once every cell reads green | the switch | not started |
 | P5 | the docs: the field and its wire name, the chip and its page, the macOS row table, the server read, and the `docs/README.md` rows | none: docs | not started |
 
 ## Acceptance criteria
 
-- [ ] **AC1** (P0, RED): on the current release and server, from the vmtest org's device list, C1's row, C3's root row
+- [x] **AC1** (P0, RED): on the current release and server, from the vmtest org's device list, C1's row, C3's root row
   and C4's row carry the same `permissions: ["no-gui-session"]`, and C2's row carries the same pair as C3's person row.
   No row carries a word for one row or for the worker, so the server cannot tell the cells apart.
-- [ ] **AC2** (P0, C5): the lag on the current release, five sign-ins stamped at the attach line, the worker's caps
+- [x] **AC2** (P0, C5): the lag on the current release, five sign-ins stamped at the attach line, the worker's caps
   line, the beat's caps line and the row's change. The split names the layer that holds anything over one beat (D2).
 - [ ] **AC3** (P1): the unit tests above, each shown RED on master first: the attach, the detach and each change of
   the supervisor's state wake the host's news; a beat that changes only the word announces caps; every `Action` maps
@@ -396,3 +396,8 @@ open.
 
 | date | what | result |
 |---|---|---|
+| 2026-11-27 19:49Z | P2 in production: the server image `hosted-20261127-0c3d452` (master `0c3d45211`, which holds #4516) on both app pods. | `ROOMLER__RC__GUI_WORKER_READ` is off by default, so P2 changes nothing a row says (D2). P0's reads below were taken on this server. P2 itself is read in the field in P4. |
+| 2026-11-27 22:59Z | P0: C3, then C2, on one fresh macOS lab guest in a throwaway organization, with agent 0.4.239 from the served `install.sh` and auto-update off, on the server above. Every row in this log was read from the organization's device list and its overview, polled from outside the guest. | C3, the default install's two rows (22:56Z): root `["no-gui-session"]`, person `["screen-capture","input"]`. C2, after FR-43's `roomlerd one-row` (22:59Z): the row carries `["screen-capture","input"]`, C3's person pair. The person's old row stays listed, offline, with its last pair, as FR-43 retires it. On every read the overview had no `gui_workers`. 🔴 RED, as the spec says. |
+| 2026-11-27 23:08Z | P0: C5 on C2's Mac, five sign-ins and five log-outs, with the row polled every 2 s (251 polls, each answered 200, the row online in all). The guest's stamps are put on the poller's clock with a mid-point offset, good to about 0.35 s. | Return → row took 4.8–7.0 s. The split: Return → spawn 0.4–4.5 s, which fits the supervisor's 5 s tick (`POLL`); spawn → attach 0.0–0.3 s; attach → worker caps 0.3–2.6 s, the layer the word removes; worker caps → beat caps within 2 ms; beat caps → row within the poll's 2 s step. Log-outs: click → beat 0.1–0.2 s, beat → row 0.4–2.2 s. No layer comes near one beat, so none is fixed first, and P1 goes ahead (D2). |
+| 2026-11-27 23:15Z | P0: C4, C2's Mac restarted with nobody signed in. | At the login window `["no-gui-session"]`; after a sign-in, the pair; after a log-out, `["no-gui-session"]` again. 🔴 RED. |
+| 2026-11-27 23:19Z | P0: C1 on C2's Mac, with the person's roomler folder handed to root. | Each new worker exited with code 1 after 5 s. After five such exits the supervisor gave up, at 23:17:40Z, with a host log line that names the cause. The row reads `["no-gui-session"]`, the same as C3's root row and C4. 🔴 RED. One text on these rows names the worker: the reason of `capabilities.unavailable.audio` (code `no-session`). It is fixed, byte-identical on C3's, C4's and C1's rows, and carries no state, so it was ruled on #4494 not to be a word for one row or for the worker, and AC1 holds. After the reads the guest was deleted, its two rows removed and its organization archived. |

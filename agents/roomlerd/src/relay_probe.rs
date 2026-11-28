@@ -86,7 +86,10 @@ async fn probe_one(target: &str) -> Option<u32> {
         .await
         .ok()?
         .find(|a| a.is_ipv4())?;
-    let sock = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await.ok()?;
+    // #4500 — 0.0.0.0, and loopback in this crate's tests.
+    let sock = tokio::net::UdpSocket::bind((crate::test_net::any_v4(), 0))
+        .await
+        .ok()?;
     let mut samples: Vec<u32> = Vec::with_capacity(SAMPLES);
     for i in 0..SAMPLES {
         let txn: [u8; 12] = rand::random();

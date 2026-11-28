@@ -22,7 +22,9 @@
 //! Lifecycle: `ServerMsg::TunnelQuicSetup` → [`setup`] → reply
 //! `ClientMsg::TunnelQuicReady { cert_fingerprint, addrs }` →
 //! `ServerMsg::TcpForwardForward` per flow → acceptor dials + `take_flow`
-//! → `run_flow_quic`. `TunnelTerminate` → [`close`]. Or no terminate at all
+//! → `run_flow_quic`. `TunnelTerminate` → [`close`], or [`end`] when it asks
+//! the exit to close the session's connection (`close_connection`): the flows
+//! stop and the connection closes with [`SESSION_END_CODE`]. Or no terminate at all
 //! (#1754): the accept loop serves exactly ONE connection, so when it ends —
 //! the client closed, or quinn idle-timed the connection out 30 s after the
 //! client's 8 s keepalives stopped — the session is over, and the loop
@@ -38,20 +40,166 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bson::oid::ObjectId;
 use tokio::sync::{Mutex, oneshot};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tracing::{debug, info, warn};
-use tunnel_core::transport::quic::{self, QuicPeer, RecvStream, SendStream};
+use tunnel_core::transport::quic::{self, QuicConnection, QuicPeer, RecvStream, SendStream};
 use tunnel_core::transport::relay::{RelayConn, RelayUdpSocket};
 
 use super::reap::{ReapSender, ReapSignal, TunnelReap};
 
-/// The two stream halves of one QUIC flow.
-pub type FlowStreams = (SendStream, RecvStream);
+/// The application close code [`AgentQuicPeer::end`] closes a session's
+/// connection with. Distinct from the failed auth's `1`.
+pub const SESSION_END_CODE: u32 = 2;
+
+/// The close reason sent with [`SESSION_END_CODE`].
+pub const SESSION_END_REASON: &[u8] = b"session ended";
+
+/// The two stream halves of one QUIC flow, and the [`FlowHold`] its forward
+/// keeps while the flow runs.
+pub type FlowStreams = (SendStream, RecvStream, FlowHold);
+
+/// What a forward keeps while its flow runs, so the session's end
+/// ([`SessionLink::end`]) reaches the flow: the session's stop, which the
+/// flow runs under.
+pub struct FlowHold {
+    _conn: Arc<QuicConnection>,
+    stop: CancellationToken,
+}
+
+impl FlowHold {
+    /// Resolves when the session ends ([`SessionLink::end`]).
+    pub fn stopped(&self) -> WaitForCancellationFuture<'_> {
+        self.stop.cancelled()
+    }
+}
+
+/// How a session's end reaches its connection and its flows: a [`Weak`] to
+/// the connection, and the stop every flow runs under ([`FlowHold`]). Cheap
+/// to clone, and to keep after the session left the signaling loop's map
+/// ([`EndedQuicSessions`]).
+#[derive(Clone, Default)]
+pub struct SessionLink(Arc<LinkInner>);
+
+#[derive(Default)]
+struct LinkInner {
+    conn: std::sync::Mutex<Weak<QuicConnection>>,
+    stop: CancellationToken,
+}
+
+impl SessionLink {
+    /// The authenticated connection, from the accept loop.
+    fn attach(&self, conn: &Arc<QuicConnection>) {
+        *self.0.conn.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(conn);
+    }
+
+    /// What a flow on `conn` keeps while it runs.
+    fn hold(&self, conn: &Arc<QuicConnection>) -> FlowHold {
+        FlowHold {
+            _conn: Arc::clone(conn),
+            stop: self.0.stop.clone(),
+        }
+    }
+
+    /// The session's connection, while it can still be reached.
+    pub fn conn(&self) -> Option<Arc<QuicConnection>> {
+        self.0
+            .conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+    }
+
+    /// End the session: stop every flow, and close the connection with
+    /// [`SESSION_END_CODE`]. Returns whether a connection was there to close.
+    /// Idempotent.
+    pub fn end(&self) -> bool {
+        self.0.stop.cancel();
+        match self.conn() {
+            Some(conn) => {
+                conn.close(SESSION_END_CODE.into(), SESSION_END_REASON);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// How long a session a terminate took out of the map without closing its
+/// connection stays reachable through [`EndedQuicSessions`].
+pub const ENDED_SESSION_TTL: Duration = Duration::from_secs(60);
+
+/// The most sessions [`EndedQuicSessions`] keeps; the oldest goes first.
+pub const ENDED_SESSIONS_CAP: usize = 64;
+
+/// The sessions a terminate took out of the map without closing their
+/// connection, each by its [`SessionLink`], for [`ENDED_SESSION_TTL`]: a
+/// terminate that asks to close the connection and arrives after one that did
+/// not still reaches the session through here.
+#[derive(Default)]
+pub struct EndedQuicSessions {
+    by_session: HashMap<ObjectId, (Instant, SessionLink)>,
+}
+
+impl EndedQuicSessions {
+    /// Keep `link` for `session_id`.
+    pub fn record(&mut self, session_id: ObjectId, link: SessionLink) {
+        self.record_at(session_id, link, Instant::now());
+    }
+
+    fn record_at(&mut self, session_id: ObjectId, link: SessionLink, now: Instant) {
+        self.prune(now);
+        self.by_session.insert(session_id, (now, link));
+        while self.by_session.len() > ENDED_SESSIONS_CAP {
+            let Some(oldest) = self
+                .by_session
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(sid, _)| *sid)
+            else {
+                break;
+            };
+            self.by_session.remove(&oldest);
+        }
+    }
+
+    /// End the session recorded for `session_id` ([`SessionLink::end`]).
+    /// Returns whether one was recorded.
+    pub fn end(&mut self, session_id: ObjectId) -> bool {
+        self.end_at(session_id, Instant::now())
+    }
+
+    fn end_at(&mut self, session_id: ObjectId, now: Instant) -> bool {
+        self.prune(now);
+        match self.by_session.remove(&session_id) {
+            Some((_, link)) => {
+                link.end();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.by_session
+            .retain(|_, (at, _)| now.saturating_duration_since(*at) < ENDED_SESSION_TTL);
+    }
+
+    /// How many sessions are kept.
+    pub fn len(&self) -> usize {
+        self.by_session.len()
+    }
+
+    /// Whether none is kept.
+    pub fn is_empty(&self) -> bool {
+        self.by_session.is_empty()
+    }
+}
 
 /// Order-independent rendezvous between the accept loop (which produces
 /// streams) and [`take_flow`] (which consumes them).
@@ -84,6 +232,9 @@ pub struct AgentQuicPeer {
     /// the client knows which DERP identity to dial. `None` on the
     /// TURN/direct paths.
     derp_pubkey_hex: Option<String>,
+    /// The session's connection and the stop its flows run under, reached
+    /// without holding either ([`Self::end`], [`Self::link`]).
+    link: SessionLink,
 }
 
 /// Spawn the accept loop shared by [`AgentQuicPeer::setup`],
@@ -106,9 +257,10 @@ fn spawn_accept_loop(
     quic_auth_token: String,
     rendezvous: Arc<Mutex<Rendezvous>>,
     reap_tx: ReapSender,
+    link: SessionLink,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        serve_one_connection(peer, session_id, quic_auth_token, rendezvous).await;
+        serve_one_connection(peer, session_id, quic_auth_token, rendezvous, link).await;
         // Already on a task of our own, so the send can simply be awaited;
         // it fails only when the org loop itself is gone.
         if reap_tx
@@ -131,6 +283,7 @@ async fn serve_one_connection(
     session_id: ObjectId,
     quic_auth_token: String,
     rendezvous: Arc<Mutex<Rendezvous>>,
+    link: SessionLink,
 ) {
     let conn = match peer.accept().await {
         Some(Ok(c)) => c,
@@ -152,18 +305,21 @@ async fn serve_one_connection(
         return;
     }
     info!(%session_id, "agent quic: client authenticated; serving flow streams");
+    let conn = Arc::new(conn);
+    link.attach(&conn);
     loop {
         match quic::accept_flow(&conn).await {
             Ok((flow_id, send, recv)) => {
+                let streams = (send, recv, link.hold(&conn));
                 let mut rdv = rendezvous.lock().await;
                 if let Some(tx) = rdv.waiters.remove(&flow_id) {
                     // A forward is already waiting — hand it over.
-                    if tx.send((send, recv)).is_err() {
+                    if tx.send(streams).is_err() {
                         debug!(%session_id, flow_id, "agent quic: forward dropped before stream");
                     }
                 } else {
                     // Stream beat the forward — stash it.
-                    rdv.ready.insert(flow_id, (send, recv));
+                    rdv.ready.insert(flow_id, streams);
                 }
             }
             Err(e) => {
@@ -195,12 +351,14 @@ impl AgentQuicPeer {
         let local_addr = peer.local_addr().context("agent quic: local_addr")?;
         let peer = Arc::new(peer);
         let rendezvous: Arc<Mutex<Rendezvous>> = Arc::new(Mutex::new(Rendezvous::default()));
+        let link = SessionLink::default();
         let accept_task = spawn_accept_loop(
             Arc::clone(&peer),
             session_id,
             quic_auth_token,
             Arc::clone(&rendezvous),
             reap_tx,
+            link.clone(),
         );
 
         Ok(Self {
@@ -212,6 +370,7 @@ impl AgentQuicPeer {
             _peer: peer,
             relay: None,
             derp_pubkey_hex: None,
+            link,
         })
     }
 
@@ -242,12 +401,14 @@ impl AgentQuicPeer {
             .context("agent quic relay: server endpoint over relay")?;
         let peer = Arc::new(peer);
         let rendezvous: Arc<Mutex<Rendezvous>> = Arc::new(Mutex::new(Rendezvous::default()));
+        let link = SessionLink::default();
         let accept_task = spawn_accept_loop(
             Arc::clone(&peer),
             session_id,
             quic_auth_token,
             Arc::clone(&rendezvous),
             reap_tx,
+            link.clone(),
         );
 
         Ok(Self {
@@ -259,6 +420,7 @@ impl AgentQuicPeer {
             _peer: peer,
             relay: Some(relay),
             derp_pubkey_hex: None,
+            link,
         })
     }
 
@@ -286,12 +448,14 @@ impl AgentQuicPeer {
             .context("agent quic derp: server endpoint over derp conn")?;
         let peer = Arc::new(peer);
         let rendezvous: Arc<Mutex<Rendezvous>> = Arc::new(Mutex::new(Rendezvous::default()));
+        let link = SessionLink::default();
         let accept_task = spawn_accept_loop(
             Arc::clone(&peer),
             session_id,
             quic_auth_token,
             Arc::clone(&rendezvous),
             reap_tx,
+            link.clone(),
         );
 
         Ok(Self {
@@ -303,6 +467,7 @@ impl AgentQuicPeer {
             _peer: peer,
             relay: Some(relay),
             derp_pubkey_hex: Some(self_pubkey_hex),
+            link,
         })
     }
 
@@ -375,8 +540,13 @@ impl AgentQuicPeer {
     /// waiter. Times out so a client that never opens the stream doesn't
     /// leak the forward.
     pub async fn take_flow(&self, flow_id: u32, timeout: Duration) -> Result<FlowStreams> {
+        let stop = self.link.0.stop.clone();
         let rx = {
             let mut rdv = self.rendezvous.lock().await;
+            if stop.is_cancelled() {
+                rdv.ready.remove(&flow_id);
+                bail!("agent quic: flow {flow_id}: the session ended");
+            }
             if let Some(streams) = rdv.ready.remove(&flow_id) {
                 return Ok(streams);
             }
@@ -384,7 +554,14 @@ impl AgentQuicPeer {
             rdv.waiters.insert(flow_id, tx);
             rx
         };
-        match tokio::time::timeout(timeout, rx).await {
+        let waited = tokio::select! {
+            waited = tokio::time::timeout(timeout, rx) => waited,
+            () = stop.cancelled() => {
+                self.rendezvous.lock().await.waiters.remove(&flow_id);
+                bail!("agent quic: flow {flow_id}: the session ended")
+            }
+        };
+        match waited {
             Ok(Ok(streams)) => Ok(streams),
             Ok(Err(_)) => {
                 self.rendezvous.lock().await.waiters.remove(&flow_id);
@@ -402,6 +579,43 @@ impl AgentQuicPeer {
     pub fn close(&self) {
         self.accept_task.abort();
         debug!(session_id = %self.session_id, "agent quic peer closed");
+    }
+
+    /// End the session: stop every flow (each aborts both halves, which
+    /// releases its destination socket and its streams), close the
+    /// connection with [`SESSION_END_CODE`], close the endpoint, and stop the
+    /// accept loop. The endpoint's socket, and on the relayed flavours the
+    /// TURN allocation, go when the closed connection drains and the last
+    /// `Arc` of this peer drops. Idempotent.
+    pub fn end(&self) {
+        let had_connection = self.link.end();
+        self._peer.close(SESSION_END_CODE, SESSION_END_REASON);
+        self.accept_task.abort();
+        info!(session_id = %self.session_id, had_connection, "agent quic: session ended; connection closed");
+    }
+
+    /// #1754 — the accept loop reported its end. When the connection ended
+    /// too, or was never served, [`end`](Self::end) the session and return
+    /// `true`. When the connection is still up, only [`close`](Self::close)
+    /// and return `false`: the caller keeps [`link`](Self::link) so a later
+    /// terminate can still end it.
+    pub fn reap(&self) -> bool {
+        match self.link.conn() {
+            Some(conn) if conn.close_reason().is_none() => {
+                self.close();
+                false
+            }
+            _ => {
+                self.end();
+                true
+            }
+        }
+    }
+
+    /// The session's [`SessionLink`], to end it after this peer left the
+    /// signaling loop's map.
+    pub fn link(&self) -> SessionLink {
+        self.link.clone()
     }
 
     /// #1754 — has the one connection this peer serves already ended?
@@ -439,6 +653,10 @@ mod tests {
     /// `take_flow` rendezvous yields the stream and the bytes arrive.
     /// Covers BOTH rendezvous orderings via the stash + waiter paths.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
     async fn agent_quic_rendezvous_delivers_authed_flow() {
         let session_id = ObjectId::new();
         let token = "session-token-xyz";
@@ -462,7 +680,7 @@ mod tests {
             send.finish().unwrap();
         });
 
-        let (_a_send, mut a_recv) = taken.expect("agent must receive flow 5's stream");
+        let (_a_send, mut a_recv, _hold) = taken.expect("agent must receive flow 5's stream");
         // quinn's RecvStream has its own read_to_end(size_limit) → Vec.
         let buf = a_recv.read_to_end(64 * 1024).await.unwrap();
         assert_eq!(
@@ -480,6 +698,10 @@ mod tests {
     /// and all. Nothing is reported while the client lives, and
     /// `accept_ended` flips with the report.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
     async fn a_client_that_drops_its_connection_is_reaped() {
         let session_id = ObjectId::new();
         let token = "session-token-gone";
@@ -592,7 +814,8 @@ mod tests {
             agent.take_flow(1, Duration::from_secs(10)),
             quic::open_flow(&conn, 1)
         );
-        let (mut agent_send, mut agent_recv) = taken.expect("agent must receive flow 1's stream");
+        let (mut agent_send, mut agent_recv, _hold) =
+            taken.expect("agent must receive flow 1's stream");
         let (mut client_send, mut client_recv) = opened.expect("client opens flow 1");
         round_trip(
             &mut client_send,
@@ -641,6 +864,10 @@ mod tests {
     /// the accept loop closes the connection after auth fails, so
     /// `take_flow` times out (no stream is ever rendezvoused).
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
     async fn agent_quic_rejects_bad_token_so_no_flow() {
         let session_id = ObjectId::new();
         let (reap_tx, _reap_rx) = reap_channel();
@@ -721,12 +948,79 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             });
 
-        let (_a_send, mut a_recv) = taken.expect("agent must receive flow 9 over the relay");
+        let (_a_send, mut a_recv, _hold) = taken.expect("agent must receive flow 9 over the relay");
         let buf = a_recv.read_to_end(64 * 1024).await.unwrap();
         assert_eq!(
             &buf, b"flow bytes over the relay",
             "flow bytes must survive the relay socket bridge"
         );
         agent.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "quinn-udp probes GSO at the first send on a socket it binds to [::]:0, which raises a firewall prompt on Windows (#4500)"
+    )]
+    async fn a_session_end_stops_a_forward_waiting_for_its_stream() {
+        let session_id = ObjectId::new();
+        let (reap_tx, _reap_rx) = reap_channel();
+        let agent = Arc::new(
+            AgentQuicPeer::setup(session_id, "tok".to_string(), loopback(), reap_tx).unwrap(),
+        );
+        let waiting = Arc::clone(&agent);
+        let forward =
+            tokio::spawn(async move { waiting.take_flow(5, Duration::from_secs(60)).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        agent.end();
+
+        let taken = tokio::time::timeout(Duration::from_secs(5), forward)
+            .await
+            .expect("a forward waiting for its stream returns when the session ends")
+            .unwrap();
+        assert!(taken.is_err(), "no stream is handed over after the end");
+        assert!(
+            agent.take_flow(6, Duration::from_secs(60)).await.is_err(),
+            "nor to a forward that asks after it"
+        );
+    }
+
+    #[test]
+    fn an_ended_session_is_kept_for_its_ttl_and_the_oldest_goes_first() {
+        let t0 = Instant::now();
+        let mut ended = EndedQuicSessions::default();
+        let first = ObjectId::new();
+        let link = SessionLink::default();
+        ended.record_at(first, link.clone(), t0);
+        assert!(
+            ended.end_at(first, t0 + ENDED_SESSION_TTL - Duration::from_secs(1)),
+            "a session is reachable inside its TTL"
+        );
+        assert!(
+            !ended.end_at(first, t0),
+            "and ending it takes it out, so a second end finds nothing"
+        );
+
+        ended.record_at(first, link, t0);
+        assert!(
+            !ended.end_at(first, t0 + ENDED_SESSION_TTL),
+            "past its TTL it is gone"
+        );
+
+        let oldest = ObjectId::new();
+        ended.record_at(oldest, SessionLink::default(), t0);
+        for i in 0..ENDED_SESSIONS_CAP {
+            ended.record_at(
+                ObjectId::new(),
+                SessionLink::default(),
+                t0 + Duration::from_millis(1 + i as u64),
+            );
+        }
+        assert_eq!(ended.len(), ENDED_SESSIONS_CAP, "the cap holds");
+        assert!(
+            !ended.end_at(oldest, t0 + Duration::from_secs(1)),
+            "the oldest made room"
+        );
     }
 }

@@ -511,7 +511,7 @@ mod tests {
     /// An offer as a browser makes one, and the peer behind it. The caller closes
     /// the peer: dropping one frees none of its sockets.
     async fn browser_offer() -> (Arc<webrtc::peer_connection::RTCPeerConnection>, String) {
-        let api = webrtc::api::APIBuilder::new().build();
+        let api = crate::test_net::api(); // #4500
         let pc = Arc::new(
             api.new_peer_connection(Default::default())
                 .await
