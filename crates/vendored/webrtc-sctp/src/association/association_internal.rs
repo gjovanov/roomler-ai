@@ -67,7 +67,7 @@ pub struct AssociationInternal {
     pub(crate) cwnd: u32,     // my congestion window size
     rwnd: u32,                // calculated peer's receiver windows size
     pub(crate) ssthresh: u32, // slow start threshold
-    partial_bytes_acked: u32,
+    pub(crate) partial_bytes_acked: u32,
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
 
@@ -2760,5 +2760,64 @@ impl AssociationInternal {
             .collect();
         marked.sort_unstable();
         marked
+    }
+}
+
+/// roomler (FR-148 P0, D35): what a `windows::WindowHandle` reads and writes,
+/// under this struct's lock. Nothing in the association calls these.
+impl AssociationInternal {
+    /// The congestion window, the slow start threshold and
+    /// `partial_bytes_acked`, as they stand.
+    pub(crate) fn windows(&self) -> super::windows::Windows {
+        super::windows::Windows {
+            cwnd: self.cwnd,
+            ssthresh: self.ssthresh,
+            partial_bytes_acked: self.partial_bytes_acked,
+        }
+    }
+
+    /// Whether a chunk of any stream waits in the pending queue: the growth
+    /// rule's own test (`handle_sack`).
+    pub(crate) fn chunks_pending(&self) -> bool {
+        self.pending_queue.len() > 0
+    }
+
+    /// Whether any chunk is in flight, a gap block's acknowledged ones among
+    /// them.
+    pub(crate) fn chunks_in_flight(&self) -> bool {
+        !self.inflight_queue.is_empty()
+    }
+
+    /// The bytes in flight, as the send path holds them against the window.
+    pub(crate) fn inflight_bytes(&self) -> usize {
+        self.inflight_queue.get_num_bytes()
+    }
+
+    /// Writes the three values of `to`, and stores the gauges.
+    pub(crate) fn write_windows(&mut self, to: &super::windows::Windows) {
+        self.cwnd = to.cwnd;
+        self.ssthresh = to.ssthresh;
+        self.partial_bytes_acked = to.partial_bytes_acked;
+        self.store_gauges();
+        log::trace!(
+            "[{}] updated cwnd={} ssthresh={} inflight={} (RST)",
+            self.name,
+            self.cwnd,
+            self.ssthresh,
+            self.inflight_queue.get_num_bytes()
+        );
+    }
+
+    /// Writes the congestion window alone, and stores the gauges.
+    pub(crate) fn write_cwnd(&mut self, cwnd: u32) {
+        self.cwnd = cwnd;
+        self.store_gauges();
+        log::trace!(
+            "[{}] updated cwnd={} ssthresh={} inflight={} (LOW)",
+            self.name,
+            self.cwnd,
+            self.ssthresh,
+            self.inflight_queue.get_num_bytes()
+        );
     }
 }

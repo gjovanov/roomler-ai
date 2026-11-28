@@ -527,6 +527,26 @@ impl RTCSctpTransport {
         Some(association.deadline_streams().await)
     }
 
+    /// roomler patch (FR-148 P0, D43): the switch of the association's pacer
+    /// (`Association::pacer`, a patch of the vendored webrtc-sctp), once there
+    /// is an association. Never waits, for `delivery_clock`'s reason: a held
+    /// slot answers `None`.
+    pub fn pacer(&self) -> Option<sctp::association::pacer::PaceSwitch> {
+        let sctp_association = self.sctp_association.try_lock().ok()?;
+        sctp_association.as_ref().map(|a| a.pacer())
+    }
+
+    /// roomler patch (FR-148 P0, D35): a handle onto the association's
+    /// windows (`Association::windows`, a patch of the vendored webrtc-sctp):
+    /// their snapshot, its gated restore and the window's lowering. Once there
+    /// is an association, and never waiting, for `delivery_clock`'s reason: a
+    /// held slot answers `None`. The handle keeps nothing of the association
+    /// alive.
+    pub fn windows(&self) -> Option<sctp::association::windows::WindowHandle> {
+        let sctp_association = self.sctp_association.try_lock().ok()?;
+        sctp_association.as_ref().map(|a| a.windows())
+    }
+
     pub(crate) fn data_channels_accepted(&self) -> u32 {
         self.data_channels_accepted.load(Ordering::SeqCst)
     }

@@ -670,6 +670,16 @@ impl Association {
         self.pacer.clone()
     }
 
+    /// roomler (FR-148 P0, D35): a handle onto this association's congestion
+    /// window, slow start threshold and `partial_bytes_acked`: a snapshot of
+    /// the three under its lock, a restore of them behind a complete gate, and
+    /// a lowering of the window that never raises it (`windows`). The handle
+    /// holds a `Weak` of the association's state, so it keeps nothing alive.
+    /// Nothing in the association calls it.
+    pub fn windows(&self) -> windows::WindowHandle {
+        windows::WindowHandle::new(Arc::downgrade(&self.association_internal))
+    }
+
     /// bytes_sent returns the number of bytes sent
     pub fn bytes_sent(&self) -> usize {
         self.bytes_sent.load(Ordering::SeqCst)
@@ -748,3 +758,8 @@ impl Association {
         self.state.load(Ordering::SeqCst).into()
     }
 }
+
+// roomler (FR-148 P0, D35): the window snapshot, its gated restore and the
+// lowering (`Association::windows`). Declared at the end, so that the line
+// anchors the docs keep into this file do not move.
+pub mod windows;

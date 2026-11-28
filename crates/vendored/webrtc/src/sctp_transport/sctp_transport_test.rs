@@ -147,3 +147,137 @@ fn test_deadline_mark_refusal_words() {
     .collect();
     assert_eq!(words, ["no_association", "slot_held", "no_stream"]);
 }
+
+/// roomler patch (FR-148 P0): a transport whose slot holds the client of an
+/// association pair handshaken over an in-memory pipe, which binds no socket,
+/// and the pair.
+async fn transport_over_a_pipe() -> Result<(RTCSctpTransport, Arc<Association>, Association)> {
+    let (client_conn, server_conn) = util::conn::conn_pipe::pipe();
+    let server = tokio::spawn(async move {
+        Association::server(sctp::association::Config {
+            net_conn: Arc::new(server_conn),
+            max_receive_buffer_size: 0,
+            max_message_size: 0,
+            name: "server".to_owned(),
+        })
+        .await
+    });
+    let client = Association::client(sctp::association::Config {
+        net_conn: Arc::new(client_conn),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "client".to_owned(),
+    })
+    .await?;
+    let server = server.await.expect("the server's task ends")?;
+    let client = Arc::new(client);
+    let transport = RTCSctpTransport {
+        sctp_association: Mutex::new(Some(Arc::clone(&client))),
+        ..Default::default()
+    };
+    Ok((transport, client, server))
+}
+
+/// roomler patch (FR-148 P0): `call`, asked again each millisecond, a second
+/// at most, while the association's own loops hold its lock (`Busy`).
+async fn past_busy<T>(
+    mut call: impl FnMut() -> std::result::Result<T, sctp::association::windows::RestoreRefusal>,
+) -> std::result::Result<T, sctp::association::windows::RestoreRefusal> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match call() {
+            Err(sctp::association::windows::RestoreRefusal::Busy)
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            answer => return answer,
+        }
+    }
+}
+
+/// roomler patch (FR-148 P0): before the transport has an association, the
+/// pacer's switch and the window handle answer `None`.
+#[test]
+fn test_pacer_and_windows_answer_none_before_the_association() {
+    let idle = RTCSctpTransport::default();
+    assert!(idle.pacer().is_none(), "a pacer with no association");
+    assert!(idle.windows().is_none(), "windows with no association");
+}
+
+/// roomler patch (FR-148 P0): while the association's slot is held, as
+/// `stop()` holds it across the association's close, both answer `None`, at
+/// once.
+#[tokio::test]
+async fn test_pacer_and_windows_answer_none_while_stop_holds_the_slot() -> Result<()> {
+    let (transport, client, server) = transport_over_a_pipe().await?;
+    let free = (transport.pacer().is_some(), transport.windows().is_some());
+    let (pacer, windows, took) = {
+        let _held = transport.sctp_association.lock().await;
+        let t = std::time::Instant::now();
+        let pacer = transport.pacer();
+        let windows = transport.windows();
+        (pacer.is_none(), windows.is_none(), t.elapsed())
+    };
+    client.close().await?;
+    server.close().await?;
+    assert_eq!(free, (true, true), "a free slot reaches the association");
+    assert!(pacer, "a held slot answered with a pacer");
+    assert!(windows, "a held slot answered with windows");
+    assert!(took < Duration::from_millis(1), "answered in {took:?}");
+    Ok(())
+}
+
+/// roomler patch (FR-148 P0): the pacer's switch the transport reaches is the
+/// association's own: `PaceSwitch::same` holds against it, and not against the
+/// peer's, and turned on through the transport the association's pacer is on.
+#[tokio::test]
+async fn test_the_pacer_reached_is_the_associations() -> Result<()> {
+    let (transport, client, server) = transport_over_a_pipe().await?;
+    let pacer = transport.pacer().expect("the slot holds the association");
+    let same = pacer.same(&client.pacer());
+    let other = pacer.same(&server.pacer());
+    pacer.set(true);
+    let on = client.pacer().is_on();
+    pacer.set(false);
+    client.close().await?;
+    server.close().await?;
+    assert!(same, "the transport's switch is not the association's");
+    assert!(!other, "the transport's switch is the peer's");
+    assert!(
+        on,
+        "turned on through the transport, the association's pacer is off"
+    );
+    Ok(())
+}
+
+/// roomler patch (FR-148 P0): the window handle the transport reaches is the
+/// association's own: a lowering through it moves the association's window,
+/// as the association's own handle and its gauges read it.
+#[tokio::test]
+async fn test_the_windows_reached_are_the_associations() -> Result<()> {
+    let (transport, client, server) = transport_over_a_pipe().await?;
+    let handle = transport.windows().expect("the slot holds the association");
+    let before = client.windows().snapshot().await;
+    let to = before.map(|w| sctp::association::windows::Windows {
+        cwnd: w.cwnd / 2,
+        ..w
+    });
+    let lowered = match &to {
+        Some(to) => Some(past_busy(|| handle.try_lower(to)).await),
+        None => None,
+    };
+    let after = client.windows().snapshot().await;
+    let gauged = client.gauges().peek().cwnd;
+    client.close().await?;
+    server.close().await?;
+    let to = to.expect("the association's own handle took a snapshot");
+    let lowered = lowered.expect("a lowering was asked");
+    assert_eq!(lowered.map(|l| l.after), Ok(to.cwnd));
+    assert_eq!(after, Some(to), "the association's window did not move");
+    assert_eq!(
+        gauged, to.cwnd,
+        "the association's gauges read another window"
+    );
+    Ok(())
+}

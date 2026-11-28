@@ -107,6 +107,18 @@
 #     on purpose (a STUN server on the internet, mDNS gathering) are ignored
 #     on Windows, where that bind raises a firewall prompt for every new test
 #     binary. A build for any dependent is unchanged.
+#   - src/sctp_transport/mod.rs (FR-148 P0 step 4b-2): `pacer()`, the
+#     association's pacer switch (`Association::pacer`, a patch of the
+#     vendored webrtc-sctp), and `windows()`, a handle onto its windows
+#     (`Association::windows`, the same patch's: their snapshot, its gated
+#     restore and the window's lowering), for the agent's open-time train.
+#     Each is reached as `gauges()` is: it never waits for the slot, and a
+#     held slot or no association answers `None`. The handle keeps nothing
+#     of the association alive. src/sctp_transport/sctp_transport_test.rs's
+#     `test_pacer_and_windows_answer_none_before_the_association`,
+#     `..._while_stop_holds_the_slot`, `test_the_pacer_reached_is_the_
+#     associations` and `test_the_windows_reached_are_the_associations` hold
+#     their tests, on an association pair over an in-memory pipe (no socket).
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only
