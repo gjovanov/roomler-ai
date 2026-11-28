@@ -23,12 +23,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::test_net::vnet_setting_engine;
 use bytes::Bytes;
 use tokio::sync::{Mutex, Notify, watch};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -222,7 +222,7 @@ async fn peer_with(net: Arc<Net>, registry: Registry) -> Arc<RTCPeerConnection> 
     let mut engine = MediaEngine::default();
     engine.register_default_codecs().expect("codecs");
     let registry = register_default_interceptors(registry, &mut engine).expect("interceptors");
-    let mut setting = SettingEngine::default();
+    let mut setting = vnet_setting_engine(); // #4500 — no mDNS socket
     setting.set_vnet(Some(net));
     let api = APIBuilder::new()
         .with_media_engine(engine)
