@@ -1106,7 +1106,6 @@ mod tests {
     /// The local app here resets its connection before it sends a byte, as
     /// one that aborts right after the SOCKS reply does.
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "#4501 fails on the base: a flow whose local side fails before its first byte resets its stream"]
     async fn a_flow_whose_local_side_fails_before_its_first_byte_finishes_its_stream() {
         use crate::forward::{FlowStats, run_flow_quic};
         use roomler_ai_remote_control::signaling::CloseReason;
