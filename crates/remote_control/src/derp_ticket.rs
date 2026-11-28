@@ -44,6 +44,13 @@ pub struct DerpTicketClaims {
     /// base64 WG public key — the ONLY key this ticket may register.
     pub pk: String,
     pub exp: u64,
+    /// FR-155 P1e — the token generation of the control socket the ticket was
+    /// minted to (its Hub entry's, never the row's). A relay holds a floor per
+    /// key ([`GenerationFloor`]) and admits a ticket only at or above it.
+    /// `None` on a ticket a pod before P1e minted; a relay before P1e ignores
+    /// the claim, as serde ignores a field it does not know.
+    #[serde(default, rename = "gen", skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
 }
 
 /// The API-side minting half. Built from the configured private key; derives
@@ -88,10 +95,23 @@ impl DerpTicketSigner {
             net: network_hex.to_string(),
             pk: wg_pubkey_b64.to_string(),
             exp,
+            generation: None,
         };
         let token = jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &self.enc)
             .map_err(|e| format!("derp ticket mint: {e}"))?;
         Ok((token, exp))
+    }
+
+    /// FR-155 P1e — [`Self::mint`], with the generation of the control socket
+    /// that asked for the ticket.
+    pub fn mint_at(
+        &self,
+        network_hex: &str,
+        wg_pubkey_b64: &str,
+        generation: u32,
+    ) -> Result<(String, u64), String> {
+        let _ = generation;
+        self.mint(network_hex, wg_pubkey_b64)
     }
 }
 
@@ -189,6 +209,83 @@ pub fn verify_allowance_set(token: &str, key: &DecodingKey) -> Result<AllowanceS
         .map_err(|e| format!("allowance set verify: {e}"))
 }
 
+/// FR-155 P1e — the audience of a signed set of generation floors. Its own, so
+/// a ticket, an allowance set and a floor set can never stand in for each
+/// other.
+pub const FLOORS_AUDIENCE: &str = "derp-floors";
+/// Clock-skew tolerance on a floor set's `exp`. A set is pushed again every
+/// poll; what lasts is each floor's own `until`.
+pub const FLOORS_LEEWAY_SECS: u64 = 30;
+
+/// FR-155 P1e — one generation floor: under the registry key a relay already
+/// holds (network, WG public key), a ticket below `gen` is refused until
+/// `until` (unix seconds, judged on the relay's clock as a ticket's `exp`
+/// is). A token rotation's commit writes one for the device's key, at the new
+/// generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationFloor {
+    /// Overlay network id (hex), as a ticket's `net`.
+    pub net: String,
+    /// base64 WG public key, as a ticket's `pk`.
+    pub pk: String,
+    /// The lowest generation a ticket for this key is admitted at.
+    #[serde(rename = "gen")]
+    pub generation: u32,
+    pub until: u64,
+}
+
+/// FR-155 P1e — the live floors as the API pushes them to a regional relay
+/// (`POST /stats/floors`), signed with the ticket key. A relay merges each set
+/// into the floors it holds by the higher generation and the later `until`,
+/// so a set never lowers a floor or ends one sooner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloorSetClaims {
+    /// Always [`FLOORS_AUDIENCE`].
+    pub aud: String,
+    /// When the API signed it (unix seconds).
+    pub iat: u64,
+    pub exp: u64,
+    /// How long after it ARRIVES a relay counts the set as live: the API
+    /// pushes one every poll while the token rotation is on.
+    pub ttl: u64,
+    pub floors: Vec<GenerationFloor>,
+}
+
+impl DerpTicketSigner {
+    /// FR-155 P1e — sign the live floors for the regional relays. The set
+    /// expires (bounding a replay) `ttl_secs` after it was signed.
+    pub fn sign_floor_set(
+        &self,
+        floors: Vec<GenerationFloor>,
+        ttl_secs: u64,
+    ) -> Result<String, String> {
+        let iat = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let claims = FloorSetClaims {
+            aud: FLOORS_AUDIENCE.to_string(),
+            iat,
+            exp: iat + ttl_secs,
+            ttl: ttl_secs,
+            floors,
+        };
+        jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &self.enc)
+            .map_err(|e| format!("floor set sign: {e}"))
+    }
+}
+
+/// FR-155 P1e — verify a pushed floor set: EdDSA signature by the ticket key,
+/// `aud == "derp-floors"`, unexpired within [`FLOORS_LEEWAY_SECS`].
+pub fn verify_floor_set(token: &str, key: &DecodingKey) -> Result<FloorSetClaims, String> {
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_audience(&[FLOORS_AUDIENCE]);
+    validation.leeway = FLOORS_LEEWAY_SECS;
+    jsonwebtoken::decode::<FloorSetClaims>(token, key, &validation)
+        .map(|d| d.claims)
+        .map_err(|e| format!("floor set verify: {e}"))
+}
+
 /// FR-115 P4b-2 — the audience of the API's request for a PoP's TURN usage.
 /// Its own, so a ticket, a set and a request can never stand in for each
 /// other.
@@ -277,6 +374,59 @@ mod tests {
         assert_eq!(claims.net, "6a54bf440b4fd609a7356f97");
         assert_eq!(claims.pk, "cHVia2V5");
         assert_eq!(claims.exp, exp);
+    }
+
+    /// T30 (FR-155 P1e): a ticket carries the generation it was minted under,
+    /// as the claim `gen`, and it round-trips. The claims as a relay before
+    /// P1e reads them, without the field, still decode a ticket that carries
+    /// it. A ticket minted without the generation decodes with none.
+    #[test]
+    fn a_ticket_carries_its_generation_and_an_old_relay_still_verifies_it() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let (signer, key) = test_signer();
+        let (ticket, exp) = signer
+            .mint_at("6a54bf440b4fd609a7356f97", "cHVia2V5", 7)
+            .unwrap();
+        let claims = verify(&ticket, &key).expect("a ticket with its generation verifies");
+        assert_eq!(claims.generation, Some(7), "the claim round-trips");
+        let payload: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(ticket.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["gen"], 7, "on the wire, the claim is `gen`");
+
+        // The claims a relay before P1e decodes.
+        #[derive(Deserialize)]
+        struct BeforeP1e {
+            aud: String,
+            net: String,
+            pk: String,
+            exp: u64,
+        }
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_audience(&[DERP_AUDIENCE]);
+        validation.leeway = DERP_TICKET_LEEWAY_SECS;
+        let before = jsonwebtoken::decode::<BeforeP1e>(&ticket, &key, &validation)
+            .expect("a relay before P1e verifies a ticket that carries the generation")
+            .claims;
+        assert_eq!(
+            (
+                before.aud.as_str(),
+                before.net.as_str(),
+                before.pk.as_str(),
+                before.exp
+            ),
+            ("derp", "6a54bf440b4fd609a7356f97", "cHVia2V5", exp)
+        );
+
+        let (without, _) = signer.mint("6a54bf440b4fd609a7356f97", "cHVia2V5").unwrap();
+        assert_eq!(
+            verify(&without, &key).unwrap().generation,
+            None,
+            "a ticket without the claim decodes with none"
+        );
     }
 
     #[test]

@@ -2270,4 +2270,442 @@ mod tests {
             }
         }
     }
+
+    // ── FR-155 P1e — the generation floors on a PoP ─────────────────────
+
+    use roomler_ai_remote_control::derp_ticket::{FloorSetClaims, GenerationFloor};
+
+    /// A relay for region `us-east` that keeps its floors in `file`, as
+    /// `DERP_FLOORS_FILE` names it (`None`: unset), and the task serving it.
+    async fn serve_floors(
+        key: DecodingKey,
+        file: Option<std::path::PathBuf>,
+    ) -> (std::net::SocketAddr, Registry, tokio::task::JoinHandle<()>) {
+        let _ = file;
+        let state = RelayState {
+            registry: Arc::new(DashMap::new()),
+            ticket_key: Arc::new(key),
+            network_bytes: Arc::new(DashMap::new()),
+            allowance: Arc::new(Allowance::default()),
+            region: "us-east".into(),
+            turn_usage: None,
+            scope: Arc::new(NetworkScope::new(None)),
+            drops: Arc::new(ForwardDrops::default()),
+        };
+        let registry = state.registry.clone();
+        let app = router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, registry, served)
+    }
+
+    /// A file of its own for one cell's floors.
+    fn floors_file(cell: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "derp-relay-floors-{cell}-{}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
+    /// A ticket for `key` in `net`, minted under `generation`.
+    fn ticket_at(signer: &DerpTicketSigner, net: &str, key: DerpPubKey, generation: u32) -> String {
+        signer
+            .mint_at(net, &BASE64.encode(key), generation)
+            .unwrap()
+            .0
+    }
+
+    /// A ticket for `key` in `net` without the generation.
+    fn ticket_without(signer: &DerpTicketSigner, net: &str, key: DerpPubKey) -> String {
+        signer.mint(net, &BASE64.encode(key)).unwrap().0
+    }
+
+    /// Sign `floors` (network, key, generation, until) as the API does,
+    /// signed at `iat`, and push them; the status.
+    async fn push_floors(
+        addr: std::net::SocketAddr,
+        enc: &EncodingKey,
+        floors: &[(&str, DerpPubKey, u32, u64)],
+        iat: u64,
+    ) -> u16 {
+        let claims = FloorSetClaims {
+            aud: derp_ticket::FLOORS_AUDIENCE.to_string(),
+            iat,
+            exp: iat + 90,
+            ttl: 90,
+            floors: floors
+                .iter()
+                .map(|(net, key, generation, until)| GenerationFloor {
+                    net: net.to_string(),
+                    pk: BASE64.encode(key),
+                    generation: *generation,
+                    until: *until,
+                })
+                .collect(),
+        };
+        let token = jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, enc).unwrap();
+        post_lite(addr, "/stats/floors", &token).await
+    }
+
+    /// Whether the upgrade of `ticket` is refused with the ticket's 401.
+    async fn refused_at(addr: std::net::SocketAddr, ticket: &str) -> bool {
+        matches!(dial(addr, Some(ticket), None).await, Err((401, _)))
+    }
+
+    /// Whether a frame `from` (registered as `from_key`) sends to `to_key`
+    /// reaches `to` within 2 s, with the sender's key in front. Sent again
+    /// every 50 ms, since a frame for a key not yet registered is dropped.
+    async fn relays(from: &mut Ws, from_key: DerpPubKey, to: &mut Ws, to_key: DerpPubKey) -> bool {
+        let payload = *b"fr155-p1e";
+        let mut frame = to_key.to_vec();
+        frame.extend_from_slice(&payload);
+        let mut want = from_key.to_vec();
+        want.extend_from_slice(&payload);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if from
+                .send(WsMsg::Binary(frame.clone().into()))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let wait = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+            loop {
+                let left = wait.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(left, to.next()).await {
+                    Ok(Some(Ok(WsMsg::Binary(b)))) if b[..] == want[..] => return true,
+                    Ok(Some(Ok(_))) => {}
+                    Err(_) => break,
+                    Ok(None) | Ok(Some(Err(_))) => return false,
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `ws` is closed within `wait`.
+    async fn closes(ws: &mut Ws, wait: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, ws.next()).await {
+                Err(_) => return false,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(WsMsg::Close(_)))) => return true,
+                Ok(Some(Ok(_))) => {}
+            }
+        }
+    }
+
+    /// T26 (FR-155 P1e): a ticket below the floor for its key is refused,
+    /// and writes nothing: the registration in place stays and keeps
+    /// relaying. A ticket at or above the floor is admitted. A ticket without
+    /// the generation is admitted for a key with no floor, and refused for a
+    /// key with one.
+    #[tokio::test]
+    async fn a_relay_refuses_a_ticket_below_its_floor() {
+        let (signer, key, enc) = test_keys();
+        let (addr, registry, _served) = serve_floors(key, None).await;
+        let (node, peer, other) = (pk(0x31), pk(0x32), pk(0x33));
+        let pushed = push_floors(
+            addr,
+            &enc,
+            &[("net1", node, 5, now_secs() + 3600)],
+            now_secs(),
+        )
+        .await;
+        let mut peer_ws = connect(addr, &ticket_without(&signer, "net1", peer), peer).await;
+
+        let mut at = connect(addr, &ticket_at(&signer, "net1", node, 5), node).await;
+        assert!(
+            relays(&mut peer_ws, peer, &mut at, node).await,
+            "a ticket at its key's floor is admitted"
+        );
+        let held = registry.len();
+        assert!(
+            refused_at(addr, &ticket_at(&signer, "net1", node, 4)).await,
+            "a ticket below its key's floor is refused (the floor set was answered {pushed})"
+        );
+        assert_eq!(pushed, 204, "a relay takes a floor set");
+        assert_eq!(registry.len(), held, "a refused ticket writes nothing");
+        assert!(
+            relays(&mut peer_ws, peer, &mut at, node).await,
+            "the registration in place stays and keeps relaying"
+        );
+
+        let mut above = connect(addr, &ticket_at(&signer, "net1", node, 6), node).await;
+        assert!(
+            relays(&mut peer_ws, peer, &mut above, node).await,
+            "a ticket above its key's floor is admitted"
+        );
+        assert!(
+            refused_at(addr, &ticket_without(&signer, "net1", node)).await,
+            "a ticket without the generation is refused for a key with a floor"
+        );
+        let mut without = connect(addr, &ticket_without(&signer, "net1", other), other).await;
+        assert!(
+            relays(&mut peer_ws, peer, &mut without, other).await,
+            "a ticket without the generation is admitted for a key with no floor"
+        );
+    }
+
+    /// T27 (FR-155 P1e): a floor that arrives ends each live connection below
+    /// it through the socket's own close: the registration in place, and a
+    /// connection whose registration a newer one replaced. The registration
+    /// at the floor stays and relays, and a new one at the floor is admitted.
+    #[tokio::test]
+    async fn a_relay_ends_a_registration_below_a_floor_that_arrives() {
+        let (signer, key, enc) = test_keys();
+        let (addr, registry, _served) = serve_floors(key, None).await;
+        let (node, peer, moved) = (pk(0x41), pk(0x42), pk(0x43));
+        let mut peer_ws = connect(addr, &ticket_without(&signer, "net1", peer), peer).await;
+
+        let mut at_g = connect(addr, &ticket_at(&signer, "net1", node, 3), node).await;
+        assert!(
+            relays(&mut peer_ws, peer, &mut at_g, node).await,
+            "the registration at G relays"
+        );
+        let mut replaced = connect(addr, &ticket_at(&signer, "net1", moved, 3), moved).await;
+        assert!(relays(&mut peer_ws, peer, &mut replaced, moved).await);
+        let mut moved_next = connect(addr, &ticket_at(&signer, "net1", moved, 4), moved).await;
+        assert!(
+            relays(&mut peer_ws, peer, &mut moved_next, moved).await,
+            "a registration at G+1 replaces the one at G"
+        );
+
+        let until = now_secs() + 3600;
+        let pushed = push_floors(
+            addr,
+            &enc,
+            &[("net1", node, 4, until), ("net1", moved, 4, until)],
+            now_secs(),
+        )
+        .await;
+        let wait = std::time::Duration::from_secs(2);
+        assert!(
+            closes(&mut at_g, wait).await,
+            "a registration below a floor that arrives ends (the floor set was answered {pushed})"
+        );
+        assert!(
+            closes(&mut replaced, wait).await,
+            "a connection below the floor ends, also when a newer registration replaced it"
+        );
+        let gone = ("net1".to_string(), node);
+        for _ in 0..40 {
+            if !registry.contains_key(&gone) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !registry.contains_key(&gone),
+            "the ended registration leaves the registry"
+        );
+        assert!(
+            relays(&mut peer_ws, peer, &mut moved_next, moved).await,
+            "the registration at the floor stays and keeps relaying"
+        );
+        let mut at_next = connect(addr, &ticket_at(&signer, "net1", node, 4), node).await;
+        assert!(
+            relays(&mut peer_ws, peer, &mut at_next, node).await,
+            "a registration at the floor is admitted, stays and relays"
+        );
+    }
+
+    /// The key of round `round`.
+    fn round_key(round: u32) -> DerpPubKey {
+        let mut key = [0x70; 32];
+        key[..4].copy_from_slice(&round.to_be_bytes());
+        key
+    }
+
+    /// A probe `peer` sends to `node`, numbered `seq`, and what `node`
+    /// receives of it.
+    fn probe(node: DerpPubKey, seq: u32) -> Vec<u8> {
+        let mut frame = node.to_vec();
+        frame.extend_from_slice(&seq.to_be_bytes());
+        frame
+    }
+
+    /// The number of the probe a frame `from` relayed carries, if it is one.
+    fn probe_number(frame: &[u8], from: DerpPubKey) -> Option<u32> {
+        if frame.len() != 36 || frame[..32] != from {
+            return None;
+        }
+        Some(u32::from_be_bytes(frame[32..36].try_into().unwrap()))
+    }
+
+    /// Whether `ws` receives probe `seq` from `from` within `wait`.
+    async fn hears(ws: &mut Ws, from: DerpPubKey, seq: u32, wait: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, ws.next()).await {
+                Ok(Some(Ok(WsMsg::Binary(b)))) if probe_number(&b, from) == Some(seq) => {
+                    return true;
+                }
+                Ok(Some(Ok(_))) => {}
+                _ => return false,
+            }
+        }
+    }
+
+    /// T28 (FR-155 P1e): while a relay holds a floor set (the API pushes one
+    /// every poll while the token rotation is on), the registration of the
+    /// higher generation stays. Two registrations of one key at two
+    /// generations at once leave the higher one in place, 500 times: once it
+    /// hears a probe, every later probe reaches it and none the lower one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_relay_keeps_the_registration_of_the_higher_generation() {
+        let (signer, key, enc) = test_keys();
+        let (addr, _registry, _served) = serve_floors(key, None).await;
+        let pushed = push_floors(addr, &enc, &[], now_secs()).await;
+        let peer = pk(0x51);
+        let mut peer_ws = connect(addr, &ticket_without(&signer, "net1", peer), peer).await;
+        let mut seq = 0u32;
+        for round in 0..500u32 {
+            let node = round_key(round);
+            let low_ticket = ticket_at(&signer, "net1", node, 5);
+            let high_ticket = ticket_at(&signer, "net1", node, 6);
+            let (low, high) = tokio::join!(
+                dial(addr, Some(&low_ticket), None),
+                dial(addr, Some(&high_ticket), None)
+            );
+            let (mut low, mut high) = (
+                low.expect("the lower upgrade"),
+                high.expect("the higher upgrade"),
+            );
+            let registration = || WsMsg::Binary(node.to_vec().into());
+            let (sent_low, sent_high) =
+                tokio::join!(low.send(registration()), high.send(registration()));
+            sent_low.unwrap();
+            sent_high.unwrap();
+
+            // Probe until the higher one hears: its registration is in.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            let first = loop {
+                seq += 1;
+                peer_ws
+                    .send(WsMsg::Binary(probe(node, seq).into()))
+                    .await
+                    .unwrap();
+                if hears(&mut high, peer, seq, std::time::Duration::from_millis(30)).await {
+                    break seq;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "round {round}: two registrations at once leave the higher generation in place, \
+                     but it heard no probe within 2 s (the floor set was answered {pushed})"
+                );
+            };
+            for _ in 0..3 {
+                seq += 1;
+                peer_ws
+                    .send(WsMsg::Binary(probe(node, seq).into()))
+                    .await
+                    .unwrap();
+                assert!(
+                    hears(&mut high, peer, seq, std::time::Duration::from_secs(1)).await,
+                    "round {round}: two registrations at once leave the higher generation in place \
+                     (the floor set was answered {pushed})"
+                );
+            }
+            while let Ok(Some(Ok(m))) =
+                tokio::time::timeout(std::time::Duration::from_millis(20), low.next()).await
+            {
+                if let WsMsg::Binary(b) = m {
+                    assert!(
+                        probe_number(&b, peer).is_none_or(|n| n < first),
+                        "round {round}: no probe reaches the lower registration once the higher one is in"
+                    );
+                }
+            }
+        }
+    }
+
+    /// T29 (FR-155 P1e): a relay's floors only rise, and last until their
+    /// tickets end. An older set with a lower floor, the same set again, and
+    /// a set without the key lower no floor. A floor holds to its `until` and
+    /// is dropped past it. A relay that restarts holds the floors it held,
+    /// from the file `DERP_FLOORS_FILE` names, before any push reaches it.
+    #[tokio::test]
+    async fn a_relays_floors_only_rise_and_last_until_their_tickets_end() {
+        let (signer, key, enc) = test_keys();
+        let file = floors_file("rise");
+        let (addr, _registry, served) = serve_floors(key.clone(), Some(file.clone())).await;
+        let (node, brief, other) = (pk(0x61), pk(0x62), pk(0x63));
+        let now = now_secs();
+        let first = [("net1", node, 5, now + 3600), ("net1", brief, 5, now + 4)];
+        let pushed = push_floors(addr, &enc, &first, now).await;
+        assert!(
+            refused_at(addr, &ticket_at(&signer, "net1", node, 4)).await,
+            "a ticket below its key's floor is refused (the floor set was answered {pushed})"
+        );
+        assert_eq!(pushed, 204, "a relay takes a floor set");
+
+        assert_eq!(
+            push_floors(addr, &enc, &[("net1", node, 3, now + 7200)], now - 60).await,
+            204
+        );
+        assert!(
+            refused_at(addr, &ticket_at(&signer, "net1", node, 4)).await,
+            "an older set with a lower floor lowers none"
+        );
+        assert_eq!(push_floors(addr, &enc, &first, now).await, 204);
+        assert!(
+            refused_at(addr, &ticket_at(&signer, "net1", node, 4)).await,
+            "the same set again lowers none"
+        );
+        assert_eq!(
+            push_floors(addr, &enc, &[("net1", other, 2, now + 3600)], now + 1).await,
+            204
+        );
+        assert!(
+            refused_at(addr, &ticket_at(&signer, "net1", node, 4)).await,
+            "a set without the key lowers none"
+        );
+        assert!(
+            dial(addr, Some(&ticket_at(&signer, "net1", node, 5)), None)
+                .await
+                .is_ok(),
+            "a ticket at the floor is admitted"
+        );
+
+        assert!(
+            refused_at(addr, &ticket_at(&signer, "net1", brief, 4)).await,
+            "a floor holds until its until"
+        );
+        // Past `until` on the relay's clock: the second after it, and a beat.
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_millis((now + 5) * 1000 + 200);
+        if let Ok(left) = past.duration_since(std::time::SystemTime::now()) {
+            tokio::time::sleep(left).await;
+        }
+        assert!(
+            dial(addr, Some(&ticket_at(&signer, "net1", brief, 4)), None)
+                .await
+                .is_ok(),
+            "past its until, a floor is dropped"
+        );
+
+        served.abort();
+        let (restarted, _, _served) = serve_floors(key, Some(file.clone())).await;
+        assert!(
+            refused_at(restarted, &ticket_at(&signer, "net1", node, 4)).await,
+            "a relay that restarts holds its floors before any push reaches it"
+        );
+        assert!(
+            dial(restarted, Some(&ticket_at(&signer, "net1", node, 5)), None)
+                .await
+                .is_ok(),
+            "and admits a ticket at the floor"
+        );
+        let _ = std::fs::remove_file(&file);
+    }
 }

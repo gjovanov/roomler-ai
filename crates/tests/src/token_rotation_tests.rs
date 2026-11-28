@@ -1568,3 +1568,216 @@ async fn a_pod_switched_off_ends_and_refuses_no_derp_registration() {
     );
     assert!(derp_registered(&off, network, kept_key));
 }
+
+/// FR-155 P1e — a stand-in regional relay: its `GET /stats` reports the
+/// `floors` a relay that takes them reports, and it records each body
+/// `POST /stats/floors` brings.
+struct StandInRelay {
+    stats_url: String,
+    gets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    floor_sets: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+async fn stand_in_relay() -> StandInRelay {
+    use std::sync::atomic::Ordering;
+    let relay = StandInRelay {
+        stats_url: String::new(),
+        gets: Default::default(),
+        floor_sets: Default::default(),
+    };
+    let app = {
+        let (gets, floor_sets) = (relay.gets.clone(), relay.floor_sets.clone());
+        axum::Router::new()
+            .route(
+                "/stats",
+                axum::routing::get(move || {
+                    gets.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        axum::Json(json!({
+                            "cpus": 1,
+                            "floors": { "held": 0, "newest_iat": null, "kept": "file" },
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/stats/floors",
+                axum::routing::post(move |body: String| {
+                    let floor_sets = floor_sets.clone();
+                    async move {
+                        floor_sets.lock().unwrap().push(body);
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    StandInRelay {
+        stats_url: format!("http://{addr}/stats"),
+        ..relay
+    }
+}
+
+/// A DERP ticket key: the private half a server is configured with, and the
+/// public half a relay holds.
+fn ticket_keys() -> (
+    String,
+    roomler_ai_remote_control::derp_ticket::jsonwebtoken::DecodingKey,
+) {
+    use base64::Engine as _;
+    use roomler_ai_remote_control::derp_ticket::{self, DerpTicketSigner};
+    let pkcs8 =
+        ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let private_b64 = base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref());
+    let signer = DerpTicketSigner::from_pkcs8_b64(&private_b64).unwrap();
+    let public = derp_ticket::decoding_key_from_public_b64(signer.public_key_b64()).unwrap();
+    (private_b64, public)
+}
+
+/// A server with `rc.agent_token_rotation` as `on` says, whose one region
+/// polls `relay` every `poll_secs`, with the ticket key `private_b64`.
+async fn spawn_with_relay(
+    on: bool,
+    relay: &StandInRelay,
+    private_b64: &str,
+    poll_secs: u64,
+) -> TestApp {
+    let (url, key) = (relay.stats_url.clone(), private_b64.to_string());
+    TestApp::spawn_with_settings(move |s| {
+        s.rc.agent_token_rotation = on;
+        s.turn.url = Some("turn:coturn.example:3478".into());
+        s.turn.shared_secret = Some(ObjectId::new().to_hex());
+        s.relay.regions_enabled = true;
+        s.relay.regions = Some(format!(
+            r#"[{{"id":"pop-test","turn_url":"turn:coturn-pop.example:3478","stats_urls":["{url}"]}}]"#
+        ));
+        s.relay.stats_poll_secs = poll_secs;
+        s.relay.derp_ticket_private_key = Some(key);
+    })
+    .await
+}
+
+/// T31 (FR-155 P1e): the commit pushes the device's floor to every regional
+/// relay before the route answers. A stand-in relay, polled once a minute,
+/// holds, when the answer arrives, a set that verifies with the ticket key's
+/// public half and names the device's key at G+1, until past every ticket
+/// minted before the commit. A ticket minted to the device's control socket
+/// at G+1 carries G+1.
+#[tokio::test]
+async fn the_commit_pushes_the_floor_to_every_relay_before_it_answers() {
+    use base64::Engine as _;
+    use roomler_ai_remote_control::derp_ticket::{self, DERP_TICKET_LEEWAY_SECS, DERP_TICKET_TTL};
+    use std::sync::atomic::Ordering;
+    let relay = stand_in_relay().await;
+    let (private_b64, public) = ticket_keys();
+    let app = spawn_with_relay(true, &relay, &private_b64, 60).await;
+    let seeded = app.seed_tenant("fr155floors").await;
+    let (agent_id, token) = enroll(&app, &seeded, "m-fr155-floors").await;
+    let key = [0x5a; 32];
+    let network = seed_node(
+        &app,
+        &seeded,
+        &agent_id,
+        "m-fr155-floors",
+        key,
+        "100.64.0.31",
+    )
+    .await;
+
+    // The server's first poll reaches the relay: let it read the answer.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while relay.gets.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server polls the relay"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for _ in 0..40 {
+        if !relay.floor_sets.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let before = relay.floor_sets.lock().unwrap().len();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let new = answered_token(rotate(&app, &token, &rotation_key(231)).await).await;
+    let next = generation_of(&new);
+    let arrived: Vec<String> = relay.floor_sets.lock().unwrap()[before..].to_vec();
+    let pk = base64::engine::general_purpose::STANDARD.encode(key);
+    let floor = arrived
+        .iter()
+        .filter_map(|set| derp_ticket::verify_floor_set(set, &public).ok())
+        .flat_map(|set| set.floors)
+        .filter(|f| f.net == network.to_hex() && f.pk == pk)
+        .max_by_key(|f| f.generation)
+        .unwrap_or_else(|| {
+            panic!(
+                "the relay holds the device's floor when the answer arrives ({} sets arrived)",
+                arrived.len()
+            )
+        });
+    assert_eq!(floor.generation, next, "the floor is the new generation");
+    assert!(
+        floor.until >= started + DERP_TICKET_TTL.as_secs() + DERP_TICKET_LEEWAY_SECS,
+        "the floor lasts past every ticket minted before the commit"
+    );
+
+    let mut ws = crate::agent_presence_tests::connect_agent(&app, &new).await;
+    ws.send(Message::Text(
+        json!({ "t": "rc:relay.derp_ticket_request" })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let ticket = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let v: Value = serde_json::from_str(&t).unwrap_or_default();
+                if v["t"] == "rc:relay.derp_ticket" {
+                    break v["ticket"].as_str().unwrap().to_string();
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => panic!("the socket at G+1 is answered a DERP ticket"),
+        }
+    };
+    assert_eq!(
+        derp_ticket::verify(&ticket, &public).unwrap().generation,
+        Some(next),
+        "a ticket minted to the socket at G+1 carries G+1"
+    );
+}
+
+/// T32 (FR-155 P1e), the control: with the switch off, no relay is told a
+/// floor. A stand-in relay that takes floors, polled every second, receives
+/// no floor set through the first poll and two more.
+#[tokio::test]
+async fn with_the_switch_off_no_relay_is_told_a_floor() {
+    use std::sync::atomic::Ordering;
+    let relay = stand_in_relay().await;
+    let (private_b64, _) = ticket_keys();
+    let _app = spawn_with_relay(false, &relay, &private_b64, 1).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while relay.gets.load(Ordering::SeqCst) < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server polls the relay"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        relay.floor_sets.lock().unwrap().is_empty(),
+        "with the switch off, no relay is told a floor"
+    );
+}
