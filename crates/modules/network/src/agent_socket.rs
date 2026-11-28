@@ -107,7 +107,14 @@ impl AgentMsgHandler for NetworkAgentSocket {
                 None
             }
             ClientMsg::DerpTicketRequest {} => {
-                handle_derp_ticket_request(state, ctx.agent_id, &ctx.tx).await;
+                handle_derp_ticket_request(
+                    state,
+                    ctx.agent_id,
+                    ctx.tenant_id,
+                    ctx.generation,
+                    &ctx.tx,
+                )
+                .await;
                 None
             }
             ClientMsg::SshRequest {

@@ -16,7 +16,15 @@
 //! 2. ends the device's DERP registrations below the new generation on this
 //!    pod ([`crate::derp_rotation`]). Every other pod ends its own when the
 //!    control event arrives, and by its own check;
-//! 3. orders the device to rotate its overlay key (FR-40, trigger
+//! 3. (P1e) commits the device's generation floor for the regional relays
+//!    (`roomler_core::relay_floors`): one per key a ticket minted below the
+//!    new generation can name, the node's key and each key it retired within
+//!    a ticket's life. The floor is stored where every pod reads it and
+//!    pushed to every relay that takes floors, at once and bounded, so a
+//!    relay the API reaches holds it before the route answers; each relay
+//!    then refuses a ticket below it and ends a connection below it. A relay
+//!    the push does not reach has it on the next poll;
+//! 4. orders the device to rotate its overlay key (FR-40, trigger
 //!    `credential_rotation`), queued for its next connection, which is at
 //!    the new generation. If the per-device limiter refuses the order, it is
 //!    placed once more after the limiter's window
@@ -59,6 +67,14 @@ pub trait Effects: Send + Sync {
     async fn take_offline(&self, tenant_id: ObjectId, agent_id: ObjectId);
     /// The agent's DERP registrations below `generation` end on this pod.
     fn end_derp_below(&self, tenant_id: ObjectId, agent_id: ObjectId, generation: u32) -> usize;
+    /// P1e — the regional relays hold the device's floor at `generation`. An
+    /// error is the shared store's; a push a relay misses is not one.
+    async fn hold_relays_below(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        generation: u32,
+    ) -> anyhow::Result<()>;
     /// The FR-40 order, `credential_rotation`.
     async fn order_key_rotation(
         &self,
@@ -70,8 +86,9 @@ pub trait Effects: Send + Sync {
 }
 
 /// The hook: the effects, in order. An order that cannot be written is the
-/// hook's error, after the other two effects ran. An order the limiter
-/// refuses is not: it is placed once more later.
+/// hook's error, after the other effects ran. An order the limiter refuses is
+/// not: it is placed once more later. A floor the shared store refuses is the
+/// hook's error too, once the order ran.
 pub async fn run(
     effects: &impl Effects,
     tenant_id: ObjectId,
@@ -80,6 +97,9 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     effects.take_offline(tenant_id, agent_id).await;
     effects.end_derp_below(tenant_id, agent_id, generation);
+    let floors = effects
+        .hold_relays_below(tenant_id, agent_id, generation)
+        .await;
     match effects.order_key_rotation(tenant_id, agent_id).await? {
         Ordered::Placed | Ordered::Refused => {}
         Ordered::RateLimited => {
@@ -90,7 +110,41 @@ pub async fn run(
             effects.order_again_later(tenant_id, agent_id);
         }
     }
-    Ok(())
+    floors
+}
+
+/// P1e — the floors a rotation to `generation` commits at `now` for a node in
+/// `network_hex` whose key is `current_key`, and which retired the keys
+/// `retired` (each with when, in unix seconds). There is one floor at
+/// `generation` for the node's key and one for each key it retired within
+/// `DERP_TICKET_TTL` plus `DERP_TICKET_LEEWAY_SECS` of `now`, so a relay
+/// admits a registration of any of those keys only at `generation` or above.
+pub fn floors_for<'a>(
+    network_hex: &str,
+    current_key: &str,
+    retired: impl IntoIterator<Item = (&'a str, u64)>,
+    generation: u32,
+    now: u64,
+) -> Vec<roomler_ai_remote_control::derp_ticket::GenerationFloor> {
+    use roomler_ai_remote_control::derp_ticket::{
+        DERP_TICKET_LEEWAY_SECS, DERP_TICKET_TTL, GenerationFloor,
+    };
+    let ticket_life = DERP_TICKET_TTL.as_secs() + DERP_TICKET_LEEWAY_SECS;
+    let until = roomler_core::relay_floors::floor_until(now);
+    let mut keys = vec![current_key.to_string()];
+    for (key, retired_at) in retired {
+        if retired_at.saturating_add(ticket_life) >= now && !keys.iter().any(|k| k == key) {
+            keys.push(key.to_string());
+        }
+    }
+    keys.into_iter()
+        .map(|pk| GenerationFloor {
+            net: network_hex.to_string(),
+            pk,
+            generation,
+            until,
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -102,6 +156,47 @@ impl Effects for NetworkState {
     fn end_derp_below(&self, tenant_id: ObjectId, agent_id: ObjectId, generation: u32) -> usize {
         self.derp_generations
             .end_below_generation(agent_id, tenant_id, generation)
+    }
+
+    async fn hold_relays_below(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        generation: u32,
+    ) -> anyhow::Result<()> {
+        // `None` while the token rotation is off: no relay is told a floor.
+        let Some(relay_floors) = &self.core.relay_floors else {
+            return Ok(());
+        };
+        // No node, no key a ticket can name: a ticket is minted only for a node.
+        let Some(node) = current_node(self, NodeIdentity::Agent(agent_id)).await else {
+            return Ok(());
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let retired = node.retired_keys.iter().map(|r| {
+            (
+                r.public_key.as_str(),
+                u64::try_from(r.retired_at.timestamp_millis() / 1000).unwrap_or(0),
+            )
+        });
+        let floors = floors_for(
+            &node.network_id.to_hex(),
+            &node.wg_public_key,
+            retired,
+            generation,
+            now,
+        );
+        info!(
+            %tenant_id, %agent_id, generation, keys = floors.len(),
+            "fr-155: the regional relays are told the device's generation floor"
+        );
+        relay_floors
+            .commit(floors)
+            .await
+            .map_err(|e| anyhow::anyhow!("relay floors: {e}"))
     }
 
     async fn order_key_rotation(
@@ -182,6 +277,7 @@ mod tests {
     enum Step {
         Offline,
         DerpEnd(u32),
+        Floors(u32),
         Order,
         OrderAgainLater,
     }
@@ -220,6 +316,16 @@ mod tests {
             1
         }
 
+        async fn hold_relays_below(
+            &self,
+            _: ObjectId,
+            _: ObjectId,
+            generation: u32,
+        ) -> anyhow::Result<()> {
+            self.note(Step::Floors(generation));
+            Ok(())
+        }
+
         async fn order_key_rotation(&self, _: ObjectId, _: ObjectId) -> anyhow::Result<Ordered> {
             self.note(Step::Order);
             (self.answer)()
@@ -230,11 +336,12 @@ mod tests {
         }
     }
 
-    /// T10 (FR-155 P1d): the hook's effects, in order. The node goes offline,
-    /// then the agent's DERP registrations below the new generation end, then
-    /// the key order is placed. An order the limiter refuses is placed once
-    /// more later, and is not the hook's error. An order that cannot be
-    /// written is the hook's error, after the other two effects ran.
+    /// T10 (FR-155 P1d, P1e): the hook's effects, in order. The node goes
+    /// offline, then the agent's DERP registrations below the new generation
+    /// end, then the regional relays are told its floor, then the key order
+    /// is placed. An order the limiter refuses is placed once more later, and
+    /// is not the hook's error. An order that cannot be written is the hook's
+    /// error, after the other effects ran.
     #[tokio::test]
     async fn credential_rotation_hook_runs_leave_then_order() {
         let (tenant, agent) = (ObjectId::new(), ObjectId::new());
@@ -245,9 +352,14 @@ mod tests {
             .expect("a placed order: the hook succeeds");
         assert_eq!(
             placed.steps(),
-            vec![Step::Offline, Step::DerpEnd(7), Step::Order],
+            vec![
+                Step::Offline,
+                Step::DerpEnd(7),
+                Step::Floors(7),
+                Step::Order
+            ],
             "the node goes offline, then its DERP registrations below the new generation end, \
-             then the key order is placed"
+             then the regional relays are told its floor, then the key order is placed"
         );
 
         let limited = StandIn::new(|| Ok(Ordered::RateLimited));
@@ -259,6 +371,7 @@ mod tests {
             vec![
                 Step::Offline,
                 Step::DerpEnd(7),
+                Step::Floors(7),
                 Step::Order,
                 Step::OrderAgainLater
             ],
@@ -272,8 +385,38 @@ mod tests {
         );
         assert_eq!(
             failing.steps(),
-            vec![Step::Offline, Step::DerpEnd(7), Step::Order],
-            "after the other two effects ran"
+            vec![
+                Step::Offline,
+                Step::DerpEnd(7),
+                Step::Floors(7),
+                Step::Order
+            ],
+            "after the other effects ran"
         );
+    }
+
+    /// P1e: a rotation's floors name the node's key and each key it retired
+    /// within a ticket's life and its leeway, at the new generation, until
+    /// past every ticket minted below it.
+    #[test]
+    fn a_rotations_floors_name_every_key_a_ticket_below_it_can_name() {
+        use roomler_ai_remote_control::derp_ticket::{DERP_TICKET_LEEWAY_SECS, DERP_TICKET_TTL};
+        let now: u64 = 1_800_000_000;
+        let life = DERP_TICKET_TTL.as_secs() + DERP_TICKET_LEEWAY_SECS;
+        let retired = [
+            ("within", now - life),
+            ("past", now - life - 1),
+            ("current", now - 60),
+        ];
+        let floors = floors_for("6a54bf440b4fd609a7356f97", "current", retired, 8, now);
+        let keys: Vec<&str> = floors.iter().map(|f| f.pk.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["current", "within"],
+            "the node's key, and each key it retired within a ticket's life"
+        );
+        assert!(floors.iter().all(|f| f.generation == 8
+            && f.until == roomler_core::relay_floors::floor_until(now)
+            && f.net == "6a54bf440b4fd609a7356f97"));
     }
 }

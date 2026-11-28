@@ -30,6 +30,16 @@
 //! any other network 403 at the upgrade, before anything is registered. Set
 //! but empty or malformed, it refuses to start.
 //!
+//! Generation floors (FR-155 P1e): a ticket carries the token generation of
+//! the control socket it was minted to. While the token rotation is on, the
+//! API pushes the live floors on its poll (`POST /stats/floors`, signed with
+//! the ticket key) and at each rotation's commit: per registry key, the
+//! lowest generation admitted, kept at least as long as a ticket lives.
+//! A ticket below its key's floor is refused, a floor that arrives ends each
+//! connection below it, and while a set is held the registration of the
+//! higher generation stays. The floors are kept in `DERP_FLOORS_FILE`, so a
+//! restart holds them before any push. See [`Floors`].
+//!
 //! v1 scope note: the central relay additionally consults the overlay-ACL
 //! DERP table (`ws/derp_acl.rs`) for ENFORCING tenants. Tickets don't carry
 //! per-peer allow-lists yet, so a PoP enforces network scoping only; ACL
@@ -67,7 +77,29 @@ use tracing::{debug, info, warn};
 type DerpPubKey = [u8; 32];
 /// Registry key: a pubkey is reachable only WITHIN its overlay network.
 type DerpKey = (String, DerpPubKey);
-type Registry = Arc<DashMap<DerpKey, mpsc::Sender<Vec<u8>>>>;
+type Registry = Arc<DashMap<DerpKey, Registered>>;
+
+/// The registration in place for a key: its sender, and the generation its
+/// ticket carries (FR-155 P1e; `None` on a ticket without it).
+struct Registered {
+    tx: mpsc::Sender<Vec<u8>>,
+    generation: Option<u32>,
+}
+
+/// FR-155 P1e — one live connection, as a floor's arrival reads it: every
+/// connection admitted is here until it closes, whether its registration is
+/// in place or a newer one replaced it.
+struct Conn {
+    key: DerpKey,
+    generation: Option<u32>,
+    end: Arc<tokio::sync::Notify>,
+}
+type Conns = Arc<DashMap<u64, Conn>>;
+
+/// How a generation ranks: a ticket without one below every generation.
+fn rank(generation: Option<u32>) -> i64 {
+    generation.map_or(-1, i64::from)
+}
 
 /// Same limits as the central relay (`api/src/ws/derp.rs`).
 const DERP_SEND_QUEUE: usize = 256;
@@ -236,6 +268,291 @@ impl Allowance {
             "age_s": live.map(|s| s.arrived.elapsed().as_secs()),
             "shaped_total": self.shaped_total.load(Ordering::Relaxed),
         })
+    }
+}
+
+/// FR-155 P1e — the generation floors this PoP holds, keyed by the registry
+/// key (network, WG public key), so a PoP learns no identifier it did not
+/// already hold.
+///
+/// - **A floor refuses below it.** A ticket for its key below the floor, or
+///   carrying no generation, is refused at the upgrade and again at the
+///   registration ([`admit`]), until the floor's `until`, judged on this
+///   relay's clock. The API sets `until` past every ticket minted below the
+///   floor. Such a ticket verifies while `now <= exp + DERP_TICKET_LEEWAY_SECS`,
+///   and its `exp` is at most the commit's time, plus the ticket arm's read of
+///   the row (10 s at most), plus `DERP_TICKET_TTL`. `until` is the commit's
+///   time plus the TTL, the leeway and an hour. Both are judged on this one
+///   clock, so its own skew cancels, and at `now == until` the floor still
+///   holds.
+/// - **Floors only rise.** A pushed set is merged entry by entry, by the
+///   higher generation and the later `until`, so an older, repeated or
+///   partial set lowers no floor and ends none sooner.
+/// - **A floor that arrives ends each connection below it,** through that
+///   socket's own close, so the removal only the registered sender makes
+///   still never removes a newer registration.
+/// - **While a set is live, the registration of the higher generation
+///   stays.** The API pushes a set every poll only while the token rotation
+///   is on, so a set that arrived within its `ttl` says that it is on.
+///   Without one, a re-registration is last-writer-wins, as before P1e.
+/// - **Kept across a restart** in `DERP_FLOORS_FILE`, written on every change
+///   and read at the start. With it unset they are kept in memory only, which
+///   the start logs and `/stats` reports (`kept: "memory"`).
+/// - **Open to everyone else.** A relay that hears no API admits every
+///   ticket at or above its key's floor, and every ticket for a key with none.
+struct Floors {
+    held: RwLock<HashMap<DerpKey, Floor>>,
+    /// When the newest set arrived, and how long it counts as live.
+    set: Mutex<Option<(Instant, Duration)>>,
+    newest_iat: AtomicU64,
+    refused_total: AtomicU64,
+    ended_total: AtomicU64,
+    file: Option<std::path::PathBuf>,
+    /// One merge and its write at a time, so the file follows the merges.
+    write: Mutex<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Floor {
+    generation: u32,
+    until: u64,
+}
+
+/// `DERP_FLOORS_FILE`'s shape: the live floors, as the API pushes them.
+#[derive(Serialize, Deserialize)]
+struct FloorsFile {
+    floors: Vec<derp_ticket::GenerationFloor>,
+}
+
+/// A base64 WG public key's 32 bytes.
+fn pubkey_of(b64: &str) -> Option<DerpPubKey> {
+    BASE64.decode(b64).ok()?.try_into().ok()
+}
+
+impl Floors {
+    /// The floors `file` keeps that are still live. An absent file holds
+    /// none; one that cannot be read or parsed is logged, and holds none.
+    fn open(file: Option<std::path::PathBuf>) -> Self {
+        let held = file.as_deref().map(load_floors).unwrap_or_default();
+        Self {
+            held: RwLock::new(held),
+            set: Mutex::new(None),
+            newest_iat: AtomicU64::new(0),
+            refused_total: AtomicU64::new(0),
+            ended_total: AtomicU64::new(0),
+            file,
+            write: Mutex::new(()),
+        }
+    }
+
+    /// Whether a ticket for `key` at `generation` is at or above its floor.
+    fn admits(&self, key: &DerpKey, generation: Option<u32>) -> bool {
+        let held = self.held.read().unwrap_or_else(|p| p.into_inner());
+        match held.get(key) {
+            Some(floor) if unix_now() <= floor.until => {
+                rank(generation) >= i64::from(floor.generation)
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether a set the API pushed arrived within its `ttl`.
+    fn set_live(&self) -> bool {
+        let set = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        matches!(*set, Some((at, ttl)) if Instant::now().duration_since(at) <= ttl)
+    }
+
+    /// Merge a verified set into the floors held: the keys whose floor it
+    /// raised, with their new floor.
+    fn merge(&self, claims: derp_ticket::FloorSetClaims) -> HashMap<DerpKey, u32> {
+        let _write = self.write.lock().unwrap_or_else(|p| p.into_inner());
+        let now = unix_now();
+        let mut raised = HashMap::new();
+        let to_keep = {
+            let mut held = self.held.write().unwrap_or_else(|p| p.into_inner());
+            let before = held.len();
+            held.retain(|_, floor| floor.until >= now);
+            let mut changed = held.len() != before;
+            for entry in claims.floors {
+                let Some(pk) = pubkey_of(&entry.pk).filter(|_| entry.until >= now) else {
+                    continue;
+                };
+                let pushed = Floor {
+                    generation: entry.generation,
+                    until: entry.until,
+                };
+                match held.entry((entry.net, pk)) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        raised.insert(v.key().clone(), pushed.generation);
+                        v.insert(pushed);
+                        changed = true;
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        let was = *o.get();
+                        let merged = Floor {
+                            generation: was.generation.max(pushed.generation),
+                            until: was.until.max(pushed.until),
+                        };
+                        if merged.generation > was.generation {
+                            raised.insert(o.key().clone(), merged.generation);
+                        }
+                        if merged != was {
+                            o.insert(merged);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            changed.then(|| {
+                held.iter()
+                    .map(|((net, pk), floor)| derp_ticket::GenerationFloor {
+                        net: net.clone(),
+                        pk: BASE64.encode(pk),
+                        generation: floor.generation,
+                        until: floor.until,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        self.newest_iat.fetch_max(claims.iat, Ordering::Relaxed);
+        *self.set.lock().unwrap_or_else(|p| p.into_inner()) = Some((
+            Instant::now(),
+            Duration::from_secs(claims.ttl).min(MAX_SET_TTL),
+        ));
+        if let (Some(path), Some(floors)) = (&self.file, to_keep)
+            && let Err(e) = store_floors(path, floors)
+        {
+            warn!(path = %path.display(), %e, "derp-relay: the floors file could not be written");
+        }
+        if !raised.is_empty() {
+            info!(raised = raised.len(), "derp-relay: generation floors rose");
+        }
+        raised
+    }
+
+    /// What `/stats` reports: counts and the newest set's `iat`, never a key.
+    fn snapshot(&self) -> serde_json::Value {
+        let now = unix_now();
+        let held = self.held.read().unwrap_or_else(|p| p.into_inner());
+        let iat = self.newest_iat.load(Ordering::Relaxed);
+        serde_json::json!({
+            "held": held.values().filter(|floor| floor.until >= now).count(),
+            "newest_iat": (iat > 0).then_some(iat),
+            "set_live": self.set_live(),
+            "kept": if self.file.is_some() { "file" } else { "memory" },
+            "refused_total": self.refused_total.load(Ordering::Relaxed),
+            "ended_total": self.ended_total.load(Ordering::Relaxed),
+        })
+    }
+}
+
+/// The live floors of `DERP_FLOORS_FILE`.
+fn load_floors(path: &std::path::Path) -> HashMap<DerpKey, Floor> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            warn!(path = %path.display(), %e, "derp-relay: the floors file is unreadable; holding none until the API's next push");
+            return HashMap::new();
+        }
+    };
+    let kept: FloorsFile = match serde_json::from_slice(&raw) {
+        Ok(kept) => kept,
+        Err(e) => {
+            warn!(path = %path.display(), %e, "derp-relay: the floors file does not parse; holding none until the API's next push");
+            return HashMap::new();
+        }
+    };
+    let now = unix_now();
+    let held: HashMap<DerpKey, Floor> = kept
+        .floors
+        .into_iter()
+        .filter(|entry| entry.until >= now)
+        .filter_map(|entry| {
+            let pk = pubkey_of(&entry.pk)?;
+            Some((
+                (entry.net, pk),
+                Floor {
+                    generation: entry.generation,
+                    until: entry.until,
+                },
+            ))
+        })
+        .collect();
+    info!(held = held.len(), path = %path.display(), "derp-relay: holding the generation floors its file keeps");
+    held
+}
+
+/// Write every floor to a temporary file, renamed over the old one.
+fn store_floors(
+    path: &std::path::Path,
+    floors: Vec<derp_ticket::GenerationFloor>,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(&FloorsFile { floors }).map_err(std::io::Error::other)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, &body)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// FR-155 P1e — admit a registration for `key` at `generation`, under the
+/// key's registry entry, so the check and the write are one step for that
+/// key. Refused, it writes nothing, and the registration in place stays:
+/// below the key's floor; or, while a set is live, below the generation of
+/// the registration in place. An equal or a higher one replaces it, as a
+/// reconnect always has.
+fn admit(
+    state: &RelayState,
+    key: &DerpKey,
+    tx: mpsc::Sender<Vec<u8>>,
+    generation: Option<u32>,
+) -> Result<(), &'static str> {
+    match state.registry.entry(key.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(mut o) => {
+            if !state.floors.admits(key, generation) {
+                return Err("below its key's generation floor");
+            }
+            if state.floors.set_live() && rank(generation) < rank(o.get().generation) {
+                return Err("below the generation of the registration in place");
+            }
+            o.insert(Registered { tx, generation });
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            if !state.floors.admits(key, generation) {
+                return Err("below its key's generation floor");
+            }
+            v.insert(Registered { tx, generation });
+        }
+    }
+    Ok(())
+}
+
+/// FR-155 P1e — end each live connection below a floor that `raised` holds,
+/// through the socket's own close.
+fn end_below(state: &RelayState, raised: &HashMap<DerpKey, u32>) {
+    if raised.is_empty() {
+        return;
+    }
+    let mut ended = 0u64;
+    for conn in state.conns.iter() {
+        if let Some(floor) = raised.get(&conn.key)
+            && rank(conn.generation) < i64::from(*floor)
+        {
+            conn.end.notify_one();
+            ended += 1;
+        }
+    }
+    if ended > 0 {
+        state.floors.ended_total.fetch_add(ended, Ordering::Relaxed);
+        info!(
+            ended,
+            "derp-relay: connections below a generation floor that arrived end"
+        );
     }
 }
 
@@ -560,6 +877,35 @@ struct RelayState {
     scope: Arc<NetworkScope>,
     /// FR-148 D52 — what `forward_frame` drops for want of a destination.
     drops: Arc<ForwardDrops>,
+    /// FR-155 P1e — the generation floors, and every live connection.
+    floors: Arc<Floors>,
+    conns: Conns,
+    next_conn: Arc<AtomicU64>,
+}
+
+impl RelayState {
+    /// The state of a relay that serves `scope`, holding the floors `floors_file` keeps.
+    fn new(
+        ticket_key: DecodingKey,
+        region: Arc<str>,
+        turn_usage: Option<Arc<TurnUsage>>,
+        scope: NetworkScope,
+        floors_file: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            registry: Arc::new(DashMap::new()),
+            ticket_key: Arc::new(ticket_key),
+            network_bytes: Arc::new(DashMap::new()),
+            allowance: Arc::new(Allowance::default()),
+            region,
+            turn_usage,
+            scope: Arc::new(scope),
+            drops: Arc::new(ForwardDrops::default()),
+            floors: Arc::new(Floors::open(floors_file)),
+            conns: Arc::new(DashMap::new()),
+            next_conn: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -606,16 +952,19 @@ async fn main() {
         _ => None,
     };
 
-    let state = RelayState {
-        registry: Arc::new(DashMap::new()),
-        ticket_key: Arc::new(ticket_key),
-        network_bytes: Arc::new(DashMap::new()),
-        allowance: Arc::new(Allowance::default()),
-        region,
-        turn_usage,
-        scope: Arc::new(scope),
-        drops: Arc::new(ForwardDrops::default()),
-    };
+    // FR-155 P1e — where the generation floors are kept across a restart.
+    let floors_file = std::env::var("DERP_FLOORS_FILE")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from);
+    if floors_file.is_none() {
+        warn!(
+            "DERP_FLOORS_FILE is unset: the generation floors are kept in memory only, and a restart holds none until the API's next push"
+        );
+    }
+
+    let state = RelayState::new(ticket_key, region, turn_usage, scope, floors_file);
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -633,8 +982,31 @@ fn router(state: RelayState) -> Router {
         // FR-115 P4b-2 — under `/stats`, because nginx proxies that prefix
         // already, so no PoP's nginx needs a change.
         .route("/stats/turn-usage", get(turn_usage_pull))
+        // FR-155 P1e — under `/stats` too, for the same reason.
+        .route("/stats/floors", axum::routing::post(floors_push))
         .route("/derp", get(derp_upgrade))
         .with_state(state)
+}
+
+/// `POST /stats/floors` — FR-155 P1e: the API's live generation floors, an
+/// EdDSA JWT signed with the ticket key (`remote_control::derp_ticket::
+/// verify_floor_set`). 204 when merged; 401 when it does not verify; 400 when
+/// the body is not text. A refused set changes nothing. A merged one ends
+/// each live connection below a floor it raised.
+async fn floors_push(State(state): State<RelayState>, body: Bytes) -> StatusCode {
+    let Ok(token) = std::str::from_utf8(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let claims = match derp_ticket::verify_floor_set(token.trim(), &state.ticket_key) {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(%e, "derp-relay: refused a floor set");
+            return StatusCode::UNAUTHORIZED;
+        }
+    };
+    let raised = state.floors.merge(claims);
+    end_below(&state, &raised);
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Deserialize)]
@@ -792,6 +1164,10 @@ async fn stats(State(state): State<RelayState>) -> axum::Json<serde_json::Value>
         // networks are throttled, how old the pushed set is, and the frames
         // dropped. `age_s` null = no live set (nothing is throttled).
         "allowance": state.allowance.snapshot(),
+        // FR-155 P1e — the generation floors this PoP holds: counts and the
+        // newest set's `iat`, never a key. Its presence (an object) is how the
+        // API knows this PoP takes floors.
+        "floors": state.floors.snapshot(),
         // FR-115 P4b-2 — present (an object) only when this PoP keeps coturn's
         // totals: the API pulls `/stats/turn-usage` from exactly those.
         "turn_usage": state.turn_usage.as_ref().map(|u| u.snapshot()),
@@ -864,7 +1240,20 @@ async fn derp_upgrade(
             .body("Forbidden (this relay does not serve the ticket's network)".into())
             .unwrap();
     }
-    ws.on_upgrade(move |socket| handle_socket(state, socket, claims.net, claims.pk))
+    // FR-155 P1e — a ticket below its key's floor is refused here, before
+    // anything is registered, with the 401 of a ticket that does not verify.
+    if let Some(pk) = pubkey_of(&claims.pk)
+        && !state
+            .floors
+            .admits(&(claims.net.clone(), pk), claims.generation)
+    {
+        state.floors.refused_total.fetch_add(1, Ordering::Relaxed);
+        debug!(network = %claims.net, "derp-relay: a ticket below its key's generation floor");
+        return refused_ticket(true);
+    }
+    ws.on_upgrade(move |socket| {
+        handle_socket(state, socket, claims.net, claims.pk, claims.generation)
+    })
 }
 
 /// The relay's 401, with the Bearer challenge (#3656): `presented` says
@@ -886,8 +1275,16 @@ fn refused_ticket(presented: bool) -> Response {
 
 /// Drive one connection: validate the registration frame against the ticket's
 /// pubkey, register, pump frames until close. Mirrors the central relay's
-/// loop (last-writer-wins re-registration, identity-gated deregistration).
-async fn handle_socket(state: RelayState, socket: WebSocket, network: String, ticket_pk: String) {
+/// loop (identity-gated deregistration; re-registration by [`admit`], which
+/// is last-writer-wins unless a generation decides). FR-155 P1e:
+/// `generation` is what the ticket carries.
+async fn handle_socket(
+    state: RelayState,
+    socket: WebSocket,
+    network: String,
+    ticket_pk: String,
+    generation: Option<u32>,
+) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // First frame MUST be the 32-byte registration pubkey and MUST equal the
@@ -910,9 +1307,27 @@ async fn handle_socket(state: RelayState, socket: WebSocket, network: String, ti
 
     let key: DerpKey = (network.clone(), self_pubkey);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(DERP_SEND_QUEUE);
-    // Last-writer-wins on re-registration (a reconnect replaces the stale
-    // sender; the displaced socket keeps working as a SENDER until it closes).
-    state.registry.insert(key.clone(), out_tx.clone());
+    // FR-155 P1e — the connection is listed BEFORE its admission reads the
+    // floors. A floor that arrives after that read ends it from the list
+    // (`end_below`); one that arrives before is read, and refuses it.
+    let conn_id = state.next_conn.fetch_add(1, Ordering::Relaxed);
+    let end = Arc::new(tokio::sync::Notify::new());
+    state.conns.insert(
+        conn_id,
+        Conn {
+            key: key.clone(),
+            generation,
+            end: end.clone(),
+        },
+    );
+    // A reconnect replaces the registration in place; the socket it replaced
+    // keeps working as a SENDER until it closes.
+    if let Err(reason) = admit(&state, &key, out_tx.clone(), generation) {
+        state.conns.remove(&conn_id);
+        state.floors.refused_total.fetch_add(1, Ordering::Relaxed);
+        info!(%network, reason, "derp-relay: registration refused");
+        return;
+    }
     info!(%network, "derp-relay: node registered");
 
     let mut write = tokio::spawn(async move {
@@ -942,6 +1357,11 @@ async fn handle_socket(state: RelayState, socket: WebSocket, network: String, ti
                 Some(Ok(_)) => {} // text/ping/pong — axum auto-pongs
             },
             _ = &mut write => break,
+            // FR-155 P1e — a floor above this connection's generation arrived.
+            _ = end.notified() => {
+                info!(%network, "derp-relay: a registration below its key's generation floor ends");
+                break;
+            }
         }
     }
 
@@ -949,7 +1369,8 @@ async fn handle_socket(state: RelayState, socket: WebSocket, network: String, ti
     // reconnect may have replaced us; we must not evict it).
     state
         .registry
-        .remove_if(&key, |_, tx| tx.same_channel(&out_tx));
+        .remove_if(&key, |_, r| r.tx.same_channel(&out_tx));
+    state.conns.remove(&conn_id);
     write.abort();
     info!(%network, "derp-relay: node disconnected");
 }
@@ -1098,7 +1519,7 @@ fn forward_frame(
     }
     let key: DerpKey = (network.to_string(), dst);
     let sender = match registry.get(&key) {
-        Some(r) => r.clone(),
+        Some(r) => r.tx.clone(),
         None => {
             drops.missed(&key, src_pubkey);
             return;
@@ -1228,16 +1649,13 @@ mod tests {
         turn_usage: Option<Arc<TurnUsage>>,
         networks: Option<HashSet<String>>,
     ) -> (std::net::SocketAddr, Registry, Arc<NetworkScope>) {
-        let state = RelayState {
-            registry: Arc::new(DashMap::new()),
-            ticket_key: Arc::new(key),
-            network_bytes: Arc::new(DashMap::new()),
-            allowance: Arc::new(Allowance::default()),
-            region: "us-east".into(),
+        let state = RelayState::new(
+            key,
+            "us-east".into(),
             turn_usage,
-            scope: Arc::new(NetworkScope::new(networks)),
-            drops: Arc::new(ForwardDrops::default()),
-        };
+            NetworkScope::new(networks),
+            None,
+        );
         let (registry, scope) = (state.registry.clone(), state.scope.clone());
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1682,7 +2100,13 @@ mod tests {
     fn a_frame_for_an_unknown_destination_is_counted() {
         let relay = Forwarder::default();
         let (tx, _rx) = mpsc::channel(DERP_SEND_QUEUE);
-        relay.registry.insert((NET_A.to_string(), [2u8; 32]), tx);
+        relay.registry.insert(
+            (NET_A.to_string(), [2u8; 32]),
+            Registered {
+                tx,
+                generation: None,
+            },
+        );
         relay.send(NET_A, [3u8; 32]);
         relay.send(NET_A, [3u8; 32]);
         relay.send(NET_B, [2u8; 32]);
@@ -1700,7 +2124,13 @@ mod tests {
     fn a_frame_a_full_destination_queue_refuses_is_counted() {
         let relay = Forwarder::default();
         let (tx, _rx) = mpsc::channel(DERP_SEND_QUEUE);
-        relay.registry.insert((NET_A.to_string(), [2u8; 32]), tx);
+        relay.registry.insert(
+            (NET_A.to_string(), [2u8; 32]),
+            Registered {
+                tx,
+                generation: None,
+            },
+        );
         for _ in 0..DERP_SEND_QUEUE {
             relay.send(NET_A, [2u8; 32]);
         }
@@ -2281,17 +2711,7 @@ mod tests {
         key: DecodingKey,
         file: Option<std::path::PathBuf>,
     ) -> (std::net::SocketAddr, Registry, tokio::task::JoinHandle<()>) {
-        let _ = file;
-        let state = RelayState {
-            registry: Arc::new(DashMap::new()),
-            ticket_key: Arc::new(key),
-            network_bytes: Arc::new(DashMap::new()),
-            allowance: Arc::new(Allowance::default()),
-            region: "us-east".into(),
-            turn_usage: None,
-            scope: Arc::new(NetworkScope::new(None)),
-            drops: Arc::new(ForwardDrops::default()),
-        };
+        let state = RelayState::new(key, "us-east".into(), None, NetworkScope::new(None), file);
         let registry = state.registry.clone();
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

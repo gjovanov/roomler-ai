@@ -105,6 +105,7 @@ pub(crate) fn claiming_connection(
         os: OsKind::Linux,
         dialed_tid: None,
         conn_established_ms: now_ms(),
+        generation: 0,
         tx: reg.tx.clone(),
         resume: AgentResume {
             window_secs: window,

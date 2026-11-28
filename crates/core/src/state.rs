@@ -117,6 +117,11 @@ pub struct Core {
     /// P6b — live per-region load written by the `/stats` poller; consulted
     /// by the Hub (session freeze) and the overlay pair-region pick.
     pub relay_load: RelayLoadMap,
+    /// FR-155 P1e — the generation floors a token rotation's commit pushes to
+    /// the regional relays, and the poller pushes again on every poll.
+    /// `Some` only while the token rotation is on and a ticket key is
+    /// configured (`crate::relay_floors`).
+    pub relay_floors: Option<Arc<crate::relay_floors::RelayFloors>>,
     /// FR-69 D6 — the inverse edges: every module's registered lifecycle
     /// hooks, invoked in `HOOK_ORDER` by whoever runs a cascade. Shared, so a
     /// registration made after this `Core` was cloned is visible to the clone.

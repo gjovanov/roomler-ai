@@ -58,6 +58,10 @@ pub struct AgentCtx {
     /// with; `None` = a key-less dial that hashed on client IP.
     pub dialed_tid: Option<String>,
     pub conn_established_ms: i64,
+    /// FR-155 P1e — the token generation this connection was admitted under
+    /// (its Hub entry's), never the row's current one: what a DERP ticket
+    /// minted to it carries.
+    pub generation: u32,
     /// The Hub's outbound sender for this connection — how an arm answers
     /// the device (a reply routed through the Hub's pump, never a second
     /// writer on the socket).
@@ -241,6 +245,7 @@ mod tests {
             os: OsKind::Linux,
             dialed_tid: None,
             conn_established_ms: 0,
+            generation: 0,
             tx,
             resume: AgentResume::default(),
             server_ended: ServerEnded::default(),
