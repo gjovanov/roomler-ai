@@ -249,13 +249,28 @@ pub async fn devices(
         if !node_by_client.is_empty()
             && let Some(network) = state.modules.network.as_ref()
         {
-            for c in network
+            let clients = network
                 .tunnel_clients
                 .list_all_active_for_tenant(tid)
-                .await?
-            {
+                .await?;
+            // #4553 — the same derivation the admin's lists read.
+            let directory =
+                roomler_ai_mod_fleet::agent::tunnel_client_presence_batch(fleet, &clients).await;
+            for c in clients {
+                let (presence, is_online) =
+                    roomler_ai_mod_fleet::agent::derive_tunnel_client_presence(
+                        fleet,
+                        &c,
+                        directory.as_ref(),
+                    );
                 let node = c.id.and_then(|i| node_by_client.get(&i).copied());
-                rows.push(client_row(c, node, dns_domain.as_deref()));
+                rows.push(client_row(
+                    c,
+                    presence,
+                    is_online,
+                    node,
+                    dns_domain.as_deref(),
+                ));
             }
         }
     }

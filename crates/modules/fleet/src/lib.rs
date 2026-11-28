@@ -180,6 +180,12 @@ pub struct FleetState {
     /// sweep so it can compare-DEL each key (an unconditional DEL could erase
     /// a claim an agent already re-made on the surviving pod mid-roll).
     pub agent_presence_tokens: Arc<DashMap<ObjectId, String>>,
+    /// #4553 — this pod's live tunnel-client sockets, the tunnel client's
+    /// counterpart of `rc_hub` for presence. The `network` module's socket
+    /// takes a seat in it; `agent::derive_tunnel_client_presence` reads it.
+    /// Here, beside the agents', because both device lists read presence
+    /// through fleet, and ONE live registry is what every reader must see.
+    pub tunnel_client_sockets: Arc<agent::TunnelClientSockets>,
     /// P4 — per-tenant `device:presence` batching + member-list cache.
     pub presence_fanout: Arc<presence::PresenceFanout>,
     /// PR-1 rehome — owner-side per-agent nudge pacing (cooldown trio).
@@ -361,6 +367,7 @@ impl Module for FleetState {
             rc_resume_reconcile: Arc::new(tokio::sync::Mutex::new(())),
             rc_hub,
             agent_presence_tokens: Arc::new(DashMap::new()),
+            tunnel_client_sockets: Arc::new(agent::TunnelClientSockets::default()),
             presence_fanout: Arc::new(presence::PresenceFanout::default()),
             agent_nudge_cooldowns: Arc::new(DashMap::new()),
             agent_nudge_throttle: Arc::new(DashMap::new()),

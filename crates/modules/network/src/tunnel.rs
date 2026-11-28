@@ -53,6 +53,10 @@ use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 use crate::NetworkState;
 use crate::agent_arms::pump_server_messages;
 use axum::{extract::WebSocketUpgrade, response::Response};
+use roomler_ai_mod_fleet::agent::{TunnelClientSeat, TunnelClientSockets};
+use roomler_core::cluster::directory::{
+    OwnershipDirectory, TUNNEL_CLIENT_CHECK_SECS, TUNNEL_CLIENT_TTL_SECS, tunnel_client_key,
+};
 use roomler_core::ws::upgrade::{MAX_WS_MESSAGE_BYTES, send_goodbye_and_close, tid_matches_claim};
 
 /// Outbound channel capacity. Per-tunnel-client. Generous because a
@@ -62,8 +66,10 @@ const OUTBOUND_CAP: usize = 256;
 
 /// Cadence of the revocation re-check. 60 s is the v1 default —
 /// cheap (one Mongo find_by_id per minute per active connection)
-/// and matches the existing agent heartbeat rhythm.
-const REVOCATION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// and matches the existing agent heartbeat rhythm. #4553: the same check
+/// refreshes the client's presence record and its `last_seen_at` trail, so
+/// the period is the directory's, which sets the record's TTL from it.
+const REVOCATION_CHECK_INTERVAL: Duration = Duration::from_secs(TUNNEL_CLIENT_CHECK_SECS);
 
 /// How long the check waits for the connection loop to have told the
 /// session's exit that the connection ends, before it tells the client
@@ -84,6 +90,16 @@ pub async fn handle_tunnel_client_socket(
 ) {
     info!(%tunnel_client_id, %tenant_id, %owner_user_id, "tunnel-client WS connected");
     let conn_established_ms = bson::DateTime::now().timestamp_millis();
+
+    // #4553 — presence. The trail first: `last_seen_at` is otherwise written
+    // only by the 60 s check, whose first run is a full period away, and a
+    // pod that cannot reach the directory reads the trail alone. Then this
+    // socket's seat on this pod and the cross-pod record, both before the
+    // check that refreshes the record starts.
+    if let Err(e) = state.tunnel_clients.touch_heartbeat(tunnel_client_id).await {
+        debug!(%tunnel_client_id, %e, "tunnel-client connect: last_seen_at write failed");
+    }
+    let (presence_seat, presence) = PresenceRecord::open(&state, tunnel_client_id).await;
 
     let (socket_tx, mut socket_rx) = socket.split();
     let socket_tx = Arc::new(Mutex::new(socket_tx));
@@ -172,6 +188,7 @@ pub async fn handle_tunnel_client_socket(
         orig.server_ended.clone(),
         tunnel_client_id,
         tenant_id,
+        presence.clone(),
     );
 
     // Main read loop.
@@ -428,6 +445,12 @@ pub async fn handle_tunnel_client_socket(
     }
 
     revocation_handle.abort();
+    // #4553 — waited out before the seat leaves: a refresh still in flight
+    // would set the record again after the release deleted it
+    // (`refresh_if_mine` writes a missing key), and the client would read
+    // online for the record's whole TTL.
+    let _ = revocation_handle.await;
+    presence.close(presence_seat).await;
 
     // Overlay teardown: drop this node from the registry + mark it
     // offline so peers' netmaps lose it. Best-effort; no-op if the
@@ -1680,6 +1703,7 @@ async fn signal_end(
     matches!(tokio::time::timeout(within, told).await, Ok(Some(())))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_revocation_check(
     state: NetworkState,
     socket_tx: Arc<Mutex<SplitSink<WebSocket, Message>>>,
@@ -1688,6 +1712,7 @@ fn spawn_revocation_check(
     server_ended: roomler_core::ServerEnded,
     tunnel_client_id: ObjectId,
     tenant_id: ObjectId,
+    presence: PresenceRecord,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(REVOCATION_CHECK_INTERVAL);
@@ -1711,6 +1736,7 @@ fn spawn_revocation_check(
                         && matches!(c.status, AgentStatus::Online | AgentStatus::Offline) =>
                 {
                     let _ = state.tunnel_clients.touch_heartbeat(tunnel_client_id).await;
+                    presence.refresh().await;
                 }
                 Ok(_) => {
                     info!(%tunnel_client_id, "tunnel-client revoked mid-session; closing WS");
@@ -1735,10 +1761,108 @@ fn spawn_revocation_check(
                         %tunnel_client_id, %e,
                         "tunnel-client revocation re-check lookup failed; keeping connection open"
                     );
+                    // #4553 — the socket stays open, so its presence does.
+                    presence.refresh().await;
                 }
             }
         }
     })
+}
+
+/// #4553 — a tunnel client's presence on this pod, as its sockets write it,
+/// read by `fleet::agent::derive_tunnel_client_presence` as an agent's is
+/// (Phase A-1): each socket's seat in this pod's registry and, on a pod with
+/// a directory, the client's cross-pod record (`directory::tunnel_client_key`,
+/// TTL `TUNNEL_CLIENT_TTL_SECS`).
+///
+/// The record follows the directory's rules for a connection-bound entity,
+/// with the client's sockets on this pod as ONE registration: they share one
+/// token ([`TunnelClientSockets`]), as an agent's hub slot holds one.
+/// - claimed at connect with `claim_if_newer`: newest wins, by the time each
+///   pod minted its token, so a socket made later on another pod keeps the
+///   record however the two writes land;
+/// - refreshed by the 60 s check with `refresh_if_mine`, the token read live:
+///   ours or gone is set again (a record lost to a Redis blip heals within one
+///   check), another pod's is left alone;
+/// - released compare-and-delete when the client's LAST socket here closes,
+///   so an old pod's late close never takes a newer socket's record with it.
+///
+/// `status` is never written: it is the admin's, and with two pods a
+/// disconnect write could land after a reconnect on the other pod.
+#[derive(Clone)]
+struct PresenceRecord {
+    sockets: Arc<TunnelClientSockets>,
+    client: ObjectId,
+    /// `None` on a pod with no directory: there the seat alone answers, and
+    /// only on this pod.
+    dir: Option<OwnershipDirectory>,
+    key: String,
+}
+
+impl PresenceRecord {
+    /// Seat one socket of `client` on this pod and claim the record with the
+    /// client's token here.
+    async fn open(state: &NetworkState, client: ObjectId) -> (TunnelClientSeat, Self) {
+        let record = Self {
+            sockets: state.fleet.tunnel_client_sockets.clone(),
+            client,
+            dir: state.cluster_directory.clone(),
+            key: tunnel_client_key(&client.to_hex()),
+        };
+        let (seat, token) = record.sockets.sit(client, || {
+            record
+                .dir
+                .as_ref()
+                .map(|dir| dir.owner_token(&ObjectId::new().to_hex()))
+        });
+        if let (Some(dir), Some(token)) = (&record.dir, &token) {
+            match dir
+                .claim_if_newer(&record.key, token, TUNNEL_CLIENT_TTL_SECS)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!(%client, "tunnel-client presence record already holds this token or a newer one")
+                }
+                Err(e) => warn!(
+                    %client, %e,
+                    "tunnel-client presence claim failed; the 60 s check claims it again"
+                ),
+            }
+        }
+        (seat, record)
+    }
+
+    /// The 60 s check's refresh. Nothing to write on a pod with no directory,
+    /// or once the shutdown release took the token.
+    async fn refresh(&self) {
+        let (Some(dir), Some(token)) = (&self.dir, self.sockets.token(self.client)) else {
+            return;
+        };
+        match dir
+            .refresh_if_mine(&self.key, &token, TUNNEL_CLIENT_TTL_SECS)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(client = %self.client, "another pod holds this tunnel client's presence record")
+            }
+            Err(e) => debug!(client = %self.client, %e, "tunnel-client presence refresh failed"),
+        }
+    }
+
+    /// The socket's end: its seat leaves. If it was the client's last socket
+    /// on this pod, the record is released if it is still ours.
+    async fn close(&self, seat: TunnelClientSeat) {
+        let Some(token) = seat.leave() else {
+            return;
+        };
+        if let Some(dir) = &self.dir
+            && let Err(e) = dir.release(&self.key, &token).await
+        {
+            debug!(client = %self.client, %e, "tunnel-client presence release failed; its TTL ends the record");
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
