@@ -623,9 +623,10 @@ pub trait ScreenCapture: Send {
     ///   of them is a spin: [`pace::EmptyGuard`] warns once and floors each.
     ///
     /// ⚠️ One backend meets this only when asked: the SYSTEM-context capture,
-    /// through [`open_async`]'s `paced`. The two DataChannel pumps do not ask, and
-    /// sleep on an empty themselves. FR-98 C7 moves them over and deletes the
-    /// opt-in.
+    /// through [`open_async`]'s `paced`. The RTP pump asks. The two DataChannel
+    /// pumps ask on a session that runs the `capture_wait` media path
+    /// ([`pace::dc_capture_wait`], FR-135 R4a), and sleep on an empty themselves
+    /// on every other. #3275's delete removes the opt-in.
     async fn next_frame(&mut self) -> Result<Option<Frame>>;
 
     fn monitor_count(&self) -> u8;
@@ -882,9 +883,7 @@ impl CaptureUnavailableCode {
             }
             Self::NoDisplay => {
                 if cfg!(target_os = "macos") {
-                    "This roomlerd runs as a system daemon, which has no desktop session and \
-                     therefore no screen to capture. Connect to this machine's user-session \
-                     roomlerd instead. Remote shell works here."
+                    mac_no_display_hint(crate::consent_relay::one_row())
                 } else {
                     no_display_hint(crate::files::follows_the_screen())
                 }
@@ -922,6 +921,30 @@ macro_rules! files_follow_the_screen {
 /// [`files_follow_the_screen!`], for a sentence composed at run time
 /// (`apps::Unavailable::reason`).
 pub(crate) const FILES_FOLLOW_THE_SCREEN: &str = files_follow_the_screen!();
+
+/// The `no_display` sentence on a Mac, which only its root daemon reaches: it
+/// runs in no login session. #4543 — `one_row`: this is a one-row Mac's root
+/// daemon (`consent_relay::one_row`), whose Mac has no other row to connect
+/// to. Off one row a two-row Mac's `-daemon` row sends the viewer to the
+/// person's own row, as it always did.
+///
+/// ⚠️ On the wire as a JSON literal, unescaped
+/// (`capture_unavailable_payload`): no double quote, no backslash.
+fn mac_no_display_hint(one_row: bool) -> &'static str {
+    if one_row {
+        // No user-session roomlerd to send the viewer to: the screen is the
+        // person's screen worker's, and a session asked before it attached
+        // crosses to it at its offer (#4543), so this one found none.
+        "This roomlerd runs as a system daemon, which has no desktop session and therefore no \
+         screen to capture. On this Mac the screen is captured by the screen worker of the \
+         person signed in at it, and none served this session. Reconnect once someone is \
+         signed in at the Mac. Remote shell works here."
+    } else {
+        "This roomlerd runs as a system daemon, which has no desktop session and therefore no \
+         screen to capture. Connect to this machine's user-session roomlerd instead. Remote \
+         shell works here."
+    }
+}
 
 /// The `no_display` sentence off macOS, which only Linux reaches. #3711 —
 /// with no display there may well be nobody at the screen, so where file
@@ -2957,8 +2980,9 @@ pub async fn open_default_async(
 /// the open waits for a seat the capture before it is letting go of, the acquire
 /// waits for a frame (so frames stay off the GPU: a wait holds the device's lock),
 /// and GDI holds to its target. It is said here, not after the open, because the
-/// open is the first thing it changes. Only the RTP pump asks; FR-98 C7 moves the
-/// others over and deletes the choice.
+/// open is the first thing it changes. The RTP pump asks, and a DataChannel pump
+/// on a session that runs `capture_wait` ([`pace::dc_capture_wait`]); #3275's
+/// delete removes the choice.
 pub async fn open_async(
     target_fps: u32,
     downscale: DownscalePolicy,
@@ -3992,8 +4016,9 @@ mod wayland_reason_tests {
     use super::CaptureUnavailableCode::{self, *};
     use super::{
         FILES_FOLLOW_THE_SCREEN, MAC_PERMISSION_HINT, SeatKind, linux_no_pixels_code,
-        no_display_hint, wayland_hint, wayland_hint_with, wayland_not_enabled_detail, x11_hint,
-        x11_hint_with, x11_not_enabled_detail, xwayland_verdict,
+        mac_no_display_hint, no_display_hint, wayland_hint, wayland_hint_with,
+        wayland_not_enabled_detail, x11_hint, x11_hint_with, x11_not_enabled_detail,
+        xwayland_verdict,
     };
 
     fn seat(answer: Option<SeatKind>) -> impl FnOnce() -> Option<SeatKind> {
@@ -4234,6 +4259,9 @@ mod wayland_reason_tests {
         let mut hints: Vec<&str> = codes.iter().map(|c| c.hint()).collect();
         // #3164 — the macOS sentence, checked on every platform.
         hints.push(MAC_PERMISSION_HINT);
+        // #4543 — both macOS `no_display` sentences, on every platform too.
+        hints.push(mac_no_display_hint(true));
+        hints.push(mac_no_display_hint(false));
         hints.push(wayland_hint(true));
         hints.push(wayland_hint(false));
         hints.push(x11_hint(true));
@@ -4346,6 +4374,31 @@ mod wayland_reason_tests {
         assert!(
             !h.contains("to Roomler in"),
             "names the menu-bar app's entry: {h}"
+        );
+    }
+
+    /// #4543 — a one-row Mac has no user-session roomlerd: its screen is
+    /// captured by the screen worker of the person signed in at it. So its
+    /// root daemon's `no_display` sentence names no row to connect to; it
+    /// says that no screen worker served this session, and when a reconnect
+    /// helps. Off one row the sentence is the one it always was.
+    #[test]
+    fn a_one_row_macs_no_display_hint_sends_the_viewer_to_no_row() {
+        let one_row = mac_no_display_hint(true);
+        assert!(!one_row.contains("user-session"), "{one_row}");
+        assert!(!one_row.contains("Connect to"), "{one_row}");
+        assert!(one_row.contains("screen worker"), "{one_row}");
+        assert!(one_row.contains("none served this session"), "{one_row}");
+        assert!(
+            one_row.contains("Reconnect once someone is signed in at the Mac"),
+            "{one_row}"
+        );
+        assert!(one_row.ends_with("Remote shell works here."), "{one_row}");
+        assert_eq!(
+            mac_no_display_hint(false),
+            "This roomlerd runs as a system daemon, which has no desktop session and therefore no \
+             screen to capture. Connect to this machine's user-session roomlerd instead. Remote \
+             shell works here."
         );
     }
 

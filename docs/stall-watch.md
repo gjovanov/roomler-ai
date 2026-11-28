@@ -2,7 +2,7 @@
 
 The instrument at the heart of [FR-65](fr/FR-65-blocking-work-on-async-runtimes.md):
 every pass of the FFmpeg DataChannel pump (`media_pump_ffmpeg_dc`,
-`agents/roomlerd/src/peer.rs:6542`) is timed, broken into named phases, and
+`agents/roomlerd/src/peer.rs:6581`) is timed, broken into named phases, and
 judged. A pass whose **work** reaches the bar (100 ms) is a **stall**: it is
 logged once with its breakdown, counted on the heartbeat, and handed to the rate
 governor, whose FR-79 validity gate refuses to learn from a window in which the
@@ -18,10 +18,10 @@ fleet, and what the watch itself costs (measured, FR-65 AC1).
 | | |
 |---|---|
 | Verdict + bookkeeping | `encode::stall` (`agents/roomlerd/src/encode/stall.rs`) — a pure module on the **default** feature set, so `cargo test -p roomlerd --lib` covers it although the pump is behind `ffmpeg-encoder` |
-| The pump's sites | `peer.rs:7001` (the watch), `:7013` (the one phase list), `:7485` (the pass boundary), `:10386` (the heartbeat's rebase) |
+| The pump's sites | `peer.rs:7049` (the watch), `:7061` (the one phase list), `:7533` (the pass boundary), `:10468` (the heartbeat's rebase) |
 | Kill switch | `pump_stall_watch` / `ROOMLERD_PUMP_STALL_WATCH=0` (`encode/mod.rs:564`), restart required |
 | The bar | `pump_stall_warn_ms` / `ROOMLERD_PUMP_STALL_WARN_MS`, default 100 (`encode/mod.rs:652`) |
-| Its own cost | `roomlerd stall-watch-cost` (`stall.rs:592`, §8) |
+| Its own cost | `roomlerd stall-watch-cost` (`stall.rs:593`, §8) |
 | The census | `scripts/fr65-stall-census.sh`, a fleet-wide server read of `agent_logs` (§7) |
 
 ## 1. A pass, and where its time goes
@@ -63,23 +63,23 @@ eleven exist only for the watch and cost nothing when it is off.
 
 | Phase | What it times | Work? | Timed when the watch is off? | Since |
 |---|---|---|---|---|
-| `capture` | `capturer.next_frame().await` (`peer.rs:8260`) — mostly **waiting for the screen to change** | no | yes (heartbeat average) | rc.88 |
-| `scale` | the downscale to the plan's box (`peer.rs:8901`) | yes | yes | P7 |
-| `encode` | the encode round trip (`peer.rs:9664`) | yes | yes | rc.88 |
-| `send` | framing and the hand-off to the send task (`peer.rs:9901`) | yes | yes | rc.88 |
+| `capture` | `capturer.next_frame().await` (`peer.rs:8316`) — mostly **waiting for the screen to change** | no | yes (heartbeat average) | rc.88 |
+| `scale` | the downscale to the plan's box (`peer.rs:8978`) | yes | yes | P7 |
+| `encode` | the encode round trip (`peer.rs:9741`) | yes | yes | rc.88 |
+| `send` | framing and the hand-off to the send task (`peer.rs:9978`) | yes | yes | rc.88 |
 | `apply` | a rate/dims change to an encoder that already exists (`timed_apply!`) | yes | yes | FR-65 P0 |
-| `open` | opening an encoder, first or rebuilt (`peer.rs:9039`) | yes | yes | #1279 |
-| `pace` | the cadence sleep when the encoder cannot hold the rate (`peer.rs:8246`) | **no** | no | #1327 |
+| `open` | opening an encoder, first or rebuilt (`peer.rs:9116`) | yes | yes | #1279 |
+| `pace` | the cadence sleep when the encoder cannot hold the rate (`peer.rs:8302`) | **no** | no | #1327 |
 | `stats` | the ICE pair and LAN-reason stats reads | yes | no | #1327 |
 | `ctrl` | the control DC's lock and `rc:video-info` send | yes | no | #1327 |
-| `swap` | adopting a finished background rebuild (`peer.rs:7644`) | yes | no | #1327 |
-| `gate` | the backpressure gate, including its skip-and-sleep (`peer.rs:8128`) | yes | no | #1327 |
-| `dc_lock` | waiting for the video DataChannel's mutex after an encode (`peer.rs:9850`) | yes | no | 2026-10-30 |
-| `enc_cmd` | encoder commands other than encode/apply/open: keyframe requests, the dims spec (`peer.rs:8782`, `:9195`, `:9213`, `:9232`) | yes | no | 2026-10-30 |
-| `close` | dropping an encoder — which **joins its thread** (`peer.rs:7526`, `:7804`, `:9133`, `:9265`) | yes | no | 2026-10-30 |
-| `recapture` | rebuilding the capturer: a flip's reopen, the error arm's backoff + reopen (`peer.rs:7792`, `:8504`) | yes | no | 2026-10-30 |
-| `poll` | an empty poll's 2 ms sleep, or the yield while the display is held (`peer.rs:8351`, `:8484`) | yes | no | 2026-10-30 |
-| `heartbeat` | the heartbeat block itself (`peer.rs:10018`) | yes | no | 2026-10-30 |
+| `swap` | adopting a finished background rebuild (`peer.rs:7692`) | yes | no | #1327 |
+| `gate` | the backpressure gate, including its skip-and-sleep (`peer.rs:8184`) | yes | no | #1327 |
+| `dc_lock` | waiting for the video DataChannel's mutex after an encode (`peer.rs:9927`) | yes | no | 2026-10-30 |
+| `enc_cmd` | encoder commands other than encode/apply/open: keyframe requests, the dims spec (`peer.rs:8859`, `:9272`, `:9290`, `:9309`) | yes | no | 2026-10-30 |
+| `close` | dropping an encoder — which **joins its thread** (`peer.rs:7574`, `:7860`, `:9210`, `:9342`) | yes | no | 2026-10-30 |
+| `recapture` | rebuilding the capturer: a flip's reopen, the error arm's backoff + reopen (`peer.rs:7840`, `:8573`) | yes | no | 2026-10-30 |
+| `poll` | an empty poll's 2 ms sleep, or the yield while the display is held (`peer.rs:8408`, `:8553`) | yes | no | 2026-10-30 |
+| `heartbeat` | the heartbeat block itself (`peer.rs:10095`) | yes | no | 2026-10-30 |
 
 ⚠️ **`apply` is timed inside `swap`, `gate` and `send` on three paths** (a
 background adoption, a backpressure decrease, an overflow decrease), so on those
@@ -95,7 +95,7 @@ from it, and both are judgements a reader would "simplify" into something wrong:
 | Rule | Code | Why |
 |---|---|---|
 | **A stall is judged on `work = iter − capture − pace`**, never on `iter` | `work_us` (`stall.rs:327`), `is_stall` (`:374`) | A quiet screen sleeps inside capture. At the 100 ms bar that made idling the MAJORITY of warnings (2026-09-03: seven in 45 s, each `iter 111 / capture 101.9`). A watch that cries about idling is ignored. `pace` is the same idle one door along: at a paced 2 fps it is ~500 ms of one pass. |
-| **`other = iter − Σphases` is computed** | `other_us` (`stall.rs:366`) | An overrun whose named phases read ~0 is itself the finding: the encoder open hid there for months, spotted by eye on the fourth occurrence. |
+| **`other = iter − Σphases` is computed** | `other_us` (`stall.rs:367`) | An overrun whose named phases read ~0 is itself the finding: the encoder open hid there for months, spotted by eye on the fourth occurrence. |
 
 ⚠️ The cost of the first rule: a **wedged capture cannot trip the watch**.
 `capture_ms` still shows it on the line and `avg_capture_ms` on the heartbeat;
@@ -107,13 +107,13 @@ out of `other` (`naming_a_phase_moves_time_out_of_other_and_changes_no_verdict`)
 That is what made it safe to name six more on 2026-10-30 without a release of
 evidence first.
 
-`dominant_phase` (`stall.rs:386`) names the phase that dominated the pass, and
+`dominant_phase` (`stall.rs:387`) names the phase that dominated the pass, and
 **refuses** to name one when `other` is larger — so a line never blames a phase
 for time it did not take (AC2's attribution tests).
 
 ## 3. The bookkeeping — `PassWatch`
 
-`PassWatch` (`stall.rs:405`) owns the pass marks, the STALL line's rate limit
+`PassWatch` (`stall.rs:406`) owns the pass marks, the STALL line's rate limit
 (one per 2 s), the window's worst pass and stall count (the heartbeat's
 `iter_ms_max` and `pump_stalls`), and a **monotonic** stall total.
 
@@ -145,8 +145,8 @@ counted as work, its encoder open as nothing, and the pass went to `other`.
 
 🔑 A pass longer than the heartbeat interval **always** holds a heartbeat — the
 long pass is what makes it due — so the rule was blind to exactly the stalls
-worth finding. `PassWatch::rebase` (`stall.rs:522`) carries what the open pass
-had accrued and moves its mark past the reset (`peer.rs:10386`). The census that
+worth finding. `PassWatch::rebase` (`stall.rs:523`) carries what the open pass
+had accrued and moves its mark past the reset (`peer.rs:10468`). The census that
 found it is §6.
 
 ### 3.2 The governor reads a total that never resets (fixed 2026-10-30)
@@ -156,8 +156,8 @@ FR-79's gate asks whether the agent's own loop was free in a window
 `pump_stalls − win_stalls_last`, and the heartbeat zeroed `pump_stalls` but not
 the mark: after a window that held a stall, the next verdict read `1 − N`,
 which saturates to 0. The first verdict after a reset is the heartbeat pass's
-own — the long one. It now reads `PassWatch::stalls_total` (`stall.rs:556`,
-`peer.rs:9304`), which only grows.
+own — the long one. It now reads `PassWatch::stalls_total` (`stall.rs:557`,
+`peer.rs:9381`), which only grows.
 
 **What the two fixes change for the controller**, since a stall verdict gates
 every rate estimator: a heartbeat pass whose overrun was only a capture wait is
@@ -254,7 +254,7 @@ correlation stands, unexplained.
 Forty of the 46 `untimed` lines (CORPLAP-1 2 of 4, CORPLAP-2 23 of 27,
 CORPLAP-3 all 15) have a normal capture and a normal encode and the rest in
 `other` — a pass that encoded a frame, then waited. The send task
-takes the video DC's mutex in an `if let` scrutinee (`peer.rs:7374`), and Rust
+takes the video DC's mutex in an `if let` scrutinee (`peer.rs:7422`), and Rust
 2024 keeps a scrutinee's temporaries alive through the whole body, so the guard
 is held across every chunk of a frame's flow-controlled send. The pump's own
 `video_bytes_dc.lock().await` after each encode then waits out the previous
@@ -468,7 +468,7 @@ restart count read 1 before and after, and `oom_kill` stayed 0 (FR-65 AC5).
 > `Instant::now()` is ~20–40 ns, and there are N of them") the switch's own
 > description used to quote.
 
-`roomlerd stall-watch-cost` (`stall.rs:592`, dispatched in `app.rs:1262` before
+`roomlerd stall-watch-cost` (`stall.rs:593`, dispatched in `app.rs:1262` before
 any runtime, config, log, lock or updater) runs the pump's per-pass watch work
 through the **real** `PassWatch`, once enabled and once disabled, rounds
 alternating which arm goes first. Everything else in a pass is the same in
@@ -526,7 +526,7 @@ as the warm cells do. A cold pass is ~80–280 µs of walking whose time varies 
 microseconds, so the watch came out at −6.4…+5.7 µs medians and p90s up to
 37 µs — a bound set by noise, which multiplied by 322 passes/s is 1.2 % of each
 second and proves nothing. The cold cells now bracket only the watch's own
-operations after each eviction walk (`pass_timed`, `stall.rs:822`). And the
+operations after each eviction walk (`pass_timed`, `stall.rs:823`). And the
 first control was a CALIBRATED LOOP COUNT: it came back at 0.83–1.16× over
 eight runs, because a core that changes its clock between calibration and run
 shrinks a step count — on a shared CI runner that is a flake waiting to happen.

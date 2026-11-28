@@ -284,6 +284,26 @@ pub fn tunnel_key(session_hex: &str) -> String {
     format!("roomler:own:tunnel:{session_hex}")
 }
 
+/// #4553 — a tunnel CLIENT's presence record, one per client (its sessions
+/// have their own, [`tunnel_key`]): LWW by mint time. Its socket claims it on
+/// connect, refreshes it on the socket's periodic check and releases it at
+/// close (`network::tunnel`); fleet's `tunnel_client_presence_batch` reads it
+/// for both tunnel-client lists.
+pub fn tunnel_client_key(client_hex: &str) -> String {
+    format!("roomler:own:tunnel-client:{client_hex}")
+}
+
+/// #4553 — the period of a tunnel-client socket's check: it re-reads the row,
+/// touches `last_seen_at` and refreshes the record above this often.
+pub const TUNNEL_CLIENT_CHECK_SECS: u64 = 60;
+
+/// #4553 — the record's TTL, and how long the `last_seen_at` trail counts as
+/// fresh: 3× the check, the headroom the agent and user records keep over
+/// their 30 s beat, so one missed refresh (a Redis or Mongo blip) neither
+/// drops a live client nor ends its trail. It also bounds how long a pod that
+/// died without releasing leaves its clients reading online.
+pub const TUNNEL_CLIENT_TTL_SECS: u64 = 3 * TUNNEL_CLIENT_CHECK_SECS;
+
 /// C-4 — media room claims: the SET-NX namespace (creation is mutually
 /// exclusive — see `ws/media_cluster.rs`). Short TTL: a crashed owner's
 /// room is unusable, so the claim must free fast for the rejoin path.

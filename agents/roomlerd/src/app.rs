@@ -5042,6 +5042,14 @@ async fn run_cmd(
     // needs no separate branch.
     #[cfg(target_os = "macos")]
     let delegate_host = roomlerd::delegate::DelegateHost::new();
+    // FR-157 P1 — the switches the row's screen-worker word reads, the same
+    // facts the supervisor's `run` reads below, set before any loop connects.
+    #[cfg(target_os = "macos")]
+    delegate_host.set_word_config(roomlerd::macos_supervisor::WordConfig {
+        is_root: euid_is_root(),
+        supervise: cfg.macos_supervise_gui_worker,
+        one_row: cfg.macos_one_row,
+    });
     // #1882 — the worker serves its OWN sessions too, and runs no overlay, so
     // the daemon tells it the overlay's blocks (`rc_overlay` off needs them).
     #[cfg(target_os = "macos")]
@@ -5293,6 +5301,15 @@ async fn run_cmd(
     // the first hello can carry it. It reads logind on its own thread; the
     // signalling loop only ever reads its cache.
     roomlerd::desktop_brief::start();
+    // FR-67 P5 / #3332 — the last install's verdict and the crash ladder's
+    // state, for every announcement. After the crash bookkeeping above saved
+    // this run's ladder, so the first read has it, and it waits a moment for
+    // that read so the first hello carries both. A thread of its own reads the
+    // records; the signalling loop only ever reads its cache. Not on a view
+    // (FR-43 P3a): its caps reach no server.
+    if !unenrolled {
+        roomlerd::health_words::start(config_path.clone());
+    }
     // FR-93 P5h — tell each viewer before this computer sleeps (Linux;
     // nothing elsewhere). A thread of its own; the runtime sends the notices.
     roomlerd::sleep_notice::start(tokio::runtime::Handle::current());
@@ -5763,6 +5780,9 @@ async fn run_cmd(
                                     last_known_good = %pkg,
                                     "clean-run threshold reached; promoted to last-known-good"
                                 );
+                                // #3332 — the crash word clears on the next beat,
+                                // not up to a refresh later.
+                                roomlerd::health_words::refresh_soon();
                             }
                         }
                         Err(e) => tracing::warn!(error = %e, "could not reload config for clean-run promotion"),
@@ -5770,10 +5790,14 @@ async fn run_cmd(
                     drop(_write_guard);
                     // #3302 — a watcher stopped before its verdict leaves the record
                     // at InProgress for good. Healthy this long, this daemon can say.
-                    if let Some(wait) = post_install::settle_record(&pkg) {
+                    // FR-67 P5 — and the install word says what it settled.
+                    let again = post_install::settle_record(&pkg);
+                    roomlerd::health_words::refresh_soon();
+                    if let Some(wait) = again {
                         tokio::select! {
                             _ = tokio::time::sleep(wait) => {
                                 let _ = post_install::settle_record(&pkg);
+                                roomlerd::health_words::refresh_soon();
                             }
                             _ = shutdown.changed() => {}
                         }

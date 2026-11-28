@@ -536,7 +536,7 @@ roomler's patches, and the root `Cargo.toml` puts it in place of the crates.io c
 one, and the drift checks in `rust-lint` compare a fork's text with its `.patch` file, not what
 it does. Until #4503 two of the six forks ran their own tests in CI, in the jobs `vendored-sctp`
 (#3755) and `vendored-ice` (FR-148 P4). The matrix job `vendored-tests`
-([`ci.yml:3186-3305`](../.github/workflows/ci.yml#L3186-L3305)) now runs one entry per fork,
+([`ci.yml:3186-3295`](../.github/workflows/ci.yml#L3186-L3295)) now runs one entry per fork,
 each a check named `Vendored <fork> tests`, so the two old checks keep their names.
 
 | Fork | Runner | What the entry runs | Skipped, by exact name | Tests, by hand with the entry's command |
@@ -544,14 +544,14 @@ each a check named `Vendored <fork> tests`, so the two old checks keep their nam
 | `rtp` ([`:3229`](../.github/workflows/ci.yml#L3229)) | ubuntu-latest | `--lib` | none | 68 passed |
 | `scrap` ([`:3237`](../.github/workflows/ci.yml#L3237)) | ubuntu-latest, after the apt sets of `ci-linux-system-deps` | `--lib`. The fork has no tests: the entry builds its X11 arm, patched too, as a test binary, which links libxcb, so a test added to the fork runs from its first PR. The quartz and DXGI arms compile in the macOS and Windows jobs' agent builds | none | 0 |
 | `webrtc` ([`:3242`](../.github/workflows/ci.yml#L3242)) | ubuntu-latest | `--lib`, with the `webrtc-sctp`, `webrtc-ice` and `rtp` forks given as `--config` patches: the fork calls their patched API, and against crates.io's copies it does not compile. On Windows, `test-binds.yml` runs the same tests under the bind audit, where three that bind off loopback on purpose are ignored ([above](#how-tests-bind-4500)) | none | 149 passed, 1 ignored upstream (`test_rtp_transceiver_stopping`) |
-| `webrtc-ice` ([`:3251`](../.github/workflows/ci.yml#L3251)) | ubuntu-latest | `--lib`. Since FR-148 P4 the fork holds the carrier rank, and `agent_carrier_rank_test.rs` is its only proof | the four `mdns::mdns_test::*` cells, since FR-148 P4: one of them hung for minutes on a Windows box | 134 passed, and `test_udp_mux` failed on a WSL2 host (below) |
-| `webrtc-sctp` ([`:3265`](../.github/workflows/ci.yml#L3265)) | ubuntu-latest | `--lib` | `fuzz_artifact_test::packet_crash_artifacts` and `fuzz_artifact_test::param_crash_artifacts`: both read `fuzz/artifacts`, which the crates.io package does not ship | 181 passed |
-| `wintun-bindings` ([`:3281`](../.github/workflows/ci.yml#L3281)) | windows-latest | `--lib --all-features`: the features the agent ships (`tun` asks for `panic_on_unsent_packets`, `async`, `enable_inner_logging` and `winreg`) and `verify_binary_signature`, which the fork's one test needs. It checks the publisher's signature on the bundled `wintun/bin/amd64/wintun.dll`, with no driver, no admin and no revocation fetch | none | 1 passed, natively on Windows |
+| `webrtc-ice` ([`:3251`](../.github/workflows/ci.yml#L3251)) | ubuntu-latest | `--lib`. Since FR-148 P4 the fork holds the carrier rank, and `agent_carrier_rank_test.rs` is its only proof | none | 134 passed with the four mDNS cells skipped, and each of the four passed alone; `test_udp_mux` failed on a WSL2 host (below) |
+| `webrtc-sctp` ([`:3255`](../.github/workflows/ci.yml#L3255)) | ubuntu-latest | `--lib` | `fuzz_artifact_test::packet_crash_artifacts` and `fuzz_artifact_test::param_crash_artifacts`: both read `fuzz/artifacts`, which the crates.io package does not ship | 181 passed |
+| `wintun-bindings` ([`:3271`](../.github/workflows/ci.yml#L3271)) | windows-latest | `--lib --all-features`: the features the agent ships (`tun` asks for `panic_on_unsent_packets`, `async`, `enable_inner_logging` and `winreg`) and `verify_binary_signature`, which the fork's one test needs. It checks the publisher's signature on the bundled `wintun/bin/amd64/wintun.dll`, with no driver, no admin and no revocation fetch | none | 1 passed, natively on Windows |
 
 **Each entry** names its runner, its timeout (15 minutes each), its `args` to cargo and, where
 it needs them, its `patches` and `system-deps`. Its skips sit in `skip`, one exact test name a
 line, with their reason in a comment above them. The step
-([`ci.yml:3292-3305`](../.github/workflows/ci.yml#L3292-L3305)):
+([`ci.yml:3282-3295`](../.github/workflows/ci.yml#L3282-L3295)):
 
 - copies the workspace's `Cargo.lock` into the fork, so the fork's tests run against the
   versions the agent ships with, where a build of its own would resolve the newest. Cargo keeps
@@ -577,7 +577,7 @@ follow-up.
 
 **The audit**, [`scripts/vendored-lanes-audit.sh`](../scripts/vendored-lanes-audit.sh), runs in
 the job `vendored-lanes-audit`
-([`ci.yml:3307-3331`](../.github/workflows/ci.yml#L3307-L3331)), check "Every vendored fork has a
+([`ci.yml:3297-3321`](../.github/workflows/ci.yml#L3297-L3321)), check "Every vendored fork has a
 test lane (#4503)". It lists the directories under `crates/vendored/` that hold a `Cargo.toml`
 and the `crate:` of each entry under the job's `matrix:` `include:`, and fails, naming each, on
 a fork with no entry, an entry that names no fork, an entry with no `crate:`, a fork that two
@@ -615,9 +615,10 @@ Known limits:
   networking mode, alone too. Its three connections are each registered by their first
   packet, and then only one of them carries its 8 KiB datagrams. It passed in the old
   `vendored-ice` job on ubuntu-latest, where the entry runs, so it is not skipped.
-- The four mDNS cells that the `webrtc-ice` entry skips pass on Linux, in 2 s or less each. The
-  fork's patch leaves `src/mdns/` alone, but the two connection cells resolve the other agent's
-  `.local` names, the path #1740 patched.
+- The four upstream mDNS cells of `webrtc-ice` run on ubuntu-latest since #4536, and no entry
+  runs them on Windows: one of them hung for minutes on a Windows box. The fork's patch leaves
+  `src/mdns/` alone, but the two connection cells resolve the other agent's `.local` names, the
+  path #1740 patched, so they exercise it. Each passed alone on Linux, in 2 s or less.
 - No test of `wintun-bindings`' own covers its patch (an adapter's drop leaves the NetworkList
   entries alone), and `scrap` has no tests: their entries prove that each fork builds as a test
   binary, and run what it has.
@@ -983,7 +984,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8290`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8314`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -1006,7 +1007,7 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
 | `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
 | `rtp:av1` | MF's AV1 | MF |
-| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5491`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5530`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
 | `named` | `encode::open_named`: an FFmpeg name past every cascade and the denylist; an MF cell's name, that MF cascade alone (MF still refuses a denied MF cell) | FFmpeg; an MF name asks for MF, not hardware |
 
@@ -1062,7 +1063,7 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
   to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
   beside `hw_encoders` for that join: the legacy label is enumeration-only
-  (`agents/roomlerd/src/encode/caps.rs:4582`), so on Windows it says `mf-h264-hw` even where the
+  (`agents/roomlerd/src/encode/caps.rs:4588`), so on Windows it says `mf-h264-hw` even where the
   cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.

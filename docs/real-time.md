@@ -268,7 +268,7 @@ seat they hold in a call of that org or room goes at once, on whichever pod serv
 When no word of it reaches that pod, the pod finds it by its own seat check, within 40 s
 ([below](#the-pod-serving-a-call-checks-its-own-seats)).
 The membership's owner tells `conference` through core's `MembershipLifecycle` hook
-(`crates/core/src/hooks.rs:194`), after the membership row is gone, so nothing can be
+(`crates/core/src/hooks.rs:230`), after the membership row is gone, so nothing can be
 admitted on it again while the seats are withdrawn. A room deleted mid-call ends every
 membership of it at once, and so its whole call
 ([below](#a-room-deleted-mid-call-ends-its-call)).
@@ -586,7 +586,7 @@ every membership of it at once: `cascade_delete` (`dao/room.rs:348`) removes the
 document and its `room_members` rows, and the call sessions those rows held go with them.
 The call running in the room ends with them, for everyone in it, on whichever pod serves
 it. `chat` tells `conference` through `MembershipLifecycle::room_removed`
-(`crates/core/src/hooks.rs:229`) once the room is gone
+(`crates/core/src/hooks.rs:265`) once the room is gone
 (`crates/modules/chat/src/room.rs:393`).
 
 ```mermaid
@@ -656,7 +656,7 @@ sequenceDiagram
   answered late, and nothing failed (`RoomClose::Owner` with no seats); a claim that still
   names it, as a crashed pod's does until its record runs out, is pruned and stays a
   failure. Every holder of `room_removed` runs even when one before it fails
-  (`crates/core/src/hooks.rs:394`), and the error names each failure. A stats record that
+  (`crates/core/src/hooks.rs:430`), and the error names each failure. A stats record that
   does not close behind the reconcile or a guard of a join or a start is closed by the stats
   rollup's orphan sweep as `stale_reset` within 15 minutes (`maintenance.rs:63`
   `close_orphaned_call_state`, each cycle at `crates/api/src/stats_rollup.rs:633`).
@@ -889,7 +889,7 @@ more packets than one worker carries without it.
 
 **Reading it.** `GET /api/cluster/status` gains `local.media_video_paused` — the video
 consumers held back by their viewers' views, never the owner's FR-30 pause
-(`crates/api/src/cluster/metrics.rs:96`, from `MediaGauges::video_paused_total`,
+(`crates/api/src/cluster/metrics.rs:100`, from `MediaGauges::video_paused_total`,
 `crates/modules/conference/src/lib.rs:128`) — and each row of `media_rooms_detail` its
 `video_paused`. With `RUST_LOG=roomler_ai_mod_conference=debug` every applied report logs
 `view applied` with `resumed` and `paused` counts. What this lever buys in packets, and the
@@ -918,7 +918,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
-| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1305`), `RETIRED_RC_TAG_FAMILIES` (`:1334`), `RETIRED_USER_WS_NAMESPACES` (`:1339`) and `RETIRED_MODULE_IDS` (`:1343`), locked by `retired_rpc_verbs_are_never_reused` (`:8658`), `retired_wire_families_and_module_ids_are_never_reused` (`:8727`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `crates/remote_control/src/signaling.rs:5325`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1327`), `RETIRED_RC_TAG_FAMILIES` (`:1356`), `RETIRED_USER_WS_NAMESPACES` (`:1361`) and `RETIRED_MODULE_IDS` (`:1365`), locked by `retired_rpc_verbs_are_never_reused` (`:8980`), `retired_wire_families_and_module_ids_are_never_reused` (`:9049`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `crates/remote_control/src/signaling.rs:5325`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 
@@ -1013,6 +1013,22 @@ UDP-blocked:
   an older daemon, with the same precedence and the same challenge
   ([scripts/relay-pop/README.md](../scripts/relay-pop/README.md#the-admission-ticket-and-the-access-log-3656)).
 
+**A token rotation (FR-155 P1d).** While the agent token rotation is on, the central
+relay admits a registration only at the device's current token generation, and a
+rotation ends the device's registrations below its new generation on every pod
+([overlay-communication.md § 6](overlay-communication.md#server-side)). A refused
+registration wrote nothing, and its line says why:
+
+| Line | Fields | What refused it |
+|---|---|---|
+| `derp: REFUSED at registration` | `reason`, `generation`, `row_gen`, `at=registration` | the row, read on the primary after the registration frame: removed, quarantined, or of another generation (the upgrade's `reason`) |
+| `derp: REFUSED — agent row unavailable` | `e`, `at=registration` | the row could not be read within 10 s; DERP fails closed, as at its upgrade |
+| `derp: registration REFUSED — below the generation this pod admits for the device; closing` | `generation`, `floor`, `at=registration` | the floor of a rotation this pod applied, or the registration of a higher generation in place for the key, which stays |
+
+A registration that a rotation ended closes with
+`derp: closing: a token rotation ended this connection (by=rotated)`, then the usual
+`derp: node disconnected`.
+
 ## Connection hygiene
 
 - Agents keep one outbound WSS control link: WS ping every 25 s,
@@ -1070,7 +1086,7 @@ flowchart LR
 | `cause` | its fields | what ended the socket |
 |---|---|---|
 | `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
-| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2336`) |
+| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2343`) |
 | `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
 | `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:603`). The check runs on a tick, so `elapsed_s` reads past the deadline |
 | `cancelled` | `by` | the Hub cancelled the loop; `by` below |

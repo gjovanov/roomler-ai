@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2163`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:3417`).
+(`agents/roomlerd/src/signaling.rs:3430`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -250,10 +250,10 @@ population this FR targets* — can take the slot. A stolen bind black-holes the
 receives the counterparty's ciphertext, and injects arbitrary UDP at its WireGuard socket.
 
 ⚠️ The first draft also cited the key-equality assertion on DERP registration (then in
-`crates/api/src/ws/derp.rs`, now `crates/modules/network/src/derp.rs:514`) as the precedent to
+`crates/api/src/ws/derp.rs`, now `crates/modules/network/src/derp.rs:591`) as the precedent to
 copy — but that check works **because the WebSocket underneath it is already authenticated**
-by the agent JWT (`crates/modules/network/src/derp.rs:338` `verify_agent_token`, `:350` tenant
-match, `:397` refusal check). Copying the assertion without the channel copies
+by the agent JWT (`crates/modules/network/src/derp.rs:342` `verify_agent_token`, `:354` tenant
+match, `:401` refusal check). Copying the assertion without the channel copies
 a check whose authentication came from somewhere else.
 
 ### The design
@@ -410,7 +410,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
 claimed four default-deny gates; there are three. `OverlayAclMode` derives `#[default] Off`
-(`crates/remote_control/src/models.rs:1918`), documented as *"every node sees every peer…
+(`crates/remote_control/src/models.rs:1940`), documented as *"every node sees every peer…
 The default, so enabling the feature never breaks a live mesh"*; `Warn` *"ship[s] the
 permissive netmap"*; and `CLAUDE.md`'s own open-issues list records that **nothing has ever
 run under `enforce` in the field**. Tailscale's `cap/relay` is an *affirmative grant*; a
@@ -696,7 +696,7 @@ the count `stale_drops()` reads (`transport/derp.rs:461`) as `dropped_stale` whe
 | surface | addition |
 |---|---|
 | `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`agents/roomler-cli/src/localclient.rs:2251`) |
-| `roomler peers --json` | `relay_kind: "org"`, `relay_transport: "udp"` and `relay_server`, the relay node's name (`PeerInfo`, `crates/localapi/src/lib.rs:930`; `OrgRelayConn::relay_server`, `crates/tunnel-core/src/overlay/orgrelay/client.rs:347-349`) |
+| `roomler peers --json` | `relay_kind: "org"`, `relay_transport: "udp"` and `relay_server`, the relay node's name (`PeerInfo`, `crates/localapi/src/lib.rs:942`; `OrgRelayConn::relay_server`, `crates/tunnel-core/src/overlay/orgrelay/client.rs:347-349`) |
 | `roomler why <peer>` | the relay row names the kind; the tier ladder is unchanged (§6) |
 | `roomler status` | relay node: an `org relay` line with the bound `ip:port` and `reachable (probes answered)`, or `bound — NOT yet proven reachable` until a probe is answered, then `answered=… refused: shape=… not-probe=… rate=…` (`print_status`, `agents/roomler-cli/src/localclient.rs:2858-2872`). `roomler netcheck` prints no org-relay line |
 | relay node | **one counter per refusal reason** in `RelayStats` (`crates/tunnel-core/src/overlay/orgrelay/server.rs:44-69`): unknown VNI, unbound source, not yet bound, session expired or idle, past the bind deadline, at the session cap, rate-limited, not relay-shaped, unknown control, and `drop_bad_tag1` / `drop_bad_cookie` / `drop_bad_tag2`, beside `forwarded`, `bound` and the session counts. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood. Two readers: `roomler status` (the probe responder's counters, above) and a daemon log line, `org-relay server counters`, every 300 s when they have changed (`report_loop`, `agents/roomlerd/src/relay_server.rs:143`). ⚠️ That line carries 13 counters. The session cap, `refused_not_shaped`, `refused_unknown_control` and the not-yet-bound, expired, idle and bind-deadline drops have no reader (`relay_stats()`, `:66`, has no caller). There are no per-session packet or byte counts, and no wrong-tenant reason |
@@ -739,7 +739,7 @@ Verified against `origin/master`, 2026-08-28.
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3291`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3352`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 

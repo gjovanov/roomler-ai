@@ -129,7 +129,7 @@ per permission `roomlerd` needs:
 
 | Row, as the person reads it | Without it | Live state from | Button |
 |---|---|---|---|
-| **See the screen** — Screen & System Audio Recording | "The remote screen is blank." | a fresh `roomlerd` child probe, because the running process's read stays false until a restart (`crates/localapi/src/lib.rs:551-563`); that macOS attributes the child to `roomlerd.app` is to verify in the field | "Open Screen & System Audio Recording" |
+| **See the screen** — Screen & System Audio Recording | "The remote screen is blank." | a fresh `roomlerd` child probe, because the running process's read stays false until a restart (`crates/localapi/src/lib.rs:563-575`); that macOS attributes the child to `roomlerd.app` is to verify in the field | "Open Screen & System Audio Recording" |
 | **Control the mouse and keyboard** — Device Control and Data Access (macOS 27), Accessibility (earlier) | "Clicks and keys from the controller do nothing." | `AXIsProcessTrusted`, live (`tcc.rs:69-71`) | "Open Device Control and Data Access" |
 | **Reach this network** — Local Network | "A controller on the same network connects through the internet or a relay instead of directly." | the agent's own sends: the last result of a multicast or local-address send | "Ask now", then "Open Local Network" once answered |
 | **Show the screen without a monthly question** — the screen-capture reminder | "macOS asks again about every 30 days, and the question covers the screen until someone answers it." | the agent's own record of when it last saw the reminder answered (replayd's own record, if a process of ours may read it: to verify in the field) | "Ask now" (one capture) |
@@ -189,9 +189,9 @@ then shows today's two rows.
 
 | The Mac's state | The viewer says | Signal |
 |---|---|---|
-| Screen Recording off | "This Mac has not allowed roomlerd to record its screen, so there is no picture. Someone at the Mac must turn it on: Roomler menu-bar app → Permissions." | `rc:media-unavailable` `permission`, which exists (`capture/mod.rs:811-815`) |
+| Screen Recording off | "This Mac has not allowed roomlerd to record its screen, so there is no picture. Someone at the Mac must turn it on: Roomler menu-bar app → Permissions." | `rc:media-unavailable` `permission`, which exists (`capture/mod.rs:812-816`) |
 | Screen Recording stale | "macOS no longer accepts this Mac's screen permission for roomlerd. This can happen after an update. Someone at the Mac must repair it: Roomler menu-bar app → Permissions → Repair." | the same code with a `stale` detail, additive |
-| Control off | "Your clicks and keys do not reach this Mac: roomlerd is not allowed to control it (Device Control and Data Access). Someone at the Mac must turn it on." | a new `rc:` notice from the input arbiter when it drops events for want of the grant (it already re-reads the grant once a second, `docs/remote-control.md:1838-1847`) |
+| Control off | "Your clicks and keys do not reach this Mac: roomlerd is not allowed to control it (Device Control and Data Access). Someone at the Mac must turn it on." | a new `rc:` notice from the input arbiter when it drops events for want of the grant (it already re-reads the grant once a second, `docs/remote-control.md:2148-2157`) |
 | macOS is asking now, the picture is live | "The Mac is showing a macOS question for roomlerd. Click Allow in the picture." | the agent sees it: Local Network by its own sends failing with `EHOSTUNREACH`; the picker by a window above the captured display at the alert layer, owned by a system process from a per-version table, appearing as capture starts (the owners are to verify in the field per version) |
 | A question nobody can reach from here (no picture, a locked screen, the login window) | "macOS is waiting for an answer at the Mac, and it cannot be given from here. Someone at the Mac must answer it." | the same detection with no live picture |
 

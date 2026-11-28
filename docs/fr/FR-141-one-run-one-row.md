@@ -115,7 +115,7 @@ What each layer has to do. The daemon needs nothing new: FR-43 P3a, P3b and P3d 
 |---|---|---|
 | Pages (`app.js`, `index.html`) | "both" = two rows; a second token field | "Screen and private network" = one row while `wizard_macos_one_row` is on; one token field; Done names one row |
 | Roles and tokens (`role.rs`, `commands.rs`, `pairing.rs`) | `wants_root_half` → `halves: 2`, a root token and a person's token | a third shape beside "screen only" and "two rows": one token, `halves: 1`, which enrolls the ROOT half |
-| Enrollment (`orchestrator_unix.rs:1008-1103`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:9130-9136`); no person's enrollment, no `--user-steps` |
+| Enrollment (`orchestrator_unix.rs:1008-1103`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:9154-9160`); no person's enrollment, no `--user-steps` |
 | Privileged half (`install.sh --privileged-steps --config-from`) | marker, package, config placed, daemon started | as built (#4152), `--privileged-steps --one-row --config-from FILE`, in `install_macos_one_row_half` (`install.sh:1139-1184`): a root config there already stops it, unless it holds this attempt's own `agent_id` (a Retry's); the marker; root's config placed, or the Retry's kept; ONE package run, whose guard reads the switch, removes the LaunchAgent and starts the root half (`postinstall:380-432`); then the binary's `enroll --help` must list `--one-row`, the belt the terminal's form has too (`install.sh:1077-1082`). The terminal's `--one-row` on a Mac that is one row already runs the package only (`install.sh:1047-1065`). The two-row form stops on a root config that is one row already (the 2026-11-21 line below) |
 | Server pairing (`crates/modules/fleet/src/pairing.rs:326-334`) | `halves: 2` for a macOS daemon only | no change: `halves: 1` is accepted for every OS. `halves: 2` stays for two-row installs and older wizards. The `/pair` page shows its two-entries note only for `halves === 2` (`ui/src/views/pair/PairView.vue:110-111`) |
 | Server features (`/api/setup/features`) | `wizard_macos_daemon` | a new key, `wizard_macos_one_row`, default off |
@@ -236,7 +236,7 @@ person's half on it and says why.
   says it is one row gets no install and no pairing at all, not a package-only road (which waits for a field need).
   The wizard runs as the person and cannot read root's config, so it asks the root daemon itself over the person
   socket root serves the console user (`/var/run/roomler-person/<uid>.sock`), which admits `status`
-  (`crates/localapi/src/lib.rs:3811-3813`) and passes it through whole (`:3940-3962`). The read is bounded to 3 s and
+  (`crates/localapi/src/lib.rs:3823-3825`) and passes it through whole (`:3952-3974`). The read is bounded to 3 s and
   believed only from a socket root serves; unknown is never one row. The stop is one decision
   (`agents/roomler-setup/src/reinstall_guard.rs`, `stop`) asked on the Welcome page, at pairing start and in the
   install's preflight. It sits behind `wizard_reinstall_guard`, default on, NOT behind P2's switch: the terminal makes
@@ -254,9 +254,9 @@ person's half on it and says why.
     writes it, a finished revert removes it (`:3205-3210`), and with no copy the revert says only "nothing to revert"
     (`:3279-3284`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
     is not named: it keeps the config. The words are `stop_text`'s (`agents/roomler-setup/src/reinstall_guard.rs`).
-  - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5914-5918`), so
-    it asks the system socket (`:4970-4972`), the root daemon's own, through the same root-only connect
-    (`:6251-6254`): `status` alone, under the same 3 s bound, believed only through `one_row_from`. A person's road is
+  - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5926-5930`), so
+    it asks the system socket (`:4982-4984`), the root daemon's own, through the same root-only connect
+    (`:6263-6266`): `status` alone, under the same 3 s bound, believed only through `one_row_from`. A person's road is
     unchanged, and a person with no person socket asks nothing, never the system socket (`socket_to_ask`). The only
     root road on a Mac is a person starting the wizard as root: it never elevates itself there
     (`crates/roomler-setup-core/src/elevation.rs:231-235`), its command line has no headless mode
@@ -293,7 +293,7 @@ on the Devices page.
 - [ ] **AC1**: macOS 15 or later, the released wizard, **pairing**, the default choice, one-row switch on: **one**
   row, online. From that row on the Devices page: its overlay address(es) shown, a remote-desktop session that
   streams and takes input; `sudo roomler peers` lists the mesh; a ping over the overlay both ways; `roomler ssh`
-  once the device's `ssh_enabled` is on (`docs/installation.md:3200-3201`).
+  once the device's `ssh_enabled` is on (`docs/installation.md:3204-3205`).
 - [ ] **AC2**: the same with a **pasted** token: one field, one token, one row.
   P0 read, cell M2 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)): the
   paste path with the default choice still asks for two tokens and leaves two rows, so AC2 is not held yet.

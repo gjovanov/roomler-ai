@@ -18,7 +18,10 @@ use axum::{
 };
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_mod_fleet::agent::org_accepts_enrollment;
+use roomler_ai_mod_fleet::agent::{
+    AgentPresence, derive_tunnel_client_presence, org_accepts_enrollment,
+    tunnel_client_presence_batch,
+};
 use roomler_ai_remote_control::models::{
     AgentStatus, DestinationRule, NodeRef, OsKind, PolicySubject, PolicyTarget, TunnelClient,
 };
@@ -700,12 +703,22 @@ pub struct TunnelClientResponse {
     pub machine_id: String,
     pub os: OsKind,
     pub client_version: String,
+    /// The admin's state (`online`/`offline` = active, `quarantined`,
+    /// `revoked`), never presence: no socket writes it (#4553).
     pub status: AgentStatus,
     pub last_seen_at: String,
+    /// #4553 — `online` | `stale` | `offline`, from the client's live
+    /// tunnel socket (`fleet::agent::derive_tunnel_client_presence`, the
+    /// derivation the unified device list reads too).
+    pub presence: AgentPresence,
+    /// `presence == online`, as on an agent.
+    pub is_online: bool,
 }
 
 fn to_tunnel_client_response(
     c: roomler_ai_remote_control::models::TunnelClient,
+    presence: AgentPresence,
+    is_online: bool,
 ) -> TunnelClientResponse {
     TunnelClientResponse {
         id: c.id.map(|i| i.to_hex()).unwrap_or_default(),
@@ -719,12 +732,14 @@ fn to_tunnel_client_response(
         client_version: c.client_version,
         status: c.status,
         last_seen_at: c.last_seen_at.try_to_rfc3339_string().unwrap_or_default(),
+        presence,
+        is_online,
     }
 }
 
 /// GET /api/tenant/{tenant_id}/tunnel-client — paginated list of
-/// enrolled tunnel clients for the tenant. Mirrors `list_agents`.
-/// T2 extends with the WS-live `is_online` derivation.
+/// enrolled tunnel clients for the tenant. Mirrors `list_agents`: each row
+/// carries its client's presence, read from its live socket (#4553).
 pub async fn list_tunnel_clients(
     State(state): State<NetworkState>,
     auth: AuthUser,
@@ -739,10 +754,15 @@ pub async fn list_tunnel_clients(
     }
 
     let page = state.tunnel_clients.list_for_tenant(tid, &params).await?;
+    let directory = tunnel_client_presence_batch(&state.fleet, &page.items).await;
     let items: Vec<TunnelClientResponse> = page
         .items
         .into_iter()
-        .map(to_tunnel_client_response)
+        .map(|c| {
+            let (presence, is_online) =
+                derive_tunnel_client_presence(&state.fleet, &c, directory.as_ref());
+            to_tunnel_client_response(c, presence, is_online)
+        })
         .collect();
 
     Ok(Json(serde_json::json!({
@@ -836,9 +856,12 @@ pub async fn update_tunnel_client(
     }
 
     let client = state.tunnel_clients.find_live_in_tenant(tid, cid).await?;
+    let directory = tunnel_client_presence_batch(&state.fleet, std::slice::from_ref(&client)).await;
+    let (presence, is_online) =
+        derive_tunnel_client_presence(&state.fleet, &client, directory.as_ref());
     Ok(Json(serde_json::json!({
         "updated": true,
-        "client": to_tunnel_client_response(client),
+        "client": to_tunnel_client_response(client, presence, is_online),
         "dns_renamed": dns_renamed,
         "dns_name": dns_name,
     })))

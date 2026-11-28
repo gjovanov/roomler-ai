@@ -212,7 +212,7 @@ pub async fn handle_forward_request(
 /// stream — so the WebRTC ceremony (`wait_pool_ready` / `pool_size` /
 /// `demux.register`) collapses to: decide + dial, reply
 /// `TcpForwardAccept`, grab the client-opened flow stream from the
-/// peer's rendezvous, then drive [`tunnel_core::forward::run_flow_quic`].
+/// peer's rendezvous, then drive [`tunnel_core::forward::run_flow_quic_until`].
 ///
 /// Ordering: we send `TcpForwardAccept` BEFORE awaiting the stream,
 /// because the client opens its QUIC stream only after it sees the
