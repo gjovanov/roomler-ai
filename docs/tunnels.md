@@ -1255,8 +1255,16 @@ established beside the first, promoted, the first drained.
 | `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:445`](../crates/tunnel-core/src/driver.rs) · `carry` `:606` · `dead` `:770` |
 | `FlowListener` | the flow's port: bound **once**, an accept task hands each connection to the current carrier — or **holds** it while there is none — under one lock, so "no carrier ⇒ hold" and "install ⇒ drain the hold" cannot interleave to strand one, and (#1816) the hand-off itself — `carry`, which counts the connection — runs under that lock too, so it cannot interleave with a promotion's swap | [`flow_listener.rs:90`](../crates/tunnel-core/src/flow_listener.rs) · `install` `:150` · `offer` `:197` |
 | `HoldPolicy` | the hold's bounds: at most **64** connections, each for at most **30 s**; past either bound the connection is **closed** (the client sees EOF), never refused | [`flow_listener.rs:67`](../crates/tunnel-core/src/flow_listener.rs) |
-| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1361`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1523` `run_flow_cycle` |
+| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1391`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1553` `run_flow_cycle` |
 | the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:893`](../crates/tunnel-core/src/driver.rs) |
+
+**A quic-v1 session ends with the control socket it was opened over** (#4501, FR-158
+P1b). When the daemon's control WS drops, its `SinkGuard` ends every flow's quic-v1
+session: the session's Source ends, its carrier reads `dead()`, and the flow's next
+cycle opens a session on the next socket while the listener holds new connections.
+One that becomes the flow's only as the socket drops (an open finishing then, or a
+re-upgrade promoted after it) ends there (`end_if_its_socket_dropped`). A session on
+another transport is left as it was.
 
 ```mermaid
 sequenceDiagram
@@ -1355,7 +1363,7 @@ sequenceDiagram
 ```
 
 The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_mgr.rs) ·
-[`client_mgr.rs:937`], mapped to deadlines by [`ProbeTimer`] `:974`), reset on a netwatch
+[`client_mgr.rs:962`], mapped to deadlines by [`ProbeTimer`] `:999`), reset on a netwatch
 **Major** and after a **promotion**, at most **one candidate per flow** in flight:
 
 | Failed probes | Next probe after |
@@ -1368,10 +1376,10 @@ The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_m
 
 | Piece | What it is | Where |
 |---|---|---|
-| the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:1017`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:1037` |
-| the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1233`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1270` · `CandidateGuard` `:1197` |
-| promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1523`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
-| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:1160`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:1131` · `spawn_drain` `:1188` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:586` |
+| the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:1042`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:1062` |
+| the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1262`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1299` · `CandidateGuard` `:1226` |
+| promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1553`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
+| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:1189`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:1160` · `spawn_drain` `:1217` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:586` |
 
 ⚠️ **A draining connection is NEVER cut, and there is no maximum drain time.** An RDP
 session that lives for hours keeps its old carrier for hours. The old carrier is dropped

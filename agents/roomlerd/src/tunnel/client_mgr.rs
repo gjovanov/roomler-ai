@@ -809,6 +809,31 @@ fn end_quic_v1_sessions(hub: &TunnelClientHub) -> usize {
         .count()
 }
 
+/// FR-158 P1b: end the flow's quic-v1 session when the control socket it was
+/// opened over (`egress`) is no longer the hub's, and say whether it was.
+/// [`SinkGuard`] ends the sessions the flows run as their socket drops; this
+/// ends one that became the flow's as it dropped (an open that finished then,
+/// or a re-upgrade promoted after it). It runs after the flow's live cells
+/// name the session, and the guard clears the sink before it reads them, so
+/// one of the two always ends it.
+fn end_if_its_socket_dropped(
+    hub: &TunnelClientHub,
+    live: &FlowLive,
+    egress: &mpsc::Sender<ClientMsg>,
+) -> bool {
+    if live.transport.lock().unwrap().as_deref() != Some(TRANSPORT_QUIC_V1)
+        || hub.sink_now().is_some_and(|now| now.same_channel(egress))
+    {
+        return false;
+    }
+    let Some(sid) = *live.session_id.lock().unwrap() else {
+        return false;
+    };
+    // The guard may have ended it already; either way it is over.
+    hub.inner.client_sessions.lock().unwrap().remove(&sid);
+    true
+}
+
 /// The signaling-loop hook (mirrors `overlay::intercept`): consume a
 /// client-bound `ServerMsg` (→ `None`) or pass it through (→ `Some`).
 pub fn intercept_server_msg(hub: &TunnelClientHub, msg: ServerMsg) -> Option<ServerMsg> {
@@ -1076,6 +1101,10 @@ enum CandidateOutcome {
         carrier: Box<Carrier>,
         session_id: ObjectId,
         transport: &'static str,
+        /// The egress of the control socket the candidate was opened over:
+        /// a quic-v1 one promoted after that socket dropped ends at once
+        /// ([`end_if_its_socket_dropped`], FR-158 P1b).
+        egress: mpsc::Sender<ClientMsg>,
     },
     /// No better transport this round (setup failed / errored). Nothing to clean
     /// up — the candidate task already reaped its own demux entries.
@@ -1324,6 +1353,7 @@ async fn establish_candidate(
                         carrier: Box::new(carrier),
                         session_id,
                         transport,
+                        egress: sink_tx.clone(),
                     };
                 }
                 // The server negotiated something not actually better than the
@@ -1622,6 +1652,16 @@ async fn run_flow_cycle(
         }
     };
 
+    // FR-158 P1b: a quic-v1 session that opened as its control socket dropped
+    // ends before it serves. The connections held stay held, and the next
+    // cycle opens on the new socket.
+    if end_if_its_socket_dropped(hub, live, &sink_tx) {
+        end_session(hub, live);
+        return Cycle::Failed(anyhow::anyhow!(
+            "the control socket dropped as the session opened"
+        ));
+    }
+
     // #1685 / FR-86 P1 — the carrier is behind the listener: the flow SERVES.
     let handed = listener.install(Arc::clone(&active));
     live.mark_listening();
@@ -1689,7 +1729,7 @@ async fn run_flow_cycle(
                     *cand_task = None;
                     let now = tokio::time::Instant::now();
                     match res {
-                        Some(CandidateOutcome::Established { carrier, session_id, transport })
+                        Some(CandidateOutcome::Established { carrier, session_id, transport, egress })
                             if transport_rank(transport) > transport_rank(active.transport()) =>
                         {
                             let old_t = active.transport();
@@ -1701,6 +1741,16 @@ async fn run_flow_cycle(
                             *live.transport.lock().unwrap() = Some(transport.to_string());
                             *live.session_id.lock().unwrap() = Some(session_id);
                             info!(flow = %flow_id, "flow re-upgraded {old_t} → {transport}");
+                            // FR-158 P1b: promoted after the control socket it
+                            // was opened over dropped, it ends at once; its
+                            // carrier reads dead, so this cycle ends and the
+                            // next opens on the new socket.
+                            if end_if_its_socket_dropped(hub, live, &egress) {
+                                info!(
+                                    flow = %flow_id,
+                                    "the re-upgraded session's control socket dropped; it ends, and the next opens on the new socket"
+                                );
+                            }
                             let old = std::mem::replace(&mut active, new);
                             let old_sid = old.session_id();
                             drains.push(spawn_drain(hub, old_sid, old));
@@ -2743,6 +2793,44 @@ mod tests {
                     .unwrap()
                     .contains_key(&oid(*n))
             );
+            let open = tokio::time::timeout(Duration::from_millis(100), source.recv()).await;
+            assert!(open.is_err(), "session {n}: its source stays open");
+        }
+    }
+
+    /// FR-158 P1b: a quic-v1 session that becomes a flow's after the control
+    /// socket it was opened over dropped (an open that finished as it did, or
+    /// a re-upgrade promoted after it) ends too, whether or not the next
+    /// socket is up. One on the hub's socket, or on another transport, is left
+    /// as it was.
+    #[tokio::test]
+    async fn a_quic_session_opened_over_a_socket_that_dropped_ends_when_it_becomes_the_flows() {
+        let hub = TunnelClientHub::new("t".into());
+        let (old, _old_rx) = mpsc::channel::<ClientMsg>(1);
+        drop(hub.publish_sink(old.clone()));
+        let mut late = a_flow_running(&hub, 1, TRANSPORT_QUIC_V1);
+        assert!(
+            end_if_its_socket_dropped(&hub, &late.live, &old),
+            "no socket up"
+        );
+
+        let (new, _new_rx) = mpsc::channel::<ClientMsg>(1);
+        let _socket = hub.publish_sink(new.clone());
+        let mut later = a_flow_running(&hub, 2, TRANSPORT_QUIC_V1);
+        assert!(
+            end_if_its_socket_dropped(&hub, &later.live, &old),
+            "the next socket up"
+        );
+        for (n, source) in [(1u8, &mut late), (2u8, &mut later)] {
+            let ended = tokio::time::timeout(Duration::from_secs(1), source.recv()).await;
+            assert!(matches!(ended, Ok(None)), "session {n}: its source ends");
+        }
+
+        let mut on_the_hubs = a_flow_running(&hub, 3, TRANSPORT_QUIC_V1);
+        let mut elsewhere = a_flow_running(&hub, 4, TRANSPORT_WEBRTC_DC_V1);
+        assert!(!end_if_its_socket_dropped(&hub, &on_the_hubs.live, &new));
+        assert!(!end_if_its_socket_dropped(&hub, &elsewhere.live, &old));
+        for (n, source) in [(3u8, &mut on_the_hubs), (4u8, &mut elsewhere)] {
             let open = tokio::time::timeout(Duration::from_millis(100), source.recv()).await;
             assert!(open.is_err(), "session {n}: its source stays open");
         }
