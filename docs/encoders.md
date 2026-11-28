@@ -1755,7 +1755,7 @@ What a rate move costs decided the shape of the rate-control code: nine of its
 heuristics exist only to ration that cost
 ([FR-62](fr/FR-62-encoder-rate-changes-without-an-idr.md)). The pump hands every
 AIMD target to `FfmpegEncoder::set_bitrate`
-(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3018`), which snaps it to the
+(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3026`), which snaps it to the
 ladder first (`encode/aimd.rs:507` — 100 k … 25 M, `coarsen_bitrate` at `:527`)
 and returns when the rung is the one already running. Only a rung crossing reaches
 the backend's arm, resolved once at open by `resolve_rate_mode` (`encoder.rs:869`).
@@ -1860,7 +1860,7 @@ FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 | `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:361`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:374`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
 | `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:371`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
 | `bg_rebuild_constrained` (`:515`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
-| `qsv_rate_mode` / `ROOMLERD_QSV_RATE_MODE` (`encode/ffmpeg/encoder.rs:3471`) | `cbr` | `qvbr`: an HEVC or H.264 QSV open leaves constant bitrate for QVBR, its target at 0.9 × the cap, and every rebuild follows ([below](#qsv-off-constant-bitrate-fr-148-p2)). `cbr` is today's open, byte for byte | FR-148 P5 deletes the constant-bitrate path, and the switch with it |
+| `qsv_rate_mode` / `ROOMLERD_QSV_RATE_MODE` (`encode/ffmpeg/encoder.rs:3479`) | `cbr` | `qvbr`: an HEVC or H.264 QSV open leaves constant bitrate for QVBR, its target at 0.9 × the cap, and every rebuild follows ([below](#qsv-off-constant-bitrate-fr-148-p2)). `cbr` is today's open, byte for byte | FR-148 P5 deletes the constant-bitrate path, and the switch with it |
 
 **Open**: QSV's `mfxExtEncoderResetOption` (patch 0004, an FFmpeg-level change),
 VideoToolbox's A0 on a Mac, and A4's per-backend retirements — NVENC can shed its
@@ -1883,7 +1883,7 @@ is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:983
 a rebuild-bound rate apply that waits for quiet waits for good: 0 rate moves in 16,719 s.
 
 `qsv_rate_mode = qvbr` (`ROOMLERD_QSV_RATE_MODE`) opens HEVC and H.264 QSV off that
-equality. `QsvRateOpen` (`encoder.rs:3444`) decides it once per open inside
+equality. `QsvRateOpen` (`encoder.rs:3452`) decides it once per open inside
 `build_encoder`, so every open that function makes is decided the same way: a session's
 first open (`new_with_dispatch_opts`, `encoder.rs:1676`), the probe's, the
 make-before-break rebuild (`open_rebuilt`, `:2612`), the rate, resolution and GPU-device
@@ -1984,7 +1984,7 @@ That charge does not reach the FFmpeg pump, so O18 asked what its encoders do wi
 same gap.
 
 **Every NVENC and AMF encoder holds, to the byte.** `o18_spend_after_a_hold`
-(`encoder.rs:4882-5300`) opens each encoder as a relayed session does (`new_preferred`
+(`encoder.rs:4890-5308`) opens each encoder as a relayed session does (`new_preferred`
 with `constrained`, as `FfmpegDcCodec::open` does at
 `agents/roomlerd/src/peer.rs:5542-5545`; `hevc_nvenc`
 4:4:4 through `new_hevc_adaptive`) and feeds it two arms, a fresh encoder each: three

@@ -2529,10 +2529,10 @@ mod tests {
     /// (e) A native geometry move through the capture fallback, and back, on a
     /// backend that re-rates in place. DXGI-direct's output grows from
     /// 1920x1080 to 3440x1440; AccessLost repeats and capture falls back to
-    /// GDI's virtual screen (6000x1440); the inline open for it lands inside a
-    /// capture stall, so its pass drops the frame (the decode-pressure skip),
-    /// and the controller's next tick is a congestion decrease; capture then
-    /// returns to DXGI at 1920x1080 and the encoder reopens there.
+    /// GDI's virtual screen (6000x1440); the inline open for it lands inside a capture
+    /// stall, so its pass drops the frame (the drain; in the field it was the decode-pressure
+    /// skip, which since #4513 passes it), and the controller's next tick is a congestion
+    /// decrease; capture then returns to DXGI at 1920x1080 and the encoder reopens there.
     #[test]
     fn a_native_move_through_the_capture_fallback_and_back_reads_zero_at_every_pass() {
         let (display, wide, virtual_screen) = ((1920, 1080), (3440, 1440), (6000, 1440));

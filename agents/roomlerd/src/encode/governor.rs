@@ -2141,6 +2141,21 @@ impl RateGovernor {
         false
     }
 
+    /// #4513 — [`Self::should_skip_delta_frame`] as both pumps call it, with
+    /// the encoder the pass feeds. A frame the encoder will code as a key
+    /// frame is never skipped and does not advance the counter: one asked for
+    /// in this pass (`forced`), and the first frame of an encoder that is
+    /// fresh (opened, adopted or rebuilt, and fed nothing since). The encoder
+    /// says so itself ([`crate::encode::thread::EncoderOps::is_fresh`]), so no
+    /// site that installs one has to. No encoder (`None`): gated as before.
+    pub fn should_skip_frame<E: crate::encode::thread::EncoderOps>(
+        &mut self,
+        forced: bool,
+        encoder: Option<&crate::encode::thread::EncoderHandle<E>>,
+    ) -> bool {
+        self.should_skip_delta_frame(forced || encoder.is_some_and(|e| e.is_fresh()))
+    }
+
     /// Per-heartbeat (2 s) step: fold the window's average encode time
     /// into the encode-pressure factor (applies to the ceiling from
     /// the next frame on), then the factor's saturation signal into
@@ -4455,6 +4470,157 @@ mod tests {
         assert!(
             g.should_skip_delta_frame(false),
             "cycle resumes where it was"
+        );
+    }
+
+    /// A governor whose decode-pressure skip runs at divisor 3, folded in as
+    /// the pattern test above folds it.
+    fn at_divisor_3(start: Instant) -> RateGovernor {
+        let mut g = gov(start);
+        let w = g
+            .tick_viewer_window(
+                start + Duration::from_secs(2),
+                30,
+                || 0,
+                || 0,
+                || 0,
+                false,
+                |_| 3,
+                0,
+            )
+            .expect("window due");
+        assert_eq!(w.skip_divisor, 3);
+        g
+    }
+
+    /// #4513 — the gate as both pumps call it, at divisor 3: a fresh
+    /// encoder's first frame, its key frame, is never skipped and does not
+    /// advance the counter, as a forced key frame does; the two delta frames
+    /// after it see the pattern a fresh counter gives. No encoder (the FFmpeg
+    /// pump's pass after its fallback dropped one) is gated as before, and at
+    /// divisor 1 nothing is skipped.
+    #[test]
+    fn skip_gate_never_sheds_a_fresh_encoders_first_frame() {
+        use crate::encode::thread::EncoderHandle;
+        use crate::encode::thread::stand_in::Counting;
+        let start = Instant::now();
+        let fresh = EncoderHandle::new(Counting::default(), false, "gate");
+        let used = EncoderHandle::new(Counting { frames: 1 }, false, "gate");
+        let none: Option<&EncoderHandle<Counting>> = None;
+        let mut fresh_counter = at_divisor_3(start);
+        let a_fresh_counter: Vec<bool> = (0..3)
+            .map(|_| fresh_counter.should_skip_frame(false, Some(&used)))
+            .collect();
+        assert_eq!(a_fresh_counter, [true, true, false]);
+
+        let mut g = at_divisor_3(start);
+        assert!(
+            !g.should_skip_frame(false, Some(&fresh)),
+            "a fresh encoder's first frame passes"
+        );
+        assert_eq!(g.frames_skipped_decode(), 0, "and is not counted");
+        let after: Vec<bool> = (0..3)
+            .map(|_| g.should_skip_frame(false, Some(&used)))
+            .collect();
+        assert_eq!(after, a_fresh_counter, "the counter did not move");
+        // Mid-cycle too: the cycle resumes where it was.
+        assert!(g.should_skip_frame(false, Some(&used)));
+        assert!(!g.should_skip_frame(false, Some(&fresh)));
+        assert!(
+            g.should_skip_frame(false, Some(&used)),
+            "cycle resumes where it was"
+        );
+        assert!(!g.should_skip_frame(false, Some(&used)));
+        // As before: a forced key frame passes, and no encoder reads as a
+        // delta frame.
+        assert!(!g.should_skip_frame(true, Some(&used)));
+        assert!(g.should_skip_frame(false, none));
+        // Divisor 1: nothing is skipped, whatever the encoder.
+        let mut one = gov(start);
+        assert!(!one.should_skip_frame(false, Some(&used)));
+        assert!(!one.should_skip_frame(false, Some(&fresh)));
+        assert!(!one.should_skip_frame(false, none));
+        assert_eq!(one.frames_skipped_decode(), 0);
+    }
+
+    /// #4513 "Done means" — with the decode-pressure skip on (divisor 3), the
+    /// first frame after an open is encoded, on both paths of the handle:
+    /// passes as both pumps run them (the gate with their encoder, then the
+    /// encode), an encoder opened mid-cycle on pass 3 and a replacement
+    /// adopted on pass 7. The pumps are out of a test's reach (a peer
+    /// connection, a capturer and an encoder behind a feature), so this drives
+    /// the unit both call, and `both_pumps_gate_with_their_encoder` pins that
+    /// they call it.
+    #[tokio::test]
+    async fn the_first_frame_after_an_open_is_encoded_under_decode_pressure() {
+        use crate::encode::thread::EncoderHandle;
+        use crate::encode::thread::stand_in::{Counting, frame};
+        for threaded in [false, true] {
+            let mut g = at_divisor_3(Instant::now());
+            let long_open = Counting { frames: 90 };
+            let mut encoder = Some(EncoderHandle::new(long_open, threaded, "done"));
+            let (mut encoded, mut keys) = (Vec::new(), Vec::new());
+            for pass in 0..12 {
+                if pass == 3 {
+                    encoder = Some(EncoderHandle::new(Counting::default(), threaded, "done"));
+                }
+                if pass == 7 {
+                    assert!(encoder.as_mut().unwrap().adopt_rebuilt(()).await);
+                }
+                if g.should_skip_frame(false, encoder.as_ref()) {
+                    continue;
+                }
+                let packets = encoder.as_mut().unwrap().encode(&frame()).await.unwrap();
+                encoded.push(pass);
+                if packets[0].is_keyframe {
+                    keys.push(pass);
+                }
+            }
+            assert_eq!(
+                keys,
+                [3, 7],
+                "threaded={threaded}: each open's key frame on its own pass"
+            );
+            assert_eq!(encoded, [2, 3, 6, 7, 10], "threaded={threaded}");
+            assert_eq!(g.frames_skipped_decode(), 7, "threaded={threaded}");
+        }
+    }
+
+    /// #4513 — both production pumps call the gate with their encoder, once
+    /// each, read from `peer.rs` as compiled; nothing there calls the gate
+    /// without one.
+    #[test]
+    fn both_pumps_gate_with_their_encoder() {
+        let src = include_str!("../peer.rs").replace("\r\n", "\n");
+        let pump = |head: &str| {
+            assert_eq!(src.matches(head).count(), 1, "one {head:?} in peer.rs");
+            let rest = &src[src.find(head).unwrap()..];
+            rest[..rest.find("\n}\n").expect("the pump's end")].to_owned()
+        };
+        for (name, head, gate) in [
+            (
+                "VP9-444",
+                "async fn media_pump_vp9_444_dc(",
+                "if governor.should_skip_frame(force_keyframe_this_iter, Some(&*enc)) {",
+            ),
+            (
+                "FFmpeg",
+                "async fn media_pump_ffmpeg_dc(",
+                "if governor.should_skip_frame(force_keyframe_this_iter, encoder.as_ref()) {",
+            ),
+        ] {
+            let body = pump(head);
+            assert_eq!(
+                body.matches("should_skip_frame(").count(),
+                1,
+                "{name}: one gate"
+            );
+            assert_eq!(body.matches(gate).count(), 1, "{name}: {gate}");
+        }
+        assert_eq!(
+            src.matches("should_skip_delta_frame(").count(),
+            0,
+            "a gate that reads no encoder"
         );
     }
 

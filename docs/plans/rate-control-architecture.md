@@ -82,7 +82,7 @@ rc_max_rate = target; rc_buffer_size = target × hrd_pct/100`** (CBR: TargetKbps
 MaxKbps). Fix the existing NVENC bug: the in-place arm wrote `rc_buffer_size = target` while the open
 sized it `maxrate × hrd_pct/100` (:297) — store `hrd_pct` on the struct. (Shipped in A1: the
 `hrd_pct` field, `agents/roomlerd/src/encode/ffmpeg/encoder.rs:738`, sizes both in-place arms through
-`encode::inplace_rate_bufsize` at `:3036`, which keeps the 1× write while the flag is off.) Dead-band: InPlace applies raw
+`encode::inplace_rate_bufsize` at `:3044`, which keeps the 1× write while the flag is off.) Dead-band: InPlace applies raw
 targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `encoder_inplace_rate`
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
 (six places: `config_surface.rs` KEYS near :1547 / get :2177 / set :2769; `config.rs` field :1298,

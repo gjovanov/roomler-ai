@@ -728,7 +728,7 @@ impl Vp9Encoder {
         let pts = stamp.pts;
         let duration: u64 = frame_duration_us as u64;
 
-        let force_kf = self.force_keyframe || self.frame_idx == 0;
+        let force_kf = self.force_keyframe || self.is_fresh();
         let flags: vpx::vpx_enc_frame_flags_t = if force_kf {
             vpx::VPX_EFLAG_FORCE_KF as vpx::vpx_enc_frame_flags_t
         } else {
@@ -818,6 +818,13 @@ impl Vp9Encoder {
         self.frame_idx += 1;
         Ok(out)
     }
+
+    /// #4513 — no frame taken since the open (libvpx is never adopted or
+    /// rebuilt in place), so [`Self::encode_at`] forces the next one as the
+    /// key frame ([`crate::encode::thread::EncoderOps::is_fresh`]).
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.frame_idx == 0
+    }
 }
 
 /// FR-70 M1b — what the encoder thread needs from libvpx. No background
@@ -872,6 +879,9 @@ impl crate::encode::thread::EncoderOps for Vp9Encoder {
         self.target_bitrate
     }
     fn rate_stats(&self) {}
+    fn is_fresh(&self) -> bool {
+        Vp9Encoder::is_fresh(self)
+    }
 }
 
 #[async_trait]
