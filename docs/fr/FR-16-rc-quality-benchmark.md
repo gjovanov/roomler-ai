@@ -247,7 +247,9 @@ competitors". Engineering may use the numbers; the public pages never print them
       first REPRODUCE the field results, or it is measuring something else.
 - [ ] Two consecutive runs of the same cell agree within a stated tolerance
       (repeatability, without which nothing can be A/B'd).
-- [ ] The FR-17 before/after is reported as a distribution from this harness.
+- Moved on 2026-11-28: "The FR-17 before/after is reported as a distribution from this
+      harness." FR-17 closed into FR-148 (#3953) on 2026-11-16, and its relay-pair criterion is
+      FR-148's AC23, read under this FR's fast-motion profile (FR-148 §12).
 - [x] **L0** runs in CI as a named `--test`. It is green on clean links, and **red** under
       the planted 50 ms capture gate (the run that proves it can fail is linked).
       Evidence: CI's recorder job names `--test l4_latency` since #2097 (`67d3ca9e8`); green
