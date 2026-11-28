@@ -1,7 +1,7 @@
 # FR-148: The path is measured, and the plan follows it
 
 **Issue:** [#3953](https://github.com/gjovanov/roomler-ai/issues/3953) · **Status:** P0 runs since 2026-11-16 and its lab cell ran a first slice on 2026-11-17; its open-time train's core is built and run by no session (4a, with one cell red: D43), and its integration is not. P1's memory stores the model in shadow, and its opener is built behind the same switch, whose default is `shadow` and which is `on` on no device; P2's QSV step and P4's rank are merged behind switches that are off by default, and so is D46's in-flight budget: its first two steps (B1, B2) and its stall classifier, computed in shadow; its third (B3, `on` for relay sessions) merged on 2026-11-20 (#4139). Two were read in the field on 2026-11-20 (§15): P2's QSV step meets AC13 on CORPLAP-1, and P4's rank fails AC22 on CORPLAP-2, because it lowers only the agent's own candidates while a pair's route is decided by both ends. On 2026-11-23 the rank by the pair's route (D49), set on CORPLAP-2, meets AC22 there. The others are not read in the field yet (§6). From `0.4.230` P0 names the cause of every move of the live target (#4161). The plan and decisions D1 to D5 are the operator's, taken on 2026-11-16 · **Owner:** the agent's rate path, its path memory and its ICE policy, and the viewer's video channels
-**Supersedes:** [FR-63](FR-63-one-delay-based-rate-controller.md) (#1243), [FR-79](FR-79-one-validity-gate.md) (#1524), [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), [FR-59](FR-59-slow-link-latency-priority.md) (#1163), [FR-71](FR-71-transport-stall-classification.md) (#1362), [FR-74](FR-74-text-clarity-on-direct-paths.md) (#1442), [FR-17](FR-17-partial-reliability-video.md) (#799), [FR-18](FR-18-carrier-queue-discipline.md) (#801), [FR-64](FR-64-remote-desktop-never-rides-the-overlay.md) (#1244). §12 says what moved where
+**Supersedes:** [FR-63](FR-63-one-delay-based-rate-controller.md) (#1243), [FR-79](FR-79-one-validity-gate.md) (#1524), [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), [FR-59](FR-59-slow-link-latency-priority.md) (#1163), [FR-71](FR-71-transport-stall-classification.md) (#1362), [FR-74](FR-74-text-clarity-on-direct-paths.md) (#1442), [FR-17](FR-17-partial-reliability-video.md) (#799), [FR-18](FR-18-carrier-queue-discipline.md) (#801), [FR-64](FR-64-remote-desktop-never-rides-the-overlay.md) (#1244), and since 2026-11-28 [FR-14](FR-14-direct-link-jitter-episodes.md) (#792). §12 says what moved where
 **Works beside:** [FR-135](FR-135-one-rc-media-pipeline.md) (#3293), which owns the pipeline's shape (§13)
 
 §2 is evidence, read on master's `df905bbc1`, and its anchors stay on that commit when the code moves: §2 names the
@@ -209,7 +209,7 @@ keeps a burst reading apart from sustained evidence: a probe moves the bracket's
 delivery raises the floor.
 
 It also supplies what two open items wait for: a capacity reading for FR-135's D12 ("Plan grant by measured
-capacity?", `docs/fr/FR-135-one-rc-media-pipeline.md:1526`) and an under-drive clause for FR-63's flip criterion.
+capacity?", `docs/fr/FR-135-one-rc-media-pipeline.md:1527`) and an under-drive clause for FR-63's flip criterion.
 
 ### 4.3 No decision lasts a session, and every plan move has a computed cost
 
@@ -416,7 +416,7 @@ flag split.
 
 **P5, one controller.** FR-63's B2 flips on the model under the amended criterion. B3 and B4's deletions follow.
 FR-135's fallback stands: if the flip is not live four weeks after R7's shadow week ends, R8 proceeds on the governor
-(`docs/fr/FR-135-one-rc-media-pipeline.md:1519`).
+(`docs/fr/FR-135-one-rc-media-pipeline.md:1520`).
 
 **P6, docs.** `docs/rate-control.md` rewritten around the model, `docs/remote-control.md`'s carrier section, the
 index row.
@@ -543,7 +543,8 @@ index row.
       the bracket's low edge is 2 × the live rate or more, the controller's target is at least 0.7 × the low edge
       in 90 % of windows. This clause and the report's (AC5) also hold on a pump's first 120 s taken alone (D7).
 - [ ] **AC29 (P5)** — Field A/B on CORPLAP-1 and CORPLAP-2 with the controller live: paint age p90 no worse than
-      the baseline, and no window with a standing queue while the encoder tracks.
+      the baseline, and no window with a standing queue while the encoder tracks. Its CORPLAP-1 read includes a
+      30-minute drag during VPN churn (FR-14's AC1 and AC3, §12).
 - [ ] **AC30 (P5)** — The deletions of §5 are in the tree, `ROOMLERD_RATECTL=off` restores the prior behaviour for
       one release, rate-control switches number 4 or fewer, and one accessor answers "how fast is the path".
 - [ ] **AC31 — Docs.** `docs/rate-control.md` is rewritten around the path model and `docs/remote-control.md`
@@ -742,7 +743,7 @@ it shows what the laptop can look like and not what TURN over UDP carries under 
 
 ## 12. What this FR supersedes, and where each open criterion went
 
-Each FR below closed as not planned on 2026-11-16. What it shipped stays in the tree until P5 deletes or keeps it.
+Each FR below closed as not planned on 2026-11-16, except FR-14, which closed as not planned on 2026-11-28. What it shipped stays in the tree until P5 deletes or keeps it.
 
 | FR | Shipped, and stays | Moved here |
 |---|---|---|
@@ -755,11 +756,16 @@ Each FR below closed as not planned on 2026-11-16. What it shipped stays in the 
 | FR-17 (#799) | stages A and B, inert behind an opt-in | the default on constrained paths, as the second video channel (P4) |
 | FR-18 (#801) | the age bound, the send-buffer cap, the counters | its field reads, joined to FR-17's channel (P4) |
 | FR-64 (#1244) | the own-adapter filter, which is what `off` means; the multi-org route fix | "never" becomes the carrier rule (D3) |
+| FR-14 (#792) | nothing: designs A, B and C were not built, and FR-74's P1 and P1b replaced the direct gate they would have tuned | the floor crash under churn (AC9, AC28) and the queue and the drag under churn (AC29) |
 
-All 29 open criteria, one by one:
+All 33 open criteria, one by one:
 
 | From | Criterion | State at the close | Here |
 |---|---|---|---|
+| FR-14 | AC1, on a VPN-churning direct pair the target never crashes to the area floor in a 30-minute drag | partial | AC9, and AC28's under-drive clause read per class (D7) as its field half |
+| FR-14 | AC2, `bytes_inflight` p99 under 80 KB on that pair | open | AC29, restated: no window with a standing queue, the queue bounded in time by D46's budget. The fixed 80 KB bar reads a measure FR-74's P1b dropped on purpose |
+| FR-14 | AC3, a drag on CORPLAP-1 during VPN churn shows no lumps of several hundred ms | open | AC29, whose CORPLAP-1 read includes that drag |
+| FR-14 | AC4, relay and constrained behaviour byte-identical | open | AC21, restated: healthy relays within noise of the P0 baseline. This FR changes constrained paths on purpose (AC17, AC18, AC32), and FR-14 built nothing to compare |
 | FR-17 | the relay pair under fast motion: `send_wait` p99 under 250 ms, age p99 under 300 ms | open | AC23 |
 | FR-17 | no IDR-storm regression | open | AC24 |
 | FR-17 | direct transports unchanged | open | AC21 |
