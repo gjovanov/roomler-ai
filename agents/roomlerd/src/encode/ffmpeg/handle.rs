@@ -63,4 +63,7 @@ impl EncoderOps for FfmpegEncoder {
     fn rate_stats(&self) -> RateStats {
         FfmpegEncoder::rate_stats(self)
     }
+    fn is_fresh(&self) -> bool {
+        FfmpegEncoder::is_fresh(self)
+    }
 }

@@ -5024,7 +5024,7 @@ async fn media_pump_vp9_444_dc(
             tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         }
-        if governor.should_skip_delta_frame(force_keyframe_this_iter) {
+        if governor.should_skip_frame(force_keyframe_this_iter, Some(&*enc)) {
             continue;
         }
 
@@ -9254,9 +9254,9 @@ async fn media_pump_ffmpeg_dc(
         // (The capture backend's cap — Phase B — is handed over right after
         // the make-before-break pin, above the resample; see there.)
 
-        // A keyframe requested THIS iteration must never be dropped by the
-        // decode-pressure frame-skip below (the browser needs the IDR to
-        // resync). Tracked here, consumed by the skip gate.
+        // A keyframe requested THIS iteration, like a fresh encoder's first
+        // frame, is never dropped by the decode-pressure frame-skip below (the
+        // browser needs the IDR to resync). Tracked here, read by the skip gate.
         let mut force_keyframe_this_iter = false;
 
         // Lock-state transitions force a keyframe so the browser sees
@@ -9473,7 +9473,7 @@ async fn media_pump_ffmpeg_dc(
             tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         }
-        if governor.should_skip_delta_frame(force_keyframe_this_iter) {
+        if governor.should_skip_frame(force_keyframe_this_iter, encoder.as_ref()) {
             if let Some(state) = fps_state.as_mut() {
                 state.pause();
             }

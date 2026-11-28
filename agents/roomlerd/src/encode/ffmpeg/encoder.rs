@@ -2363,7 +2363,7 @@ impl FfmpegEncoder {
 
         // Note: set_key_frame doesn't exist on Video in ffmpeg-next 8.x;
         // set_kind(I) is the supported way to force IDR.
-        av.set_kind(if self.force_keyframe || self.frame_count == 0 {
+        av.set_kind(if self.force_keyframe || self.is_fresh() {
             util::picture::Type::I
         } else {
             util::picture::Type::None
@@ -3002,6 +3002,14 @@ impl FfmpegEncoder {
         self.stage.submit_us += us(t1, t2);
         self.stage.drain_us += us(t2, t3);
         Ok(packets)
+    }
+
+    /// #4513 — no frame taken since the open, an adoption or a rebuild (each
+    /// zeroes `frame_count`; the encodes above count a frame once it is
+    /// sent), so `stamp_frame` codes the next one as I
+    /// ([`crate::encode::thread::EncoderOps::is_fresh`]).
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.frame_count == 0
     }
 }
 

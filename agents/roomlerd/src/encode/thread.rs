@@ -114,27 +114,38 @@ pub trait EncoderOps: Send + 'static {
     /// the hardware default (`encode::clock`). That default changes nothing on
     /// any OS, so an encoder that says nothing is hardware.
     const HARDWARE: bool = true;
+
+    /// #4513 — has this encoder taken no frame since it was opened, adopted a
+    /// replacement or rebuilt itself? Then it codes its next frame as a key
+    /// frame whatever was asked, and the decode-pressure gate must not skip
+    /// that frame (`RateGovernor::should_skip_frame`). Read from the encoder's
+    /// own count, so an open site added later cannot forget it, and required,
+    /// so a backend added later cannot either.
+    fn is_fresh(&self) -> bool;
 }
 
+/// #4513 — a command that takes the encoder `&mut` replies with its answer
+/// and [`EncoderOps::is_fresh`] after it, so the handle's mirror of that is
+/// exact the moment the await returns.
 enum Cmd<E: EncoderOps> {
     /// The frame, and the time it is charged (FR-148 D51 B4g): the charge
     /// rides the encode's own message, so it costs the thread no other.
     Encode(
         Arc<Frame>,
         Option<Gate>,
-        oneshot::Sender<Result<Vec<crate::encode::EncodedPacket>>>,
+        oneshot::Sender<(Result<Vec<crate::encode::EncodedPacket>>, bool)>,
     ),
     /// Replies with the maxrate after the move, so the handle's mirror is
     /// exact the moment the await returns.
-    SetBitrate(u32, oneshot::Sender<u32>),
-    RequestKeyframe(oneshot::Sender<()>),
-    Adopt(E::Rebuilt, oneshot::Sender<(bool, u32)>),
+    SetBitrate(u32, oneshot::Sender<(u32, bool)>),
+    RequestKeyframe(oneshot::Sender<((), bool)>),
+    Adopt(E::Rebuilt, oneshot::Sender<((bool, u32), bool)>),
     RebuildSpec(u32, oneshot::Sender<Option<E::RebuildSpec>>),
     RebuildSpecAt(u32, u32, u32, u32, oneshot::Sender<Option<E::RebuildSpec>>),
     RateStats(oneshot::Sender<E::Stats>),
     /// An encoder-specific operation the trait does not name (the VP9
     /// pump's `set_speed`), run on the thread in order like the rest.
-    With(Box<dyn FnOnce(&mut E) + Send>, oneshot::Sender<()>),
+    With(Box<dyn FnOnce(&mut E) + Send>, oneshot::Sender<((), bool)>),
 }
 
 /// Depth of the command channel. The pump awaits every command it sends, so
@@ -148,6 +159,8 @@ pub struct EncoderThread<E: EncoderOps> {
     join: Option<std::thread::JoinHandle<()>>,
     caps: EncoderCaps,
     maxrate_bps: u32,
+    /// #4513 — [`EncoderOps::is_fresh`], as the last reply carried it.
+    fresh: bool,
     name: String,
 }
 
@@ -161,6 +174,7 @@ impl<E: EncoderOps> EncoderThread<E> {
     pub fn spawn(enc: E, label: &str) -> std::result::Result<Self, (E, std::io::Error)> {
         let caps = enc.caps();
         let maxrate_bps = enc.current_maxrate_bps();
+        let fresh = enc.is_fresh();
         let (tx, rx) = std::sync::mpsc::sync_channel::<Cmd<E>>(CMD_DEPTH);
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<E>(1);
         let name = format!("rc-enc-{label}");
@@ -190,6 +204,7 @@ impl<E: EncoderOps> EncoderThread<E> {
             join: Some(join),
             caps,
             maxrate_bps,
+            fresh,
             name,
         })
     }
@@ -200,6 +215,12 @@ impl<E: EncoderOps> EncoderThread<E> {
 
     pub fn current_maxrate_bps(&self) -> u32 {
         self.maxrate_bps
+    }
+
+    /// #4513 — [`EncoderOps::is_fresh`] as of the last command answered:
+    /// every command that takes the encoder `&mut` refreshes it from its reply.
+    pub fn is_fresh(&self) -> bool {
+        self.fresh
     }
 
     /// The thread's name, for logs.
@@ -230,34 +251,42 @@ impl<E: EncoderOps> EncoderThread<E> {
             .map_err(|_| anyhow!("encoder thread dropped the command (it died mid-command)"))
     }
 
-    pub async fn encode(&self, frame: Arc<Frame>) -> Result<Vec<crate::encode::EncodedPacket>> {
+    /// [`Self::ask`] for a command that takes the encoder `&mut`: its reply
+    /// also carries [`EncoderOps::is_fresh`] after it, kept here (#4513).
+    async fn ask_fresh<T>(&mut self, cmd: Cmd<E>, rx: oneshot::Receiver<(T, bool)>) -> Result<T> {
+        let (answer, fresh) = self.ask(cmd, rx).await?;
+        self.fresh = fresh;
+        Ok(answer)
+    }
+
+    pub async fn encode(&mut self, frame: Arc<Frame>) -> Result<Vec<crate::encode::EncodedPacket>> {
         self.encode_charged(frame, None).await
     }
 
     /// FR-148 D51 B4g — [`Self::encode`] with the time the frame is charged.
     pub async fn encode_charged(
-        &self,
+        &mut self,
         frame: Arc<Frame>,
         gate: Option<Gate>,
     ) -> Result<Vec<crate::encode::EncodedPacket>> {
         let (tx, rx) = oneshot::channel();
-        self.ask(Cmd::Encode(frame, gate, tx), rx).await?
+        self.ask_fresh(Cmd::Encode(frame, gate, tx), rx).await?
     }
 
     pub async fn set_bitrate(&mut self, bps: u32) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.maxrate_bps = self.ask(Cmd::SetBitrate(bps, tx), rx).await?;
+        self.maxrate_bps = self.ask_fresh(Cmd::SetBitrate(bps, tx), rx).await?;
         Ok(())
     }
 
-    pub async fn request_keyframe(&self) -> Result<()> {
+    pub async fn request_keyframe(&mut self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.ask(Cmd::RequestKeyframe(tx), rx).await
+        self.ask_fresh(Cmd::RequestKeyframe(tx), rx).await
     }
 
     pub async fn adopt_rebuilt(&mut self, rebuilt: E::Rebuilt) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
-        let (adopted, maxrate) = self.ask(Cmd::Adopt(rebuilt, tx), rx).await?;
+        let (adopted, maxrate) = self.ask_fresh(Cmd::Adopt(rebuilt, tx), rx).await?;
         self.maxrate_bps = maxrate;
         Ok(adopted)
     }
@@ -285,9 +314,9 @@ impl<E: EncoderOps> EncoderThread<E> {
     }
 
     /// Run `f` on the encoder, on its thread, in order with everything else.
-    pub async fn with(&self, f: impl FnOnce(&mut E) + Send + 'static) -> Result<()> {
+    pub async fn with(&mut self, f: impl FnOnce(&mut E) + Send + 'static) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.ask(Cmd::With(Box::new(f), tx), rx).await
+        self.ask_fresh(Cmd::With(Box::new(f), tx), rx).await
     }
 
     /// Has the thread exited (an encoder panic)? The next command would fail
@@ -314,19 +343,20 @@ fn serve<E: EncoderOps>(mut enc: E, rx: Receiver<Cmd<E>>) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Encode(frame, gate, reply) => {
-                let _ = reply.send(enc.encode_charged(&frame, gate));
+                let packets = enc.encode_charged(&frame, gate);
+                let _ = reply.send((packets, enc.is_fresh()));
             }
             Cmd::SetBitrate(bps, reply) => {
                 enc.set_bitrate(bps);
-                let _ = reply.send(enc.current_maxrate_bps());
+                let _ = reply.send((enc.current_maxrate_bps(), enc.is_fresh()));
             }
             Cmd::RequestKeyframe(reply) => {
                 enc.request_keyframe();
-                let _ = reply.send(());
+                let _ = reply.send(((), enc.is_fresh()));
             }
             Cmd::Adopt(rebuilt, reply) => {
                 let adopted = enc.adopt_rebuilt(rebuilt);
-                let _ = reply.send((adopted, enc.current_maxrate_bps()));
+                let _ = reply.send(((adopted, enc.current_maxrate_bps()), enc.is_fresh()));
             }
             Cmd::RebuildSpec(bps, reply) => {
                 let _ = reply.send(enc.rebuild_spec(bps));
@@ -339,7 +369,7 @@ fn serve<E: EncoderOps>(mut enc: E, rx: Receiver<Cmd<E>>) {
             }
             Cmd::With(f, reply) => {
                 f(&mut enc);
-                let _ = reply.send(());
+                let _ = reply.send(((), enc.is_fresh()));
             }
         }
     }
@@ -407,6 +437,16 @@ impl<E: EncoderOps> EncoderHandle<E> {
         match self {
             Self::Inline(e) => e.current_maxrate_bps(),
             Self::Threaded(t) => t.current_maxrate_bps(),
+        }
+    }
+
+    /// #4513 — [`EncoderOps::is_fresh`]: inline, the encoder's own count;
+    /// threaded, the mirror its commands' replies keep, exact once the await
+    /// of each returns (the pump awaits every command it sends).
+    pub fn is_fresh(&self) -> bool {
+        match self {
+            Self::Inline(e) => e.is_fresh(),
+            Self::Threaded(t) => t.is_fresh(),
         }
     }
 
@@ -535,6 +575,82 @@ impl<E: EncoderOps> EncoderHandle<E> {
     }
 }
 
+/// #4513 — an encoder that only counts, for the cells of the gate that reads
+/// it from outside this module (`governor`): fresh until it takes a frame,
+/// which it codes as its key frame, and an adopted replacement starts over.
+#[cfg(test)]
+pub(crate) mod stand_in {
+    use super::{EncoderCaps, EncoderOps};
+    use crate::capture::{Damage, Frame, PixelFormat};
+    use crate::encode::EncodedPacket;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    pub(crate) struct Counting {
+        /// Frames taken since the open or the last adoption.
+        pub(crate) frames: u64,
+    }
+
+    impl EncoderOps for Counting {
+        type Rebuilt = ();
+        type RebuildSpec = ();
+        type Stats = ();
+
+        // A plain call inline, so a current-thread runtime runs it.
+        const INLINE_BLOCK_IN_PLACE: bool = false;
+
+        fn encode_sync(&mut self, _frame: &Frame) -> anyhow::Result<Vec<EncodedPacket>> {
+            let is_keyframe = self.frames == 0;
+            self.frames += 1;
+            Ok(vec![EncodedPacket {
+                data: vec![0],
+                is_keyframe,
+                duration_us: 33_333,
+                qp: None,
+            }])
+        }
+        fn set_bitrate(&mut self, _bps: u32) {}
+        fn request_keyframe(&mut self) {}
+        fn adopt_rebuilt(&mut self, _rebuilt: ()) -> bool {
+            self.frames = 0;
+            true
+        }
+        fn rebuild_spec(&self, _bps: u32) -> Option<()> {
+            None
+        }
+        fn caps(&self) -> EncoderCaps {
+            EncoderCaps {
+                name: "counting",
+                supports_dynamic_bitrate: true,
+                reconfig_forces_idr: false,
+                chroma444: false,
+            }
+        }
+        fn current_maxrate_bps(&self) -> u32 {
+            1_000_000
+        }
+        fn rate_stats(&self) {}
+        fn is_fresh(&self) -> bool {
+            self.frames == 0
+        }
+    }
+
+    /// A 2x2 capture, as a pump hands one to its encoder.
+    pub(crate) fn frame() -> Arc<Frame> {
+        Arc::new(Frame {
+            width: 2,
+            height: 2,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra,
+            data: vec![0; 16].into(),
+            monotonic_us: 33_333,
+            monitor: 0,
+            damage: Damage::Unknown,
+            source: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +679,10 @@ mod tests {
         dropped_on: Arc<Mutex<Option<String>>>,
         fail_encode: bool,
         panic_on_encode: bool,
+        /// Frames taken since the open, the last adoption or a rebuild (#4513).
+        frames: u64,
+        /// A rate move rebuilds it, as a rebuild-bound backend's does.
+        rebuild_on_rate: bool,
     }
 
     impl Drop for Fake {
@@ -589,6 +709,7 @@ mod tests {
             if self.fail_encode {
                 return Err(anyhow!("hw says no"));
             }
+            self.frames += 1;
             Ok(vec![crate::encode::EncodedPacket {
                 data: vec![frame.cpu()[0]],
                 is_keyframe: false,
@@ -599,6 +720,9 @@ mod tests {
         fn set_bitrate(&mut self, bps: u32) {
             self.maxrate = bps;
             self.log.lock().unwrap().push(format!("rate:{bps}"));
+            if self.rebuild_on_rate {
+                self.frames = 0;
+            }
         }
         fn request_keyframe(&mut self) {
             self.log.lock().unwrap().push("idr".into());
@@ -609,6 +733,7 @@ mod tests {
                 return false;
             }
             self.maxrate = rebuilt;
+            self.frames = 0;
             true
         }
         fn rebuild_spec(&self, bps: u32) -> Option<(u32, u32)> {
@@ -628,6 +753,9 @@ mod tests {
         fn rate_stats(&self) -> usize {
             self.log.lock().unwrap().len()
         }
+        fn is_fresh(&self) -> bool {
+            self.frames == 0
+        }
     }
 
     fn fake(log: &Arc<Mutex<Vec<String>>>, dropped_on: &Arc<Mutex<Option<String>>>) -> Fake {
@@ -637,6 +765,8 @@ mod tests {
             dropped_on: dropped_on.clone(),
             fail_encode: false,
             panic_on_encode: false,
+            frames: 0,
+            rebuild_on_rate: false,
         }
     }
 
@@ -705,7 +835,7 @@ mod tests {
         let dropped_on = Arc::new(Mutex::new(None));
         let mut f = fake(&log, &dropped_on);
         f.fail_encode = true;
-        let t = EncoderThread::spawn(f, "err").ok().expect("spawn");
+        let mut t = EncoderThread::spawn(f, "err").ok().expect("spawn");
         let e = t.encode(frame(1)).await.unwrap_err();
         assert!(e.to_string().contains("hw says no"), "{e}");
         assert!(t.is_alive(), "an error does not kill the thread");
@@ -719,7 +849,7 @@ mod tests {
         let dropped_on = Arc::new(Mutex::new(None));
         let mut f = fake(&log, &dropped_on);
         f.panic_on_encode = true;
-        let t = EncoderThread::spawn(f, "panic").ok().expect("spawn");
+        let mut t = EncoderThread::spawn(f, "panic").ok().expect("spawn");
         // Silence the panic's default hook output for this test only.
         let quiet = Arc::new(AtomicBool::new(true));
         let prev = std::panic::take_hook();
@@ -777,5 +907,61 @@ mod tests {
             .await;
         assert_eq!(log.lock().unwrap().clone(), vec!["inline-speed"]);
         assert_eq!(h.name(), "fake");
+    }
+
+    /// #4513 — the gate's predicate where the pump holds its encoder, on both
+    /// paths of the handle: an encoder that has taken no frame reads fresh
+    /// (its next frame is its key frame), and a command that is not a frame
+    /// leaves it so, as does an encode that failed; a frame taken ends it,
+    /// and a key frame asked for or a rate moved in place does not bring it
+    /// back; a rate move that rebuilds the encoder does; a refused adoption
+    /// changes nothing; an adopted replacement reads fresh until its own first
+    /// frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_encoder_reads_fresh_until_it_takes_a_frame_and_again_once_it_adopts() {
+        for threaded in [false, true] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let dropped_on = Arc::new(Mutex::new(None));
+            let mut f = fake(&log, &dropped_on);
+            f.fail_encode = true;
+            let mut h = EncoderHandle::new(f, threaded, "fresh");
+            assert_eq!(h.is_threaded(), threaded);
+            let at = |what: &str| format!("threaded={threaded}: {what}");
+            assert!(h.is_fresh(), "{}", at("opened, nothing taken"));
+            h.request_keyframe().await;
+            h.set_bitrate(500_000).await;
+            assert!(h.encode(&frame(1)).await.is_err());
+            assert!(h.is_fresh(), "{}", at("no frame taken yet"));
+            h.with(|e| e.fail_encode = false).await;
+            assert!(h.is_fresh(), "{}", at("an operation is not a frame"));
+            h.encode(&frame(2)).await.unwrap();
+            assert!(!h.is_fresh(), "{}", at("a frame taken"));
+            h.request_keyframe().await;
+            h.set_bitrate(400_000).await;
+            assert!(
+                !h.is_fresh(),
+                "{}",
+                at("a key frame asked, a rate in place")
+            );
+            h.with(|e| e.rebuild_on_rate = true).await;
+            h.set_bitrate(300_000).await;
+            assert!(h.is_fresh(), "{}", at("a rate move that rebuilt it"));
+            h.encode(&frame(3)).await.unwrap();
+            assert!(
+                !h.is_fresh(),
+                "{}",
+                at("the rebuilt one's first frame taken")
+            );
+            assert!(!h.adopt_rebuilt(0).await, "{}", at("refused"));
+            assert!(
+                !h.is_fresh(),
+                "{}",
+                at("a refused adoption changes nothing")
+            );
+            assert!(h.adopt_rebuilt(750_000).await);
+            assert!(h.is_fresh(), "{}", at("the replacement has taken nothing"));
+            h.encode(&frame(4)).await.unwrap();
+            assert!(!h.is_fresh(), "{}", at("its first frame taken"));
+        }
     }
 }
