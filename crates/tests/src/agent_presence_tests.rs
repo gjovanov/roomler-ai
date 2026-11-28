@@ -62,12 +62,31 @@ pub(crate) async fn connect_agent(
     app: &TestApp,
     agent_token: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut ws = open_agent_socket(app, agent_token).await;
+    say_hello(&mut ws).await;
+    ws
+}
+
+/// The agent socket's upgrade alone: the server waits for the hello.
+pub(crate) async fn open_agent_socket(
+    app: &TestApp,
+    agent_token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let ws_url = format!(
         "ws://{}/ws?token={}&role=agent",
         app.addr,
         urlencode(agent_token)
     );
-    let (mut ws, _) = connect_async(&ws_url).await.expect("ws connect");
+    let (ws, _) = connect_async(&ws_url).await.expect("ws connect");
+    ws
+}
+
+/// The hello [`connect_agent`] sends, on a socket [`open_agent_socket`] opened.
+pub(crate) async fn say_hello(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
     let hello = json!({
         "t": "rc:agent.hello",
         "machine_name": "presence test box",
@@ -86,7 +105,6 @@ pub(crate) async fn connect_agent(
     ws.send(Message::Text(hello.to_string().into()))
         .await
         .expect("send hello");
-    ws
 }
 
 /// Fetch one agent's listing row via `app`'s HTTP API.
