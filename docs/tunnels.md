@@ -1069,7 +1069,7 @@ sequenceDiagram
 
     Note over S: the server ends the session
     S->>X: rc:tunnel.terminate { close_connection: true }
-    Note over X: AgentQuicPeer::end — flows stop, connection closed (code 2)
+    Note over X: AgentQuicPeer::end — connection closed (code 2), then flows stop
     S->>C: tells the client
     C->>S: ack (rc:tunnel.terminate)
     S->>X: rc:tunnel.terminate { close_connection: true } (relayed)
@@ -1077,18 +1077,19 @@ sequenceDiagram
 ```
 
 **What the exit does.** The `ServerMsg::TunnelTerminate` arm
-(`agents/roomlerd/src/signaling.rs:5627`) hands the QUIC half to
-`terminate_quic_session` (`:6715`):
+(`agents/roomlerd/src/signaling.rs:5638`) hands the QUIC half to
+`terminate_quic_session` (`:6726`):
 
 - **with the flag**, `AgentQuicPeer::end` (`agents/roomlerd/src/tunnel/quic_peer.rs:590`):
-  every flow stops, its two halves aborted, which drops its destination socket and
-  its streams; the connection closes with application code `2` (`SESSION_END_CODE`,
-  `:58`, reason `session ended`, distinct from a failed auth's `1`); the endpoint
-  closes and the accept loop stops. The endpoint's UDP socket, and on the relayed
-  flavours the TURN allocation, go once the closed connection drains. A peer R3
-  parked and reclaimed is ended the same way;
+  the connection closes with application code `2` (`SESSION_END_CODE`, `:58`, reason
+  `session ended`, distinct from a failed auth's `1`); then every flow stops, its two
+  halves aborted, which drops its destination socket and its streams. The close goes
+  first, so each flow's client reads the end as that close and never as a finished
+  stream (`SessionLink::end`, `:123`). The endpoint closes and the accept loop stops.
+  The endpoint's UDP socket, and on the relayed flavours the TURN allocation, go once
+  the closed connection drains. A peer R3 parked and reclaimed is ended the same way;
 - **without it**, `AgentQuicPeer::close`, and the session's `SessionLink` is kept in
-  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6689`) for 60 s
+  `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6700`) for 60 s
   (`ENDED_SESSION_TTL`, at most 64 sessions a tenant, the oldest first out). A
   terminate with the flag that arrives after one without still reaches the session
   through it and ends it.
@@ -1102,7 +1103,7 @@ forward still waiting for its stream (`take_flow`,
 ends.
 
 **The reap.** A #1754 reap (`ReapSignal::QuicConnEnded`) goes through `reap_quic_peer`
-(`agents/roomlerd/src/signaling.rs:6747`, from the reap arm at `:3100`) to
+(`agents/roomlerd/src/signaling.rs:6758`, from the reap arm at `:3111`) to
 `AgentQuicPeer::reap` (`agents/roomlerd/src/tunnel/quic_peer.rs:602`): when the
 connection itself has ended (`close_reason()` is set), it ends the session as above.
 When the accept loop ended on a connection that is still up, it only closes the peer
@@ -1184,14 +1185,14 @@ The channel (`signaling.rs:810`) has the #1754 reap channel's shape: created in
 org's peer in the primary's maps — borrowed into every `connect_once`, a sender
 retained for the loop's life so the receiver never closes. The in-flight
 bookkeeping is `PendingQuicSetups` (`agents/roomlerd/src/tunnel/quic_setup.rs`),
-fresh per connection (`agents/roomlerd/src/signaling.rs:2237`) like the session maps, and free of I/O
+fresh per connection (`agents/roomlerd/src/signaling.rs:2244`) like the session maps, and free of I/O
 so tests drive it directly:
 
 | While a setup is in flight… | Rule | Where |
 |---|---|---|
-| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5577-5585`, `quic_setup.rs:243` |
-| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5620`, `quic_setup.rs:258` |
-| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `agents/roomlerd/src/signaling.rs:3129` |
+| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `agents/roomlerd/src/signaling.rs:5588-5596`, `quic_setup.rs:243` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `agents/roomlerd/src/signaling.rs:5631`, `quic_setup.rs:258` |
+| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `agents/roomlerd/src/signaling.rs:3140` |
 | a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
 | more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
 | the control WS ends | the entry map dies with the connection (one log line names how many were in flight); the results reach the next connection and are closed there. The #1754 teardown and R3 parking of the **maps** are unchanged | `quic_setup.rs:335` |
@@ -1559,7 +1560,7 @@ enrolled under one name in one org send one hash, and the second lands on the fi
 row (#4479). The `instance_id` is the install's own. A row keeps the `machine_id` it was
 made with for good, because the client's overlay node is keyed by it, and it holds an
 `instance_id` once an FR-159 client has claimed it (`TunnelClient`,
-`crates/remote_control/src/models.rs:3628`). A row an FR-159 client creates takes its
+`crates/remote_control/src/models.rs:3650`). A row an FR-159 client creates takes its
 `instance_id` as its `machine_id` too (`create_row`, `routes/tunnel.rs:486`), so no legacy hash
 ever finds it.
 
@@ -1756,7 +1757,7 @@ to a running `roomlerd` without any token:
 | `ConfigGet` · `ConfigSet` | The config surface, grouped (FR-84 D2) |
 | `RestartDaemon` | "Apply now" — restart only under a proven supervisor (FR-84 D3) |
 | `EncoderCaps` · `Devices` · `Mesh` | What the companion's Overview and Devices pages show (FR-84 D4, D5) |
-| `LiveWork` · `AskForUpdate` | A Mac's update gate (FR-151). `{"t":"live_work"}` answers `{"t":"live_work","d":{…}}`: what an install that restarts this daemon would cut (`rc_sessions`, `ssh_connections`, `exec_runs`, `work` for transfers and recordings, `net_transition`) and `ask_age_secs`, the age of the newest update ask it recorded. The root update helper reads it from both halves before it installs. `{"t":"ask_for_update"}` records the person's own ask ("Apply update", a `roomlerd self-update` run as the person) and answers `{"t":"update_ask_recorded"}`; a daemon that runs as root refuses it. Neither is served on the person socket (`crates/localapi/src/lib.rs:1870`, `:1878`; `person_may`, `:3811`; [installation.md](installation.md#macos-the-root-update-helpers-gate-fr-151)) |
+| `LiveWork` · `AskForUpdate` | A Mac's update gate (FR-151). `{"t":"live_work"}` answers `{"t":"live_work","d":{…}}`: what an install that restarts this daemon would cut (`rc_sessions`, `ssh_connections`, `exec_runs`, `work` for transfers and recordings, `net_transition`) and `ask_age_secs`, the age of the newest update ask it recorded. The root update helper reads it from both halves before it installs. `{"t":"ask_for_update"}` records the person's own ask ("Apply update", a `roomlerd self-update` run as the person) and answers `{"t":"update_ask_recorded"}`; a daemon that runs as root refuses it. Neither is served on the person socket (`crates/localapi/src/lib.rs:1882`, `:1890`; `person_may`, `:3823`; [installation.md](installation.md#macos-the-root-update-helpers-gate-fr-151)) |
 
 ⚠️ **On Windows the pipe keeps a pool of listening instances** (`localapi_pipe_pool`,
 default 4; `1` is the pre-FR-84 single instance). With one instance, a client that

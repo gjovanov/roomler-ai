@@ -57,7 +57,7 @@ wait that should not exist.
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
 (`post_install.rs:385`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:7741`)
+(`post_install.rs:97-98`, echoed at `:10`, `:136`, `docs/remote-control.md:7861`)
 was never wired. So even on Windows — where the staged watcher does produce a
 verdict — nothing surfaces it. **P3 wires it** (2026-10-26): the daemon reads
 the record at startup and on every `roomler status`, see the P3 section below.
@@ -123,7 +123,7 @@ flowchart LR
 
 | Piece | Where |
 |---|---|
-| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:587`; `NodeStatus.last_install`, `:490` |
+| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:599`; `NodeStatus.last_install`, `:490` |
 | The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:2155`), its pure half `summarize` (`:2174`) |
 | The startup line and its level | `log_at_startup` (`:1829`), `startup_level` (`:1813`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4425`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:1143`) |
@@ -187,8 +187,8 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:471`); `UpdateRefusal` and `update_refusal()` (`:699`, `:1384`) |
-| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5635`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3368`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3339`), else `self` |
-| Stamped at **every** announcement | `stub_caps` (`agents/roomlerd/src/signaling.rs:7383`, `:7399`) |
+| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5646`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3368`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3339`), else `self` |
+| Stamped at **every** announcement | `stub_caps` (`agents/roomlerd/src/signaling.rs:7412`, `:7428`) |
 | Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:2354`): a 409 on one device (`:2408`), a `refused` row with its `refused_code` in a bulk (`:2549`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 
