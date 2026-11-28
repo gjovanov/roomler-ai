@@ -560,7 +560,7 @@ loop the same way.
 | Test (`crates/vendored/webrtc-sctp/src/`) | Holds | Before the fix |
 |---|---|---|
 | `test_stream_a_read_sees_a_shutdown_between_its_check_and_its_wait` (`stream/stream_test.rs:676`) | on one thread, the test holds the stream's reassembly-queue lock, so a read stops there, past its check of the flag; the channel's close (`shutdown(Both)`) runs, the lock goes, and the read returns `(0, Unknown)` within 5 s | the read waited for good, in 10 runs of 10 |
-| `test_assoc_close_ends_a_read_between_its_check_and_its_wait` (`association/association_internal/association_internal_test.rs:1353`) | the same, with the association's close in place of the channel's | the read waited for good, in 10 runs of 10 |
+| `test_assoc_close_ends_a_read_between_its_check_and_its_wait` (`association/association_internal/association_internal_test.rs:1361`) | the same, with the association's close in place of the channel's | the read waited for good, in 10 runs of 10 |
 | `test_stream_a_chunk_that_races_a_read_still_wakes_it` (`stream/stream_test.rs:725`) | a chunk that races a read for the queue's lock is read, whichever takes the lock first, and a wake-up the read took but did not need is kept for the next wait | passes: it guards the data path the fix moved |
 
 With the fix each of the three passed 200 runs of 200, one at a time, and the fork's whole

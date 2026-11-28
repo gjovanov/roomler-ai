@@ -1942,7 +1942,7 @@ association reads them back.
 
 **The twin test** shows that a reader changes nothing the association sends.
 `test_gauges_a_reader_changes_nothing_the_association_sends`
-(`crates/vendored/webrtc-sctp/src/association/association_internal/association_internal_test.rs:1072`)
+(`crates/vendored/webrtc-sctp/src/association/association_internal/association_internal_test.rs:1080`)
 runs one scripted exchange twice, with a loss, a fast retransmission and a T3-rtx expiry
 in it, the second time with a thread reading both sides' gauges as fast as it can. It
 then compares every byte both sides sent, packet by packet. Before the comparison it
@@ -1952,8 +1952,8 @@ initial TSN, and the state cookie and the checksum become zeros. Each run sent 1
 packets and 76,168 bytes, and the two runs were the same. The same script losing the
 fourth packet instead of the third sends differently, so the comparison does see a
 change of one packet. Two more fork tests pin the acknowledgement delay: the newest
-chunk sent once is the one that counts (`:1131`), and a clock that went backwards
-stores nothing (`:1203`).
+chunk sent once is the one that counts (`:1139`), and a clock that went backwards
+stores nothing (`:1211`).
 
 **A step**, in the order the machine takes it:
 
@@ -2208,7 +2208,7 @@ and only its first call reads anything (`DeliverySampler::on_first_write`,
 which never waits for the transport's slot, with `GaugeReader::peek`
 (`crates/vendored/webrtc-sctp/src/association/gauges.rs:202`), which resets nothing, so
 the least acknowledgement delay stays for the reader that takes it (the fork's test,
-`crates/vendored/webrtc-sctp/src/association/association_internal/association_internal_test.rs:1167`).
+`crates/vendored/webrtc-sctp/src/association/association_internal/association_internal_test.rs:1175`).
 The answer is a pure function of the gauges (`OpenedBy::of`,
 `agents/roomlerd/src/media_delivery.rs:1627`):
 
