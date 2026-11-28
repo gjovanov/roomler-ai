@@ -195,13 +195,40 @@ pub struct WordInputs {
 /// would serve a session now. The map from [`Action`] is one `match` with no
 /// catch-all arm, so a new `Action` cannot compile without a word.
 pub fn gui_worker_word(i: WordInputs) -> GuiWorkerBrief {
-    // FR-157 P1 — a stub, so the tests read RED first: every daemon says the
-    // same word.
-    let _ = i;
-    GuiWorkerBrief {
-        state: GuiWorkerBrief::UNSUPERVISED.to_string(),
-        reason: None,
-        one_row: false,
+    let word = |state: &str, reason: Option<&str>| GuiWorkerBrief {
+        state: state.to_string(),
+        reason: reason.map(str::to_string),
+        one_row: i.config.one_row,
+    };
+    let not_attached = |reason: &str| word(GuiWorkerBrief::NOT_ATTACHED, Some(reason));
+    // No worker is supervised here. A root daemon on one row then serves no
+    // screen at all, the case `run` warns of; any other daemon serves its own.
+    let off = || {
+        if i.config.is_root && i.config.one_row {
+            not_attached(GuiWorkerBrief::SUPERVISOR_OFF)
+        } else {
+            word(GuiWorkerBrief::UNSUPERVISED, None)
+        }
+    };
+    if !(i.config.is_root && i.config.supervise) {
+        return off();
+    }
+    if i.attached {
+        return word(GuiWorkerBrief::ATTACHED, None);
+    }
+    match i.last {
+        // The supervisor is on and has not decided yet: its first tick spawns,
+        // stands down or waits, and each of those is noted at once.
+        None => not_attached(GuiWorkerBrief::STARTING),
+        Some(Action::Disabled) => off(),
+        Some(Action::NoGuiSession) => not_attached(GuiWorkerBrief::NO_CONSOLE_USER),
+        Some(Action::LaunchdOwns) | Some(Action::HandBack(_)) => {
+            not_attached(GuiWorkerBrief::LAUNCHD_OWNS)
+        }
+        Some(Action::Spawn(_)) | Some(Action::Replace(_)) | Some(Action::Healthy) => {
+            not_attached(GuiWorkerBrief::STARTING)
+        }
+        Some(Action::GaveUp) => not_attached(GuiWorkerBrief::GAVE_UP),
     }
 }
 
@@ -212,9 +239,7 @@ pub fn gui_worker_word(i: WordInputs) -> GuiWorkerBrief {
 /// is the screen side itself and says none, and neither does any other
 /// platform.
 pub fn says_word(macos: bool, supervision: Option<crate::supervision::Supervision>) -> bool {
-    // FR-157 P1 — a stub, so the tests read RED first.
-    let _ = (macos, supervision);
-    false
+    macos && supervision != Some(crate::supervision::Supervision::MacosSupervisor)
 }
 
 /// FR-157 P1 — what a connection of this process says while it holds no
@@ -1813,6 +1838,9 @@ mod imp {
                     error = %e,
                     "macOS supervisor: cannot resolve own exe — not supervising"
                 );
+                // FR-157 P1 — nothing will start a worker for the rest of
+                // this daemon's life, which the row's word says as `gave-up`.
+                delegate.note_supervisor(Action::GaveUp);
                 return;
             }
         };
@@ -1910,6 +1938,10 @@ mod imp {
             // Log transitions, not every tick: this loop runs every 5 s for
             // the daemon's whole life.
             if last_action != Some(action) {
+                // FR-157 P1 — and tell the row's screen-worker word, here and
+                // never on a tick that repeats the state, so a steady
+                // supervisor wakes no connection.
+                delegate.note_supervisor(action);
                 if matches!(action, Action::GaveUp) {
                     let mut not_theirs = uid_now.and_then(person_folder_not_theirs);
                     // #3802 — bounded and off this thread (`administrator_reads`).

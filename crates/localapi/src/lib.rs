@@ -551,10 +551,12 @@ pub struct GuiWorkerStatus {
     /// `not-attached`. Built by the function that builds the row's word, so
     /// the host and the server never disagree. `None` from a daemon older
     /// than P1, and an older CLI ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     /// FR-157 P1 (D5) — with `not-attached`, why: `no-console-user` ·
     /// `launchd-owns` · `starting` · `gave-up` · `supervisor-off`. The row's
     /// `reason`, from the same function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 

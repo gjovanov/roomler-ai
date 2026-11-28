@@ -1966,8 +1966,13 @@ async fn connect_once(
         multi_org_tun: cfg.overlay_multi_org,
         is_primary: ctx.is_primary,
         survive,
-        // FR-157 P1 — a stub, so the tests read RED first.
-        gui_worker: None,
+        // FR-157 P1 (D1) — a Mac's daemon says the screen-worker word on every
+        // loop, the worker none, and no other platform one.
+        gui_worker: crate::macos_supervisor::word_without_host(
+            cfg!(target_os = "macos"),
+            crate::supervision::current(),
+            cfg.macos_one_row,
+        ),
     };
     let announced::Hello {
         caps: hello_caps,
@@ -2659,10 +2664,12 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             // #3992 — the attached worker said a word after the hello: its caps,
-            // the person's floor, or its leaving. The heartbeat announces it
-            // now, not within its 30 s. The beat decides what is sent, so a
-            // word that changes nothing the row says costs no caps. Never on a
-            // loop that does not hold the host.
+            // the person's floor, or its leaving. FR-157 P1 — or the
+            // screen-worker word moved: the channel attached or ended, or the
+            // supervisor decided anew. The heartbeat announces it now, not
+            // within its 30 s. The beat decides what is sent, so a word that
+            // changes nothing the row says costs no caps. Never on a loop that
+            // does not hold the host.
             Ok(()) = next_worker_news(&mut worker_news) => {
                 let _stage = watchdog::enter(ctx.pump, "worker.news");
                 debug!("the worker said a word after the hello; the heartbeat announces it now");
@@ -2728,6 +2735,8 @@ async fn connect_once(
                             apps = ?c.apps,
                             audio = ?c.audio,
                             desktop = ?c.desktop,
+                            // FR-157 P1 — the screen-worker word it carries.
+                            gui_worker = ?c.gui_worker,
                             video_cells = c.video_cells.len(),
                             "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                         );
@@ -7123,6 +7132,12 @@ struct Announced {
     /// FR-138 — `rc-resume`: the switch as this connection read it, the same
     /// for its whole life.
     resume: bool,
+    /// FR-157 P1 — a Mac's screen-worker word
+    /// ([`DelegateHost::gui_worker_word`](crate::delegate::DelegateHost::gui_worker_word)):
+    /// the channel's attach and end, or a new decision of the supervisor,
+    /// reaches the server at once. `None` in the worker and on every other
+    /// platform.
+    gui_worker: Option<roomler_ai_remote_control::models::GuiWorkerBrief>,
 }
 
 /// #3992 — what a connection's announcements are built from and that stays the
@@ -7154,9 +7169,6 @@ impl Announcer<'_> {
     /// `None` and says our own words: off one row a secondary org's session is
     /// never handed to the worker.
     fn now(&self, delegate: Option<&crate::delegate::DelegateHost>) -> Announced {
-        // FR-157 P1 — a stub, so the tests read RED first: the word is not
-        // read.
-        let _ = &self.gui_worker;
         // #3280 — before the answer [`Self::caps`] reads: one adopted in
         // between is news on the next beat.
         let caps_generation = crate::encode::caps::generation();
@@ -7195,6 +7207,12 @@ impl Announcer<'_> {
                 ),
             ),
             resume: self.survive,
+            // FR-157 P1 — the host's word on a loop that holds it; the word
+            // without one on a loop that does not; none where this process
+            // says none.
+            gui_worker: self.gui_worker.clone().map(|without_host| {
+                delegate.map_or(without_host, crate::delegate::DelegateHost::gui_worker_word)
+            }),
         }
     }
 
@@ -7377,6 +7395,9 @@ fn stub_caps(multi_org_tun: bool, is_primary: bool, words: &Announced) -> AgentC
     // refresher's cache (never logind on this path). Live, like the words
     // above: the heartbeat re-announces when it changes.
     caps.desktop = words.desktop.clone();
+    // FR-157 P1 — a Mac's screen-worker word, live the same way. A claim, read
+    // by no decision: off the wire where this process says none.
+    caps.gui_worker = words.gui_worker.clone();
     // FR-99 P1b — `privacy-available` where a curtain is possible here, and
     // `privacy-mode` only while the owner allows it too. Live like the record
     // words: the owner's switch moves the second, and the overlay coming up
