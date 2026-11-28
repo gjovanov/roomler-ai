@@ -932,7 +932,7 @@ flowchart TD
 #3669 made each step a read takes run as the person. What a read touched outside such a step, or
 with no bound, and what its refusal said, is gathered in `agents/roomlerd/src/files/reads.rs`, with
 its tests in `files::drawer_edges` (`agents/roomlerd/src/files/drawer_edges.rs`) and
-`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:18084`).
+`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:18189`).
 
 ```mermaid
 sequenceDiagram
@@ -963,17 +963,17 @@ sequenceDiagram
 ```
 
 - **The read loop never awaits a listing.** The files channel's message handler hands `files:dir`
-  to a task of its own (`spawn_dir_listing`, `agents/roomlerd/src/peer.rs:13506`, from the arm at
-  `:13435`) and goes on reading, so a download's `files:cancel`, the next listing or an upload's
+  to a task of its own (`spawn_dir_listing`, `agents/roomlerd/src/peer.rs:13530`, from the arm at
+  `:13459`) and goes on reading, so a download's `files:cancel`, the next listing or an upload's
   chunks never wait behind a share: the channel's worst-case hold for a listing is none. It used to
   be awaited inline, and webrtc-rs reads a channel's next message only once the handler of the last
   one returns. A later listing's answer can now come before an earlier one's; the viewer matches
   each by its `req_id` (`onFilesMessage`, `ui/src/composables/remoteDirListing.ts:215`), so no wire changed. Once the
   channel closes or its session ends, a listing still running drops its answer and sends nothing
   (`FilesHandler::channel_closed`, `agents/roomlerd/src/files/reads.rs:323`, from the channel's
-  `on_close`, `agents/roomlerd/src/peer.rs:13101`; `end_session`). An answer already being sent
-  races that end too (`answer_dir_listing`, `agents/roomlerd/src/peer.rs:13525`, through
-  `or_stopped`, `:14096`): after a network drop a send can park for good on a channel that still
+  `on_close`, `agents/roomlerd/src/peer.rs:13125`; `end_session`). An answer already being sent
+  races that end too (`answer_dir_listing`, `agents/roomlerd/src/peer.rs:13549`, through
+  `or_stopped`, `:14120`): after a network drop a send can park for good on a channel that still
   reads open (#1730), and the task kept the channel and its handler for as long as the agent ran.
 - **One listing step at a time per channel** (the folder lane, `reads::Lane`). A step on a blocking thread
   cannot be cancelled, so a share that stops answering keeps its thread, and a timeout frees the
@@ -1013,7 +1013,7 @@ sequenceDiagram
   request said `paged`, and as one `files:dir-error` naming the folder, its count and the
   listing's size to a viewer that did not, which every viewer shows. The task sends the pages in
   order behind the same end as a whole answer (`send_listing_frames`,
-  `agents/roomlerd/src/peer.rs:13574`, through `or_stopped`), so a channel that closes mid-listing
+  `agents/roomlerd/src/peer.rs:13598`, through `or_stopped`), so a channel that closes mid-listing
   stops them, and the viewer waits 5 s again at each page. A send that fails is a WARN,
   `files: answer not sent`, with its error. A folder over 10 000 entries is listed to that limit
   and says so (`capped`). The answers by viewer and agent, the limit and the budget:
@@ -1079,9 +1079,9 @@ sequenceDiagram
 |---|---|---|
 | The end's first half, on the loop | `FilesHandler::begin_end` (`files.rs:2927`) | quick: under the channel's `incoming` lock it takes the upload out of the slot and marks it as ending (`ENDING`, `files.rs:1539`, read by `upload_ending`, `:1542`) before the lock goes, so whatever is read next finds the slot free and the upload ending. Its refusals keep their words ("no active transfer to end", "files:end id=… but active transfer is …"), and the read loop answers them, as before |
 | The placement | `Ending::place` (`files.rs:2974`) | the end's body from the flush on, unchanged: the short-transfer check, the rename, the copy across volumes or the copy across to the person, then the staging and its registry entry removed. It keeps the upload's busy mark for the updater (`ActiveTransferGuard`) until the file is durable, and its ending mark until it returns, however it ends. It holds neither the handler nor the channel |
-| The lane | `spawn_placement_lane` (`peer.rs:13186`), made by `attach_files_handler` (`:13107`) | one per channel: the placements run one at a time, each in a task of its own, in the order their ends came, so their answers keep that order. It holds the channel only weakly, and its end by the token a listing drops its answer on (`listings_closed`). Its sender lives in the channel's message callback, which `on_session_end` (`:13154`) lets go, and the lane ends once the placements queued by then are done |
-| The answer | `answer_upload_end` (`peer.rs:13213`) | one per upload, `files:complete` or the end's `files:error`, with the fields and the words the read loop sent; logged ("files: complete", "files: end failed") and noted for the session's audit as before. Sent only while the channel lives, the send racing the channel's end (`or_stopped`, `:14096`) |
-| The End arm | `handle_files_control` (`peer.rs:13332`, `:13337`, `:13346`) | the end of an upload refused at its begin is dropped (#3785), and so is a second end of an upload being placed, so it is answered once. Any other end takes `begin_end`, and the loop never waits for its placement |
+| The lane | `spawn_placement_lane` (`peer.rs:13210`), made by `attach_files_handler` (`:13131`) | one per channel: the placements run one at a time, each in a task of its own, in the order their ends came, so their answers keep that order. It holds the channel only weakly, and its end by the token a listing drops its answer on (`listings_closed`). Its sender lives in the channel's message callback, which `on_session_end` (`:13178`) lets go, and the lane ends once the placements queued by then are done |
+| The answer | `answer_upload_end` (`peer.rs:13237`) | one per upload, `files:complete` or the end's `files:error`, with the fields and the words the read loop sent; logged ("files: complete", "files: end failed") and noted for the session's audit as before. Sent only while the channel lives, the send racing the channel's end (`or_stopped`, `:14120`) |
+| The End arm | `handle_files_control` (`peer.rs:13356`, `:13361`, `:13370`) | the end of an upload refused at its begin is dropped (#3785), and so is a second end of an upload being placed, so it is answered once. Any other end takes `begin_end`, and the loop never waits for its placement |
 
 - **A cancel of the upload being placed does nothing to it** (`cancel_incoming`,
   `agents/roomlerd/src/files.rs:3276`): the copy is one step that cannot stop, and its staging is
@@ -1112,7 +1112,7 @@ sequenceDiagram
   channel.
 - **No bound on the copy.** A large file legitimately copies for long, so only a bound on progress
   would be sound, and none is set.
-- The tests are `peer::upload_end_tests` (`agents/roomlerd/src/peer.rs:18540`). A test holds a
+- The tests are `peer::upload_end_tests` (`agents/roomlerd/src/peer.rs:18645`). A test holds a
   placement where its copy runs (`files::drawer_edges::seams::hold_placing`), a download before
   its first chunk (`hold_sending`), and a begin between its two makes (`before_the_id`).
 
@@ -1486,10 +1486,10 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/peer.rs`) | Why |
 |---|---|---|
-| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12913`), asked as the channel opens (`files_channel_here`, `:12922`, from the `"files"` arm, `:1338`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3892`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1278`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`agents/roomlerd/src/signaling.rs:4788`) |
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12928`), asked as the channel opens (`files_channel_here`, `:12942`, from the `"files"` arm, `:1338`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3892`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1278`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`agents/roomlerd/src/signaling.rs:4788`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches after the offer moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. On a one-row Mac, one that attaches between the session's request and its offer serves the session since #4543: the parameters the root daemon held cross with the offer (`hold`, `agents/roomlerd/src/delegate.rs:2064`; `cross_held`, `:2164`), and a session whose offer the root daemon answered stays there (`served_here`, `:2209`). A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
-| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12948`), `attach_files_declined` (`:12971`), `declined_reply` (`:13002`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
-| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12881`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session roomlerd." |
+| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12972`), `attach_files_declined` (`:12995`), `declined_reply` (`:13026`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
+| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12882`) on a Mac with two rows; since #4566, `FILES_ON_A_ONE_ROW_MAC` (`:12892`) on a one-row Mac's root daemon (`consent_relay::one_row`, the read the no-screen sentence uses) | Two rows: "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session roomlerd." One row, where that daemon is the Mac's only row and there is no user-session roomlerd: "File transfer on this Mac runs as the person signed in at its screen, in their screen worker, and none served this session. Reconnect once someone is signed in at the Mac." |
 | What stays | the device's caps (`agents/roomlerd/src/encode/caps.rs:4481`) | the row still offers file transfer: on a one-row Mac it is the row the worker serves whenever someone is signed in, and the hub puts FILES in a grant, which consent names, from these words when a session is asked. Consent, the session request and every other channel are unchanged |
 
 What a viewer notices:
@@ -1500,6 +1500,9 @@ What a viewer notices:
   person signed in is the worker's already, if the worker had attached by its offer (#4543).
 - **On a two-row Mac's `-daemon` row** the same, whoever is signed in: the person's own row serves
   the screen and files.
+- **On a one-row Mac** the reason names no row since #4566, as the no-screen sentence below does:
+  that Mac has no user-session roomlerd to connect to. A two-row Mac's `-daemon` row keeps its
+  sentence.
 - **A session whose offer the root daemon answered before the person signed in** keeps its declined
   channel until it ends.
 - **The no-screen sentence** that daemon sends (`no_display`, `mac_no_display_hint`,
@@ -1511,8 +1514,11 @@ What a viewer notices:
   `-daemon` row still sends the viewer to the person's own row.
 - Windows, Linux, a per-user Mac and every session a GUI worker serves are unchanged.
 
-**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17250`), on every lane's lib
-tests: the decision and its reason's words; each request's answer (`declined_reply`); and through
+**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17274`), on every lane's lib
+tests: the decision and its reason's words; since #4566, one row's reason, which names no row
+(`a_one_row_macs_declined_files_channel_names_no_row`), two rows' byte for byte
+(`a_two_row_macs_declined_files_channel_keeps_its_reason`), and each whole in an answer
+(`every_reason_reaches_the_viewer_whole`); each request's answer (`declined_reply`); and through
 the router over an in-process peer pair, both peers closed after each test, a declined channel that
 answers each request with the reason, leaves the folder asked about as it was and stays up
 (`a_declined_channel_answers_each_request_with_the_reason_and_stays_up`), a served one that lists the
