@@ -1055,11 +1055,11 @@ it ends itself, and no other:
 
 | Path | `close_connection` | Where |
 |---|---|---|
-| a tunnel-client connection the server ends: the connection loop tells the exit at once, and the client is told after it | `true` | `exit_end` (`crates/modules/network/src/tunnel.rs:1655`), from the end-signal arm of `handle_tunnel_client_socket` (`:181`); `signal_end` (`:1669`) sets the flag first and waits for that arm at most 5 s (`END_TOLD_WITHIN`, `:71`) |
-| that client's ack, relayed, and the connection's teardown | `true` | `Originator::exit_terminate` (`crates/modules/network/src/tunnel.rs:524`), which reads `Originator::server_ended` |
-| an agent connection the server ends itself: `Hub::kick_removed_agent` sets the connection's `ServerEnded` (`crates/modules/fleet/src/hub.rs:1331`), which `AgentCtx::server_ended` shares (`crates/core/src/agent_socket.rs:72`); the agent's relays from then on, and its teardown | `true` | `relay_tunnel_client_msg_from_agent` (`crates/modules/network/src/tunnel.rs:1772`), `teardown_agent_originated_sessions` (`:2000`) |
+| a tunnel-client connection the server ends: the connection loop tells the exit at once, and the client is told after it | `true` | `exit_end` (`crates/modules/network/src/tunnel.rs:1678`), from the end-signal arm of `handle_tunnel_client_socket` (`:198`); `signal_end` (`:1692`) sets the flag first and waits for that arm at most 5 s (`END_TOLD_WITHIN`, `:77`) |
+| that client's ack, relayed, and the connection's teardown | `true` | `Originator::exit_terminate` (`crates/modules/network/src/tunnel.rs:547`), which reads `Originator::server_ended` |
+| an agent connection the server ends itself: `Hub::kick_removed_agent` sets the connection's `ServerEnded` (`crates/modules/fleet/src/hub.rs:1331`), which `AgentCtx::server_ended` shares (`crates/core/src/agent_socket.rs:72`); the agent's relays from then on, and its teardown | `true` | `relay_tunnel_client_msg_from_agent` (`crates/modules/network/src/tunnel.rs:1896`), `teardown_agent_originated_sessions` (`:2124`) |
 | every other relay and teardown: a socket that drops, a roll, a replacement | `false` | the same sites |
-| a push to a client (`terminate_agent_sessions_now`, the relays in `agent_arms.rs`) | `false` | `crates/modules/network/src/tunnel.rs:2098`, `crates/modules/network/src/agent_arms.rs` |
+| a push to a client (`terminate_agent_sessions_now`, the relays in `agent_arms.rs`) | `false` | `crates/modules/network/src/tunnel.rs:2222`, `crates/modules/network/src/agent_arms.rs` |
 
 ```mermaid
 sequenceDiagram
@@ -1450,7 +1450,7 @@ Locked by lib tests, each shown red with a one-line negative control:
    ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
    The forward itself reads no permission bit: the policy is the grant, made to let
    people who hold no management bit reach what a holder named them for
-   (`crates/modules/network/src/tunnel.rs:1149`). Every decision lands in
+   (`crates/modules/network/src/tunnel.rs:1172`). Every decision lands in
    `tunnel_audit` (90 d). A device the org
    removed is refused as a target while it is removed; if its machine enrolls
    again, the device is taken out of every live policy's subjects and targets
@@ -1462,7 +1462,7 @@ Locked by lib tests, each shown red with a one-line negative control:
 ### Who a forward is matched as (#3635)
 
 A forward is matched in the org whose policies decide it, the target device's
-(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1143`); a forward from
+(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1166`); a forward from
 another org is refused `cross_tenant` whatever those policies say. In that org the
 originator is matched as the person it acts for, its `owner_user_id`:
 
@@ -1471,7 +1471,7 @@ originator is matched as the person it acts for, its `owner_user_id`:
 | A tunnel client: `roomler` on its own socket, with its tunnel-client credential | the person who enrolled it; for a paired client, whoever approved the pairing | a role that person holds in the org | `TunnelClientId` = this client; an `AgentId` never matches it | yes |
 | A device opening forwards over its own device socket: `forward --daemon`, a declared route, a supervised SOCKS5 listener ([tunnel-install.md](tunnel-install.md#declared-routes-daemon-supervised--p6)) | the device's owner, as read when the device's socket connected | a role the device's owner holds in the org | `AgentId` = this device; a `TunnelClientId` never matches it | yes |
 
-The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1035`),
+The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1058`),
 through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:757`),
 the same read every gate that matches a role makes
 ([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)):
@@ -1516,7 +1516,7 @@ flowchart TD
 | `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:398`) | a device forwards on its owner's role, and is refused once the owner left the org |
 | `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:455`) | a role of another org, and a role the org deleted, grant nothing here; the rule naming the other org's role is a stored one, because a policy write takes only the org's roles |
 | `…::the_other_subject_kinds_forward_as_before` (`:539`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
-| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2256`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
+| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2380`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
 
 ### A retired agent-session grant is refused (FR-137)
 
@@ -1529,8 +1529,8 @@ reach whatever the device may reach. So:
 - `net_grant` stays on `ClientMsg::TunnelOpen`, parse-only
   (`crates/remote_control/src/signaling.rs:1363`), and no build sends it;
 - the server refuses any open that carries one, at step 3c
-  (`crates/modules/network/src/tunnel.rs:732`), before a tunnel session exists
-  (step 4, `:815`), with `rc:error {code: net_grant_refused}`
+  (`crates/modules/network/src/tunnel.rs:755`), before a tunnel session exists
+  (step 4, `:839`), with `rc:error {code: net_grant_refused}`
   (`NET_GRANT_REFUSED`, `signaling.rs:102`). An old device reads that code as the
   end of its grant, never as a reason to retry.
 
@@ -1544,7 +1544,7 @@ reserved are listed in
 
 `roomler enroll` and the setup wizard trade a single-use tunnel enrollment token for the
 client's own credential at `POST /api/tunnel-client/enroll` (`enroll_tunnel_client`,
-`crates/modules/network/src/routes/tunnel.rs:185`). The request carries no user
+`crates/modules/network/src/routes/tunnel.rs:188`). The request carries no user
 session: the enrollment acts for the person the token was minted for, and a row it makes
 is theirs.
 
@@ -1561,7 +1561,7 @@ row (#4479). The `instance_id` is the install's own. A row keeps the `machine_id
 made with for good, because the client's overlay node is keyed by it, and it holds an
 `instance_id` once an FR-159 client has claimed it (`TunnelClient`,
 `crates/remote_control/src/models.rs:3806`). A row an FR-159 client creates takes its
-`instance_id` as its `machine_id` too (`create_row`, `routes/tunnel.rs:486`), so no legacy hash
+`instance_id` as its `machine_id` too (`create_row`, `routes/tunnel.rs:489`), so no legacy hash
 ever finds it.
 
 **The order.** Every refusal comes before the token is spent, and the token is spent once
@@ -1609,7 +1609,7 @@ flowchart TD
   test (`every_row_of_the_outcome_table`). It asks for the scope's answer, and then for
   the cap's, only when it needs one: an owner's revival reads neither, as before.
 - **The owner scope stands.** Every revival, by either id, goes through `revive_scope`
-  (`routes/tunnel.rs:410`), and the write holds the same scope (`ReviveScope`). An
+  (`routes/tunnel.rs:413`), and the write holds the same scope (`ReviveScope`). An
   `instance_id` never revives another person's row. The one refusal FR-159 lifts is
   #4479's second case: an install that meets someone else's live row by the legacy hash
   alone gets a row of its own, which grants nothing a new name does not.
@@ -1657,7 +1657,7 @@ sequenceDiagram
 |---|---|---|
 | 400 | an `instance_id` that is not 32 lowercase hex, with the switch on | `instance_id must be 32 lowercase hexadecimal characters` |
 | 409 `SOMEONE_ELSES_TUNNEL_CLIENT` | an older client's `machine_id` (any request's, while the switch is off) names someone else's live row | enroll under a different name (the name is in the hash), or ask an administrator |
-| 409 `SOMEONE_ELSES_TUNNEL_INSTANCE` (`routes/tunnel.rs:124`) | the row the request's `instance_id` holds is someone else's live row | another name changes nothing for that id: enroll from another configuration, or ask the client's owner or an administrator |
+| 409 `SOMEONE_ELSES_TUNNEL_INSTANCE` (`routes/tunnel.rs:127`) | the row the request's `instance_id` holds is someone else's live row | another name changes nothing for that id: enroll from another configuration, or ask the client's owner or an administrator |
 | 409 `REMOVED_TUNNEL_CLIENT` | a removed row, by either id, and the token's person does not hold `MANAGE_AGENTS` | only a device manager brings it back |
 | 403 | the plan's cap, for a new row | `Tunnel-client limit reached …` |
 
@@ -1727,6 +1727,99 @@ a person who is no longer a member holds none there, so their next forward throu
   the person are left in place for an admin to edit. A device the person owns stops
   matching `RoleId` grants at once, because the forward reads its owner's roles in
   the org on every request and its owner holds none there any more.
+
+## How a tunnel client's presence is read (#4553)
+
+A tunnel client's row carries a `status`, and nothing its socket does writes it. It is
+the admin's state: `online` and `offline` both mean active, and `quarantined` ends
+the socket at its next 60 s check. Whether the client is connected is derived on
+every read from its live tunnel socket, the way an agent's presence is derived from
+its hub registration (Phase A-1). ONE function does it,
+`derive_tunnel_client_presence` (`crates/modules/fleet/src/agent.rs:2838`), beside
+`derive_agent_presence` (`:2636`), and every list that shows a tunnel client calls
+it: the unified device list and a device's own listing
+(`crates/api/src/routes/device.rs:226`, `crates/api/src/routes/agent_self.rs`), and
+`GET …/tunnel-client` with the PUT's answer
+(`crates/modules/network/src/routes/tunnel.rs:743`). Each row carries `presence` and
+`is_online` beside `status` ([api.md](api.md)).
+
+```mermaid
+flowchart TD
+    R["a list reads a tunnel client"] --> L{"a socket of it on this pod?"}
+    L -- yes --> ON["online"]
+    L -- no --> D{"the directory answered?<br/>one MGET, 200 ms"}
+    D -- "yes, a fresh record from any pod" --> ON
+    D -- "yes, no record" --> OFF["offline"]
+    D -- "no: no Redis, an error, the budget spent" --> T{"last_seen_at under 180 s old?"}
+    T -- yes --> ST["stale"]
+    T -- no --> OFF
+```
+
+| What the read finds | `presence` | `is_online` |
+|---|---|---|
+| a socket of the client is live on this pod (`TunnelClientSockets`, `agent.rs:2676`) | `online` | `true` |
+| else, a fresh record of it from any pod (`tunnel_client_presence_batch`, `agent.rs:2804`) | `online` | `true` |
+| else, the directory answered | `offline` | `false` |
+| else (no Redis, an error, or the 200 ms budget spent), and `last_seen_at` is fresh | `stale` | `false` |
+| else | `offline` | `false` |
+
+⚠️ **The heartbeat trail speaks only when the directory cannot answer.** An agent's
+`stale` is gated on the `Online` status its own socket writes at the hello and its
+clean teardown clears. A tunnel client cannot have that gate: its `status` stays the
+admin's, and with two pods a disconnect's write could land after the client
+reconnected through the other pod. Its `last_seen_at` stays fresh for up to 180 s
+after a clean close, so read on its own it would show every client that just closed,
+or just enrolled, as `stale`. A directory that answered knows the sockets; the trail
+stands in only for one that did not, and then it is never green: with Redis down, a
+pod reads a client connected to the other pod as `stale` (`tunnel_client_presence`,
+`agent.rs:2868`, and its table test).
+
+### The record its sockets write
+
+One Redis record per client, `roomler:own:tunnel-client:<client_id>`
+(`tunnel_client_key`, `crates/core/src/cluster/directory.rs:292`), in the ownership
+directory every pod reads ([multi-pod-scale-out.md](multi-pod-scale-out.md)). Its TTL is
+180 s, 3 × the socket's 60 s check (`TUNNEL_CLIENT_TTL_SECS`, `:305`), the headroom the
+agent and user records keep over their 30 s beat: one missed refresh drops neither a
+live client nor its trail.
+
+| When | What | Where |
+|---|---|---|
+| connect | `last_seen_at` is touched (the check's first run is a full period away); the socket takes a seat on this pod; a client new to this pod gets its token there; the record is claimed with `claim_if_newer`, newest wins by the time each pod minted its token | `handle_tunnel_client_socket` (`crates/modules/network/src/tunnel.rs:99-102`), `PresenceRecord::open` (`:1805`) |
+| every 60 s | the check that re-reads the row, and closes the socket of a quarantined or removed client, touches `last_seen_at` and refreshes the record with `refresh_if_mine`, the token read live: ours or gone is set again, another pod's is left alone | `spawn_revocation_check` (`:1707`), its refresh at `:1739` and, when the row could not be read, `:1765` |
+| close | the check is aborted and awaited, then the seat leaves; the client's LAST socket on this pod releases the record, compare-and-delete, so an old pod's late close never takes a newer socket's record | `:447-453`, `PresenceRecord::close` (`:1856`) |
+| pod shutdown | every token this pod holds is taken, so no refresh writes it back, then released | `NetworkState::shutdown` (`crates/modules/network/src/lib.rs:994`) |
+
+- ⚠️ **The client's sockets on one pod share one token**, as an agent's hub slot holds
+  one (`TunnelClientSockets::sit`, `agent.rs:2694`). Two `roomler` processes on one
+  machine hold two sockets, and the newer one often closes first (a short `roomler
+  ssh` beside a long-lived forward). With a token per socket, that close would delete
+  the record the other socket stands behind, and every other pod would read the client
+  offline until the next refresh, up to 60 s. Shared, the first close releases nothing;
+  the last one releases the record (`leave`, `:2754`).
+- ⚠️ **The release waits for the check.** `refresh_if_mine` writes a missing key back:
+  that is how a record lost to a Redis blip heals within one check. A refresh still in
+  flight after the release would bring the record back for its whole TTL, so the
+  teardown awaits the aborted check before the seat leaves.
+- **`status` is never written by a socket**, and `TunnelClientDao::mark_status`, which
+  had no caller, is gone.
+- **Presence is a fact the server observes.** No authorization decision reads it.
+
+Known gaps:
+
+- **A pod that crashes** releases nothing, so its clients' records live out their TTL:
+  a dead client reads `online` on the other pod for up to 180 s (an agent's record has
+  the same gap, for its 90 s).
+- **Two sockets of one client on two pods:** when the one whose pod holds the record
+  closes, the other pod's next refresh claims it again, so for up to 60 s the closing
+  socket's pod reads the client `offline` while its other socket is open.
+- **A deployment with no Redis at all** has no directory to ask, so it reads every
+  client without a socket on this pod by its trail: one that closed, or enrolled, in
+  the last 180 s reads `stale`, never `offline`, even on a single pod.
+- **A half-open socket** keeps its seat and its record, and so reads `online`, until a
+  write to it fails: the tunnel socket has no receive deadline (`socket_rx.next()`,
+  `tunnel.rs:197`), and the 60 s check writes to the database and Redis, never to the
+  socket.
 
 ## LocalAPI
 

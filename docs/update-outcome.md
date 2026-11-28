@@ -439,7 +439,7 @@ can name a person.
   heartbeat store the parsed caps (`update_hello`,
   `crates/services/src/dao/agent.rs:621`), and the
   device list serves them as stored (`caps_as_served`,
-  `crates/modules/fleet/src/agent.rs:2751`, which takes out `gui_worker`
+  `crates/modules/fleet/src/agent.rs:2966`, which takes out `gui_worker`
   alone). A word only reaches a row because `AgentCaps` declares it: the parse
   drops a key the struct does not know
   (`the_caps_keep_the_install_verdict_and_the_crash_health`).

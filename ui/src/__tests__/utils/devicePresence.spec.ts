@@ -7,6 +7,7 @@ import {
   presenceIcon,
   presenceLabel,
   presenceTitle,
+  type DevicePresence,
   type PresenceRow,
   type SleepView,
 } from '@/utils/devicePresence'
@@ -74,9 +75,26 @@ describe('device presence (FR-55 P4)', () => {
     expect(presenceIcon(stale)).toBe('mdi-circle-half-full')
   })
 
-  it('keeps a tunnel client on its stored status', () => {
-    const t = row({ kind: 'tunnel_client', sleep: sleep('never', false) })
-    expect(isAsleep(t)).toBe(false)
-    expect(presenceTitle(t, fmt)).toBe('Offline (stored status)')
+  // #4553 — the server derives a tunnel client's presence from its socket;
+  // the chip says what each state means for a tunnel client, not an agent.
+  it('reads a tunnel client by its presence, which the server takes from its socket', () => {
+    const t = (presence: DevicePresence) =>
+      row({
+        kind: 'tunnel_client',
+        presence,
+        is_online: presence === 'online',
+        sleep: sleep('never', false),
+      })
+    expect(isAsleep(t('offline'))).toBe(false)
+    expect(presenceColor(t('online'))).toBe('success')
+    expect(presenceColor(t('stale'))).toBe('warning')
+    expect(presenceTitle(t('online'), fmt)).toBe('Online — its tunnel socket is connected')
+    expect(presenceTitle(t('stale'), fmt)).toMatch(/^Stale — /)
+    expect(presenceTitle(t('offline'), fmt)).toBe('Offline')
+    for (const p of ['online', 'stale', 'offline'] as const) {
+      expect(presenceTitle(t(p), fmt)).not.toContain('stored status')
+      // An agent's remedy, which a tunnel client has no service for.
+      expect(presenceTitle(t(p), fmt)).not.toContain('Roomler service')
+    }
   })
 })
