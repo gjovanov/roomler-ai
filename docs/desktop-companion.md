@@ -432,7 +432,7 @@ flowchart TD
 - **What never leaves the server:** machine ids, owner ids, WireGuard keys and key epochs,
   consent settings, codecs. Those fields are blanked *before* search runs, so `q` cannot be
   used to probe them. Search, sort and paging are the web grid's own
-  (`parse_query` / `apply_query`, `crates/api/src/routes/device.rs:295`, `:337`), so the two
+  (`parse_query` / `apply_query`, `crates/api/src/routes/device.rs:310`, `:352`), so the two
   grids cannot drift.
 - Proven by a negative control: with visibility taken from every live node instead of the
   shaped netmap, the enforce test leaks a withheld peer and fails
