@@ -170,7 +170,7 @@ the order the probe opens them. A host's probe adds an overlay of proof, and `de
 
 **It drives nothing.** `compute_caps_with` (`agents/roomlerd/src/encode/caps.rs:3970`)
 makes every open it made before and records what it found in `ProbeFindings`
-(`cell_table.rs:624`). `assemble` (`caps.rs:4552`) writes the real hello from that, with
+(`cell_table.rs:624`). `assemble` (`caps.rs:4558`) writes the real hello from that, with
 the pushes the probe used to make inline, in the same order and on the same conditions.
 The table derives beside it, and `shadow` (`caps.rs:4381`, `cell_table.rs:1286`) compares
 the two once per process and touches nothing. **The evidence is the gate**, which proves the
@@ -297,7 +297,7 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:4040`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:4042`), and the viewer ignores
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:10448`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
@@ -786,7 +786,7 @@ something holds its pipe is a unit test with a real process on each OS.
   session on that host would run the same vendor's code in-process. With `h264` chosen it
   takes OpenH264 instead. With `av1` chosen it gets no video until #3279 lands: `av1_mf` is
   denied, an FFmpeg AV1 cell that opened still puts `av1` in `codecs`,
-  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L5136) puts it first, and
+  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L5142) puts it first, and
   `MfEncoder::new_av1` refuses. A report that came before the stuck child stops offering those
   cells, so the hello does not promise what a session is refused. Only a kill that landed
   within its bound keeps Media Foundation: a later kill on a thrashing host reads as "would
@@ -930,7 +930,7 @@ nothing has produced a stuck child in the field.
   child. It is a level, so a child that came back first costs nothing. When the cells go, the answer
   in force stops offering them, as for a fault. A session starting beside a live one, or within that
   minute, can still open them.
-- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L5157)). A session picks its codec and transport
+- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L5163)). A session picks its codec and transport
   at its request, before consent, and a person can take longer than that minute (`prompt_then_email`
   waits minutes). So its offer reads both against the answer in force (`answer_now`, which never
   waits for a probe, #3439): what has gone is picked again by the
@@ -966,10 +966,10 @@ in.
 
 **How it reaches the server and the viewer.** The hello and the heartbeat announce one snapshot
 (#3992). One function reads every word a connection announces, the answer's generation first
-([`Announcer::now`](../agents/roomlerd/src/signaling.rs#L7264)), and one builds the caps from it
-([`Announcer::caps`](../agents/roomlerd/src/signaling.rs#L7318)). The hello carries the first
+([`Announcer::now`](../agents/roomlerd/src/signaling.rs#L7275)), and one builds the caps from it
+([`Announcer::caps`](../agents/roomlerd/src/signaling.rs#L7334)). The hello carries the first
 snapshot, and that is what the connection has announced until a beat reads one that differs
-([`Announcer::beat`](../agents/roomlerd/src/signaling.rs#L7401)) and re-announces (FR-43 P2c);
+([`Announcer::beat`](../agents/roomlerd/src/signaling.rs#L7417)) and re-announces (FR-43 P2c);
 the server replaces the row's blob. Only the hello makes that first value, so the comparison
 starts from nothing else. The generation is part of that comparison, per connection, with no
 wire change, and since #3439 a watch on it wakes every connection, so every organization's row
@@ -977,7 +977,7 @@ gets it at once rather than within a beat. A supervised Mac's screen worker wake
 that hold its delegation host the same way: its caps, the person's floor or its leaving, once
 stored, move a second watch ([`DelegateHost::news`](../agents/roomlerd/src/delegate.rs#L1751)).
 The hello subscribes to it before it reads its words
-([`Announcer::hello_with`](../agents/roomlerd/src/signaling.rs#L7378)), so a word said in between
+([`Announcer::hello_with`](../agents/roomlerd/src/signaling.rs#L7394)), so a word said in between
 is in the hello or wakes the loop. The beat still decides what is sent, and a word that changes
 nothing the row says costs no caps. A reconnect's hello reads the answer in force. A
 viewer sees the new matrix at its next page load or 5-minute status read. A session
@@ -1815,7 +1815,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:859`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6819`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6835`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -1829,11 +1829,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:7052`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:7068`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:7081`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:7097`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
