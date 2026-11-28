@@ -142,9 +142,12 @@ pub struct ExecRequest {
     pub start_in_home: bool,
     /// #3303 — the command belongs to a Roomler SSH session and ends with it.
     /// On Windows it runs in a kill-on-close job, so that holds whichever way
-    /// this process leaves (`session_job`). Roomler SSH's exec channel sets it;
-    /// Fleet RPC never does, because a command there may stop this very daemon
-    /// and has to outlive it (`roomler exec … self-update`).
+    /// this process leaves (`session_job`). On Linux and macOS its container is
+    /// the process group it leads (#3361): a client gone ends that, the
+    /// command's exit included, and the daemon's leaving ends it only as far
+    /// as the service manager does. Roomler SSH's exec channel sets it; Fleet
+    /// RPC never does, because a command there may stop this very daemon and
+    /// has to outlive it (`roomler exec … self-update`).
     pub session_owned: bool,
 }
 
@@ -2453,7 +2456,8 @@ impl ExecEngine {
         let pid = child.id();
 
         // `kill_on_drop` ends a child that never ran, on the failure's return.
-        #[cfg(windows)]
+        // A session's container (#3303, #3361): a job on Windows, the process
+        // group the command leads on Linux and macOS.
         let job = if req.session_owned {
             match session_job::start(&child) {
                 Ok(job) => job,
@@ -2495,24 +2499,26 @@ impl ExecEngine {
         tokio::pin!(timeout);
         tokio::pin!(cancel);
 
+        // On Unix a session's shell is left uncollected here, its status
+        // `None`, and collected below, after `finish` (`session_job::exited`).
         let (status, error) = tokio::select! {
-            res = child.wait() => match res {
-                Ok(s) => (Some(s), None),
+            res = session_job::exited(&mut child, job.as_ref()) => match res {
+                Ok(s) => (s, None),
                 Err(e) => (None, Some(format!("waiting for the command failed: {e}"))),
             },
             _ = &mut timeout => {
-                #[cfg(windows)]
                 session_job::end(job.as_ref());
                 kill_tree(&mut child, pid).await;
                 (None, Some(format!("timed out after {}ms", timeout_ms.unwrap_or_default())))
             }
             _ = &mut cancel => {
-                #[cfg(windows)]
                 session_job::end(job.as_ref());
                 kill_tree(&mut child, pid).await;
                 (None, Some("cancelled by the caller".to_string()))
             }
         };
+        #[cfg(unix)]
+        let exited_by_itself = error.is_none();
         // The command is gone. A feeder still waiting on a client that has
         // not sent EOF has nothing left to write to: end it here rather than
         // leaving it parked until the session drops its sender.
@@ -2520,17 +2526,29 @@ impl ExecEngine {
             feeder.abort();
         }
 
-        let readers = async {
+        // #3361 — on Unix a session's readers stop when `finish` stops
+        // waiting on them, past a process that left the group.
+        #[cfg(unix)]
+        let stop = job
+            .as_ref()
+            .map(|_| session_job::StopReaders([out_task.abort_handle(), err_task.abort_handle()]));
+        let readers = async move {
+            #[cfg(unix)]
+            let _stop = stop;
             (
                 out_task.await.unwrap_or_default(),
                 err_task.await.unwrap_or_default(),
             )
         };
-        #[cfg(windows)]
         let (readers, error) = session_job::finish(job, readers, &mut cancel, error).await;
-        #[cfg(not(windows))]
-        let readers = readers.await;
         let ((stdout_bytes, out_trunc), (stderr_bytes, err_trunc)) = readers;
+        // #3361 — the shell `exited` left uncollected, collected now that
+        // nothing signals its group any more.
+        #[cfg(unix)]
+        let status = match status {
+            None if exited_by_itself => child.wait().await.ok(),
+            status => status,
+        };
 
         // The text views are filled after redaction (`run_fed`).
         ExecOutcome {
@@ -4437,6 +4455,15 @@ mod session_job {
         }
     }
 
+    /// The command's exit. A job changes nothing about collecting it; the Unix
+    /// side is where it does (#3361).
+    pub(super) async fn exited(
+        child: &mut tokio::process::Child,
+        _job: Option<&JobObject>,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        child.wait().await.map(Some)
+    }
+
     /// The command is over: wait for its output, and settle what it left.
     ///
     /// Something it started may hold its output pipes, and the run waits on
@@ -4471,6 +4498,190 @@ mod session_job {
             _ = cancel => {
                 end(Some(&job));
                 (readers.await, Some("cancelled by the caller".to_string()))
+            }
+        }
+    }
+}
+
+/// #3361 — the same lifecycle on Linux and macOS. A Roomler SSH one-shot that
+/// its client leaves is ended, and the run stops waiting, even after the
+/// command's own process has exited while something it started holds its
+/// pipes: what Windows' job gives in its `finish`. The container is the process
+/// group the command leads (`process_group(0)` in `spawn_and_wait`). What the
+/// command starts stays in it unless it leaves (`setsid`), and one `killpg`
+/// ends it.
+///
+/// What a group does not do is what the kernel does for a job: nothing ends it
+/// as this daemon goes. Under systemd the unit's cgroup does; launchd and a
+/// daemon nobody supervises reach no group (`docs/roomler-ssh.md` § What
+/// outlives a session). A command that ENDS by itself keeps what it started, as
+/// on Windows: nothing signals its group after that.
+///
+/// The shell is not collected while its group may still be signalled. An
+/// unreaped zombie keeps its pid reserved, and the group's id with it, so a
+/// `killpg` cannot land on a group the kernel has since handed to someone else
+/// (the rule `virtual_desktop.rs`'s teardown keeps). [`exited`] waits without
+/// collecting, and `spawn_and_wait` collects the shell after [`finish`].
+#[cfg(unix)]
+mod session_job {
+    use std::future::Future;
+    use std::time::Duration;
+
+    use tracing::warn;
+
+    /// Worded as Windows' `NO_JOB`, so a fleet log search finds both.
+    const NO_GROUP: &str = "ssh: the session's command does not lead its own process group — descendants may outlive it";
+
+    /// How long the output may take to reach its end once the group is ended.
+    /// What was in the group is gone within milliseconds of a SIGKILL. A
+    /// process that left it (`setsid`) may hold the pipes for as long as it
+    /// lives, and the run stops waiting on it here.
+    pub(super) const DRAIN_WITHIN: Duration = Duration::from_millis(500);
+
+    /// The session's process group, by the id of the shell that leads it.
+    pub(super) struct Group {
+        pgid: i32,
+    }
+
+    /// The group the command leads. `process_group(0)` made it at the spawn; a
+    /// command in any other group runs without the guarantee, as a Windows
+    /// command whose job could not be made does, and says so.
+    pub(super) fn start(child: &tokio::process::Child) -> Result<Option<Group>, String> {
+        let Some(pid) = child.id() else {
+            return Err("the process is gone before it ran".to_string());
+        };
+        let pid = pid as i32;
+        // SAFETY: `getpgid(2)` only reads, on our own child, not yet collected.
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pid <= 1 || pgid != pid {
+            warn!(pid, pgid, "{NO_GROUP}");
+            return Ok(None);
+        }
+        Ok(Some(Group { pgid }))
+    }
+
+    /// End every process in the group. Called only while its leader is not
+    /// collected: by the arms of `spawn_and_wait`'s wait, before `kill_tree`
+    /// collects the shell, and by [`finish`], while the shell is the zombie
+    /// [`exited`] left.
+    pub(super) fn end(group: Option<&Group>) {
+        let Some(group) = group else {
+            return;
+        };
+        // SAFETY: `killpg(2)` on the group this run's command leads. Its
+        // leader is not collected yet (above), so the id is still this group's.
+        if unsafe { libc::killpg(group.pgid, libc::SIGKILL) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                warn!(%e, "ssh: could not end the session's process group");
+            }
+        }
+    }
+
+    /// The command's exit. With a group the shell is left uncollected
+    /// (`WNOWAIT`) and the answer is `Ok(None)`: `spawn_and_wait` collects it
+    /// after [`finish`]. With none this is `Child::wait`, as ever.
+    pub(super) async fn exited(
+        child: &mut tokio::process::Child,
+        group: Option<&Group>,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let Some(group) = group else {
+            return child.wait().await.map(Some);
+        };
+        let pid = group.pgid;
+        tokio::task::spawn_blocking(move || wait_exit(pid))
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(None)
+    }
+
+    /// Block until our child `pid` has exited, and leave it waitable. The
+    /// thread is the command's for its whole run, as `win_console`'s waiter
+    /// is, and the per-device permit bounds how many there are.
+    fn wait_exit(pid: i32) -> std::io::Result<()> {
+        loop {
+            // SAFETY: `siginfo_t` is plain data that `waitid` fills in;
+            // all-zero is a valid value for it.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `waitid(2)` on our own child, with a live out-pointer.
+            // `WNOWAIT` leaves it waitable, so `Child::wait` collects it later.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                return Err(e);
+            }
+        }
+    }
+
+    /// Stops the run's two readers when the run stops waiting on them
+    /// ([`drained`]). A pipe held past that point is read by nobody, as when
+    /// an OpenSSH session's reader goes, and its holder's next write fails.
+    pub(super) struct StopReaders(pub(super) [tokio::task::AbortHandle; 2]);
+
+    impl Drop for StopReaders {
+        fn drop(&mut self) {
+            for reader in &self.0 {
+                reader.abort();
+            }
+        }
+    }
+
+    /// The command is over: wait for its output, and settle what it left, as
+    /// Windows' `finish` does with the job.
+    ///
+    /// A command that ended by itself, its output at its end, keeps what it
+    /// left running: nothing signals its group after this. A client gone ends
+    /// the group. After that the run waits for its output at most
+    /// [`DRAIN_WITHIN`]: what left the group may hold the pipes past it, and
+    /// is not the session's to end. With no group the wait is as it always
+    /// was.
+    ///
+    /// `cancel` is polled only with `error` empty, as on Windows. An `error`
+    /// here is a run whose wait has already ended the group (`end`, then
+    /// `kill_tree`) while its leader held the id; it is not signalled again.
+    pub(super) async fn finish<T: Default>(
+        group: Option<Group>,
+        readers: impl Future<Output = T>,
+        cancel: impl Future<Output = ()>,
+        error: Option<String>,
+    ) -> (T, Option<String>) {
+        let Some(group) = group else {
+            return (readers.await, error);
+        };
+        if error.is_some() {
+            return (drained(readers).await, error);
+        }
+        tokio::pin!(readers);
+        tokio::select! {
+            out = &mut readers => (out, None),
+            _ = cancel => {
+                end(Some(&group));
+                (drained(readers).await, Some("cancelled by the caller".to_string()))
+            }
+        }
+    }
+
+    /// The output once every writer of its pipes is gone, or nothing once
+    /// [`DRAIN_WITHIN`] has passed. Dropping `readers` stops the readers
+    /// ([`StopReaders`]), so the run's redaction stage sees its end too.
+    async fn drained<T: Default>(readers: impl Future<Output = T>) -> T {
+        match tokio::time::timeout(DRAIN_WITHIN, readers).await {
+            Ok(out) => out,
+            Err(_) => {
+                warn!(
+                    "ssh: a process outside the session's process group holds its output; the run stops waiting on it"
+                );
+                T::default()
             }
         }
     }
@@ -4909,6 +5120,44 @@ mod session_group_tests {
             !left.gone_within(STILL_THERE_FOR).await,
             "it ended with a client that left after the command had ended"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other side of the line: a Fleet RPC command has no container, and
+    /// its final wait is as it always was. A cancel after it exited ends
+    /// nothing it left, and the run waits on the holder of its pipes, which
+    /// the test then ends itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fleet_rpc_commands_final_wait_is_as_it_was() {
+        let dir = folder();
+        let eng = Arc::new(ExecEngine::new());
+        let mut run = {
+            let mut req = session(leaves(&dir, "sleep 1000"), "t3361-fleet");
+            req.session_owned = false;
+            let eng = eng.clone();
+            tokio::spawn(async move { eng.run_fed(req, &Redactor::default(), None).await })
+        };
+        let pids = said(&dir.join("pids"), 2, &run).await;
+        let (shell, left) = (pids[0], Proc::of(pids[1]));
+        let group = Group::new(shell, left);
+        exited(shell, &run).await;
+
+        assert!(eng.cancel("t3361-fleet").await, "the run is not in flight");
+        assert!(
+            !left.gone_within(STILL_THERE_FOR).await,
+            "a cancel after a Fleet RPC command exited ended what it left"
+        );
+        assert!(
+            !run.is_finished(),
+            "a Fleet RPC command's final wait heard its cancel"
+        );
+        // Ends the holder, through the group the engine made for this command.
+        drop(group);
+        let outcome = tokio::time::timeout(STILL_WAITING_AFTER, &mut run)
+            .await
+            .expect("the run ends once the holder of its pipes is gone")
+            .unwrap();
+        assert_eq!(outcome.error, None, "{outcome:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
