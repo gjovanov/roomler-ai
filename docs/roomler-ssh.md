@@ -1371,7 +1371,7 @@ table exists for: a captured key must not open a second session.
 
 Now a process honours a grant id at most once. `record_grant` checks the id
 after its prune and before the table changes
-([`ssh.rs:3352-3360`](../agents/roomlerd/src/ssh.rs#L3352)), and a copy is
+([`ssh.rs:3352-3362`](../agents/roomlerd/src/ssh.rs#L3352)), and a copy is
 never recorded, so the first copy keeps its entry, its window and its
 acknowledgement:
 
@@ -1432,7 +1432,7 @@ differently so that it does:
 
 | Path | A copy is | Why the first copy's answer stands |
 |---|---|---|
-| the worker's own table | refused, `invalid` | One loop records and acknowledges each grant in order (`handle_server_msg`, [`signaling.rs:3373`](../agents/roomlerd/src/signaling.rs#L3373)), and its answers leave on one queue ([`signaling.rs:2807`](../agents/roomlerd/src/signaling.rs#L2807)). The server reads one socket's frames in order ([`socket.rs:607-629`](../crates/modules/fleet/src/socket.rs#L607)), and the first answer removes the caller's wait ([`ssh_grant_acks.rs:108-120`](../crates/modules/network/src/ssh_grant_acks.rs#L108)). The copy's refusal finds no wait, and the server logs `ssh: grant ack with no waiter` at debug ([`agent_socket.rs:141-155`](../crates/modules/network/src/agent_socket.rs#L141)) |
+| the worker's own table | refused, `invalid` | One loop records and acknowledges each grant in order (`handle_server_msg`, [`signaling.rs:3373`](../agents/roomlerd/src/signaling.rs#L3373)), and its answers leave on one queue ([`signaling.rs:2807`](../agents/roomlerd/src/signaling.rs#L2807)). The server reads one socket's frames in order ([`socket.rs:607-630`](../crates/modules/fleet/src/socket.rs#L607)), and the first answer removes the caller's wait ([`ssh_grant_acks.rs:108-120`](../crates/modules/network/src/ssh_grant_acks.rs#L108)). The copy's refusal finds no wait, and the server logs `ssh: grant ack with no waiter` at debug ([`agent_socket.rs:141-155`](../crates/modules/network/src/agent_socket.rs#L141)) |
 | the SYSTEM service (FR-105) | dropped by the worker: no second ring and no acknowledgement, only a warning, `rc:ssh.grant already handed to the SYSTEM service (or refused); this copy is dropped, no ack` ([`signaling.rs:6151-6160`](../agents/roomlerd/src/signaling.rs#L6151)) | Here a refusal could undo the first copy. The service's claim is single use ([`ssh_pending.rs:44-68`](../crates/services/src/dao/ssh_pending.rs#L44)), so a copy's ring ends in a 404 ([`agent_ssh.rs:1263-1290`](../crates/modules/network/src/routes/agent_ssh.rs#L1263)), which the worker would answer as a refusal. The first copy's claim can land on a server instance other than the one holding the caller's wait. That wait reads the claim from the shared row every 400 ms, and until then it still takes a worker's refusal ([`ssh_grant_acks.rs:115`](../crates/modules/network/src/ssh_grant_acks.rs#L115)): its refusal arm would deny the caller ([`agent_ssh.rs:545-566`](../crates/modules/network/src/routes/agent_ssh.rs#L545)) while the service holds the grant. So the worker remembers each via-service id at first sight, before any outcome (`first_sight_via_service`, [`ssh.rs:3559`](../agents/roomlerd/src/ssh.rs#L3559)), in a memory of its own with the same horizon and bound, never the table's. A grant the worker refused is as dead as one the service took, and its first refusal already answered |
 
 Left as they are:
