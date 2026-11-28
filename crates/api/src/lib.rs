@@ -8,6 +8,8 @@ pub mod extractors;
 mod gate_before_body;
 pub mod growth;
 pub mod logging;
+#[cfg(test)]
+mod message_writer_guard;
 pub mod middleware;
 mod request_log;
 pub mod routes;

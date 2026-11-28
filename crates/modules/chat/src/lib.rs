@@ -31,7 +31,10 @@ use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_text, index_unique, index_unique_sparse};
 use roomler_ai_services::{
     GiphyService,
-    dao::{file::FileDao, message::MessageDao, reaction::ReactionDao, room::RoomDao},
+    dao::{
+        file::FileDao, message::MessageDao, reaction::ReactionDao, room::RoomDao,
+        room_message_count::TICK,
+    },
 };
 use roomler_core::{
     Capabilities, Core, Job, Module, Role, TenantCtx, WsHandlerSpec, WsRegistration,
@@ -195,19 +198,26 @@ impl Module for ChatState {
     /// ([`member_count`]). Not leader-gated: every write compares the count
     /// it read, so a pass is right beside a live pod's joins and leaves and
     /// beside another pass, and a roll's last pod to boot passes after the
-    /// old code is gone. #4448: the same for a room's message count, set to
-    /// its live messages ([`message_count`]), on the same grounds.
+    /// old code is gone. #4448: a room's message count, set to its live
+    /// messages ([`message_count`]) on the same grounds, begins a sweep at each
+    /// boot, and a periodic job on every pod finishes it and begins one again
+    /// each day.
     fn jobs(&self) -> Vec<Job> {
         let members = self.clone();
-        let messages = self.clone();
+        let at_boot = self.clone();
+        let sweep = self.clone();
         vec![
             Job::at_startup(member_count::JOB, false, move || {
                 let state = members.clone();
                 async move { member_count::repair(&state).await }
             }),
             Job::at_startup(message_count::JOB, false, move || {
-                let state = messages.clone();
-                async move { message_count::repair(&state).await }
+                let state = at_boot.clone();
+                async move { message_count::at_boot(&state).await }
+            }),
+            Job::every(message_count::SWEEP_JOB, TICK, false, move || {
+                let state = sweep.clone();
+                async move { message_count::tick(&state).await }
             }),
         ]
     }
@@ -259,6 +269,9 @@ impl Module for ChatState {
                     index(bson::doc! { "tenant_id": 1, "author_id": 1, "created_at": -1 }),
                     index(bson::doc! { "room_id": 1, "is_pinned": 1 }),
                     index(bson::doc! { "mentions.users": 1 }),
+                    // #4448 — what the message-count repair counts a room's live
+                    // messages through (`room_message_count::LIVE_INDEX`, its name).
+                    index(bson::doc! { "room_id": 1, "deleted_at": 1 }),
                     index_text(bson::doc! { "content": "text" }),
                 ],
             },

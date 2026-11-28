@@ -261,6 +261,9 @@ async fn main() -> anyhow::Result<()> {
     // conference's leader-gated job now. A failing job is logged, not fatal —
     // exactly what the inline block did with its `.ok()`.
     app_state.modules.run_startup_jobs(startup_leader).await;
+    // #4448 — and their periodic jobs, on this pod's runtime until the
+    // shutdown below stops them (dropping `periodic` would stop them too).
+    let periodic = app_state.modules.spawn_periodic_jobs();
 
     // FR-82 — bring every system-managed role up to its definition.
     //
@@ -366,6 +369,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(async move {
         shutdown_signal().await;
+        // #4448 — no periodic job starts a run once the pod is stopping, and
+        // one under way is dropped (each of its writes is a compare on what it
+        // read, so a dropped run loses nothing).
+        periodic.stop().await;
         info!("shutdown signal received — running presence cleanup");
         state::shutdown_cleanup(&shutdown_state).await;
         let _ = cleanup_done_tx.send(());

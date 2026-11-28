@@ -87,7 +87,7 @@ pub use hooks::{
     FleetLifecycle, HookRegistry, Hooks, MembershipLifecycle, ReleasedLease, RenamePropagation,
     TenantLifecycle,
 };
-pub use job::{Cadence, Job, JobFuture};
+pub use job::{Cadence, Job, JobFuture, PeriodicJobs};
 pub use module::Module;
 pub use roomler_ai_db::indexes::{IndexOp, IndexPlan, IndexSet};
 pub use state::Core;

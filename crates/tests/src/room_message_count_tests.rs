@@ -2,21 +2,25 @@
 // Copyright (C) 2026 G ROX EOOD
 //! #4448 — a room's `message_count` is the number of its live messages.
 //!
-//! A live message is a `messages` document of the room with no `deleted_at`:
-//! a post, a thread reply and a quote each count one, and a delete (a soft
-//! delete, which leaves the tombstone) takes its one away. The room API reads
-//! the count on all three of its room routes: the room, the org's room list
-//! (the dashboard sums it) and Explore (its "N messages" line).
+//! A live message is a `messages` document of the room whose `deleted_at` is
+//! null or absent: a post, a thread reply and a quote each count one, and a
+//! delete (a soft delete, which leaves the tombstone) takes its one away. The
+//! room API reads the count on all three of its room routes: the room, the
+//! org's room list (the dashboard sums it) and Explore (its "N messages"
+//! line).
 //!
-//! The counts stored before the fix (0 over every room's messages) are set
-//! right by chat's startup job `room-message-count` (`MessageCountRepair`):
-//! bounded, on a compare with the count it read, and right when it runs twice
-//! or on two pods at once.
+//! The counts stored before the fix (0 over every room's messages), and any a
+//! missed write leaves wrong, are set right by `MessageCountRepair`'s sweeps:
+//! one begun at every boot (`room-message-count`) and finished by a periodic
+//! job on every pod (`room-message-count-sweep`), bounded, on a compare with
+//! the count it read, and right when it runs twice or on two pods at once.
 
 use std::time::Duration;
 
-use bson::{Bson, Document, doc, oid::ObjectId};
-use roomler_ai_services::dao::room_message_count::{CURSOR, MessageCountPass, MessageCountRepair};
+use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
+use roomler_ai_services::dao::room_message_count::{
+    LIVE_INDEX, MessageCountPass, MessageCountRepair, RESWEEP, Sweep, TICK, live_pipeline,
+};
 use roomler_core::{Cadence, Module};
 use serde_json::{Value, json};
 
@@ -338,22 +342,18 @@ async fn assert_every_room_right(app: &TestApp, when: &str) {
     }
 }
 
-async fn cursor(app: &TestApp) -> Option<ObjectId> {
-    app.db
-        .collection::<Document>("locks")
-        .find_one(doc! { "_id": CURSOR })
-        .await
-        .unwrap()
-        .and_then(|d| d.get_object_id("after").ok())
+/// Where the sweep stands, as the `locks` document holds it.
+async fn cursor(app: &TestApp) -> Sweep {
+    repair(app).sweep().await.unwrap()
 }
 
-fn pass_of(read: u64, changed: u64, skipped: u64, more: bool) -> MessageCountPass {
-    MessageCountPass {
-        read,
-        changed,
-        skipped,
-        more,
-    }
+/// A pass's rooms read, changed and skipped, and whether it stopped early.
+fn shape(pass: &MessageCountPass) -> (u64, u64, u64, bool) {
+    (pass.read, pass.changed, pass.skipped, pass.more)
+}
+
+fn pass_of(read: u64, changed: u64, skipped: u64, more: bool) -> (u64, u64, u64, bool) {
+    (read, changed, skipped, more)
 }
 
 #[tokio::test]
@@ -377,7 +377,7 @@ async fn the_repair_sets_each_count_to_its_live_messages_and_nothing_else() {
     let before_empty = room_doc(&app, &empty).await;
 
     let pass = repair(&app).pass().await.unwrap();
-    assert_eq!(pass, pass_of(rooms.len() as u64, 1, 0, false));
+    assert_eq!(shape(&pass), pass_of(rooms.len() as u64, 1, 0, false));
     // The deleted one is not counted.
     assert_counts(&app, &t, &room, name, 3, "repaired").await;
     let mut now = room_doc(&app, &room).await;
@@ -393,10 +393,11 @@ async fn the_repair_sets_each_count_to_its_live_messages_and_nothing_else() {
 
     let again = repair(&app).pass().await.unwrap();
     assert_eq!(
-        again,
+        shape(&again),
         pass_of(rooms.len() as u64, 0, 0, false),
         "a second pass changes nothing"
     );
+    assert!(!again.corrected(), "a steady-state pass reads 0 corrected");
 }
 
 #[tokio::test]
@@ -478,10 +479,10 @@ async fn a_pass_stops_at_its_cap_or_out_of_time_and_the_next_begins_where_it_sto
     assert!(n > 4, "{n} rooms");
 
     let first = repair(&app).pass_with(2, 3, NO_BUDGET).await.unwrap();
-    assert_eq!(first, pass_of(3, 3, 0, true));
+    assert_eq!(shape(&first), pass_of(3, 3, 0, true));
     assert_eq!(
         cursor(&app).await,
-        Some(rooms[2]),
+        Sweep::At(Some(rooms[2])),
         "it stopped at the third room"
     );
 
@@ -490,19 +491,18 @@ async fn a_pass_stops_at_its_cap_or_out_of_time_and_the_next_begins_where_it_sto
         .pass_with(1, 100, Duration::ZERO)
         .await
         .unwrap();
-    assert_eq!(second, pass_of(1, 1, 0, true));
+    assert_eq!(shape(&second), pass_of(1, 1, 0, true));
     assert_eq!(
         cursor(&app).await,
-        Some(rooms[3]),
+        Sweep::At(Some(rooms[3])),
         "the cursor is the last room it finished"
     );
 
     let third = repair(&app).pass_with(2, 100, NO_BUDGET).await.unwrap();
-    assert_eq!(third, pass_of(n - 4, n - 4, 0, false));
-    assert_eq!(
-        cursor(&app).await,
-        None,
-        "a pass that reached the end clears it"
+    assert_eq!(shape(&third), pass_of(n - 4, n - 4, 0, false));
+    assert!(
+        matches!(cursor(&app).await, Sweep::Idle { swept_at: Some(_) }),
+        "a pass that reached the end ends the sweep and says when"
     );
     assert_every_room_right(&app, "after the three passes").await;
 }
@@ -562,4 +562,257 @@ async fn the_message_count_job_runs_on_a_pod_without_the_lease_because_every_wri
     // A pod that does not hold the startup lease.
     app.state.modules.run_startup_jobs(false).await;
     assert_every_room_right(&app, "after a boot without the lease").await;
+}
+
+#[tokio::test]
+async fn a_pass_reports_how_many_rooms_it_corrected_and_by_how_much() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("msgdrift").await;
+    let up = new_room(&app, &t, "msgdriftup").await;
+    let down = new_room(&app, &t, "msgdriftdown").await;
+    for content in ["a", "b", "c"] {
+        post(&app, &t, &up, content, json!({})).await;
+    }
+    post(&app, &t, &down, "one", json!({})).await;
+    // A count a missed post left 3 behind, and one a missed delete left 4 ahead.
+    store_count(&app, &oid(&up), 0).await;
+    store_count(&app, &oid(&down), 5).await;
+
+    let pass = repair(&app).pass().await.unwrap();
+    assert!(pass.corrected());
+    assert_eq!((pass.changed, pass.raised, pass.lowered), (2, 3, 4));
+    assert_every_room_right(&app, "after the pass").await;
+}
+
+#[tokio::test]
+async fn a_message_stored_with_no_deleted_at_field_counts_as_live() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("msgnofield").await;
+    let name = "msgnofield";
+    let room = new_room(&app, &t, name).await;
+    let old = post(&app, &t, &room, "stored before the field", json!({})).await;
+    post(&app, &t, &room, "stored with it", json!({})).await;
+    // As a message stored before `deleted_at` existed: no such field. Every
+    // reader of `messages` matches `deleted_at: null`, which takes it.
+    app.db
+        .collection::<Document>("messages")
+        .update_one(
+            doc! { "_id": oid(&old) },
+            doc! { "$unset": { "deleted_at": "" } },
+        )
+        .await
+        .unwrap();
+    store_count(&app, &oid(&room), 0).await;
+
+    repair(&app).pass().await.unwrap();
+    assert_counts(&app, &t, &room, name, 2, "the pass counts it").await;
+
+    // Its delete matches it, and takes its one away.
+    assert_eq!(
+        delete(&app, &t, &room, &old, &t.admin.access_token).await,
+        200
+    );
+    assert_counts(&app, &t, &room, name, 1, "after its delete").await;
+}
+
+/// Two pods' passes that read the sweep at the same place: the one that
+/// finishes second may repeat rooms, but never moves the sweep back and never
+/// skips a room.
+#[tokio::test]
+async fn a_pass_that_read_the_sweep_before_another_moved_it_leaves_the_cursor() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("msgrace2").await;
+    for name in ["msge1", "msge2", "msge3", "msge4"] {
+        let room = new_room(&app, &t, name).await;
+        post(&app, &t, &room, "counted", json!({})).await;
+    }
+    let (rooms, _) = all_at_zero(&app).await;
+    let r = repair(&app);
+    r.begin_sweep().await.unwrap();
+
+    // Both read the sweep at its start.
+    let began = r.sweep().await.unwrap();
+    assert_eq!(began, Sweep::At(None));
+    let first = r.pass_from(began, 1, 3, NO_BUDGET).await.unwrap();
+    assert!(!first.cursor_moved);
+    assert_eq!(cursor(&app).await, Sweep::At(Some(rooms[2])));
+
+    // A slower one from the same start, covering fewer rooms: had it moved
+    // the cursor, it would have moved it back.
+    let second = r.pass_from(began, 1, 2, NO_BUDGET).await.unwrap();
+    assert!(second.cursor_moved, "{second:?}");
+    assert_eq!(
+        cursor(&app).await,
+        Sweep::At(Some(rooms[2])),
+        "the cursor stays where the first pass left it"
+    );
+
+    // The sweep goes on from there and reaches every room.
+    let rest = r.pass_with(1, 100, NO_BUDGET).await.unwrap();
+    assert!(!rest.more && !rest.cursor_moved, "{rest:?}");
+    assert!(matches!(
+        cursor(&app).await,
+        Sweep::Idle { swept_at: Some(_) }
+    ));
+    assert_every_room_right(&app, "after the sweep").await;
+}
+
+/// A boot begins a new sweep at the first room. A pass already under way on
+/// another pod must not undo that, or the rooms before its cursor would miss
+/// what a pod of the old code wrote during the roll.
+#[tokio::test]
+async fn a_boot_begins_a_new_sweep_and_a_pass_under_way_does_not_undo_it() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("msgboot").await;
+    for name in ["msgf1", "msgf2", "msgf3"] {
+        let room = new_room(&app, &t, name).await;
+        post(&app, &t, &room, "counted", json!({})).await;
+    }
+    let r = repair(&app);
+    r.pass_with(1, 2, NO_BUDGET).await.unwrap();
+    let mid = r.sweep().await.unwrap();
+    assert!(matches!(mid, Sweep::At(Some(_))), "{mid:?}");
+
+    // A pass under way read the sweep mid-way; a pod boots and begins anew.
+    r.begin_sweep().await.unwrap();
+    let raced = r.pass_from(mid, 1, 1, NO_BUDGET).await.unwrap();
+    assert!(raced.cursor_moved);
+    assert_eq!(
+        cursor(&app).await,
+        Sweep::At(None),
+        "the boot's new sweep stands"
+    );
+}
+
+#[tokio::test]
+async fn a_pass_is_due_while_a_sweep_is_under_way_or_a_day_after_the_last_one() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("msgdue").await;
+    new_room(&app, &t, "msgdue").await;
+    let r = repair(&app);
+    let now = DateTime::now();
+    assert!(r.due(now).await.unwrap(), "no sweep ever finished");
+
+    r.pass().await.unwrap();
+    assert!(
+        !r.due(DateTime::now()).await.unwrap(),
+        "a sweep just finished"
+    );
+    let later = DateTime::from_millis(now.timestamp_millis() + RESWEEP.as_millis() as i64 + 1_000);
+    assert!(r.due(later).await.unwrap(), "a day after the last sweep");
+
+    r.begin_sweep().await.unwrap();
+    assert!(r.due(DateTime::now()).await.unwrap(), "a sweep under way");
+}
+
+/// The sweep a boot's pass stopped (its budget, its cap) finishes on the
+/// periodic job, with no deploy.
+#[tokio::test]
+async fn the_periodic_job_is_ungated_and_finishes_a_sweep_a_pass_stopped() {
+    let app = TestApp::spawn().await;
+    let jobs = app
+        .state
+        .modules
+        .chat
+        .as_ref()
+        .expect("chat is mounted")
+        .jobs();
+    let job = jobs
+        .iter()
+        .find(|j| j.name == "room-message-count-sweep")
+        .expect("chat declares room-message-count-sweep");
+    assert_eq!(job.cadence, Cadence::Every(TICK));
+    assert!(
+        !job.leader_gated,
+        "the host runs only ungated periodic jobs"
+    );
+
+    let t = app.seed_tenant("msgtick").await;
+    for name in ["msgg1", "msgg2", "msgg3"] {
+        let room = new_room(&app, &t, name).await;
+        post(&app, &t, &room, "counted", json!({})).await;
+    }
+    all_at_zero(&app).await;
+    let r = repair(&app);
+    r.begin_sweep().await.unwrap();
+    let stopped = r.pass_with(1, 1, NO_BUDGET).await.unwrap();
+    assert!(stopped.more);
+
+    (job.run)().await.expect("a tick");
+    assert!(
+        matches!(cursor(&app).await, Sweep::Idle { swept_at: Some(_) }),
+        "the tick finished the sweep"
+    );
+    assert_every_room_right(&app, "after the tick").await;
+
+    // With the sweep just finished, a tick is not due and changes nothing.
+    let first = all_rooms(&app).await[0];
+    store_count(&app, &first, 99).await;
+    (job.run)().await.expect("a tick");
+    assert_eq!(stored(&app, &first).await, 99);
+}
+
+/// The repair counts through the index chat declares, and examines no
+/// deleted message's key: its cost is the rooms' live messages, whatever the
+/// size of `messages`.
+#[tokio::test]
+async fn the_count_reads_the_live_index_and_examines_no_deleted_message() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("msgplan").await;
+    let room = new_room(&app, &t, "msgplan").await;
+    post(&app, &t, &room, "kept one", json!({})).await;
+    post(&app, &t, &room, "kept two", json!({})).await;
+    for n in 0..6 {
+        let gone = post(&app, &t, &room, &format!("gone {n}"), json!({})).await;
+        assert_eq!(
+            delete(&app, &t, &room, &gone, &t.admin.access_token).await,
+            200
+        );
+    }
+    let plan = app
+        .db
+        .run_command(doc! {
+            "explain": {
+                "aggregate": "messages",
+                "pipeline": live_pipeline(&[oid(&room)]),
+                "cursor": {},
+                "hint": LIVE_INDEX,
+            },
+            "verbosity": "executionStats",
+        })
+        .await
+        .unwrap();
+    let text = plan.to_string();
+    assert!(
+        text.contains(LIVE_INDEX),
+        "the plan names {LIVE_INDEX}: {text}"
+    );
+    let plan = Bson::Document(plan);
+    let keys = max_number(&plan, "totalKeysExamined")
+        .or_else(|| max_number(&plan, "keysExamined"))
+        .expect("the plan reports the keys it examined");
+    assert!(
+        keys < 2 + 6,
+        "it examined {keys} keys for 2 live messages among 8: {text}"
+    );
+}
+
+/// The largest number under `key` anywhere in `v`.
+fn max_number(v: &Bson, key: &str) -> Option<i64> {
+    match v {
+        Bson::Document(d) => d
+            .iter()
+            .filter_map(|(k, v)| {
+                let here = match (k == key, v) {
+                    (true, Bson::Int32(n)) => Some(i64::from(*n)),
+                    (true, Bson::Int64(n)) => Some(*n),
+                    (true, Bson::Double(n)) => Some(*n as i64),
+                    _ => None,
+                };
+                here.max(max_number(v, key))
+            })
+            .max(),
+        Bson::Array(a) => a.iter().filter_map(|v| max_number(v, key)).max(),
+        _ => None,
+    }
 }

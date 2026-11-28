@@ -9,8 +9,14 @@ use roomler_ai_db::models::{
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
+/// The one writer of `messages` (#4448). A room's `message_count` moves with
+/// each message this DAO writes or deletes, so a write that went around it
+/// would leave the count wrong until the repair's next sweep. Its collection
+/// handle is private for that reason, and the api crate's unit test
+/// `message_writer_guard` fails on any other code that names the `messages`
+/// collection outside the list it keeps.
 pub struct MessageDao {
-    pub base: BaseDao<Message>,
+    base: BaseDao<Message>,
     /// The rooms, for the one field this DAO writes there: a room's
     /// `message_count` moves with each message it writes or deletes (#4448).
     rooms: Collection<Document>,
@@ -22,6 +28,25 @@ impl MessageDao {
             base: BaseDao::new(db, Message::COLLECTION),
             rooms: db.collection(Room::COLLECTION),
         }
+    }
+
+    /// The live message `id` of `tenant_id`, in whichever room.
+    pub async fn find_by_id_in_tenant(
+        &self,
+        tenant_id: ObjectId,
+        id: ObjectId,
+    ) -> DaoResult<Message> {
+        self.base.find_by_id_in_tenant(tenant_id, id).await
+    }
+
+    /// The messages that match the text `query` and `filter`, at most `limit`.
+    pub async fn text_search(
+        &self,
+        query: &str,
+        filter: Document,
+        limit: i64,
+    ) -> DaoResult<Vec<Message>> {
+        self.base.text_search(query, filter, limit).await
     }
 
     #[allow(clippy::too_many_arguments)]

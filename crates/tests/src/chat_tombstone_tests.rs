@@ -401,8 +401,7 @@ async fn a_write_that_raced_the_delete_matches_nothing_and_the_first_removal_tim
         (
             "the soft delete",
             messages
-                .base
-                .soft_delete_in_tenant(toid, moid)
+                .soft_delete_in_room(toid, roid, moid)
                 .await
                 .unwrap(),
         ),
@@ -514,7 +513,6 @@ async fn a_message_or_file_with_no_deleted_at_field_is_live() {
     );
     assert!(
         MessageDao::new(&app.db)
-            .base
             .find_by_id_in_tenant(toid, oid(&mid))
             .await
             .is_ok(),

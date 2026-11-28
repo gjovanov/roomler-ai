@@ -35,7 +35,8 @@ use std::sync::Arc;
 use axum::Router;
 use roomler_ai_config::Settings;
 use roomler_core::{
-    Core, IndexSet, Job, Module, Role, WsCtx, WsHandler, WsHandlerSpec, graph, job::Cadence,
+    Core, IndexSet, Job, Module, PeriodicJobs, Role, WsCtx, WsHandler, WsHandlerSpec, graph,
+    job::Cadence,
 };
 use tracing::{error, info, warn};
 
@@ -551,9 +552,8 @@ impl Modules {
     /// Run every mounted module's startup jobs, in composition order — the
     /// leader-gated ones only when this pod holds the startup lease. A job
     /// that fails is logged and the next one runs: maintenance must never
-    /// keep a pod from serving. Periodic jobs are declared but not scheduled
-    /// by the host yet (no module needs one); a stray declaration is logged
-    /// so it cannot be silently ignored.
+    /// keep a pod from serving. Periodic jobs are not run here: they are
+    /// [`Modules::spawn_periodic_jobs`]'s.
     pub async fn run_startup_jobs(&self, leader: bool) {
         for job in self.jobs() {
             match job.cadence {
@@ -570,12 +570,24 @@ impl Modules {
                         Err(e) => error!(job = job.name, %e, "startup job failed"),
                     }
                 }
-                Cadence::Every(_) => warn!(
-                    job = job.name,
-                    "periodic module jobs are not scheduled by the host yet (FR-69) — declared, not run"
-                ),
+                Cadence::Every(_) => {}
             }
         }
+    }
+
+    /// Start every mounted module's periodic jobs on this pod's runtime
+    /// ([`PeriodicJobs`]: a jittered first run, each next run one period after
+    /// the last one ended, a failed run logged, all of them ended by
+    /// [`PeriodicJobs::stop`] at shutdown). The host keeps what this returns
+    /// until it stops: dropping it stops the jobs.
+    ///
+    /// Only jobs that are not leader-gated run. A leader-gated periodic job is
+    /// logged as declared and not run: the host's only lease is the startup
+    /// one, 120 s at boot, and a job that must run on one pod at a time needs a
+    /// lease it renews while it runs. #4448's `room-message-count-sweep` is
+    /// ungated: each of its writes is a compare on what it read.
+    pub fn spawn_periodic_jobs(&self) -> PeriodicJobs {
+        PeriodicJobs::spawn(self.jobs())
     }
 
     /// The handler a module registered for this role and message type, if

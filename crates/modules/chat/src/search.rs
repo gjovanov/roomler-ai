@@ -97,7 +97,6 @@ pub async fn search(
     };
     let messages = state
         .messages
-        .base
         .text_search(q, msg_filter, limit)
         .await
         .unwrap_or_default();
