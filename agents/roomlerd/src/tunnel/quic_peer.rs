@@ -969,10 +969,10 @@ mod tests {
     /// flow's stream when its local TCP read fails
     /// (`tunnel_core::forward::run_flow_quic`), and a local app that aborts
     /// its connection right after the SOCKS reply does that to a brand-new
-    /// flow. The accept loop reads each preamble inline and takes that error
-    /// for the connection's end: it reports `QuicConnEnded`, the signalling
-    /// loop reaps the session and tells the client, and every in-flight flow
-    /// on it is cut. The field measured whole sessions ending this way under
+    /// flow. The accept loop read each preamble inline and took that error
+    /// for the connection's end: it reported `QuicConnEnded`, the signalling
+    /// loop reaped the session and told the client, and every in-flight flow
+    /// on it was cut. The field measured whole sessions ending this way under
     /// live traffic, each a few milliseconds after a flow that moved no byte.
     #[tokio::test(flavor = "multi_thread")]
     #[cfg_attr(
