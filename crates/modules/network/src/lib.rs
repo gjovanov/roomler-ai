@@ -66,6 +66,7 @@ pub mod overlay;
 pub mod relay_allowance;
 pub mod ssh_grant_acks;
 pub mod tunnel;
+pub mod tunnel_admission;
 pub mod tunnel_enrollment;
 pub mod turn_usage;
 pub mod routes {

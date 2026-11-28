@@ -62,7 +62,7 @@ rotation closes.
 
 ## The order — `POST /api/tenant/{tid}/agent/{aid}/overlay-key/rotate`
 
-Owned by the **network** module (`crates/modules/network/src/lib.rs:468-471`, handler
+Owned by the **network** module (`crates/modules/network/src/lib.rs:469-472`, handler
 `crates/modules/network/src/routes/overlay_key.rs:118-250`). It touches no key. In
 order:
 
@@ -182,7 +182,7 @@ the grid can always show the device's current key.
 | record | lives in | written by | what it is |
 |---|---|---|---|
 | the **order** | `agents.key_rotation` (`KeyRotationRequest`, `models.rs:3473`) | the route, or the server itself for a retired key (P2: `trigger: key_retired`, the zero `requested_by`) or after an agent-token rotation (FR-155 P1d: `trigger: credential_rotation`) | what was asked, when, by whom — and `public_key_before`, the key held at that moment |
-| the **decision** | `key_rotation_audit` (`KeyRotationAuditEvent`, `models.rs:5939`; DAO `crates/services/src/dao/key_rotation_audit.rs`) | `place_order`, one call site, both arms, whoever placed the order (`trigger` names the server's) | `pushed` / `queued` / `denied: <reason>`. Records what the **server** decided — never what the device did. 90 d TTL, `(tenant_id, at)`, `(agent_id, at)` (`network/src/lib.rs:862-870`) |
+| the **decision** | `key_rotation_audit` (`KeyRotationAuditEvent`, `models.rs:5939`; DAO `crates/services/src/dao/key_rotation_audit.rs`) | `place_order`, one call site, both arms, whoever placed the order (`trigger` names the server's) | `pushed` / `queued` / `denied: <reason>`. Records what the **server** decided — never what the device did. 90 d TTL, `(tenant_id, at)`, `(agent_id, at)` (`network/src/lib.rs:863-871`) |
 | the **claim** | `agents.key_rotation_report` (`KeyRotationReport`, `models.rs:3532`) | `rc:agent.key_rotated` ingest (`agent_socket.rs:175` → `agent_arms.rs:81-125`) | the device's account; `reported_at` is server-stamped, `detail` re-clamped on receipt |
 | the **proof** | `agents.overlay_identity` (`OverlayIdentity`, `models.rs:3563`) | the overlay join | the public key and epoch the device actually presented, and when |
 
@@ -445,7 +445,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:654-677`; `crates/services/src/dao/agent.rs:1269` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1234-1264` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:1581-1742`, `:2898-2906` |
-| audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:862-870` |
+| audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:863-871` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6361-6503`, `:3610-3652`, `:3654-3675`, `:1459-1486` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:674-706` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:1096-1101`, `:1894-1899`, `:2024-2026`; `config_surface.rs:1266-1273` |
@@ -453,10 +453,10 @@ The server cannot see the device switch, so a switched-off device is still order
 | P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3591`, `:3609`, `:4341`, `:3574`, `:11360`, `:11642`; the node and network fields `:7464`, `:7711` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7498` |
 | P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:381-423`, `:444-475`, `:813`, `:834`, `:883` |
-| P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:383`; nest `crates/modules/network/src/lib.rs:568`, `:626` |
+| P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:383`; nest `crates/modules/network/src/lib.rs:569`, `:627` |
 | P2 DERP | `crates/modules/network/src/derp.rs:451`, `:591-627` |
 | P2 DAO: the check · the CAS write · the switch | `crates/services/src/dao/overlay_node.rs:148`, `:365-391`; `crates/services/src/dao/overlay_network.rs:326` |
-| P2 indexes | `crates/modules/network/src/lib.rs:825-829` |
+| P2 indexes | `crates/modules/network/src/lib.rs:826-830` |
 | P2 integration tests | `crates/tests/src/retired_key_tests.rs` |
 
 ## Not built
