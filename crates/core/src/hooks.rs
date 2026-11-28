@@ -174,6 +174,42 @@ pub trait FleetLifecycle: Send + Sync {
         let _ = (tenant_id, target, viewers);
         None
     }
+
+    /// FR-155 P1d — the agent's token rotated to `generation`, and the
+    /// rotation committed on this pod. Fleet calls it once, on that pod,
+    /// after it ended the agent's control sockets below `generation` on
+    /// every pod, and before it answers the new token. `network` takes the
+    /// overlay node offline, ends the agent's DERP registrations below
+    /// `generation` on this pod, and orders the device to rotate its overlay
+    /// key (FR-40, trigger `credential_rotation`). An error is logged,
+    /// counted and audited by fleet, and the new token is answered all the
+    /// same: it is the device's only working credential now.
+    async fn agent_credentials_rotated(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        generation: u32,
+    ) -> anyhow::Result<()> {
+        let _ = (tenant_id, agent_id, generation);
+        Ok(())
+    }
+
+    /// FR-155 P1d — a rotation of the agent's token to `generation`
+    /// committed on another pod: end what you admitted for the agent below
+    /// `generation` on this pod, and admit nothing below it while the floor
+    /// you keep for it lasts. Fleet calls it on every pod that applies the
+    /// control event `end_below_generation`, beside the hub's own end; sync,
+    /// as that handler is. `network` ends the agent's DERP registrations.
+    /// Returns how many connections ended.
+    fn end_below_generation(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        generation: u32,
+    ) -> usize {
+        let _ = (tenant_id, agent_id, generation);
+        0
+    }
 }
 
 /// Hooks the owner of a membership invokes when someone stops being a member.
@@ -496,6 +532,42 @@ impl HookRegistry {
             }
         }
         None
+    }
+
+    /// FR-155 P1d — run every `agent_credentials_rotated` hook in order, once
+    /// a rotation committed. The rotation is made whatever a module answers,
+    /// so one that answers an error does not stop the others: every one
+    /// runs, and the answer names each that failed, with its error, in order.
+    pub async fn agent_credentials_rotated(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        generation: u32,
+    ) -> Vec<(&'static str, anyhow::Error)> {
+        let mut failed = Vec::new();
+        for (module, hook) in self.fleet_lifecycles() {
+            if let Err(e) = hook
+                .agent_credentials_rotated(tenant_id, agent_id, generation)
+                .await
+            {
+                failed.push((module, e));
+            }
+        }
+        failed
+    }
+
+    /// FR-155 P1d — run every `end_below_generation` hook in order: how many
+    /// connections they ended.
+    pub fn end_below_generation(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        generation: u32,
+    ) -> usize {
+        self.fleet_lifecycles()
+            .iter()
+            .map(|(_, hook)| hook.end_below_generation(tenant_id, agent_id, generation))
+            .sum()
     }
 
     /// Run every `tenant_archived` hook in order and sum what they did. A

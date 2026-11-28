@@ -582,6 +582,15 @@ impl TunnelClientHub {
         flows.get(id)?.live.transport.lock().unwrap().clone()
     }
 
+    /// The tunnel session a registered flow runs now (hex), `None` while it
+    /// has none. #4501's cells read it to tell a session that was kept across
+    /// an event from one that ended and was opened again.
+    pub fn live_session_id(&self, id: &str) -> Option<String> {
+        let flows = self.inner.flows.lock().unwrap();
+        let sid = *flows.get(id)?.live.session_id.lock().unwrap();
+        sid.map(|s| s.to_hex())
+    }
+
     /// Test seam: the live cells of a registered flow, so a sibling module's
     /// tests can play the supervisor (a failed attempt, the listener bind)
     /// without a server.

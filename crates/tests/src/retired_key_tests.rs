@@ -21,7 +21,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::agent_presence_tests::enroll;
 use crate::fixtures::{seed::SeededTenant, test_app::TestApp};
 
-type Ws =
+pub(crate) type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -29,18 +29,18 @@ const WAIT: Duration = Duration::from_secs(5);
 /// asserts that none does.
 const QUIET: Duration = Duration::from_millis(1500);
 
-fn key(seed: u8) -> String {
+pub(crate) fn key(seed: u8) -> String {
     BASE64.encode([seed; 32])
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     s.replace('+', "%2B")
         .replace('/', "%2F")
         .replace('=', "%3D")
 }
 
 /// An agent socket whose hello advertises `rpc`.
-async fn connect(app: &TestApp, token: &str, rpc: &[&str]) -> Ws {
+pub(crate) async fn connect(app: &TestApp, token: &str, rpc: &[&str]) -> Ws {
     let url = format!("ws://{}/ws?token={}&role=agent", app.addr, urlencode(token));
     let (mut ws, _) = connect_async(&url).await.expect("agent ws connect");
     ws.send(Message::Text(
@@ -84,7 +84,7 @@ async fn join(ws: &mut Ws, seed: u8, refusal_aware: bool) {
 }
 
 /// The next frame of type `want`, or `None` once `wait` passes.
-async fn recv_t(ws: &mut Ws, want: &str, wait: Duration) -> Option<Value> {
+pub(crate) async fn recv_t(ws: &mut Ws, want: &str, wait: Duration) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -151,7 +151,7 @@ async fn still_served(ws: &mut Ws) -> bool {
 }
 
 /// Join and require the netmap: the join was admitted.
-async fn join_admitted(ws: &mut Ws, seed: u8) {
+pub(crate) async fn join_admitted(ws: &mut Ws, seed: u8) {
     join(ws, seed, true).await;
     assert!(
         recv_t(ws, "rc:overlay.netmap", WAIT).await.is_some(),
@@ -173,7 +173,7 @@ async fn set_mode(app: &TestApp, t: &SeededTenant, mode: &str) {
 }
 
 /// The device's live overlay node row.
-async fn node_row(app: &TestApp, t: &SeededTenant, machine: &str) -> Document {
+pub(crate) async fn node_row(app: &TestApp, t: &SeededTenant, machine: &str) -> Document {
     app.db
         .collection::<Document>("overlay_nodes")
         .find_one(doc! {

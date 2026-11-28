@@ -478,6 +478,10 @@ mod tunnel_policy_permission_tests;
 /// hold that role in the policy's org, read on every forward request.
 #[cfg(test)]
 mod tunnel_role_subject_tests;
+/// #4501 — an in-flight tunnel connection across a pod roll and across its
+/// exit's control socket cycling, on two pods.
+#[cfg(test)]
+mod tunnel_survival_tests;
 #[cfg(test)]
 mod tunnel_tests;
 /// FR-115 P4b — coturn's per-allocation totals into `turn_bytes`, for the

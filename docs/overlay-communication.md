@@ -700,6 +700,22 @@ last-writer-wins, because corp middleboxes routinely leave half-open TCP. Both
 drops are counted and logged on the central relay and on a regional one
 ([every drop on the relay path](#every-drop-on-the-relay-path-and-where-it-reports-fr-148-d52)).
 
+**The token generation (FR-155 P1d).** While the agent token rotation is on
+(`rc.agent_token_rotation` and `rc.token_generation_check` both), the central
+relay admits a registration only at the device's current token generation. After
+the registration frame it reads the row on the primary and judges it as the
+upgrade does, and its record of the pod's DERP connections
+(`crates/modules/network/src/derp_rotation.rs`) refuses a registration below the
+floor of a rotation the pod applied, or below the generation of the registration
+in place for its key, which stays. A refusal writes nothing. A rotation ends the
+device's registrations below its new generation on every pod: in the hook on the
+pod that commits, through the control event `end_below_generation` on every other,
+and in each pod's own check once a period of `rc.presence_sweep_secs`. An equal or
+a higher generation re-registers last-writer-wins, as above. With the rotation
+off, its default until FR-155's P1e, none of this runs. The log lines are in
+[real-time.md § DERP](real-time.md#derp); the design and its argument are in
+[FR-155](fr/FR-155-one-row-new-credentials.md#only-the-devices-current-generation-holds-its-derp-registration-p1d).
+
 ### Client side
 
 ```mermaid
@@ -861,10 +877,10 @@ receiving node's line tells `backpressure` and `unrouted`.
 |---|---|---|---|
 | sending node, `DerpConn::send_to` (`crates/tunnel-core/src/transport/derp.rs:307`) | the shared outbound queue already holds 512 frames (`OUTBOUND_QUEUE`, `:55`) | `dropped_full` (`:308`), one count for every conn of the mux | the drop line |
 | sending node, the WS writer (`agents/roomlerd/src/derp.rs:550`) | the frame waited past the age bound (above) | `dropped_stale` (`DerpMux::note_stale_drop`, `crates/tunnel-core/src/transport/derp.rs:456`) | the drop line |
-| relay, both: central `forward_frame` (`crates/modules/network/src/derp.rs:693`), regional (`crates/derp-relay/src/main.rs:1092`) | a bulk frame of an org past its plan's monthly relay (FR-115) | `derp_allowance_shaped_total` | INFO, at most one per network and source per 30 s (central) or per network per 10 s (regional) |
-| central relay only (`crates/modules/network/src/derp.rs:676`, `:711`) | the overlay ACL denies the pair; a tunnel-leg frame over its rate | the ACL drop is not counted; `derp_tunnel_shaped_total` | INFO `derp: dropped a frame the overlay ACL denies`; the shaper's INFO at most one per network and source per 30 s |
-| relay, both: central (`crates/modules/network/src/derp.rs:727`), regional (`crates/derp-relay/src/main.rs:1103`) | no registration for (network, dst) here: the peer is offline, or registered on another pod or relay | `derp_miss_total` | INFO, at most one per network and destination per 30 s; on the central relay also its census line each minute (`crates/modules/network/src/derp.rs:286`) |
-| relay, both: central (`crates/modules/network/src/derp.rs:751`), regional (`crates/derp-relay/src/main.rs:1126`) | the destination's send queue refused it: full (a slow or half-open consumer), or closed by a socket on its way out | `derp_full_total` | WARN, at most one per network and destination per 30 s; the central relay's census line |
+| relay, both: central `forward_frame` (`crates/modules/network/src/derp.rs:841`), regional (`crates/derp-relay/src/main.rs:1092`) | a bulk frame of an org past its plan's monthly relay (FR-115) | `derp_allowance_shaped_total` | INFO, at most one per network and source per 30 s (central) or per network per 10 s (regional) |
+| central relay only (`crates/modules/network/src/derp.rs:824`, `:859`) | the overlay ACL denies the pair; a tunnel-leg frame over its rate | the ACL drop is not counted; `derp_tunnel_shaped_total` | INFO `derp: dropped a frame the overlay ACL denies`; the shaper's INFO at most one per network and source per 30 s |
+| relay, both: central (`crates/modules/network/src/derp.rs:875`), regional (`crates/derp-relay/src/main.rs:1103`) | no registration for (network, dst) here: the peer is offline, or registered on another pod or relay | `derp_miss_total` | INFO, at most one per network and destination per 30 s; on the central relay also its census line each minute (`crates/modules/network/src/derp.rs:290`) |
+| relay, both: central (`crates/modules/network/src/derp.rs:899`), regional (`crates/derp-relay/src/main.rs:1126`) | the destination's send queue refused it: full (a slow or half-open consumer), or closed by a socket on its way out | `derp_full_total` | WARN, at most one per network and destination per 30 s; the central relay's census line |
 | receiving node, `DerpMux::deliver` (`crates/tunnel-core/src/transport/derp.rs:622`) | the mux holds no route for the frame's source | `dropped_unrouted` (`:623`), and `DERP_INBOUND_UNROUTED`; the runtime is told to follow that peer onto DERP | the drop line; `NodeStatus.derp_inbound_drops`, which `roomler status` prints |
 | receiving node, `DerpMux::deliver` (`crates/tunnel-core/src/transport/derp.rs:603`, `:611`) | a routed consumer's queue (256 frames, `INBOUND_QUEUE`, `:80`) is full, or closed since a better tier replaced the carrier | `dropped_backpressure` (`:604`, `:617`), and `DERP_INBOUND_BACKPRESSURE` | the drop line; `NodeStatus.derp_inbound_drops` |
 
