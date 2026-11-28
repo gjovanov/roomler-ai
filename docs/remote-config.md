@@ -431,7 +431,9 @@ so a push never answers 200 as if it had taken. It is set on the device
 `rc_media_legacy`. The model test that guards it compares whole keys
 (`the_device_owned_refusals_are_not_pushable`). A canary entry this build has no
 new code for, or whose requirement is on the old path, is refused and named in
-the plan's `refused`.
+the plan's `refused`. The first name a build honours is `capture_wait`, from the
+release that carries FR-135 R4a: the two DataChannel pumps wait in the capture
+([remote-control.md §5.1g](remote-control.md#the-datachannel-pumps-wait-behind-capture_wait-fr-135-r4a)).
 
 ⚠️ **`rc_sessions_survive_reattach`, FR-138's switch that keeps a live remote
 session through the loss of the control socket, is not pushable either.** It

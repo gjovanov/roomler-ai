@@ -52,7 +52,9 @@
 //! "nothing new", so every ask is a whole capture) holds to the target rate. Its
 //! open also waits for a taken seat ([`direct_then_scrap`]). A pump that did not
 //! ask keeps the old behaviour, its open included, and sleeps on its own empties.
-//! FR-98 C7 moves every pump over and removes the choice.
+//! The RTP pump asks, and a DataChannel pump on a session that runs the
+//! `capture_wait` media path (FR-135 R4a, `capture::pace::dc_capture_wait`).
+//! #3275's delete removes the choice.
 
 #![cfg(all(feature = "system-context", target_os = "windows"))]
 
@@ -65,7 +67,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use crate::capture::gate::SlotFirst;
-use crate::capture::pace::floor_remaining;
+use crate::capture::pace::{FLOOD_LINE_EVERY, LineEvery, floor_remaining};
 use crate::capture::{DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 use super::desktop_rebind;
@@ -177,6 +179,15 @@ const DXGI_RECLIMB_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
 const ACQUIRE_WAIT_MS: u32 = 16;
 
+/// #3275 — three WARNs whose arms run once per ask, each held to one line per
+/// [`FLOOD_LINE_EVERY`] across the process. Two of them counted asks, and the
+/// third had no limit, so all three ran with the ask rate: a few lines a second
+/// to 450 at the floor, where the first two meant one per 5 s.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+static MISMATCH_UNCHANGED_LINE: LineEvery = LineEvery::new(FLOOD_LINE_EVERY);
+static NO_INPUT_DESKTOP_LINE: LineEvery = LineEvery::new(FLOOD_LINE_EVERY);
+static BITBLT_FAILED_LINE: LineEvery = LineEvery::new(FLOOD_LINE_EVERY);
+
 /// Active capture backend. Starts as DXGI; swaps to GDI on persistent
 /// HardError; can climb back to DXGI when it recovers. The DXGI variant is
 /// boxed behind [`DxgiCapture`] so it can hold either the adapter-bound
@@ -277,7 +288,8 @@ pub struct SystemContextCapture {
     paced: bool,
     /// The rate the open asked for, or `set_target_fps`'s since. It reaches the
     /// worker only through a paced request: FR-119's grants call the setter on
-    /// the DC pumps too, and those must keep running at the display's rate.
+    /// the DC pumps too, and one that did not ask for a pace keeps running at
+    /// the display's rate.
     target_fps: u32,
     /// FR-119 P2b-3 — the display's refresh rate, read by the worker at the
     /// open and carried back in its ready ack.
@@ -1029,9 +1041,15 @@ fn capture_one_blocking(
                         tracing::info!(%name, "system-context capture: rebound desktop after DXGI DesktopMismatch");
                     }
                     Ok(desktop_rebind::DesktopChange::Unchanged) => {
-                        tracing::warn!(
-                            "DXGI DesktopMismatch but try_change_desktop reported Unchanged — race or stale binding"
-                        );
+                        // #3275 — on time. This arm runs once per ask, and with
+                        // no limit it wrote a line per ask: about 450 a second
+                        // at the floor, above the uploader's 100.
+                        if let Some(skipped) = MISMATCH_UNCHANGED_LINE.due(Instant::now()) {
+                            tracing::warn!(
+                                skipped,
+                                "DXGI DesktopMismatch but try_change_desktop reported Unchanged — race or stale binding"
+                            );
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(%e, "desktop rebind failed after DesktopMismatch");
@@ -1168,7 +1186,10 @@ fn capture_one_blocking(
                     // spam. Distinguishes "stale binding" (recoverable
                     // here) from "wrong session" (needs a spawn fix).
                     *consecutive_hard = consecutive_hard.saturating_add(1);
-                    if *consecutive_hard <= 3 || consecutive_hard.is_multiple_of(150) {
+                    // #3275 — the first 3, then one per 5 s on time: a count of
+                    // asks ran with the ask rate, about 3 lines a second.
+                    let due = NO_INPUT_DESKTOP_LINE.due(Instant::now()).is_some();
+                    if *consecutive_hard <= 3 || due {
                         tracing::warn!(
                             %e,
                             count = *consecutive_hard,
@@ -1187,9 +1208,12 @@ fn capture_one_blocking(
                 }
                 Err(e) => {
                     *consecutive_hard = consecutive_hard.saturating_add(1);
-                    // Rate-limit: WARN first 3, then ~once / 5 s (150
-                    // frames @ 30 fps). Pre-rc.90 this logged EVERY frame.
-                    if *consecutive_hard <= 3 || consecutive_hard.is_multiple_of(150) {
+                    // Rate-limit: WARN the first 3, then one per 5 s. #3275 —
+                    // on time: it counted 150 asks, which is 5 s at 30 a second
+                    // and a third of a second at the floor's 450. Pre-rc.90 this
+                    // logged EVERY frame.
+                    let due = BITBLT_FAILED_LINE.due(Instant::now()).is_some();
+                    if *consecutive_hard <= 3 || due {
                         tracing::warn!(
                             %e,
                             count = *consecutive_hard,
@@ -1304,7 +1328,8 @@ mod tests {
     }
 
     /// #3272 — a request carries a wait only when its pump asked for a pace.
-    /// The DC pumps do not, and their acquire must stay at 0 until FR-98 C7.
+    /// A DataChannel pump off the `capture_wait` path does not (FR-135 R4a),
+    /// and its acquire stays at 0.
     #[test]
     fn only_a_paced_request_waits_in_the_acquire() {
         let cmd = |pace| CaptureCmd {

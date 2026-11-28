@@ -2695,8 +2695,8 @@ async fn media_pump(
     // `next_frame`'s contract and the guard below watches it, and its open waits
     // for a seat the capture before it is letting go of. Off is the kill switch
     // for the first release: the capture and its open run as they did. The DC
-    // pumps do not ask yet (FR-98 C7), and their open stays as it is until then:
-    // `capture::open_default_async`.
+    // pumps ask behind a switch of their own, the `capture_wait` media path
+    // (FR-135 R4a, `capture::pace::dc_capture_wait`).
     let pace_capture = capture::pace::rtp_capture_wait_enabled();
     let mut empty_guard = capture::pace::EmptyGuard::new(pace_capture);
     let mut capturer = capture::open_async(
@@ -4030,9 +4030,17 @@ async fn media_pump_vp9_444_dc(
         target_fps,
         "VP9-444 DC pump starting"
     );
-    let mut capturer = capture::open_default_async(
+    // FR-135 R4a (#3275) — read once per pump, as `media_pump` reads its own.
+    // On, this pump's capture keeps `next_frame`'s contract: it opens paced, an
+    // empty rests in the guard where this pump slept, and a reopen lets go of
+    // the old capture first. Off, the default until the canary has been read,
+    // everything below runs as it did.
+    let pace_capture = capture::pace::dc_capture_wait(&media_paths);
+    let mut empty_guard = capture::pace::EmptyGuard::new(pace_capture);
+    let mut capturer = capture::open_async(
         target_fps,
         downscale,
+        pace_capture,
         media_waiting_hook(session_id, control_dc.clone()),
     )
     .await;
@@ -4134,6 +4142,8 @@ async fn media_pump_vp9_444_dc(
     let mut last_viewers: usize = 0;
 
     let mut frames_captured: u64 = 0;
+    // FR-135 R4a — with `frames_captured`, how often this pump asked its capture.
+    let mut frames_empty: u64 = 0;
     let mut frames_encoded: u64 = 0;
     // rc.166 freeze fix — these three are now owned by a dedicated DC send
     // task (spawned below, mirroring the FFmpeg pump rc.106 pattern) and
@@ -4579,6 +4589,7 @@ async fn media_pump_vp9_444_dc(
 
         // A local first, so `capturer`'s borrow ends before the idle arm asks
         // it what it waits for (FR-93 P3e).
+        let capture_started = std::time::Instant::now();
         let next_frame = capturer.next_frame().await;
         // FR-135 R0 (N7) — when the pump took this pass's real frame.
         let mut frame_captured_at: Option<std::time::Instant> = None;
@@ -4591,6 +4602,7 @@ async fn media_pump_vp9_444_dc(
                 }
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
+                empty_guard.on_frame();
                 // #3423 — and a viewer that joins from now on hears no stale notice.
                 pipeline.on_frame();
                 let arc = std::sync::Arc::new(f);
@@ -4603,6 +4615,7 @@ async fn media_pump_vp9_444_dc(
                 arc
             }
             Ok(None) => {
+                frames_empty += 1;
                 // FR-93 P3e — the display is off (P5f: this user's session is
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
@@ -4654,10 +4667,24 @@ async fn media_pump_vp9_444_dc(
                         }
                         f.clone()
                     } else {
+                        // FR-135 R4a — the capture waited for this empty, so
+                        // the pump adds no sleep of its own, here or below.
+                        if pace_capture {
+                            empty_guard
+                                .rest(capture_started.elapsed(), capturer.backend())
+                                .await;
+                            continue;
+                        }
                         tokio::time::sleep(frame_duration_floor).await;
                         continue;
                     }
                 } else {
+                    if pace_capture {
+                        empty_guard
+                            .rest(capture_started.elapsed(), capturer.backend())
+                            .await;
+                        continue;
+                    }
                     tokio::time::sleep(frame_duration_floor / 2).await;
                     continue;
                 }
@@ -4670,10 +4697,17 @@ async fn media_pump_vp9_444_dc(
                 }
                 // P3 — bounded backoff, same rationale as the track pump.
                 warn!(%session_id, %e, "VP9-444 capture error — rebuilding capturer");
+                // FR-135 R4a — let go first, as `media_pump` does: a paced open
+                // waits for a seat, and it would be waiting on the one this
+                // pump holds.
+                if pace_capture {
+                    drop(capturer);
+                }
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default_async(
+                capturer = capture::open_async(
                     target_fps,
                     downscale,
+                    pace_capture,
                     shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
@@ -5435,6 +5469,11 @@ async fn media_pump_vp9_444_dc(
                 shadow_disagree_pct = ?governor.shadow_disagree_pct(),
                 shadow_pauses = governor.shadow_pauses(),
                 shadow_reason = governor.shadow_reason(),
+                // FR-135 R4a (#3275), appended: with `frames_captured`, how
+                // often the pump asked its capture, and whether this session
+                // waits in the capture (`capture_wait`) or sleeps here.
+                frames_empty,
+                capture_wait = pace_capture,
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
             delivery.heartbeat(&pc, session_id, &mut governor, None); // FR-148 P0
@@ -6802,9 +6841,18 @@ async fn media_pump_ffmpeg_dc(
         slow_link = slow_link_profile.is_some(),
         "FFmpeg DC pump starting"
     );
-    let mut capturer = capture::open_default_async(
+    // FR-135 R4a (#3275) — read once per pump, as `media_pump` reads its own.
+    // On, this pump's capture keeps `next_frame`'s contract: it opens paced, an
+    // empty rests in the guard where this pump slept, and a reopen lets go of
+    // the old capture first. Off, the default until the canary has been read,
+    // everything below runs as it did. A session on GPU frames stays off: a
+    // capture that waits hands out none (`capture::pace::dc_capture_wait`).
+    let pace_capture = capture::pace::dc_capture_wait(&media_paths);
+    let mut empty_guard = capture::pace::EmptyGuard::new(pace_capture);
+    let mut capturer = capture::open_async(
         target_fps,
         downscale,
+        pace_capture,
         shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
     )
     .await;
@@ -7790,9 +7838,17 @@ async fn media_pump_ffmpeg_dc(
                             // reopen as `recapture`, the drop (a thread join)
                             // as `close`.
                             let t = watch.start();
-                            capturer = capture::open_default_async(
+                            // FR-135 R4a — on the waiting path the old capture
+                            // goes first: a paced open waits for a seat, and it
+                            // would wait on the one held here. Inside the
+                            // timer, where the assignment below dropped it.
+                            if pace_capture {
+                                drop(capturer);
+                            }
+                            capturer = capture::open_async(
                                 target_fps,
                                 downscale,
+                                pace_capture,
                                 shared_media_waiting_hook(
                                     session_id,
                                     control_dc.clone(),
@@ -8285,6 +8341,7 @@ async fn media_pump_ffmpeg_dc(
                 last_capture_at = std::time::Instant::now();
                 frame_captured_at = Some(last_capture_at);
                 capture_wait.on_frame();
+                empty_guard.on_frame();
                 // #3423 — and a viewer that joins from now on hears no stale notice.
                 pipeline.on_frame();
                 frames_captured += 1;
@@ -8462,6 +8519,18 @@ async fn media_pump_ffmpeg_dc(
                     }
                     f.clone()
                 } else {
+                    // FR-135 R4a — the capture waited for this empty, so the
+                    // pump adds no sleep of its own. FR-65 — still `poll`: what
+                    // is timed is the floor an empty that came straight back
+                    // owes (a pull backend whose next ask was already due).
+                    if pace_capture {
+                        let t = watch.start();
+                        empty_guard
+                            .rest(capture_start.elapsed(), capturer.backend())
+                            .await;
+                        PassWatch::stop(t, &mut poll_us);
+                        continue;
+                    }
                     // rc.99 — pace empty polls with a short sleep before
                     // retrying. rc.93 removed the top-of-loop floor (correctly
                     // — it capped the Some-rate) AND made this `continue`
@@ -8502,10 +8571,18 @@ async fn media_pump_ffmpeg_dc(
                 tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: capture error — rebuilding capturer");
                 // FR-65 — the backoff and the reopen together: `recapture`.
                 let t = watch.start();
+                // FR-135 R4a — let go first, as `media_pump` does: a paced open
+                // waits for a seat, and it would be waiting on the one this
+                // pump holds. Inside the timer, where the assignment below
+                // dropped it.
+                if pace_capture {
+                    drop(capturer);
+                }
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default_async(
+                capturer = capture::open_async(
                     target_fps,
                     downscale,
+                    pace_capture,
                     shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
@@ -10357,6 +10434,11 @@ async fn media_pump_ffmpeg_dc(
                 viewer_freezes = ?viewer.and_then(|v| v.report.freezes),
                 viewer_painted = ?viewer.and_then(|v| v.report.painted),
                 viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
+                // FR-135 R4a (#3275), appended: whether this session waits in
+                // the capture (`capture_wait`) or sleeps here on an empty. With
+                // it, `frames_captured` + `frames_empty` is the asks a read
+                // compares between the two.
+                capture_wait = pace_capture,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             delivery.heartbeat(&pc, session_id, &mut governor, seed_age); // FR-148 P0
@@ -12877,10 +12959,21 @@ async fn send_clipboard_image(
 /// no worker serves this session. It says what to do: once someone is signed
 /// in, the next session is the worker's; a Mac with two rows serves its
 /// screen and files on the person's own row. The viewer shows it on the
-/// transfer, or in the drawer.
+/// transfer, or in the drawer. #4566 — on two rows: a one-row Mac's root
+/// daemon says [`FILES_ON_A_ONE_ROW_MAC`].
 pub(crate) const FILES_IN_THE_PERSONS_SESSION: &str = "File transfer on this Mac needs someone \
      signed in at its screen and runs in their session, not in this one. Reconnect once someone \
      is signed in, or connect to the Mac's user-session roomlerd.";
+
+/// #4566 — the same reason on a one-row Mac, whose root daemon is the Mac's
+/// only row (`consent_relay::one_row`), so there is no user-session roomlerd
+/// to send the viewer to. File transfer there runs in the screen worker of
+/// the person signed in at the screen, and a channel that opens in the root
+/// daemon belongs to a session no screen worker served. Worded as the
+/// no-picture sentence is (`capture::mac_no_display_hint`).
+pub(crate) const FILES_ON_A_ONE_ROW_MAC: &str = "File transfer on this Mac runs as the person \
+     signed in at its screen, in their screen worker, and none served this session. Reconnect \
+     once someone is signed in at the Mac.";
 
 /// #3757 — whether the process that holds a session's peer serves the
 /// session's `files` channel ([`files_channel`]).
@@ -12910,17 +13003,30 @@ pub(crate) enum FilesChannel {
 /// never hands its own to the daemon; a new offer is decided again where it
 /// lands. Every other process serves the channel as before. Pure, so the
 /// rule is a test on every OS.
-pub(crate) fn files_channel(on_macos: bool, root: bool) -> FilesChannel {
+///
+/// #4566 — `one_row`: this is a one-row Mac's root daemon
+/// (`consent_relay::one_row`). It declines as a two-row Mac's does, and only
+/// its reason differs: [`FILES_ON_A_ONE_ROW_MAC`], which names no other row.
+pub(crate) fn files_channel(on_macos: bool, root: bool, one_row: bool) -> FilesChannel {
     if on_macos && root {
-        FilesChannel::Declined(FILES_IN_THE_PERSONS_SESSION)
+        FilesChannel::Declined(if one_row {
+            FILES_ON_A_ONE_ROW_MAC
+        } else {
+            FILES_IN_THE_PERSONS_SESSION
+        })
     } else {
         FilesChannel::Served
     }
 }
 
-/// [`files_channel`] for this process, by its own effective uid.
+/// [`files_channel`] for this process, by its own effective uid, and whether
+/// it is a one-row Mac's root daemon.
 pub(crate) fn files_channel_here() -> FilesChannel {
-    files_channel(cfg!(target_os = "macos"), effective_uid_is_root())
+    files_channel(
+        cfg!(target_os = "macos"),
+        effective_uid_is_root(),
+        crate::consent_relay::one_row(),
+    )
 }
 
 /// #3757 — whether this process's file access runs as root: its effective
@@ -17260,23 +17366,35 @@ mod files_channel_tests {
 
     /// The decision: a root process on a Mac holds the peer of a session no
     /// GUI worker serves, so it declines the channel with the reason. Red on
-    /// master, where every process served it.
+    /// master, where every process served it. #4566 — on one row too, with
+    /// its own reason (below).
     #[test]
     fn a_macs_root_daemon_declines_the_files_channel() {
-        assert_eq!(files_channel(true, true), FilesChannel::Declined(WHY));
+        assert_eq!(
+            files_channel(true, true, false),
+            FilesChannel::Declined(WHY)
+        );
+        assert!(matches!(
+            files_channel(true, true, true),
+            FilesChannel::Declined(_)
+        ));
     }
 
     /// Every other process serves the channel as before: a GUI worker (the
     /// one a delegated session's peer lives in) and a per-user install run as
     /// the person, and Linux and Windows keep their own rules (#3688, #3669).
+    /// #4566 — on one row or two: off macOS, and in a process that is not
+    /// root, the one-row input changes nothing.
     #[test]
     fn every_other_process_serves_it_as_before() {
-        for (on_macos, root) in [(true, false), (false, true), (false, false)] {
-            assert_eq!(
-                files_channel(on_macos, root),
-                FilesChannel::Served,
-                "on macOS: {on_macos}, root: {root}"
-            );
+        for one_row in [false, true] {
+            for (on_macos, root) in [(true, false), (false, true), (false, false)] {
+                assert_eq!(
+                    files_channel(on_macos, root, one_row),
+                    FilesChannel::Served,
+                    "on macOS: {on_macos}, root: {root}, one row: {one_row}"
+                );
+            }
         }
     }
 
@@ -17294,9 +17412,78 @@ mod files_channel_tests {
         }
     }
 
+    /// #4566 — a one-row Mac's root daemon is that Mac's only row: there is
+    /// no user-session roomlerd, and no other row, to send the viewer to. Its
+    /// reason names none. It says that file transfer runs as the person signed
+    /// in at the screen, that no screen worker served this session, and when a
+    /// reconnect helps, as the no-picture sentence does
+    /// (`capture::mac_no_display_hint`). Red on master, whose reason sent the
+    /// viewer to the Mac's user-session roomlerd.
+    #[test]
+    fn a_one_row_macs_declined_files_channel_names_no_row() {
+        let FilesChannel::Declined(why) = files_channel(true, true, true) else {
+            panic!("a one-row Mac's root daemon declines the channel");
+        };
+        for row in [
+            "user-session roomlerd",
+            "person's own row",
+            "-daemon row",
+            "user-session",
+        ] {
+            assert!(!why.contains(row), "{row:?} is in {why:?}");
+        }
+        assert!(!why.to_lowercase().contains("connect to"), "{why:?}");
+        for words in [
+            "runs as the person signed in at its screen",
+            "screen worker",
+            "none served this session",
+            "Reconnect once someone is signed in at the Mac.",
+        ] {
+            assert!(why.contains(words), "{words:?} is not in {why:?}");
+        }
+    }
+
+    /// #4566 — a two-row Mac's root daemon keeps its reason, byte for byte:
+    /// there the person's own row serves the screen and files.
+    #[test]
+    fn a_two_row_macs_declined_files_channel_keeps_its_reason() {
+        assert_eq!(
+            files_channel(true, true, false),
+            FilesChannel::Declined(
+                "File transfer on this Mac needs someone signed in at its screen and runs in \
+                 their session, not in this one. Reconnect once someone is signed in, or \
+                 connect to the Mac's user-session roomlerd."
+            )
+        );
+    }
+
+    /// #4566 — each reason reaches the viewer whole. It goes out through serde
+    /// (`files::FilesOutgoing::frame`), not spliced into a JSON literal by
+    /// hand, so it needs no escaping rule of its own: a listing's answer and a
+    /// transfer's carry it byte for byte, on one row or two.
+    #[test]
+    fn every_reason_reaches_the_viewer_whole() {
+        for one_row in [false, true] {
+            let FilesChannel::Declined(why) = files_channel(true, true, one_row) else {
+                panic!("a Mac's root daemon declines the channel (one row: {one_row})");
+            };
+            for frame in [
+                json!({"t": "files:dir", "req_id": "ls-1", "path": "/"}),
+                json!({"t": "files:get", "id": "dl-1", "path": "/etc/hosts"}),
+            ] {
+                let reply = declined_reply(frame.to_string().as_bytes(), why)
+                    .expect("a declined frame is answered");
+                let heard: Value = serde_json::from_str(&reply.text).expect("the answer is JSON");
+                assert_eq!(heard["message"], why, "one row: {one_row}, {frame}");
+            }
+        }
+    }
+
     /// This process's own facts: on a Mac its effective uid decides, and
     /// every other OS serves. The macOS job runs it as the runner's user
-    /// (served) and under sudo (declined).
+    /// (served) and under sudo (declined). A test process is never a one-row
+    /// Mac's root daemon (`DelegateHost::set_one_row` registers no host under
+    /// test), so its reason is the two-row one.
     #[test]
     fn this_process_follows_its_own_effective_uid() {
         let expected = if cfg!(target_os = "macos") && euid_is_root() {
@@ -17546,7 +17733,7 @@ mod files_channel_tests {
         let file = file.to_string_lossy().into_owned();
         let mut pair = Pair::open(
             Permissions::default() | Permissions::FILES,
-            files_channel(true, true),
+            files_channel(true, true, false),
         )
         .await;
         pair.ask(&json!({"t": "files:dir", "req_id": "ls-1", "path": folder}))
@@ -17643,7 +17830,7 @@ mod files_channel_tests {
     /// its words, whoever serves it: the grant is asked first, as before.
     #[tokio::test]
     async fn a_session_without_files_keeps_the_not_granted_channel() {
-        let mut pair = Pair::open(Permissions::default(), files_channel(true, true)).await;
+        let mut pair = Pair::open(Permissions::default(), files_channel(true, true, false)).await;
         pair.ask(&json!({"t": "files:begin", "id": "up-9", "name": "a.txt", "size": 3}))
             .await;
         let answered = pair.heard(1).await;

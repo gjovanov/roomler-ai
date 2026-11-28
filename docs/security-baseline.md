@@ -348,7 +348,7 @@ give.
 A tunnel policy names who may reach which `host:port` through which of the org's
 devices, so writing one is granting access. Every `…/tunnel-policy` route needs
 **`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
-(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:977`; the
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:1000`; the
 overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:157`).
 The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
 roles do not.
@@ -379,7 +379,7 @@ roles do not.
   The rest of the network module's gated writes followed in #4218, and a guard now
   holds the order in every module ([below](#a-gated-write-decides-its-gate-before-it-reads-its-body)).
 - ⚠️ **The forward itself reads no permission bit, and must not.**
-  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1069`) asks only
+  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1092`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
   people who hold no management bit reach what a holder named them for, so a bit on
   the forward would either defeat it or repeat it. When a policy names a role, the
@@ -870,8 +870,8 @@ as it is only after a check of its own shape:
 | Logged as it is | The check it passed |
 |---|---|
 | an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
-| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11468`) |
-| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10802`) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11550`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10884`) |
 
 The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are

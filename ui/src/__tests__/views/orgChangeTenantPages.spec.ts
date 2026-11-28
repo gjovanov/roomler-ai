@@ -99,7 +99,9 @@ const ORGS: Record<
     name: string
     rooms: ReturnType<typeof room>[]
     machines: { online: number; total: number }
-    clients: Array<{ id: string; name: string; status: string }>
+    // `presence` and `is_online` come from the client's socket (#4553); the
+    // stored `status` is the admin's state.
+    clients: Array<{ id: string; name: string; status: string; presence: string; is_online: boolean }>
     box: string
   }
 > = {
@@ -113,11 +115,11 @@ const ORGS: Record<
     ],
     machines: { online: 7, total: 9 },
     clients: [
-      { id: hex(0xa021), name: 'org-a-1', status: 'online' },
-      { id: hex(0xa022), name: 'org-a-2', status: 'online' },
-      { id: hex(0xa023), name: 'org-a-3', status: 'online' },
-      { id: hex(0xa024), name: 'org-a-4', status: 'online' },
-      { id: hex(0xa025), name: 'org-a-5', status: 'offline' },
+      { id: hex(0xa021), name: 'org-a-1', status: 'online', presence: 'online', is_online: true },
+      { id: hex(0xa022), name: 'org-a-2', status: 'online', presence: 'online', is_online: true },
+      { id: hex(0xa023), name: 'org-a-3', status: 'online', presence: 'online', is_online: true },
+      { id: hex(0xa024), name: 'org-a-4', status: 'online', presence: 'online', is_online: true },
+      { id: hex(0xa025), name: 'org-a-5', status: 'offline', presence: 'offline', is_online: false },
     ],
     box: 'Org A box',
   },
@@ -126,7 +128,7 @@ const ORGS: Record<
     name: 'Org B',
     rooms: [room(hex(0xb011), 'Org B general', 4)],
     machines: { online: 2, total: 3 },
-    clients: [{ id: hex(0xb021), name: 'org-b-1', status: 'online' }],
+    clients: [{ id: hex(0xb021), name: 'org-b-1', status: 'online', presence: 'online', is_online: true }],
     box: 'Org B box',
   },
 }
